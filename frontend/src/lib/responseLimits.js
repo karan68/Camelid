@@ -15,7 +15,79 @@ export const GEMMA4_MIN_CHAT_TOKENS = 8
 // for ordinary prompts/history instead of letting the global 8,192 default
 // force CPU common execution before position zero.
 export const GEMMA4_GHOST_WEBUI_MAX_TOKENS = 512
+// BitNet-b1.58-2B-4T is useful interactively at a short, bounded first-turn
+// budget. A valid per-model setting remains authoritative; this ceiling only
+// replaces Camelid's much larger legacy/global default for a fresh BitNet setup.
+export const BITNET_B1_58_DEFAULT_CHAT_MAX_TOKENS = 128
 export const DETENTS = [256, 1000, 4000, 16000, 64000, 256000, 1000000]
+
+const BITNET_B1_58_IDENTITIES = new Set([
+  'bitnet_b1_58_2b_4t_i2_s',
+  'bitnet_b1_58_2b_4t',
+  'bitnet2b',
+])
+const BITNET_B1_58_FILENAME = 'ggml-model-i2_s.gguf'
+
+function normalizedModelIdentity(value) {
+  return String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+}
+
+function filenameFromIdentity(value) {
+  return String(value || '').split(/[\\/]/).pop()?.toLowerCase() || ''
+}
+
+function ggufArchitecture(record) {
+  const metadata = record?.gguf?.metadata || record?.metadata || {}
+  return record?.architecture
+    ?? record?.gguf?.architecture
+    ?? metadata?.general?.architecture
+    ?? metadata?.['general.architecture']
+    ?? null
+}
+
+/* Identify only the causal Microsoft 2B row. The two BitNet embedding models
+   deliberately do not match: their inspected architectures are qwen3/gemma3,
+   their filenames differ, and none of their ids are in the exact identity set. */
+export function isBitNetB158ChatModel(model, runtime, requestModelId = '') {
+  const currentModel = runtime?.current_model || null
+  const architectures = [ggufArchitecture(model), ggufArchitecture(currentModel)]
+  if (architectures.some((value) => normalizedModelIdentity(value) === 'bitnet_b1_58')) return true
+
+  const identities = [
+    requestModelId,
+    runtime?.active_model_id,
+    model?.id,
+    model?.catalog_id,
+    model?.runtime_model_name,
+    model?.name,
+    model?.model_path,
+    model?.hf_filename,
+    currentModel?.id,
+    currentModel?.name,
+    currentModel?.path,
+    currentModel?.model_path,
+  ]
+  return identities.some((value) => (
+    BITNET_B1_58_IDENTITIES.has(normalizedModelIdentity(value))
+    || filenameFromIdentity(value) === BITNET_B1_58_FILENAME
+  ))
+}
+
+export function applyBitNetFreshChatTokenCap(value, {
+  bitNetB158 = false,
+  hasExplicitSetting = false,
+} = {}) {
+  const configured = Number.isFinite(Number(value))
+    ? Math.max(MIN_RESPONSE_TOKENS, Math.round(Number(value)))
+    : MIN_RESPONSE_TOKENS
+  return bitNetB158 && !hasExplicitSetting
+    ? Math.min(configured, BITNET_B1_58_DEFAULT_CHAT_MAX_TOKENS)
+    : configured
+}
 
 export function applyGemma4ChatTokenFloor(value, compatibilityFamily = '') {
   const configured = Number.isFinite(Number(value)) ? Math.round(Number(value)) : MIN_RESPONSE_TOKENS
@@ -133,6 +205,12 @@ export function validateSendBudget({ promptTokens, maxTokens, contextLength }) {
 }
 
 const MAX_TOKENS_KEY = 'camelid.maxTokens'
+
+export function hasExplicitMaxTokensSetting(modelId = '') {
+  if (typeof window === 'undefined' || !modelId) return false
+  const value = Number.parseInt(window.localStorage.getItem(`${MAX_TOKENS_KEY}.${modelId}`) || '', 10)
+  return Number.isFinite(value) && value >= MIN_RESPONSE_TOKENS
+}
 
 export function getConfiguredMaxTokens(modelId = '') {
   if (typeof window === 'undefined') return 8192

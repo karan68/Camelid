@@ -21,6 +21,12 @@ use crate::{BackendError, Result};
 
 const NOMIC_BERT_ARCH: &str = "nomic-bert";
 const MAX_BATCH_INPUTS: usize = 256;
+// The checkpoints advertise 32K training context, but Camelid's current
+// embedding graph uses host-side quadratic causal attention. Keep the public
+// runtime inside the real-model-tested interactive envelope until a resident
+// flash-attention path exists.
+const MAX_BITNET_EMBEDDING_INPUT_TOKENS: usize = 1_024;
+const MAX_BITNET_EMBEDDING_BATCH_TOKENS: usize = 4_096;
 const DEFAULT_BATCH_WORKERS: usize = 8;
 const MAX_BATCH_WORKERS: usize = 16;
 const BATCH_WORKERS_ENV: &str = "CAMELID_EMBEDDING_BATCH_WORKERS";
@@ -218,6 +224,26 @@ impl EmbeddingRuntime {
         }
     }
 
+    /// Validate the optional OpenAI-compatible `dimensions` override before
+    /// running an encoder so API errors can identify that field precisely.
+    pub fn validate_dimensions(&self, dimensions: Option<usize>) -> Result<()> {
+        let Some(dimensions) = dimensions else {
+            return Ok(());
+        };
+        match self {
+            Self::Nomic(runtime) => {
+                let native = runtime.config().embedding_length;
+                if dimensions == 0 || dimensions > native {
+                    return Err(BackendError::InvalidModelMetadata(format!(
+                        "embedding dimensions must be between 1 and {native}, got {dimensions}"
+                    )));
+                }
+                Ok(())
+            }
+            Self::BitNet(runtime) => runtime.validate_dimensions(dimensions),
+        }
+    }
+
     pub fn embed_batch(
         &self,
         inputs: &[String],
@@ -277,11 +303,127 @@ fn with_bitnet_query_instruction(text: &str) -> String {
     }
 }
 
+fn resolve_bitnet_embedding_pooling(declared: PoolingType) -> Result<PoolingType> {
+    match declared {
+        PoolingType::Mean | PoolingType::Cls | PoolingType::Last => Ok(declared),
+        PoolingType::None => Err(BackendError::InvalidModelMetadata(
+            "BitNet embedding pooling=none cannot produce one API embedding vector".into(),
+        )),
+        PoolingType::Rank => Err(BackendError::InvalidModelMetadata(
+            "BitNet embedding pooling=rank requires a classifier head".into(),
+        )),
+    }
+}
+
 #[derive(Debug, Clone)]
-struct BitNetEmbeddingConfig {
-    context_length: usize,
-    embedding_length: usize,
+pub(crate) struct BitNetEmbeddingConfig {
+    pub(crate) context_length: usize,
+    pub(crate) embedding_length: usize,
     pooling: PoolingType,
+}
+
+/// Header-only admission shared by `/api/models/inspect` and the real loader.
+/// Keeping these checks in one place prevents the UI from declaring a malformed
+/// look-alike ready only for weight loading to reject it later.
+pub(crate) fn validate_bitnet_embedding_metadata(gguf: &GgufFile) -> Result<BitNetEmbeddingConfig> {
+    if !is_bitnet_embedding_model(gguf) {
+        return Err(BackendError::UnsupportedModelArchitecture(format!(
+            "not an exact Microsoft BitNet embedding GGUF: architecture {:?}, model {:?}",
+            gguf.architecture().unwrap_or("unknown"),
+            gguf.model_name().unwrap_or("unknown")
+        )));
+    }
+    let llama = LlamaModelConfig::from_gguf(gguf)?;
+    let expected = match gguf.model_name() {
+        Some("bitnet-embeddings-0.6b") => ("qwen3", 32_768, 1_024, 3_072, 28, 16, 8, 128),
+        Some("bitnet-embeddings-270m") => ("gemma3", 32_768, 640, 2_048, 18, 4, 1, 256),
+        _ => unreachable!("exact BitNet embedding model checked above"),
+    };
+    let actual = (
+        llama.architecture.as_str(),
+        llama.context_length as usize,
+        llama.embedding_length as usize,
+        llama.feed_forward_length as usize,
+        llama.block_count as usize,
+        llama.attention_head_count as usize,
+        llama.attention_head_count_kv as usize,
+        llama.attention_key_length.unwrap_or(0) as usize,
+    );
+    if actual != expected {
+        return Err(BackendError::InvalidModelMetadata(format!(
+            "BitNet embedding geometry {actual:?} does not match the pinned official artifact {expected:?}"
+        )));
+    }
+    if gguf.metadata_u32("general.file_type") != Some(40) {
+        return Err(BackendError::InvalidModelMetadata(
+            "BitNet embedding GGUF must declare general.file_type=40 (I2_S)".into(),
+        ));
+    }
+    if gguf
+        .tensors
+        .iter()
+        .any(|tensor| tensor.name == "output.weight")
+    {
+        return Err(BackendError::InvalidModelMetadata(
+            "BitNet embedding artifact unexpectedly contains output.weight".into(),
+        ));
+    }
+    let projection_suffixes = [
+        ".attn_q.weight",
+        ".attn_k.weight",
+        ".attn_v.weight",
+        ".attn_output.weight",
+        ".ffn_gate.weight",
+        ".ffn_up.weight",
+        ".ffn_down.weight",
+    ];
+    let projection_count = gguf
+        .tensors
+        .iter()
+        .filter(|tensor| {
+            tensor.name.starts_with("blk.")
+                && projection_suffixes
+                    .iter()
+                    .any(|suffix| tensor.name.ends_with(suffix))
+        })
+        .map(|tensor| {
+            if tensor.tensor_type != GgufTensorType::I2S {
+                Err(BackendError::UnsupportedTensorType(format!(
+                    "BitNet embedding projection {} must be I2_S, got {:?}",
+                    tensor.name, tensor.tensor_type
+                )))
+            } else {
+                Ok(())
+            }
+        })
+        .collect::<Result<Vec<_>>>()?
+        .len();
+    let expected_projections = llama.block_count as usize * projection_suffixes.len();
+    if projection_count != expected_projections {
+        return Err(BackendError::InvalidModelMetadata(format!(
+            "BitNet embedding artifact has {projection_count} dense projections, expected {expected_projections}"
+        )));
+    }
+
+    let architecture = llama.architecture.as_str();
+    // Microsoft's prose says EOS/last-token pooling, but the shipped GGUFs
+    // declare pooling_type=1 (mean), and Microsoft's published numeric prefix
+    // matches the 0.6B artifact under mean pooling (despite the example command
+    // selecting 270M). Treat the artifact metadata as the executable contract.
+    let declared_pooling = PoolingType::from_gguf(
+        gguf.metadata_u32(&format!("{architecture}.pooling_type"))
+            .ok_or_else(|| {
+                BackendError::InvalidModelMetadata(format!(
+                    "required metadata {architecture}.pooling_type is missing"
+                ))
+            })?,
+    )?;
+    let pooling = resolve_bitnet_embedding_pooling(declared_pooling)?;
+    Ok(BitNetEmbeddingConfig {
+        context_length: expected.1,
+        embedding_length: expected.2,
+        pooling,
+    })
 }
 
 /// Runtime for Microsoft's exact BitNet embedding GGUFs. Projection weights
@@ -308,94 +450,7 @@ impl BitNetEmbeddingRuntime {
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let gguf = read_metadata(&path)?;
-        if !is_bitnet_embedding_model(&gguf) {
-            return Err(BackendError::UnsupportedModelArchitecture(format!(
-                "not an exact Microsoft BitNet embedding GGUF: architecture {:?}, model {:?}",
-                gguf.architecture().unwrap_or("unknown"),
-                gguf.model_name().unwrap_or("unknown")
-            )));
-        }
-        let llama = LlamaModelConfig::from_gguf(&gguf)?;
-        let expected = match gguf.model_name() {
-            Some("bitnet-embeddings-0.6b") => ("qwen3", 32_768, 1_024, 3_072, 28, 16, 8, 128),
-            Some("bitnet-embeddings-270m") => ("gemma3", 32_768, 640, 2_048, 18, 4, 1, 256),
-            _ => unreachable!("exact BitNet embedding model checked above"),
-        };
-        let actual = (
-            llama.architecture.as_str(),
-            llama.context_length as usize,
-            llama.embedding_length as usize,
-            llama.feed_forward_length as usize,
-            llama.block_count as usize,
-            llama.attention_head_count as usize,
-            llama.attention_head_count_kv as usize,
-            llama.attention_key_length.unwrap_or(0) as usize,
-        );
-        if actual != expected {
-            return Err(BackendError::InvalidModelMetadata(format!(
-                "BitNet embedding geometry {actual:?} does not match the pinned official artifact {expected:?}"
-            )));
-        }
-        if gguf.metadata_u32("general.file_type") != Some(40) {
-            return Err(BackendError::InvalidModelMetadata(
-                "BitNet embedding GGUF must declare general.file_type=40 (I2_S)".into(),
-            ));
-        }
-        if gguf
-            .tensors
-            .iter()
-            .any(|tensor| tensor.name == "output.weight")
-        {
-            return Err(BackendError::InvalidModelMetadata(
-                "BitNet embedding artifact unexpectedly contains output.weight".into(),
-            ));
-        }
-        let projection_suffixes = [
-            ".attn_q.weight",
-            ".attn_k.weight",
-            ".attn_v.weight",
-            ".attn_output.weight",
-            ".ffn_gate.weight",
-            ".ffn_up.weight",
-            ".ffn_down.weight",
-        ];
-        let projection_count = gguf
-            .tensors
-            .iter()
-            .filter(|tensor| {
-                tensor.name.starts_with("blk.")
-                    && projection_suffixes
-                        .iter()
-                        .any(|suffix| tensor.name.ends_with(suffix))
-            })
-            .map(|tensor| {
-                if tensor.tensor_type != GgufTensorType::I2S {
-                    Err(BackendError::UnsupportedTensorType(format!(
-                        "BitNet embedding projection {} must be I2_S, got {:?}",
-                        tensor.name, tensor.tensor_type
-                    )))
-                } else {
-                    Ok(())
-                }
-            })
-            .collect::<Result<Vec<_>>>()?
-            .len();
-        let expected_projections = llama.block_count as usize * projection_suffixes.len();
-        if projection_count != expected_projections {
-            return Err(BackendError::InvalidModelMetadata(format!(
-                "BitNet embedding artifact has {projection_count} dense projections, expected {expected_projections}"
-            )));
-        }
-
-        let architecture = llama.architecture.as_str();
-        let pooling = PoolingType::from_gguf(
-            gguf.metadata_u32(&format!("{architecture}.pooling_type"))
-                .ok_or_else(|| {
-                    BackendError::InvalidModelMetadata(format!(
-                        "required metadata {architecture}.pooling_type is missing"
-                    ))
-                })?,
-        )?;
+        let config = validate_bitnet_embedding_metadata(&gguf)?;
         let tokenizer = Arc::new(Tokenizer::from_gguf(&gguf)?);
         let model_path = path.to_str().ok_or_else(|| {
             BackendError::InvalidModelMetadata("BitNet model path is not valid UTF-8".into())
@@ -403,11 +458,7 @@ impl BitNetEmbeddingRuntime {
         let model = RunnableModel::load(model_path)?;
         Ok(Self {
             path,
-            config: BitNetEmbeddingConfig {
-                context_length: expected.1,
-                embedding_length: expected.2,
-                pooling,
-            },
+            config,
             tokenizer,
             model,
         })
@@ -417,17 +468,31 @@ impl BitNetEmbeddingRuntime {
         &self.tokenizer
     }
 
+    fn validate_dimensions(&self, dimensions: usize) -> Result<()> {
+        if dimensions != self.config.embedding_length {
+            return Err(BackendError::InvalidModelMetadata(format!(
+                "Microsoft BitNet embeddings have a fixed native dimension of {}; dimension truncation is not supported because these checkpoints do not declare Matryoshka training",
+                self.config.embedding_length
+            )));
+        }
+        Ok(())
+    }
+
     pub fn embed(&self, text: &str, dimensions: Option<usize>) -> Result<Vec<f32>> {
+        if let Some(dimensions) = dimensions {
+            self.validate_dimensions(dimensions)?;
+        }
         let token_ids = self.tokenizer.encode(text, true, false)?;
         if token_ids.is_empty() {
             return Err(BackendError::InvalidTokenizerMetadata(
                 "BitNet embedding tokenizer produced no tokens".into(),
             ));
         }
-        if token_ids.len() > self.config.context_length {
+        if token_ids.len() > MAX_BITNET_EMBEDDING_INPUT_TOKENS {
             return Err(BackendError::InvalidModelMetadata(format!(
-                "embedding input is {} tokens, above this model's {}-token context",
+                "embedding input is {} tokens, above Camelid's tested {}-token BitNet embedding runtime limit (the checkpoint's trained context is {})",
                 token_ids.len(),
+                MAX_BITNET_EMBEDDING_INPUT_TOKENS,
                 self.config.context_length
             )));
         }
@@ -437,18 +502,7 @@ impl BitNetEmbeddingRuntime {
             token_ids,
             embedding_length: self.config.embedding_length,
         };
-        let mut embedding = output.pool(self.config.pooling)?;
-        if let Some(dimensions) = dimensions {
-            if dimensions == 0 || dimensions > embedding.len() {
-                return Err(BackendError::InvalidModelMetadata(format!(
-                    "embedding dimensions must be between 1 and {}, got {dimensions}",
-                    embedding.len()
-                )));
-            }
-            embedding.truncate(dimensions);
-            l2_normalize(&mut embedding)?;
-        }
-        Ok(embedding)
+        output.pool(self.config.pooling)
     }
 
     pub fn embed_batch(
@@ -456,6 +510,9 @@ impl BitNetEmbeddingRuntime {
         inputs: &[String],
         dimensions: Option<usize>,
     ) -> Result<Vec<Vec<f32>>> {
+        if let Some(dimensions) = dimensions {
+            self.validate_dimensions(dimensions)?;
+        }
         if inputs.is_empty() {
             return Err(BackendError::InvalidModelMetadata(
                 "embedding input must contain at least one string".into(),
@@ -467,12 +524,48 @@ impl BitNetEmbeddingRuntime {
                 inputs.len()
             )));
         }
-        embedding_batch_pool().install(|| {
+        let token_counts = inputs
+            .iter()
+            .map(|input| {
+                self.tokenizer
+                    .encode(input, true, false)
+                    .map(|ids| ids.len())
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if let Some((index, count)) = token_counts
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_, count)| *count > MAX_BITNET_EMBEDDING_INPUT_TOKENS)
+        {
+            return Err(BackendError::InvalidModelMetadata(format!(
+                "embedding input at index {index} is {count} tokens, above Camelid's tested {MAX_BITNET_EMBEDDING_INPUT_TOKENS}-token BitNet embedding runtime limit"
+            )));
+        }
+        let batch_tokens = token_counts.iter().sum::<usize>();
+        if batch_tokens > MAX_BITNET_EMBEDDING_BATCH_TOKENS {
+            return Err(BackendError::InvalidModelMetadata(format!(
+                "embedding batch contains {batch_tokens} tokens; Camelid's tested BitNet batch limit is {MAX_BITNET_EMBEDDING_BATCH_TOKENS} tokens"
+            )));
+        }
+
+        // A single GPU queue already parallelizes each projection. Running
+        // multiple full causal graphs concurrently only multiplies activation
+        // memory and transfer pressure, so serialize GPU-backed batches. CPU
+        // execution retains the bounded worker pool.
+        if crate::bitnet_kernels::gpu_allowed() && crate::cuda::gpu_accel_enabled() {
             inputs
-                .par_iter()
+                .iter()
                 .map(|input| self.embed(input, dimensions))
                 .collect()
-        })
+        } else {
+            embedding_batch_pool().install(|| {
+                inputs
+                    .par_iter()
+                    .map(|input| self.embed(input, dimensions))
+                    .collect()
+            })
+        }
     }
 }
 
@@ -1189,6 +1282,15 @@ mod tests {
         assert!((norm - 1.0).abs() < 1e-6);
         assert!(output.pool(PoolingType::None).is_err());
         assert!(output.pool(PoolingType::Rank).is_err());
+    }
+
+    #[test]
+    fn bitnet_embedding_pooling_honors_supported_artifact_metadata() {
+        for pooling in [PoolingType::Mean, PoolingType::Cls, PoolingType::Last] {
+            assert_eq!(resolve_bitnet_embedding_pooling(pooling).unwrap(), pooling);
+        }
+        assert!(resolve_bitnet_embedding_pooling(PoolingType::None).is_err());
+        assert!(resolve_bitnet_embedding_pooling(PoolingType::Rank).is_err());
     }
 
     #[test]

@@ -62,7 +62,6 @@ impl RawMatBytes {
         Self::Owned(Arc::new(bytes))
     }
 
-    #[cfg(target_os = "macos")]
     fn wire_pages(&self) -> Option<&Arc<crate::wire_mmap::WirePages>> {
         match self {
             Self::WirePages(pages) => Some(pages),
@@ -117,6 +116,16 @@ fn resident_metal_format(tt: GgufTensorType) -> Option<crate::metal::ResidentWei
     }
 }
 
+/// Formats accepted by the small hybrid projection bridge. Dense F16 is not a
+/// general resident-model admission: it is used only for BitNet's explicitly
+/// page-backed tied output head (see `load_raw`).
+fn hybrid_metal_format(tt: GgufTensorType) -> Option<crate::metal::ResidentWeightFormat> {
+    match tt {
+        GgufTensorType::F16 => Some(crate::metal::ResidentWeightFormat::DenseF16),
+        _ => resident_metal_format(tt),
+    }
+}
+
 /// Tensor types read into `RawMatBytes::WirePages` rather than an owned `Vec`, so the
 /// allocation can be wrapped in place with `newBufferWithBytesNoCopy`.
 ///
@@ -131,12 +140,94 @@ fn wants_page_backing(tt: GgufTensorType) -> bool {
     tt == GgufTensorType::I2S || resident_metal_format(tt).is_some()
 }
 
+/// The ReLU²/SubLN graph below is certified for Microsoft's exact 2B-4T
+/// checkpoint, not for every historical model that reused the
+/// `bitnet-b1.58` architecture label. Fail closed before loading weights so an
+/// older SiLU checkpoint cannot be executed with a plausible-but-wrong graph.
+fn validate_bitnet_b158_2b_4t(gguf: &GgufFile, config: &LlamaModelConfig) -> Result<()> {
+    if config.architecture != "bitnet-b1.58" {
+        return Ok(());
+    }
+
+    let head_dim = config
+        .attention_key_length
+        .or_else(|| {
+            config
+                .embedding_length
+                .checked_div(config.attention_head_count)
+        })
+        .unwrap_or(0);
+    let geometry_matches = gguf.model_name() == Some("bitnet2b")
+        && config.context_length == 4_096
+        && config.embedding_length == 2_560
+        && config.block_count == 30
+        && config.feed_forward_length == 6_912
+        && config.attention_head_count == 20
+        && config.attention_head_count_kv == 5
+        && head_dim == 128
+        && config.rope_dimension_count == Some(128)
+        && config.rope_freq_base == Some(500_000.0)
+        && config.vocab_size == Some(128_256)
+        && config.file_type == Some(40);
+
+    let projection_suffixes = [
+        ".attn_q.weight",
+        ".attn_k.weight",
+        ".attn_v.weight",
+        ".attn_output.weight",
+        ".ffn_gate.weight",
+        ".ffn_up.weight",
+        ".ffn_down.weight",
+    ];
+    let projections: Vec<_> = gguf
+        .tensors
+        .iter()
+        .filter(|tensor| {
+            tensor.name.starts_with("blk.")
+                && projection_suffixes
+                    .iter()
+                    .any(|suffix| tensor.name.ends_with(suffix))
+        })
+        .collect();
+    let tensors_match = projections.len() == 30 * projection_suffixes.len()
+        && projections
+            .iter()
+            .all(|tensor| tensor.tensor_type == GgufTensorType::I2S)
+        && gguf.tensors.iter().any(|tensor| {
+            tensor.name == "token_embd.weight" && tensor.tensor_type == GgufTensorType::F16
+        })
+        && !gguf
+            .tensors
+            .iter()
+            .any(|tensor| tensor.name == "output.weight");
+
+    if !geometry_matches || !tensors_match {
+        return Err(BackendError::InvalidModelMetadata(format!(
+            "bitnet-b1.58 runnable support is pinned to Microsoft's BitNet-b1.58-2B-4T I2_S artifact; got model {:?}, geometry ({}, {}, {}, {}, {}, {}, head_dim {}, rope {:?}/{:?}, vocab {:?}, file_type {:?}) and {} canonical projections",
+            gguf.model_name().unwrap_or("unknown"),
+            config.context_length,
+            config.embedding_length,
+            config.block_count,
+            config.feed_forward_length,
+            config.attention_head_count,
+            config.attention_head_count_kv,
+            head_dim,
+            config.rope_dimension_count,
+            config.rope_freq_base,
+            config.vocab_size,
+            config.file_type,
+            projections.len()
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(target_os = "macos")]
 fn log_prism_metal_hybrid_once() {
     static LOGGED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     LOGGED.get_or_init(|| {
         eprintln!(
-            "[qwen35] Metal hybrid bring-up: packed Q1/Q2 projections are NoCopy GPU \
+            "[runnable] Metal hybrid bring-up: packed/ternary projections are NoCopy GPU \
              kernels; recurrent/attention state is still CPU-resident"
         );
     });
@@ -340,7 +431,7 @@ impl RawMat {
         }
         #[cfg(target_os = "macos")]
         if let Some(pages) = self.bytes.wire_pages() {
-            if let Some(output) = resident_metal_format(self.tt).and_then(|format| {
+            if let Some(output) = hybrid_metal_format(self.tt).and_then(|format| {
                 crate::metal::try_prism_wire_matvec_f32(x, pages, format, self.out_features)
             }) {
                 log_prism_metal_hybrid_once();
@@ -368,6 +459,14 @@ impl RawMat {
             GgufTensorType::F32 => Ok((0..self.out_features)
                 .into_par_iter()
                 .map(|r| f32_row_dot(&self.bytes.as_slice()[r * rb..(r + 1) * rb], x))
+                .collect()),
+            GgufTensorType::F16 => Ok((0..self.out_features)
+                .into_par_iter()
+                .map(|r| f16_row_dot(&self.bytes.as_slice()[r * rb..(r + 1) * rb], x))
+                .collect()),
+            GgufTensorType::BF16 => Ok((0..self.out_features)
+                .into_par_iter()
+                .map(|r| bf16_row_dot(&self.bytes.as_slice()[r * rb..(r + 1) * rb], x))
                 .collect()),
             _ => (0..self.out_features)
                 .into_par_iter()
@@ -466,6 +565,57 @@ fn f32_row_dot(row: &[u8], x: &[f32]) -> f32 {
         .sum()
 }
 
+/// Fused F16-row · f32 dot (no 2,560-element allocation per vocabulary row).
+/// Element conversion and accumulation order match `dequantize_f16` + `dot`.
+fn f16_row_dot(row: &[u8], x: &[f32]) -> f32 {
+    row.chunks_exact(2)
+        .zip(x.iter())
+        .map(|(c, &xi)| crate::tensor::f16_bits_to_f32(u16::from_le_bytes([c[0], c[1]])) * xi)
+        .sum()
+}
+
+/// Fused BF16-row · f32 dot. BF16 is exactly the high 16 bits of an f32.
+fn bf16_row_dot(row: &[u8], x: &[f32]) -> f32 {
+    row.chunks_exact(2)
+        .zip(x.iter())
+        .map(|(c, &xi)| {
+            let bits = u16::from_le_bytes([c[0], c[1]]) as u32;
+            f32::from_bits(bits << 16) * xi
+        })
+        .sum()
+}
+
+#[cfg(test)]
+mod dense_row_dot_tests {
+    use super::*;
+
+    #[test]
+    fn fused_f16_and_bf16_rows_match_dequantized_dot() {
+        let x = [0.25_f32, -2.0, 3.5, 0.0];
+        let f16_bits = [0x3c00_u16, 0xc000, 0x3800, 0x7bff];
+        let f16_bytes = f16_bits
+            .iter()
+            .flat_map(|bits| bits.to_le_bytes())
+            .collect::<Vec<_>>();
+        let f16_values = f16_bits
+            .iter()
+            .map(|&bits| crate::tensor::f16_bits_to_f32(bits))
+            .collect::<Vec<_>>();
+        assert_eq!(f16_row_dot(&f16_bytes, &x), dot(&f16_values, &x));
+
+        let bf16_bits = [0x3f80_u16, 0xc000, 0x3f00, 0x7f7f];
+        let bf16_bytes = bf16_bits
+            .iter()
+            .flat_map(|bits| bits.to_le_bytes())
+            .collect::<Vec<_>>();
+        let bf16_values = bf16_bits
+            .iter()
+            .map(|&bits| f32::from_bits((bits as u32) << 16))
+            .collect::<Vec<_>>();
+        assert_eq!(bf16_row_dot(&bf16_bytes, &x), dot(&bf16_values, &x));
+    }
+}
+
 impl RawMat {
     /// Batched [`par_matvec`]: one output vector per input in `xs`, reading each
     /// weight row ONCE and dotting it against every input — so the resident weights
@@ -525,7 +675,7 @@ impl RawMat {
         }
         #[cfg(target_os = "macos")]
         if let Some(pages) = self.bytes.wire_pages() {
-            if let Some(output) = resident_metal_format(self.tt).and_then(|format| {
+            if let Some(output) = hybrid_metal_format(self.tt).and_then(|format| {
                 crate::metal::try_prism_wire_matmul_f32(xs, pages, format, self.out_features)
             }) {
                 log_prism_metal_hybrid_once();
@@ -704,6 +854,7 @@ impl RunnableModel {
         let gguf = read_metadata(path)?;
         admit::admit(&gguf).map_err(BackendError::from)?;
         let cfg = LlamaModelConfig::from_gguf(&gguf)?;
+        validate_bitnet_b158_2b_4t(&gguf, &cfg)?;
         let arch = gguf
             .architecture()
             .ok_or_else(|| BackendError::InvalidModelMetadata("missing architecture".into()))?
@@ -742,7 +893,10 @@ impl RunnableModel {
         let load_raw = |f: &mut File, name: &str| -> Result<RawMat> {
             let d = find_tensor(&gguf, name)?;
             let (inf, outf) = mat_dims(d, name)?;
-            let bytes = if wants_page_backing(d.tensor_type) {
+            let bitnet_tied_head = arch == "bitnet-b1.58"
+                && d.tensor_type == GgufTensorType::F16
+                && matches!(name, "token_embd.weight" | "output.weight");
+            let bytes = if wants_page_backing(d.tensor_type) || bitnet_tied_head {
                 let byte_len = usize::try_from(d.n_bytes).map_err(|_| {
                     BackendError::InvalidTensorData(format!(
                         "tensor {name} packed byte length {} does not fit usize",
@@ -1315,11 +1469,62 @@ impl RunnableModel {
         }
         let hidden = self.forward_hidden_states(tokens)?;
         let normed = &hidden[hidden.len() - self.d_model..];
-        let mut logits = vec![0.0f32; self.vocab];
-        for (t, lt) in logits.iter_mut().enumerate() {
-            let row = self.output.dequant_row(t, "output")?;
-            *lt = dot(&row, normed);
-        }
+        self.project_output_logits(normed)
+    }
+
+    /// Project one normalized hidden row through the language-model head and
+    /// apply the architecture's final logit transforms.
+    fn project_output_logits(&self, normed: &[f32]) -> Result<Vec<f32>> {
+        let mut logits = if self.architecture == "bitnet-b1.58" {
+            // The official 2B model ties a 128,256 x 2,560 F16 embedding to its
+            // LM head. `par_matvec` keeps that matrix page-backed on Metal and
+            // uses allocation-free row dots on CPU, instead of making 128k
+            // temporary Vecs for every generated token. Windows additionally
+            // keeps the immutable F16 wire bytes resident in CUDA and runs one
+            // 256-thread reduction block per vocabulary row. Every gate below
+            // is intentionally exact: this is not a generic dense-F16 CUDA path.
+            let tied_pages = match (
+                self.token_embd.bytes.wire_pages(),
+                self.output.bytes.wire_pages(),
+            ) {
+                (Some(token), Some(output)) if Arc::ptr_eq(token, output) => Some(output),
+                _ => None,
+            };
+            let exact_cuda_head = self.output.tt == GgufTensorType::F16
+                && self.output.in_features == 2_560
+                && self.d_model == 2_560
+                && self.output.out_features == 128_256
+                && self.vocab == 128_256
+                && crate::bitnet_kernels::gpu_allowed()
+                && crate::cuda::gpu_accel_enabled();
+            if exact_cuda_head {
+                if let Some(pages) = tied_pages {
+                    let mut output = vec![0.0_f32; self.vocab];
+                    if crate::cuda::try_bitnet_f16_head_matvec(
+                        normed,
+                        pages,
+                        self.vocab,
+                        self.d_model,
+                        &mut output,
+                    ) {
+                        output
+                    } else {
+                        self.output.par_matvec(normed, "output")?
+                    }
+                } else {
+                    self.output.par_matvec(normed, "output")?
+                }
+            } else {
+                self.output.par_matvec(normed, "output")?
+            }
+        } else {
+            let mut logits = vec![0.0f32; self.vocab];
+            for (token, logit) in logits.iter_mut().enumerate() {
+                let row = self.output.dequant_row(token, "output")?;
+                *logit = dot(&row, normed);
+            }
+            logits
+        };
         // gemma2 final logit soft-cap (gemma3: None).
         if let Some(cap) = self.final_logit_softcap {
             for l in logits.iter_mut() {
@@ -1338,6 +1543,19 @@ impl RunnableModel {
     /// every input position. This is also the encoder surface used by the official
     /// decoder-only BitNet embedding checkpoints before their declared pooling.
     pub(crate) fn forward_hidden_states(&self, tokens: &[u32]) -> Result<Vec<f32>> {
+        self.forward_hidden_states_with_cache(tokens, None, None)
+    }
+
+    /// Batched generic forward with optional KV capture. BitNet chat uses the
+    /// captured cache for prompt prefill; embedding models use the same graph
+    /// without a cache. `cancelled` is checked between transformer blocks so a
+    /// disconnected streaming request does not continue monopolizing the GPU.
+    fn forward_hidden_states_with_cache(
+        &self,
+        tokens: &[u32],
+        mut cache: Option<&mut KvCache>,
+        cancelled: Option<&dyn Fn() -> bool>,
+    ) -> Result<Vec<f32>> {
         if tokens.is_empty() {
             return Err(BackendError::InvalidTensorData(
                 "empty token sequence".into(),
@@ -1372,7 +1590,12 @@ impl RunnableModel {
         let dump_path = std::env::var("CAMELID_LAYER_DUMP").ok();
         let mut dump = String::new();
         for (li, layer) in self.layers.iter().enumerate() {
-            self.attention_block(layer, li, &mut hidden, seq)?;
+            if cancelled.is_some_and(|is_cancelled| is_cancelled()) {
+                return Err(BackendError::InvalidTensorData(
+                    "generation cancelled".into(),
+                ));
+            }
+            self.attention_block(layer, li, &mut hidden, seq, cache.as_deref_mut())?;
             self.ffn_block(layer, li, &mut hidden, seq)?;
             if dump_path.is_some() {
                 let last = &hidden[(seq - 1) * dm..seq * dm];
@@ -1416,14 +1639,7 @@ impl RunnableModel {
             return self.generate_lfm2_metal(prompt, max_new, &[], None, &mut |_| {});
         }
         let mut cache = self.new_cache();
-        let mut last = Vec::new();
-        // Only the LAST prompt position's logits are consumed; the rest exist to
-        // fill the cache and roll the conv ring. Skipping the tied 128k-row head on
-        // those positions removes 9.7% of the bytes each prefill step reads.
-        let last_prompt = prompt.len().saturating_sub(1);
-        for (pos, &tok) in prompt.iter().enumerate() {
-            last = self.forward_step_maybe_logits(tok, pos, &mut cache, pos == last_prompt)?;
-        }
+        let last = self.prefill_generic(prompt, &mut cache, None)?;
         let mut out = Vec::with_capacity(max_new);
         let mut pos = prompt.len();
         let mut next = argmax(&last);
@@ -1536,6 +1752,41 @@ impl RunnableModel {
             }
         }
         cache
+    }
+
+    /// Fill the generic decoder cache and return the final prompt position's
+    /// logits. BitNet uses the existing full-sequence projection path so every
+    /// layer submits one batched I2_S matmul per projection instead of one Metal
+    /// command buffer per prompt token. Other generic architectures retain their
+    /// established incremental prefill order.
+    fn prefill_generic(
+        &self,
+        prompt: &[u32],
+        cache: &mut KvCache,
+        cancelled: Option<&dyn Fn() -> bool>,
+    ) -> Result<Vec<f32>> {
+        if self.architecture == "bitnet-b1.58" {
+            let hidden = self.forward_hidden_states_with_cache(prompt, Some(cache), cancelled)?;
+            if cancelled.is_some_and(|is_cancelled| is_cancelled()) {
+                return Err(BackendError::InvalidTensorData(
+                    "generation cancelled".into(),
+                ));
+            }
+            let normed = &hidden[hidden.len() - self.d_model..];
+            return self.project_output_logits(normed);
+        }
+
+        let mut last = Vec::new();
+        let last_prompt = prompt.len().saturating_sub(1);
+        for (pos, &token) in prompt.iter().enumerate() {
+            if cancelled.is_some_and(|is_cancelled| is_cancelled()) {
+                return Err(BackendError::InvalidTensorData(
+                    "generation cancelled".into(),
+                ));
+            }
+            last = self.forward_step_maybe_logits(token, pos, cache, pos == last_prompt)?;
+        }
+        Ok(last)
     }
 
     /// Incremental forward of one LFM2 token at absolute `pos`. Conv layers
@@ -1741,9 +1992,9 @@ impl RunnableModel {
         self.forward_step_maybe_logits(token, pos, cache, true)
     }
 
-    /// [`forward_step`] with the LM head made optional. Only the lfm2 path honors
-    /// the flag today; every other architecture ignores it and always projects,
-    /// so behaviour there is unchanged.
+    /// [`forward_step`] with the LM head made optional. Prompt positions that only
+    /// populate KV state skip the vocabulary projection; the final prompt position
+    /// and every decode position still return logits.
     ///
     /// [`forward_step`]: RunnableModel::forward_step
     fn forward_step_maybe_logits(
@@ -1855,7 +2106,13 @@ impl RunnableModel {
             let u = layer.up.projection_matvec(&up_input, &name(li, "ffn_up"))?;
             let mut act = vec![0.0f32; g.len()];
             for i in 0..g.len() {
-                let gated = if self.ffn_gelu {
+                let gated = if self.architecture == "bitnet-b1.58" {
+                    // BitNet-b1.58-2B-4T is trained with `hidden_act = relu2`:
+                    // ReLU(gate)^2, multiplied by the parallel up projection.
+                    // The older BitNet family used SiLU, but applying that graph
+                    // to Microsoft's 2B-4T row produces repetitive garbage.
+                    g[i].max(0.0).powi(2)
+                } else if self.ffn_gelu {
                     gelu_tanh(g[i])
                 } else {
                     g[i] / (1.0 + (-g[i]).exp())
@@ -1898,23 +2155,11 @@ impl RunnableModel {
             }
         }
 
+        if !need_logits {
+            return Ok(Vec::new());
+        }
         let normed = self.apply_norm(&hidden, &self.output_norm);
-        let mut logits = vec![0.0f32; self.vocab];
-        for (tk, lt) in logits.iter_mut().enumerate() {
-            let row = self.output.dequant_row(tk, "output")?;
-            *lt = dot(&row, &normed);
-        }
-        if let Some(cap) = self.final_logit_softcap {
-            for l in logits.iter_mut() {
-                *l = cap * (*l / cap).tanh();
-            }
-        }
-        if let Some(scale) = self.logit_scale {
-            for l in logits.iter_mut() {
-                *l *= scale;
-            }
-        }
-        Ok(logits)
+        self.project_output_logits(&normed)
     }
 
     fn attention_block(
@@ -1923,6 +2168,7 @@ impl RunnableModel {
         li: usize,
         hidden: &mut [f32],
         seq: usize,
+        cache: Option<&mut KvCache>,
     ) -> Result<()> {
         let dm = self.d_model;
         let hd = self.head_dim;
@@ -2019,6 +2265,10 @@ impl RunnableModel {
                 *h += *p;
             }
         }
+        if let Some(cache) = cache {
+            cache.k[li] = k;
+            cache.v[li] = v;
+        }
         Ok(())
     }
 
@@ -2045,7 +2295,11 @@ impl RunnableModel {
             // Gated FFN: gemma uses GeGLU (gelu-tanh), llama uses SwiGLU (silu).
             let mut act = vec![0.0f32; g.len()];
             for i in 0..g.len() {
-                let gated = if self.ffn_gelu {
+                let gated = if self.architecture == "bitnet-b1.58" {
+                    // Exact Microsoft BitNet 2B-4T FFN activation. Keep this
+                    // identical to the incremental path above.
+                    g[i].max(0.0).powi(2)
+                } else if self.ffn_gelu {
                     gelu_tanh(g[i])
                 } else {
                     g[i] / (1.0 + (-g[i]).exp())
@@ -3606,7 +3860,14 @@ impl RunnableModel {
                 &mut |_| {},
             );
         }
-        self.generate_stopping(prompt, max_new, stop)
+        self.generate_stopping_streaming_with_sampling_cancelled(
+            prompt,
+            max_new,
+            stop,
+            sampling,
+            &|| false,
+            &mut |_| {},
+        )
     }
 
     /// [`generate_stopping`](Self::generate_stopping) with a per-token callback
@@ -3620,49 +3881,29 @@ impl RunnableModel {
         stop: &[u32],
         on_token: &mut dyn FnMut(u32),
     ) -> Result<Vec<u32>> {
-        if prompt.is_empty() {
-            return Err(BackendError::InvalidTensorData("empty prompt".into()));
-        }
-        if self.qwen35.is_some() {
-            return self.generate_qwen35_streaming(prompt, max_new, stop, None, true, on_token);
-        }
-        // LFM2 resident Metal graph (opt-in via CAMELID_LFM2_METAL while it is
-        // being proven). No silent CPU fallback: the conv ring is order-dependent
-        // and a mid-stream replay would restart from the prompt, so a Metal failure
-        // surfaces as an error rather than a quietly different lane.
-        #[cfg(target_os = "macos")]
-        if self.lfm2.is_some() && lfm2_metal_enabled() {
-            return self.generate_lfm2_metal(prompt, max_new, stop, None, on_token);
-        }
-        // Dense/generic path (MUSTER M-A1): the same incremental loop as `generate`
-        // (byte-identical forward sequence when no stop token fires) plus stop-token
-        // handling and true per-token streaming. A stop token ends the turn and is
-        // NOT appended — matching the qwen35 lane and llama.cpp's served output.
-        let mut cache = self.new_cache();
-        let mut last = Vec::new();
-        // Only the LAST prompt position's logits are consumed; the rest exist to
-        // fill the cache and roll the conv ring. Skipping the tied 128k-row head on
-        // those positions removes 9.7% of the bytes each prefill step reads.
-        let last_prompt = prompt.len().saturating_sub(1);
-        for (pos, &tok) in prompt.iter().enumerate() {
-            last = self.forward_step_maybe_logits(tok, pos, &mut cache, pos == last_prompt)?;
-        }
-        let mut out = Vec::with_capacity(max_new);
-        let mut pos = prompt.len();
-        let mut next = argmax(&last);
-        while out.len() < max_new {
-            if stop.contains(&next) {
-                break;
-            }
-            out.push(next);
-            on_token(next);
-            if out.len() < max_new {
-                let logits = self.forward_step(next, pos, &mut cache)?;
-                pos += 1;
-                next = argmax(&logits);
-            }
-        }
-        Ok(out)
+        self.generate_stopping_streaming_cancelled(prompt, max_new, stop, &|| false, on_token)
+    }
+
+    /// Greedy streaming with cooperative cancellation. The predicate is checked
+    /// between prompt blocks and decode tokens, allowing an SSE disconnect to
+    /// release the runnable lane instead of finishing an abandoned long reply.
+    pub fn generate_stopping_streaming_cancelled(
+        &self,
+        prompt: &[u32],
+        max_new: usize,
+        stop: &[u32],
+        is_cancelled: &dyn Fn() -> bool,
+        on_token: &mut dyn FnMut(u32),
+    ) -> Result<Vec<u32>> {
+        let greedy = SamplingConfig::default();
+        self.generate_stopping_streaming_with_sampling_cancelled(
+            prompt,
+            max_new,
+            stop,
+            &greedy,
+            is_cancelled,
+            on_token,
+        )
     }
 
     /// Qwen3.5 served sampling path. Greedy/no-op configurations retain the
@@ -3676,17 +3917,88 @@ impl RunnableModel {
         sampling: &SamplingConfig,
         on_token: &mut dyn FnMut(u32),
     ) -> Result<Vec<u32>> {
-        if self.qwen35.is_some() && qwen35_sampling_requires_logits(sampling) {
-            return self.generate_qwen35_streaming(
-                prompt,
-                max_new,
-                stop,
-                Some(sampling),
-                true,
-                on_token,
-            );
+        self.generate_stopping_streaming_with_sampling_cancelled(
+            prompt,
+            max_new,
+            stop,
+            sampling,
+            &|| false,
+            on_token,
+        )
+    }
+
+    /// Sampling-capable runnable generation with cooperative cancellation. Unlike
+    /// the previous generic bridge, BitNet now honors non-greedy sampling instead
+    /// of silently ignoring the OpenAI request parameters.
+    pub fn generate_stopping_streaming_with_sampling_cancelled(
+        &self,
+        prompt: &[u32],
+        max_new: usize,
+        stop: &[u32],
+        sampling: &SamplingConfig,
+        is_cancelled: &dyn Fn() -> bool,
+        on_token: &mut dyn FnMut(u32),
+    ) -> Result<Vec<u32>> {
+        if prompt.is_empty() {
+            return Err(BackendError::InvalidTensorData("empty prompt".into()));
         }
-        self.generate_stopping_streaming(prompt, max_new, stop, on_token)
+        if is_cancelled() {
+            return Err(BackendError::InvalidTensorData(
+                "generation cancelled".into(),
+            ));
+        }
+        if self.qwen35.is_some() {
+            let sampling = qwen35_sampling_requires_logits(sampling).then_some(sampling);
+            return self.generate_qwen35_streaming(prompt, max_new, stop, sampling, true, on_token);
+        }
+        #[cfg(target_os = "macos")]
+        if self.lfm2.is_some() && lfm2_metal_enabled() {
+            let sampling = qwen35_sampling_requires_logits(sampling).then_some(sampling);
+            return self.generate_lfm2_metal(prompt, max_new, stop, sampling, on_token);
+        }
+
+        let mut cache = self.new_cache();
+        let logits = self.prefill_generic(prompt, &mut cache, Some(is_cancelled))?;
+        let sampler = qwen35_sampling_requires_logits(sampling)
+            .then(|| LlamaSampler::Sampling(sampling.clone()));
+        let mut token_history = prompt.to_vec();
+        let choose = |logits: Vec<f32>, history: &[u32]| -> Result<u32> {
+            match &sampler {
+                Some(sampler) => qwen35_sample_logits(logits, sampler, history),
+                None => Ok(argmax(&logits)),
+            }
+        };
+        let mut next = choose(logits, &token_history)?;
+        let mut out = Vec::with_capacity(max_new);
+        let mut pos = prompt.len();
+        while out.len() < max_new {
+            if is_cancelled() {
+                return Err(BackendError::InvalidTensorData(
+                    "generation cancelled".into(),
+                ));
+            }
+            if stop.contains(&next) {
+                break;
+            }
+            out.push(next);
+            token_history.push(next);
+            on_token(next);
+            // The generic path serves architectures beyond Qwen 3.5 (including
+            // BitNet).  Qwen's defensive repetition heuristic is model-specific
+            // and can terminate perfectly valid repeated text from those models.
+            if out.len() >= max_new {
+                break;
+            }
+            if is_cancelled() {
+                return Err(BackendError::InvalidTensorData(
+                    "generation cancelled".into(),
+                ));
+            }
+            let logits = self.forward_step(next, pos, &mut cache)?;
+            pos += 1;
+            next = choose(logits, &token_history)?;
+        }
+        Ok(out)
     }
 
     /// One token through the full qwen35 stack at absolute `pos`, mutating `cache`.

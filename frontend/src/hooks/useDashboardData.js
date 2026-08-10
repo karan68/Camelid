@@ -9,7 +9,14 @@ import { getRuntimeRequestModelId, isExternalModel, modelRuntimeIdMatches } from
 import { contractSamplingOverrides } from '../lib/samplingContract'
 import { executionRuntimeFields } from '../lib/executionPlan'
 import { createPacerState, paceDrain, paceStep } from '../lib/streamPacing'
-import { applyGemma4ChatTokenFloor, applyGemma4GhostChatTokenCap, getConfiguredMaxTokens as getModelMaxTokens } from '../lib/responseLimits'
+import {
+  applyBitNetFreshChatTokenCap,
+  applyGemma4ChatTokenFloor,
+  applyGemma4GhostChatTokenCap,
+  getConfiguredMaxTokens as getModelMaxTokens,
+  hasExplicitMaxTokensSetting,
+  isBitNetB158ChatModel,
+} from '../lib/responseLimits'
 import { beginRequest, emitFirstContent, emitProgress, getTelemetrySnapshot, recordChatGeneration, recordHealthPoll } from '../lib/telemetryLog'
 
 const TAB_STORAGE_KEY = 'camelid.activeTab'
@@ -1094,6 +1101,31 @@ export function useDashboardData({ showNotice, clearNotice }) {
       setPendingChat(null)
 
       const requestModelId = getRuntimeRequestModelId(selectedModel, runtime, selectedModelId)
+      const bitNetB158Chat = isBitNetB158ChatModel(selectedModel, runtime, requestModelId)
+      const responseLimitModelIds = [...new Set([
+        requestModelId,
+        selectedModel?.id,
+        selectedModelId,
+      ].filter(Boolean))]
+      const explicitResponseLimitModelId = responseLimitModelIds.find(hasExplicitMaxTokensSetting) || ''
+      const responseLimitModelId = explicitResponseLimitModelId || requestModelId
+      const requestMaxTokens = applyGemma4GhostChatTokenCap(
+        applyGemma4ChatTokenFloor(
+          applyBitNetFreshChatTokenCap(
+            localChatMaxTokens(history, responseLimitModelId),
+            {
+              bitNetB158: bitNetB158Chat,
+              hasExplicitSetting: Boolean(explicitResponseLimitModelId),
+            },
+          ),
+          sendGate.hint?.target?.family,
+        ),
+        runtime?.gemma4_serve_lane,
+      )
+      // The generic BitNet runnable is a greedy lane. Its experimental status
+      // must not cause the browser to advertise Prism's sampling controls that
+      // this model does not use.
+      const useExperimentalSampling = selectedModelExperimental && !bitNetB158Chat
       const requestController = new AbortController()
       activeChatRequestRef.current = requestController
       const response = await fetch(`${normalizedApiBase}/v1/chat/completions`, {
@@ -1105,23 +1137,18 @@ export function useDashboardData({ showNotice, clearNotice }) {
           messages: requestMessages,
           // Supported rows stay greedy (temperature 0) — their behavior is parity-
           // locked. Experimental rows have no parity contract and small models loop
-          // badly under greedy decoding, so they sample for usable output.
-          temperature: selectedModelExperimental ? 0.7 : 0,
+          // badly under greedy decoding, so they sample for usable output. BitNet's
+          // runnable lane is explicitly greedy even while its row is experimental.
+          temperature: useExperimentalSampling ? 0.7 : 0,
           // Prism's checked 27B demo sampler: keep the experimental lane aligned
           // with the model authors instead of letting low-bit greedy decode fall
           // into exact repetition loops.
-          ...(selectedModelExperimental ? { top_p: 0.95, top_k: 20, min_p: 0 } : {}),
+          ...(useExperimentalSampling ? { top_p: 0.95, top_k: 20, min_p: 0 } : {}),
           // Gemma 4 may spend its first four tokens on a hidden channel
           // envelope before the first visible token. Keep at least that visible
           // floor, then apply the Ghost-only WebUI ceiling so the global 8,192
           // default does not pre-admit normal chats to CPU common execution.
-          max_tokens: applyGemma4GhostChatTokenCap(
-            applyGemma4ChatTokenFloor(
-              localChatMaxTokens(history, requestModelId),
-              sendGate.hint?.target?.family,
-            ),
-            runtime?.gemma4_serve_lane,
-          ),
+          max_tokens: requestMaxTokens,
           /* Empty today: a sampling override is sent only when /api/capabilities
              advertises a supported row for that exact parameter. */
           ...contractSamplingOverrides(dashboard?.capabilities?.api_features, requestModelId),

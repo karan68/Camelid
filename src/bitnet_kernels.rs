@@ -5,9 +5,9 @@
 //! tensor-wide f32 scale. Camelid keeps those bytes unchanged and offers three
 //! execution strategies over them:
 //!
-//! - `i2_s`: direct ternary accumulation;
-//! - `tl1`: two-weight lookup-table accumulation;
-//! - `tl2`: three-weight lookup-table accumulation.
+//! - `i2_s`: direct ternary-by-A8 integer accumulation;
+//! - `tl1`: two-weight lookup-table integer accumulation;
+//! - `tl2`: three-weight lookup-table integer accumulation.
 //!
 //! These are independently implemented behavioral kernels. They do not ingest
 //! BitNet.cpp's model-specific, pre-permuted TL1/TL2 GGUF layouts and do not use
@@ -158,20 +158,26 @@ impl<'a> I2SMatrix<'a> {
         }
     }
 
-    fn row_dot(&self, row: usize, input: &[f32], mode: BitNetKernelMode) -> f32 {
+    fn row_dot(
+        &self,
+        row: usize,
+        input: &[i8],
+        activation_scale: f32,
+        mode: BitNetKernelMode,
+    ) -> f32 {
         debug_assert!(row < self.output_rows);
         debug_assert_eq!(input.len(), self.input_width);
         let base = row * self.input_width;
         let unscaled = match mode.effective_cpu() {
             BitNetKernelMode::I2S => {
-                let mut sum = 0.0_f32;
+                let mut sum = 0_i32;
                 for (column, value) in input.iter().copied().enumerate() {
-                    sum += f32::from(self.ternary(base + column)) * value;
+                    sum += i32::from(self.ternary(base + column)) * i32::from(value);
                 }
                 sum
             }
             BitNetKernelMode::Tl1 => {
-                let mut sum = 0.0_f32;
+                let mut sum = 0_i32;
                 let mut pairs = input.chunks_exact(2);
                 for (pair_index, pair) in pairs.by_ref().enumerate() {
                     let column = pair_index * 2;
@@ -179,19 +185,19 @@ impl<'a> I2SMatrix<'a> {
                         .expect("ternary TL1 digit");
                     let right = usize::try_from(self.ternary(base + column + 1) + 1)
                         .expect("ternary TL1 digit");
-                    let a = pair[0];
-                    let b = pair[1];
-                    let table = [-a - b, -a, -a + b, -b, 0.0, b, a - b, a, a + b];
+                    let a = i32::from(pair[0]);
+                    let b = i32::from(pair[1]);
+                    let table = [-a - b, -a, -a + b, -b, 0, b, a - b, a, a + b];
                     sum += table[left * 3 + right];
                 }
                 let consumed = input.len() - pairs.remainder().len();
                 for (tail, value) in pairs.remainder().iter().copied().enumerate() {
-                    sum += f32::from(self.ternary(base + consumed + tail)) * value;
+                    sum += i32::from(self.ternary(base + consumed + tail)) * i32::from(value);
                 }
                 sum
             }
             BitNetKernelMode::Tl2 => {
-                let mut sum = 0.0_f32;
+                let mut sum = 0_i32;
                 let mut triples = input.chunks_exact(3);
                 for (triple_index, triple) in triples.by_ref().enumerate() {
                     let column = triple_index * 3;
@@ -201,13 +207,13 @@ impl<'a> I2SMatrix<'a> {
                         .expect("ternary TL2 digit");
                     let d2 = usize::try_from(self.ternary(base + column + 2) + 1)
                         .expect("ternary TL2 digit");
-                    let mut table = [0.0_f32; 27];
+                    let mut table = [0_i32; 27];
                     for a in 0..3 {
                         for b in 0..3 {
                             for c in 0..3 {
-                                table[a * 9 + b * 3 + c] = (a as f32 - 1.0) * triple[0]
-                                    + (b as f32 - 1.0) * triple[1]
-                                    + (c as f32 - 1.0) * triple[2];
+                                table[a * 9 + b * 3 + c] = (a as i32 - 1) * i32::from(triple[0])
+                                    + (b as i32 - 1) * i32::from(triple[1])
+                                    + (c as i32 - 1) * i32::from(triple[2]);
                             }
                         }
                     }
@@ -215,14 +221,63 @@ impl<'a> I2SMatrix<'a> {
                 }
                 let consumed = input.len() - triples.remainder().len();
                 for (tail, value) in triples.remainder().iter().copied().enumerate() {
-                    sum += f32::from(self.ternary(base + consumed + tail)) * value;
+                    sum += i32::from(self.ternary(base + consumed + tail)) * i32::from(value);
                 }
                 sum
             }
             BitNetKernelMode::Auto => unreachable!("auto is resolved above"),
         };
-        unscaled * self.scale
+        unscaled as f32 * activation_scale * self.scale
     }
+}
+
+/// Quantize contiguous f32 activation rows to BitNet's symmetric A8 contract.
+///
+/// The returned scale for each row is its dequantization scale (`max_abs / 127`).
+/// An all-zero row has a zero scale and zero quantized values. Keeping this
+/// conversion on the host gives the CPU, Metal, and CUDA kernels identical
+/// rounding and clamping semantics.
+pub(crate) fn quantize_activation_rows(input: &[f32], width: usize) -> Result<(Vec<i8>, Vec<f32>)> {
+    if width == 0 {
+        return Err(BackendError::RuntimeShapeMismatch(
+            "BitNet A8 quantization requires a non-zero row width".into(),
+        ));
+    }
+    if input.is_empty() || !input.len().is_multiple_of(width) {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "BitNet A8 input length {} is not a non-zero multiple of row width {width}",
+            input.len()
+        )));
+    }
+
+    let mut quantized = Vec::with_capacity(input.len());
+    let mut scales = Vec::with_capacity(input.len() / width);
+    for (row_index, row) in input.chunks_exact(width).enumerate() {
+        let mut max_abs = 0.0_f32;
+        for (column, value) in row.iter().copied().enumerate() {
+            if !value.is_finite() {
+                return Err(BackendError::InvalidTensorData(format!(
+                    "BitNet A8 activation at row {row_index}, column {column} is non-finite"
+                )));
+            }
+            max_abs = max_abs.max(value.abs());
+        }
+
+        if max_abs == 0.0 {
+            quantized.resize(quantized.len() + width, 0);
+            scales.push(0.0);
+            continue;
+        }
+
+        let dequant_scale = max_abs / 127.0;
+        let quant_multiplier = 127.0 / max_abs;
+        quantized.extend(row.iter().map(|value| {
+            let rounded = (*value * quant_multiplier).round();
+            rounded.clamp(-128.0, 127.0) as i8
+        }));
+        scales.push(dequant_scale);
+    }
+    Ok((quantized, scales))
 }
 
 pub(crate) fn i2_s_matvec(
@@ -233,9 +288,11 @@ pub(crate) fn i2_s_matvec(
 ) -> Result<Vec<f32>> {
     log_cpu_once(mode);
     let matrix = I2SMatrix::new(bytes, input.len(), output_rows)?;
+    let (quantized, activation_scales) = quantize_activation_rows(input, input.len())?;
+    let activation_scale = activation_scales[0];
     Ok((0..output_rows)
         .into_par_iter()
-        .map(|row| matrix.row_dot(row, input, mode))
+        .map(|row| matrix.row_dot(row, &quantized, activation_scale, mode))
         .collect())
 }
 
@@ -258,8 +315,10 @@ pub(crate) fn i2_s_matmul(
     inputs
         .par_iter()
         .map(|input| {
+            let (quantized, activation_scales) = quantize_activation_rows(input, input_width)?;
+            let activation_scale = activation_scales[0];
             Ok((0..output_rows)
-                .map(|row| matrix.row_dot(row, input, mode))
+                .map(|row| matrix.row_dot(row, &quantized, activation_scale, mode))
                 .collect())
         })
         .collect()
@@ -299,8 +358,59 @@ mod tests {
         packed
     }
 
+    fn w158a8_scalar_oracle(weights: &[i8], input: &[f32], weight_scale: f32) -> f32 {
+        assert_eq!(weights.len(), input.len());
+        let max_abs = input.iter().copied().map(f32::abs).fold(0.0_f32, f32::max);
+        if max_abs == 0.0 {
+            return 0.0;
+        }
+        let multiplier = 127.0 / max_abs;
+        let integer_dot = weights
+            .iter()
+            .copied()
+            .zip(input.iter().copied())
+            .map(|(weight, value)| {
+                let activation = (value * multiplier).round().clamp(-128.0, 127.0) as i64;
+                i64::from(weight) * activation
+            })
+            .sum::<i64>();
+        integer_dot as f32 * (max_abs / 127.0) * weight_scale
+    }
+
+    fn assert_close(actual: f32, expected: f32) {
+        assert!(
+            (actual - expected).abs() <= 2.0e-6 * expected.abs().max(1.0),
+            "actual={actual} expected={expected}"
+        );
+    }
+
     #[test]
-    fn cleanroom_i2_s_tl1_and_tl2_modes_match_dense_ternary_math() {
+    fn a8_quantization_is_rowwise_symmetric_and_handles_zero_rows() {
+        let input = [
+            -2.0, -1.0, 0.5, 2.0, -0.25, 0.25, 0.125, -0.125, 0.0, 0.0, 0.0, 0.0,
+        ];
+        let (quantized, scales) = quantize_activation_rows(&input, 4).unwrap();
+        assert_eq!(
+            quantized,
+            vec![-127, -64, 32, 127, -127, 127, 64, -64, 0, 0, 0, 0]
+        );
+        assert_eq!(scales.len(), 3);
+        assert_close(scales[0], 2.0 / 127.0);
+        assert_close(scales[1], 0.25 / 127.0);
+        assert_eq!(scales[2], 0.0);
+    }
+
+    #[test]
+    fn a8_quantization_rejects_empty_ragged_and_non_finite_inputs() {
+        assert!(quantize_activation_rows(&[], 4).is_err());
+        assert!(quantize_activation_rows(&[1.0], 0).is_err());
+        assert!(quantize_activation_rows(&[1.0, 2.0, 3.0], 2).is_err());
+        assert!(quantize_activation_rows(&[1.0, f32::NAN], 2).is_err());
+        assert!(quantize_activation_rows(&[f32::INFINITY, 1.0], 2).is_err());
+    }
+
+    #[test]
+    fn cleanroom_i2_s_tl1_and_tl2_modes_match_w158a8_scalar_oracle() {
         let rows = 3;
         let width = 128;
         let values = (0..rows * width)
@@ -313,33 +423,45 @@ mod tests {
         let scale = 0.25_f32;
         let bytes = encode_i2_s(&values, scale);
         let input = (0..width)
-            .map(|index| (index as i32 % 7 - 3) as f32)
+            .map(|index| ((index as f32 + 0.25) * 0.173).sin() * 2.75)
+            .collect::<Vec<_>>();
+        let second_input = input
+            .iter()
+            .enumerate()
+            .map(|(index, value)| value * 0.37 + (index as f32 * 0.11).cos() * 0.2)
             .collect::<Vec<_>>();
         let expected = values
             .chunks_exact(width)
-            .map(|row| {
-                row.iter()
-                    .zip(&input)
-                    .map(|(weight, value)| f32::from(*weight) * *value)
-                    .sum::<f32>()
-                    * scale
-            })
+            .map(|row| w158a8_scalar_oracle(row, &input, scale))
+            .collect::<Vec<_>>();
+        let second_expected = values
+            .chunks_exact(width)
+            .map(|row| w158a8_scalar_oracle(row, &second_input, scale))
             .collect::<Vec<_>>();
         for mode in [
             BitNetKernelMode::I2S,
             BitNetKernelMode::Tl1,
             BitNetKernelMode::Tl2,
         ] {
-            assert_eq!(i2_s_matvec(&bytes, &input, rows, mode).unwrap(), expected);
-            assert_eq!(
-                i2_s_matmul(&bytes, &[input.clone(), input.clone()], rows, mode).unwrap(),
-                vec![expected.clone(), expected.clone()]
-            );
+            let actual = i2_s_matvec(&bytes, &input, rows, mode).unwrap();
+            for (actual, expected) in actual.into_iter().zip(expected.iter().copied()) {
+                assert_close(actual, expected);
+            }
+            let batch =
+                i2_s_matmul(&bytes, &[input.clone(), second_input.clone()], rows, mode).unwrap();
+            for (actual_row, expected_row) in batch
+                .iter()
+                .zip([expected.as_slice(), second_expected.as_slice()])
+            {
+                for (actual, expected) in actual_row.iter().zip(expected_row) {
+                    assert_close(*actual, *expected);
+                }
+            }
         }
     }
 
     #[test]
-    fn lookup_modes_stay_within_float_rounding_of_direct_on_fractional_inputs() {
+    fn lookup_modes_are_integer_equivalent_to_direct_after_a8_quantization() {
         let rows = 5;
         let width = 128;
         let values = (0..rows * width)
@@ -356,12 +478,7 @@ mod tests {
         let direct = i2_s_matvec(&bytes, &input, rows, BitNetKernelMode::I2S).unwrap();
         for mode in [BitNetKernelMode::Tl1, BitNetKernelMode::Tl2] {
             let lookup = i2_s_matvec(&bytes, &input, rows, mode).unwrap();
-            for (actual, expected) in lookup.iter().zip(&direct) {
-                assert!(
-                    (actual - expected).abs() <= 2.0e-6 * expected.abs().max(1.0),
-                    "{mode:?}: actual={actual} direct={expected}"
-                );
-            }
+            assert_eq!(lookup, direct, "{mode:?}");
         }
     }
 
@@ -386,5 +503,9 @@ mod tests {
         let mut non_finite = encode_i2_s(&[0; 128], 1.0);
         non_finite[32..36].copy_from_slice(&f32::NAN.to_le_bytes());
         assert!(i2_s_matvec(&non_finite, &[0.0; 128], 1, BitNetKernelMode::I2S).is_err());
+        let valid = encode_i2_s(&[0; 128], 1.0);
+        let mut non_finite_activation = [0.0; 128];
+        non_finite_activation[17] = f32::NEG_INFINITY;
+        assert!(i2_s_matvec(&valid, &non_finite_activation, 1, BitNetKernelMode::I2S).is_err());
     }
 }

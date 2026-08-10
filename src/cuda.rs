@@ -242,14 +242,16 @@ pub fn selected_device_ordinal() -> usize {
 
 #[cfg(feature = "cuda")]
 pub use backend::{
-    detect_cuda_device, probe_capability, release_async_pool, try_bitnet_i2_s_linear_rows,
-    try_q8_0_block_linear_row, try_q8_0_encoded_linear_row, try_q8_0_encoded_linear_rows,
+    detect_cuda_device, probe_capability, release_async_pool, try_bitnet_f16_head_matvec,
+    try_bitnet_i2_s_linear_rows, try_q8_0_block_linear_row, try_q8_0_encoded_linear_row,
+    try_q8_0_encoded_linear_rows,
 };
 
 #[cfg(not(feature = "cuda"))]
 pub use stub::{
-    detect_cuda_device, probe_capability, release_async_pool, try_bitnet_i2_s_linear_rows,
-    try_q8_0_block_linear_row, try_q8_0_encoded_linear_row, try_q8_0_encoded_linear_rows,
+    detect_cuda_device, probe_capability, release_async_pool, try_bitnet_f16_head_matvec,
+    try_bitnet_i2_s_linear_rows, try_q8_0_block_linear_row, try_q8_0_encoded_linear_row,
+    try_q8_0_encoded_linear_rows,
 };
 
 #[cfg(not(feature = "cuda"))]
@@ -328,6 +330,18 @@ mod stub {
     ) -> bool {
         false
     }
+
+    /// Exact BitNet-b1.58-2B-4T's tied F16 output head. Non-CUDA builds
+    /// decline it so the caller keeps using the portable row-dot fallback.
+    pub fn try_bitnet_f16_head_matvec(
+        _input: &[f32],
+        _weight_pages: &std::sync::Arc<crate::wire_mmap::WirePages>,
+        _weight_rows: usize,
+        _input_width: usize,
+        _output: &mut [f32],
+    ) -> bool {
+        false
+    }
 }
 
 /// Number of Q8_0 matmuls the CUDA backend has completed on the GPU this
@@ -354,6 +368,17 @@ pub fn cuda_bitnet_run_count() -> u64 {
     0
 }
 
+/// Number of exact tied BitNet F16 output-head matvecs completed by CUDA.
+#[cfg(feature = "cuda")]
+pub fn cuda_bitnet_f16_head_run_count() -> u64 {
+    backend::bitnet_f16_head_run_count()
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn cuda_bitnet_f16_head_run_count() -> u64 {
+    0
+}
+
 #[cfg(feature = "cuda")]
 mod backend {
     use std::collections::HashMap;
@@ -370,8 +395,10 @@ mod backend {
 
     static RUN_COUNT: AtomicU64 = AtomicU64::new(0);
     static BITNET_RUN_COUNT: AtomicU64 = AtomicU64::new(0);
+    static BITNET_F16_HEAD_RUN_COUNT: AtomicU64 = AtomicU64::new(0);
     static LOGGED: AtomicBool = AtomicBool::new(false);
     static BITNET_LOGGED: AtomicBool = AtomicBool::new(false);
+    static BITNET_F16_HEAD_LOGGED: AtomicBool = AtomicBool::new(false);
     static ENTRY_LOGGED: AtomicBool = AtomicBool::new(false);
 
     pub(super) fn run_count() -> u64 {
@@ -380,6 +407,10 @@ mod backend {
 
     pub(super) fn bitnet_run_count() -> u64 {
         BITNET_RUN_COUNT.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn bitnet_f16_head_run_count() -> u64 {
+        BITNET_F16_HEAD_RUN_COUNT.load(Ordering::Relaxed)
     }
 
     /// CUDA C source for the Q8_0 encoded linear kernel. One thread computes one
@@ -472,9 +503,9 @@ extern "C" __global__ void q8_0_block_linear_row(
 // lookup (2). One thread computes one output element in deterministic K order.
 __device__ __forceinline__ int i2_s_ternary(
     const unsigned char* packed,
-    const long logical_index
+    const long long logical_index
 ) {
-    const long tile = logical_index / 128;
+    const long long tile = logical_index / 128;
     const int within = (int)(logical_index % 128);
     const unsigned char byte = packed[tile * 32 + (within % 32)];
     const int code = (byte >> (6 - 2 * (within / 32))) & 3;
@@ -482,46 +513,47 @@ __device__ __forceinline__ int i2_s_ternary(
 }
 
 extern "C" __global__ void bitnet_i2_s_linear_rows(
-    const float* __restrict__ input,
+    const signed char* __restrict__ input,
     const unsigned char* __restrict__ weights,
     const int input_rows,
     const int weight_rows,
     const int input_width,
     const int mode,
+    const float* __restrict__ activation_scales,
     float* __restrict__ output
 ) {
-    const long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
-    const long total = (long)input_rows * weight_rows;
+    const long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    const long long total = (long long)input_rows * weight_rows;
     if (idx >= total) return;
     const int input_row = (int)(idx / weight_rows);
     const int weight_row = (int)(idx % weight_rows);
-    const float* x = input + (long)input_row * input_width;
-    const long base = (long)weight_row * input_width;
-    float sum = 0.0f;
+    const signed char* x = input + (long long)input_row * input_width;
+    const long long base = (long long)weight_row * input_width;
+    int sum = 0;
 
     if (mode == 1) {
         int column = 0;
         for (; column + 1 < input_width; column += 2) {
-            const float a = x[column];
-            const float b = x[column + 1];
-            const float table[9] = {-a-b, -a, -a+b, -b, 0.0f, b, a-b, a, a+b};
+            const int a = (int)x[column];
+            const int b = (int)x[column + 1];
+            const int table[9] = {-a-b, -a, -a+b, -b, 0, b, a-b, a, a+b};
             const int left = i2_s_ternary(weights, base + column) + 1;
             const int right = i2_s_ternary(weights, base + column + 1) + 1;
             sum += table[left * 3 + right];
         }
         for (; column < input_width; ++column) {
-            sum += (float)i2_s_ternary(weights, base + column) * x[column];
+            sum += i2_s_ternary(weights, base + column) * (int)x[column];
         }
     } else if (mode == 2) {
         int column = 0;
         for (; column + 2 < input_width; column += 3) {
-            float table[27];
+            int table[27];
             for (int a = 0; a < 3; ++a) {
                 for (int b = 0; b < 3; ++b) {
                     for (int c = 0; c < 3; ++c) {
-                        table[a * 9 + b * 3 + c] = (float)(a - 1) * x[column]
-                            + (float)(b - 1) * x[column + 1]
-                            + (float)(c - 1) * x[column + 2];
+                        table[a * 9 + b * 3 + c] = (a - 1) * (int)x[column]
+                            + (b - 1) * (int)x[column + 1]
+                            + (c - 1) * (int)x[column + 2];
                     }
                 }
             }
@@ -531,17 +563,86 @@ extern "C" __global__ void bitnet_i2_s_linear_rows(
             sum += table[d0 * 9 + d1 * 3 + d2];
         }
         for (; column < input_width; ++column) {
-            sum += (float)i2_s_ternary(weights, base + column) * x[column];
+            sum += i2_s_ternary(weights, base + column) * (int)x[column];
         }
     } else {
         for (int column = 0; column < input_width; ++column) {
-            sum += (float)i2_s_ternary(weights, base + column) * x[column];
+            sum += i2_s_ternary(weights, base + column) * (int)x[column];
         }
     }
 
-    const long packed_len = (long)weight_rows * input_width / 4;
+    const long long packed_len = (long long)weight_rows * input_width / 4;
     const float scale = *reinterpret_cast<const float*>(weights + packed_len);
-    output[idx] = sum * scale;
+    output[idx] = (float)sum * activation_scales[input_row] * scale;
+}
+
+// Header-free IEEE-754 binary16 conversion. The tied BitNet head stays in its
+// canonical little-endian GGUF F16 wire form; converting in the kernel avoids a
+// 1.25 GiB f32 expansion and lets the same resident bytes serve every token.
+__device__ __forceinline__ float bitnet_f16_bits_to_f32(unsigned short bits) {
+    const unsigned int sign = ((unsigned int)(bits & 0x8000u)) << 16;
+    const unsigned int exp = (bits & 0x7c00u) >> 10;
+    const unsigned int frac = (unsigned int)(bits & 0x03ffu);
+    unsigned int out;
+    if (exp == 0u) {
+        if (frac == 0u) {
+            out = sign;
+        } else {
+            unsigned int mant = frac;
+            int e = -14;
+            while ((mant & 0x0400u) == 0u) {
+                mant <<= 1;
+                e -= 1;
+            }
+            mant &= 0x03ffu;
+            out = sign | ((unsigned int)(e + 127) << 23) | (mant << 13);
+        }
+    } else if (exp == 0x1fu) {
+        out = sign | 0x7f800000u | (frac << 13);
+    } else {
+        out = sign | ((exp + (127u - 15u)) << 23) | (frac << 13);
+    }
+    return __uint_as_float(out);
+}
+
+// Exact BitNet-b1.58-2B-4T tied language-model head. One 256-thread block owns
+// one vocabulary row and reduces its F16-row · f32-hidden dot in shared memory.
+// Weight bytes are read explicitly as little-endian so this does not depend on
+// host pointer alignment or CUDA's native half headers. The row base is 64-bit:
+// the real matrix contains 328,335,360 elements, and future safe shape checks
+// must not regress into Windows-host-sized indexing assumptions.
+extern "C" __global__ void bitnet_f16_head_matvec(
+    const float* __restrict__ input,
+    const unsigned char* __restrict__ weight_bytes,
+    const int weight_rows,
+    const int input_width,
+    float* __restrict__ output
+) {
+    const int row = (int)blockIdx.x;
+    const int lane = (int)threadIdx.x;
+    if (row >= weight_rows) return;
+
+    const long long row_base = (long long)row * input_width;
+    float partial = 0.0f;
+    for (int column = lane; column < input_width; column += 256) {
+        const long long byte_index = (row_base + column) * 2;
+        const unsigned short bits = (unsigned short)(
+            (unsigned short)weight_bytes[byte_index]
+            | ((unsigned short)weight_bytes[byte_index + 1] << 8)
+        );
+        partial += bitnet_f16_bits_to_f32(bits) * input[column];
+    }
+
+    __shared__ float scratch[256];
+    scratch[lane] = partial;
+    __syncthreads();
+    for (int stride = 128; stride > 0; stride >>= 1) {
+        if (lane < stride) {
+            scratch[lane] += scratch[lane + stride];
+        }
+        __syncthreads();
+    }
+    if (lane == 0) output[row] = scratch[0];
 }
 "#;
 
@@ -551,6 +652,7 @@ extern "C" __global__ void bitnet_i2_s_linear_rows(
         kernel: CudaFunction,
         kernel_block: CudaFunction,
         kernel_bitnet: CudaFunction,
+        kernel_bitnet_f16_head: CudaFunction,
         device_name: String,
         /// GPU-resident weight cache: each Q8_0 weight is uploaded to the GPU
         /// once (keyed by its stable host pointer + length) and reused across
@@ -559,6 +661,18 @@ extern "C" __global__ void bitnet_i2_s_linear_rows(
         /// model's `q8_0_blocks` live for the model's lifetime, so the pointer
         /// is a stable identity; distinct models map at distinct addresses.
         weight_cache: HashMap<(usize, usize), CudaSlice<u8>>,
+        /// The official 2B BitNet model ties its F16 token embedding to the LM
+        /// head. Keep that 626 MiB wire matrix on the GPU after its first use;
+        /// it deliberately has a separate cache from packed I2_S/Q8 weights.
+        bitnet_f16_head_weight_cache: HashMap<(usize, usize), BitNetF16HeadWeight>,
+    }
+
+    struct BitNetF16HeadWeight {
+        /// Weak ownership keeps the allocation identity reserved without
+        /// pinning the model's 626 MiB host table after unload. Expired entries
+        /// are dropped before lookup, which also releases their device slice.
+        host: std::sync::Weak<crate::wire_mmap::WirePages>,
+        device: CudaSlice<u8>,
     }
 
     // SAFETY: cudarc's context/stream/function handles are Send + Sync; we
@@ -650,14 +764,19 @@ extern "C" __global__ void bitnet_i2_s_linear_rows(
         let kernel_bitnet = module
             .load_function("bitnet_i2_s_linear_rows")
             .map_err(|e| format!("load_function (BitNet I2_S) failed: {e}"))?;
+        let kernel_bitnet_f16_head = module
+            .load_function("bitnet_f16_head_matvec")
+            .map_err(|e| format!("load_function (BitNet F16 head) failed: {e}"))?;
         Ok(CudaBackend {
             ctx,
             stream,
             kernel,
             kernel_block,
             kernel_bitnet,
+            kernel_bitnet_f16_head,
             device_name,
             weight_cache: HashMap::new(),
+            bitnet_f16_head_weight_cache: HashMap::new(),
         })
     }
 
@@ -1098,6 +1217,9 @@ extern "C" __global__ void bitnet_i2_s_linear_rows(
         if input_rows == 0
             || weight_rows == 0
             || input_width == 0
+            || input_rows > i32::MAX as usize
+            || weight_rows > i32::MAX as usize
+            || input_width > i32::MAX as usize
             || !elements.is_multiple_of(128)
             || input.len() != input_elements
             || weight_bytes.len() != elements / 4 + 32
@@ -1107,13 +1229,26 @@ extern "C" __global__ void bitnet_i2_s_linear_rows(
         {
             return false;
         }
+        let packed_len = elements / 4;
+        let Ok(scale_bytes) = weight_bytes[packed_len..packed_len + 4].try_into() else {
+            return false;
+        };
+        if !f32::from_le_bytes(scale_bytes).is_finite() {
+            return false;
+        }
         let Some(b) = backend() else {
+            return false;
+        };
+        let Ok((quantized_input, activation_scales)) =
+            crate::bitnet_kernels::quantize_activation_rows(input, input_width)
+        else {
             return false;
         };
         let mut guard = b.lock().expect("cuda backend mutex poisoned");
         match run_bitnet_inner(
             &mut guard,
-            input,
+            &quantized_input,
+            &activation_scales,
             weight_bytes,
             input_rows,
             weight_rows,
@@ -1143,7 +1278,8 @@ extern "C" __global__ void bitnet_i2_s_linear_rows(
     #[allow(clippy::too_many_arguments)]
     fn run_bitnet_inner(
         b: &mut CudaBackend,
-        input: &[f32],
+        input: &[i8],
+        activation_scales: &[f32],
         weight_bytes: &[u8],
         input_rows: usize,
         weight_rows: usize,
@@ -1158,6 +1294,7 @@ extern "C" __global__ void bitnet_i2_s_linear_rows(
         }
         let d_weights = b.weight_cache.get(&key).expect("weight just inserted");
         let d_input = b.stream.clone_htod(input)?;
+        let d_activation_scales = b.stream.clone_htod(activation_scales)?;
         let mut d_output = b.stream.alloc_zeros::<f32>(output.len())?;
         let total = output.len() as u32;
         let block_dim = 256_u32;
@@ -1178,10 +1315,134 @@ extern "C" __global__ void bitnet_i2_s_linear_rows(
             .arg(&weight_rows)
             .arg(&input_width)
             .arg(&mode)
+            .arg(&d_activation_scales)
             .arg(&mut d_output);
         // SAFETY: every buffer and scalar is shape-checked above; the grid is
         // bounded by output.len(), and the kernel guards its final partial block.
         unsafe { builder.launch(cfg)? };
+        b.stream.memcpy_dtoh(&d_output, output)?;
+        b.ctx.synchronize()?;
+        Ok(())
+    }
+
+    /// Execute the official 2B BitNet model's tied F16 output head on CUDA.
+    /// The caller performs the model-identity gate; this boundary still rejects
+    /// every malformed shape and non-finite activation, and validates every F16
+    /// weight before its immutable host allocation is first cached on-device.
+    pub fn try_bitnet_f16_head_matvec(
+        input: &[f32],
+        weight_pages: &Arc<crate::wire_mmap::WirePages>,
+        weight_rows: usize,
+        input_width: usize,
+        output: &mut [f32],
+    ) -> bool {
+        let weight_bytes = weight_pages.bytes();
+        let Some(weight_elements) = weight_rows.checked_mul(input_width) else {
+            return false;
+        };
+        let Some(expected_weight_bytes) = weight_elements.checked_mul(2) else {
+            return false;
+        };
+        if weight_rows == 0
+            || input_width == 0
+            || weight_rows > i32::MAX as usize
+            || input_width > i32::MAX as usize
+            || input.len() != input_width
+            || weight_bytes.len() != expected_weight_bytes
+            || output.len() != weight_rows
+            || !input.iter().all(|value| value.is_finite())
+        {
+            return false;
+        }
+
+        let Some(backend) = backend() else {
+            return false;
+        };
+        let mut guard = backend.lock().expect("cuda backend mutex poisoned");
+        // Remove dead-model entries before pointer lookup. Keeping a Weak in
+        // each entry prevents its allocation identity from being recycled
+        // while stale device bytes still exist under the same key.
+        guard
+            .bitnet_f16_head_weight_cache
+            .retain(|_, cached| cached.host.strong_count() != 0);
+        let key = (Arc::as_ptr(weight_pages) as usize, weight_bytes.len());
+        if !guard.bitnet_f16_head_weight_cache.contains_key(&key)
+            && !weight_bytes.chunks_exact(2).all(|bytes| {
+                let bits = u16::from_le_bytes([bytes[0], bytes[1]]);
+                bits & 0x7c00 != 0x7c00
+            })
+        {
+            return false;
+        }
+
+        match run_bitnet_f16_head_inner(
+            &mut guard,
+            input,
+            weight_pages,
+            weight_rows,
+            input_width,
+            output,
+        ) {
+            Ok(()) if output.iter().all(|value| value.is_finite()) => {
+                BITNET_F16_HEAD_RUN_COUNT.fetch_add(1, Ordering::Relaxed);
+                if !BITNET_F16_HEAD_LOGGED.swap(true, Ordering::Relaxed) {
+                    eprintln!(
+                        "[bitnet] CUDA tied F16 output-head kernel active on {}",
+                        guard.device_name
+                    );
+                }
+                true
+            }
+            Ok(()) | Err(_) => false,
+        }
+    }
+
+    fn run_bitnet_f16_head_inner(
+        b: &mut CudaBackend,
+        input: &[f32],
+        weight_pages: &Arc<crate::wire_mmap::WirePages>,
+        weight_rows: usize,
+        input_width: usize,
+        output: &mut [f32],
+    ) -> Result<(), cudarc::driver::DriverError> {
+        let weight_bytes = weight_pages.bytes();
+        let key = (Arc::as_ptr(weight_pages) as usize, weight_bytes.len());
+        if !b.bitnet_f16_head_weight_cache.contains_key(&key) {
+            let resident = b.stream.clone_htod(weight_bytes)?;
+            b.bitnet_f16_head_weight_cache.insert(
+                key,
+                BitNetF16HeadWeight {
+                    host: Arc::downgrade(weight_pages),
+                    device: resident,
+                },
+            );
+        }
+        let d_weights = b
+            .bitnet_f16_head_weight_cache
+            .get(&key)
+            .expect("BitNet F16 head weight just inserted")
+            .device
+            .as_view();
+        let d_input = b.stream.clone_htod(input)?;
+        let mut d_output = b.stream.alloc_zeros::<f32>(output.len())?;
+        let config = LaunchConfig {
+            grid_dim: (weight_rows as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let weight_rows = weight_rows as i32;
+        let input_width = input_width as i32;
+        let mut builder = b.stream.launch_builder(&b.kernel_bitnet_f16_head);
+        builder
+            .arg(&d_input)
+            .arg(&d_weights)
+            .arg(&weight_rows)
+            .arg(&input_width)
+            .arg(&mut d_output);
+        // SAFETY: the public boundary checked all byte/element products, buffer
+        // lengths and i32/grid conversions. Each block owns one validated row,
+        // and this path always launches the kernel's required 256 threads.
+        unsafe { builder.launch(config)? };
         b.stream.memcpy_dtoh(&d_output, output)?;
         b.ctx.synchronize()?;
         Ok(())
@@ -1247,7 +1508,7 @@ extern "C" __global__ void bitnet_i2_s_linear_rows(
                 eprintln!("skipping: no CUDA device available");
                 return;
             }
-            let input_rows = 2;
+            let input_rows = 3;
             let weight_rows = 3;
             let input_width = 128;
             let values = (0..weight_rows * input_width)
@@ -1263,18 +1524,42 @@ extern "C" __global__ void bitnet_i2_s_linear_rows(
                 let within = index % 128;
                 let code: u8 = match value {
                     -1 => 0,
-                    0 => 1,
+                    // Both public zero encodings must decode identically.
+                    0 if index.is_multiple_of(2) => 1,
+                    0 => 3,
                     1 => 2,
                     _ => unreachable!(),
                 };
                 wire[tile * 32 + within % 32] |= code << (6 - 2 * (within / 32));
             }
-            wire.extend_from_slice(&0.25_f32.to_le_bytes());
+            // A non-power-of-two scale exposes multiplication-association drift.
+            wire.extend_from_slice(&0.000_581_790_6_f32.to_le_bytes());
             wire.extend_from_slice(&[0; 28]);
             let one_input = (0..input_width)
-                .map(|index| (index as i32 % 7 - 3) as f32)
+                .map(|index| ((index as f32 + 0.25) * 0.173).sin() * 3.75)
                 .collect::<Vec<_>>();
-            let input = [one_input.clone(), one_input.clone()].concat();
+            let second_input = (0..input_width)
+                .map(|index| ((index as f32 + 0.5) * 0.119).cos() * 0.037 + 0.002)
+                .collect::<Vec<_>>();
+            let zero_input = vec![0.0_f32; input_width];
+            let input_rows_data = [one_input, second_input, zero_input];
+            let input = input_rows_data.concat();
+
+            let mut invalid_wire = wire.clone();
+            let scale_offset = weight_rows * input_width / 4;
+            invalid_wire[scale_offset..scale_offset + 4].copy_from_slice(&f32::NAN.to_le_bytes());
+            let mut invalid_output = vec![0.0_f32; input_rows * weight_rows];
+            let before_invalid = bitnet_run_count();
+            assert!(!try_bitnet_i2_s_linear_rows(
+                &input,
+                &invalid_wire,
+                input_rows,
+                weight_rows,
+                input_width,
+                0,
+                &mut invalid_output,
+            ));
+            assert_eq!(bitnet_run_count(), before_invalid);
 
             for (mode, cpu_mode) in [
                 (0, crate::bitnet_kernels::BitNetKernelMode::I2S),
@@ -1283,7 +1568,7 @@ extern "C" __global__ void bitnet_i2_s_linear_rows(
             ] {
                 let expected = crate::bitnet_kernels::i2_s_matmul(
                     &wire,
-                    &[one_input.clone(), one_input.clone()],
+                    &input_rows_data,
                     weight_rows,
                     cpu_mode,
                 )
@@ -1302,9 +1587,140 @@ extern "C" __global__ void bitnet_i2_s_linear_rows(
                 ));
                 assert!(bitnet_run_count() > before);
                 for (got, want) in actual.iter().zip(&expected) {
-                    assert!((got - want).abs() <= 1.0e-5 * want.abs().max(1.0));
+                    assert_eq!(got.to_bits(), want.to_bits(), "got={got} want={want}");
                 }
             }
+        }
+
+        #[test]
+        #[ignore = "requires a CUDA device"]
+        fn cuda_bitnet_f16_head_matches_cpu_oracle_and_reuses_weights() {
+            use std::io::Write;
+
+            if !detect_cuda_device().available {
+                if std::env::var("CAMELID_REQUIRE_CUDA_TESTS").as_deref() == Ok("1") {
+                    panic!(
+                        "CAMELID_REQUIRE_CUDA_TESTS=1 but the CUDA backend (including NVRTC \
+                         compilation of bitnet_f16_head_matvec) is unavailable"
+                    );
+                }
+                eprintln!("skipping: no CUDA device available");
+                return;
+            }
+
+            fn make_pages(bytes: &[u8]) -> Arc<crate::wire_mmap::WirePages> {
+                let mut file = tempfile::tempfile().expect("temporary F16 wire file");
+                file.write_all(bytes).expect("write F16 wire bytes");
+                file.flush().expect("flush F16 wire bytes");
+                crate::wire_mmap::WirePages::read_from_file(&file, 0, bytes.len())
+                    .expect("page-backed F16 wire bytes")
+            }
+
+            fn reference_row(row: &[u8], input: &[f32]) -> f32 {
+                let mut sum = 0.0_f32;
+                for (bytes, value) in row.chunks_exact(2).zip(input) {
+                    let bits = u16::from_le_bytes([bytes[0], bytes[1]]);
+                    sum += crate::tensor::f16_bits_to_f32(bits) * value;
+                }
+                sum
+            }
+
+            // Seven distinct rows and a width that is neither a warp nor block
+            // multiple exercise both the kernel's final partial stride and its
+            // 64-bit row addressing. Include signed zero, subnormals, ordinary
+            // values, and the largest finite half without admitting NaN/Inf.
+            let weight_rows = 7;
+            let input_width = 513;
+            let finite_bits = [
+                0x0000_u16, 0x8000, 0x0001, 0x8001, 0x3400, 0xb800, 0x3d00, 0xc000, 0x4300, 0x7bff,
+            ];
+            let mut wire = Vec::with_capacity(weight_rows * input_width * 2);
+            for row in 0..weight_rows {
+                for column in 0..input_width {
+                    let bits = finite_bits[(row * 17 + column * 13) % finite_bits.len()];
+                    wire.extend_from_slice(&bits.to_le_bytes());
+                }
+            }
+            let pages = make_pages(&wire);
+            let first_input = (0..input_width)
+                .map(|index| ((index as f32 + 0.375) * 0.071).sin() * 0.000_23)
+                .collect::<Vec<_>>();
+            let second_input = (0..input_width)
+                .map(|index| ((index as f32 + 0.625) * 0.053).cos() * -0.000_19 + 0.000_011)
+                .collect::<Vec<_>>();
+
+            let mut invalid_output = vec![0.0_f32; weight_rows];
+            let before_invalid = bitnet_f16_head_run_count();
+            assert!(!try_bitnet_f16_head_matvec(
+                &first_input[..input_width - 1],
+                &pages,
+                weight_rows,
+                input_width,
+                &mut invalid_output,
+            ));
+            let mut nonfinite_input = first_input.clone();
+            nonfinite_input[31] = f32::NAN;
+            assert!(!try_bitnet_f16_head_matvec(
+                &nonfinite_input,
+                &pages,
+                weight_rows,
+                input_width,
+                &mut invalid_output,
+            ));
+            let mut nonfinite_wire = wire.clone();
+            nonfinite_wire[46..48].copy_from_slice(&0x7c00_u16.to_le_bytes());
+            let nonfinite_pages = make_pages(&nonfinite_wire);
+            assert!(!try_bitnet_f16_head_matvec(
+                &first_input,
+                &nonfinite_pages,
+                weight_rows,
+                input_width,
+                &mut invalid_output,
+            ));
+            assert_eq!(bitnet_f16_head_run_count(), before_invalid);
+
+            let cache_before = backend()
+                .expect("CUDA backend")
+                .lock()
+                .expect("CUDA backend mutex")
+                .bitnet_f16_head_weight_cache
+                .len();
+            for input in [&first_input, &second_input] {
+                let expected = (0..weight_rows)
+                    .map(|row| {
+                        let start = row * input_width * 2;
+                        reference_row(&wire[start..start + input_width * 2], input)
+                    })
+                    .collect::<Vec<_>>();
+                let mut actual = vec![0.0_f32; weight_rows];
+                let before = bitnet_f16_head_run_count();
+                assert!(try_bitnet_f16_head_matvec(
+                    input,
+                    &pages,
+                    weight_rows,
+                    input_width,
+                    &mut actual,
+                ));
+                assert_eq!(bitnet_f16_head_run_count(), before + 1);
+                for (row, (&got, &want)) in actual.iter().zip(&expected).enumerate() {
+                    let tolerance = 0.000_2 * want.abs().max(1.0);
+                    assert!(
+                        (got - want).abs() <= tolerance,
+                        "row={row} got={got} want={want} tolerance={tolerance}"
+                    );
+                }
+            }
+            let cache_after = backend()
+                .expect("CUDA backend")
+                .lock()
+                .expect("CUDA backend mutex")
+                .bitnet_f16_head_weight_cache
+                .len();
+            assert_eq!(
+                cache_after,
+                cache_before + 1,
+                "weights uploaded more than once"
+            );
         }
 
         // Requires a CUDA device; ignored by default so GPU-less CI (which has

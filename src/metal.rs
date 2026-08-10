@@ -7022,46 +7022,47 @@ inline int bitnet_i2_s_ternary(device const uchar* packed, ulong logical_index) 
 // Cleanroom BitNet projection over canonical I2_S bytes. Mode 0 decodes each
 // ternary weight directly; modes 1 and 2 use 9-entry and 27-entry lookup tables.
 kernel void bitnet_i2_s_linear_rows(
-    device const float* input [[buffer(0)]],
+    device const char* input [[buffer(0)]],
     device const uchar* weights [[buffer(1)]],
     device float* output [[buffer(2)]],
     constant uint& input_width [[buffer(3)]],
     constant uint& weight_rows [[buffer(4)]],
     constant uint& input_rows [[buffer(5)]],
     constant uint& mode [[buffer(6)]],
+    device const float* activation_scales [[buffer(7)]],
     uint gid [[thread_position_in_grid]]
 ) {
     const ulong total = ulong(input_rows) * weight_rows;
     if (gid >= total) return;
     const uint input_row = gid / weight_rows;
     const uint weight_row = gid % weight_rows;
-    device const float* x = input + ulong(input_row) * input_width;
+    device const char* x = input + ulong(input_row) * input_width;
     const ulong base = ulong(weight_row) * input_width;
-    float sum = 0.0f;
+    int sum = 0;
 
     if (mode == 1) {
         uint column = 0;
         for (; column + 1 < input_width; column += 2) {
-            const float a = x[column];
-            const float b = x[column + 1];
-            const float table[9] = {-a-b, -a, -a+b, -b, 0.0f, b, a-b, a, a+b};
+            const int a = int(x[column]);
+            const int b = int(x[column + 1]);
+            const int table[9] = {-a-b, -a, -a+b, -b, 0, b, a-b, a, a+b};
             const int left = bitnet_i2_s_ternary(weights, base + column) + 1;
             const int right = bitnet_i2_s_ternary(weights, base + column + 1) + 1;
             sum += table[left * 3 + right];
         }
         for (; column < input_width; ++column) {
-            sum += float(bitnet_i2_s_ternary(weights, base + column)) * x[column];
+            sum += bitnet_i2_s_ternary(weights, base + column) * int(x[column]);
         }
     } else if (mode == 2) {
         uint column = 0;
         for (; column + 2 < input_width; column += 3) {
-            float table[27];
+            int table[27];
             for (uint a = 0; a < 3; ++a) {
                 for (uint b = 0; b < 3; ++b) {
                     for (uint c = 0; c < 3; ++c) {
-                        table[a * 9 + b * 3 + c] = float(int(a) - 1) * x[column]
-                            + float(int(b) - 1) * x[column + 1]
-                            + float(int(c) - 1) * x[column + 2];
+                        table[a * 9 + b * 3 + c] = (int(a) - 1) * int(x[column])
+                            + (int(b) - 1) * int(x[column + 1])
+                            + (int(c) - 1) * int(x[column + 2]);
                     }
                 }
             }
@@ -7071,16 +7072,16 @@ kernel void bitnet_i2_s_linear_rows(
             sum += table[d0 * 9 + d1 * 3 + d2];
         }
         for (; column < input_width; ++column) {
-            sum += float(bitnet_i2_s_ternary(weights, base + column)) * x[column];
+            sum += bitnet_i2_s_ternary(weights, base + column) * int(x[column]);
         }
     } else {
         for (uint column = 0; column < input_width; ++column) {
-            sum += float(bitnet_i2_s_ternary(weights, base + column)) * x[column];
+            sum += bitnet_i2_s_ternary(weights, base + column) * int(x[column]);
         }
     }
     const ulong packed_len = ulong(weight_rows) * input_width / 4;
     const float scale = *reinterpret_cast<device const float*>(weights + packed_len);
-    output[gid] = sum * scale;
+    output[gid] = float(sum) * activation_scales[input_row] * scale;
 }
 "#;
 
@@ -12488,10 +12489,16 @@ fn try_bitnet_i2_s_matmul_flat(
     if !scale.is_finite() {
         return None;
     }
+    let (quantized_input, activation_scales) =
+        crate::bitnet_kernels::quantize_activation_rows(input, input_width).ok()?;
 
     let kernel = metal_linear_kernel()?;
     let input_buffer = kernel.device.new_buffer(
-        std::mem::size_of_val(input) as u64,
+        quantized_input.len() as u64,
+        MTLResourceOptions::StorageModeShared,
+    );
+    let activation_scales_buffer = kernel.device.new_buffer(
+        std::mem::size_of_val(activation_scales.as_slice()) as u64,
         MTLResourceOptions::StorageModeShared,
     );
     let output_buffer = kernel.device.new_buffer(
@@ -12501,7 +12508,8 @@ fn try_bitnet_i2_s_matmul_flat(
     let scalar_buffer = kernel
         .device
         .new_buffer(16, MTLResourceOptions::StorageModeShared);
-    write_buffer_f32(&input_buffer, input);
+    write_buffer_i8(&input_buffer, &quantized_input);
+    write_buffer_f32(&activation_scales_buffer, &activation_scales);
     unsafe {
         let scalars = scalar_buffer.contents().cast::<u32>();
         *scalars = input_width as u32;
@@ -12526,6 +12534,7 @@ fn try_bitnet_i2_s_matmul_flat(
     encoder.set_buffer(4, Some(&scalar_buffer), 4);
     encoder.set_buffer(5, Some(&scalar_buffer), 8);
     encoder.set_buffer(6, Some(&scalar_buffer), 12);
+    encoder.set_buffer(7, Some(&activation_scales_buffer), 0);
     let width = kernel
         .bitnet_i2_s_linear_pipeline
         .thread_execution_width()
@@ -20765,8 +20774,11 @@ impl ResidentWeightFormat {
     #[cfg(target_os = "macos")]
     fn hybrid_prism_wire_supported(self) -> bool {
         match self {
-            Self::Q1_0 | Self::Q2_0G64 | Self::Q2_0G128 => true,
-            Self::DenseF32 | Self::DenseF16 | Self::Q8_0 | Self::Q4K | Self::Q6K => false,
+            // DenseF16 is also the tied 128k-row BitNet output head. The shared
+            // dense kernel consumes its canonical row-major GGUF bytes directly,
+            // so the hybrid bridge can keep that head page-backed and resident.
+            Self::DenseF16 | Self::Q1_0 | Self::Q2_0G64 | Self::Q2_0G128 => true,
+            Self::DenseF32 | Self::Q8_0 | Self::Q4K | Self::Q6K => false,
         }
     }
 }
@@ -27285,7 +27297,7 @@ mod tests {
             (ResidentWeightFormat::Q4K, false),
             (ResidentWeightFormat::Q6K, false),
             (ResidentWeightFormat::DenseF32, false),
-            (ResidentWeightFormat::DenseF16, false),
+            (ResidentWeightFormat::DenseF16, true),
         ] {
             assert_eq!(
                 format.hybrid_prism_wire_supported(),
@@ -41171,6 +41183,53 @@ kernel void mma_probe(
                 busy_us as f64,
                 flops / (busy_us as f64 * 1e-6) / 1e12
             );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn bitnet_dense_f16_output_head_executes_on_metal() {
+        use std::io::Write;
+
+        if !super::detect_metal_device().available {
+            return;
+        }
+        let rows = 3usize;
+        let width = 64usize;
+        let bits = (0..rows * width)
+            .map(|index| match index % 4 {
+                0 => 0x3c00_u16, // 1.0
+                1 => 0xbc00_u16, // -1.0
+                2 => 0x3800_u16, // 0.5
+                _ => 0x0000_u16,
+            })
+            .collect::<Vec<_>>();
+        let wire = bits
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        let mut file = tempfile::NamedTempFile::new().expect("temp file");
+        file.write_all(&wire).expect("write F16 matrix");
+        file.flush().expect("flush F16 matrix");
+        let pages = crate::wire_mmap::WirePages::read_from_file(file.as_file(), 0, wire.len())
+            .expect("page-backed F16 fixture");
+        let input = (0..width)
+            .map(|index| (index as f32 * 0.07).sin())
+            .collect::<Vec<_>>();
+        let actual = super::try_prism_wire_matvec_f32(
+            &input,
+            &pages,
+            super::ResidentWeightFormat::DenseF16,
+            rows,
+        )
+        .expect("dense F16 Metal dispatch");
+        for (row, got) in actual.iter().enumerate() {
+            let want = bits[row * width..(row + 1) * width]
+                .iter()
+                .zip(&input)
+                .map(|(&weight, &x)| crate::tensor::f16_bits_to_f32(weight) * x)
+                .sum::<f32>();
+            assert!((got - want).abs() <= 2.0e-5 * want.abs().max(1.0));
         }
     }
 }

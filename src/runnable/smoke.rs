@@ -180,6 +180,18 @@ pub fn smoke_admit(path: &str) -> Result<SmokeReport> {
 /// The headline quant: the most common quantized (non-F32) tensor type, e.g. `Q8_0`.
 fn headline_quant(gguf: &GgufFile) -> String {
     use std::collections::HashMap;
+    // `general.file_type=40` is the GGUF I2_S file type. Official BitNet files
+    // also contain many small F16 norms (and an F16 embedding/head), so counting
+    // tensor descriptors mislabels their projection format as F16 even though
+    // every transformer matrix uses I2_S.
+    if gguf.metadata_u32("general.file_type") == Some(40)
+        && gguf
+            .tensors
+            .iter()
+            .any(|tensor| tensor.tensor_type == GgufTensorType::I2S)
+    {
+        return "I2_S".to_string();
+    }
     let mut counts: HashMap<GgufTensorType, usize> = HashMap::new();
     for t in &gguf.tensors {
         if t.tensor_type != GgufTensorType::F32 {

@@ -6,7 +6,7 @@
      1. header-only inspect, so an architecture Camelid cannot run is refused before
         anything reads a multi-GB file;
      2. the authoritative load (generative models replace the active chat model;
-        the exact Nomic encoder registers as a sidecar without replacing it);
+        inspected embedding-only models register as sidecars without replacing it);
      3. a lane-specific readiness check: active identity plus generation readiness
         for chat, or a real bounded embedding for the encoder sidecar.
 
@@ -18,13 +18,21 @@
 const CHECKING = 'checking'
 const LOADING = 'loading'
 
+/* Inspect metadata, never a filename guess, decides whether loading a model
+   should replace active Chat. `nomic-bert` remains an older-server fallback;
+   new backends expose the unambiguous `embedding_only` task fact. */
+export function inspectDeclaresEmbeddingSidecar(inspect) {
+  return inspect?.embedding_only === true
+    || inspect?.architecture === 'nomic-bert'
+}
+
 export function modelFilenameFromPath(value) {
   return String(value || '').split(/[\\/]/).pop() || ''
 }
 
 /* Load `filename` (a bare name inside the engine's configured models directory).
 
-   Generative models return `{ ok: true }`; the supported Nomic encoder returns
+   Generative models return `{ ok: true }`; a supported embedding sidecar returns
    `{ ok: true, embedding: true }` after its sidecar readiness probe. Failures use
    `{ ok: false, stage, message, code, blocker }`. `code` is the backend's stable
    `error.code` when it sent one — the caller needs it to tell a permanent refusal
@@ -72,7 +80,7 @@ export async function loadLocalModelForChat({
         blocker: inspect.blocker,
       }
     }
-    const embeddingModel = inspect?.architecture === 'nomic-bert'
+    const embeddingModel = inspectDeclaresEmbeddingSidecar(inspect)
 
     // Only an inspected, implemented model reaches the authoritative load.
     stage = LOADING
@@ -108,12 +116,22 @@ export async function loadLocalModelForChat({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           model: filename,
-          input: 'search_query: Camelid embedding readiness probe',
-          dimensions: 256,
+          input: 'Camelid embedding readiness probe',
         }),
       })
       const probe = await probeRes.json().catch(() => ({}))
-      if (!probeRes.ok || probe?.data?.[0]?.embedding?.length !== 256) {
+      const embedding = probe?.data?.[0]?.embedding
+      const expectedDimensions = Number(
+        inspect?.native_embedding_dimensions ?? inspect?.embedding_dimensions,
+      )
+      const nativeDimensionsMatch = !Number.isFinite(expectedDimensions)
+        || expectedDimensions <= 0
+        || embedding?.length === expectedDimensions
+      const embeddingReady = Array.isArray(embedding)
+        && embedding.length > 0
+        && embedding.every((value) => Number.isFinite(value))
+        && nativeDimensionsMatch
+      if (!probeRes.ok || !embeddingReady) {
         return {
           ok: false,
           stage: LOADING,

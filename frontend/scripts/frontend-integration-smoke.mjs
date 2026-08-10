@@ -24,6 +24,7 @@ try {
   const { default: SystemView } = await server.ssrLoadModule('/src/views/SystemView.jsx')
   const { default: ModelsView } = await server.ssrLoadModule('/src/views/ModelsView.jsx')
   const { default: TopBar } = await server.ssrLoadModule('/src/components/TopBar.jsx')
+  const { StreamingLoader, streamingStatusLabel } = await server.ssrLoadModule('/src/components/chat/render/StreamingIndicator.jsx')
   const { getChatGateState } = await server.ssrLoadModule('/src/lib/chatGate.js')
   const {
     capabilityRowMatchesSearch,
@@ -334,7 +335,19 @@ try {
   // The pre-token phase label is now the reader-facing "Generating response"
   // (StreamingIndicator.FIRST_TOKEN_STREAMING_LABEL); same live status, plain wording.
   assert.match(preTokenMarkup, /Generating response/, 'pre-token streaming should render the active backend-generation live status')
+  assert.match(preTokenMarkup, /streaming-loader-label">Generating response<\/span>/, 'the pre-token status must be visible beside the dots rather than carried only by aria-label')
   assert.match(preTokenMarkup, /streaming-loader-dot-3/, 'pre-token streaming should render the active loader, not a static placeholder')
+
+  const delayedPreTokenLabel = streamingStatusLabel('generating', 20)
+  const delayedPreTokenMarkup = renderToStaticMarkup(React.createElement(StreamingLoader, {
+    label: delayedPreTokenLabel,
+    compact: true,
+  }))
+  assert.match(
+    delayedPreTokenMarkup,
+    /streaming-loader-label">Local response is taking a while<\/span>/,
+    'the delayed-first-token explanation must be visible instead of leaving the user with unexplained dots',
+  )
 
   const completedUnclosedFenceMarkup = renderToStaticMarkup(React.createElement(ChatWorkspace, {
     selectedConversation: {

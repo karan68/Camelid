@@ -7,9 +7,10 @@ use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 
-use camelid::embedding::EmbeddingRuntime;
+use camelid::embedding::{cosine_similarity, EmbeddingRuntime};
 use camelid::gguf::{read_metadata, GgufTensorType};
 use camelid::runnable::RunnableModel;
+use camelid::tokenizer::Tokenizer;
 use sha2::{Digest, Sha256};
 
 fn fixture(name: &str) -> PathBuf {
@@ -72,6 +73,18 @@ fn assert_gpu_dispatch(metal_before: u64, cuda_before: u64) {
     }
 }
 
+fn assert_f16_head_cuda_dispatch(cuda_before: u64) {
+    if bitnet_gpu_allowed()
+        && camelid::cuda::gpu_accel_enabled()
+        && camelid::cuda::gpu_acceleration_info().backend == "cuda"
+    {
+        assert!(
+            camelid::cuda::cuda_bitnet_f16_head_run_count() > cuda_before,
+            "BitNet tied F16 output head silently fell back instead of executing CUDA"
+        );
+    }
+}
+
 #[test]
 #[ignore = "requires the SHA-pinned 1.19 GB Microsoft BitNet causal GGUF"]
 fn bitnet_b1_58_2b_4t_loads_the_exact_i2_s_graph() {
@@ -88,12 +101,34 @@ fn bitnet_b1_58_2b_4t_loads_the_exact_i2_s_graph() {
     assert_eq!(model.n_layers, 30);
     let metal_before = camelid::metal::metal_bitnet_run_count();
     let cuda_before = camelid::cuda::cuda_bitnet_run_count();
+    let cuda_f16_head_before = camelid::cuda::cuda_bitnet_f16_head_run_count();
     let logits = model
         .forward_logits(&[1])
         .expect("execute one causal BitNet position");
     assert_gpu_dispatch(metal_before, cuda_before);
+    assert_f16_head_cuda_dispatch(cuda_f16_head_before);
     assert_eq!(logits.len(), model.vocab);
     assert!(logits.iter().all(|value| value.is_finite()));
+
+    let gguf = read_metadata(&path).expect("reload causal BitNet metadata");
+    let tokenizer = Tokenizer::from_gguf(&gguf).expect("load causal BitNet tokenizer");
+    let prompt =
+        "User: What is the capital of France? Answer in one short sentence.<|eot_id|>Assistant: ";
+    let prompt_ids = tokenizer
+        .encode(prompt, true, true)
+        .expect("tokenize canonical BitNet prompt");
+    assert_eq!(prompt_ids.len(), 20);
+    let stop: Vec<u32> = tokenizer.special.eog.iter().copied().collect();
+    let generated = model
+        .generate_stopping(&prompt_ids, 64, &stop)
+        .expect("generate canonical BitNet answer");
+    assert_eq!(generated, [791, 6864, 315, 9822, 374, 12366, 13]);
+    assert_eq!(
+        tokenizer
+            .decode(&generated, true)
+            .expect("decode canonical BitNet answer"),
+        "The capital of France is Paris."
+    );
 }
 
 fn assert_embedding(
@@ -102,6 +137,7 @@ fn assert_embedding(
     expected_name: &str,
     expected_i2_s: usize,
     expected_dimensions: usize,
+    published_prefix: Option<&[f32]>,
 ) {
     let path = fixture(filename);
     assert_sha256(&path, expected_sha256);
@@ -122,6 +158,47 @@ fn assert_embedding(
         .sum::<f32>()
         .sqrt();
     assert!((norm - 1.0).abs() < 1e-4, "L2 norm was {norm}");
+
+    let query = runtime
+        .embed(
+            &runtime.prepare_retrieval_query("Which animals store fat in their humps?"),
+            None,
+        )
+        .expect("embed retrieval query");
+    let relevant = runtime
+        .embed(
+            &runtime.prepare_retrieval_document(
+                "Camels and other camelids use their humps to store fat.",
+            ),
+            None,
+        )
+        .expect("embed relevant document");
+    let unrelated = runtime
+        .embed(
+            &runtime.prepare_retrieval_document(
+                "A database index accelerates structured record lookups.",
+            ),
+            None,
+        )
+        .expect("embed unrelated document");
+    let relevant_score = cosine_similarity(&query, &relevant).expect("relevant similarity");
+    let unrelated_score = cosine_similarity(&query, &unrelated).expect("unrelated similarity");
+    assert!(
+        relevant_score > unrelated_score,
+        "semantic retrieval ordering failed: relevant={relevant_score}, unrelated={unrelated_score}"
+    );
+
+    if let Some(expected) = published_prefix {
+        let oracle = runtime
+            .embed("query: What is BitNet?", None)
+            .expect("embed Microsoft published-vector prompt");
+        for (index, (&actual, &expected)) in oracle.iter().zip(expected).enumerate() {
+            assert!(
+                (actual - expected).abs() < 0.003,
+                "published-vector component {index} differed: actual={actual}, expected={expected}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -133,6 +210,9 @@ fn bitnet_embedding_0_6b_executes_and_normalizes() {
         "bitnet-embeddings-0.6b",
         196,
         1_024,
+        Some(&[
+            0.0239517, 0.6826404, -0.0, -0.0644535, 0.0613754, 0.0473094, 0.0114330,
+        ]),
     );
 }
 
@@ -145,5 +225,6 @@ fn bitnet_embedding_270m_executes_and_normalizes() {
         "bitnet-embeddings-270m",
         126,
         640,
+        None,
     );
 }

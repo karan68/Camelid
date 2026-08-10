@@ -15,7 +15,7 @@ export const streamingStatusLabel = (phase, elapsedSeconds, isOpenCode = false) 
   return FIRST_TOKEN_STREAMING_LABEL
 }
 
-/* The aria-label carries only the phase label: the live region should announce
+/* The status text is both visible and stable: the live region should announce
    phase changes (preparing → generating → streaming), not re-announce a ticking
    seconds counter every second. */
 export function StreamingLoader({ label = ACTIVE_STREAMING_LABEL, compact = false }) {
@@ -26,6 +26,7 @@ export function StreamingLoader({ label = ACTIVE_STREAMING_LABEL, compact = fals
         <span className="streaming-loader-dot streaming-loader-dot-2" />
         <span className="streaming-loader-dot streaming-loader-dot-3" />
       </div>
+      <span className="streaming-loader-label">{label}</span>
     </div>
   )
 }

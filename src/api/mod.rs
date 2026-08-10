@@ -43,7 +43,9 @@ pub use server::ServeOptions;
 pub(crate) use server::DEFAULT_MAX_REQUEST_BODY_BYTES;
 
 use crate::{
-    embedding::{cosine_similarity, EmbeddingRuntime, EncoderConfig},
+    embedding::{
+        cosine_similarity, validate_bitnet_embedding_metadata, EmbeddingRuntime, EncoderConfig,
+    },
     execution_plan::{plan_for_model_with_env, ExecutionPlan, PlannerEnv},
     gguf::{read_metadata, GgufFile, GgufTensorDescriptor, GgufTensorType},
     inference::{
@@ -961,6 +963,8 @@ pub struct ChatMessage {
     pub unsupported_content_parts: Vec<String>,
 }
 
+const INTERNAL_TOOL_CALL_HISTORY_MARKER: &str = "__camelid_internal_tool_calls";
+
 /// Wire shape for `ChatMessage` deserialization: accepts the OpenAI plain
 /// string form and the content-parts array form. `text` parts are concatenated
 /// in order; every non-text part records its `type` so the handler can reject
@@ -1073,7 +1077,7 @@ impl<'de> Deserialize<'de> for ChatMessage {
         D: serde::Deserializer<'de>,
     {
         let mut wire = ChatMessageWire::deserialize(deserializer)?;
-        let (mut content, image_urls, unsupported_content_parts) = match wire.content {
+        let (mut content, image_urls, mut unsupported_content_parts) = match wire.content {
             Some(ChatContentWire::Text(text)) => (text, Vec::new(), Vec::new()),
             Some(ChatContentWire::Parts(parts)) => {
                 let mut text = String::new();
@@ -1111,6 +1115,10 @@ impl<'de> Deserialize<'de> for ChatMessage {
                 content.push('\n');
                 content.push_str(&canonical);
             }
+            // Preserve the fact that this assistant content came from structured
+            // tool_calls. Tool-capable templates still consume the canonicalized
+            // text, while no-tools dialects such as BitNet can fail closed.
+            unsupported_content_parts.push(INTERNAL_TOOL_CALL_HISTORY_MARKER.to_string());
         }
         if wire.tool_call_id.is_some() && wire.role != "tool" {
             return Err(serde::de::Error::custom(
@@ -1136,7 +1144,12 @@ impl<'de> Deserialize<'de> for ChatMessage {
 fn reject_unsupported_multimodal_content(messages: &[ChatMessage]) -> Option<Response> {
     let mut part_types: Vec<&str> = messages
         .iter()
-        .flat_map(|m| m.unsupported_content_parts.iter().map(String::as_str))
+        .flat_map(|m| {
+            m.unsupported_content_parts
+                .iter()
+                .map(String::as_str)
+                .filter(|part| *part != INTERNAL_TOOL_CALL_HISTORY_MARKER)
+        })
         .collect();
     if part_types.is_empty() {
         return None;
@@ -4621,6 +4634,14 @@ async fn embeddings(
             Err(response) => return response,
         };
     let dimensions = request.dimensions;
+    if let Err(error) = runtime.validate_dimensions(dimensions) {
+        return api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            backend_error_code(&error),
+            error.to_string(),
+            Some("dimensions"),
+        );
+    }
     let result = tokio::task::spawn_blocking(move || {
         let embeddings = runtime.embed_batch(&inputs, dimensions)?;
         let prompt_tokens = inputs
@@ -7456,6 +7477,12 @@ struct InspectBlocker {
 struct InspectModelResponse {
     architecture: Option<String>,
     quant: Option<String>,
+    /// True when the artifact is an encoder sidecar and must not replace the
+    /// active chat model.
+    embedding_only: bool,
+    /// Fixed native vector width for embedding-only artifacts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    native_embedding_dimensions: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     source: Option<ModelSourceInspection>,
     /// Predicted lane (`supported` / `experimental_implemented` / `unsupported`).
@@ -7495,6 +7522,8 @@ async fn inspect_model(
                 Json(InspectModelResponse {
                     architecture: None,
                     quant: None,
+                    embedding_only: false,
+                    native_embedding_dimensions: None,
                     source: Some(source),
                     lane_class: ModelLaneClass::Unsupported,
                     blocker: Some(InspectBlocker {
@@ -7546,10 +7575,25 @@ async fn inspect_model(
         .unwrap_or_default()
         .to_string();
     let quant = Some(crate::runnable::headline_quant_of(&gguf)).filter(|q| !q.is_empty());
+    let bitnet_embedding = crate::model::is_bitnet_embedding_model(&gguf);
+    let embedding_only = architecture.as_deref() == Some("nomic-bert") || bitnet_embedding;
+    let bitnet_embedding_config =
+        bitnet_embedding.then(|| validate_bitnet_embedding_metadata(&gguf));
+    let native_embedding_dimensions = if let Some(config) = bitnet_embedding_config.as_ref() {
+        config.as_ref().ok().map(|config| config.embedding_length)
+    } else if architecture.as_deref() == Some("nomic-bert") {
+        EncoderConfig::from_gguf(&gguf)
+            .ok()
+            .map(|config| config.embedding_length)
+    } else {
+        None
+    };
 
     // Parse the config header (no tensor bind, no weight load). Ok â‡’ it would load;
     // Err â‡’ it would fail closed with this exact typed reason.
-    let config_result = if architecture.as_deref() == Some("nomic-bert") {
+    let config_result = if let Some(result) = bitnet_embedding_config {
+        result.map(|_| ())
+    } else if architecture.as_deref() == Some("nomic-bert") {
         EncoderConfig::from_gguf(&gguf).map(|_| ())
     } else {
         LlamaModelConfig::from_gguf(&gguf).map(|_| ())
@@ -7573,6 +7617,8 @@ async fn inspect_model(
         Json(InspectModelResponse {
             architecture,
             quant,
+            embedding_only,
+            native_embedding_dimensions,
             source: None,
             lane_class,
             blocker,
@@ -9451,6 +9497,20 @@ pub struct RunnableServeRuntime {
     vision: Option<crate::runnable::PrismVisionProjector>,
 }
 
+/// Lives inside the SSE body. Dropping the response (for example when the UI
+/// aborts a request) flips the flag even if BitNet is still in prompt prefill
+/// and has not emitted a first token yet.
+struct RunnableStreamDisconnectGuard {
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for RunnableStreamDisconnectGuard {
+    fn drop(&mut self) {
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
 impl RunnableServeRuntime {
     fn load(path: &std::path::Path, model_sha256: &str) -> std::result::Result<Self, BackendError> {
         let path_str = path.to_string_lossy().to_string();
@@ -9516,24 +9576,29 @@ impl RunnableServeRuntime {
         Ok((text, ids))
     }
 
-    /// [`generate_greedy`](Self::generate_greedy) with a per-token-id callback —
-    /// the runnable lane's SSE source. Returns the same (text, ids) as the
-    /// non-streaming path (identical generation by construction).
-    fn generate_greedy_streaming<F: FnMut(u32)>(
+    /// Streaming generation with a cooperative disconnect check. The generic
+    /// runnable decoder polls `is_cancelled` during prefill and between decode
+    /// steps, so a dropped BitNet SSE response does not leave a long-running
+    /// Metal/CPU generation monopolizing the model in the background.
+    fn generate_greedy_streaming_cancelled<F: FnMut(u32)>(
         &self,
         prompt_ids: &[u32],
         max_new: usize,
         sampling: &SamplingConfig,
+        is_cancelled: &dyn Fn() -> bool,
         mut on_token: F,
     ) -> std::result::Result<(String, Vec<u32>), BackendError> {
         let stop: Vec<u32> = self.tokenizer.special.eog.iter().copied().collect();
-        let ids = self.model.generate_stopping_streaming_with_sampling(
-            prompt_ids,
-            max_new,
-            &stop,
-            sampling,
-            &mut on_token,
-        )?;
+        let ids = self
+            .model
+            .generate_stopping_streaming_with_sampling_cancelled(
+                prompt_ids,
+                max_new,
+                &stop,
+                sampling,
+                is_cancelled,
+                &mut on_token,
+            )?;
         let text = self.tokenizer.decode(&ids, true).unwrap_or_default();
         Ok((text, ids))
     }
@@ -9881,6 +9946,247 @@ fn render_ornith_chatml_prompt(messages: &[ChatMessage], enable_thinking: bool) 
         });
     }
     prompt
+}
+
+const STALE_MICROSOFT_GGUF_TEMPLATE: &str = "{% for message in messages %}{% if loop.first %}{{ bos_token }}{% endif %}{% if message['role'] == 'user' %}{{ 'Human: ' + message['content'] + '\\n\\nBITNETAssistant: ' + eos_token }}{% elif message['role'] == 'assistant' %}{{ message['content'] + eos_token }}{% endif %}{% endfor %}";
+const CANONICAL_MICROSOFT_TEMPLATE: &str = "{% set loop_messages = messages %}{% for message in loop_messages %}{% set content = message['role'] | capitalize + ': '+ message['content'] | trim + '<|eot_id|>' %}{{ content }}{% endfor %}{% if add_generation_prompt %}{{ 'Assistant: ' }}{% endif %}";
+
+/// Render the canonical Microsoft BitNet-b1.58-2B-4T chat dialect.
+///
+/// The published GGUF accidentally embeds an older BitNet
+/// `Human:/BITNETAssistant:` template. The 2B-4T tokenizer configuration and
+/// the model's training/runtime implementation instead use:
+///
+/// ```text
+/// System: {system content}<|eot_id|>User: {user content}<|eot_id|>Assistant:
+/// ```
+///
+/// BOS deliberately does not appear in the returned text: the runnable
+/// tokenizer supplies it through `add_special=true`. Message content is
+/// trimmed exactly like the canonical Jinja template's `| trim` expression.
+fn render_bitnet_b158_prompt(messages: &[ChatMessage]) -> String {
+    let mut prompt = String::new();
+    for message in messages {
+        let role = match message.role.trim() {
+            "system" => "System",
+            "user" => "User",
+            "assistant" => "Assistant",
+            other => other,
+        };
+        prompt.push_str(role);
+        prompt.push_str(": ");
+        prompt.push_str(message.content.trim());
+        prompt.push_str("<|eot_id|>");
+    }
+    prompt.push_str("Assistant: ");
+    prompt
+}
+
+/// Validate the request features that Microsoft's BitNet chat template can
+/// actually represent. Its GGUF template has neither a tools branch nor a
+/// thinking-mode switch, so silently accepting either would discard caller
+/// intent while presenting the request as supported.
+fn bitnet_b158_request_rejection(
+    tools: &[serde_json::Value],
+    enable_thinking: bool,
+) -> Option<Response> {
+    if !tools.is_empty() {
+        return Some(bitnet_runnable_lane_tools_rejection());
+    }
+    enable_thinking.then(bitnet_runnable_lane_thinking_rejection)
+}
+
+fn bitnet_b158_message_rejection(messages: &[ChatMessage]) -> Option<Response> {
+    for message in messages {
+        if message
+            .unsupported_content_parts
+            .iter()
+            .any(|part| part == INTERNAL_TOOL_CALL_HISTORY_MARKER)
+        {
+            return Some(bitnet_runnable_lane_tools_rejection());
+        }
+        let role = message.role.trim();
+        if !matches!(role, "system" | "user" | "assistant") {
+            return Some(api_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "unsupported_message_role",
+                format!(
+                    "the BitNet-b1.58-2B-4T chat dialect accepts only system, user, and assistant messages; role {role:?} requires an unsupported tool/function protocol"
+                ),
+                Some("messages"),
+            ));
+        }
+    }
+    None
+}
+
+/// Gate the hand-written renderer on either the known-stale official GGUF
+/// template or the corrected canonical template. Also require the canonical
+/// end-of-turn marker to exist as one tokenizer token; treating it as ordinary
+/// text would shift every trained turn boundary.
+#[allow(clippy::result_large_err)]
+fn prepare_bitnet_b158_chat_prompt(
+    runtime: &RunnableServeRuntime,
+    model_id: &str,
+    messages: &[ChatMessage],
+) -> std::result::Result<String, Response> {
+    if let Some(rejection) = bitnet_b158_message_rejection(messages) {
+        return Err(rejection);
+    }
+    if let Some(rejection) = reject_bitnet_with_unrecognized_template(runtime, model_id) {
+        return Err(rejection);
+    }
+    let eot_id = runtime.tokenizer.token_to_id.get("<|eot_id|>").copied();
+    let eot_is_one_special = eot_id.is_some_and(|expected| {
+        runtime
+            .tokenizer
+            .encode("<|eot_id|>", false, true)
+            .is_ok_and(|ids| ids.as_slice() == [expected])
+    });
+    if !eot_is_one_special {
+        return Err(api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "unsupported_chat_template",
+            format!(
+                "model '{model_id}' declares architecture 'bitnet-b1.58', but its tokenizer has no single <|eot_id|> token required by the canonical Microsoft chat template"
+            ),
+            Some("messages"),
+        ));
+    }
+    Ok(render_bitnet_b158_prompt(messages))
+}
+
+#[cfg(test)]
+mod bitnet_runnable_api_tests {
+    use super::*;
+
+    fn message(role: &str, content: &str) -> ChatMessage {
+        ChatMessage {
+            role: role.to_string(),
+            content: content.to_string(),
+            image_urls: Vec::new(),
+            unsupported_content_parts: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn bitnet_renderer_corrects_the_stale_gguf_template_to_the_trained_dialect() {
+        let messages = [
+            message("system", " Be helpful. "),
+            message("user", " Hello "),
+            message("assistant", "Hi"),
+            message("user", "Again"),
+        ];
+        let prompt = render_bitnet_b158_prompt(&messages);
+        assert_eq!(
+            prompt,
+            "System: Be helpful.<|eot_id|>User: Hello<|eot_id|>Assistant: Hi<|eot_id|>User: Again<|eot_id|>Assistant: "
+        );
+        assert!(
+            !prompt.contains("<|begin_of_text|>"),
+            "BOS belongs to tokenizer add_special, not renderer text"
+        );
+    }
+
+    #[test]
+    fn bitnet_template_gate_is_specific_to_the_evidenced_dialect() {
+        assert!(is_bitnet_b158_chat_template(STALE_MICROSOFT_GGUF_TEMPLATE));
+        assert!(is_bitnet_b158_chat_template(CANONICAL_MICROSOFT_TEMPLATE));
+        assert!(!is_bitnet_b158_chat_template(
+            "{{ bos_token }}<|im_start|>user<|im_end|>{{ eos_token }}"
+        ));
+        assert!(!is_bitnet_b158_chat_template(
+            "Human: {{ content }} BITNETAssistant:"
+        ));
+        assert!(!is_bitnet_b158_chat_template(&format!(
+            "{STALE_MICROSOFT_GGUF_TEMPLATE}{{{{ forged_extra }}}}"
+        )));
+    }
+
+    #[test]
+    fn bitnet_prompt_requests_bos_special_token_insertion() {
+        assert!(runnable_prompt_add_special("bitnet-b1.58"));
+        assert!(runnable_prompt_add_special("lfm2"));
+        assert!(!runnable_prompt_add_special("qwen35"));
+    }
+
+    #[test]
+    fn runnable_finish_reason_reports_a_capped_bitnet_reply_as_length() {
+        assert_eq!(runnable_finish_reason(false, 64, 64), "length");
+        assert_eq!(runnable_finish_reason(false, 12, 64), "stop");
+        assert_eq!(runnable_finish_reason(true, 64, 64), "tool_calls");
+    }
+
+    #[test]
+    fn bitnet_rejects_uncertified_tools_and_thinking() {
+        assert!(bitnet_b158_request_rejection(&[], false).is_none());
+
+        let tools = [serde_json::json!({"name": "weather"})];
+        let tools_response = bitnet_b158_request_rejection(&tools, false).unwrap();
+        assert_eq!(tools_response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            tools_response
+                .extensions()
+                .get::<ApiErrorDetails>()
+                .unwrap()
+                .code,
+            "unsupported_tools"
+        );
+
+        let thinking_response = bitnet_b158_request_rejection(&[], true).unwrap();
+        assert_eq!(thinking_response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            thinking_response
+                .extensions()
+                .get::<ApiErrorDetails>()
+                .unwrap()
+                .code,
+            "unsupported_parameter"
+        );
+
+        assert!(bitnet_b158_message_rejection(&[message("user", "hello")]).is_none());
+        let tool_history = bitnet_b158_message_rejection(&[message("tool", "result")]).unwrap();
+        assert_eq!(tool_history.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            tool_history
+                .extensions()
+                .get::<ApiErrorDetails>()
+                .unwrap()
+                .code,
+            "unsupported_message_role"
+        );
+
+        let assistant_tool_call: ChatMessage = serde_json::from_value(serde_json::json!({
+            "role": "assistant",
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "weather", "arguments": "{}"}
+            }]
+        }))
+        .unwrap();
+        let structured_history = bitnet_b158_message_rejection(&[assistant_tool_call]).unwrap();
+        assert_eq!(
+            structured_history
+                .extensions()
+                .get::<ApiErrorDetails>()
+                .unwrap()
+                .code,
+            "unsupported_tools"
+        );
+    }
+
+    #[test]
+    fn runnable_disconnect_guard_sets_cancellation_flag() {
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let _guard = RunnableStreamDisconnectGuard {
+                cancelled: cancelled.clone(),
+            };
+            assert!(!cancelled.load(std::sync::atomic::Ordering::Acquire));
+        }
+        assert!(cancelled.load(std::sync::atomic::Ordering::Acquire));
+    }
 }
 
 /// Render an LFM2 / LFM2.5 chat prompt, faithful to the GGUF's own template.
@@ -10341,13 +10647,10 @@ fn prepare_runnable_prompt(
         .flat_map(|message| message.image_urls.iter().map(String::as_str))
         .collect();
     if image_urls.is_empty() {
-        // `add_special` is what supplies the leading BOS. gemma needs it; so
-        // does lfm2 — LFM2.5's chat template opens with `{{- bos_token -}}`
-        // (`<|startoftext|>`, id 124894), and the GGUF omits
-        // `tokenizer.ggml.add_bos_token` so the tokenizer's default `true`
-        // applies. Without this the whole prompt is shifted by a missing BOS
-        // and the forward diverges from the reference.
-        let add_special = matches!(runtime.architecture.as_str(), "gemma2" | "gemma3" | "lfm2");
+        // `add_special` supplies the leading BOS for templates that emit
+        // `bos_token` outside their returned text. Without it the whole prompt
+        // is shifted and the forward diverges from the reference.
+        let add_special = runnable_prompt_add_special(&runtime.architecture);
         let ids = runtime
             .tokenizer
             .encode(prompt_text, add_special, true)
@@ -10440,6 +10743,29 @@ fn prepare_runnable_prompt(
     })
 }
 
+/// Architectures whose evidenced GGUF chat template supplies its leading BOS
+/// through tokenizer special-token insertion rather than literal renderer text.
+fn runnable_prompt_add_special(architecture: &str) -> bool {
+    matches!(architecture, "gemma2" | "gemma3" | "lfm2" | "bitnet-b1.58")
+}
+
+/// OpenAI-compatible runnable completion terminator. Tool calls take
+/// precedence; otherwise exhausting the caller's token budget is `length`,
+/// while an earlier EOG is `stop`.
+fn runnable_finish_reason(
+    has_tool_calls: bool,
+    completion_tokens: usize,
+    max_tokens: usize,
+) -> &'static str {
+    if has_tool_calls {
+        "tool_calls"
+    } else if completion_tokens >= max_tokens {
+        "length"
+    } else {
+        "stop"
+    }
+}
+
 /// Non-streaming chat for a runnable-served model (qwen35/Ornith): render the Ornith
 /// ChatML prompt (with tools when present), greedy-generate to EOG, split the
 /// `<think>` reasoning, and lift `<function=â€¦>` tool calls into structured `tool_calls`
@@ -10457,6 +10783,14 @@ async fn runnable_chat_nonstreaming(
             return gemma_runnable_lane_tools_rejection();
         }
         render_gemma3_prompt(&messages)
+    } else if runtime.architecture == "bitnet-b1.58" {
+        if let Some(rejection) = bitnet_b158_request_rejection(&tools, enable_thinking) {
+            return rejection;
+        }
+        match prepare_bitnet_b158_chat_prompt(&runtime, &id, &messages) {
+            Ok(prompt) => prompt,
+            Err(rejection) => return rejection,
+        }
     } else if runtime.architecture == "lfm2" {
         // LFM2 has its own template AND its own tool-call envelope; borrowing
         // the qwen35 tools renderer would emit a format these weights were
@@ -10536,8 +10870,11 @@ async fn runnable_chat_nonstreaming(
     // Prefer the token-level split: on lfm2 `</think>` is a control token that
     // detokenization strips, so the text search below can never find it and the
     // whole think block would land in `content`.
-    let (reasoning, content) =
-        split_think_by_token(&ids, &runtime.tokenizer).unwrap_or_else(|| split_ornith_think(&text));
+    let (reasoning, content) = if runtime.architecture == "bitnet-b1.58" {
+        (None, text)
+    } else {
+        split_think_by_token(&ids, &runtime.tokenizer).unwrap_or_else(|| split_ornith_think(&text))
+    };
     // Structured tool_calls (OpenAI shape) lifted from the Ornith `<function=â€¦>` XML.
     // The agent loop ALSO re-parses the content text client-side (chat-lane
     // `parse_ornith`), so the content keeps the tool-call text below.
@@ -10551,17 +10888,14 @@ async fn runnable_chat_nonstreaming(
     // covers). Without this a request that was REFUSED a tools array could still
     // come back with `finish_reason: "tool_calls"` if the model echoed Ornith
     // syntax from its history.
-    let tool_calls =
-        if runtime.architecture != "lfm2" && tool_choice_allows_calls(req.tool_choice.as_ref()) {
-            parse_ornith_tool_calls_json(&content)
-        } else {
-            Vec::new()
-        };
-    let finish_reason = if tool_calls.is_empty() {
-        "stop"
+    let tool_calls = if !matches!(runtime.architecture.as_str(), "lfm2" | "bitnet-b1.58")
+        && tool_choice_allows_calls(req.tool_choice.as_ref())
+    {
+        parse_ornith_tool_calls_json(&content)
     } else {
-        "tool_calls"
+        Vec::new()
     };
+    let finish_reason = runnable_finish_reason(!tool_calls.is_empty(), ids.len(), max_tokens);
 
     let mut message = serde_json::json!({ "role": "assistant", "content": content });
     if let Some(r) = reasoning {
@@ -10618,6 +10952,14 @@ async fn runnable_chat_streaming(
             return gemma_runnable_lane_tools_rejection();
         }
         render_gemma3_prompt(&messages)
+    } else if runtime.architecture == "bitnet-b1.58" {
+        if let Some(rejection) = bitnet_b158_request_rejection(&tools, enable_thinking) {
+            return rejection;
+        }
+        match prepare_bitnet_b158_chat_prompt(&runtime, &id, &messages) {
+            Ok(prompt) => prompt,
+            Err(rejection) => return rejection,
+        }
     } else if runtime.architecture == "lfm2" {
         // LFM2 has its own template AND its own tool-call envelope; borrowing
         // the qwen35 tools renderer would emit a format these weights were
@@ -10658,10 +11000,11 @@ async fn runnable_chat_streaming(
     // (hold-back off), so lifting here would BOTH violate OpenAI semantics and
     // duplicate the streamed text as a structured tool_calls delta.
     // Arch-gated for the same reason as the non-streaming path above.
-    let lift_tool_calls =
-        runtime.architecture != "lfm2" && tool_choice_allows_calls(req.tool_choice.as_ref());
+    let lift_tool_calls = !matches!(runtime.architecture.as_str(), "lfm2" | "bitnet-b1.58")
+        && tool_choice_allows_calls(req.tool_choice.as_ref());
     let think_close = runtime.tokenizer.token_to_id.get("</think>").copied();
     let opens_think_unconditionally = runtime.architecture == "lfm2";
+    let bitnet_stream = runtime.architecture == "bitnet-b1.58";
     let created = unix_secs();
 
     enum StreamItem {
@@ -10670,15 +11013,26 @@ async fn runnable_chat_streaming(
         Fail(String),
     }
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<StreamItem>();
+    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let worker_cancelled = cancelled.clone();
     let rt = runtime.clone();
     tokio::task::spawn_blocking(move || {
         let send_tx = tx.clone();
+        let is_cancelled = || worker_cancelled.load(std::sync::atomic::Ordering::Acquire);
         let result = match prepared {
             RunnablePreparedPrompt::Text(prompt_ids) => {
                 let prompt_token_count = prompt_ids.len();
-                rt.generate_greedy_streaming(&prompt_ids, max_tokens, &sampling, |tok| {
-                    let _ = send_tx.send(StreamItem::Token(tok));
-                })
+                rt.generate_greedy_streaming_cancelled(
+                    &prompt_ids,
+                    max_tokens,
+                    &sampling,
+                    &is_cancelled,
+                    |tok| {
+                        if send_tx.send(StreamItem::Token(tok)).is_err() {
+                            worker_cancelled.store(true, std::sync::atomic::Ordering::Release);
+                        }
+                    },
+                )
                 .map(|(text, ids)| (text, ids, prompt_token_count))
             }
             RunnablePreparedPrompt::Vision {
@@ -10696,7 +11050,9 @@ async fn runnable_chat_streaming(
                 max_tokens,
                 &sampling,
                 |tok| {
-                    let _ = send_tx.send(StreamItem::Token(tok));
+                    if send_tx.send(StreamItem::Token(tok)).is_err() {
+                        worker_cancelled.store(true, std::sync::atomic::Ordering::Release);
+                    }
                 },
             ),
         };
@@ -10711,7 +11067,10 @@ async fn runnable_chat_streaming(
     });
 
     let tokenizer = runtime.tokenizer.clone();
+    let disconnect_guard = RunnableStreamDisconnectGuard { cancelled };
     let events = async_stream::stream! {
+        // Keep the guard owned by the response body for its full lifetime.
+        let _disconnect_guard = disconnect_guard;
         let chunk = |delta: serde_json::Value, finish: Option<&str>| {
             serde_json::json!({
                 "id": "chatcmpl-runnable",
@@ -10805,13 +11164,18 @@ async fn runnable_chat_streaming(
 
         match final_state {
             Some(Ok((text, ids, prompt_token_count))) => {
-                let (_reasoning, content) = split_ornith_think(&text);
+                let content = if bitnet_stream {
+                    text
+                } else {
+                    split_ornith_think(&text).1
+                };
                 let tool_calls = if lift_tool_calls {
                     parse_ornith_tool_calls_json(&content)
                 } else {
                     Vec::new()
                 };
-                let finish = if tool_calls.is_empty() { "stop" } else { "tool_calls" };
+                let finish =
+                    runnable_finish_reason(!tool_calls.is_empty(), ids.len(), max_tokens);
                 if !tool_calls.is_empty() {
                     let deltas: Vec<serde_json::Value> = tool_calls
                         .iter()
@@ -19234,6 +19598,58 @@ fn gemma_runnable_lane_tools_rejection() -> Response {
         "unsupported_tools",
         "the gemma runnable serve lane does not support tools: the model's chat template has no tools branch and no tool-call grammar is certified for this row".to_string(),
         None,
+    )
+}
+
+/// Recognize either Microsoft's known-stale 2B GGUF template or the canonical
+/// 2B-4T tokenizer template. The stale branch is admitted only so Camelid can
+/// apply the documented corrective renderer above; it is never rendered as-is.
+fn is_bitnet_b158_chat_template(template: &str) -> bool {
+    let template = template.trim();
+    template == STALE_MICROSOFT_GGUF_TEMPLATE || template == CANONICAL_MICROSOFT_TEMPLATE
+}
+
+/// Refuse a `bitnet-b1.58` file whose template is neither of the two exact
+/// evidenced forms. Falling through to generic ChatML remains forbidden.
+fn reject_bitnet_with_unrecognized_template(
+    runtime: &RunnableServeRuntime,
+    model_id: &str,
+) -> Option<Response> {
+    if runtime
+        .tokenizer
+        .chat_template
+        .as_deref()
+        .is_some_and(is_bitnet_b158_chat_template)
+    {
+        return None;
+    }
+    Some(api_error(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "unsupported_chat_template",
+        format!(
+            "model '{model_id}' declares architecture 'bitnet-b1.58', but its embedded tokenizer.chat_template is neither the known Microsoft GGUF form nor the canonical User:/Assistant:<|eot_id|> form. Generic ChatML would be a foreign prompt, so chat fails closed."
+        ),
+        Some("messages"),
+    ))
+}
+
+fn bitnet_runnable_lane_tools_rejection() -> Response {
+    api_error(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "unsupported_tools",
+        "the bitnet-b1.58 runnable serve lane does not support tools: the model's chat template has no tools branch and no BitNet tool-call grammar is certified"
+            .to_string(),
+        None,
+    )
+}
+
+fn bitnet_runnable_lane_thinking_rejection() -> Response {
+    api_error(
+        StatusCode::BAD_REQUEST,
+        "unsupported_parameter",
+        "the bitnet-b1.58 runnable serve lane does not support camelid_enable_thinking: the model's chat template has no thinking branch"
+            .to_string(),
+        Some("camelid_enable_thinking"),
     )
 }
 
