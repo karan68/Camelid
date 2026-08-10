@@ -142,7 +142,7 @@ try {
       body: JSON.stringify(completionRequest),
     })
     await recordStep('v1_completions', completionResponse, completionResponsePath)
-    timingInputs.push(completionResponsePath)
+    if (completionResponse?.camelid?.timings_ms) timingInputs.push(completionResponsePath)
   }
 
   const chatRequest = {
@@ -159,28 +159,35 @@ try {
     body: JSON.stringify(chatRequest),
   })
   await recordStep('v1_chat_completions', chatResponse, chatResponsePath)
-  timingInputs.push(chatResponsePath)
+  if (chatResponse?.camelid?.timings_ms) timingInputs.push(chatResponsePath)
 
-  const timingsReportPath = join(outDir, 'generation-timings.summary.json')
-  const timingsCommand = [
-    process.execPath,
-    timingsScript,
-    '--out', timingsReportPath,
-    ...timingInputs,
-  ]
-  await writeFile(join(outDir, 'generation-timings.command.txt'), `${shellJoin(timingsCommand)}\n`)
-  const timingsRun = await run(timingsCommand[0], timingsCommand.slice(1))
-  await writeFile(join(outDir, 'generation-timings.stdout.log'), timingsRun.stdout)
-  await writeFile(join(outDir, 'generation-timings.stderr.log'), timingsRun.stderr)
-  const timingsSummary = {
-    command: timingsCommand,
-    exit_code: timingsRun.code,
-    summary_path: timingsReportPath,
+  if (timingInputs.length > 0) {
+    const timingsReportPath = join(outDir, 'generation-timings.summary.json')
+    const timingsCommand = [
+      process.execPath,
+      timingsScript,
+      '--out', timingsReportPath,
+      ...timingInputs,
+    ]
+    await writeFile(join(outDir, 'generation-timings.command.txt'), `${shellJoin(timingsCommand)}\n`)
+    const timingsRun = await run(timingsCommand[0], timingsCommand.slice(1))
+    await writeFile(join(outDir, 'generation-timings.stdout.log'), timingsRun.stdout)
+    await writeFile(join(outDir, 'generation-timings.stderr.log'), timingsRun.stderr)
+    const timingsSummary = {
+      command: timingsCommand,
+      exit_code: timingsRun.code,
+      summary_path: timingsReportPath,
+    }
+    if (timingsRun.code !== 0) {
+      timingsSummary.__error = `generation timing summary exited ${timingsRun.code}`
+    }
+    await recordStep('generation_timings', timingsSummary, join(outDir, 'generation-timings.run.json'))
+  } else {
+    await recordStep('generation_timings', {
+      skipped: true,
+      reason: 'the selected generation lane did not emit camelid.timings_ms; timing diagnostics are not a support gate',
+    }, join(outDir, 'generation-timings.skipped.json'))
   }
-  if (timingsRun.code !== 0) {
-    timingsSummary.__error = `generation timing summary exited ${timingsRun.code}`
-  }
-  await recordStep('generation_timings', timingsSummary, join(outDir, 'generation-timings.run.json'))
 
   const healthAfter = await tryFetchJson(`${apiBase}/v1/health`)
   await recordStep('health_after', healthAfter, join(outDir, 'health-after.json'))

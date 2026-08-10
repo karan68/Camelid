@@ -26,6 +26,7 @@ let completionCalls = 0
 let chatCalls = 0
 let loadedId = 'fixture-row'
 let loadedPath = modelPath
+let includeTimings = true
 
 const server = createServer(async (request, response) => {
   try {
@@ -114,6 +115,25 @@ try {
   assert.equal(timings.inputs.length, 1, 'chat-only timing summary must contain only the chat response')
   assert.equal(timings.inputs[0].file, 'chat.response.json')
 
+  includeTimings = false
+  const noTimingsDir = join(tempDir, 'no-timings')
+  await execFileAsync(process.execPath, [
+    bundleScript,
+    '--api', apiBase,
+    '--model', modelPath,
+    '--model-id', 'fixture-row',
+    '--out-dir', noTimingsDir,
+    '--chat-only',
+    '--skip-frontend',
+    '--expect-local-lane-class', 'supported',
+    '--expect-gguf-sha256', ggufSha256,
+  ], { cwd: repoRoot })
+  const noTimingsSummary = await readJson(join(noTimingsDir, 'summary.json'))
+  assert.equal(noTimingsSummary.passed, true)
+  assert.equal(noTimingsSummary.steps.generation_timings.skipped, true)
+  const skippedTimings = await readJson(join(noTimingsDir, 'generation-timings.skipped.json'))
+  assert.match(skippedTimings.reason, /did not emit camelid\.timings_ms/)
+
   laneClass = 'experimental_implemented'
   const failDir = join(tempDir, 'lane-mismatch')
   await assert.rejects(
@@ -157,14 +177,16 @@ function currentModel() {
 }
 
 function generationResponse() {
-  return {
+  const response = {
     id: 'chatcmpl-test',
     object: 'chat.completion',
     model: loadedId,
     choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
     usage: { prompt_tokens: 2, completion_tokens: 1, total_tokens: 3 },
-    camelid: {
-      timings_ms: {
+    camelid: {},
+  }
+  if (includeTimings) {
+    response.camelid.timings_ms = {
         tokenize: 0.1,
         weight_load: 0,
         weight_cache_hit: true,
@@ -172,9 +194,9 @@ function generationResponse() {
         generate: 0.5,
         generation: { forward_total: 0.4, layers_total: 0.3, logits: 0.1, sample: 0 },
         layers: [],
-      },
-    },
+    }
   }
+  return response
 }
 
 async function readJsonBody(request) {
