@@ -17,7 +17,8 @@ const errorsAfter = (mutate) => {
 
 assert.deepEqual(validateRoster(roster, 'phase1'), [], 'the committed Phase 1 roster must validate')
 assert.equal(summarizeRoster(roster).length, 6, 'all six Phase 1 graph families must remain visible')
-assert.equal(summarizeRoster(roster)[0].next_gate, 'api_webui', 'LFM2 proceeds to API/WebUI after immutable provenance closes')
+assert.equal(summarizeRoster(roster)[0].next_gate, null, 'LFM2 closes every Phase 1 gate on the exact promoted row')
+assert.equal(roster.rows[0].disposition, 'promotion_candidate', 'all-green LFM2 is ready for exact-row promotion')
 assert.equal(summarizeRoster(roster)[1].next_gate, 'load_smoke', 'Qwen2.5 preserves its first post-bootstrap blocker')
 
 assert.ok(

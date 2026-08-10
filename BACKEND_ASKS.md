@@ -143,12 +143,16 @@ runnable lane (`RUNNABLE_LANE_SPEC.md`). Each entry: what's needed, why, blockin
   is the alias — but the alias alone only makes the tokenizer *constructible*, and
   LFM2 carries its own vocab (BOS 124894, not Llama-3's 128000), so it is now
   backed by its own id-agreement receipt rather than by resemblance.
-- **Evidence:** three checks against llama.cpp b9632 on the LFM2.5-2.6B Q8_0 row —
+- **Initial evidence:** three checks against llama.cpp b9632 on the LFM2.5-2.6B Q8_0 row —
   greedy forward parity (`tests/lfm2_parity.rs::lfm2_matches_llamacpp_greedy`,
   receipt `qa/runnable/lfm2-parity.json`), tokenizer id-agreement
   (`::lfm2_tokenizer_matches_llamacpp`), and chat-template fidelity
   (`api::tests::lfm2_renderer_matches_llamacpp_applied_template`).
-- **Scope of the claim:** forward graph, tokenizer, and renderer are each proven at
-  the prompt level on ONE file at ONE quant on CPU. NOT proven: an end-to-end serve
-  run, long context, sampling (the lane decodes greedy), tools (fail closed), other
-  quants, GPU lanes, or any other LFM2 variant. No row should claim those.
+- **Scope of the original RA-8 closure:** forward graph, tokenizer, and renderer
+  were each proven at the prompt level on ONE file at ONE quant on CPU. The later
+  exact-row promotion bundle at
+  `qa/evidence-bundles/lfm2-2.6b-q8-phase1-promotion-20260810/` additionally closes
+  runnable chat, SSE/Models-page behavior, and one exact 512-token chat bucket on
+  Windows CPU. Sampling beyond greedy, tools (fail closed), context above 512,
+  other quants, CUDA, resident Metal parity, and every other LFM2 variant remain
+  unclaimed.

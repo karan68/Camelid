@@ -1,6 +1,8 @@
 # Hugging Face Model Catch-up
 
-Status: active, Phase 1 started 2026-08-09.
+Status: active, Phase 1 started 2026-08-09. The first exact row, LFM2.5 2.6B
+Q8_0, completed all eight gates and was promoted on 2026-08-10; Phase 1
+continues for the remaining families.
 
 ## Goal
 
@@ -24,9 +26,10 @@ page progressively harder to scan.
 
 ## Phase 1 work order
 
-1. **LFM2** has the most complete graph evidence. Close exact source provenance,
-   streaming/API/WebUI, and a bounded context receipt for
-   `LFM2.5-2.6B-Q8_0.gguf`.
+1. **LFM2** is complete for the exact `LFM2.5-2.6B-Q8_0.gguf` row. Its
+   immutable source identity, tokenizer/template, runnable CPU smoke/parity,
+   API/SSE/Models-page contract, and exact 512-token receipt all pass. This is
+   an exact-row promotion, not family-wide LFM2 support.
 2. **Qwen2.5 0.5B** is the cheapest new-family proof. The bootstrap row is the
    official Q8_0 GGUF so graph parity is measured with the least quantization
    ambiguity. Start on the CPU reference lane because Qwen2 projection biases
@@ -41,26 +44,29 @@ page progressively harder to scan.
 6. **Qwen3 MoE** needs an authoritative artifact anchor and a routing-semantics
    audit before a large download. Synthetic browse fixtures are not candidates.
 
-The work order reflects implementation closeness. The first newly downloaded
-bootstrap artifact is Qwen2.5 0.5B because it is much smaller than the LFM2 row;
-the existing LFM2 receipts can be audited without reacquiring its weights.
+The work order reflects implementation closeness. The full LFM2 artifact has
+now been identity-checked and exercised at its pinned SHA-256; its promotion no
+longer depends on historical receipts. Qwen2.5 0.5B remains the smaller
+bootstrap artifact for the next unfinished family.
 
 ## Phase 1 current dispositions
 
 The first overnight pass closed every unsafe ambiguity it reached without
-turning preparatory evidence into support:
+turning preparatory evidence into support. LFM2 subsequently completed its
+promotion; the other five families remain active dispositions:
 
 | Family | Current result | Next honest gate |
 |---|---|---|
-| LFM2 | Immutable official source is pinned; six gates pass. | Exact artifact API/SSE/WebUI and 512-token receipts. |
+| LFM2 | **Complete / promoted exact-row smoke.** All eight Phase 1 gates pass for `LFM2.5-2.6B-Q8_0.gguf` on the Windows CPU runnable lane. | Apple-Silicon resident-Metal parity, context above 512 tokens, and separately evidenced neighboring sizes/quants or broader sampling/tool boundaries. |
 | Qwen2.5 | Source, metadata, tokenizer, and template pass; strict greedy parity remains failed on one stable cross-engine numeric frontier. | Layer trace under one fully pinned oracle launch recipe; do not waive the token mismatch. |
 | Phi-3 | Generic head-dim-96 CPU cache reads are bit-identical; the unproven partial Metal PV tile now falls back. | Repeat the exact-row Metal prefill/decode receipt before changing the HOLD. |
 | Gemma 2 | Source identity and exact IT template route pass; substituted templates and invalid shapes fail closed. | Exact-row metadata and token-ID oracle, then load/parity. |
 | SmolLM3 | Source is pinned and the real `smaug-bpe` construction gap is closed; its dynamic chat template has an executable HOLD. | Exact-row token IDs, then a deterministic renderer for its date/reasoning/system/tool contract. |
 | Qwen3 MoE | Official 32.48 GB row is pinned; a bounded 32 MiB prefix confirms all 579 descriptors. | Full-artifact identity/load and MoE parity; remote metadata alone is not a promotion. |
 
-The roster remains active because these are dispositions, not six completed
-support promotions. A `blocked` or `fail` gate is intentional information.
+Phase 1 remains active for Qwen2.5, Phi-3, Gemma 2, SmolLM3, and Qwen3 MoE.
+LFM2's completed exact row does not promote those families or any adjacent
+LFM2 artifact. A `blocked` or `fail` gate is intentional information.
 
 ## Qualification gates
 
@@ -85,6 +91,29 @@ Each representative row crosses these gates in order:
 
 Promotion remains a separate change to the ledger, API contract, docs, and UI.
 The Phase 1 roster is intentionally much thinner than that promotion contract.
+LFM2.5 2.6B Q8_0 is the first row to complete both.
+
+### LFM2 exact-row promotion
+
+The committed promotion bundle at
+`qa/evidence-bundles/lfm2-2.6b-q8-phase1-promotion-20260810/` records all eight
+Phase 1 gates as passing for one immutable artifact:
+
+- repo/revision: `LiquidAI/LFM2.5-2.6B-GGUF` /
+  `b421ad1d549afeda6a0fb2ad3a697cb5a7879adc`
+- file: `LFM2.5-2.6B-Q8_0.gguf`, `2874779456` bytes, SHA-256
+  `36587fdf27bdfc69caf2637273679a0870ec155162161bde6fd16e8c70bdb757`
+- result: `source`, `metadata`, `tokenizer`, `template`, `load_smoke`, `parity`,
+  `api_webui`, and `context` all pass on the Windows x86_64 CPU runnable lane;
+  the short gate matches all 96 generated IDs and the native chat receipt
+  matches all eight generated IDs/text at exactly 512 rendered prompt tokens
+- support decision: `supported_exact_row_smoke`; non-streaming and streaming
+  chat plus the Models-page identity/readiness contract pass, while legacy raw
+  completions and tools remain intentionally typed fail-closed
+
+Next evidence is the bundle's Apple-Silicon Metal handoff, then bounded context
+above 512 tokens and separately qualified broader sizes, quants, sampling, and
+tool behavior. None of those follow-ups is implied by the Windows CPU promotion.
 
 ## Phase 1 bootstrap receipt
 

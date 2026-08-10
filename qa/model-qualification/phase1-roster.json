@@ -71,14 +71,15 @@
         ]
       },
       "target_tier": "experimental_exact_row",
-      "disposition": "active_validation",
+      "disposition": "promotion_candidate",
       "gates": {
         "source": {
           "required": true,
           "status": "pass",
           "evidence": [
             "qa/runnable/lfm2-parity.json",
-            "qa/model-qualification/lfm2.5-2.6b-q8-phase1-report.json"
+            "qa/model-qualification/lfm2.5-2.6b-q8-phase1-report.json",
+            "qa/evidence-bundles/lfm2-2.6b-q8-phase1-promotion-20260810/manifest.json"
           ]
         },
         "metadata": {
@@ -109,32 +110,36 @@
           "required": true,
           "status": "pass",
           "evidence": [
-            "qa/runnable/lfm2-serve-smoke.json"
+            "qa/runnable/lfm2-serve-smoke.json",
+            "qa/evidence-bundles/lfm2-2.6b-q8-phase1-promotion-20260810/api-webui-summary.json"
           ]
         },
         "parity": {
           "required": true,
           "status": "pass",
           "evidence": [
-            "qa/runnable/lfm2-parity.json"
+            "qa/runnable/lfm2-parity.json",
+            "qa/evidence-bundles/lfm2-2.6b-q8-phase1-promotion-20260810/parity-receipt.json"
           ]
         },
         "api_webui": {
           "required": true,
-          "status": "blocked",
+          "status": "pass",
           "evidence": [
-            "qa/runnable/lfm2-serve-smoke.json",
-            "qa/model-qualification/lfm2.5-2.6b-q8-phase1-report.json"
-          ],
-          "reason": "The exact 2.87 GB artifact is not present locally. The committed smoke proves the non-streaming API path but explicitly does not prove SSE, frontend behavior, or reference parity on the chat surface."
+            "qa/model-qualification/lfm2.5-2.6b-q8-phase1-report.json",
+            "qa/evidence-bundles/lfm2-2.6b-q8-phase1-promotion-20260810/api-webui-summary.json",
+            "qa/evidence-bundles/lfm2-2.6b-q8-phase1-promotion-20260810/frontend-smoke.log"
+          ]
         },
         "context": {
           "required": true,
-          "status": "blocked",
+          "status": "pass",
           "evidence": [
-            "qa/model-qualification/lfm2.5-2.6b-q8-phase1-report.json"
-          ],
-          "reason": "The exact 2.87 GB artifact is not present locally, so no preflighted 512-token parity receipt can be generated for this exact row."
+            "qa/model-qualification/lfm2.5-2.6b-q8-phase1-report.json",
+            "qa/evidence-bundles/lfm2-2.6b-q8-phase1-promotion-20260810/context-summary.json",
+            "qa/evidence-bundles/lfm2-2.6b-q8-phase1-promotion-20260810/parity-receipt.json",
+            "qa/evidence-bundles/lfm2-2.6b-q8-phase1-promotion-20260810/verify.log"
+          ]
         }
       }
     },
