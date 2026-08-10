@@ -1,0 +1,178 @@
+{
+  "schema": "camelid.smollm3-chat-template-shapes/v1",
+  "pack_id": "smollm3-chat-template-shapes-v1",
+  "row_id": "smollm3_3b_q8_0",
+  "support_scope": "preparation_only_runtime_chat_remains_architecture_wide_typed_hold",
+  "grounding": {
+    "header_receipt": "qa/model-qualification/smollm3-3b-q8-header-inspection.json",
+    "header_receipt_sha256": "6faa8cee4a70b5821f485e2debc8a9263d02ebbf5c346138221e9f78a46c9dae",
+    "tokenizer_receipt": "qa/model-qualification/smollm3-3b-q8-header-tokenizer-parity.json",
+    "tokenizer_receipt_sha256": "4e3f3b74346b4b005a462ab888a50d9bacdd01cc5a20d05e57682d70eff9afe4"
+  },
+  "source": {
+    "repo": "ggml-org/SmolLM3-3B-GGUF",
+    "file": "SmolLM3-Q8_0.gguf",
+    "revision": "4965cb60b150737b68a0408c36aeefb65078f894",
+    "size_bytes": 3275574624,
+    "sha256": "8aa8cc74656137174a1988d993b00828e65a86fd68773412b632a75aa1373248",
+    "license": "apache-2.0"
+  },
+  "bounded_prefix": {
+    "requested_bytes": 33554432,
+    "received_bytes": 33554432,
+    "prefix_sha256": "2d043b2114b89100c7ba464e57375a6f32c06c04729542d54ed684b5e8c5016e",
+    "content_range": {
+      "start": 0,
+      "end": 33554431,
+      "total": 3275574624
+    },
+    "full_weights_downloaded": false
+  },
+  "source_template": {
+    "utf8_bytes": 5493,
+    "sha256": "b9b66f04c64fbb8695cf5b35c37780efd0b8e0829fbfe3e30fafb9f469b7d30e",
+    "text": "{# ───── defaults ───── #}\n{%- if enable_thinking is not defined -%}\n{%- set enable_thinking = true -%}\n{%- endif -%}\n\n{# ───── reasoning mode ───── #}\n{%- if enable_thinking -%}\n  {%- set reasoning_mode = \"/think\" -%}\n{%- else -%}\n  {%- set reasoning_mode = \"/no_think\" -%}\n{%- endif -%}\n\n{# ───── header (system message) ───── #}\n{{- \"<|im_start|>system\\n\" -}}\n\n{%- if messages[0].role == \"system\" -%}\n  {%- set system_message = messages[0].content -%}\n  {%- if \"/no_think\" in system_message -%}\n    {%- set reasoning_mode = \"/no_think\" -%}\n  {%- elif \"/think\" in system_message -%}\n    {%- set reasoning_mode = \"/think\" -%}\n  {%- endif -%}\n  {%- set custom_instructions = system_message.replace(\"/no_think\", \"\").replace(\"/think\", \"\").rstrip() -%}\n{%- endif -%}\n\n{%- if \"/system_override\" in system_message -%}\n  {{- custom_instructions.replace(\"/system_override\", \"\").rstrip() -}}\n  {{- \"<|im_end|>\\n\" -}}\n{%- else -%}\n  {{- \"## Metadata\\n\\n\" -}}\n  {{- \"Knowledge Cutoff Date: June 2025\\n\" -}}\n  {%- set today = strftime_now(\"%d %B %Y\") -%}\n  {{- \"Today Date: \" ~ today ~ \"\\n\" -}}\n  {{- \"Reasoning Mode: \" + reasoning_mode + \"\\n\\n\" -}}\n  \n  {{- \"## Custom Instructions\\n\\n\" -}}\n  {%- if custom_instructions -%}\n    {{- custom_instructions + \"\\n\\n\" -}}\n  {%- elif reasoning_mode == \"/think\" -%}\n    {{- \"You are a helpful AI assistant named SmolLM, trained by Hugging Face. Your role as an assistant involves thoroughly exploring questions through a systematic thinking process before providing the final precise and accurate solutions. This requires engaging in a comprehensive cycle of analysis, summarizing, exploration, reassessment, reflection, backtracking, and iteration to develop well-considered thinking process. Please structure your response into two main sections: Thought and Solution using the specified format: <think> Thought section </think> Solution section. In the Thought section, detail your reasoning process in steps. Each step should include detailed considerations such as analysing questions, summarizing relevant findings, brainstorming new ideas, verifying the accuracy of the current steps, refining any errors, and revisiting previous steps. In the Solution section, based on various attempts, explorations, and reflections from the Thought section, systematically present the final solution that you deem correct. The Solution section should be logical, accurate, and concise and detail necessary steps needed to reach the conclusion.\\n\\n\" -}}\n  {%- else -%}\n    {{- \"You are a helpful AI assistant named SmolLM, trained by Hugging Face.\\n\\n\" -}}\n  {%- endif -%}\n\n  {%- if xml_tools or python_tools -%}\n    {{- \"### Tools\\n\\n\" -}}\n    {%- if xml_tools -%}\n      {%- set ns = namespace(xml_tool_string=\"You may call one or more functions to assist with the user query.\\nYou are provided with function signatures within <tools></tools> XML tags:\\n\\n<tools>\\n\") -%}\n      {%- for tool in xml_tools -%} {# The slicing makes sure that xml_tools is a list #}\n        {%- set ns.xml_tool_string = ns.xml_tool_string ~ (tool | string) ~ \"\\n\" -%}\n      {%- endfor -%}\n      {%- set xml_tool_string = ns.xml_tool_string + \"</tools>\\n\\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\\n<tool_call>\\n{\\\"name\\\": <function-name>, \\\"arguments\\\": <args-json-object>}\\n</tool_call>\" -%}\n      {{- xml_tool_string -}}\n    {%- endif -%}\n    {%- if python_tools -%}\n      {%- set ns = namespace(python_tool_string=\"When you send a message containing Python code between '<code>' and '</code>' tags, it will be executed in a stateful Jupyter notebook environment, and you will then be given the output to continued reasoning in an agentic loop.\\n\\nYou can use the following tools in your python code like regular functions:\\n<tools>\\n\") -%}\n      {%- for tool in python_tools -%} {# The slicing makes sure that python_tools is a list #}\n        {%- set ns.python_tool_string = ns.python_tool_string ~ (tool | string) ~ \"\\n\" -%}\n      {%- endfor -%}\n      {%- set python_tool_string = ns.python_tool_string + \"</tools>\\n\\nThe state persists between code executions: so variables that you define in one step are still available thereafter.\" -%}\n      {{- python_tool_string -}}\n    {%- endif -%}\n    {{- \"\\n\\n\" -}}\n    {{- \"<|im_end|>\\n\" -}}\n  {%- endif -%}\n{%- endif -%}\n{# ───── main loop ───── #}\n{%- for message in messages -%}\n    {%- set content = message.content if message.content is string else \"\" -%}\n    {%- if message.role == \"user\" -%}\n        {{ \"<|im_start|>\" + message.role + \"\\n\"  + content + \"<|im_end|>\\n\" }}\n    {%- elif message.role == \"assistant\" -%}\n        {% generation %}\n        {%- if reasoning_mode == \"/think\" -%}\n            {{ \"<|im_start|>assistant\\n\" + content.lstrip(\"\\n\") + \"<|im_end|>\\n\" }}\n        {%- else -%}\n            {{ \"<|im_start|>assistant\\n\" + \"<think>\\n\\n</think>\\n\" + content.lstrip(\"\\n\") + \"<|im_end|>\\n\" }}\n        {%- endif -%}\n        {% endgeneration %}\n    {%- elif message.role == \"tool\" -%}\n    {{ \"<|im_start|>\" + \"user\\n\"  + content + \"<|im_end|>\\n\" }}\n    {%- endif -%}\n{%- endfor -%}\n{# ───── generation prompt ───── #}\n{%- if add_generation_prompt -%}\n    {%- if reasoning_mode == \"/think\" -%}\n        {{ \"<|im_start|>assistant\\n\" }}\n    {%- else -%}\n        {{ \"<|im_start|>assistant\\n\" + \"<think>\\n\\n</think>\\n\"  }}\n    {%- endif -%}\n{%- endif -%}"
+  },
+  "inspector": {
+    "version": "camelid v0.6.1-28-gfcb3e022",
+    "binary_sha256": "17c60bcad794934416a1ae29de99ce0316d77b68207ac1e5d1e7d90189f5b9c3",
+    "source_head": "fcb3e022e24efecdd0a554ff7fd218a6ee106dfc",
+    "source_tracked_dirty": false,
+    "binary_commit_abbrev": "fcb3e022",
+    "binary_reports_dirty": false,
+    "binary_matches_source_head": true,
+    "clean_current_head": true,
+    "binary_path_redacted": true
+  },
+  "oracle": {
+    "project": "llama.cpp",
+    "build": 9632,
+    "revision": "acd79d603cb2e1c84c0886137b80f1ad649b6857",
+    "reported_revision": "acd79d603",
+    "analyzer_executable": "llama-template-analysis.exe",
+    "analyzer_binary_sha256": "3ee4a64a2cc3f71cb07f0fe7357b779cab03468fc603f76637bb9d5364a9216c",
+    "companion_executable": "llama-cli.exe",
+    "companion_binary_sha256": "2ec09da0b81d0201ce5b21810caefb4e77fd108f383b30c15ca493c5a70f7731",
+    "platform": "win32-x64",
+    "package_file_count": 51,
+    "package_manifest_bytes": 4682,
+    "package_manifest_sha256": "d70bbe8beb7848396d0993ee533062c200350fd9961e2b92c799b24f94a33e93",
+    "archive_size_bytes": 16899258,
+    "archive_sha256": "b835d5c5155dd2a5ed748a0351debf2ede0dc9f808757e0429f8700a11832dcd",
+    "executable_paths_redacted": true,
+    "mode": "template_core_analysis_not_http_apply_template",
+    "default_case_only": true,
+    "analyzer_date_value_redacted": true,
+    "capabilities": {
+      "supports_tools": false,
+      "supports_tool_calls": false,
+      "supports_system_role": true,
+      "supports_parallel_tool_calls": false,
+      "supports_typed_content": false,
+      "supports_string_content": true
+    },
+    "standard_tools_inert_for_analyzer_case": true
+  },
+  "dynamic_date": {
+    "injected_by_preparation_renderer": true,
+    "format": "%d %B %Y",
+    "placeholder": "{{CURRENT_DATE_DD_MONTH_YYYY}}",
+    "normalized_occurrences": 1
+  },
+  "cases": [
+    {
+      "id": "default_think_single_user_generation_prompt",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Hello, please help me."
+        }
+      ],
+      "enable_thinking": true,
+      "add_generation_prompt": true,
+      "normalized_prompt": "<|im_start|>system\n## Metadata\n\nKnowledge Cutoff Date: June 2025\nToday Date: {{CURRENT_DATE_DD_MONTH_YYYY}}\nReasoning Mode: /think\n\n## Custom Instructions\n\nYou are a helpful AI assistant named SmolLM, trained by Hugging Face. Your role as an assistant involves thoroughly exploring questions through a systematic thinking process before providing the final precise and accurate solutions. This requires engaging in a comprehensive cycle of analysis, summarizing, exploration, reassessment, reflection, backtracking, and iteration to develop well-considered thinking process. Please structure your response into two main sections: Thought and Solution using the specified format: <think> Thought section </think> Solution section. In the Thought section, detail your reasoning process in steps. Each step should include detailed considerations such as analysing questions, summarizing relevant findings, brainstorming new ideas, verifying the accuracy of the current steps, refining any errors, and revisiting previous steps. In the Solution section, based on various attempts, explorations, and reflections from the Thought section, systematically present the final solution that you deem correct. The Solution section should be logical, accurate, and concise and detail necessary steps needed to reach the conclusion.\n\n<|im_start|>user\nHello, please help me.<|im_end|>\n<|im_start|>assistant\n",
+      "normalized_prompt_utf8_bytes": 1392,
+      "normalized_prompt_sha256": "7619416ae94ba9a00378d976bfa944f5ba726747f9b67ba4e862d9a7fe20e4f1",
+      "oracle_grounding": "exact add_generation_prompt diff right side",
+      "oracle_exact_match_after_date_normalization": true
+    },
+    {
+      "id": "default_think_user_assistant_user_generation_prompt",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Hello, please help me."
+        },
+        {
+          "role": "assistant",
+          "content": "I can help you with that."
+        },
+        {
+          "role": "user",
+          "content": "Thank you."
+        }
+      ],
+      "enable_thinking": true,
+      "add_generation_prompt": true,
+      "normalized_prompt": "<|im_start|>system\n## Metadata\n\nKnowledge Cutoff Date: June 2025\nToday Date: {{CURRENT_DATE_DD_MONTH_YYYY}}\nReasoning Mode: /think\n\n## Custom Instructions\n\nYou are a helpful AI assistant named SmolLM, trained by Hugging Face. Your role as an assistant involves thoroughly exploring questions through a systematic thinking process before providing the final precise and accurate solutions. This requires engaging in a comprehensive cycle of analysis, summarizing, exploration, reassessment, reflection, backtracking, and iteration to develop well-considered thinking process. Please structure your response into two main sections: Thought and Solution using the specified format: <think> Thought section </think> Solution section. In the Thought section, detail your reasoning process in steps. Each step should include detailed considerations such as analysing questions, summarizing relevant findings, brainstorming new ideas, verifying the accuracy of the current steps, refining any errors, and revisiting previous steps. In the Solution section, based on various attempts, explorations, and reflections from the Thought section, systematically present the final solution that you deem correct. The Solution section should be logical, accurate, and concise and detail necessary steps needed to reach the conclusion.\n\n<|im_start|>user\nHello, please help me.<|im_end|>\n<|im_start|>assistant\nI can help you with that.<|im_end|>\n<|im_start|>user\nThank you.<|im_end|>\n<|im_start|>assistant\n",
+      "normalized_prompt_utf8_bytes": 1488,
+      "normalized_prompt_sha256": "64e0558c7855509dd775f786c20889204cf9b58a267164887c1a939dd7c92d9c",
+      "oracle_grounding": "exact user-assistant-user core plus isolated exact generation suffix",
+      "oracle_core_exact_match_after_date_normalization": true
+    }
+  ],
+  "contract": {
+    "allowed_roles": [
+      "user",
+      "assistant"
+    ],
+    "message_input_stage": "post_canonicalized_chat_messages",
+    "text_only_content_parts": "canonicalized_to_string_before_helper",
+    "exact_role_bytes_required": true,
+    "messages_nonempty": true,
+    "content_nonempty": true,
+    "history_starts_with": "user",
+    "history_must_end_with": "user",
+    "history_strictly_alternating": true,
+    "thinking": [
+      "omitted_defaults_true",
+      "explicit_true"
+    ],
+    "add_generation_prompt": true,
+    "injected_date": "calendar_valid_DD_EnglishMonth_YYYY",
+    "parse_special": true,
+    "add_special": false,
+    "synthetic_system_terminator_present": false,
+    "exact_adjacency": "ncise and detail necessary steps needed to reach the conclusion.\n\n<|im_start|>user"
+  },
+  "typed_hold_branches": [
+    "empty_messages",
+    "empty_content",
+    "non_exact_role_bytes",
+    "unsupported_roles",
+    "non_alternating_history",
+    "invalid_injected_date",
+    "explicit_enable_thinking_false",
+    "system_message",
+    "system_override",
+    "custom_system_instructions",
+    "xml_tools",
+    "python_tools",
+    "tool_role_history",
+    "multimodal_content",
+    "unsupported_nontext_content_parts",
+    "history_ending_assistant",
+    "add_generation_prompt_false"
+  ],
+  "does_not_prove": [
+    "runtime_chat_enablement",
+    "full_weight_download_or_hash",
+    "model_load",
+    "generation",
+    "http_apply_template_parity",
+    "tool_or_system_branches",
+    "false_thinking_branch",
+    "wire_content_parts_representation_parity"
+  ],
+  "support_decision": "no_roster_change_template_preparation_only"
+}
