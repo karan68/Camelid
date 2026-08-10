@@ -3,7 +3,7 @@
 The handoff from branch `codex/huggingface-model-catchup` is complete for the
 exact file below on one Apple M4 host running macOS 26.5 arm64. The independently
 committed receipt is
-`qa/evidence-bundles/lfm2-2.6b-q8-macos-metal-20260810-head-35ca855f/`.
+`qa/evidence-bundles/lfm2-2.6b-q8-macos-metal-20260810-head-d31e5cb0/`.
 
 That receipt records 96/96 short greedy generated IDs and an exact
 512-rendered-prompt-token plus 8-generated-ID/text match against pinned llama.cpp b9632

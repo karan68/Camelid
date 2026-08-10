@@ -1,5 +1,4 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { isCompatibilitySupportedForModel } from '../../lib/capabilities'
 import { beginCatalogSettlement, catalogDownloadSettlement, completeCatalogAcquisition, reserveCatalogAcquisition } from '../../lib/catalogActivation'
 import {
   catalogBundleInstalled,
@@ -17,6 +16,7 @@ import {
   isRefusingFit,
   partitionByArchSupport,
   partitionCuratedByFit,
+  predictedLane,
   quantAdvice,
 } from '../../lib/catalogBrowse'
 import { SUPPORTED_MODELS } from '../../lib/supportedModels'
@@ -52,17 +52,6 @@ const CURATED_DECORATION = new Map(SUPPORTED_MODELS.map((item) => [item.catalog_
    in a tooltip on the guessed value, rather than as a paragraph on all 150 rows. */
 const HF_GUESS_EXPLANATION =
   'Architecture and quantization are read from the filename, not the model. The real lane is only known after the file loads.'
-
-/* Predicted lane for a catalog entry — derived, never a hand-authored label. */
-function predictedLane(item, capabilities) {
-  // Experimental (live Hugging Face) rows are advisory only: their architecture/quant
-  // are filename guesses, so they can never anchor a lane or imply support — even when
-  // the filename happens to coincide with a supported contract row. Always not-anchored.
-  if (item.group === 'experimental') return 'not_anchored'
-  if (isCompatibilitySupportedForModel(capabilities, null, item)) return 'supported'
-  if (item.oracle_qualified) return 'compatible'
-  return 'not_anchored'
-}
 
 function laneChip(lane) {
   if (lane === 'supported') return <EvidenceChip state="supported" asText>Supported</EvidenceChip>

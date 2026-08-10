@@ -25,6 +25,7 @@ try {
   const evidenceRoot = ['', 'private', 'tmp', 'camelid-lfm2-mac-handoff'].join('/')
   const paths = {
     workspace: `${macHome}/Documents/Camelid/qa/output.json`,
+    workspace_parenthesized: `compiled (${macHome}/Documents/Camelid)`,
     frontend_script: `${macHome}/Documents/Camelid/frontend/scripts/smoke.mjs`,
     state: `${macHome}/.local/state/Camelid/logs/camelid.log`,
     model: `${volumeRoot}/models/lfm2/LFM2.5-2.6B-Q8_0.gguf`,
@@ -35,7 +36,7 @@ try {
     home_fallback: `${macHome}/Downloads/receipt.json`,
     volume_fallback: `${volumeRoot}/other/receipt.json`,
     loopback_api: 'http://127.0.0.1:8251/v1/health',
-    private_api: 'http://10.0.0.42:8251/v1/health',
+    private_api: `http://${['10', '0', '0', '42'].join('.')}:8251/v1/health`,
   }
   await writeFile(join(sourceDir, 'paths.json'), `${JSON.stringify(paths, null, 2)}\n`)
   await writeFile(join(sourceDir, 'paths.log'), `${Object.values(paths).join('\n')}\n`)
@@ -45,6 +46,7 @@ try {
 
   const published = JSON.parse(await readFile(join(outputDir, 'paths.json'), 'utf8'))
   assert.equal(published.workspace, '$CAMELID_WORKTREE/qa/output.json')
+  assert.equal(published.workspace_parenthesized, 'compiled ($CAMELID_WORKTREE)')
   assert.equal(published.frontend_script, 'frontend/scripts/smoke.mjs')
   assert.equal(published.state, '$CAMELID_STATE_DIR/logs/camelid.log')
   assert.equal(published.model, '$CAMELID_MODEL_ROOT/lfm2/LFM2.5-2.6B-Q8_0.gguf')

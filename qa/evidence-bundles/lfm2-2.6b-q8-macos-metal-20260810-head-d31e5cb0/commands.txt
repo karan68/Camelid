@@ -1,0 +1,17 @@
+# Exact model identity
+shasum -a 256 $CAMELID_MODEL_ROOT/lfm2/LFM2.5-2.6B-Q8_0.gguf
+
+# Frozen short parity gate (96 generated IDs)
+CAMELID_LFM2_METAL=1 cargo test --release --test lfm2_parity --locked -- --nocapture --test-threads=1
+
+# Exact 512-rendered-token chat parity gate
+node qa/capability/context_parity.mjs --request-mode chat --gguf $CAMELID_MODEL_ROOT/lfm2/LFM2.5-2.6B-Q8_0.gguf --row lfm2_5_2_6b_q8_0 --label "LFM2.5 2.6B Q8_0" --target-tokens 681 --expect-actual-tokens 512 --kv-bytes-per-token 32768 --llama-ctx 640 --max-gen 8 --verify-mode reference-only --camelid-lane metal --expect-selected-backend metal_resident_lfm2_runtime --expect-prefill-path lfm2_metal_resident_prefill --expect-decode-path lfm2_metal_resident_decode --camelid-exe $CAMELID_BIN --llama-server $CAMELID_LLAMA_CPP_BIN/llama-server --camelid-port 8231 --llama-port 8233 --out $CAMELID_EVIDENCE_TMP/context-512
+
+# Fresh backend; CAMELID_SKIP_FIT_CHECK is intentionally absent
+CAMELID_LFM2_METAL=1 RUST_BACKTRACE=1 $CAMELID_BIN serve --addr 127.0.0.1:8251 --models-dir $CAMELID_MODEL_ROOT/lfm2 --gpu on --no-open
+
+# Fresh frontend
+(cd frontend && npm run dev)
+
+# Exact-row API/Models-page/WebUI smoke
+node scripts/model-promotion-smoke-bundle.mjs --api http://127.0.0.1:8251 --frontend http://127.0.0.1:4175 --model $CAMELID_MODEL_ROOT/lfm2/LFM2.5-2.6B-Q8_0.gguf --model-id lfm2_5_2_6b_q8_0 --out-dir $CAMELID_EVIDENCE_TMP/api-webui/smoke --message hello --max-tokens 8 --stream-max-tokens 128 --temperature 0 --skip-completions --replace-loaded-model --expect-compatibility-row lfm2_5_2_6b_q8_0 --expect-compatibility-status supported_exact_row_smoke --expect-contract-supported true --expect-webui-chat enabled --expect-local-lane-class supported --expect-gguf-sha256 36587fdf27bdfc69caf2637273679a0870ec155162161bde6fd16e8c70bdb757 --expect-selected-backend metal_resident_lfm2_runtime --expect-prefill-path lfm2_metal_resident_prefill --expect-decode-path lfm2_metal_resident_decode

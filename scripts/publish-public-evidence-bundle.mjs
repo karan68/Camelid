@@ -61,7 +61,7 @@ function sanitizeText(input) {
   return String(input)
     .replace(/\/Users\/[^/]+\/Documents\/Camelid\/frontend\/scripts\/smoke\.mjs/g, 'frontend/scripts/smoke.mjs')
     .replace(/\/Users\/[^/]+\/Documents\/Camelid\/scripts\/summarize-generation-timings\.mjs/g, 'scripts/summarize-generation-timings.mjs')
-    .replace(/\/Users\/[^/]+\/Documents\/Camelid(?=\/|$)/g, '$CAMELID_WORKTREE')
+    .replace(/\/Users\/[^/]+\/Documents\/Camelid(?=\/|[\s)"']|$)/g, '$CAMELID_WORKTREE')
     .replace(/\/Users\/[^/]+\/\.local\/state\/Camelid(?=\/|$)/g, '$CAMELID_STATE_DIR')
     .replace(/\/Volumes\/[^/]+\/models\//g, '$CAMELID_MODEL_ROOT/')
     .replace(/\/Volumes\/[^/]+\/cargo-targets\/global\/release\/camelid/g, '$CAMELID_BIN')

@@ -1,0 +1,19 @@
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "lfm2_5_2_6b_q8_0",
+      "object": "model",
+      "created": 0,
+      "owned_by": "camelid",
+      "meta": {
+        "n_vocab": 128000,
+        "n_ctx_train": 128000,
+        "n_embd": 2048,
+        "n_params": 2697198592,
+        "size": 2874779456,
+        "file_type": 7
+      }
+    }
+  ]
+}

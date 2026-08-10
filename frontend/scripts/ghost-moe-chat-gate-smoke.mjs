@@ -56,7 +56,7 @@ for (const gemma4_serve_lane of ['ghost_moe', 'local', 'cuda', undefined, 'futur
   assert.equal(gate.experimentalUnlocked, true)
   assert.equal(gate.chatMode, 'experimental')
   assert.equal(gate.hint?.target?.status, 'experimental_runtime_lane')
-  assert.match(gate.label, /experimental runtime lane/i)
+  assert.match(gate.label, /unverified/i)
   assert.match(gate.copy, /experimental/i)
 }
 

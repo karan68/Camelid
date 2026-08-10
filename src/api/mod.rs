@@ -4960,7 +4960,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
         hf_catalog_install: true,
         execution_plan,
         support_contract: SupportContract {
-            current_gate: "Current exact-row support: TinyLlama Q8_0 current gate; Llama 3.2 1B Instruct Q8_0 has checked bounded 512/1024/2048/4096/8192 packs; Llama 3.2 3B Instruct Q8_0 is supported_exact_row_smoke with the anchored checked bounded 512/1024/2048/4096/8192 raw-decode context ladder on the current canonical GGUF (prior-upload Ubuntu API/WebUI refresh at source head e9f926ed1a65 retained as historical evidence); and Llama 3 8B Instruct Q8_0 has checked bounded 512/1024/2048 packs where row-specific PASS artifacts exist. Mistral 7B Instruct v0.3 Q8_0 is supported_exact_row_smoke: checked tokenizer/template, parity (including GPU-vs-CPU greedy continuations on the exact row), bounded 512/1024/2048/4096/8192 context artifacts, and a support-promotion API/WebUI smoke bundle. LFM2.5-2.6B Q8_0 is hash-pinned supported_exact_row_smoke after tokenizer/template and 96/96 short greedy parity, native runnable-chat receipts, a checked exact 512-token chat bucket, and current-head API/WebUI/SSE smoke; tools, sampling beyond greedy, adjacent files, and broader context remain unclaimed. Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf has bounded one-token backend MoE runtime evidence only; later 5-token/API/WebUI/RSS promotion-candidate artifacts are superseded by Gate 9A 50-token divergence and a longer-continuation hang, so broad/API/WebUI/frontend readiness remains unsupported. The dense Qwen3 Q8_0 ChatML rows (0.6B/1.7B/4B/8B Instruct, thinking disabled) are supported_exact_row_smoke: qwen2 BPE pre-tokenizer + ChatML renderer, per-head QK-norm + NEOX RoPE, and token+text parity vs llama.cpp at 1/5/50 on macOS/Ubuntu and on Windows x86_64 CPU (cpu_reference + the x86_q8 AVX2 runtime-repack path, bit-identical), and additionally on Windows CUDA: the 0.6B/1.7B/4B rows fully VRAM-resident and the 8B row via the VRAM+host-RAM offload split (RTX 3060 Laptop 6 GB, driver 576.83, CUDA 12.9; GPU decode+single-shot prefill token+text identical to cpu_reference/llama.cpp at 1/5/50); 1.7B additionally has GPU-resident decode+prefill and a 15,373-token single-shot prefill lane on macOS, and thinking-mode is opt-in (leading-trace parity only). The 4B row additionally carries checked bounded-context packs 512/1024/2048/4096/8192, the 1.7B row 512/1024/2048/4096, and the 0.6B row 512/2048/4096/8192 (fully-GPU-resident raw-decode greedy parity vs llama.cpp acd79d603 at 50 tokens; the 1.7B 8192 and 0.6B 1024 buckets are held as documented benign near-ties). These are exact bounded lanes only; no model-native/larger context beyond the checked packs, arbitrary-template behavior, production throughput, portability, neighboring-row, or broad-family support is implied. Seven hash-pinned Prism ML Bonsai Q1_0, Prism Q2_0, and PQ2_0 artifacts are supported_exact_row_smoke on macOS Apple Silicon Metal and Windows x86_64 CUDA after paired text and vision validation; the claim is exact-file and limited to those two GPU platforms, with broader qwen3/qwen35 or quant support, bounded/model-native context, and production throughput still unclaimed. The seven files are mixed-arch: the 4B and 8B rows declare general.architecture=qwen3 (dense), only the 27B rows declare qwen35 (hybrid).",
+            current_gate: "Current exact-row support: TinyLlama Q8_0 current gate; Llama 3.2 1B Instruct Q8_0 has checked bounded 512/1024/2048/4096/8192 packs; Llama 3.2 3B Instruct Q8_0 is supported_exact_row_smoke with the anchored checked bounded 512/1024/2048/4096/8192 raw-decode context ladder on the current canonical GGUF (prior-upload Ubuntu API/WebUI refresh at source head e9f926ed1a65 retained as historical evidence); and Llama 3 8B Instruct Q8_0 has checked bounded 512/1024/2048 packs where row-specific PASS artifacts exist. Mistral 7B Instruct v0.3 Q8_0 is supported_exact_row_smoke: checked tokenizer/template, parity (including GPU-vs-CPU greedy continuations on the exact row), bounded 512/1024/2048/4096/8192 context artifacts, and a support-promotion API/WebUI smoke bundle. LFM2.5-2.6B Q8_0 is hash-pinned supported_exact_row_smoke only on the Windows x86_64 runnable-CPU lane and one Mac16,10 / Apple M4 / macOS 26.5 arm64 resident-Metal lane after tokenizer/template and 96/96 short greedy parity, native runnable-chat receipts, a checked exact 512-token chat bucket, and the clean d31e5cb0 API/WebUI/SSE smoke; tools, sampling beyond greedy, adjacent files, broader context, CUDA, Linux, other Apple hardware or macOS revisions, and broad portability remain unclaimed. Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf has bounded one-token backend MoE runtime evidence only; later 5-token/API/WebUI/RSS promotion-candidate artifacts are superseded by Gate 9A 50-token divergence and a longer-continuation hang, so broad/API/WebUI/frontend readiness remains unsupported. The dense Qwen3 Q8_0 ChatML rows (0.6B/1.7B/4B/8B Instruct, thinking disabled) are supported_exact_row_smoke: qwen2 BPE pre-tokenizer + ChatML renderer, per-head QK-norm + NEOX RoPE, and token+text parity vs llama.cpp at 1/5/50 on macOS/Ubuntu and on Windows x86_64 CPU (cpu_reference + the x86_q8 AVX2 runtime-repack path, bit-identical), and additionally on Windows CUDA: the 0.6B/1.7B/4B rows fully VRAM-resident and the 8B row via the VRAM+host-RAM offload split (RTX 3060 Laptop 6 GB, driver 576.83, CUDA 12.9; GPU decode+single-shot prefill token+text identical to cpu_reference/llama.cpp at 1/5/50); 1.7B additionally has GPU-resident decode+prefill and a 15,373-token single-shot prefill lane on macOS, and thinking-mode is opt-in (leading-trace parity only). The 4B row additionally carries checked bounded-context packs 512/1024/2048/4096/8192, the 1.7B row 512/1024/2048/4096, and the 0.6B row 512/2048/4096/8192 (fully-GPU-resident raw-decode greedy parity vs llama.cpp acd79d603 at 50 tokens; the 1.7B 8192 and 0.6B 1024 buckets are held as documented benign near-ties). These are exact bounded lanes only; no model-native/larger context beyond the checked packs, arbitrary-template behavior, production throughput, portability, neighboring-row, or broad-family support is implied. Seven hash-pinned Prism ML Bonsai Q1_0, Prism Q2_0, and PQ2_0 artifacts are supported_exact_row_smoke on macOS Apple Silicon Metal and Windows x86_64 CUDA after paired text and vision validation; the claim is exact-file and limited to those two GPU platforms, with broader qwen3/qwen35 or quant support, bounded/model-native context, and production throughput still unclaimed. The seven files are mixed-arch: the 4B and 8B rows declare general.architecture=qwen3 (dense), only the 27B rows declare qwen35 (hybrid).",
             support_policy: "A model, tokenizer, quantization, API feature, or context length is supported only after tests, docs, and real-model evidence exist for that lane.",
             unsupported_policy: "Unsupported combinations should return typed errors instead of silently falling back to best-effort behavior.",
         },
@@ -5057,7 +5057,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             SupportItem {
                 id: "lfm2_5_exact_2_6b_q8_0",
                 status: "supported_exact_row_smoke_lane",
-                notes: "exact LFM2.5-2.6B-Q8_0.gguf only (sha256 36587fdf27bdfc69caf2637273679a0870ec155162161bde6fd16e8c70bdb757): tokenizer/template and 96/96 short greedy parity against pinned llama.cpp, native runnable-chat receipts, exact 512-token chat parity, 128-token SSE with terminal usage, and Models-page exact-identity smoke. Tools fail closed; sampling beyond greedy, context above 512, neighboring LFM2 files/quants, CUDA, and broad-family support are not implied.",
+                notes: "exact LFM2.5-2.6B-Q8_0.gguf only (sha256 36587fdf27bdfc69caf2637273679a0870ec155162161bde6fd16e8c70bdb757), scoped to Windows x86_64 runnable CPU and one Mac16,10 / Apple M4 / macOS 26.5 arm64 resident-Metal lane: tokenizer/template and 96/96 short greedy parity against pinned llama.cpp, native runnable-chat receipts, exact 512-token chat parity, 128-token SSE with terminal usage, and Models-page exact-identity smoke. Tools fail closed; sampling beyond greedy, context above 512, neighboring LFM2 files/quants, CUDA, Linux, other Apple hardware or macOS revisions, broad portability, and broad-family support are not implied.",
             },
             SupportItem {
                 id: "llama_bpe_decoder_exact_1b_3b_8b_q8_0",
@@ -6535,17 +6535,17 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 family: "lfm2",
                 quantization: "Q8_0",
                 status: "supported_exact_row_smoke",
-                support_scope: "exact_row_greedy_runnable_chat_and_512_context_smoke_only",
+                support_scope: "exact_hash_pinned_row_on_windows_x86_64_runnable_cpu_or_mac16_10_apple_m4_macos_26_5_arm64_resident_metal_greedy_chat_and_512_context_smoke_only",
                 full_support_status: "blocked_pending_normalized_full_support",
-                full_support_blockers: "tool calling, sampling semantics beyond greedy, context beyond the checked 512-token chat bucket, Linux portability, CUDA and non-Apple-Silicon GPU execution, production throughput, neighboring LFM2 variants/quants, and broader normalized support bundles remain missing",
+                full_support_blockers: "tool calling, sampling semantics beyond greedy, context beyond the checked 512-token chat bucket, Linux portability, CUDA and non-Apple-Silicon GPU execution, other Apple hardware or macOS revisions, broad platform portability, production throughput, neighboring LFM2 variants/quants, and broader normalized support bundles remain missing",
                 metadata_parses: "validated",
                 tokenizer_works: "validated_against_pinned_llamacpp",
                 tensors_load: "validated",
                 generation_runs: "raw_greedy_plus_non_streaming_and_streaming_runnable_chat_smoke",
-                parity_audited: "windows_cpu_and_macos_metal_96_of_96_short_greedy_tokens_plus_tokenizer_template_and_512_chat_context_parity_pass",
+                parity_audited: "windows_cpu_and_one_apple_m4_macos_26_5_arm64_resident_metal_96_of_96_short_greedy_tokens_plus_tokenizer_template_and_512_chat_context_parity_pass",
                 performance_measured: "macos_m4_measurement_only_not_promoted_as_sla",
-                frontend_load_path_verified: "validated_current_head_windows_and_macos_models_page_smoke",
-                frontend_readiness_gate: "green only when this exact hash-pinned GGUF row plus Q8_0 quant match /api/capabilities and /api/models/local reports lane_class=supported for the loaded exact bytes",
+                frontend_load_path_verified: "validated_windows_bundle_and_clean_d31e5cb0_single_apple_m4_macos_26_5_arm64_models_page_smoke",
+                frontend_readiness_gate: "green only when this exact hash-pinned GGUF row plus Q8_0 quant match /api/capabilities, /api/models/local reports lane_class=supported for the loaded exact bytes and current host, and the live execution plan reports host-scoped support_level=supported_exact_row_smoke plus either Windows x86_64 runnable CPU or the Mac resident labels metal_resident_lfm2_runtime, lfm2_metal_resident_prefill, and lfm2_metal_resident_decode; that Mac support level itself requires Mac16,10 / Apple M4 / macOS 26.5 arm64",
                 tested_context: "short_raw_and_chat_prompts_plus_exact_512_token_rendered_chat_prompt",
                 chat_template_renderer: "lfm2_5_chatml_open_think",
                 chat_template_shape_pack: "validated_three_shapes",
@@ -6565,11 +6565,11 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 bounded_context_8192_pack: "not_promoted",
                 bounded_context_8192_pack_id: "not_selected",
                 bounded_context_8192_window: 8192,
-                latest_checked_bucket: "current_head_windows_cpu_and_macos_metal_api_webui_sse_and_exact_512_chat_context",
+                latest_checked_bucket: "windows_cpu_bundle_and_clean_d31e5cb0_single_apple_m4_macos_26_5_arm64_resident_metal_api_webui_sse_and_exact_512_chat_context",
                 latest_checked_result: "pass",
-                latest_checked_output: "qa/evidence-bundles/lfm2-2.6b-q8-macos-metal-20260810-head-35ca855f/manifest.json",
-                evidence: "exact LFM2.5-2.6B-Q8_0.gguf bytes (sha256 36587fdf27bdfc69caf2637273679a0870ec155162161bde6fd16e8c70bdb757, 2874779456 B): tokenizer/template fixtures and 4 prompts x 24 greedy tokens match pinned llama.cpp b9632/acd79d603 on Windows CPU and macOS Metal; native runnable chat emits sealed prompt/generated-token receipts; exact 512-token rendered chat matches the same oracle for 8/8 generated tokens and text on both lanes; current-head Windows CPU and macOS resident-Metal API/WebUI smokes cover non-streaming chat, 128-token SSE with terminal usage, exact local identity, and supported Models-page state; the macOS receipt asserts selected_backend=metal_resident_lfm2_runtime, prefill_path=lfm2_metal_resident_prefill, and decode_path=lfm2_metal_resident_decode",
-                next_step: "add 1024+ chat context buckets before widening the checked context envelope; qualify Linux CPU, CUDA, sampling, tools, neighboring artifacts, and throughput independently",
+                latest_checked_output: "qa/evidence-bundles/lfm2-2.6b-q8-macos-metal-20260810-head-d31e5cb0/manifest.json",
+                evidence: "exact LFM2.5-2.6B-Q8_0.gguf bytes (sha256 36587fdf27bdfc69caf2637273679a0870ec155162161bde6fd16e8c70bdb757, 2874779456 B): tokenizer/template fixtures and 4 prompts x 24 greedy tokens match pinned llama.cpp b9632/acd79d603 on the Windows CPU bundle and one Apple M4/macOS 26.5/arm64 resident-Metal host; native runnable chat emits sealed prompt/generated-token receipts; exact 512-token rendered chat matches the same oracle for 8/8 generated tokens and text on both lanes; the Windows bundle and clean d31e5cb0 single-host Mac API/WebUI smokes cover non-streaming chat, 128-token SSE with terminal usage, exact local identity, and supported Models-page state; the Mac receipt asserts selected_backend=metal_resident_lfm2_runtime, prefill_path=lfm2_metal_resident_prefill, and decode_path=lfm2_metal_resident_decode",
+                next_step: "add 1024+ chat context buckets before widening the checked context envelope; qualify Linux CPU, CUDA, other Apple hardware and macOS revisions, broad platform portability, sampling, tools, neighboring artifacts, and throughput independently",
             },
             ModelCompatibilityTarget {
                 id: "qwen3_0_6b_instruct_q8_0",
@@ -12744,7 +12744,7 @@ async fn load_model_from_path_with_activation(
     let metadata_path = path.clone();
     let configured_threads = state.configured_threads;
     let planner_env = state.planner_env.clone();
-    let (gguf, outcome) = tokio::task::spawn_blocking(move || {
+    let (gguf, mut outcome) = tokio::task::spawn_blocking(move || {
         let gguf = read_metadata(&metadata_path)?;
         let outcome =
             plan_for_model_with_env(&metadata_path, &gguf, configured_threads, &planner_env);
@@ -12755,7 +12755,6 @@ async fn load_model_from_path_with_activation(
         BackendError::InvalidModelMetadata(format!("model metadata task panicked: {join_error}"))
     })??;
     state.planner_env.apply(&outcome.env_updates);
-    log_selected_execution_plan(&outcome.plan);
     let id = id
         .or_else(|| gguf.model_name().map(ToOwned::to_owned))
         .or_else(|| path.file_stem().map(|s| s.to_string_lossy().to_string()))
@@ -12768,6 +12767,12 @@ async fn load_model_from_path_with_activation(
         .map_err(|join_error| {
             BackendError::InvalidModelMetadata(format!("model load task panicked: {join_error}"))
         })??;
+    finalize_execution_plan_support_for_loaded_artifact(
+        &mut outcome.plan,
+        &loaded.path,
+        &loaded.lane.gguf_sha256,
+    );
+    log_selected_execution_plan(&outcome.plan);
 
     // Runnable-only models are published atomically with their runtime. Build
     // the bridge before inserting LoadedModel/active state so a tokenizer or
@@ -23401,7 +23406,11 @@ mod tests {
         );
         assert_eq!(
             classify_model_lane(Some("lfm2"), "LFM2.5-2.6B-Q8_0.gguf"),
-            ModelLaneClass::Supported,
+            if lfm2_supported_on_current_host() {
+                ModelLaneClass::Supported
+            } else {
+                ModelLaneClass::ExperimentalImplemented
+            },
         );
         // Non-catalog allowlisted artifact of a supported row (in-house requant
         // with no HF catalog source) â†’ Supported.
@@ -23497,6 +23506,115 @@ mod tests {
         );
     }
 
+    #[test]
+    fn lfm2_support_scope_fails_closed_outside_the_two_receipted_lanes() {
+        assert!(lfm2_support_scope_matches(
+            "windows", "x86_64", None, None, None, false, true,
+        ));
+        assert!(lfm2_support_scope_matches(
+            "macos",
+            "aarch64",
+            Some("Mac16,10"),
+            Some("Apple M4"),
+            Some("26.5"),
+            true,
+            true,
+        ));
+        assert!(!lfm2_support_scope_matches(
+            "windows", "x86_64", None, None, None, false, false,
+        ));
+
+        for (os, arch, model, cpu, version, metal) in [
+            ("linux", "x86_64", None, None, None, false),
+            ("windows", "aarch64", None, None, None, false),
+            (
+                "macos",
+                "aarch64",
+                Some("Mac15,3"),
+                Some("Apple M3"),
+                Some("26.5"),
+                true,
+            ),
+            (
+                "macos",
+                "aarch64",
+                Some("Mac16,10"),
+                Some("Apple M4"),
+                Some("26.6"),
+                true,
+            ),
+            (
+                "macos",
+                "aarch64",
+                Some("Mac16,10"),
+                Some("Apple M4"),
+                Some("26.5"),
+                false,
+            ),
+        ] {
+            assert!(
+                !lfm2_support_scope_matches(os, arch, model, cpu, version, metal, true),
+                "unreceipted LFM2 scope must stay experimental: {os}/{arch}/{model:?}/{cpu:?}/{version:?}/metal={metal}"
+            );
+        }
+    }
+
+    fn provisional_lfm2_supported_plan() -> ExecutionPlan {
+        ExecutionPlan {
+            profile: ExecutionProfile::Auto,
+            operating_system: "macos".into(),
+            architecture: "aarch64".into(),
+            platform_label: "macOS arm64 Apple Silicon".into(),
+            cpu_model: "Apple M4".into(),
+            cpu_features: vec!["i8mm".into()],
+            model_family: "lfm2".into(),
+            quant_type: "Q8_0".into(),
+            exact_model_row: LFM2_5_2_6B_Q8_0_FILENAME.into(),
+            support_level: "supported_exact_row_smoke".into(),
+            selected_backend: "metal_resident_lfm2_runtime".into(),
+            selected_q8_path: "metal_resident_q8_wire".into(),
+            prefill_path: "lfm2_metal_resident_prefill".into(),
+            prefill_runtime_policy: "resident_tiled_mm_prefill".into(),
+            decode_path: "lfm2_metal_resident_decode".into(),
+            thread_count: 8,
+            diagnostics_status: "standard diagnostics".into(),
+            fallback_path: "runnable_cpu_decode_fallback".into(),
+            cuda_resident_active: false,
+            reasons: vec!["support_level=supported_exact_row_smoke".into()],
+        }
+    }
+
+    #[test]
+    fn stored_lfm2_plan_requires_the_exact_certified_artifact() {
+        let expected_sha = supported_artifact_expected_sha256(LFM2_5_2_6B_Q8_0_FILENAME)
+            .expect("promoted LFM row must carry a digest");
+
+        let mut exact = provisional_lfm2_supported_plan();
+        finalize_execution_plan_support_for_loaded_artifact(
+            &mut exact,
+            std::path::Path::new("/models/LFM2.5-2.6B-Q8_0.gguf"),
+            expected_sha,
+        );
+        assert_eq!(exact.support_level, "supported_exact_row_smoke");
+
+        for (path, sha) in [
+            ("/models/LFM2.5-2.6B-Q8_0.gguf", "00"),
+            ("/models/renamed-lfm2.gguf", expected_sha),
+        ] {
+            let mut plan = provisional_lfm2_supported_plan();
+            finalize_execution_plan_support_for_loaded_artifact(
+                &mut plan,
+                std::path::Path::new(path),
+                sha,
+            );
+            assert_eq!(plan.support_level, "unknown_or_unvalidated");
+            assert!(plan
+                .reasons
+                .iter()
+                .any(|reason| reason == "support_level=unknown_or_unvalidated"));
+        }
+    }
+
     /// Every artifact whose supported-row identity is pinned to exact bytes:
     /// the paired Prism evidence bundles, the non-catalog allowlist, and the
     /// curated rows carrying a recorded digest. `classify_model_lane` only
@@ -23530,10 +23648,16 @@ mod tests {
                 filename,
                 &"00".repeat(32)
             ));
+            let expected_lane =
+                if filename == LFM2_5_2_6B_Q8_0_FILENAME && !lfm2_supported_on_current_host() {
+                    ModelLaneClass::ExperimentalImplemented
+                } else {
+                    ModelLaneClass::Supported
+                };
             assert_eq!(
                 classify_loaded_model_identity(Some("qwen35"), filename, expected_sha256),
-                ModelLaneClass::Supported,
-                "{filename} with its evidence digest must remain supported"
+                expected_lane,
+                "{filename} with its evidence digest must retain its exact identity while obeying any narrower host lane"
             );
             assert_eq!(
                 classify_loaded_model_identity(Some("qwen35"), filename, &"00".repeat(32)),
@@ -23541,13 +23665,12 @@ mod tests {
                 "{filename} with replaced bytes must not inherit support by name"
             );
             // With no digest in hand, a pin says nothing: the row keeps its
-            // ordinary filename/header class. Asserting ExperimentalImplemented
-            // here for every pinned artifact is what locked the v0.6.0 library
-            // regression in behind a green test.
+            // ordinary filename/header class, further narrowed only by an
+            // explicitly host-scoped receipt such as LFM2's.
             assert_eq!(
                 classify_model_lane_with_verified_sha256(Some("qwen35"), filename, None),
-                ModelLaneClass::Supported,
-                "{filename} must not be demoted before anyone has hashed it"
+                expected_lane,
+                "{filename} must retain its artifact class while obeying any narrower host lane"
             );
         }
         // A curated row with NO recorded digest keeps its filename-only gating.
@@ -23606,10 +23729,16 @@ mod tests {
                 supported_artifact_expected_sha256(filename).is_some(),
                 "precondition: {filename} is hash-pinned"
             );
+            let expected_preload_class =
+                if filename == LFM2_5_2_6B_Q8_0_FILENAME && !lfm2_supported_on_current_host() {
+                    ModelLaneClass::ExperimentalImplemented
+                } else {
+                    ModelLaneClass::Supported
+                };
             assert_eq!(
                 classify_model_lane_with_verified_sha256(Some("llama"), filename, None),
-                ModelLaneClass::Supported,
-                "{filename} must read Supported in the models library, not Experimental"
+                expected_preload_class,
+                "{filename} must retain its artifact class unless a narrower host receipt applies"
             );
             // The pin still does its real job: certified NAME + uncertified BYTES
             // loses the row's evidence at load, which is where it always mattered.
@@ -23673,10 +23802,20 @@ mod tests {
                 supported_compatibility_row_ids().contains(catalog_id),
                 "{filename} pins {catalog_id}, which is not a supported row"
             );
+            assert!(
+                supported_artifact_identity_matches(filename, sha256),
+                "{filename} must retain its certified byte identity independently of host scope"
+            );
+            let expected_lane =
+                if *filename == LFM2_5_2_6B_Q8_0_FILENAME && !lfm2_supported_on_current_host() {
+                    ModelLaneClass::ExperimentalImplemented
+                } else {
+                    ModelLaneClass::Supported
+                };
             assert_eq!(
                 classify_loaded_model_identity(Some("llama"), filename, sha256),
-                ModelLaneClass::Supported,
-                "{filename} with its certified bytes keeps the row"
+                expected_lane,
+                "{filename} with its certified bytes keeps its identity while obeying any narrower host lane"
             );
             assert_eq!(
                 classify_loaded_model_identity(Some("llama"), filename, &"00".repeat(32)),
@@ -28047,6 +28186,15 @@ pub struct CatalogItemView {
     pub architecture: String,
     pub license: String,
     pub oracle_qualified: bool,
+    /// Current-host verdict for a curated row whose support evidence is narrower
+    /// than the static catalog contract. `None` keeps the ordinary existing
+    /// compatibility/oracle path for rows without an explicit host predicate.
+    ///
+    /// An explicit non-supported value is authoritative: it prevents a static
+    /// `/api/capabilities` row from promoting platform-scoped evidence onto an
+    /// unreceipted host. Live Hugging Face rows never carry this field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_lane_class: Option<ModelLaneClass>,
     /// `"curated"` (pinned, known-good, authoritative metadata) or `"experimental"`
     /// (live from Hugging Face; metadata is advisory and must never read as support).
     pub group: &'static str,
@@ -28205,6 +28353,7 @@ impl CatalogItemView {
             architecture: item.architecture.to_string(),
             license: item.license.to_string(),
             oracle_qualified: crate::runnable::oracle_qualified(item.architecture, item.quant),
+            host_lane_class: catalog_host_lane_class(item),
             group: "curated",
             arch_detected: true,
             fit,
@@ -28250,6 +28399,7 @@ impl CatalogItemView {
             architecture: file.architecture,
             license: String::new(),
             oracle_qualified: false,
+            host_lane_class: None,
             group: "experimental",
             arch_detected: false,
             fit,
@@ -30727,13 +30877,169 @@ fn filename_is_supported_exact_row(filename: &str) -> bool {
             .any(|(artifact, row_id, _)| *artifact == filename && supported.contains(row_id))
 }
 
+const LFM2_5_2_6B_Q8_0_FILENAME: &str = "LFM2.5-2.6B-Q8_0.gguf";
+
+/// The exact platform envelope carried by the LFM2 promotion receipts.
+///
+/// Windows x86_64 owns the original runnable-CPU receipt. The independent Mac
+/// receipt is deliberately narrower: one Mac16,10 / base Apple M4 shape on
+/// macOS 26.5, with the resident-Metal lane enabled. Linux, CUDA, other Apple
+/// hardware, later macOS revisions, and a Mac CPU fallback remain runnable but
+/// experimental until they earn their own receipts.
+fn lfm2_support_scope_matches(
+    operating_system: &str,
+    architecture: &str,
+    mac_model_identifier: Option<&str>,
+    cpu_model: Option<&str>,
+    operating_system_version: Option<&str>,
+    resident_metal_enabled: bool,
+    supported_profile_selected: bool,
+) -> bool {
+    if !supported_profile_selected {
+        return false;
+    }
+    if operating_system == "windows" && architecture == "x86_64" {
+        return true;
+    }
+    operating_system == "macos"
+        && architecture == "aarch64"
+        && mac_model_identifier == Some("Mac16,10")
+        && cpu_model == Some("Apple M4")
+        && operating_system_version == Some("26.5")
+        && resident_metal_enabled
+}
+
+#[cfg(target_os = "macos")]
+fn lfm2_support_command_output(program: &str, args: &[&str]) -> Option<String> {
+    std::process::Command::new(program)
+        .args(args)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn lfm2_supported_on_current_host() -> bool {
+    let supported_profile_selected = crate::execution_plan::lfm2_supported_profile_selected();
+    if lfm2_support_scope_matches(
+        env::consts::OS,
+        env::consts::ARCH,
+        None,
+        None,
+        None,
+        false,
+        supported_profile_selected,
+    ) {
+        return true;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        static HOST_FACTS: OnceLock<(String, String, String)> = OnceLock::new();
+        static METAL_AVAILABLE: OnceLock<bool> = OnceLock::new();
+        let (model_identifier, cpu_model, operating_system_version) =
+            HOST_FACTS.get_or_init(|| {
+                (
+                    lfm2_support_command_output("sysctl", &["-n", "hw.model"])
+                        .unwrap_or_else(|| "unknown".into()),
+                    lfm2_support_command_output("sysctl", &["-n", "machdep.cpu.brand_string"])
+                        .unwrap_or_else(|| "unknown".into()),
+                    lfm2_support_command_output("sw_vers", &["-productVersion"])
+                        .unwrap_or_else(|| "unknown".into()),
+                )
+            });
+        return lfm2_support_scope_matches(
+            env::consts::OS,
+            env::consts::ARCH,
+            Some(model_identifier),
+            Some(cpu_model),
+            Some(operating_system_version),
+            crate::runnable::model::lfm2_metal_enabled()
+                && *METAL_AVAILABLE.get_or_init(|| crate::metal::detect_metal_device().available),
+            supported_profile_selected,
+        );
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
+fn supported_exact_row_host_eligible(filename: &str) -> bool {
+    filename != LFM2_5_2_6B_Q8_0_FILENAME || lfm2_supported_on_current_host()
+}
+
+/// Finalize the provisional LFM plan only after the load pipeline has hashed
+/// the actual bytes. Planning can prove a host/backend shape but cannot prove
+/// artifact identity from GGUF metadata: `general.name` is user-controlled and
+/// a same-named replacement may carry different bytes. Every stored/health plan
+/// therefore loses the supported label unless filename and certified digest
+/// both match the promoted artifact.
+fn finalize_execution_plan_support_for_loaded_artifact(
+    plan: &mut ExecutionPlan,
+    model_path: &std::path::Path,
+    gguf_sha256: &str,
+) {
+    if plan.model_family != "lfm2" || plan.support_level != "supported_exact_row_smoke" {
+        return;
+    }
+    let filename = model_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    if filename == LFM2_5_2_6B_Q8_0_FILENAME
+        && supported_artifact_identity_matches(filename, gguf_sha256)
+    {
+        return;
+    }
+
+    plan.support_level = "unknown_or_unvalidated".into();
+    if let Some(reason) = plan
+        .reasons
+        .iter_mut()
+        .find(|reason| reason.starts_with("support_level="))
+    {
+        *reason = "support_level=unknown_or_unvalidated".into();
+    }
+    plan.reasons
+        .push("support withheld: LFM filename or certified sha256 did not match".into());
+}
+
+/// Add a current-host answer only for the explicitly platform-scoped LFM row.
+/// Other curated rows retain their existing compatibility/oracle prediction;
+/// live Hugging Face rows never call this helper.
+///
+/// Keeping the negative explicit is important for platform-scoped promotions:
+/// the capabilities ledger remains a description of all certified lanes, while
+/// this value answers whether the host serving the catalog owns one of them.
+fn catalog_host_lane_class_with_eligibility(
+    item: &CatalogItem,
+    host_eligible: bool,
+) -> Option<ModelLaneClass> {
+    (item.filename == LFM2_5_2_6B_Q8_0_FILENAME
+        && supported_compatibility_row_ids().contains(item.catalog_id))
+    .then_some(if host_eligible {
+        ModelLaneClass::Supported
+    } else {
+        ModelLaneClass::ExperimentalImplemented
+    })
+}
+
+fn catalog_host_lane_class(item: &CatalogItem) -> Option<ModelLaneClass> {
+    catalog_host_lane_class_with_eligibility(item, supported_exact_row_host_eligible(item.filename))
+}
+
 /// Classify a model from real header metadata. `architecture` is the parsed
 /// `general.architecture` (NOT a filename guess); `filename` identifies the exact
-/// artifact for the supported-row check.
+/// artifact for the supported-row check. Rows whose evidence is platform-scoped
+/// must also match the current host; otherwise an implemented artifact remains
+/// runnable under the explicit experimental label.
 fn classify_model_lane(architecture: Option<&str>, filename: &str) -> ModelLaneClass {
     match architecture {
         Some(arch) if crate::model::is_implemented_architecture(arch) || arch == "nomic-bert" => {
-            if filename_is_supported_exact_row(filename) {
+            if filename_is_supported_exact_row(filename)
+                && supported_exact_row_host_eligible(filename)
+            {
                 ModelLaneClass::Supported
             } else {
                 ModelLaneClass::ExperimentalImplemented
@@ -32333,6 +32639,47 @@ mod catalog_fit_tests {
     }
 
     #[test]
+    fn curated_supported_lane_is_explicitly_scoped_to_the_current_host() {
+        let hw = host(false, 0, 64 * GIB, 48 * GIB);
+        let item = row("lfm2_5_2_6b_q8_0");
+
+        // Exercise both sides without depending on the CI host. The static
+        // supported row remains the same; only the host receipt changes.
+        assert_eq!(
+            super::catalog_host_lane_class_with_eligibility(&item, true),
+            Some(super::ModelLaneClass::Supported)
+        );
+        assert_eq!(
+            super::catalog_host_lane_class_with_eligibility(&item, false),
+            Some(super::ModelLaneClass::ExperimentalImplemented)
+        );
+
+        let view = CatalogItemView::from_curated(&item, &hw);
+        let expected = if super::lfm2_supported_on_current_host() {
+            super::ModelLaneClass::Supported
+        } else {
+            super::ModelLaneClass::ExperimentalImplemented
+        };
+        assert_eq!(view.host_lane_class, Some(expected));
+        assert_eq!(
+            serde_json::to_value(&view).unwrap()["host_lane_class"],
+            serde_json::json!(match expected {
+                super::ModelLaneClass::Supported => "supported",
+                super::ModelLaneClass::ExperimentalImplemented => "experimental_implemented",
+                super::ModelLaneClass::Unsupported => "unsupported",
+            }),
+            "the frontend must receive the host-scoped verdict"
+        );
+
+        let unpromoted = row("qwen3_14b_q4_k_m");
+        assert_eq!(
+            super::catalog_host_lane_class_with_eligibility(&unpromoted, true),
+            None,
+            "a host verdict must not manufacture support for an unpromoted row"
+        );
+    }
+
+    #[test]
     fn both_bonsai_27b_rows_publish_the_same_checked_vision_projector() {
         let hw = host(true, 6 * GIB, 32 * GIB, 24 * GIB);
         for id in ["bonsai_27b_q1_0", "ternary_bonsai_27b_q2_0"] {
@@ -32387,6 +32734,14 @@ mod catalog_fit_tests {
         assert!(view.task_tags.is_empty());
         assert_eq!(view.group, "experimental");
         assert_eq!(view.fit_confidence, "unknown");
+        assert_eq!(view.host_lane_class, None);
+        assert!(
+            serde_json::to_value(&view)
+                .unwrap()
+                .get("host_lane_class")
+                .is_none(),
+            "live filename guesses must not carry an authoritative host lane"
+        );
     }
 
     #[test]
@@ -32563,7 +32918,9 @@ mod catalog_fit_tests {
             );
             assert_eq!(
                 super::classify_model_lane(Some(architecture), filename),
-                if supported {
+                if supported
+                    && (id != "lfm2_5_2_6b_q8_0" || super::lfm2_supported_on_current_host())
+                {
                     super::ModelLaneClass::Supported
                 } else {
                     super::ModelLaneClass::ExperimentalImplemented
@@ -32578,7 +32935,11 @@ mod catalog_fit_tests {
                 "LFM2.5-2.6B-Q8_0.gguf",
                 "36587fdf27bdfc69caf2637273679a0870ec155162161bde6fd16e8c70bdb757",
             ),
-            super::ModelLaneClass::Supported
+            if super::lfm2_supported_on_current_host() {
+                super::ModelLaneClass::Supported
+            } else {
+                super::ModelLaneClass::ExperimentalImplemented
+            }
         );
         assert_eq!(
             super::classify_loaded_model_identity(

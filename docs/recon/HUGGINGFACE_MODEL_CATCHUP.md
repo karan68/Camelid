@@ -116,7 +116,7 @@ Phase 1 gates as passing for one immutable artifact:
   completions and tools remain intentionally typed fail-closed
 
 The exact-row Mac handoff at
-`qa/evidence-bundles/lfm2-2.6b-q8-macos-metal-20260810-head-35ca855f/` is complete
+`qa/evidence-bundles/lfm2-2.6b-q8-macos-metal-20260810-head-d31e5cb0/` is complete
 on Apple M4 / macOS 26.5 / arm64. Against pinned llama.cpp b9632
 (`acd79d603`), its release gate matches all 96/96 short greedy generated IDs and
 its reference-only context gate matches an exact 512-token rendered chat prompt

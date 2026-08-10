@@ -4798,21 +4798,16 @@ fn lfm2_metal_prefill_chunk() -> usize {
         .unwrap_or(64)
 }
 
-/// Whether the LFM2 resident Metal lane may be used. DEFAULT-ON; opt out with
-/// `CAMELID_LFM2_METAL=0` (also `off`/`false`/`no`/`disabled`, the documented
-/// opt-out convention).
+/// Whether the LFM2 resident Metal lane may be used. DEFAULT-ON; the Safe
+/// profile or `CAMELID_LFM2_METAL=0` (also `off`/`false`/`no`/`disabled`)
+/// selects the CPU path.
 ///
 /// This predicate MUST stay in lockstep with the execution-plan gate in
 /// `execution_plan.rs`. They answer the same question, and when they disagree
 /// `/v1/health` describes a lane other than the one that ran.
 #[cfg(target_os = "macos")]
 pub(crate) fn lfm2_metal_enabled() -> bool {
-    // Reuses the planner's own opt-out predicate rather than restating the value
-    // list. Restating it is how the two drift: an independently written list here
-    // already differed from the planner's on `no` and `cpu`, which would have let
-    // routing and disclosure disagree for those two values.
-    !std::env::var("CAMELID_LFM2_METAL")
-        .is_ok_and(|v| crate::execution_plan::flag_value_disabled(&v))
+    crate::execution_plan::lfm2_metal_plan_selectable()
 }
 
 /// Whether qwen35 decode routes to the resident Metal graph (default on; `=0`

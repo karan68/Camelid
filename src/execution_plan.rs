@@ -273,8 +273,14 @@ fn env_updates_enable_gate(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlanPlatform {
     pub operating_system: String,
+    /// Host operating-system product version. On macOS this is the exact
+    /// `sw_vers -productVersion` value used to scope host-specific receipts.
+    pub operating_system_version: String,
     pub architecture: String,
     pub platform_label: String,
+    /// Hardware model identifier (for example `Mac16,10`), distinct from the
+    /// processor brand. Unknown on platforms where Camelid has no stable probe.
+    pub host_model_identifier: String,
     pub cpu_model: String,
     pub cpu_features: Vec<String>,
     /// A usable Metal compute device exists on this host (always false off macOS).
@@ -295,8 +301,10 @@ pub struct PlanPlatform {
 impl PlanPlatform {
     pub fn current() -> Self {
         let operating_system = env::consts::OS.to_string();
+        let operating_system_version = operating_system_version();
         let architecture = env::consts::ARCH.to_string();
         let cpu_features = cpu_features();
+        let host_model_identifier = host_model_identifier();
         let cpu_model = cpu_model();
         let platform_label = platform_label(&operating_system, &architecture, &cpu_model);
         let metal_available = crate::metal::detect_metal_device().available;
@@ -305,8 +313,10 @@ impl PlanPlatform {
         let cuda_resident_active = cuda_resident_decode_will_run();
         Self {
             operating_system,
+            operating_system_version,
             architecture,
             platform_label,
+            host_model_identifier,
             cpu_model,
             cpu_features,
             metal_available,
@@ -493,14 +503,13 @@ pub fn plan_for_model_with_platform_and_env(
         && !matches!(profile, ExecutionProfile::Safe)
         && (gguf.architecture() != Some("qwen35")
             || !planner_env.flag_disabled("CAMELID_QWEN35_CUDA"));
-    let support_level = if prism_supported_macos {
+    let mut support_level = if prism_supported_macos {
         "supported_exact_row_smoke_macos_metal".to_string()
     } else if prism_supported_windows {
         "supported_exact_row_smoke_windows_cuda".to_string()
     } else {
         support_level(&row, &quant_type)
     };
-    reasons.push(format!("support_level={support_level}"));
 
     let bitnet_gpu_allowed =
         platform.gpu_accel_enabled && !planner_env.flag_disabled("CAMELID_BITNET_GPU");
@@ -661,8 +670,7 @@ pub fn plan_for_model_with_platform_and_env(
         && platform.operating_system == "macos"
         && platform.architecture == "aarch64"
         && platform.metal_available
-        && !matches!(profile, ExecutionProfile::Safe)
-        && !planner_env.flag_disabled("CAMELID_LFM2_METAL")
+        && lfm2_metal_policy_allows(&profile, planner_env.flag_disabled("CAMELID_LFM2_METAL"))
     {
         // The lfm2 resident Metal graph. Without this arm lfm2 fell through every
         // arm below to the safe path and `/v1/health` reported `cpu_reference` /
@@ -858,6 +866,32 @@ pub fn plan_for_model_with_platform_and_env(
             "safe_cpu_reference_path",
         )
     };
+
+    // LFM2.5-2.6B is supported only on the two lanes that carry receipts. Its
+    // row-table entry is recognition-only so a Linux host, a neighboring Mac,
+    // Safe mode, or a CPU fallback cannot inherit the platform-blind claim.
+    // Evaluate this after route selection: the Mac receipt is specifically for
+    // the resident backend/prefill/decode labels below, not merely for a host
+    // on which Metal happens to be present.
+    if is_lfm2_5_2_6b_exact_row(&row) {
+        support_level = if lfm2_selected_lane_supported(
+            &profile,
+            &platform,
+            model_path,
+            gguf,
+            &quant_type,
+            selected_backend,
+            prefill_path,
+            decode_path,
+        ) {
+            "supported_exact_row_smoke".into()
+        } else {
+            "unknown_or_unvalidated".into()
+        };
+    }
+    // Preserve the stable reason ordering (profile, row, quant, support, lane)
+    // even though LFM support can only be decided after lane selection.
+    reasons.insert(3, format!("support_level={support_level}"));
 
     let plan = ExecutionPlan {
         profile,
@@ -1907,11 +1941,64 @@ fn support_level(row: &str, quant_type: &str) -> String {
         return "unknown_or_unvalidated".into();
     }
     let level = recognized_row_level(row);
-    if level == "recognized_prism_bonsai_exact_row" {
+    if matches!(
+        level,
+        "recognized_prism_bonsai_exact_row" | "recognized_lfm2_5_2_6b_exact_row"
+    ) {
         "unknown_or_unvalidated".into()
     } else {
         level.into()
     }
+}
+
+/// Exact public LFM2.5 2.6B row recognition. Keep this stem match narrow: a
+/// future Base, tool, multimodal, or differently versioned file must not
+/// inherit the one Q8_0 receipt merely because its name contains `2.6B`.
+fn is_lfm2_5_2_6b_exact_row(row: &str) -> bool {
+    let normalized = normalize_row(row);
+    let stem = normalized.strip_suffix("_gguf").unwrap_or(&normalized);
+    matches!(stem, "lfm2_5_2_6b" | "lfm2_5_2_6b_q8_0")
+}
+
+/// Whether the selected execution plan is one of the two receipted LFM lanes.
+///
+/// Windows evidence covers the non-Safe x86_64 runnable CPU plan. The macOS
+/// receipt is narrower: one Mac16,10 with the base Apple M4 CPU, macOS 26.5,
+/// and the exact resident-Metal backend/prefill/decode labels. Every other
+/// platform or fallback remains recognition-only.
+fn lfm2_selected_lane_supported(
+    profile: &ExecutionProfile,
+    platform: &PlanPlatform,
+    model_path: &Path,
+    gguf: &GgufFile,
+    quant_type: &str,
+    selected_backend: &str,
+    prefill_path: &str,
+    decode_path: &str,
+) -> bool {
+    if matches!(profile, ExecutionProfile::Safe)
+        || gguf.architecture() != Some("lfm2")
+        || quant_type != "Q8_0"
+        || model_path.file_name().and_then(|name| name.to_str()) != Some("LFM2.5-2.6B-Q8_0.gguf")
+    {
+        return false;
+    }
+
+    let windows_runnable_cpu = platform.operating_system == "windows"
+        && platform.architecture == "x86_64"
+        && selected_backend == "cpu_reference"
+        && prefill_path == "safe_cpu_prefill"
+        && decode_path == "safe_cpu_decode";
+    let exact_m4_resident_metal = platform.operating_system == "macos"
+        && platform.operating_system_version.trim() == "26.5"
+        && platform.architecture == "aarch64"
+        && platform.host_model_identifier.trim() == "Mac16,10"
+        && platform.cpu_model.trim() == "Apple M4"
+        && selected_backend == "metal_resident_lfm2_runtime"
+        && prefill_path == "lfm2_metal_resident_prefill"
+        && decode_path == "lfm2_metal_resident_decode";
+
+    windows_runnable_cpu || exact_m4_resident_metal
 }
 
 /// Quant certified for one exact Prism/Bonsai artifact name. Exact normalized
@@ -1983,17 +2070,17 @@ fn recognized_row_level(row: &str) -> &'static str {
         // Non-Q8_0 quants of the same name report unknown via `support_level`
         // and are declined by the resident admission (hazard H5).
         "supported_exact_row_smoke_sub512"
-    } else if normalized.contains("lfm2_5_2_6b") {
-        // LFM2.5-2.6B Q8_0 is certified on the runnable lane. Some published
-        // conversions use an opaque hash for `general.name`, so recognizing
-        // the exact model family in the filename lets `exact_model_row` expose
-        // the same supported row as `/api/capabilities`.
+    } else if is_lfm2_5_2_6b_exact_row(row) {
+        // Recognition only. Some published conversions use an opaque hash for
+        // `general.name`, so recognizing the exact filename lets
+        // `exact_model_row` expose the capabilities row. The plan promotes
+        // this marker only after a receipted platform and actual selected lane
+        // both match; platform-blind `support_level` maps it back to unknown.
         //
         // This does not admit LFM2 to the optimized dense Q8 planner:
         // `is_supported_exact_q8_row` rejects runnable-only architectures
-        // before consulting this table, and `support_level` still gates the
-        // claim to Q8_0.
-        "supported_exact_row_smoke"
+        // before consulting this table.
+        "recognized_lfm2_5_2_6b_exact_row"
     } else if normalized.contains("ornith_1_0_9b") {
         // Ornith-1.0-9B (qwen35 hybrid gated-delta-net), certified on the
         // runnable serve lane. `/api/capabilities` has carried
@@ -2228,6 +2315,28 @@ fn cpu_model() -> String {
     }
 }
 
+fn host_model_identifier() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        command_output("sysctl", &["-n", "hw.model"]).unwrap_or_else(|| "unknown".into())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        "unknown".into()
+    }
+}
+
+fn operating_system_version() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        command_output("sw_vers", &["-productVersion"]).unwrap_or_else(|| "unknown".into())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        "unknown".into()
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn command_output(program: &str, args: &[&str]) -> Option<String> {
     std::process::Command::new(program)
@@ -2314,6 +2423,27 @@ fn env_flag_disabled(key: &str) -> bool {
     env::var(key).is_ok_and(|value| flag_value_disabled(&value))
 }
 
+/// Whether the LFM2 resident-Metal plan may be selected from operator policy.
+/// Runtime routing calls the same predicate so `CAMELID_PROFILE=safe` and the
+/// explicit LFM opt-out cannot leave health reporting CPU while Metal runs.
+pub(crate) fn lfm2_metal_plan_selectable() -> bool {
+    lfm2_metal_policy_allows(
+        &requested_profile().0,
+        env_flag_disabled("CAMELID_LFM2_METAL"),
+    )
+}
+
+/// The promotion receipts cover the normal runnable profile, not Safe (or an
+/// invalid profile that resolves to Safe). API/catalog host classification uses
+/// this same parser so it cannot disagree with the stored execution plan.
+pub(crate) fn lfm2_supported_profile_selected() -> bool {
+    !matches!(requested_profile().0, ExecutionProfile::Safe)
+}
+
+fn lfm2_metal_policy_allows(profile: &ExecutionProfile, explicitly_disabled: bool) -> bool {
+    !matches!(profile, ExecutionProfile::Safe) && !explicitly_disabled
+}
+
 #[allow(dead_code)]
 fn env_flag_enabled(key: &str) -> bool {
     env::var(key).is_ok_and(|value| flag_value_enabled(&value))
@@ -2345,6 +2475,20 @@ mod tests {
                 "{v:?} must leave the default-on lane enabled for BOTH gates"
             );
         }
+
+        let _guard = crate::test_support::env_lock();
+        env::set_var("CAMELID_PROFILE", "safe");
+        env::remove_var("CAMELID_LFM2_METAL");
+        assert!(
+            !lfm2_metal_plan_selectable(),
+            "Safe profile must disable both LFM plan selection and runtime routing"
+        );
+        env::set_var("CAMELID_PROFILE", "auto");
+        assert!(lfm2_metal_plan_selectable());
+        env::set_var("CAMELID_LFM2_METAL", "0");
+        assert!(!lfm2_metal_plan_selectable());
+        env::remove_var("CAMELID_PROFILE");
+        env::remove_var("CAMELID_LFM2_METAL");
     }
 
     use super::*;
@@ -2357,8 +2501,10 @@ mod tests {
     fn platform(os: &str, arch: &str, features: &[&str]) -> PlanPlatform {
         PlanPlatform {
             operating_system: os.into(),
+            operating_system_version: "fixture-os-version".into(),
             architecture: arch.into(),
             platform_label: platform_label(os, arch, "Apple M4"),
+            host_model_identifier: "fixture-host-model".into(),
             cpu_model: "fixture cpu".into(),
             cpu_features: features.iter().map(|feature| (*feature).into()).collect(),
             metal_available: false,
@@ -2382,6 +2528,15 @@ mod tests {
             gpu_accel_enabled: true,
             cuda_resident_active: true,
             ..platform(os, arch, features)
+        }
+    }
+
+    fn receipted_lfm2_m4_platform() -> PlanPlatform {
+        PlanPlatform {
+            operating_system_version: "26.5".into(),
+            host_model_identifier: "Mac16,10".into(),
+            cpu_model: "Apple M4".into(),
+            ..metal_platform("macos", "aarch64", &["dotprod", "i8mm"])
         }
     }
 
@@ -2739,6 +2894,7 @@ mod tests {
             "CAMELID_METAL_KQUANT",
             "CAMELID_METAL_F32Y",
             "CAMELID_METAL_WIRE",
+            "CAMELID_LFM2_METAL",
             "CAMELID_QWEN35_CUDA",
             "CAMELID_X86_Q8_REPACK",
             "CAMELID_X86_Q8_KERNEL",
@@ -2812,7 +2968,7 @@ mod tests {
     }
 
     #[test]
-    fn lfm2_filename_recognition_matches_capabilities_without_dense_q8_admission() {
+    fn lfm2_filename_is_recognized_without_platform_blind_support_or_dense_q8_admission() {
         let capabilities_status = crate::api::capabilities_response()
             .model_compatibility
             .iter()
@@ -2833,12 +2989,147 @@ mod tests {
         let row = exact_model_row(&PathBuf::from("/models/LFM2.5-2.6B-Q8_0.gguf"), &gguf);
 
         assert_eq!(row, "LFM2.5-2.6B-Q8_0.gguf");
-        assert_eq!(support_level(&row, "Q8_0"), capabilities_status);
+        assert_eq!(
+            recognized_row_level(&row),
+            "recognized_lfm2_5_2_6b_exact_row"
+        );
+        assert_eq!(support_level(&row, "Q8_0"), "unknown_or_unvalidated");
         assert_eq!(support_level(&row, "Q4_K_M"), "unknown_or_unvalidated");
         assert!(
             !is_supported_exact_q8_row(&row, &gguf),
             "LFM2 is certified on its runnable lane, not the optimized dense Q8 engine"
         );
+    }
+
+    fn lfm2_q8_fixture() -> GgufFile {
+        let mut gguf = quant_fixture(
+            "799e37a4e60bdaae",
+            None,
+            &[GgufTensorType::Q8_0, GgufTensorType::F32],
+        );
+        gguf.metadata.insert(
+            "general.architecture".into(),
+            GgufMetadataValue::String("lfm2".into()),
+        );
+        gguf
+    }
+
+    fn lfm2_plan(filename: &str, platform: PlanPlatform) -> ExecutionPlanOutcome {
+        plan_for_model_with_platform(
+            &PathBuf::from(format!("/models/{filename}")),
+            &lfm2_q8_fixture(),
+            Some(8),
+            platform,
+        )
+    }
+
+    #[test]
+    fn lfm2_support_level_is_limited_to_the_two_receipted_execution_lanes() {
+        let _guard = env_lock();
+        clear_profile_env();
+
+        let windows = lfm2_plan(
+            "LFM2.5-2.6B-Q8_0.gguf",
+            platform("windows", "x86_64", &["avx2"]),
+        );
+        assert_eq!(windows.plan.profile, ExecutionProfile::Auto);
+        assert_eq!(windows.plan.selected_backend, "cpu_reference");
+        assert_eq!(windows.plan.prefill_path, "safe_cpu_prefill");
+        assert_eq!(windows.plan.decode_path, "safe_cpu_decode");
+        assert_eq!(windows.plan.support_level, "supported_exact_row_smoke");
+
+        let mac = lfm2_plan("LFM2.5-2.6B-Q8_0.gguf", receipted_lfm2_m4_platform());
+        assert_eq!(mac.plan.profile, ExecutionProfile::Auto);
+        assert_eq!(mac.plan.selected_backend, "metal_resident_lfm2_runtime");
+        assert_eq!(mac.plan.prefill_path, "lfm2_metal_resident_prefill");
+        assert_eq!(mac.plan.decode_path, "lfm2_metal_resident_decode");
+        assert_eq!(mac.plan.support_level, "supported_exact_row_smoke");
+
+        let linux = lfm2_plan(
+            "LFM2.5-2.6B-Q8_0.gguf",
+            platform("linux", "x86_64", &["avx2"]),
+        );
+        assert_eq!(linux.plan.support_level, "unknown_or_unvalidated");
+
+        clear_profile_env();
+    }
+
+    #[test]
+    fn lfm2_support_level_fails_closed_off_the_exact_m4_receipt() {
+        let _guard = env_lock();
+        clear_profile_env();
+
+        let mut m3 = receipted_lfm2_m4_platform();
+        m3.host_model_identifier = "Mac15,6".into();
+        m3.cpu_model = "Apple M3".into();
+        assert_eq!(
+            lfm2_plan("LFM2.5-2.6B-Q8_0.gguf", m3).plan.support_level,
+            "unknown_or_unvalidated"
+        );
+
+        let mut other_model_identifier = receipted_lfm2_m4_platform();
+        other_model_identifier.host_model_identifier = "Mac16,11".into();
+        assert_eq!(
+            lfm2_plan("LFM2.5-2.6B-Q8_0.gguf", other_model_identifier)
+                .plan
+                .support_level,
+            "unknown_or_unvalidated"
+        );
+
+        let mut other_os_version = receipted_lfm2_m4_platform();
+        other_os_version.operating_system_version = "26.6".into();
+        assert_eq!(
+            lfm2_plan("LFM2.5-2.6B-Q8_0.gguf", other_os_version)
+                .plan
+                .support_level,
+            "unknown_or_unvalidated"
+        );
+
+        let mut cpu_fallback = platform("macos", "aarch64", &["dotprod", "i8mm"]);
+        cpu_fallback.operating_system_version = "26.5".into();
+        cpu_fallback.host_model_identifier = "Mac16,10".into();
+        cpu_fallback.cpu_model = "Apple M4".into();
+        let cpu_fallback = lfm2_plan("LFM2.5-2.6B-Q8_0.gguf", cpu_fallback);
+        assert_eq!(cpu_fallback.plan.selected_backend, "cpu_reference");
+        assert_eq!(cpu_fallback.plan.support_level, "unknown_or_unvalidated");
+
+        env::set_var("CAMELID_PROFILE", "safe");
+        let safe_mac = lfm2_plan("LFM2.5-2.6B-Q8_0.gguf", receipted_lfm2_m4_platform());
+        assert_eq!(safe_mac.plan.profile, ExecutionProfile::Safe);
+        assert_eq!(safe_mac.plan.selected_backend, "cpu_reference");
+        assert_eq!(safe_mac.plan.support_level, "unknown_or_unvalidated");
+        let safe_windows = lfm2_plan(
+            "LFM2.5-2.6B-Q8_0.gguf",
+            platform("windows", "x86_64", &["avx2"]),
+        );
+        assert_eq!(safe_windows.plan.profile, ExecutionProfile::Safe);
+        assert_eq!(safe_windows.plan.support_level, "unknown_or_unvalidated");
+        env::remove_var("CAMELID_PROFILE");
+
+        let neighboring_model =
+            lfm2_plan("LFM2.5-2.6B-Base-Q8_0.gguf", receipted_lfm2_m4_platform());
+        assert_eq!(
+            neighboring_model.plan.support_level,
+            "unknown_or_unvalidated"
+        );
+
+        let mut renamed = lfm2_q8_fixture();
+        renamed.metadata.insert(
+            "general.name".into(),
+            GgufMetadataValue::String("LFM2.5-2.6B".into()),
+        );
+        let renamed = plan_for_model_with_platform(
+            &PathBuf::from("/models/repacked-lfm2.gguf"),
+            &renamed,
+            Some(8),
+            receipted_lfm2_m4_platform(),
+        );
+        assert_eq!(
+            renamed.plan.support_level, "unknown_or_unvalidated",
+            "a general.name match cannot promote a renamed artifact"
+        );
+
+        clear_profile_env();
     }
 
     #[test]

@@ -30,6 +30,7 @@ function backendMarksSupportedRow(model) {
 
 const GEMMA4_26B_LANE_SCOPED_ROW = 'gemma4_26b_a4b_it_q4_0'
 const GEMMA4_SERVE_LANES = new Set(['ghost_moe', 'local', 'distributed', 'cuda'])
+const LFM2_26B_LANE_SCOPED_ROW = 'lfm2_5_2_6b_q8_0'
 
 function normalizedGemma4ServeLane(runtime) {
   const lane = String(runtime?.gemma4_serve_lane || '').trim().toLowerCase().replace(/-/g, '_')
@@ -53,6 +54,52 @@ function isGemma426bLaneScopedRow(model, hint) {
     return normalized === GEMMA4_26B_LANE_SCOPED_ROW
       || (/gemma_?4_26b(?:_|$)/.test(normalized) && normalized.includes('q4_0'))
   })
+}
+
+function normalizedIdentity(value) {
+  return String(value || '').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '')
+}
+
+function isLfm226bLaneScopedRow(model, hint) {
+  if (hint?.kind === 'compatibility' && hint?.exact === true
+    && hint?.target?.id === LFM2_26B_LANE_SCOPED_ROW) return true
+  const identities = [
+    model?.catalog_id,
+    model?.compatibility_id,
+    model?.runtime_model_name,
+    model?.id,
+    model?.name,
+    model?.model_path,
+    model?.hf_filename,
+  ]
+  return identities.some((identity) => {
+    const normalized = normalizedIdentity(identity)
+    return normalized === LFM2_26B_LANE_SCOPED_ROW
+      || normalized.endsWith('_lfm2_5_2_6b_q8_0_gguf')
+      || normalized === 'lfm2_5_2_6b_q8_0_gguf'
+  })
+}
+
+function supportedLfm2Runtime(runtime) {
+  const plan = runtime?.execution_plan
+  if (runtime?.backend !== 'runnable-runtime' || !plan) return false
+  if (normalizedIdentity(plan.model_family) !== 'lfm2'
+    || normalizedIdentity(plan.exact_model_row) !== 'lfm2_5_2_6b_q8_0_gguf'
+    || plan.quant_type !== 'Q8_0'
+    || plan.support_level !== 'supported_exact_row_smoke') return false
+
+  if (plan.operating_system === 'windows' && plan.architecture === 'x86_64') {
+    return plan.selected_backend === 'cpu_reference'
+      && plan.prefill_path === 'safe_cpu_prefill'
+      && plan.decode_path === 'safe_cpu_decode'
+  }
+
+  return plan.operating_system === 'macos'
+    && plan.architecture === 'aarch64'
+    && plan.cpu_model === 'Apple M4'
+    && plan.selected_backend === 'metal_resident_lfm2_runtime'
+    && plan.prefill_path === 'lfm2_metal_resident_prefill'
+    && plan.decode_path === 'lfm2_metal_resident_decode'
 }
 
 function supportedCatalogGhostCuda(runtime, runtimeLane) {
@@ -99,24 +146,33 @@ export function getChatGateState(capabilities, model, runtime) {
   const runtimeReady = Boolean(!embeddingOnly && isRunnableInCurrentRuntime(model, runtime) && runtimeLoaded && runtimeGenerationReady)
   const discoveredHint = findCompatibilityHint(capabilities, model)
   const runtimeLane = normalizedGemma4ServeLane(runtime)
-  const laneScopedRow = isGemma426bLaneScopedRow(model, discoveredHint)
-  const scopedTarget = laneScopedRow
-    ? capabilities?.model_compatibility?.find((row) => row?.id === GEMMA4_26B_LANE_SCOPED_ROW)
+  const gemmaLaneScopedRow = isGemma426bLaneScopedRow(model, discoveredHint)
+  const lfm2LaneScopedRow = isLfm226bLaneScopedRow(model, discoveredHint)
+  const scopedRowId = gemmaLaneScopedRow
+    ? GEMMA4_26B_LANE_SCOPED_ROW
+    : lfm2LaneScopedRow
+      ? LFM2_26B_LANE_SCOPED_ROW
+      : null
+  const scopedTarget = scopedRowId
+    ? capabilities?.model_compatibility?.find((row) => row?.id === scopedRowId)
     : null
   const contractHint = scopedTarget
     ? {
         kind: 'compatibility',
         target: scopedTarget,
-        confidence: 'exact Gemma 4 26B artifact identity',
+        confidence: `exact ${gemmaLaneScopedRow ? 'Gemma 4 26B' : 'LFM2.5 2.6B'} artifact identity`,
         exact: true,
       }
     : discoveredHint
-  // Support evidence is lane-scoped. The 26B row is green only for distributed
+  // Support evidence is lane-scoped. Gemma 4 26B is green only for distributed
   // serve or the durable catalog-managed Windows CUDA Ghost pair with every GPU
-  // component live. Ad-hoc/CPU/Metal/partial Ghost runs fail closed.
-  const runtimeLaneEligible = !laneScopedRow
+  // component live. LFM2 is green only for the two receipted runnable lanes,
+  // with an execution plan whose host scope and live path are both verified.
+  const gemmaRuntimeLaneEligible = !gemmaLaneScopedRow
     || runtimeLane === 'distributed'
     || supportedCatalogGhostCuda(runtime, runtimeLane)
+  const lfm2RuntimeLaneEligible = !lfm2LaneScopedRow || supportedLfm2Runtime(runtime)
+  const runtimeLaneEligible = gemmaRuntimeLaneEligible && lfm2RuntimeLaneEligible
   // Once /api/models/local supplies a lane verdict, it owns artifact identity.
   // Falling back to name matching after an explicit experimental verdict would
   // let a same-named, wrong-hash file inherit the supported contract. Runtime
@@ -125,11 +181,11 @@ export function getChatGateState(capabilities, model, runtime) {
   const hasBackendLaneVerdict = Boolean(model?.lane_class)
   const artifactSupported = hasBackendLaneVerdict
     ? backendMarksSupportedRow(model)
-    : isCompatibilitySupportedForModel(capabilities, model)
+    : !lfm2LaneScopedRow && isCompatibilitySupportedForModel(capabilities, model)
   const contractSupported = Boolean(!embeddingOnly && runtimeLaneEligible && artifactSupported)
   const hint = runtimeLaneEligible
     ? contractHint
-    : runtimeLaneHint(contractHint, laneScopedRow, runtimeLane)
+    : runtimeLaneHint(contractHint, gemmaLaneScopedRow, runtimeLane)
   const chatUnlocked = Boolean(runtimeReady && contractSupported)
   // Experimental lane: the model loaded and is generation-ready (so its architecture
   // is implemented — generation_ready is false for unimplemented archs) but it is NOT

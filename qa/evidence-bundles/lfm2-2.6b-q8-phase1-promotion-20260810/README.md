@@ -36,7 +36,7 @@ fail-closed; sampling beyond the deterministic greedy lane, context above the
 checked 512-token bucket, neighboring sizes/quants, production throughput,
 and CUDA remain unclaimed. The later resident-Metal handoff completed on one
 Apple M4 host running macOS 26.5 arm64 and is recorded independently at
-`qa/evidence-bundles/lfm2-2.6b-q8-macos-metal-20260810-head-35ca855f/`; see
+`qa/evidence-bundles/lfm2-2.6b-q8-macos-metal-20260810-head-d31e5cb0/`; see
 `MAC_HANDOFF.md` for the retained recipe. That receipt does not retroactively
 change this bundle's Windows scope, and it does not claim other Apple hardware,
 broad platform portability, context above 512, sampling beyond greedy, tools,

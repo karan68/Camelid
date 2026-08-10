@@ -1,0 +1,106 @@
+{
+  "schema": "camelid.model-promotion.exact-model-identity.v1",
+  "expected": {
+    "model_id": "lfm2_5_2_6b_q8_0",
+    "model_path": "$CAMELID_MODEL_ROOT/lfm2/LFM2.5-2.6B-Q8_0.gguf",
+    "filename": "LFM2.5-2.6B-Q8_0.gguf",
+    "size_bytes": 2874779456,
+    "lane_class": "supported",
+    "gguf_sha256": "36587fdf27bdfc69caf2637273679a0870ec155162161bde6fd16e8c70bdb757"
+  },
+  "current": {
+    "id": "lfm2_5_2_6b_q8_0",
+    "path": "$CAMELID_MODEL_ROOT/lfm2/LFM2.5-2.6B-Q8_0.gguf",
+    "lane": {
+      "model_id": "lfm2_5_2_6b_q8_0",
+      "gguf_sha256": "36587fdf27bdfc69caf2637273679a0870ec155162161bde6fd16e8c70bdb757",
+      "gguf_filename": "LFM2.5-2.6B-Q8_0.gguf",
+      "quantization": "Q8_0",
+      "architecture": "lfm2",
+      "tokenizer_kind": "gpt2_bpe",
+      "tokenizer_sha256": "0debd31d2a2c0079f709b4a9edc5f6a6b68403264e42bc862fe5182617e6c47b",
+      "camelid_version": "v0.6.1-26-gd31e5cb0",
+      "camelid_commit": "d31e5cb02bd3633407cbd3e6e89aeac5bacde617"
+    }
+  },
+  "local_model": {
+    "filename": "LFM2.5-2.6B-Q8_0.gguf",
+    "size_bytes": 2874779456,
+    "architecture": "lfm2",
+    "quantization": "Q8_0",
+    "tokenizer_kind": "gpt2_bpe",
+    "admitted": true,
+    "admission_reason": null,
+    "oracle_qualified": true,
+    "runnable_receipt_present": false,
+    "chat_capable": true,
+    "embedding_capable": false,
+    "generation_capable": true,
+    "context_length": 128000,
+    "ghost_moe_prepared": false,
+    "lane_class": "supported"
+  },
+  "checks": [
+    {
+      "name": "current model id",
+      "expected": "lfm2_5_2_6b_q8_0",
+      "actual": "lfm2_5_2_6b_q8_0",
+      "passed": true
+    },
+    {
+      "name": "current lane model id",
+      "expected": "lfm2_5_2_6b_q8_0",
+      "actual": "lfm2_5_2_6b_q8_0",
+      "passed": true
+    },
+    {
+      "name": "current model path",
+      "expected": "$CAMELID_MODEL_ROOT/lfm2/LFM2.5-2.6B-Q8_0.gguf",
+      "actual": "$CAMELID_MODEL_ROOT/lfm2/LFM2.5-2.6B-Q8_0.gguf",
+      "passed": true
+    },
+    {
+      "name": "current lane filename",
+      "expected": "LFM2.5-2.6B-Q8_0.gguf",
+      "actual": "LFM2.5-2.6B-Q8_0.gguf",
+      "passed": true
+    },
+    {
+      "name": "local exact filename match count",
+      "expected": 1,
+      "actual": 1,
+      "passed": true
+    },
+    {
+      "name": "local models directory path",
+      "expected": "$CAMELID_MODEL_ROOT/lfm2/LFM2.5-2.6B-Q8_0.gguf",
+      "actual": "$CAMELID_MODEL_ROOT/lfm2/LFM2.5-2.6B-Q8_0.gguf",
+      "passed": true
+    },
+    {
+      "name": "local exact file size",
+      "expected": 2874779456,
+      "actual": 2874779456,
+      "passed": true
+    },
+    {
+      "name": "loaded lane SHA-256 shape",
+      "expected": true,
+      "actual": true,
+      "passed": true
+    },
+    {
+      "name": "local lane class",
+      "expected": "supported",
+      "actual": "supported",
+      "passed": true
+    },
+    {
+      "name": "loaded lane SHA-256",
+      "expected": "36587fdf27bdfc69caf2637273679a0870ec155162161bde6fd16e8c70bdb757",
+      "actual": "36587fdf27bdfc69caf2637273679a0870ec155162161bde6fd16e8c70bdb757",
+      "passed": true
+    }
+  ],
+  "passed": true
+}
