@@ -67,7 +67,7 @@ use crate::{
     },
     model::{
         DenseLlamaDims, LlamaAttentionTensors, LlamaFfnTensors, LlamaModelConfig,
-        LlamaTensorBinding,
+        LlamaMoeExpertTensors, LlamaTensorBinding,
     },
     model_default,
     model_source::{inspect_model_source, ModelSourceInspection, ModelSourceKind},
@@ -4963,9 +4963,16 @@ fn loaded_model_generation_ready(model: &LoadedModel) -> bool {
     let Some(binding) = model.llama_tensors.as_ref() else {
         return false;
     };
+    let (layer_range, load_embedding, load_output) = api_weight_load_ownership();
     model.llama_config.is_some()
         && matches!(model.tokenizer, TokenizerLoadState::Available(_))
-        && guard_cpu_weight_materialization_budget(binding).is_ok()
+        && guard_cpu_weight_materialization_budget_with_ownership(
+            binding,
+            layer_range.as_ref(),
+            load_embedding,
+            load_output,
+        )
+        .is_ok()
 }
 
 /// Runtime GPU state for the UI toggle. `available` covers either a usable CUDA
@@ -13645,7 +13652,14 @@ async fn load_weights_lru(
         }
     }
 
-    let estimated_bytes = guard_cpu_weight_materialization_budget(binding).map_err(|err| {
+    let (layer_range, load_embedding, load_output) = api_weight_load_ownership();
+    let estimated_bytes = guard_cpu_weight_materialization_budget_with_ownership(
+        binding,
+        layer_range.as_ref(),
+        load_embedding,
+        load_output,
+    )
+    .map_err(|err| {
         api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "cpu_weight_materialization_exceeds_budget",
@@ -13665,7 +13679,12 @@ async fn load_weights_lru(
             if id != &model.id {
                 if let Some(m) = loaded.get(id) {
                     if let Some(b) = m.llama_tensors.as_ref() {
-                        if let Ok(bytes) = estimate_cpu_weight_materialization_bytes(b) {
+                        if let Ok(bytes) = estimate_cpu_weight_materialization_bytes_with_ownership(
+                            b,
+                            layer_range.as_ref(),
+                            load_embedding,
+                            load_output,
+                        ) {
                             current_sum += bytes;
                         }
                     }
@@ -13710,20 +13729,18 @@ async fn load_weights_lru(
     let store = TensorStore::open(&model.path, &model.gguf);
     // Only the coordinator reaches the API loader; a worker runs `run_worker_loop` instead.
     // Its ownership is role-derived, not positional -- see `distributed::PipelineRole`.
-    let loaded = match crate::distributed::DISTRIBUTED_RANGE.get() {
-        Some(&(layer_start, layer_end)) => {
-            let (load_embedding, load_output) =
-                crate::distributed::PipelineRole::Coordinator.tensor_ownership();
+    let loaded = match layer_range {
+        Some(layer_range) => {
             tracing::info!(
                 "API loader running in distributed coordinator mode; loading layers {}..{}",
-                layer_start,
-                layer_end
+                layer_range.start,
+                layer_range.end
             );
             LlamaLoadedWeights::load_distributed(
                 &store,
                 binding,
-                layer_start,
-                layer_end,
+                layer_range.start,
+                layer_range.end,
                 load_embedding,
                 load_output,
             )
@@ -15555,57 +15572,40 @@ fn cpu_weight_materialization_retains_q8_blocks() -> bool {
     )
 }
 
-fn lazy_q8_linear_materialization_enabled() -> bool {
-    match env::var(LAZY_Q8_LINEAR_ENV) {
-        Ok(value)
-            if value.eq_ignore_ascii_case("0")
-                || value.eq_ignore_ascii_case("false")
-                || value.eq_ignore_ascii_case("off")
-                || value.eq_ignore_ascii_case("disabled") =>
-        {
-            false
-        }
-        Ok(_) | Err(env::VarError::NotPresent) => true,
-        Err(_) => true,
-    }
-}
-
 fn q8_file_cache_bytes_for_health() -> Option<u64> {
     parse_byte_count_env("CAMELID_Q8_0_FILE_CACHE_BYTES").map(|value| value as u64)
 }
 
-fn q8_lazy_env_value_disabled(value: &str) -> bool {
-    value.eq_ignore_ascii_case("0")
-        || value.eq_ignore_ascii_case("false")
-        || value.eq_ignore_ascii_case("off")
-        || value.eq_ignore_ascii_case("disabled")
-}
-
-fn q8_lazy_env_present_and_enabled() -> bool {
-    matches!(env::var(LAZY_Q8_LINEAR_ENV), Ok(value) if !q8_lazy_env_value_disabled(&value))
-}
-
 fn q8_runtime_health() -> Q8RuntimeHealth {
-    let lazy_q8_linear = lazy_q8_linear_materialization_enabled();
+    let dense_storage = crate::inference::q8_dense_linear_storage_policy();
+    let lazy_q8_linear = matches!(
+        dense_storage,
+        crate::inference::Q8DenseLinearStorage::FileBacked
+    );
     let retain_q8_blocks = cpu_weight_materialization_retains_q8_blocks();
-    let forced_lazy = q8_lazy_env_present_and_enabled();
-    let policy = if forced_lazy {
+    let policy = if lazy_q8_linear {
         "forced_lazy_file_backed_q8"
-    } else if lazy_q8_linear {
-        "lazy_q8_linear_default_or_auto_retain"
+    } else if matches!(
+        dense_storage,
+        crate::inference::Q8DenseLinearStorage::WirePages
+    ) {
+        "resident_q8_wire_pages"
     } else if retain_q8_blocks {
-        "eager_f32_with_retained_q8_blocks"
+        "resident_q8_default_with_generic_retention"
     } else {
-        "eager_cpu_materialization"
+        "resident_q8_default"
     };
-    let note = if forced_lazy {
+    let note = if lazy_q8_linear {
         "Q8_0 linears are explicitly forced to file-backed lazy reads; retained-block settings do not override that loader path."
-    } else if lazy_q8_linear {
-        "Q8_0 linears are lazy by policy unless the loader auto-retains a fitting compact Q8 model."
+    } else if matches!(
+        dense_storage,
+        crate::inference::Q8DenseLinearStorage::WirePages
+    ) {
+        "Dense Q8_0 linears use page-aligned 34-byte GGUF wire allocations for Metal no-copy; this effective loader path outranks CAMELID_LAZY_Q8_0_LINEAR."
     } else if retain_q8_blocks {
-        "Lazy Q8_0 linears are disabled and Q8_0 source blocks are retained alongside eager f32 CPU weights."
+        "Dense Q8_0 linears use expanded RAM-resident blocks by default. CAMELID_RETAIN_Q8_0_BLOCKS also retains Q8_0 source blocks for tensors routed through the generic f32 loader."
     } else {
-        "Lazy Q8_0 linears are disabled; CPU weights may be eagerly materialized within the configured budget."
+        "Dense Q8_0 linears use expanded RAM-resident blocks by default; set CAMELID_LAZY_Q8_0_LINEAR=1 only to force the slower file-backed path."
     };
 
     Q8RuntimeHealth {
@@ -15618,10 +15618,75 @@ fn q8_runtime_health() -> Q8RuntimeHealth {
 }
 
 fn estimate_cpu_weight_materialization_bytes(binding: &LlamaTensorBinding) -> crate::Result<u64> {
+    estimate_cpu_weight_materialization_bytes_with_ownership(binding, None, true, true)
+}
+
+fn estimate_cpu_weight_materialization_bytes_with_ownership(
+    binding: &LlamaTensorBinding,
+    layer_range: Option<&std::ops::Range<usize>>,
+    load_embedding: bool,
+    load_output: bool,
+) -> crate::Result<u64> {
+    estimate_cpu_weight_materialization_bytes_with_q8_storage_and_ownership(
+        binding,
+        crate::inference::q8_dense_linear_storage_policy(),
+        layer_range,
+        load_embedding,
+        load_output,
+    )
+}
+
+fn estimate_cpu_weight_materialization_bytes_with_q8_storage(
+    binding: &LlamaTensorBinding,
+    dense_q8_storage: crate::inference::Q8DenseLinearStorage,
+) -> crate::Result<u64> {
+    estimate_cpu_weight_materialization_bytes_with_q8_storage_and_ownership(
+        binding,
+        dense_q8_storage,
+        None,
+        true,
+        true,
+    )
+}
+
+fn estimate_cpu_weight_materialization_bytes_with_q8_storage_and_ownership(
+    binding: &LlamaTensorBinding,
+    dense_q8_storage: crate::inference::Q8DenseLinearStorage,
+    layer_range: Option<&std::ops::Range<usize>>,
+    load_embedding: bool,
+    load_output: bool,
+) -> crate::Result<u64> {
+    #[derive(Clone, Copy)]
+    enum TensorLoadKind {
+        GenericF32,
+        DenseLinear,
+        MoeExpertMerged,
+        MoeExpertSplit,
+    }
+
+    fn page_rounded_wire_bytes(
+        desc: &GgufTensorDescriptor,
+        wire_bytes: u64,
+        storage_label: &str,
+    ) -> crate::Result<u64> {
+        let page_bytes = crate::wire_mmap::page_size() as u64;
+        wire_bytes
+            .div_ceil(page_bytes)
+            .checked_mul(page_bytes)
+            .ok_or_else(|| {
+                BackendError::InvalidTensorData(format!(
+                    "tensor {} {storage_label} page-rounded byte estimate overflow",
+                    desc.name
+                ))
+            })
+    }
+
     fn tensor_estimate(
         desc: &GgufTensorDescriptor,
         retain_q8_blocks: bool,
-        lazy_q8_linear: bool,
+        dense_q8_storage: crate::inference::Q8DenseLinearStorage,
+        resident_q8_experts: bool,
+        load_kind: TensorLoadKind,
     ) -> crate::Result<u64> {
         let element_count = desc.dimensions.iter().try_fold(1u64, |acc, dim| {
             acc.checked_mul(*dim).ok_or_else(|| {
@@ -15631,42 +15696,93 @@ fn estimate_cpu_weight_materialization_bytes(binding: &LlamaTensorBinding) -> cr
                 ))
             })
         })?;
-        let file_backed_q8_linear = lazy_q8_linear
-            && desc.tensor_type == GgufTensorType::Q8_0
-            && matches!(desc.dimensions.len(), 2 | 3);
-        // K-quant 2-D/3-D linears (Q4_K/Q5_K/Q6_K/Q2_K/Q3_K) load via the wire path
-        // (`load_kquant_wire_linear`), retaining only the compact super-block wire
-        // bytes â€” they never materialize an f32 copy, so they must not be counted
-        // against the f32 budget (otherwise a 4B Q2_K/Q4_K model's ~16 GB f32 estimate
-        // wrongly trips the safety limit even though the resident GPU path uses wire).
-        let wire_resident_kquant = matches!(
+        let q8_dense_linear = desc.tensor_type == GgufTensorType::Q8_0
+            && desc.dimensions.len() == 2
+            && matches!(load_kind, TensorLoadKind::DenseLinear);
+        let q8_expert_pack = desc.tensor_type == GgufTensorType::Q8_0
+            && matches!(
+                load_kind,
+                TensorLoadKind::MoeExpertMerged | TensorLoadKind::MoeExpertSplit
+            );
+        let q4_expert_pack = matches!(
             desc.tensor_type,
-            GgufTensorType::Q4K
-                | GgufTensorType::Q5K
-                | GgufTensorType::Q6K
-                | GgufTensorType::Q2K
-                | GgufTensorType::Q3K
-        ) && matches!(desc.dimensions.len(), 2 | 3);
+            GgufTensorType::Q4_0 | GgufTensorType::Q4_1
+        );
+        if matches!(load_kind, TensorLoadKind::MoeExpertSplit) && !q8_expert_pack {
+            return Err(BackendError::UnsupportedTensorType(format!(
+                "split MoE expert tensor {} has storage type {:?}; split expert loaders require Q8_0",
+                desc.name, desc.tensor_type
+            )));
+        }
+        if matches!(load_kind, TensorLoadKind::MoeExpertMerged)
+            && resident_q8_experts
+            && !q8_expert_pack
+            && !q4_expert_pack
+        {
+            return Err(BackendError::UnsupportedTensorType(format!(
+                "resident MoE expert tensor {} has storage type {:?}; resident_q8 requires Q8_0 (merged Q4_0/Q4_1 packs remain file-backed)",
+                desc.name, desc.tensor_type
+            )));
+        }
+        // Mirror `LlamaLoadedWeights::load_with_ownership`: dense Q8 linears
+        // retain expanded Q8_0Block storage unless the explicit lazy opt-out is
+        // on; rank-3 expert packs follow the separate MoE storage policy.
+        let file_backed_q8 = (q8_dense_linear
+            && matches!(
+                dense_q8_storage,
+                crate::inference::Q8DenseLinearStorage::FileBacked
+            ))
+            || (q8_expert_pack && !resident_q8_experts);
+        let resident_q8_wire = q8_dense_linear
+            && matches!(
+                dense_q8_storage,
+                crate::inference::Q8DenseLinearStorage::WirePages
+            );
+        let resident_q8_dense_expanded = q8_dense_linear
+            && matches!(
+                dense_q8_storage,
+                crate::inference::Q8DenseLinearStorage::ExpandedBlocks
+            );
+        let resident_q8_expert_expanded = q8_expert_pack && resident_q8_experts;
+        // K-quant rank-2 linears (Q4_K/Q5_K/Q6_K/Q2_K/Q3_K) load via the wire path
+        // (`load_kquant_wire_linear`), retaining only the compact super-block wire
+        // bytes. They never materialize an f32 copy, but the retained compact bytes
+        // still count against the admission/LRU memory budget. Under Metal no-copy,
+        // Q4_K/Q6_K use page-rounded WirePages; the other K-quants keep Arc<Vec<u8>>.
+        let wire_resident_kquant = matches!(load_kind, TensorLoadKind::DenseLinear)
+            && matches!(
+                desc.tensor_type,
+                GgufTensorType::Q4K
+                    | GgufTensorType::Q5K
+                    | GgufTensorType::Q6K
+                    | GgufTensorType::Q2K
+                    | GgufTensorType::Q3K
+            )
+            && desc.dimensions.len() == 2;
         // Prism Q1_0/Q2_0 2-D tensors remain in their native packed wire layout
         // for the Metal resident lane. They carry neither an f32 copy nor the
-        // historical Q1->Q8 expansion, so budget the exact descriptor bytes.
-        let wire_resident_prism = matches!(
-            desc.tensor_type,
-            GgufTensorType::Q1_0
-                | GgufTensorType::Q2_0G64
-                | GgufTensorType::Q2_0G128
-                | GgufTensorType::Pq2_0
-        ) && desc.dimensions.len() == 2;
+        // historical Q1->Q8 expansion. The loader uses WirePages on every platform,
+        // so budget the page-rounded allocation rather than only descriptor bytes.
+        let wire_resident_prism = matches!(load_kind, TensorLoadKind::DenseLinear)
+            && matches!(
+                desc.tensor_type,
+                GgufTensorType::Q1_0
+                    | GgufTensorType::Q2_0G64
+                    | GgufTensorType::Q2_0G128
+                    | GgufTensorType::Pq2_0
+            )
+            && desc.dimensions.len() == 2;
         // Rank-3 Q4_0 MoE expert packs stream file-backed unconditionally
         // (`load_q4_0_file_backed_expert_tensor`): only per-expert slices are
         // ever dequantized, transiently, at matvec time. Counting them at f32
         // bytes would refuse every fine-grained Q4_0 MoE (e.g. ~116 GB for a
         // 30B-A3B pack) that the engine actually runs in a ~2 GB footprint.
-        let file_backed_q4_experts = matches!(
-            desc.tensor_type,
-            GgufTensorType::Q4_0 | GgufTensorType::Q4_1
-        ) && desc.dimensions.len() == 3;
-        let f32_bytes = if file_backed_q8_linear
+        let file_backed_q4_experts =
+            matches!(load_kind, TensorLoadKind::MoeExpertMerged) && q4_expert_pack;
+        let f32_bytes = if file_backed_q8
+            || resident_q8_wire
+            || resident_q8_dense_expanded
+            || resident_q8_expert_expanded
             || wire_resident_kquant
             || wire_resident_prism
             || file_backed_q4_experts
@@ -15681,11 +15797,35 @@ fn estimate_cpu_weight_materialization_bytes(binding: &LlamaTensorBinding) -> cr
             })?
         };
         let retained_source_bytes = if wire_resident_prism {
-            desc.n_bytes
-        } else if retain_q8_blocks
-            && !file_backed_q8_linear
-            && desc.tensor_type == GgufTensorType::Q8_0
-        {
+            page_rounded_wire_bytes(desc, desc.n_bytes, "Prism wire")?
+        } else if wire_resident_kquant {
+            if matches!(desc.tensor_type, GgufTensorType::Q4K | GgufTensorType::Q6K)
+                && matches!(
+                    dense_q8_storage,
+                    crate::inference::Q8DenseLinearStorage::WirePages
+                )
+            {
+                page_rounded_wire_bytes(desc, desc.n_bytes, "K-quant wire")?
+            } else {
+                desc.n_bytes
+            }
+        } else if resident_q8_wire {
+            let q8_block_count = element_count.checked_add(31).ok_or_else(|| {
+                BackendError::InvalidTensorData(format!(
+                    "tensor {} q8 block-count estimate overflow",
+                    desc.name
+                ))
+            })? / 32;
+            let wire_bytes = q8_block_count.checked_mul(34).ok_or_else(|| {
+                BackendError::InvalidTensorData(format!(
+                    "tensor {} q8 wire materialization byte estimate overflow",
+                    desc.name
+                ))
+            })?;
+            page_rounded_wire_bytes(desc, wire_bytes, "q8 wire")?
+        } else if resident_q8_dense_expanded {
+            crate::tensor::q8_0_block_backed_linear_retained_bytes(&desc.name, &desc.dimensions)?
+        } else if resident_q8_expert_expanded {
             let q8_block_count = element_count.checked_add(31).ok_or_else(|| {
                 BackendError::InvalidTensorData(format!(
                     "tensor {} q8 block-count estimate overflow",
@@ -15700,6 +15840,21 @@ fn estimate_cpu_weight_materialization_bytes(binding: &LlamaTensorBinding) -> cr
                         desc.name
                     ))
                 })?
+        } else if f32_bytes > 0
+            && matches!(
+                desc.tensor_type,
+                GgufTensorType::Q2K
+                    | GgufTensorType::Q3K
+                    | GgufTensorType::Q4K
+                    | GgufTensorType::Q6K
+            )
+        {
+            // `load_cpu_f32` preserves these wire bytes beside the decoded f32
+            // tensor for resident/CPU block-dot consumers. Q5_K is deliberately
+            // absent: its generic f32 loader does not retain a wire sidecar.
+            desc.n_bytes
+        } else if retain_q8_blocks && !file_backed_q8 && desc.tensor_type == GgufTensorType::Q8_0 {
+            crate::tensor::q8_0_retained_blocks_with_sidecars_bytes(&desc.name, &desc.dimensions)?
         } else {
             0
         };
@@ -15711,54 +15866,212 @@ fn estimate_cpu_weight_materialization_bytes(binding: &LlamaTensorBinding) -> cr
         })
     }
 
+    fn checked_f32_tensor_bytes(role: &str, dimensions: &[u64]) -> crate::Result<u64> {
+        let elements = dimensions.iter().try_fold(1u64, |count, dim| {
+            count.checked_mul(*dim).ok_or_else(|| {
+                BackendError::InvalidTensorData(format!(
+                    "{role} element count overflow while estimating CPU materialization"
+                ))
+            })
+        })?;
+        elements.checked_mul(4).ok_or_else(|| {
+            BackendError::InvalidTensorData(format!(
+                "{role} f32 materialization byte estimate overflow"
+            ))
+        })
+    }
+
     let retain_q8_blocks = cpu_weight_materialization_retains_q8_blocks();
-    let lazy_q8_linear = lazy_q8_linear_materialization_enabled();
-    let mut total = tensor_estimate(&binding.token_embedding, retain_q8_blocks, lazy_q8_linear)?
-        .checked_add(tensor_estimate(
-            &binding.output_norm,
+    let resident_q8_experts = matches!(
+        crate::runtime_config::moe_expert_storage(),
+        crate::runtime_config::MoeExpertStorage::ResidentQ8
+    );
+    let estimate_tensor = |desc, load_kind| {
+        tensor_estimate(
+            desc,
             retain_q8_blocks,
-            lazy_q8_linear,
-        )?)
-        .ok_or_else(|| {
+            dense_q8_storage,
+            resident_q8_experts,
+            load_kind,
+        )
+    };
+    let estimate_expert_set = |experts: &LlamaMoeExpertTensors| -> crate::Result<u64> {
+        let (descriptors, load_kind) = match experts {
+            LlamaMoeExpertTensors::Merged(desc) => {
+                (std::slice::from_ref(desc), TensorLoadKind::MoeExpertMerged)
+            }
+            LlamaMoeExpertTensors::Split(descs) => {
+                if descs.is_empty() {
+                    return Err(BackendError::InvalidModelMetadata(
+                        "split MoE expert binding has no descriptors (expert_count must be greater than zero)"
+                            .to_string(),
+                    ));
+                }
+                (descs.as_slice(), TensorLoadKind::MoeExpertSplit)
+            }
+        };
+        descriptors.iter().try_fold(0u64, |total, desc| {
+            total
+                .checked_add(tensor_estimate(
+                    desc,
+                    retain_q8_blocks,
+                    dense_q8_storage,
+                    resident_q8_experts,
+                    load_kind,
+                )?)
+                .ok_or_else(|| {
+                    BackendError::InvalidTensorData(
+                        "CPU materialization byte estimate overflow".to_string(),
+                    )
+                })
+        })
+    };
+    let estimate_tied_output_clone = |desc: &GgufTensorDescriptor| -> crate::Result<u64> {
+        let shared_q8_storage = desc.tensor_type == GgufTensorType::Q8_0
+            && desc.dimensions.len() == 2
+            && matches!(
+                dense_q8_storage,
+                crate::inference::Q8DenseLinearStorage::FileBacked
+                    | crate::inference::Q8DenseLinearStorage::WirePages
+            );
+        let shared_wire_storage = desc.dimensions.len() == 2
+            && matches!(
+                desc.tensor_type,
+                GgufTensorType::Q4K
+                    | GgufTensorType::Q5K
+                    | GgufTensorType::Q6K
+                    | GgufTensorType::Q2K
+                    | GgufTensorType::Q3K
+                    | GgufTensorType::Q1_0
+                    | GgufTensorType::Q2_0G64
+                    | GgufTensorType::Q2_0G128
+                    | GgufTensorType::Pq2_0
+            );
+        if shared_q8_storage || shared_wire_storage {
+            Ok(0)
+        } else {
+            tensor_estimate(
+                desc,
+                retain_q8_blocks,
+                dense_q8_storage,
+                resident_q8_experts,
+                TensorLoadKind::DenseLinear,
+            )
+        }
+    };
+    // Empty split sets must fail before admission even when they belong to an
+    // unowned pipeline layer: the loader's name-only placeholder path still
+    // indexes the first descriptor for those layers.
+    for layer in &binding.layers {
+        let expert_sets = match &layer.ffn {
+            LlamaFfnTensors::Dense { .. } => continue,
+            LlamaFfnTensors::MoE {
+                gate_experts,
+                up_experts,
+                down_experts,
+                ..
+            }
+            | LlamaFfnTensors::DeepSeekMoE {
+                gate_experts,
+                up_experts,
+                down_experts,
+                ..
+            } => [gate_experts, up_experts, down_experts],
+        };
+        if expert_sets.iter().any(
+            |experts| matches!(experts, LlamaMoeExpertTensors::Split(descs) if descs.is_empty()),
+        ) {
+            return Err(BackendError::InvalidModelMetadata(
+                "split MoE expert binding has no descriptors (expert_count must be greater than zero)"
+                    .to_string(),
+            ));
+        }
+    }
+
+    let mut total = 0u64;
+    if load_embedding {
+        total = total
+            .checked_add(estimate_tensor(
+                &binding.token_embedding,
+                TensorLoadKind::DenseLinear,
+            )?)
+            .ok_or_else(|| {
+                BackendError::InvalidTensorData(
+                    "CPU materialization byte estimate overflow".to_string(),
+                )
+            })?;
+    }
+    if load_output {
+        total = total
+            .checked_add(estimate_tensor(
+                &binding.output_norm,
+                TensorLoadKind::GenericF32,
+            )?)
+            .ok_or_else(|| {
+                BackendError::InvalidTensorData(
+                    "CPU materialization byte estimate overflow".to_string(),
+                )
+            })?;
+        let output_estimate = if binding.output_is_tied_embedding {
+            if load_embedding {
+                // `CpuTensor::clone` shares file/wire Arc backings, but deep-clones
+                // expanded Q8 blocks and eager f32 data for the tied output alias.
+                estimate_tied_output_clone(&binding.token_embedding)?
+            } else {
+                // A last-only shard loads the tied embedding descriptor afresh as
+                // its output projection because this node does not own embeddings.
+                estimate_tensor(&binding.token_embedding, TensorLoadKind::DenseLinear)?
+            }
+        } else {
+            estimate_tensor(&binding.output, TensorLoadKind::DenseLinear)?
+        };
+        total = total.checked_add(output_estimate).ok_or_else(|| {
             BackendError::InvalidTensorData(
                 "CPU materialization byte estimate overflow".to_string(),
             )
         })?;
-    if !binding.output_is_tied_embedding {
-        total = total
-            .checked_add(tensor_estimate(
-                &binding.output,
-                retain_q8_blocks,
-                lazy_q8_linear,
-            )?)
-            .ok_or_else(|| {
-                BackendError::InvalidTensorData(
-                    "CPU materialization byte estimate overflow".to_string(),
-                )
-            })?;
     }
     if let Some(rope_freqs) = &binding.rope_freqs {
         total = total
-            .checked_add(tensor_estimate(
-                rope_freqs,
-                retain_q8_blocks,
-                lazy_q8_linear,
-            )?)
+            .checked_add(estimate_tensor(rope_freqs, TensorLoadKind::GenericF32)?)
             .ok_or_else(|| {
                 BackendError::InvalidTensorData(
                     "CPU materialization byte estimate overflow".to_string(),
                 )
             })?;
     }
-    for layer in &binding.layers {
-        let mut attention_tensors = vec![&layer.attention_norm, &layer.attention_output];
+    for (layer_idx, layer) in binding.layers.iter().enumerate() {
+        if layer_range.is_some_and(|range| !range.contains(&layer_idx)) {
+            continue;
+        }
+        let mut attention_tensors = vec![(&layer.attention_norm, TensorLoadKind::GenericF32)];
         match &layer.attention {
             LlamaAttentionTensors::Standard {
-                q, k, v, biases, ..
+                q,
+                k,
+                v,
+                q_norm,
+                k_norm,
+                biases,
             } => {
-                attention_tensors.extend([q, k, v]);
+                attention_tensors.extend([
+                    (&layer.attention_output, TensorLoadKind::DenseLinear),
+                    (q, TensorLoadKind::DenseLinear),
+                    (k, TensorLoadKind::DenseLinear),
+                    (v, TensorLoadKind::DenseLinear),
+                ]);
+                if let Some(q_norm) = q_norm {
+                    attention_tensors.push((q_norm, TensorLoadKind::GenericF32));
+                }
+                if let Some(k_norm) = k_norm {
+                    attention_tensors.push((k_norm, TensorLoadKind::GenericF32));
+                }
                 if let Some(biases) = biases {
-                    attention_tensors.extend([&biases.q, &biases.k, &biases.v]);
+                    attention_tensors.extend([
+                        (&biases.q, TensorLoadKind::GenericF32),
+                        (&biases.k, TensorLoadKind::GenericF32),
+                        (&biases.v, TensorLoadKind::GenericF32),
+                    ]);
                 }
             }
             LlamaAttentionTensors::Mla {
@@ -15769,19 +16082,77 @@ fn estimate_cpu_weight_materialization_bytes(binding: &LlamaTensorBinding) -> cr
                 kv_a_layernorm,
                 kv_b_proj,
             } => {
-                attention_tensors.extend([
-                    q_a_proj,
-                    q_a_layernorm,
-                    q_b_proj,
-                    kv_a_proj_with_mqa,
-                    kv_a_layernorm,
-                    kv_b_proj,
-                ]);
+                if let Some(mla) = binding.mla_metadata.as_ref() {
+                    attention_tensors.extend([
+                        (q_a_proj, TensorLoadKind::DenseLinear),
+                        (q_a_layernorm, TensorLoadKind::GenericF32),
+                        (kv_a_proj_with_mqa, TensorLoadKind::DenseLinear),
+                        (kv_a_layernorm, TensorLoadKind::GenericF32),
+                    ]);
+
+                    // The loader initially reads q_b, kv_b, and attention_output,
+                    // then absorbs them and drops all three source tensors. The
+                    // retained weights are two newly allocated f32 matrices whose
+                    // shapes come from the MLA metadata, independent of the source
+                    // quantization and dense-Q8 storage policy.
+                    let num_heads = u64::try_from(binding.attention_head_count).map_err(|_| {
+                        BackendError::InvalidTensorData(
+                            "MLA attention head count does not fit u64".to_string(),
+                        )
+                    })?;
+                    let hidden_size = u64::try_from(binding.hidden_size).map_err(|_| {
+                        BackendError::InvalidTensorData(
+                            "MLA hidden size does not fit u64".to_string(),
+                        )
+                    })?;
+                    let q_lora = u64::from(mla.q_lora_rank);
+                    let kv_lora = u64::from(mla.kv_lora_rank);
+                    let rope_dim = u64::from(mla.rope_head_dim);
+                    let absorbed_q_width = kv_lora.checked_add(rope_dim).ok_or_else(|| {
+                        BackendError::InvalidTensorData(
+                            "MLA absorbed q_b width overflow".to_string(),
+                        )
+                    })?;
+                    let absorbed_q_b = checked_f32_tensor_bytes(
+                        "MLA absorbed q_b",
+                        &[num_heads, absorbed_q_width, q_lora],
+                    )?;
+                    let absorbed_output = checked_f32_tensor_bytes(
+                        "MLA absorbed attention output",
+                        &[hidden_size, num_heads, kv_lora],
+                    )?;
+                    total = total
+                        .checked_add(absorbed_q_b)
+                        .and_then(|value| value.checked_add(absorbed_output))
+                        .ok_or_else(|| {
+                            BackendError::InvalidTensorData(
+                                "CPU materialization byte estimate overflow".to_string(),
+                            )
+                        })?;
+                } else {
+                    // Defensive mirror of the loader's no-metadata branch: no
+                    // absorption occurs, so all original linears remain resident.
+                    attention_tensors.extend([
+                        (&layer.attention_output, TensorLoadKind::DenseLinear),
+                        (q_a_proj, TensorLoadKind::DenseLinear),
+                        (q_a_layernorm, TensorLoadKind::GenericF32),
+                        (q_b_proj, TensorLoadKind::DenseLinear),
+                        (kv_a_proj_with_mqa, TensorLoadKind::DenseLinear),
+                        (kv_a_layernorm, TensorLoadKind::GenericF32),
+                        (kv_b_proj, TensorLoadKind::DenseLinear),
+                    ]);
+                }
             }
         }
-        for desc in attention_tensors {
+        if let Some(post_attention_norm) = &layer.post_attention_norm {
+            attention_tensors.push((post_attention_norm, TensorLoadKind::GenericF32));
+        }
+        if let Some(post_ffw_norm) = &layer.post_ffw_norm {
+            attention_tensors.push((post_ffw_norm, TensorLoadKind::GenericF32));
+        }
+        for (desc, load_kind) in attention_tensors {
             total = total
-                .checked_add(tensor_estimate(desc, retain_q8_blocks, lazy_q8_linear)?)
+                .checked_add(estimate_tensor(desc, load_kind)?)
                 .ok_or_else(|| {
                     BackendError::InvalidTensorData(
                         "CPU materialization byte estimate overflow".to_string(),
@@ -15789,10 +16160,9 @@ fn estimate_cpu_weight_materialization_bytes(binding: &LlamaTensorBinding) -> cr
                 })?;
         }
         total = total
-            .checked_add(tensor_estimate(
+            .checked_add(estimate_tensor(
                 &layer.ffn_norm,
-                retain_q8_blocks,
-                lazy_q8_linear,
+                TensorLoadKind::GenericF32,
             )?)
             .ok_or_else(|| {
                 BackendError::InvalidTensorData(
@@ -15803,7 +16173,7 @@ fn estimate_cpu_weight_materialization_bytes(binding: &LlamaTensorBinding) -> cr
             LlamaFfnTensors::Dense { gate, up, down } => {
                 for desc in [gate, up, down] {
                     total = total
-                        .checked_add(tensor_estimate(desc, retain_q8_blocks, lazy_q8_linear)?)
+                        .checked_add(estimate_tensor(desc, TensorLoadKind::DenseLinear)?)
                         .ok_or_else(|| {
                             BackendError::InvalidTensorData(
                                 "CPU materialization byte estimate overflow".to_string(),
@@ -15817,13 +16187,16 @@ fn estimate_cpu_weight_materialization_bytes(binding: &LlamaTensorBinding) -> cr
                 up_experts,
                 down_experts,
             } => {
-                for desc in std::iter::once(router)
-                    .chain(gate_experts.descriptors())
-                    .chain(up_experts.descriptors())
-                    .chain(down_experts.descriptors())
-                {
+                total = total
+                    .checked_add(estimate_tensor(router, TensorLoadKind::GenericF32)?)
+                    .ok_or_else(|| {
+                        BackendError::InvalidTensorData(
+                            "CPU materialization byte estimate overflow".to_string(),
+                        )
+                    })?;
+                for experts in [gate_experts, up_experts, down_experts] {
                     total = total
-                        .checked_add(tensor_estimate(desc, retain_q8_blocks, lazy_q8_linear)?)
+                        .checked_add(estimate_expert_set(experts)?)
                         .ok_or_else(|| {
                             BackendError::InvalidTensorData(
                                 "CPU materialization byte estimate overflow".to_string(),
@@ -15840,14 +16213,25 @@ fn estimate_cpu_weight_materialization_bytes(binding: &LlamaTensorBinding) -> cr
                 up_experts,
                 down_experts,
             } => {
-                for desc in [shared_gate, shared_up, shared_down, router]
-                    .into_iter()
-                    .chain(gate_experts.descriptors())
-                    .chain(up_experts.descriptors())
-                    .chain(down_experts.descriptors())
-                {
+                for desc in [shared_gate, shared_up, shared_down] {
                     total = total
-                        .checked_add(tensor_estimate(desc, retain_q8_blocks, lazy_q8_linear)?)
+                        .checked_add(estimate_tensor(desc, TensorLoadKind::DenseLinear)?)
+                        .ok_or_else(|| {
+                            BackendError::InvalidTensorData(
+                                "CPU materialization byte estimate overflow".to_string(),
+                            )
+                        })?;
+                }
+                total = total
+                    .checked_add(estimate_tensor(router, TensorLoadKind::GenericF32)?)
+                    .ok_or_else(|| {
+                        BackendError::InvalidTensorData(
+                            "CPU materialization byte estimate overflow".to_string(),
+                        )
+                    })?;
+                for experts in [gate_experts, up_experts, down_experts] {
+                    total = total
+                        .checked_add(estimate_expert_set(experts)?)
                         .ok_or_else(|| {
                             BackendError::InvalidTensorData(
                                 "CPU materialization byte estimate overflow".to_string(),
@@ -15864,7 +16248,8 @@ fn estimate_cpu_weight_materialization_bytes(binding: &LlamaTensorBinding) -> cr
 /// Q6_K) in a dense (non-MoE) layout. Such a model is loaded WIRE-ONLY: K-quant 2-D
 /// linears keep only their packed super-block wire bytes (see `load_kquant_wire_linear`
 /// in `LlamaLoadedWeights::load_with_ownership`) and Q8_0 linears keep their 36-byte
-/// blocks/pages â€” neither materializes the f32 the CPU-budget guard estimates. The CUDA
+/// blocks/pages â€” neither materializes an f32 copy. The memory guard still counts the
+/// retained compact/page-backed representation. The CUDA
 /// resident decode engine reads those packed bytes in place (q8_gemv / q4k_gemv /
 /// q6k_gemv), so the f32 quantity the guard sizes is never produced for this model.
 ///
@@ -15872,12 +16257,17 @@ fn estimate_cpu_weight_materialization_bytes(binding: &LlamaTensorBinding) -> cr
 /// (which needs a built session); it intentionally checks only what the guard needs â€”
 /// the per-tensor quant types and the dense layout. Anything else (an f16/f32 linear, a
 /// MoE router/expert stack) keeps the eager-f32 CPU path and stays under the guard.
+#[cfg(test)]
 fn binding_all_resident_quant_linears(binding: &LlamaTensorBinding) -> bool {
     let is_resident_quant = |desc: &GgufTensorDescriptor| {
-        matches!(
-            desc.tensor_type,
-            GgufTensorType::Q8_0 | GgufTensorType::Q4K | GgufTensorType::Q5K | GgufTensorType::Q6K
-        )
+        desc.dimensions.len() == 2
+            && matches!(
+                desc.tensor_type,
+                GgufTensorType::Q8_0
+                    | GgufTensorType::Q4K
+                    | GgufTensorType::Q5K
+                    | GgufTensorType::Q6K
+            )
     };
     if !is_resident_quant(&binding.token_embedding) {
         return false;
@@ -15909,17 +16299,9 @@ fn binding_all_resident_quant_linears(binding: &LlamaTensorBinding) -> bool {
     })
 }
 
-/// Whether the GPU-resident decode engine will run this model â€” and therefore the
-/// CPU f32 weight materialization the budget guard estimates is never produced. True
-/// only when CUDA resident decode is active for this process AND every linear is a
-/// resident-eligible quant (`binding_all_resident_quant_linears`). On non-CUDA builds
-/// `resident_decode_cuda_active()` is `false`, so the guard always applies there.
-fn binding_runs_on_resident_gpu(binding: &LlamaTensorBinding) -> bool {
-    crate::inference::resident_decode_cuda_active() && binding_all_resident_quant_linears(binding)
-}
-
 /// Whether the CPU decode path consumes every linear WIRE-ONLY â€” and so, like the
-/// resident-GPU case, never materializes the f32 weights the budget guard sizes. True
+/// resident-GPU case, never materializes f32 weights. The compact wire backing remains
+/// part of the memory estimate. True
 /// when the K-quant CPU block-dot is enabled (Q4_K/Q6_K linears stream their wire bytes
 /// via `q4_k`/`q6_k_block_dot`, Q8_0 linears stream their packed blocks) AND every linear
 /// is a resident-eligible quant. Without this, serve CPU mode FALSE-POSITIVES the guard
@@ -15927,8 +16309,24 @@ fn binding_runs_on_resident_gpu(binding: &LlamaTensorBinding) -> bool {
 /// because `binding_runs_on_resident_gpu` is false on CPU. K-quant super-blocks are
 /// 256-wide so the block-dot always engages (the 7130 dispatch requires that), matching
 /// the wire-only invariant documented on `binding_all_resident_quant_linears`.
+#[cfg(test)]
 fn binding_runs_on_cpu_wire_only(binding: &LlamaTensorBinding) -> bool {
     crate::inference::q4_k_cpu_block_dot_enabled() && binding_all_resident_quant_linears(binding)
+}
+
+/// Exact tensor ownership used by the API-side weight loader. The distributed
+/// coordinator owns its configured prefix layers plus both model ends; a normal
+/// single-node server owns the complete binding. This immutable process context
+/// is shared by readiness, admission, LRU accounting, and execution.
+fn api_weight_load_ownership() -> (Option<std::ops::Range<usize>>, bool, bool) {
+    match crate::distributed::DISTRIBUTED_RANGE.get() {
+        Some(&(layer_start, layer_end)) => {
+            let (load_embedding, load_output) =
+                crate::distributed::PipelineRole::Coordinator.tensor_ownership();
+            (Some(layer_start..layer_end), load_embedding, load_output)
+        }
+        None => (None, true, true),
+    }
 }
 
 fn enforce_context_budget(
@@ -15954,24 +16352,28 @@ pub(super) fn model_resident_cache_key(model_id: &str) -> u64 {
 }
 
 fn guard_cpu_weight_materialization_budget(binding: &LlamaTensorBinding) -> crate::Result<u64> {
-    // Resident-GPU models load wire-only (packed Q8_0/Q4_K/Q6_K bytes the CUDA engine
-    // reads in place) and never materialize the f32 weights this guard sizes. Bypass the
-    // CPU budget for them â€” but ONLY them; genuinely CPU-bound large models (or any
-    // build/host without the resident GPU path) still hit the guard below.
-    if binding_runs_on_resident_gpu(binding) {
-        return Ok(0);
-    }
-    // CPU K-quant block-dot decode is also wire-only (no f32 materialization), so the
-    // same bypass applies on the CPU lane â€” otherwise a K-quant model that runs fine via
-    // the block-dot is wrongly rejected here. (K-quant conductor Phase 2 follow-up.)
-    if binding_runs_on_cpu_wire_only(binding) {
-        return Ok(0);
-    }
-    let estimated_bytes = estimate_cpu_weight_materialization_bytes(binding)?;
+    guard_cpu_weight_materialization_budget_with_ownership(binding, None, true, true)
+}
+
+fn guard_cpu_weight_materialization_budget_with_ownership(
+    binding: &LlamaTensorBinding,
+    layer_range: Option<&std::ops::Range<usize>>,
+    load_embedding: bool,
+    load_output: bool,
+) -> crate::Result<u64> {
+    // Always run the ownership-aware estimator so eager norms, biases, rope
+    // tensors, retained wire storage, malformed-rank fallbacks, and MLA
+    // absorption cannot be hidden by an all-quant shortcut.
+    let estimated_bytes = estimate_cpu_weight_materialization_bytes_with_ownership(
+        binding,
+        layer_range,
+        load_embedding,
+        load_output,
+    )?;
     let limit_bytes = cpu_weight_materialization_limit_bytes()?;
     if estimated_bytes > limit_bytes {
         return Err(BackendError::UnsupportedTensorType(format!(
-            "estimated CPU f32 weight materialization is {estimated_bytes} bytes, above safety limit {limit_bytes} bytes; current CPU path eagerly decodes dense weights and may trigger host memory pressure. Lower model size/quant target, add lazy/mmap weight materialization, or raise {CPU_WEIGHT_MATERIALIZATION_LIMIT_ENV} deliberately for a controlled run"
+            "estimated CPU weight materialization/retention is {estimated_bytes} bytes, above safety limit {limit_bytes} bytes; dense Q8_0 linears retain expanded in-memory blocks by default and other CPU tensors may decode eagerly. Lower model size/quant target, set {LAZY_Q8_LINEAR_ENV}=1 only if deliberately accepting the slower file-backed Q8 path, or raise {CPU_WEIGHT_MATERIALIZATION_LIMIT_ENV} deliberately for a controlled run"
         )));
     }
     Ok(estimated_bytes)
@@ -25039,15 +25441,417 @@ mod tests {
     }
 
     #[test]
-    fn cpu_weight_materialization_estimate_defaults_q8_linears_to_file_backed() {
+    fn q8_estimate_matches_loader_for_unset_disabled_and_enabled_lazy_env() {
         let _env_guard = crate::test_support::env_lock();
         std::env::remove_var(RETAIN_Q8_BLOCKS_ENV);
         std::env::remove_var(LAZY_Q8_LINEAR_ENV);
-        let binding = materialization_binding(false, GgufTensorType::Q8_0, vec![32, 2]);
+        let binding = dense_q8_materialization_binding(false, vec![32, 2]);
+        let expected_per_tensor = 2 * mem::size_of::<Q8_0Block>() as u64;
+        let expected_dense_tensor_count = 2 + 4 + 3;
+
+        let unset = estimate_cpu_weight_materialization_bytes(&binding).unwrap();
+        assert_eq!(unset, expected_per_tensor * expected_dense_tensor_count);
+
+        std::env::set_var(LAZY_Q8_LINEAR_ENV, "0");
+        let explicitly_disabled = estimate_cpu_weight_materialization_bytes(&binding).unwrap();
+        assert_eq!(explicitly_disabled, unset);
+
+        std::env::set_var(LAZY_Q8_LINEAR_ENV, "1");
+        let explicitly_enabled = estimate_cpu_weight_materialization_bytes(&binding).unwrap();
+        assert_eq!(explicitly_enabled, 0);
+        std::env::remove_var(LAZY_Q8_LINEAR_ENV);
+    }
+
+    #[test]
+    fn forced_lazy_still_budgets_eager_generic_f32_tensors() {
+        let _env_guard = crate::test_support::env_lock();
+        std::env::remove_var(RETAIN_Q8_BLOCKS_ENV);
+        std::env::set_var(LAZY_Q8_LINEAR_ENV, "1");
+        std::env::set_var("CAMELID_X86_Q4K_DECODE", "1");
+        let mut binding = dense_q8_materialization_binding(false, vec![32, 2]);
+        binding.output_norm =
+            materialization_desc("output_norm.weight", GgufTensorType::F32, vec![8]);
+        binding.layers[0].attention_norm =
+            materialization_desc("blk.0.attn_norm.weight", GgufTensorType::F32, vec![8]);
+        binding.layers[0].ffn_norm =
+            materialization_desc("blk.0.ffn_norm.weight", GgufTensorType::F32, vec![8]);
 
         let estimated = estimate_cpu_weight_materialization_bytes(&binding).unwrap();
+        assert_eq!(estimated, 3 * 8 * 4);
+        std::env::set_var(
+            CPU_WEIGHT_MATERIALIZATION_LIMIT_ENV,
+            (estimated - 1).to_string(),
+        );
+        assert!(guard_cpu_weight_materialization_budget(&binding).is_err());
 
-        assert_eq!(estimated, 0);
+        std::env::remove_var(CPU_WEIGHT_MATERIALIZATION_LIMIT_ENV);
+        std::env::remove_var("CAMELID_X86_Q4K_DECODE");
+        std::env::remove_var(LAZY_Q8_LINEAR_ENV);
+    }
+
+    #[test]
+    fn malformed_rank_q8_linear_falls_back_to_eager_f32_estimate() {
+        let _env_guard = crate::test_support::env_lock();
+        std::env::remove_var(RETAIN_Q8_BLOCKS_ENV);
+        std::env::set_var(LAZY_Q8_LINEAR_ENV, "1");
+        let mut binding = dense_q8_materialization_binding(false, vec![32, 2]);
+        let LlamaAttentionTensors::Standard { q, .. } = &mut binding.layers[0].attention else {
+            unreachable!();
+        };
+        *q = materialization_desc("blk.0.attn_q.weight", GgufTensorType::Q8_0, vec![32]);
+
+        assert_eq!(
+            estimate_cpu_weight_materialization_bytes(&binding).unwrap(),
+            32 * 4
+        );
+        assert!(!binding_all_resident_quant_linears(&binding));
+
+        std::env::remove_var(LAZY_Q8_LINEAR_ENV);
+    }
+
+    #[test]
+    fn mla_absorption_budgets_final_f32_weights_for_every_q8_storage_policy() {
+        use crate::inference::Q8DenseLinearStorage;
+
+        let _env_guard = crate::test_support::env_lock();
+        std::env::remove_var(RETAIN_Q8_BLOCKS_ENV);
+        let binding = mla_q8_materialization_binding();
+        // heads=2, q_lora=3, kv_lora=5, rope=2, hidden=7:
+        // absorbed q_b = 2*(5+2)*3, absorbed output = 7*2*5.
+        let expected = (2 * (5 + 2) * 3 + 7 * 2 * 5) * 4;
+
+        for storage in [
+            Q8DenseLinearStorage::ExpandedBlocks,
+            Q8DenseLinearStorage::FileBacked,
+            Q8DenseLinearStorage::WirePages,
+        ] {
+            assert_eq!(
+                estimate_cpu_weight_materialization_bytes_with_q8_storage(&binding, storage)
+                    .unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn merged_q4_moe_stays_file_backed_but_split_q4_fails_closed() {
+        let _env_guard = crate::test_support::env_lock();
+        std::env::set_var(crate::runtime_config::MOE_EXPERT_STORAGE_ENV, "resident_q8");
+        let merged = q4_moe_materialization_binding(false);
+        assert_eq!(
+            estimate_cpu_weight_materialization_bytes(&merged).unwrap(),
+            0
+        );
+
+        let split = q4_moe_materialization_binding(true);
+        let err = estimate_cpu_weight_materialization_bytes(&split)
+            .expect_err("split Q4 experts have no matching loader")
+            .to_string();
+        assert!(err.contains("split expert loaders require Q8_0"), "{err}");
+
+        std::env::remove_var(crate::runtime_config::MOE_EXPERT_STORAGE_ENV);
+    }
+
+    #[test]
+    fn metal_nocopy_outranks_lazy_and_budgets_page_rounded_q8_wire() {
+        use crate::inference::Q8DenseLinearStorage;
+
+        let policy = crate::inference::q8_dense_linear_storage_policy_given(true, true);
+        assert_eq!(policy, Q8DenseLinearStorage::WirePages);
+        assert_eq!(
+            crate::inference::q8_dense_linear_storage_policy_given(false, true),
+            Q8DenseLinearStorage::FileBacked
+        );
+        assert_eq!(
+            crate::inference::q8_dense_linear_storage_policy_given(false, false),
+            Q8DenseLinearStorage::ExpandedBlocks
+        );
+
+        let _env_guard = crate::test_support::env_lock();
+        std::env::remove_var(RETAIN_Q8_BLOCKS_ENV);
+        let binding = dense_q8_materialization_binding(false, vec![32, 2]);
+        let estimated = estimate_cpu_weight_materialization_bytes_with_q8_storage(
+            &binding,
+            Q8DenseLinearStorage::WirePages,
+        )
+        .unwrap();
+        let page_bytes = crate::wire_mmap::page_size() as u64;
+        let expected_per_tensor = 68_u64.div_ceil(page_bytes) * page_bytes;
+        let expected_dense_tensor_count = 2 + 4 + 3;
+        assert_eq!(estimated, expected_per_tensor * expected_dense_tensor_count);
+        assert!(estimated > 68 * expected_dense_tensor_count);
+    }
+
+    #[test]
+    fn kquant_estimate_counts_compact_or_page_rounded_retained_storage() {
+        use crate::inference::Q8DenseLinearStorage;
+
+        const DENSE_TENSOR_COUNT: u64 = 2 + 4 + 3;
+        const TIED_DENSE_TENSOR_COUNT: u64 = 1 + 4 + 3;
+        let page_bytes = crate::wire_mmap::page_size() as u64;
+
+        for (tensor_type, wire_bytes) in [
+            (GgufTensorType::Q2K, 84_u64),
+            (GgufTensorType::Q4K, 144_u64),
+            (GgufTensorType::Q5K, 176_u64),
+            (GgufTensorType::Q6K, 210_u64),
+        ] {
+            let binding = dense_quant_materialization_binding(false, tensor_type, vec![256, 1]);
+            assert_eq!(
+                estimate_cpu_weight_materialization_bytes_with_q8_storage(
+                    &binding,
+                    Q8DenseLinearStorage::ExpandedBlocks,
+                )
+                .unwrap(),
+                wire_bytes * DENSE_TENSOR_COUNT,
+                "{tensor_type:?} Vec-backed dense linears retain compact wire bytes"
+            );
+
+            let nocopy_per_tensor =
+                if matches!(tensor_type, GgufTensorType::Q4K | GgufTensorType::Q6K) {
+                    wire_bytes.div_ceil(page_bytes) * page_bytes
+                } else {
+                    wire_bytes
+                };
+            assert_eq!(
+                estimate_cpu_weight_materialization_bytes_with_q8_storage(
+                    &binding,
+                    Q8DenseLinearStorage::WirePages,
+                )
+                .unwrap(),
+                nocopy_per_tensor * DENSE_TENSOR_COUNT,
+                "{tensor_type:?} no-copy estimate must match its actual loader backing"
+            );
+
+            let tied = dense_quant_materialization_binding(true, tensor_type, vec![256, 1]);
+            assert_eq!(
+                estimate_cpu_weight_materialization_bytes_with_q8_storage(
+                    &tied,
+                    Q8DenseLinearStorage::WirePages,
+                )
+                .unwrap(),
+                nocopy_per_tensor * TIED_DENSE_TENSOR_COUNT,
+                "the tied output clone shares {tensor_type:?} Arc storage"
+            );
+        }
+    }
+
+    #[test]
+    fn generic_kquant_f32_load_counts_retained_wire_sidecar() {
+        use crate::inference::Q8DenseLinearStorage;
+
+        let mut binding = dense_q8_materialization_binding(false, vec![32, 2]);
+        for (tensor_type, wire_bytes) in [
+            (GgufTensorType::Q2K, 84_u64),
+            (GgufTensorType::Q3K, 110_u64),
+            (GgufTensorType::Q4K, 144_u64),
+            (GgufTensorType::Q6K, 210_u64),
+        ] {
+            binding.output_norm =
+                materialization_desc("output_norm.weight", tensor_type, vec![256]);
+            assert_eq!(
+                estimate_cpu_weight_materialization_bytes_with_q8_storage(
+                    &binding,
+                    Q8DenseLinearStorage::FileBacked,
+                )
+                .unwrap(),
+                256 * 4 + wire_bytes,
+                "generic {tensor_type:?} retains its wire Arc beside decoded f32 data"
+            );
+        }
+
+        binding.output_norm =
+            materialization_desc("output_norm.weight", GgufTensorType::Q5K, vec![256]);
+        assert_eq!(
+            estimate_cpu_weight_materialization_bytes_with_q8_storage(
+                &binding,
+                Q8DenseLinearStorage::FileBacked,
+            )
+            .unwrap(),
+            256 * 4,
+            "the generic Q5_K loader decodes f32 without retaining a wire sidecar"
+        );
+    }
+
+    #[test]
+    fn kquant_retained_storage_is_enforced_by_the_materialization_guard() {
+        let _env_guard = crate::test_support::env_lock();
+        std::env::remove_var("CAMELID_METAL_NOCOPY");
+        let binding = dense_quant_materialization_binding(false, GgufTensorType::Q4K, vec![256, 1]);
+        let estimated = estimate_cpu_weight_materialization_bytes(&binding).unwrap();
+        assert_eq!(estimated, 144 * (2 + 4 + 3));
+        std::env::set_var(
+            CPU_WEIGHT_MATERIALIZATION_LIMIT_ENV,
+            (estimated - 1).to_string(),
+        );
+
+        let err = guard_cpu_weight_materialization_budget(&binding)
+            .expect_err("the guard must enforce retained compact K-quant storage")
+            .to_string();
+        assert!(err.contains(&estimated.to_string()), "{err}");
+
+        std::env::remove_var(CPU_WEIGHT_MATERIALIZATION_LIMIT_ENV);
+    }
+
+    #[test]
+    fn distributed_coordinator_budget_counts_only_owned_prefix_plus_both_ends() {
+        use crate::inference::Q8DenseLinearStorage;
+
+        let _env_guard = crate::test_support::env_lock();
+        std::env::remove_var("CAMELID_METAL_NOCOPY");
+        std::env::remove_var(LAZY_Q8_LINEAR_ENV);
+        std::env::remove_var(RETAIN_Q8_BLOCKS_ENV);
+        let mut binding = dense_q8_materialization_binding(false, vec![32, 2]);
+        let layer = binding.layers[0].clone();
+        binding.layers = vec![layer; 4];
+        let coordinator_range = 0..1;
+
+        let full = estimate_cpu_weight_materialization_bytes_with_q8_storage_and_ownership(
+            &binding,
+            Q8DenseLinearStorage::ExpandedBlocks,
+            None,
+            true,
+            true,
+        )
+        .unwrap();
+        let coordinator = estimate_cpu_weight_materialization_bytes_with_q8_storage_and_ownership(
+            &binding,
+            Q8DenseLinearStorage::ExpandedBlocks,
+            Some(&coordinator_range),
+            true,
+            true,
+        )
+        .unwrap();
+        assert!(
+            coordinator < full,
+            "prefix shard {coordinator} < full {full}"
+        );
+
+        std::env::set_var(
+            CPU_WEIGHT_MATERIALIZATION_LIMIT_ENV,
+            coordinator.to_string(),
+        );
+        assert_eq!(
+            guard_cpu_weight_materialization_budget_with_ownership(
+                &binding,
+                Some(&coordinator_range),
+                true,
+                true,
+            )
+            .unwrap(),
+            coordinator,
+            "the coordinator shard must be admitted at its exact retained size"
+        );
+        let err = guard_cpu_weight_materialization_budget(&binding)
+            .expect_err("the same limit must reject the full model")
+            .to_string();
+        assert!(err.contains(&full.to_string()), "{err}");
+
+        std::env::remove_var(CPU_WEIGHT_MATERIALIZATION_LIMIT_ENV);
+    }
+
+    #[test]
+    fn ownership_estimate_models_embedding_output_and_tied_arc_sharing() {
+        use crate::inference::Q8DenseLinearStorage;
+
+        const KQUANT_WIRE_BYTES: u64 = 144;
+        const OUTPUT_NORM_BYTES: u64 = 8 * 4;
+        let mut tied = dense_quant_materialization_binding(true, GgufTensorType::Q4K, vec![256, 1]);
+        tied.layers.clear();
+        tied.output_norm = materialization_desc("output_norm.weight", GgufTensorType::F32, vec![8]);
+
+        for (load_embedding, load_output, expected) in [
+            (false, false, 0),
+            (true, false, KQUANT_WIRE_BYTES),
+            (false, true, KQUANT_WIRE_BYTES + OUTPUT_NORM_BYTES),
+            (true, true, KQUANT_WIRE_BYTES + OUTPUT_NORM_BYTES),
+        ] {
+            assert_eq!(
+                estimate_cpu_weight_materialization_bytes_with_q8_storage_and_ownership(
+                    &tied,
+                    Q8DenseLinearStorage::ExpandedBlocks,
+                    Some(&(0..0)),
+                    load_embedding,
+                    load_output,
+                )
+                .unwrap(),
+                expected,
+                "tied ownership ({load_embedding}, {load_output})"
+            );
+        }
+
+        let mut untied = tied.clone();
+        untied.output_is_tied_embedding = false;
+        assert_eq!(
+            estimate_cpu_weight_materialization_bytes_with_q8_storage_and_ownership(
+                &untied,
+                Q8DenseLinearStorage::ExpandedBlocks,
+                Some(&(0..0)),
+                true,
+                true,
+            )
+            .unwrap(),
+            2 * KQUANT_WIRE_BYTES + OUTPUT_NORM_BYTES,
+            "an untied output owns a second compact allocation"
+        );
+    }
+
+    #[test]
+    fn prism_estimate_counts_page_rounded_wire_pages_and_shared_tied_clone() {
+        use crate::inference::Q8DenseLinearStorage;
+
+        const DENSE_TENSOR_COUNT: u64 = 2 + 4 + 3;
+        const TIED_DENSE_TENSOR_COUNT: u64 = 1 + 4 + 3;
+        let page_bytes = crate::wire_mmap::page_size() as u64;
+        let wire_pages = 18_u64.div_ceil(page_bytes) * page_bytes;
+        let binding =
+            dense_quant_materialization_binding(false, GgufTensorType::Q1_0, vec![128, 1]);
+        assert_eq!(
+            estimate_cpu_weight_materialization_bytes_with_q8_storage(
+                &binding,
+                Q8DenseLinearStorage::ExpandedBlocks,
+            )
+            .unwrap(),
+            wire_pages * DENSE_TENSOR_COUNT
+        );
+
+        let tied = dense_quant_materialization_binding(true, GgufTensorType::Q1_0, vec![128, 1]);
+        assert_eq!(
+            estimate_cpu_weight_materialization_bytes_with_q8_storage(
+                &tied,
+                Q8DenseLinearStorage::ExpandedBlocks,
+            )
+            .unwrap(),
+            wire_pages * TIED_DENSE_TENSOR_COUNT,
+            "the tied Prism output clone shares its WirePages allocation"
+        );
+    }
+
+    #[test]
+    fn empty_split_moe_experts_fail_admission_before_zero_byte_estimate() {
+        let _env_guard = crate::test_support::env_lock();
+        std::env::remove_var(crate::runtime_config::MOE_EXPERT_STORAGE_ENV);
+        let mut binding = q4_moe_materialization_binding(true);
+        let LlamaFfnTensors::MoE {
+            gate_experts,
+            up_experts,
+            down_experts,
+            ..
+        } = &mut binding.layers[0].ffn
+        else {
+            unreachable!("MoE materialization fixture must contain expert sets");
+        };
+        *gate_experts = LlamaMoeExpertTensors::Split(Vec::new());
+        *up_experts = LlamaMoeExpertTensors::Split(Vec::new());
+        *down_experts = LlamaMoeExpertTensors::Split(Vec::new());
+
+        let err = estimate_cpu_weight_materialization_bytes(&binding)
+            .expect_err("zero-expert split bindings must fail before admission")
+            .to_string();
+        assert!(
+            err.contains("expert_count must be greater than zero"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -25067,7 +25871,7 @@ mod tests {
     }
 
     #[test]
-    fn q8_runtime_health_reports_default_auto_retain_candidate_policy() {
+    fn q8_runtime_health_reports_default_resident_policy() {
         let _env_guard = crate::test_support::env_lock();
         std::env::remove_var(RETAIN_Q8_BLOCKS_ENV);
         std::env::remove_var(LAZY_Q8_LINEAR_ENV);
@@ -25075,22 +25879,25 @@ mod tests {
 
         let health = q8_runtime_health();
 
-        assert_eq!(health.policy, "lazy_q8_linear_default_or_auto_retain");
-        assert!(health.lazy_q8_linear);
+        assert_eq!(health.policy, "resident_q8_default");
+        assert!(!health.lazy_q8_linear);
         assert!(!health.retain_q8_blocks);
+        assert!(health
+            .note
+            .contains("expanded RAM-resident blocks by default"));
         assert_eq!(health.file_cache_bytes, Some(64 * 1024 * 1024));
         std::env::remove_var("CAMELID_Q8_0_FILE_CACHE_BYTES");
     }
 
     #[test]
-    fn q8_runtime_health_reports_eager_retained_duplicate_policy() {
+    fn q8_runtime_health_reports_default_resident_with_generic_retention() {
         let _env_guard = crate::test_support::env_lock();
         std::env::set_var(LAZY_Q8_LINEAR_ENV, "0");
         std::env::set_var(RETAIN_Q8_BLOCKS_ENV, "1");
 
         let health = q8_runtime_health();
 
-        assert_eq!(health.policy, "eager_f32_with_retained_q8_blocks");
+        assert_eq!(health.policy, "resident_q8_default_with_generic_retention");
         assert!(!health.lazy_q8_linear);
         assert!(health.retain_q8_blocks);
         std::env::remove_var(RETAIN_Q8_BLOCKS_ENV);
@@ -25098,30 +25905,30 @@ mod tests {
     }
 
     #[test]
-    fn cpu_weight_materialization_estimate_can_count_q8_f32_when_lazy_disabled() {
+    fn cpu_weight_materialization_estimate_counts_expanded_q8_when_lazy_is_zero() {
         let _env_guard = crate::test_support::env_lock();
         std::env::remove_var(RETAIN_Q8_BLOCKS_ENV);
         std::env::set_var(LAZY_Q8_LINEAR_ENV, "0");
-        let binding = materialization_binding(false, GgufTensorType::Q8_0, vec![32, 2]);
+        let binding = dense_q8_materialization_binding(false, vec![32, 2]);
 
         let estimated = estimate_cpu_weight_materialization_bytes(&binding).unwrap();
-        let expected_per_tensor = 32 * 2 * 4;
-        let expected_tensor_count = 3 + 9;
+        let expected_per_tensor = 2 * mem::size_of::<Q8_0Block>() as u64;
+        let expected_tensor_count = 2 + 4 + 3;
 
         assert_eq!(estimated, expected_per_tensor * expected_tensor_count);
         std::env::remove_var(LAZY_Q8_LINEAR_ENV);
     }
 
     #[test]
-    fn cpu_weight_materialization_estimate_counts_opt_in_q8_retained_blocks() {
+    fn generic_retain_env_does_not_double_count_default_dense_q8_blocks() {
         let _env_guard = crate::test_support::env_lock();
         std::env::set_var(LAZY_Q8_LINEAR_ENV, "0");
         std::env::set_var(RETAIN_Q8_BLOCKS_ENV, "1");
-        let binding = materialization_binding(false, GgufTensorType::Q8_0, vec![32, 2]);
+        let binding = dense_q8_materialization_binding(false, vec![32, 2]);
 
         let estimated = estimate_cpu_weight_materialization_bytes(&binding).unwrap();
-        let expected_per_tensor = (32 * 2 * 4) + (2 * mem::size_of::<Q8_0Block>() as u64);
-        let expected_tensor_count = 3 + 9;
+        let expected_per_tensor = 2 * mem::size_of::<Q8_0Block>() as u64;
+        let expected_tensor_count = 2 + 4 + 3;
 
         assert_eq!(estimated, expected_per_tensor * expected_tensor_count);
         std::env::remove_var(RETAIN_Q8_BLOCKS_ENV);
@@ -25129,11 +25936,34 @@ mod tests {
     }
 
     #[test]
-    fn cpu_weight_materialization_estimate_counts_lazy_q8_linears_as_file_backed() {
+    fn q8_estimator_budgets_opt_in_packed_sidecars() {
+        let _env_guard = crate::test_support::env_lock();
+        std::env::remove_var(RETAIN_Q8_BLOCKS_ENV);
+        std::env::set_var(LAZY_Q8_LINEAR_ENV, "0");
+        std::env::remove_var("CAMELID_MAC_Q8_REPACK");
+        std::env::remove_var("CAMELID_X86_Q8_REPACK");
+        std::env::set_var("CAMELID_Q8_0_PACKED_4X4_DOT", "on");
+        std::env::set_var("CAMELID_Q8_0_PACKED_4X8_DOT", "on");
+        let binding = dense_q8_materialization_binding(false, vec![4, 32]);
+
+        let base_per_tensor = 4 * mem::size_of::<Q8_0Block>() as u64;
+        let expected_tensor_count = 2 + 4 + 3;
+        assert_eq!(
+            estimate_cpu_weight_materialization_bytes(&binding).unwrap(),
+            base_per_tensor * 3 * expected_tensor_count
+        );
+
+        std::env::remove_var("CAMELID_Q8_0_PACKED_4X4_DOT");
+        std::env::remove_var("CAMELID_Q8_0_PACKED_4X8_DOT");
+        std::env::remove_var(LAZY_Q8_LINEAR_ENV);
+    }
+
+    #[test]
+    fn cpu_weight_materialization_estimate_counts_forced_lazy_q8_linears_as_file_backed() {
         let _env_guard = crate::test_support::env_lock();
         std::env::remove_var(RETAIN_Q8_BLOCKS_ENV);
         std::env::set_var(LAZY_Q8_LINEAR_ENV, "1");
-        let binding = materialization_binding(false, GgufTensorType::Q8_0, vec![32, 2]);
+        let binding = dense_q8_materialization_binding(false, vec![32, 2]);
 
         let estimated = estimate_cpu_weight_materialization_bytes(&binding).unwrap();
 
@@ -25142,17 +25972,36 @@ mod tests {
     }
 
     #[test]
-    fn cpu_weight_materialization_estimate_skips_tied_output_tensor() {
+    fn cpu_weight_materialization_estimate_models_tied_output_clone_storage() {
         let _env_guard = crate::test_support::env_lock();
         std::env::remove_var(RETAIN_Q8_BLOCKS_ENV);
         std::env::set_var(LAZY_Q8_LINEAR_ENV, "0");
-        let binding = materialization_binding(true, GgufTensorType::Q8_0, vec![32, 2]);
+        let binding = dense_q8_materialization_binding(true, vec![32, 2]);
 
         let estimated = estimate_cpu_weight_materialization_bytes(&binding).unwrap();
-        let expected_per_tensor = 32 * 2 * 4;
-        let expected_tensor_count = 2 + 9;
+        let expected_per_tensor = 2 * mem::size_of::<Q8_0Block>() as u64;
+        let expected_tensor_count = 2 + 4 + 3;
 
         assert_eq!(estimated, expected_per_tensor * expected_tensor_count);
+
+        let page_bytes = crate::wire_mmap::page_size() as u64;
+        let wire_per_tensor = 68_u64.div_ceil(page_bytes) * page_bytes;
+        assert_eq!(
+            estimate_cpu_weight_materialization_bytes_with_q8_storage(
+                &binding,
+                crate::inference::Q8DenseLinearStorage::WirePages,
+            )
+            .unwrap(),
+            wire_per_tensor * (1 + 4 + 3)
+        );
+        assert_eq!(
+            estimate_cpu_weight_materialization_bytes_with_q8_storage(
+                &binding,
+                crate::inference::Q8DenseLinearStorage::FileBacked,
+            )
+            .unwrap(),
+            0
+        );
         std::env::remove_var(LAZY_Q8_LINEAR_ENV);
     }
 
@@ -25168,6 +26017,52 @@ mod tests {
             estimated
         );
         std::env::remove_var(CPU_WEIGHT_MATERIALIZATION_LIMIT_ENV);
+    }
+
+    #[test]
+    fn smollm3_sized_q8_budget_uses_expanded_blocks_and_forced_lazy_stays_zero() {
+        const SMOLLM3_Q8_GGUF_BYTES: u64 = 3_275_574_624;
+        const DENSE_TENSOR_COUNT: u64 = 2 + 4 + 3;
+
+        let _env_guard = crate::test_support::env_lock();
+        std::env::remove_var(RETAIN_Q8_BLOCKS_ENV);
+        std::env::remove_var(LAZY_Q8_LINEAR_ENV);
+        // Shape nine synthetic dense linears so their aggregate 34-byte GGUF wire
+        // footprint is the exact SmolLM3 row's size (rounded up by <9 blocks).
+        let blocks_per_tensor = SMOLLM3_Q8_GGUF_BYTES
+            .div_ceil(34)
+            .div_ceil(DENSE_TENSOR_COUNT);
+        let binding = dense_q8_materialization_binding(false, vec![32, blocks_per_tensor]);
+
+        let retained = estimate_cpu_weight_materialization_bytes(&binding).unwrap();
+        let expected = blocks_per_tensor * DENSE_TENSOR_COUNT * mem::size_of::<Q8_0Block>() as u64;
+        assert_eq!(retained, expected);
+        assert!(
+            retained > SMOLLM3_Q8_GGUF_BYTES,
+            "expanded 36-byte Q8 blocks must not be budgeted as 34-byte GGUF wire"
+        );
+
+        std::env::set_var(
+            CPU_WEIGHT_MATERIALIZATION_LIMIT_ENV,
+            SMOLLM3_Q8_GGUF_BYTES.to_string(),
+        );
+        let err = guard_cpu_weight_materialization_budget(&binding)
+            .expect_err("wire-sized budget must reject the larger retained layout")
+            .to_string();
+        assert!(err.contains("weight materialization/retention"), "{err}");
+
+        std::env::set_var(LAZY_Q8_LINEAR_ENV, "1");
+        assert_eq!(
+            estimate_cpu_weight_materialization_bytes(&binding).unwrap(),
+            0
+        );
+        assert_eq!(
+            guard_cpu_weight_materialization_budget(&binding).unwrap(),
+            0
+        );
+
+        std::env::remove_var(CPU_WEIGHT_MATERIALIZATION_LIMIT_ENV);
+        std::env::remove_var(LAZY_Q8_LINEAR_ENV);
     }
 
     #[test]
@@ -25254,18 +26149,17 @@ mod tests {
             .expect_err("oversized materialization should fail before eager decode")
             .to_string();
 
-        assert!(err.contains("estimated CPU f32 weight materialization"));
+        assert!(err.contains("estimated CPU weight materialization/retention"));
         assert!(err.contains(CPU_WEIGHT_MATERIALIZATION_LIMIT_ENV));
         std::env::remove_var(CPU_WEIGHT_MATERIALIZATION_LIMIT_ENV);
     }
 
     #[test]
-    fn cpu_weight_materialization_budget_bypassed_for_kquant_block_dot() {
-        // The budget guard must treat a K-quant block-dot model as wire-only (no f32
-        // materialization) on the CPU lane â€” otherwise serve CPU mode false-positives
-        // on the f32 size it never produces (Phase 2 follow-up). Tested directly on
-        // `binding_runs_on_cpu_wire_only` to avoid the `resident_decode_cuda_active`
-        // GPU-bypass confound on CUDA builds.
+    fn cpu_wire_only_classification_accepts_kquant_block_dot() {
+        // The execution classifier must treat a K-quant block-dot model as wire-only
+        // (no f32 materialization) on the CPU lane. Admission separately budgets the
+        // retained compact bytes. Test the classifier directly so CUDA availability
+        // cannot confound this CPU-path assertion.
         let _env_guard = crate::test_support::env_lock();
         let kquant = materialization_binding(false, GgufTensorType::Q4K, vec![256, 256]);
         let dense_f32 = materialization_binding(false, GgufTensorType::F32, vec![256, 256]);
@@ -28223,6 +29117,86 @@ mod tests {
         }
     }
 
+    /// Synthetic dense-Q8 binding whose non-linear tensors have zero-sized f32
+    /// storage. This isolates the storage policy under test: every byte in its
+    /// estimate belongs to a tensor routed through the loader's `load_linear`
+    /// closure, so forced lazy is genuinely materialization-free.
+    fn dense_quant_materialization_binding(
+        tied_output: bool,
+        tensor_type: GgufTensorType,
+        dimensions: Vec<u64>,
+    ) -> LlamaTensorBinding {
+        let mut binding = materialization_binding(tied_output, tensor_type, dimensions);
+        let empty_f32 = |name: &str| materialization_desc(name, GgufTensorType::F32, vec![0]);
+        binding.output_norm = empty_f32("output_norm.weight");
+        for layer in &mut binding.layers {
+            layer.attention_norm = empty_f32("blk.0.attn_norm.weight");
+            layer.ffn_norm = empty_f32("blk.0.ffn_norm.weight");
+        }
+        binding
+    }
+
+    fn dense_q8_materialization_binding(
+        tied_output: bool,
+        dimensions: Vec<u64>,
+    ) -> LlamaTensorBinding {
+        dense_quant_materialization_binding(tied_output, GgufTensorType::Q8_0, dimensions)
+    }
+
+    fn mla_q8_materialization_binding() -> LlamaTensorBinding {
+        let mut binding = dense_q8_materialization_binding(true, vec![0]);
+        let q8 = |name: &str, dimensions: Vec<u64>| {
+            materialization_desc(name, GgufTensorType::Q8_0, dimensions)
+        };
+        let f32 = |name: &str| materialization_desc(name, GgufTensorType::F32, vec![0]);
+        binding.mla_metadata = Some(crate::model::MlaMetadata {
+            q_lora_rank: 3,
+            kv_lora_rank: 5,
+            nope_head_dim: 4,
+            rope_head_dim: 2,
+        });
+        binding.attention_head_count = 2;
+        binding.hidden_size = 7;
+        binding.layers[0].attention = LlamaAttentionTensors::Mla {
+            q_a_proj: q8("blk.0.attn_q_a_proj.weight", vec![0]),
+            q_a_layernorm: f32("blk.0.attn_q_a_norm.weight"),
+            q_b_proj: q8("blk.0.attn_q_b_proj.weight", vec![3, 12]),
+            kv_a_proj_with_mqa: q8("blk.0.attn_kv_a_mqa.weight", vec![0]),
+            kv_a_layernorm: f32("blk.0.attn_kv_a_norm.weight"),
+            kv_b_proj: q8("blk.0.attn_kv_b.weight", vec![5, 16]),
+        };
+        binding.layers[0].attention_output = q8(
+            "blk.0.attn_output.weight",
+            vec![8, binding.hidden_size as u64],
+        );
+        binding
+    }
+
+    fn q4_moe_materialization_binding(split: bool) -> LlamaTensorBinding {
+        let mut binding = dense_q8_materialization_binding(true, vec![0]);
+        let expert = materialization_desc(
+            "blk.0.ffn_gate_exps.weight",
+            GgufTensorType::Q4_0,
+            vec![32, 1, 1],
+        );
+        let expert_set = |suffix: &str| {
+            let mut desc = expert.clone();
+            desc.name = format!("blk.0.ffn_{suffix}_exps.weight");
+            if split {
+                LlamaMoeExpertTensors::Split(vec![desc])
+            } else {
+                LlamaMoeExpertTensors::Merged(desc)
+            }
+        };
+        binding.layers[0].ffn = LlamaFfnTensors::MoE {
+            router: materialization_desc("blk.0.ffn_gate_inp.weight", GgufTensorType::F32, vec![0]),
+            gate_experts: expert_set("gate"),
+            up_experts: expert_set("up"),
+            down_experts: expert_set("down"),
+        };
+        binding
+    }
+
     fn materialization_desc(
         name: &str,
         tensor_type: GgufTensorType,
@@ -28231,6 +29205,14 @@ mod tests {
         let element_count = dimensions.iter().product::<u64>();
         let n_bytes = match tensor_type {
             GgufTensorType::Q8_0 => element_count.div_ceil(32) * 34,
+            GgufTensorType::Q2K => element_count.div_ceil(256) * 84,
+            GgufTensorType::Q3K => element_count.div_ceil(256) * 110,
+            GgufTensorType::Q4K => element_count.div_ceil(256) * 144,
+            GgufTensorType::Q5K => element_count.div_ceil(256) * 176,
+            GgufTensorType::Q6K => element_count.div_ceil(256) * 210,
+            GgufTensorType::Q1_0 => element_count.div_ceil(128) * 18,
+            GgufTensorType::Q2_0G64 => element_count.div_ceil(64) * 18,
+            GgufTensorType::Q2_0G128 | GgufTensorType::Pq2_0 => element_count.div_ceil(128) * 34,
             GgufTensorType::F32 => element_count * 4,
             GgufTensorType::F16 | GgufTensorType::BF16 => element_count * 2,
             _ => element_count,

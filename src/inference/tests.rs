@@ -223,6 +223,39 @@ fn resident_q8_moe_expert_view_slices_blocks_without_f32_materialization() {
 }
 
 #[test]
+fn only_merged_q4_moe_experts_use_the_streamed_override() {
+    let desc = crate::gguf::GgufTensorDescriptor {
+        name: "blk.0.ffn_gate_exps.weight".to_string(),
+        dimensions: vec![32, 1, 1],
+        tensor_type: GgufTensorType::Q4_0,
+        relative_offset: 0,
+        absolute_offset: 0,
+        n_bytes: 18,
+    };
+    assert!(merged_moe_expert_set_streams_q4(
+        &LlamaMoeExpertTensors::Merged(desc.clone())
+    ));
+    assert!(!merged_moe_expert_set_streams_q4(
+        &LlamaMoeExpertTensors::Split(vec![desc])
+    ));
+}
+
+#[test]
+fn empty_split_moe_expert_set_fails_closed_before_pipeline_name_indexing() {
+    let empty = LlamaMoeExpertTensors::Split(Vec::new());
+
+    let err = validate_moe_expert_set_nonempty(&empty, "layer 0 gate experts")
+        .expect_err("zero-expert split bindings must not reach descs[0]")
+        .to_string();
+
+    assert!(err.contains("layer 0 gate experts"), "{err}");
+    assert!(
+        err.contains("expert_count must be greater than zero"),
+        "{err}"
+    );
+}
+
+#[test]
 fn resident_moe_preflight_preserves_host_headroom() {
     const GIB: u64 = 1024 * 1024 * 1024;
     let empty = MoeResidentMemoryEstimate::default();
