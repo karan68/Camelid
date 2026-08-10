@@ -12,7 +12,7 @@ import { Notice } from '../components/ui/Notice'
 import { useModelsPageData } from '../hooks/useModelsPageData'
 import { formatBytes } from '../lib/formatters'
 import { bucketByLane } from '../lib/modelLanes'
-import { loadLocalModelForChat, modelFilenameFromPath } from '../lib/modelActivation'
+import { loadLocalModelForChat, modelFilenameFromPath, unloadLocalModel } from '../lib/modelActivation'
 import { modelDeleteBlockedReason } from '../lib/modelDeletion'
 import { IconModels, IconRefresh } from '../components/ui/icons'
 
@@ -86,6 +86,7 @@ export default function ModelsView({
     : []
   const deleteBlockedReason = modelDeleteBlockedReason({
     activeFilename: spine.activeFilename,
+    residentModelsLoaded: spine.loadedModelIds.size > 0,
     downloads: spine.downloads,
     loading: Boolean(usingFilename || loadingModelId || importing || unloading),
     smoking: Object.values(smokeBusy).some(Boolean) || catalogOperations.size > 0,
@@ -105,7 +106,7 @@ export default function ModelsView({
   // lib/modelActivation so this page and the first-run card cannot drift; what stays
   // here is the page's own state wiring. The spine's `/api/models/current` refresh
   // answers the identity check, so the confirmation costs no extra request.
-  const loadModelForChat = async (filename, { onStage } = {}) => {
+  const loadModelForChat = async (filename, { onStage, model = null } = {}) => {
     if (loadInFlightRef.current) {
       const message = loadInFlightRef.current === filename
         ? `${filename} is already loading.`
@@ -121,6 +122,7 @@ export default function ModelsView({
       const result = await loadLocalModelForChat({
         apiBase: spine.base,
         filename,
+        model: model || spine.local?.models.find((entry) => entry.filename === filename) || null,
         onStage,
         readActiveFilename: async () => modelFilenameFromPath((await spine.refreshCurrent())?.path),
       })
@@ -129,8 +131,33 @@ export default function ModelsView({
         setLaneError(result.message)
         return result
       }
-      await refreshDashboard?.({ silent: true })
+      await Promise.all([
+        spine.refreshLoadedModels(),
+        refreshDashboard?.({ silent: true }),
+      ])
       return result
+    } finally {
+      if (loadInFlightRef.current === filename) loadInFlightRef.current = ''
+      setUsingFilename('')
+    }
+  }
+
+  const unloadEmbeddingModel = async (filename) => {
+    if (loadInFlightRef.current) return
+    loadInFlightRef.current = filename
+    setUsingFilename(filename)
+    setLaneError('')
+    try {
+      const result = await unloadLocalModel({ apiBase: spine.base, modelId: filename })
+      if (!result.ok) {
+        setLaneError(result.message)
+        return
+      }
+      await Promise.all([
+        spine.refreshLoadedModels(),
+        spine.refreshCurrent(),
+        refreshDashboard?.({ silent: true }),
+      ])
     } finally {
       if (loadInFlightRef.current === filename) loadInFlightRef.current = ''
       setUsingFilename('')
@@ -380,12 +407,14 @@ export default function ModelsView({
               key={m.filename}
               entry={m}
               active={m.filename === spine.activeFilename}
+              resident={m.filename === spine.activeFilename || spine.loadedModelIds.has(m.filename)}
               busy={usingFilename === m.filename}
               deleteBusy={deletingFilename === m.filename}
               defaultBusy={defaultingFilename === m.filename}
               isDefault={spine.defaultFilename === m.filename}
               blockedReason={deleteBlockedReason}
               onUse={() => loadModelForChat(m.filename)}
+              onUnload={unloadEmbeddingModel}
               onDelete={requestDeleteModel}
               onMakeDefault={makeDefaultModel}
             />
@@ -413,12 +442,15 @@ export default function ModelsView({
                 key={m.filename}
                 entry={m}
                 receipt={receipts[m.filename]}
+                active={m.filename === spine.activeFilename}
+                resident={m.filename === spine.activeFilename || spine.loadedModelIds.has(m.filename)}
                 busy={usingFilename === m.filename}
                 deleteBusy={deletingFilename === m.filename}
                 defaultBusy={defaultingFilename === m.filename}
                 isDefault={spine.defaultFilename === m.filename}
                 blockedReason={deleteBlockedReason}
                 onUse={() => loadModelForChat(m.filename)}
+                onUnload={unloadEmbeddingModel}
                 onDelete={requestDeleteModel}
                 onMakeDefault={makeDefaultModel}
               />
@@ -438,12 +470,15 @@ export default function ModelsView({
               <NotAnchoredRow
                 key={m.filename}
                 entry={m}
+                active={m.filename === spine.activeFilename}
+                resident={m.filename === spine.activeFilename || spine.loadedModelIds.has(m.filename)}
                 busy={usingFilename === m.filename}
                 deleteBusy={deletingFilename === m.filename}
                 defaultBusy={defaultingFilename === m.filename}
                 isDefault={spine.defaultFilename === m.filename}
                 blockedReason={deleteBlockedReason}
                 onUse={() => loadModelForChat(m.filename)}
+                onUnload={unloadEmbeddingModel}
                 onDelete={requestDeleteModel}
                 onMakeDefault={makeDefaultModel}
               />

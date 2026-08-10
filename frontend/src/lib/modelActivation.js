@@ -1,3 +1,5 @@
+import { isEmbeddingOnlyModel } from './modelCapabilities.js'
+
 /* The exact HTTP sequence that puts a local GGUF into its runtime, defined once.
 
    Two surfaces run it — the Models page's "Use" action and the first-run activation
@@ -6,7 +8,7 @@
      1. header-only inspect, so an architecture Camelid cannot run is refused before
         anything reads a multi-GB file;
      2. the authoritative load (generative models replace the active chat model;
-        the exact Nomic encoder registers as a sidecar without replacing it);
+        embedding encoders register as sidecars without replacing Chat);
      3. a lane-specific readiness check: active identity plus generation readiness
         for chat, or a real bounded embedding for the encoder sidecar.
 
@@ -24,8 +26,8 @@ export function modelFilenameFromPath(value) {
 
 /* Load `filename` (a bare name inside the engine's configured models directory).
 
-   Generative models return `{ ok: true }`; the supported Nomic encoder returns
-   `{ ok: true, embedding: true }` after its sidecar readiness probe. Failures use
+   Generative models return `{ ok: true }`; embedding-only encoders return
+   `{ ok: true, embedding: true }` after their sidecar readiness probe. Failures use
    `{ ok: false, stage, message, code, blocker }`. `code` is the backend's stable
    `error.code` when it sent one — the caller needs it to tell a permanent refusal
    (`model_too_large_for_host`) from something worth retrying, and to avoid rendering
@@ -38,16 +40,20 @@ export function modelFilenameFromPath(value) {
 export async function loadLocalModelForChat({
   apiBase = '',
   filename,
+  path: requestedPath = '',
+  modelId = filename,
   fetchImpl = globalThis.fetch,
   onStage = () => {},
   readActiveFilename = null,
+  model = null,
 } = {}) {
   const base = String(apiBase || '').replace(/\/$/, '')
   /* A models-relative path, NOT the engine's absolute models_dir joined with '/'.
      On Windows the reported models_dir can be a `\\?\` verbatim path, and Win32 does
      not separator-normalize inside one, so the concatenation produced an invalid
      name (os error 123). The backend resolves this relative path itself. */
-  const path = `models/${filename}`
+  const path = requestedPath || `models/${filename}`
+  const requestModelId = modelId || filename
   let stage = CHECKING
 
   try {
@@ -72,7 +78,18 @@ export async function loadLocalModelForChat({
         blocker: inspect.blocker,
       }
     }
-    const embeddingModel = inspect?.architecture === 'nomic-bert'
+    const inspectedModel = {
+      ...(model || {}),
+      filename,
+      architecture: inspect?.architecture || model?.architecture,
+      embedding_capable: typeof inspect?.embedding_capable === 'boolean'
+        ? inspect.embedding_capable
+        : model?.embedding_capable,
+      generation_capable: typeof inspect?.generation_capable === 'boolean'
+        ? inspect.generation_capable
+        : model?.generation_capable,
+    }
+    const embeddingModel = isEmbeddingOnlyModel(inspectedModel)
 
     // Only an inspected, implemented model reaches the authoritative load.
     stage = LOADING
@@ -81,7 +98,7 @@ export async function loadLocalModelForChat({
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        id: filename,
+        id: requestModelId,
         path,
         replace: !embeddingModel,
         set_active: !embeddingModel,
@@ -107,7 +124,7 @@ export async function loadLocalModelForChat({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          model: filename,
+          model: requestModelId,
           input: 'search_query: Camelid embedding readiness probe',
           dimensions: 256,
         }),
@@ -123,7 +140,13 @@ export async function loadLocalModelForChat({
           blocker: null,
         }
       }
-      return { ok: true, embedding: true }
+      return {
+        ok: true,
+        id: requestModelId,
+        embedding: true,
+        embedding_capable: true,
+        generation_capable: false,
+      }
     }
 
     const activeFilename = readActiveFilename
@@ -150,7 +173,7 @@ export async function loadLocalModelForChat({
         blocker: null,
       }
     }
-    if (!health.loaded_now || !health.generation_ready || health.active_model_id !== filename) {
+    if (!health.loaded_now || !health.generation_ready || health.active_model_id !== requestModelId) {
       return {
         ok: false,
         stage: LOADING,
@@ -159,7 +182,7 @@ export async function loadLocalModelForChat({
         blocker: null,
       }
     }
-    return { ok: true }
+    return { ok: true, id: requestModelId }
   } catch (error) {
     return { ok: false, stage, message: String(error?.message || error), code: '', blocker: null }
   }

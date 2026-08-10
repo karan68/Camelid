@@ -7456,6 +7456,13 @@ struct InspectBlocker {
 struct InspectModelResponse {
     architecture: Option<String>,
     quant: Option<String>,
+    /// The file exposes an embedding/reranking runtime rather than a token-
+    /// generation head. This is metadata-derived and independent of whether the
+    /// current host can admit the model.
+    embedding_capable: bool,
+    /// The file can produce completion tokens. Keep this separate from
+    /// `chat_capable`: base completion models may not ship a chat template.
+    generation_capable: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     source: Option<ModelSourceInspection>,
     /// Predicted lane (`supported` / `experimental_implemented` / `unsupported`).
@@ -7495,6 +7502,8 @@ async fn inspect_model(
                 Json(InspectModelResponse {
                     architecture: None,
                     quant: None,
+                    embedding_capable: false,
+                    generation_capable: false,
                     source: Some(source),
                     lane_class: ModelLaneClass::Unsupported,
                     blocker: Some(InspectBlocker {
@@ -7539,6 +7548,8 @@ async fn inspect_model(
     };
 
     let architecture = gguf.architecture().map(ToOwned::to_owned);
+    let embedding_capable = is_embedding_model(&gguf);
+    let generation_capable = is_generation_model(&gguf);
     let filename = req
         .path
         .file_name()
@@ -7573,6 +7584,8 @@ async fn inspect_model(
         Json(InspectModelResponse {
             architecture,
             quant,
+            embedding_capable,
+            generation_capable,
             source: None,
             lane_class,
             blocker,
@@ -7796,6 +7809,81 @@ fn is_embedding_model(gguf: &GgufFile) -> bool {
     gguf.architecture() == Some("nomic-bert") || crate::model::is_bitnet_embedding_model(gguf)
 }
 
+/// Whether the GGUF carries the decoder-side token embedding table required by
+/// a text-generation graph. This deliberately leaves companion projectors (for
+/// example CLIP/mmproj GGUFs) in the third, neither-generation-nor-embedding
+/// state instead of treating every non-encoder file as generative.
+fn is_generation_model(gguf: &GgufFile) -> bool {
+    !is_embedding_model(gguf)
+        && gguf
+            .tensors
+            .iter()
+            .any(|tensor| tensor.name == "token_embd.weight")
+}
+
+#[cfg(test)]
+mod model_capability_tests {
+    use std::{collections::BTreeMap, path::PathBuf};
+
+    use super::{is_embedding_model, is_generation_model};
+    use crate::gguf::{GgufFile, GgufMetadataValue, GgufTensorDescriptor, GgufTensorType};
+
+    fn fixture(architecture: &str, name: &str, tensor_names: &[&str]) -> GgufFile {
+        GgufFile {
+            path: PathBuf::from("capability.gguf"),
+            version: 3,
+            tensor_count: tensor_names.len() as i64,
+            metadata_count: 2,
+            alignment: 32,
+            data_start_offset: 0,
+            metadata: BTreeMap::from([
+                (
+                    "general.architecture".to_string(),
+                    GgufMetadataValue::String(architecture.to_string()),
+                ),
+                (
+                    "general.name".to_string(),
+                    GgufMetadataValue::String(name.to_string()),
+                ),
+            ]),
+            tensors: tensor_names
+                .iter()
+                .map(|tensor_name| GgufTensorDescriptor {
+                    name: (*tensor_name).to_string(),
+                    dimensions: vec![8, 8],
+                    tensor_type: GgufTensorType::F32,
+                    relative_offset: 0,
+                    absolute_offset: 0,
+                    n_bytes: 256,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn decoder_encoder_and_projector_capabilities_are_distinct() {
+        let decoder = fixture(
+            "bitnet-b1.58",
+            "bitnet2b",
+            &["token_embd.weight", "output.weight"],
+        );
+        assert!(is_generation_model(&decoder));
+        assert!(!is_embedding_model(&decoder));
+
+        let encoder = fixture(
+            "gemma3",
+            "bitnet-embeddings-270m",
+            &["token_embd.weight", "output_norm.weight"],
+        );
+        assert!(is_embedding_model(&encoder));
+        assert!(!is_generation_model(&encoder));
+
+        let projector = fixture("clip", "vision-projector", &["mm.0.weight"]);
+        assert!(!is_embedding_model(&projector));
+        assert!(!is_generation_model(&projector));
+    }
+}
+
 /// Gemma 4 chat template constants + renderer. Turns are
 /// `<|turn>{system|user|model}\nâ€¦<turn|>\n` and generation follows a trailing
 /// `<|turn>model\n`; a leading system message gets its own system turn, and
@@ -7824,7 +7912,8 @@ pub(crate) const GEMMA4_THINK: &str = "<|think|>";
 mod gemma4_template_tests {
     use super::*;
     use crate::tokenizer::{
-        BpePreTokenizer, BpeRegistry, SpecialTokens, TokenizerConfig, TokenizerModel,
+        BpePreTokenizer, BpeRegistry, SpecialTokens, Token, TokenKind, TokenizerConfig,
+        TokenizerModel,
     };
 
     fn phi4_template_test_tokenizer(template: &str) -> Tokenizer {
@@ -7845,6 +7934,48 @@ mod gemma4_template_tests {
                 remove_extra_whitespaces: false,
             },
             chat_template: Some(template.to_string()),
+            specials_index: OnceLock::new(),
+        }
+    }
+
+    fn bitnet_template_test_tokenizer() -> Tokenizer {
+        Tokenizer {
+            model: TokenizerModel::Gpt2Bpe,
+            bpe_pre_tokenizer: BpePreTokenizer::default(),
+            tokens: vec![
+                Token {
+                    id: 0,
+                    text: "<|begin_of_text|>".to_string(),
+                    score: 0.0,
+                    kind: TokenKind::Control,
+                },
+                Token {
+                    id: 1,
+                    text: "<|end_of_text|>".to_string(),
+                    score: 0.0,
+                    kind: TokenKind::Control,
+                },
+            ],
+            token_to_id: HashMap::from([
+                ("<|begin_of_text|>".to_string(), 0),
+                ("<|end_of_text|>".to_string(), 1),
+            ]),
+            byte_token_to_id: HashMap::new(),
+            bpe_ranks: HashMap::new(),
+            bpe_registry: BpeRegistry::default(),
+            special: SpecialTokens {
+                bos: Some(0),
+                eos: Some(1),
+                ..SpecialTokens::default()
+            },
+            config: TokenizerConfig {
+                add_bos: true,
+                add_eos: false,
+                add_sep: false,
+                add_space_prefix: false,
+                remove_extra_whitespaces: false,
+            },
+            chat_template: Some(MICROSOFT_BITNET_2B_CHAT_TEMPLATE.to_string()),
             specials_index: OnceLock::new(),
         }
     }
@@ -7879,6 +8010,105 @@ mod gemma4_template_tests {
             "<|im_start|>user\nWhat is the capital of France?<|im_end|>\n\
              <|im_start|>assistant\n<think>\n\n</think>\n\n"
         );
+    }
+
+    #[test]
+    fn bitnet_2b_renderer_matches_embedded_human_assistant_template() {
+        let messages = [
+            ChatMessage {
+                image_urls: Vec::new(),
+                unsupported_content_parts: Vec::new(),
+                role: "system".to_string(),
+                content: "Ignored by the upstream template.".to_string(),
+            },
+            ChatMessage {
+                image_urls: Vec::new(),
+                unsupported_content_parts: Vec::new(),
+                role: "user".to_string(),
+                content: "First".to_string(),
+            },
+            ChatMessage {
+                image_urls: Vec::new(),
+                unsupported_content_parts: Vec::new(),
+                role: "assistant".to_string(),
+                content: "Answer".to_string(),
+            },
+            ChatMessage {
+                image_urls: Vec::new(),
+                unsupported_content_parts: Vec::new(),
+                role: "user".to_string(),
+                content: "Second".to_string(),
+            },
+        ];
+
+        let rendered = render_bitnet_chat_prompt(&messages, "<|end_of_text|>");
+        assert_eq!(
+            rendered,
+            "Human: First\n\nBITNETAssistant: <|end_of_text|>Answer<|end_of_text|>\
+             Human: Second\n\nBITNETAssistant: <|end_of_text|>"
+        );
+        assert!(!rendered.contains("<|begin_of_text|>"));
+        assert!(!rendered.contains("<|im_start|>"));
+    }
+
+    #[test]
+    fn bitnet_2b_template_gate_and_feature_refusals_are_exact() {
+        let official = MICROSOFT_BITNET_2B_CHAT_TEMPLATE;
+        assert!(is_bitnet_chat_template(official));
+        assert!(!is_bitnet_chat_template(&format!(
+            "{official}{{# materially different template #}}"
+        )));
+        assert!(!is_bitnet_chat_template(
+            "<|im_start|>user{{ content }}<|im_end|>"
+        ));
+        assert!(!is_bitnet_chat_template(
+            "Human: {{ content }}\n\nBITNETAssistant: "
+        ));
+
+        assert_eq!(bitnet_chat_feature_error(false, false), None);
+        assert_eq!(
+            bitnet_chat_feature_error(false, true),
+            Some(BitNetChatFeatureError::Tools)
+        );
+        assert_eq!(
+            bitnet_chat_feature_error(true, false),
+            Some(BitNetChatFeatureError::Thinking)
+        );
+        assert_eq!(
+            bitnet_chat_feature_error(true, true),
+            Some(BitNetChatFeatureError::Tools),
+            "tools take precedence when both unsupported extensions are requested"
+        );
+    }
+
+    #[test]
+    fn bitnet_2b_runnable_prompt_requests_metadata_driven_bos() {
+        assert!(runnable_prompt_add_special("bitnet-b1.58"));
+        assert!(!runnable_prompt_add_special("qwen35"));
+    }
+
+    #[test]
+    fn bitnet_2b_apply_template_uses_the_generation_renderer() {
+        let tokenizer = bitnet_template_test_tokenizer();
+        let messages = [ChatMessage {
+            image_urls: Vec::new(),
+            unsupported_content_parts: Vec::new(),
+            role: "user".to_string(),
+            content: "hi".to_string(),
+        }];
+        let rendered = render_chat_prompt_for_tokenization_for_model_result(
+            &messages,
+            &tokenizer,
+            Some("bitnet2b"),
+            false,
+        )
+        .expect("recognized Microsoft BitNet template");
+        assert_eq!(
+            rendered.text,
+            "Human: hi\n\nBITNETAssistant: <|end_of_text|>"
+        );
+        assert!(rendered.add_special);
+        assert!(rendered.parse_special);
     }
 
     #[test]
@@ -9858,6 +10088,124 @@ fn render_gemma3_prompt(messages: &[ChatMessage]) -> String {
     prompt
 }
 
+const MICROSOFT_BITNET_2B_CHAT_TEMPLATE: &str = r#"{% for message in messages %}{% if loop.first %}{{ bos_token }}{% endif %}{% if message['role'] == 'user' %}{{ 'Human: ' + message['content'] + '\n\nBITNETAssistant: ' + eos_token }}{% elif message['role'] == 'assistant' %}{{ message['content'] + eos_token }}{% endif %}{% endfor %}"#;
+
+/// Render the official Microsoft BitNet-b1.58-2B-4T GGUF chat template.
+///
+/// The file's template is deliberately not ChatML. User turns open the model
+/// response with `Human: ...\n\nBITNETAssistant: ` and then append the GGUF's
+/// EOS token; assistant turns append their content plus EOS. System and other
+/// roles are ignored by the upstream template. The leading BOS is NOT renderer
+/// text: [`prepare_runnable_prompt`] requests special-token insertion and the
+/// tokenizer's `add_bos_token` metadata supplies it exactly once.
+fn render_bitnet_chat_prompt(messages: &[ChatMessage], eos_token: &str) -> String {
+    let mut prompt = String::new();
+    for message in messages {
+        match message.role.trim() {
+            "user" => {
+                prompt.push_str("Human: ");
+                prompt.push_str(&message.content);
+                prompt.push_str("\n\nBITNETAssistant: ");
+                prompt.push_str(eos_token);
+            }
+            "assistant" => {
+                prompt.push_str(&message.content);
+                prompt.push_str(eos_token);
+            }
+            _ => {}
+        }
+    }
+    prompt
+}
+
+/// Exact detector for the Microsoft 2B GGUF's embedded Jinja template.
+/// Architecture alone is insufficient: routing an unrelated `bitnet-b1.58`
+/// conversion through the hard-coded Human/BITNETAssistant dialect would put a
+/// foreign prompt in front of its weights. Keep this equality strict so a
+/// materially different template cannot inherit the Microsoft rendering merely
+/// by containing the same marker words.
+fn is_bitnet_chat_template(template: &str) -> bool {
+    template.trim() == MICROSOFT_BITNET_2B_CHAT_TEMPLATE
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BitNetChatFeatureError {
+    Tools,
+    Thinking,
+}
+
+fn bitnet_chat_feature_error(
+    enable_thinking: bool,
+    tools_present: bool,
+) -> Option<BitNetChatFeatureError> {
+    if tools_present {
+        Some(BitNetChatFeatureError::Tools)
+    } else if enable_thinking {
+        Some(BitNetChatFeatureError::Thinking)
+    } else {
+        None
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn bitnet_chat_prompt_for_runtime(
+    runtime: &RunnableServeRuntime,
+    model_id: &str,
+    messages: &[ChatMessage],
+    enable_thinking: bool,
+    tools: &[serde_json::Value],
+) -> std::result::Result<String, Response> {
+    let template_matches = runtime
+        .tokenizer
+        .chat_template
+        .as_deref()
+        .is_some_and(is_bitnet_chat_template);
+    let bos_ready = runtime.tokenizer.config.add_bos && runtime.tokenizer.special.bos.is_some();
+    let eos_token = runtime
+        .tokenizer
+        .token_text(runtime.tokenizer.special.eos)
+        .filter(|token| !token.is_empty());
+    if !template_matches || !bos_ready || eos_token.is_none() {
+        return Err(api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "unsupported_chat_template",
+            format!(
+                "model '{model_id}' declares architecture 'bitnet-b1.58', but its embedded \
+                 tokenizer metadata does not match the evidenced Microsoft 2B chat dialect \
+                 (Human:/BITNETAssistant: roles, BOS insertion, and an EOS token). Camelid \
+                 refuses to substitute the unrelated Ornith ChatML template."
+            ),
+            Some("messages"),
+        ));
+    }
+    match bitnet_chat_feature_error(enable_thinking, !tools.is_empty()) {
+        Some(BitNetChatFeatureError::Tools) => {
+            return Err(api_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "unsupported_tools",
+                "the bitnet-b1.58 runnable lane does not support tools: the model's Human:/BITNETAssistant: template has no tools branch or certified tool-call grammar"
+                    .to_string(),
+                Some("tools"),
+            ));
+        }
+        Some(BitNetChatFeatureError::Thinking) => {
+            return Err(api_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "unsupported_thinking",
+                "the bitnet-b1.58 chat template has no thinking-mode branch; set camelid_enable_thinking=false"
+                    .to_string(),
+                Some("camelid_enable_thinking"),
+            ));
+        }
+        None => {}
+    }
+
+    Ok(render_bitnet_chat_prompt(
+        messages,
+        eos_token.expect("BitNet EOS checked above"),
+    ))
+}
+
 /// Render an Ornith/qwen35 ChatML prompt (no tools). The generation prompt opens the
 /// reasoning block (`<think>\n`) when thinking is enabled, else prefills an empty one.
 fn render_ornith_chatml_prompt(messages: &[ChatMessage], enable_thinking: bool) -> String {
@@ -10328,6 +10676,10 @@ fn decode_prism_image_data_url(url: &str) -> std::result::Result<Vec<u8>, Respon
     Ok(bytes)
 }
 
+fn runnable_prompt_add_special(architecture: &str) -> bool {
+    matches!(architecture, "gemma2" | "gemma3" | "lfm2" | "bitnet-b1.58")
+}
+
 #[allow(clippy::result_large_err)]
 fn prepare_runnable_prompt(
     runtime: &RunnableServeRuntime,
@@ -10347,7 +10699,9 @@ fn prepare_runnable_prompt(
         // `tokenizer.ggml.add_bos_token` so the tokenizer's default `true`
         // applies. Without this the whole prompt is shifted by a missing BOS
         // and the forward diverges from the reference.
-        let add_special = matches!(runtime.architecture.as_str(), "gemma2" | "gemma3" | "lfm2");
+        // The Microsoft BitNet GGUF likewise declares add_bos_token=true;
+        // requesting special insertion here honors that metadata exactly once.
+        let add_special = runnable_prompt_add_special(&runtime.architecture);
         let ids = runtime
             .tokenizer
             .encode(prompt_text, add_special, true)
@@ -10452,7 +10806,12 @@ async fn runnable_chat_nonstreaming(
     let messages = req.messages.clone().unwrap_or_default();
     let enable_thinking = req.camelid_enable_thinking.unwrap_or(false);
     let tools = runnable_request_tools(req);
-    let prompt_text = if runtime.architecture == "gemma2" || runtime.architecture == "gemma3" {
+    let prompt_text = if runtime.architecture == "bitnet-b1.58" {
+        match bitnet_chat_prompt_for_runtime(&runtime, &id, &messages, enable_thinking, &tools) {
+            Ok(prompt) => prompt,
+            Err(response) => return response,
+        }
+    } else if runtime.architecture == "gemma2" || runtime.architecture == "gemma3" {
         if !tools.is_empty() {
             return gemma_runnable_lane_tools_rejection();
         }
@@ -10536,8 +10895,14 @@ async fn runnable_chat_nonstreaming(
     // Prefer the token-level split: on lfm2 `</think>` is a control token that
     // detokenization strips, so the text search below can never find it and the
     // whole think block would land in `content`.
-    let (reasoning, content) =
-        split_think_by_token(&ids, &runtime.tokenizer).unwrap_or_else(|| split_ornith_think(&text));
+    let ornith_output_dialect = runtime.architecture != "bitnet-b1.58";
+    let (reasoning, content) = if ornith_output_dialect {
+        split_think_by_token(&ids, &runtime.tokenizer).unwrap_or_else(|| split_ornith_think(&text))
+    } else {
+        // BitNet's evidenced template has no reasoning/tool dialect. Preserve
+        // literal model text even if it happens to contain Ornith-looking tags.
+        (None, text)
+    };
     // Structured tool_calls (OpenAI shape) lifted from the Ornith `<function=â€¦>` XML.
     // The agent loop ALSO re-parses the content text client-side (chat-lane
     // `parse_ornith`), so the content keeps the tool-call text below.
@@ -10551,12 +10916,14 @@ async fn runnable_chat_nonstreaming(
     // covers). Without this a request that was REFUSED a tools array could still
     // come back with `finish_reason: "tool_calls"` if the model echoed Ornith
     // syntax from its history.
-    let tool_calls =
-        if runtime.architecture != "lfm2" && tool_choice_allows_calls(req.tool_choice.as_ref()) {
-            parse_ornith_tool_calls_json(&content)
-        } else {
-            Vec::new()
-        };
+    let tool_calls = if ornith_output_dialect
+        && runtime.architecture != "lfm2"
+        && tool_choice_allows_calls(req.tool_choice.as_ref())
+    {
+        parse_ornith_tool_calls_json(&content)
+    } else {
+        Vec::new()
+    };
     let finish_reason = if tool_calls.is_empty() {
         "stop"
     } else {
@@ -10613,7 +10980,12 @@ async fn runnable_chat_streaming(
     let messages = req.messages.clone().unwrap_or_default();
     let enable_thinking = req.camelid_enable_thinking.unwrap_or(false);
     let tools = runnable_request_tools(req);
-    let prompt_text = if runtime.architecture == "gemma2" || runtime.architecture == "gemma3" {
+    let prompt_text = if runtime.architecture == "bitnet-b1.58" {
+        match bitnet_chat_prompt_for_runtime(&runtime, &id, &messages, enable_thinking, &tools) {
+            Ok(prompt) => prompt,
+            Err(response) => return response,
+        }
+    } else if runtime.architecture == "gemma2" || runtime.architecture == "gemma3" {
         if !tools.is_empty() {
             return gemma_runnable_lane_tools_rejection();
         }
@@ -10658,8 +11030,10 @@ async fn runnable_chat_streaming(
     // (hold-back off), so lifting here would BOTH violate OpenAI semantics and
     // duplicate the streamed text as a structured tool_calls delta.
     // Arch-gated for the same reason as the non-streaming path above.
-    let lift_tool_calls =
-        runtime.architecture != "lfm2" && tool_choice_allows_calls(req.tool_choice.as_ref());
+    let ornith_output_dialect = runtime.architecture != "bitnet-b1.58";
+    let lift_tool_calls = ornith_output_dialect
+        && runtime.architecture != "lfm2"
+        && tool_choice_allows_calls(req.tool_choice.as_ref());
     let think_close = runtime.tokenizer.token_to_id.get("</think>").copied();
     let opens_think_unconditionally = runtime.architecture == "lfm2";
     let created = unix_secs();
@@ -10805,7 +11179,11 @@ async fn runnable_chat_streaming(
 
         match final_state {
             Some(Ok((text, ids, prompt_token_count))) => {
-                let (_reasoning, content) = split_ornith_think(&text);
+                let content = if ornith_output_dialect {
+                    split_ornith_think(&text).1
+                } else {
+                    text
+                };
                 let tool_calls = if lift_tool_calls {
                     parse_ornith_tool_calls_json(&content)
                 } else {
@@ -18763,6 +19141,28 @@ fn render_chat_prompt_for_tokenization_for_model_result(
     let exact_llama32_metadata_jinja_row =
         model_id.and_then(llama32_metadata_jinja_exact_row_label);
     if let Some(template) = tokenizer.chat_template.as_deref() {
+        if is_bitnet_chat_template(template) {
+            if !tokenizer.config.add_bos || tokenizer.special.bos.is_none() {
+                return Err(MiniJinjaError::new(
+                    MiniJinjaErrorKind::InvalidOperation,
+                    "the Microsoft BitNet 2B template requires tokenizer BOS insertion",
+                ));
+            }
+            let eos_token = tokenizer
+                .token_text(tokenizer.special.eos)
+                .filter(|token| !token.is_empty())
+                .ok_or_else(|| {
+                    MiniJinjaError::new(
+                        MiniJinjaErrorKind::InvalidOperation,
+                        "the Microsoft BitNet 2B template requires a declared EOS token",
+                    )
+                })?;
+            return Ok(RenderedPrompt {
+                text: render_bitnet_chat_prompt(messages, eos_token),
+                add_special: true,
+                parse_special: true,
+            });
+        }
         if metadata_chat_template_enabled() {
             return render_metadata_jinja_chat_template_prompt(messages, tokenizer, template, None);
         }
@@ -27024,6 +27424,11 @@ pub struct LocalModelEntry {
     /// The GGUF ships a chat template â€” i.e. it is an instruction-tuned chat model
     /// (vs a base text-completion model). A model capability, not a system fact.
     pub chat_capable: bool,
+    /// The file exposes an embedding/reranking runtime.
+    pub embedding_capable: bool,
+    /// The file exposes a token-generation head. This intentionally differs from
+    /// `chat_capable`, because base completion models need no chat template.
+    pub generation_capable: bool,
     /// Trained context window (tokens) from the GGUF â€” a model capability.
     pub context_length: Option<u32>,
     /// A validated catalog-managed marker and sibling `.cghost` are present, so
@@ -28186,6 +28591,8 @@ struct CachedLocalMeta {
     admission_reason: Option<String>,
     oracle_qualified: bool,
     chat_capable: bool,
+    embedding_capable: bool,
+    generation_capable: bool,
     context_length: Option<u32>,
 }
 
@@ -28333,10 +28740,14 @@ async fn local_models(
                         admission_reason: None,
                         oracle_qualified: false,
                         chat_capable: false,
+                        embedding_capable: false,
+                        generation_capable: false,
                         context_length: None,
                     };
                     match read_metadata(&path) {
                         Ok(gguf) => {
+                            c.embedding_capable = is_embedding_model(&gguf);
+                            c.generation_capable = is_generation_model(&gguf);
                             let quant = crate::runnable::headline_quant_of(&gguf);
                             c.quantization = Some(quant.clone());
                             // Model capabilities (system-independent): a chat template
@@ -28399,6 +28810,8 @@ async fn local_models(
                 admission_reason: meta.admission_reason,
                 oracle_qualified: meta.oracle_qualified,
                 chat_capable: meta.chat_capable,
+                embedding_capable: meta.embedding_capable,
+                generation_capable: meta.generation_capable,
                 context_length: meta.context_length,
                 ghost_moe_prepared: crate::ghost_install::is_prepared(&path),
                 lane_class,

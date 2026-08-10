@@ -1,4 +1,5 @@
 import { compatibilityHintCopy, findCompatibilityHint, isCompatibilitySupportedForModel } from './capabilities.js'
+import { isEmbeddingOnlyModel, modelTaskKind } from './modelCapabilities.js'
 import { isRunnableInCurrentRuntime, modelRuntimeIdMatches } from './modelState.js'
 
 /* The backend's exact-artifact verdict for this model's GGUF, from
@@ -90,9 +91,11 @@ function runtimeLaneHint(hint, laneScopedRow, runtimeLane) {
 }
 
 export function getChatGateState(capabilities, model, runtime) {
+  const embeddingOnly = isEmbeddingOnlyModel(model, runtime)
+  const taskKind = modelTaskKind(model, runtime)
   const runtimeLoaded = Boolean(runtime?.loaded_now && modelRuntimeIdMatches(model, runtime))
   const runtimeGenerationReady = Boolean(runtime?.generation_ready && modelRuntimeIdMatches(model, runtime))
-  const runtimeReady = Boolean(isRunnableInCurrentRuntime(model, runtime) && runtimeLoaded && runtimeGenerationReady)
+  const runtimeReady = Boolean(!embeddingOnly && isRunnableInCurrentRuntime(model, runtime) && runtimeLoaded && runtimeGenerationReady)
   const discoveredHint = findCompatibilityHint(capabilities, model)
   const runtimeLane = normalizedGemma4ServeLane(runtime)
   const laneScopedRow = isGemma426bLaneScopedRow(model, discoveredHint)
@@ -122,7 +125,7 @@ export function getChatGateState(capabilities, model, runtime) {
   const artifactSupported = hasBackendLaneVerdict
     ? backendMarksSupportedRow(model)
     : isCompatibilitySupportedForModel(capabilities, model)
-  const contractSupported = Boolean(runtimeLaneEligible && artifactSupported)
+  const contractSupported = Boolean(!embeddingOnly && runtimeLaneEligible && artifactSupported)
   const hint = runtimeLaneEligible
     ? contractHint
     : runtimeLaneHint(contractHint, laneScopedRow, runtimeLane)
@@ -136,6 +139,9 @@ export function getChatGateState(capabilities, model, runtime) {
 
   return {
     hint,
+    taskKind,
+    embeddingOnly,
+    generationCapable: !embeddingOnly && model?.generation_capable !== false,
     runtimeReady,
     runtimeLoaded,
     runtimeGenerationReady,
@@ -147,6 +153,8 @@ export function getChatGateState(capabilities, model, runtime) {
     // the gate. Raw row ids stay in `hint` for technical views and popovers.
     label: !model
       ? 'No model loaded'
+      : embeddingOnly
+        ? 'Embedding only'
       : contractSupported
         ? 'Verified'
         : experimentalUnlocked

@@ -32,7 +32,7 @@ try {
     rowSupportNextStepCopy,
     statusContainsSupportedEvidence,
   } = await server.ssrLoadModule('/src/lib/capabilities.js')
-  const { resolveLoadedModelDisplayName } = await server.ssrLoadModule('/src/hooks/useDashboardData.js')
+  const { mergeModelLists, resolveLoadedModelDisplayName } = await server.ssrLoadModule('/src/hooks/useDashboardData.js')
   const { LLAMA32_3B_ACCEPTANCE_TARGET } = await server.ssrLoadModule('/src/lib/acceptanceTargets.js')
 
   const noop = () => {}
@@ -168,6 +168,72 @@ try {
     setTab: noop,
   }))
   assert.doesNotMatch(textOnlyRendered, /accept="image\/png,image\/jpeg"/, 'text-only runtime must not advertise an image control it cannot serve')
+
+  const embeddingModel = {
+    id: 'bitnet-embeddings-270m',
+    name: 'Microsoft BitNet Embedding 270M',
+    provider_kind: 'local',
+    status: 'ready',
+    model_path: 'models/bitnet-embeddings-270m-bf16-i2_s.gguf',
+    embedding_capable: true,
+    generation_capable: false,
+    loaded_now: true,
+    generation_ready: false,
+  }
+  const embeddingRuntime = {
+    ...readyRuntime,
+    active_model_id: embeddingModel.id,
+    generation_ready: false,
+    model_family: 'embedding',
+  }
+  const mergedSidecars = mergeModelLists({
+    modelItems: [
+      { id: 'bitnet-embeddings-0.6b-bf16-i2_s.gguf' },
+      { id: 'bitnet-embeddings-270m-bf16-i2_s.gguf' },
+    ],
+    health: readyRuntime,
+    currentModel: { path: selectedModel.model_path },
+    localModels: [
+      {
+        id: 'microsoft-bitnet-embedding-0.6b',
+        name: 'Microsoft BitNet Embedding 0.6B',
+        model_path: 'models/bitnet-embeddings-0.6b-bf16-i2_s.gguf',
+        embedding_capable: true,
+        generation_capable: false,
+      },
+      embeddingModel,
+    ],
+    apiBase: readyRuntime.api_base,
+    localFacts: new Map(),
+  })
+  assert.equal(mergedSidecars.length, 2, 'non-active embedding sidecars should merge into their saved catalog rows without duplicate runtime entries')
+  assert.deepEqual(
+    mergedSidecars.map((model) => model.id).sort(),
+    ['bitnet-embeddings-270m', 'microsoft-bitnet-embedding-0.6b'],
+    'resident filename ids should preserve the saved catalog identities',
+  )
+  assert.ok(mergedSidecars.every((model) => model.loaded_now), 'merged sidecar rows should be marked resident even though neither is the active Chat model')
+  const embeddingMarkup = renderToStaticMarkup(React.createElement(ChatWorkspace, {
+    selectedConversation: { id: 'embedding-chat', title: 'Embedding', messages: [] },
+    selectedModel: embeddingModel,
+    selectedModelId: embeddingModel.id,
+    setSelectedModelId: noop,
+    models: [embeddingModel],
+    runtime: embeddingRuntime,
+    capabilities,
+    pendingConversation: null,
+    composer: 'Draft only',
+    setComposer: noop,
+    saveToMemory: noop,
+    sendMessage: noop,
+    sending: false,
+    selectedModelRunnable: false,
+    selectedModelExperimental: false,
+    setTab: noop,
+  }))
+  assert.match(embeddingMarkup, /ready for embeddings and reranking, not Chat/i, 'embedding runtime must render a terminal task-ready state')
+  assert.match(embeddingMarkup, /<optgroup label="Embedding only">/, 'embedding rows remain visible but disabled outside Chat choices')
+  assert.doesNotMatch(embeddingMarkup, /BitNet Embedding 270M · Loading/, 'embedding-only generation_ready=false must never be described as an in-progress Chat load')
 
   const wrongArtifactModel = {
     ...selectedModel,

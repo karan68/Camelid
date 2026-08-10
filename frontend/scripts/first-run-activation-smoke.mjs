@@ -386,6 +386,47 @@ assert.equal(modelFilenameFromPath(null), '')
   assert.equal(calls[1].body.set_active, false)
 }
 
+for (const fixture of [
+  { filename: 'bitnet-embeddings-0.6b-bf16-i2_s.gguf', architecture: 'qwen3' },
+  { filename: 'bitnet-embeddings-270m-bf16-i2_s.gguf', architecture: 'gemma3' },
+]) {
+  const calls = []
+  const result = await loadLocalModelForChat({
+    apiBase: 'http://camelid.test',
+    filename: fixture.filename,
+    fetchImpl: async (url, options) => {
+      calls.push({ url, body: options?.body ? JSON.parse(options.body) : null })
+      if (url.endsWith('/api/models/inspect')) {
+        return response({
+          body: {
+            architecture: fixture.architecture,
+            embedding_capable: true,
+            generation_capable: false,
+          },
+        })
+      }
+      if (url.endsWith('/api/models/load')) return response({ body: {} })
+      if (url.endsWith('/v1/embeddings')) {
+        return response({ body: { data: [{ embedding: Array(256).fill(0) }] } })
+      }
+      throw new Error(`unexpected request ${url}`)
+    },
+  })
+  assert.equal(result.ok, true)
+  assert.equal(result.embedding, true)
+  assert.deepEqual(
+    calls.map((call) => call.url),
+    [
+      'http://camelid.test/api/models/inspect',
+      'http://camelid.test/api/models/load',
+      'http://camelid.test/v1/embeddings',
+    ],
+    `${fixture.filename} must use embedding readiness instead of waiting on generation_ready`,
+  )
+  assert.equal(calls[1].body.replace, false, 'BitNet embeddings must not release the current Chat model')
+  assert.equal(calls[1].body.set_active, false, 'BitNet embeddings must remain non-active sidecars')
+}
+
 {
   // A refused architecture must stop before anything reads the weights.
   let loadAttempted = false

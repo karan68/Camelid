@@ -102,7 +102,7 @@ export async function completeCatalogAcquisition({
   }
 
   try {
-    const loaded = await loadModelForChat(item.filename, { onStage })
+    const loaded = await loadModelForChat(item.filename, { onStage, model: item })
     if (!loaded?.ok) {
       return {
         ok: false,

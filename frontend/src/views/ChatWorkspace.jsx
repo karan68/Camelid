@@ -1,6 +1,7 @@
 import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { getChatGateState } from '../lib/chatGate'
 import { exactArtifactFilenameForRow } from '../lib/capabilities'
+import { isEmbeddingOnlyModel, isGenerationCapableModel } from '../lib/modelCapabilities.js'
 import { applyGemma4GhostChatTokenCap, getConfiguredMaxTokens, modelContextLength, validateSendBudget } from '../lib/responseLimits'
 import { CamelidMark } from '../components/ui/CamelidMark'
 import { Avatar } from '../components/ui/Avatar'
@@ -198,9 +199,15 @@ export default function ChatWorkspace({
 
   // ----- Gate / readiness derivations (shared exact-row chat gate) -----
   const selectedChatGate = getChatGateState(capabilities, selectedModel, runtime)
+  const selectedEmbeddingOnly = selectedChatGate.embeddingOnly
+  const selectedBitNetChatModel = selectedModel?.architecture === 'bitnet-b1.58'
   const apiUnavailable = runtime?.status === 'offline'
   const selectedRuntimeReady = selectedChatGate.runtimeReady
   const selectedModelCapabilitySupported = selectedChatGate.contractSupported
+
+  useEffect(() => {
+    if (selectedBitNetChatModel && thinkingMode && setThinkingMode) setThinkingMode(false)
+  }, [selectedBitNetChatModel, setThinkingMode, thinkingMode])
   const supportBlocked = selectedRuntimeReady && !selectedModelCapabilitySupported
   /* Only set when the row was matched but the loaded GGUF is not its exact
      artifact — the one blocked state with a concrete next step. */
@@ -215,8 +222,10 @@ export default function ChatWorkspace({
      (send gate, reply cap, local-inference note) folds into the tooltip below. */
   const statusLine = apiUnavailable
     ? 'Not connected — start the local server to chat.'
-    : selectedModelRunnable
-      ? `${selectedModelName} is loaded and ready.`
+    : selectedEmbeddingOnly
+      ? `${selectedModelName} is ready for embeddings and reranking, not Chat.`
+      : selectedModelRunnable
+        ? `${selectedModelName} is loaded and ready.`
       : experimentalChatReady
         ? `${selectedModelName} is ready — replies are not verified.`
       : selectedModelIssue
@@ -242,7 +251,9 @@ export default function ChatWorkspace({
       ? 'Experimental local chat is ready. Replies are not verified.'
     : apiUnavailable
       ? 'Keep writing here. Send unlocks again once the local API responds.'
-      : supportBlocked
+      : selectedEmbeddingOnly
+        ? 'This model creates embeddings for search and reranking. Choose a generation model to chat.'
+        : supportBlocked
         /* When the blocker is a near-miss GGUF, naming the file the reader
            actually needs is far more actionable than "pick a verified model" —
            they are usually one download away, not one decision away. */
@@ -257,8 +268,8 @@ export default function ChatWorkspace({
             ? 'Camelid answers with a model running on this machine. Set one up above and this becomes a chat.'
             : 'Pick a local GGUF model first. Camelid will show the readiness path here.'
 
-  const readinessState = canChat ? 'ready' : apiUnavailable ? 'offline' : supportBlocked ? 'blocked' : selectedModel ? 'waiting' : 'idle'
-  const statusTone = selectedModelRunnable ? 'ready' : experimentalChatReady ? 'warn' : apiUnavailable ? 'offline' : supportBlocked ? 'warn' : runtime?.loaded_now ? 'warn' : 'neutral'
+  const readinessState = canChat ? 'ready' : apiUnavailable ? 'offline' : selectedEmbeddingOnly ? 'blocked' : supportBlocked ? 'blocked' : selectedModel ? 'waiting' : 'idle'
+  const statusTone = selectedModelRunnable ? 'ready' : experimentalChatReady ? 'warn' : apiUnavailable ? 'offline' : selectedEmbeddingOnly ? 'ready' : supportBlocked ? 'warn' : runtime?.loaded_now ? 'warn' : 'neutral'
 
   const canSubmit = Boolean(composer.trim()) && canChat && !generationActive
   const sendDisabledReason = canChat
@@ -267,7 +278,9 @@ export default function ChatWorkspace({
       ? 'Wait for the current reply to finish or stop it before sending again.'
       : apiUnavailable
         ? 'Sending unlocks once the connection is back.'
-        : supportBlocked
+        : selectedEmbeddingOnly
+          ? 'Choose a generation model to send this chat.'
+          : supportBlocked
           ? 'Choose a verified model to send.'
           : selectedModel
             ? 'Sending unlocks once this model is ready.'
@@ -279,7 +292,9 @@ export default function ChatWorkspace({
     ? 'Message Camelid…'
     : apiUnavailable
       ? 'Draft a prompt while the Camelid API comes back'
-      : composerDraftUnlocked
+      : selectedEmbeddingOnly
+        ? 'Choose a generation model to send a chat'
+        : composerDraftUnlocked
         ? 'Draft a prompt while Camelid finishes getting ready'
         : firstRunActive
           ? 'Set up the model above, then chat here'
@@ -425,11 +440,14 @@ export default function ChatWorkspace({
 
   // ----- Model picker -----
   const modelCanChat = (model) => ['supported', 'experimental'].includes(getChatGateState(capabilities, model, runtime).chatMode)
-  const runnableModels = models.filter(modelCanChat)
-  const waitingModels = models.filter((model) => !modelCanChat(model))
-  const selectedPickerModelId = models.some((model) => model.id === selectedModel?.id) ? selectedModel.id : ''
+  const chatModels = models.filter((model) => isGenerationCapableModel(model, runtime))
+  const embeddingModels = models.filter((model) => isEmbeddingOnlyModel(model, runtime))
+  const runnableModels = chatModels.filter(modelCanChat)
+  const waitingModels = chatModels.filter((model) => !modelCanChat(model))
+  const selectedPickerModelId = chatModels.some((model) => model.id === selectedModel?.id) ? selectedModel.id : ''
   const modelOptionLabel = (model) => {
     const gate = getChatGateState(capabilities, model, runtime)
+    if (gate.embeddingOnly) return `${model.name} · Embedding only`
     if (gate.chatUnlocked) return `${model.name} · Ready`
     if (gate.chatMode === 'experimental') return `${model.name} · Experimental ready`
     if (apiUnavailable) return `${model.name} · Not connected`
@@ -528,7 +546,7 @@ export default function ChatWorkspace({
                   }}
                   disabled={generationActive || Boolean(loadingModelId)}
                 >
-                  {!selectedModel && <option value="">Choose model</option>}
+                  {!selectedPickerModelId && <option value="">Choose chat model</option>}
                   {runnableModels.length > 0 && (
                     <optgroup label="Ready">
                       {runnableModels.map((model) => <option key={model.id} value={model.id}>{modelOptionLabel(model)}</option>)}
@@ -537,6 +555,13 @@ export default function ChatWorkspace({
                   {waitingModels.length > 0 && (
                     <optgroup label="Needs readiness">
                       {waitingModels.map((model) => <option key={model.id} value={model.id}>{modelOptionLabel(model)}</option>)}
+                    </optgroup>
+                  )}
+                  {embeddingModels.length > 0 && (
+                    <optgroup label="Embedding only">
+                      {embeddingModels.map((model) => (
+                        <option key={model.id} value={`embedding:${model.id}`} disabled>{modelOptionLabel(model)}</option>
+                      ))}
                     </optgroup>
                   )}
                 </select>
@@ -578,7 +603,7 @@ export default function ChatWorkspace({
                 <IconReceipt size={16} /> <span className="cxcomposer__tool-label">{receiptMode ? 'Receipt on' : 'Receipt'}</span>
               </button>
             )}
-            {!demoMode && setThinkingMode && (
+            {!demoMode && setThinkingMode && !selectedBitNetChatModel && (
               <button
                 type="button"
                 className={`cxcomposer__tool cxcomposer__tool--collapsible ${thinkingMode ? 'is-on' : ''}`}
