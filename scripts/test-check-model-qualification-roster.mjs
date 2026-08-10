@@ -79,8 +79,8 @@ assert.match(qwenVerifyLog, /PASS execution-trace:.*200 checkpoints/)
 assert.match(qwenVerifyLog, /INFO reference-rerun: llama-server version "version: 9632 \(acd79d603\)"/)
 assert.match(qwenVerifyLog, /PASS reference-rerun: generated tokens \(8\) and text match llama\.cpp \(first_divergent_token_index=-1\)/)
 assert.match(qwenVerifyLog, /RECEIPT VERIFIED \(self-digest, lane identity, Camelid replay, and llama\.cpp reference re-run all passed/)
-assert.equal(summarizeRoster(roster)[3].next_gate, 'metadata', 'Gemma2 tokenizer evidence passes independently while clean-head metadata regeneration stays fail-closed')
-assert.equal(summarizeRoster(roster)[4].next_gate, 'metadata', 'SmolLM3 keeps metadata blocked until the clean-head receipt is regenerated')
+assert.equal(summarizeRoster(roster)[3].next_gate, 'load_smoke', 'Gemma2 advances through exact-row metadata, tokenizer, and template evidence')
+assert.equal(summarizeRoster(roster)[4].next_gate, 'tokenizer', 'SmolLM3 advances metadata while preserving its tokenizer and dynamic-template HOLDs')
 
 assert.ok(
   errorsAfter((candidate) => { candidate.defaults.models_dir_env = 'CAMELID_MODEL_DIR' }).some((error) => error.includes('plural CAMELID_MODELS_DIR')),

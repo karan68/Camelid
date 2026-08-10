@@ -1,18 +1,7 @@
 {
   "schema": "camelid.remote-gguf-header-inspection/v1",
-  "provenance": {
-    "status": "draft_requires_clean_head_regeneration",
-    "clean_head_inspector_receipt": false,
-    "missing_fields": [
-      "inspector.source_head",
-      "inspector.binary_commit_abbrev",
-      "inspector.binary_reports_dirty",
-      "inspector.binary_matches_source_head",
-      "inspector.clean_current_head"
-    ]
-  },
   "row_id": "gemma2_9b_it_q8_0",
-  "generated_at": "2026-08-10T16:33:23.993Z",
+  "generated_at": "2026-08-10T17:03:15.879Z",
   "host": {
     "hostname_redacted": true,
     "platform": "win32",
@@ -20,8 +9,13 @@
     "arch": "x64"
   },
   "inspector": {
-    "version": "camelid v0.6.1-27-g8a99bd9e",
-    "binary_sha256": "a21ac6df71fab0b35a226f5ed26fdb22a19a9ac70cbf4188c1fb6fcfe3d9275e",
+    "version": "camelid v0.6.1-28-gfcb3e022",
+    "binary_sha256": "17c60bcad794934416a1ae29de99ce0316d77b68207ac1e5d1e7d90189f5b9c3",
+    "source_head": "fcb3e022e24efecdd0a554ff7fd218a6ee106dfc",
+    "binary_commit_abbrev": "fcb3e022",
+    "binary_reports_dirty": false,
+    "binary_matches_source_head": true,
+    "clean_current_head": true,
     "binary_path_redacted": true,
     "command": [
       "<camelid>",

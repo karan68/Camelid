@@ -176,10 +176,9 @@ for (const [rowId, receiptPath] of [
   const durableStage = metadataStageFromHeader(durableRow, durableReceipt)
   assert.equal(
     durableStage.status,
-    'fail',
-    `${receiptPath} remains a draft until clean-head inspector provenance is regenerated`,
+    'pass',
+    `${receiptPath} must remain a valid clean-head exact-row remote-header receipt`,
   )
-  assert.equal(durableStage.error_code, 'header_receipt_invalid')
 }
 
 let resolverCalls = 0

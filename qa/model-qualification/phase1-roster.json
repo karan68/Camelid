@@ -396,12 +396,11 @@
         },
         "metadata": {
           "required": true,
-          "status": "blocked",
+          "status": "pass",
           "evidence": [
             "qa/model-qualification/gemma2-9b-it-q8-header-inspection.json",
             "src/model.rs"
-          ],
-          "reason": "The exact-row immutable prefix parsed all metadata and descriptors, but the receipt predates the clean-current-head inspector provenance contract. Regenerate it after the hardened header helper lands before this gate can pass."
+          ]
         },
         "tokenizer": {
           "required": true,
@@ -493,13 +492,12 @@
         },
         "metadata": {
           "required": true,
-          "status": "blocked",
+          "status": "pass",
           "evidence": [
             "qa/model-qualification/smollm3-3b-q8-header-inspection.json",
             "src/model.rs",
             "tests/inference_session.rs"
-          ],
-          "reason": "The exact-row immutable prefix parsed all metadata and descriptors, but the receipt predates the clean-current-head inspector provenance contract. Regenerate it after the hardened header helper lands before this gate can pass."
+          ]
         },
         "tokenizer": {
           "required": true,
