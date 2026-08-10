@@ -4,12 +4,14 @@ import assert from 'node:assert/strict'
 import {
   actualTokenGate,
   buildGenerationRequest,
+  buildLongPrompt,
   buildMessages,
   camelidLaunchConfig,
   oracleConfig,
   parseArgs,
   requireNativeReceipt,
   requestMode,
+  sealReceiptArgs,
   verifierArgs,
 } from '../qa/capability/context_parity_lib.mjs'
 
@@ -63,6 +65,10 @@ assert.deepEqual(buildGenerationRequest({ mode: 'raw', prompt: 'raw prompt', mes
   camelid_receipt: true,
 })
 
+const longPrompt = buildLongPrompt(739)
+assert.equal(buildLongPrompt(739, '.'), `${longPrompt}.`)
+assert.equal(buildLongPrompt(739, ''), longPrompt)
+
 assert.deepEqual(actualTokenGate(512, '512'), {
   enabled: true,
   expected: 512,
@@ -107,6 +113,9 @@ assert.deepEqual(verify.slice(-8), [
   '--llama-flash-attn', 'off',
   '--llama-no-repack',
   '--reference-only',
+])
+assert.deepEqual(sealReceiptArgs('receipt.json'), [
+  'seal-receipt', '--input', 'receipt.json',
 ])
 
 assert.throws(() => requestMode(parseArgs(['--request-mode', 'other'])), /raw or chat/)

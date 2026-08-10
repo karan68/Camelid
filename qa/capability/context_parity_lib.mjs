@@ -78,13 +78,13 @@ export function oracleConfig(args) {
   return { cacheTypeK, cacheTypeV, flashAttn, repack }
 }
 
-export function buildLongPrompt(targetTokens) {
+export function buildLongPrompt(targetTokens, suffix = '') {
   const paragraph =
     'The river wound past the old stone mill, where farmers once ground wheat into flour for the village bakeries. ' +
     'Each autumn the orchards filled with ripe apples, and children carried baskets along the dusty lane toward the market square. ' +
     'A blacksmith hammered iron near the well while merchants argued over the price of wool and salt. '
   const repetitions = Math.ceil((targetTokens * 3.6) / paragraph.length)
-  return paragraph.repeat(repetitions).slice(0, Math.floor(targetTokens * 3.6))
+  return paragraph.repeat(repetitions).slice(0, Math.floor(targetTokens * 3.6)) + suffix
 }
 
 export function buildMessages(prompt, systemMessage) {
@@ -150,4 +150,8 @@ export function verifierArgs({
   if (verifyMode === 'reference-only') args.push('--reference-only')
   if (verifyMode === 'self-only') args.push('--self-only')
   return args
+}
+
+export function sealReceiptArgs(receiptPath) {
+  return ['seal-receipt', '--input', receiptPath]
 }

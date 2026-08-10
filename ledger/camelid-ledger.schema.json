@@ -77,6 +77,7 @@
         "exact_row_embeddings_rerank_and_workspace_semantic_retrieval_only",
         "exact_row_gpu_resident_raw_decode_parity_smoke_only",
         "exact_row_gpu_resident_windowed_chat_smoke_only_metal_or_cuda",
+        "exact_hash_pinned_row_on_windows_x86_64_runnable_cpu_or_mac16_10_apple_m4_macos_26_5_arm64_resident_metal_greedy_chat_and_512_context_smoke_only",
         "exact_row_greedy_runnable_chat_and_512_context_smoke_only",
         "exact_row_macos_apple_silicon_metal_chat_smoke_only",
         "exact_row_macos_apple_silicon_metal_text_and_single_image_chat_smoke_only",

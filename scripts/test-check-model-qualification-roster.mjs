@@ -20,6 +20,10 @@ assert.equal(summarizeRoster(roster).length, 6, 'all six Phase 1 graph families 
 assert.equal(summarizeRoster(roster)[0].next_gate, null, 'LFM2 closes every Phase 1 gate on the exact promoted row')
 assert.equal(roster.rows[0].disposition, 'promotion_candidate', 'all-green LFM2 is ready for exact-row promotion')
 assert.equal(summarizeRoster(roster)[1].next_gate, 'load_smoke', 'Qwen2.5 preserves its first post-bootstrap blocker')
+assert.equal(roster.rows[1].gates.context.status, 'blocked', 'Qwen2.5 context remains blocked while its verifier transcript is absent')
+assert.match(roster.rows[1].gates.context.reason, /verifier transcript is absent/)
+assert.equal(summarizeRoster(roster)[3].next_gate, 'load_smoke', 'Gemma2 advances through exact-row metadata, tokenizer, and template evidence')
+assert.equal(summarizeRoster(roster)[4].next_gate, 'template', 'SmolLM3 advances through exact-row tokenizer evidence while preserving its dynamic-template HOLD')
 
 assert.ok(
   errorsAfter((candidate) => { candidate.defaults.models_dir_env = 'CAMELID_MODEL_DIR' }).some((error) => error.includes('plural CAMELID_MODELS_DIR')),

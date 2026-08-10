@@ -7268,7 +7268,7 @@ fn resident_load_is_idempotent(
     if resident_path != requested_path {
         return false;
     }
-    requested_id.map_or(true, |id| id == resident_id)
+    requested_id.is_none_or(|id| id == resident_id)
 }
 
 /// The refusal for a load-blocking verdict: a stable error code plus its message.
@@ -11523,7 +11523,7 @@ async fn runnable_chat_nonstreaming(
         }
         match prepare_gemma2_runnable_chat_prompt(&runtime, &id, &messages) {
             Ok(prompt) => prompt,
-            Err(rejection) => return rejection,
+            Err(rejection) => return *rejection,
         }
     } else if runtime.architecture == "gemma3" {
         if !tools.is_empty() {
@@ -11747,7 +11747,7 @@ async fn runnable_chat_streaming(
         }
         match prepare_gemma2_runnable_chat_prompt(&runtime, &id, &messages) {
             Ok(prompt) => prompt,
-            Err(rejection) => return rejection,
+            Err(rejection) => return *rejection,
         }
     } else if runtime.architecture == "gemma3" {
         if !tools.is_empty() {
@@ -20034,6 +20034,180 @@ struct RenderedPrompt {
     parse_special: bool,
 }
 
+#[allow(dead_code)]
+const SMOLLM3_EXACT_CHAT_TEMPLATE_UTF8_BYTES: usize = 5_493;
+#[allow(dead_code)]
+const SMOLLM3_EXACT_CHAT_TEMPLATE_SHA256: &str =
+    "b9b66f04c64fbb8695cf5b35c37780efd0b8e0829fbfe3e30fafb9f469b7d30e";
+#[allow(dead_code)]
+const SMOLLM3_DEFAULT_THINKING_INSTRUCTION: &str = "You are a helpful AI assistant named SmolLM, trained by Hugging Face. Your role as an assistant involves thoroughly exploring questions through a systematic thinking process before providing the final precise and accurate solutions. This requires engaging in a comprehensive cycle of analysis, summarizing, exploration, reassessment, reflection, backtracking, and iteration to develop well-considered thinking process. Please structure your response into two main sections: Thought and Solution using the specified format: <think> Thought section </think> Solution section. In the Thought section, detail your reasoning process in steps. Each step should include detailed considerations such as analysing questions, summarizing relevant findings, brainstorming new ideas, verifying the accuracy of the current steps, refining any errors, and revisiting previous steps. In the Solution section, based on various attempts, explorations, and reflections from the Thought section, systematically present the final solution that you deem correct. The Solution section should be logical, accurate, and concise and detail necessary steps needed to reach the conclusion.";
+
+/// Typed boundary for the exact-row SmolLM3 prompt-shape preparation helper.
+///
+/// This is deliberately not wired into chat dispatch. The architecture-wide
+/// runtime HOLD remains authoritative until every dynamic branch is qualified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+enum SmolLm3TemplatePreparationError {
+    TemplateIdentityMismatch,
+    EmptyMessages,
+    EmptyContent,
+    ExplicitFalseThinkingUnsupported,
+    AddGenerationPromptRequired,
+    InvalidInjectedDate,
+    SystemRoleUnsupported,
+    SystemOverrideUnsupported,
+    ToolRoleUnsupported,
+    UnsupportedRole,
+    NonAlternatingHistory,
+    HistoryMustEndWithUser,
+    MultimodalUnsupported,
+    StructuredContentUnsupported,
+}
+
+#[allow(dead_code)]
+impl SmolLm3TemplatePreparationError {
+    fn code(self) -> &'static str {
+        match self {
+            Self::TemplateIdentityMismatch => "smollm3_template_identity_mismatch",
+            Self::EmptyMessages => "smollm3_template_empty_messages",
+            Self::EmptyContent => "smollm3_template_empty_content",
+            Self::ExplicitFalseThinkingUnsupported => "smollm3_template_false_thinking_unsupported",
+            Self::AddGenerationPromptRequired => "smollm3_template_add_generation_prompt_required",
+            Self::InvalidInjectedDate => "smollm3_template_injected_date_invalid",
+            Self::SystemRoleUnsupported => "smollm3_template_system_role_unsupported",
+            Self::SystemOverrideUnsupported => "smollm3_template_system_override_unsupported",
+            Self::ToolRoleUnsupported => "smollm3_template_tool_role_unsupported",
+            Self::UnsupportedRole => "smollm3_template_role_unsupported",
+            Self::NonAlternatingHistory => "smollm3_template_history_non_alternating",
+            Self::HistoryMustEndWithUser => "smollm3_template_history_must_end_with_user",
+            Self::MultimodalUnsupported => "smollm3_template_multimodal_unsupported",
+            Self::StructuredContentUnsupported => "smollm3_template_structured_content_unsupported",
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn valid_smollm3_injected_date(value: &str) -> bool {
+    let mut parts = value.split(' ');
+    let (Some(day), Some(month), Some(year), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    if day.len() != 2
+        || !day.bytes().all(|byte| byte.is_ascii_digit())
+        || year.len() != 4
+        || !year.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return false;
+    }
+    let Ok(day) = day.parse::<u8>() else {
+        return false;
+    };
+    let Ok(year) = year.parse::<u16>() else {
+        return false;
+    };
+    let max_day = match month {
+        "January" | "March" | "May" | "July" | "August" | "October" | "December" => 31,
+        "April" | "June" | "September" | "November" => 30,
+        "February" if year % 400 == 0 || (year % 4 == 0 && year % 100 != 0) => 29,
+        "February" => 28,
+        _ => return false,
+    };
+    year > 0 && (1..=max_day).contains(&day)
+}
+
+/// Render the fixture-locked, deterministic subset of the pinned SmolLM3
+/// template from Camelid's post-canonicalization [`ChatMessage`] shape. A
+/// text-only content-parts array has already become the same string as plain
+/// text at this boundary; non-text parts remain recorded and are refused.
+/// This helper prepares exact prompt shapes for qualification only; production
+/// chat continues to fail closed in the dynamic-template guard.
+#[allow(dead_code)]
+fn render_smollm3_template_preparation_prompt(
+    messages: &[ChatMessage],
+    source_template: &str,
+    enable_thinking: Option<bool>,
+    add_generation_prompt: bool,
+    injected_today: &str,
+) -> std::result::Result<RenderedPrompt, SmolLm3TemplatePreparationError> {
+    let template_sha256 = format!("{:x}", Sha256::digest(source_template.as_bytes()));
+    if source_template.len() != SMOLLM3_EXACT_CHAT_TEMPLATE_UTF8_BYTES
+        || template_sha256 != SMOLLM3_EXACT_CHAT_TEMPLATE_SHA256
+    {
+        return Err(SmolLm3TemplatePreparationError::TemplateIdentityMismatch);
+    }
+    if matches!(enable_thinking, Some(false)) {
+        return Err(SmolLm3TemplatePreparationError::ExplicitFalseThinkingUnsupported);
+    }
+    if !add_generation_prompt {
+        return Err(SmolLm3TemplatePreparationError::AddGenerationPromptRequired);
+    }
+    if !valid_smollm3_injected_date(injected_today) {
+        return Err(SmolLm3TemplatePreparationError::InvalidInjectedDate);
+    }
+    if messages.is_empty() {
+        return Err(SmolLm3TemplatePreparationError::EmptyMessages);
+    }
+
+    for (index, message) in messages.iter().enumerate() {
+        let role = message.role.as_str();
+        if message.content.is_empty() {
+            return Err(SmolLm3TemplatePreparationError::EmptyContent);
+        }
+        if !message.image_urls.is_empty() {
+            return Err(SmolLm3TemplatePreparationError::MultimodalUnsupported);
+        }
+        if !message.unsupported_content_parts.is_empty() {
+            return Err(SmolLm3TemplatePreparationError::StructuredContentUnsupported);
+        }
+        match role {
+            "system" if message.content.contains("/system_override") => {
+                return Err(SmolLm3TemplatePreparationError::SystemOverrideUnsupported)
+            }
+            "system" => return Err(SmolLm3TemplatePreparationError::SystemRoleUnsupported),
+            "tool" => return Err(SmolLm3TemplatePreparationError::ToolRoleUnsupported),
+            "user" if index % 2 == 0 => {}
+            "assistant" if index % 2 == 1 => {}
+            "user" | "assistant" => {
+                return Err(SmolLm3TemplatePreparationError::NonAlternatingHistory)
+            }
+            _ => return Err(SmolLm3TemplatePreparationError::UnsupportedRole),
+        }
+    }
+    if messages.last().map(|message| message.role.as_str()) != Some("user") {
+        return Err(SmolLm3TemplatePreparationError::HistoryMustEndWithUser);
+    }
+
+    let mut text = format!(
+        "<|im_start|>system\n## Metadata\n\nKnowledge Cutoff Date: June 2025\nToday Date: \
+         {injected_today}\nReasoning Mode: /think\n\n## Custom Instructions\n\n\
+         {SMOLLM3_DEFAULT_THINKING_INSTRUCTION}\n\n"
+    );
+    // Exact source behavior: the ordinary no-tools synthetic system branch
+    // has no `<|im_end|>` before the first user turn.
+    for message in messages {
+        match message.role.as_str() {
+            "user" => text.push_str(&format!(
+                "<|im_start|>user\n{}<|im_end|>\n",
+                message.content
+            )),
+            "assistant" => text.push_str(&format!(
+                "<|im_start|>assistant\n{}<|im_end|>\n",
+                message.content.trim_start_matches('\n')
+            )),
+            _ => unreachable!("roles were validated above"),
+        }
+    }
+    text.push_str("<|im_start|>assistant\n");
+    Ok(RenderedPrompt {
+        text,
+        add_special: false,
+        parse_special: true,
+    })
+}
+
 #[derive(Debug, Serialize)]
 struct ChatTemplateMessage<'a> {
     role: &'a str,
@@ -20622,14 +20796,14 @@ fn prepare_gemma2_runnable_chat_prompt(
     runtime: &RunnableServeRuntime,
     model_id: &str,
     messages: &[ChatMessage],
-) -> std::result::Result<String, Response> {
+) -> std::result::Result<String, Box<Response>> {
     if let Some(rejection) = reject_gemma2_with_unrecognized_template(&runtime.tokenizer, model_id)
     {
-        return Err(rejection);
+        return Err(Box::new(rejection));
     }
 
     render_gemma2_it_prompt(messages).map_err(|reason| {
-        api_error(
+        Box::new(api_error(
             StatusCode::UNPROCESSABLE_ENTITY,
             "unsupported_chat_template_shape",
             format!(
@@ -20637,7 +20811,7 @@ fn prepare_gemma2_runnable_chat_prompt(
                  model '{model_id}': {reason}"
             ),
             Some("messages"),
-        )
+        ))
     })
 }
 
@@ -25997,6 +26171,285 @@ mod tests {
         assert!(err.to_string().contains("generic Qwen3 renderer"));
     }
 
+    #[test]
+    fn smollm3_template_preparation_helper_matches_bounded_oracle_shapes() {
+        let pack: serde_json::Value = serde_json::from_str(include_str!(
+            "../../qa/prompt-packs/smollm3-chat-template-shapes-v1.json"
+        ))
+        .expect("parse SmolLM3 prompt-shape pack");
+        let template = pack["source_template"]["text"]
+            .as_str()
+            .expect("exact source template");
+        assert_eq!(template.len(), SMOLLM3_EXACT_CHAT_TEMPLATE_UTF8_BYTES);
+        assert_eq!(
+            format!("{:x}", Sha256::digest(template.as_bytes())),
+            SMOLLM3_EXACT_CHAT_TEMPLATE_SHA256
+        );
+
+        let message = |role: &str, content: &str| ChatMessage {
+            role: role.to_string(),
+            content: content.to_string(),
+            image_urls: Vec::new(),
+            unsupported_content_parts: Vec::new(),
+        };
+        let text_parts_message: ChatMessage = serde_json::from_value(serde_json::json!({
+            "role": "user",
+            "content": [
+                { "type": "text", "text": "Hello, " },
+                { "type": "text", "text": "please help me." }
+            ]
+        }))
+        .expect("text-only content parts canonicalize to a string");
+        assert_eq!(text_parts_message.content, "Hello, please help me.");
+        assert!(text_parts_message.image_urls.is_empty());
+        assert!(text_parts_message.unsupported_content_parts.is_empty());
+        assert_eq!(
+            render_smollm3_template_preparation_prompt(
+                std::slice::from_ref(&text_parts_message),
+                template,
+                None,
+                true,
+                "10 August 2026",
+            )
+            .expect("post-canonicalization text parts are the plain-text shape"),
+            render_smollm3_template_preparation_prompt(
+                &[message("user", "Hello, please help me.")],
+                template,
+                None,
+                true,
+                "10 August 2026",
+            )
+            .expect("plain-text shape"),
+        );
+        let cases = pack["cases"].as_array().expect("shape cases");
+        for (case, messages) in [
+            (&cases[0], vec![message("user", "Hello, please help me.")]),
+            (
+                &cases[1],
+                vec![
+                    message("user", "Hello, please help me."),
+                    message("assistant", "I can help you with that."),
+                    message("user", "Thank you."),
+                ],
+            ),
+        ] {
+            let expected = case["normalized_prompt"]
+                .as_str()
+                .expect("normalized prompt")
+                .replace("{{CURRENT_DATE_DD_MONTH_YYYY}}", "10 August 2026");
+            let omitted = render_smollm3_template_preparation_prompt(
+                &messages,
+                template,
+                None,
+                true,
+                "10 August 2026",
+            )
+            .expect("omitted thinking defaults to true");
+            let explicit = render_smollm3_template_preparation_prompt(
+                &messages,
+                template,
+                Some(true),
+                true,
+                "10 August 2026",
+            )
+            .expect("explicit true thinking is in the bounded envelope");
+            assert_eq!(omitted, explicit);
+            assert_eq!(omitted.text, expected);
+            assert!(!omitted.add_special);
+            assert!(omitted.parse_special);
+            assert!(omitted.text.contains(
+                "detail necessary steps needed to reach the conclusion.\n\n<|im_start|>user"
+            ));
+            assert!(!omitted
+                .text
+                .contains("detail necessary steps needed to reach the conclusion.\n\n<|im_end|>"));
+        }
+
+        let leading_newline_history = vec![
+            message("user", "First"),
+            message("assistant", "\n\nAnswer"),
+            message("user", "Second"),
+        ];
+        let rendered = render_smollm3_template_preparation_prompt(
+            &leading_newline_history,
+            template,
+            Some(true),
+            true,
+            "29 February 2024",
+        )
+        .expect("valid leap-day injection and assistant history");
+        assert!(rendered
+            .text
+            .contains("<|im_start|>assistant\nAnswer<|im_end|>\n"));
+        assert!(rendered.text.contains("Today Date: 29 February 2024\n"));
+    }
+
+    #[test]
+    fn smollm3_template_preparation_helper_typed_blocks_every_unqualified_branch() {
+        let pack: serde_json::Value = serde_json::from_str(include_str!(
+            "../../qa/prompt-packs/smollm3-chat-template-shapes-v1.json"
+        ))
+        .expect("parse SmolLM3 prompt-shape pack");
+        let template = pack["source_template"]["text"]
+            .as_str()
+            .expect("exact source template");
+        let message = |role: &str, content: &str| ChatMessage {
+            role: role.to_string(),
+            content: content.to_string(),
+            image_urls: Vec::new(),
+            unsupported_content_parts: Vec::new(),
+        };
+        let render = |messages: &[ChatMessage],
+                      source_template: &str,
+                      thinking: Option<bool>,
+                      add_generation_prompt: bool,
+                      today: &str| {
+            render_smollm3_template_preparation_prompt(
+                messages,
+                source_template,
+                thinking,
+                add_generation_prompt,
+                today,
+            )
+        };
+        let user = message("user", "Hello");
+
+        for (messages, expected) in [
+            (Vec::new(), SmolLm3TemplatePreparationError::EmptyMessages),
+            (
+                vec![message("user", "")],
+                SmolLm3TemplatePreparationError::EmptyContent,
+            ),
+            (
+                vec![message("system", "custom instructions")],
+                SmolLm3TemplatePreparationError::SystemRoleUnsupported,
+            ),
+            (
+                vec![message("system", "/system_override custom")],
+                SmolLm3TemplatePreparationError::SystemOverrideUnsupported,
+            ),
+            (
+                vec![message("tool", "result")],
+                SmolLm3TemplatePreparationError::ToolRoleUnsupported,
+            ),
+            (
+                vec![message("developer", "policy")],
+                SmolLm3TemplatePreparationError::UnsupportedRole,
+            ),
+            (
+                vec![message(" user ", "Hello")],
+                SmolLm3TemplatePreparationError::UnsupportedRole,
+            ),
+            (
+                vec![message("User", "Hello")],
+                SmolLm3TemplatePreparationError::UnsupportedRole,
+            ),
+            (
+                vec![message("user", "First"), message("user", "Second")],
+                SmolLm3TemplatePreparationError::NonAlternatingHistory,
+            ),
+            (
+                vec![message("user", "First"), message("assistant", "Answer")],
+                SmolLm3TemplatePreparationError::HistoryMustEndWithUser,
+            ),
+        ] {
+            let error = render(&messages, template, None, true, "10 August 2026")
+                .expect_err("shape must remain outside the bounded envelope");
+            assert_eq!(error, expected);
+            assert!(error.code().starts_with("smollm3_template_"));
+        }
+
+        assert_eq!(
+            render(
+                std::slice::from_ref(&user),
+                template,
+                Some(false),
+                true,
+                "10 August 2026"
+            )
+            .expect_err("false thinking remains blocked"),
+            SmolLm3TemplatePreparationError::ExplicitFalseThinkingUnsupported
+        );
+        assert_eq!(
+            render(
+                std::slice::from_ref(&user),
+                template,
+                None,
+                false,
+                "10 August 2026"
+            )
+            .expect_err("generation prompt is mandatory in this slice"),
+            SmolLm3TemplatePreparationError::AddGenerationPromptRequired
+        );
+        for invalid_date in [
+            "10 Aug 2026",
+            "10 august 2026",
+            "0 August 2026",
+            "00 August 2026",
+            "31 February 2026",
+            "29 February 2025",
+            "10 August 26",
+            "10 August 0000",
+            "2026-08-10",
+        ] {
+            assert_eq!(
+                render(
+                    std::slice::from_ref(&user),
+                    template,
+                    None,
+                    true,
+                    invalid_date
+                )
+                .expect_err("date must be exact locale-independent DD Month YYYY"),
+                SmolLm3TemplatePreparationError::InvalidInjectedDate
+            );
+        }
+
+        let mut multimodal = user.clone();
+        multimodal
+            .image_urls
+            .push("data:image/png;base64,AQID".to_string());
+        assert_eq!(
+            render(&[multimodal], template, None, true, "10 August 2026")
+                .expect_err("multimodal input remains blocked"),
+            SmolLm3TemplatePreparationError::MultimodalUnsupported
+        );
+        let mut structured = user.clone();
+        structured
+            .unsupported_content_parts
+            .push("input_audio".to_string());
+        assert_eq!(
+            render(&[structured], template, None, true, "10 August 2026")
+                .expect_err("structured input remains blocked"),
+            SmolLm3TemplatePreparationError::StructuredContentUnsupported
+        );
+
+        let same_length_hash_mutation = template.replacen("defaults", "Defaults", 1);
+        assert_eq!(same_length_hash_mutation.len(), template.len());
+        assert_ne!(same_length_hash_mutation, template);
+        for mutated_template in [
+            format!("{template} "),
+            same_length_hash_mutation,
+            template.replacen(
+                "{# ───── main loop ───── #}",
+                "{{- \"<|im_end|>\\n\" -}}\n{# ───── main loop ───── #}",
+                1,
+            ),
+        ] {
+            assert_eq!(
+                render(
+                    std::slice::from_ref(&user),
+                    &mutated_template,
+                    None,
+                    true,
+                    "10 August 2026",
+                )
+                .expect_err("any source-template mutation must fail before rendering"),
+                SmolLm3TemplatePreparationError::TemplateIdentityMismatch
+            );
+        }
+    }
+
     /// Phase 3c triage: routing admits gemma3 by ARCH while the dense renderer
     /// selects `render_gemma3_prompt` by TEMPLATE SHAPE. When the two
     /// disagree, the fallback chain reaches `render_role_colon_prompt` — a
@@ -30948,7 +31401,7 @@ fn lfm2_supported_on_current_host() -> bool {
                         .unwrap_or_else(|| "unknown".into()),
                 )
             });
-        return lfm2_support_scope_matches(
+        lfm2_support_scope_matches(
             env::consts::OS,
             env::consts::ARCH,
             Some(model_identifier),
@@ -30957,7 +31410,7 @@ fn lfm2_supported_on_current_host() -> bool {
             crate::runnable::model::lfm2_metal_enabled()
                 && *METAL_AVAILABLE.get_or_init(|| crate::metal::detect_metal_device().available),
             supported_profile_selected,
-        );
+        )
     }
     #[cfg(not(target_os = "macos"))]
     {

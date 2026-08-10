@@ -36,6 +36,7 @@ import {
   positiveInt,
   requireNativeReceipt,
   requestMode,
+  sealReceiptArgs,
   verifierArgs,
 } from './context_parity_lib.mjs'
 
@@ -47,6 +48,7 @@ const row = need('row')
 const label = args.get('label') || row
 const mode = requestMode(args)
 const targetTokens = positiveInt(need('target-tokens'), '--target-tokens')
+const promptSuffix = args.get('prompt-suffix') || ''
 const kvBytesPerToken = positiveInt(need('kv-bytes-per-token'), '--kv-bytes-per-token')
 const llamaCtx = positiveInt(args.get('llama-ctx') || String(targetTokens + 64), '--llama-ctx')
 const maxGen = positiveInt(args.get('max-gen') || '8', '--max-gen')
@@ -167,7 +169,7 @@ async function stopChild(child, timeoutMs = 15000) {
   }
 }
 
-const prompt = buildLongPrompt(targetTokens)
+const prompt = buildLongPrompt(targetTokens, promptSuffix)
 const messages = buildMessages(prompt, args.get('system-message'))
 const endpoint = mode === 'chat' ? '/v1/chat/completions' : '/v1/completions'
 const requestBody = buildGenerationRequest({ mode, prompt, messages, maxGen })
@@ -215,6 +217,7 @@ try {
       gguf,
       request_mode: mode,
       target_tokens: targetTokens,
+      prompt_suffix: promptSuffix,
       actual_prompt_tokens: promptTokens,
       actual_prompt_tokens_gate: gate,
       preflight_projected_kv_bytes: preflightProjectedKv,
@@ -233,6 +236,10 @@ try {
 
 const receiptPath = resolve(out, 'parity-receipt.json')
 await writeFile(receiptPath, `${JSON.stringify(parityReceipt, null, 2)}\n`)
+// JSON.stringify collapses a typed 0.0 temperature to integer 0. Re-emit the
+// native receipt through Camelid's canonical serializer so the on-disk body
+// remains byte-compatible with the receipt_id and the repository-wide audit.
+await execFileAsync(camelidExe, sealReceiptArgs(receiptPath), { env })
 const ctx = Math.max(llamaCtx, promptTokens + maxGen + 8)
 console.log(
   `actual_prompt_tokens=${promptTokens} positions_exceed_8192=${promptTokens > 8192} llama_ctx=${ctx}`,
@@ -275,6 +282,7 @@ const summary = {
   camelid_log: 'camelid.log',
   endpoint,
   target_tokens: targetTokens,
+  prompt_suffix: promptSuffix,
   actual_prompt_tokens: promptTokens,
   actual_prompt_tokens_gate: gate,
   positions_exceed_8192: promptTokens > 8192,

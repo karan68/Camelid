@@ -3,7 +3,8 @@
 Status: active, Phase 1 started 2026-08-09. The first exact row, LFM2.5 2.6B
 Q8_0, completed all eight gates and was promoted on 2026-08-10; its exact-row
 Mac handoff is also complete on one Apple M4 / macOS 26.5 / arm64 host. Phase 1
-continues for the remaining families.
+continues for the remaining families while the Phase 2 qualification factory is
+being built from the same fail-closed gates.
 
 ## Goal
 
@@ -43,8 +44,11 @@ page progressively harder to scan.
 4. **Gemma 2** has a runnable graph but needs a Gemma-2-specific chat-template
    fixture and real-row proof; it must not borrow Gemma 3's renderer by name.
 5. **SmolLM3** actually declares `tokenizer.ggml.pre = smaug-bpe`, an exact
-   llama3-regex alias in the pinned reference. Legacy `smollm` remains a distinct
-   two-pass dialect and must not be used as a shortcut for the real row.
+   llama3-regex alias in the pinned reference. Its exact-row tokenizer pack now
+   passes, including the dialect-specific absent-BOS default. Legacy `smollm`
+   remains a distinct two-pass dialect and must not be used as a shortcut. A
+   preparation-only renderer now locks two default no-tool prompt shapes; the
+   production route and the remaining dynamic branches remain the next gate.
 6. **Qwen3 MoE** needs an authoritative artifact anchor and a routing-semantics
    audit before a large download. Synthetic browse fixtures are not candidates.
 
@@ -62,10 +66,11 @@ promotion; the other five families remain active dispositions:
 | Family | Current result | Next honest gate |
 |---|---|---|
 | LFM2 | **Complete / promoted exact-row smoke.** All eight Phase 1 gates pass for `LFM2.5-2.6B-Q8_0.gguf` on the Windows CPU runnable lane, and the exact-row handoff independently passes on the resident-Metal lane on one Apple M4 / macOS 26.5 / arm64 host. | Context above 512 tokens, CUDA, other Apple hardware, and separately evidenced neighboring sizes/quants or broader sampling/tool boundaries. |
-| Qwen2.5 | Source, metadata, tokenizer, and template pass; strict greedy parity remains failed on one stable cross-engine numeric frontier. | Layer trace under one fully pinned oracle launch recipe; do not waive the token mismatch. |
+| LFM2 | **Complete / promoted exact-row smoke.** All eight Phase 1 gates pass for `LFM2.5-2.6B-Q8_0.gguf` on the Windows CPU runnable lane, and the exact-row handoff independently passes on the resident-Metal lane on one Apple M4 / macOS 26.5 / arm64 host. | Context above 512 tokens, CUDA, other Apple hardware, and separately evidenced neighboring sizes/quants or broader sampling/tool boundaries. |
+| Qwen2.5 | Source, metadata, tokenizer, and template pass; strict greedy parity remains failed on one stable cross-engine numeric frontier. A prepared 512-token capture is not accepted because its required verifier transcript is absent from Git. | Recover or rerun the complete 512-token bundle, then complete the layer trace and API/WebUI/SSE smoke; do not waive the short-token mismatch. |
 | Phi-3 | Generic head-dim-96 CPU cache reads are bit-identical; the unproven partial Metal PV tile now falls back. | Repeat the exact-row Metal prefill/decode receipt before changing the HOLD. |
-| Gemma 2 | Source identity and exact IT template route pass; substituted templates and invalid shapes fail closed. | Exact-row metadata and token-ID oracle, then load/parity. |
-| SmolLM3 | Source is pinned and the real `smaug-bpe` construction gap is closed; its dynamic chat template has an executable HOLD. | Exact-row token IDs, then a deterministic renderer for its date/reasoning/system/tool contract. |
+| Gemma 2 | Source identity, clean-head bounded exact-row metadata, seven-case tokenizer parity, and the exact IT template route pass; substituted templates and invalid shapes fail closed. | Full-artifact identity/load and greedy parity, then API/WebUI/context. |
+| SmolLM3 | Source, clean-head bounded exact-row metadata, and the 10-case `smaug-bpe` tokenizer pack pass. Its absent BOS metadata resolves exactly like pinned llama.cpp. Two default no-tool prompt shapes are preparation-qualified, while the production dynamic template remains under an executable HOLD. | Wire only after runtime token-ID parity and control-marker safety are locked, then qualify system/custom/tool/no-think branches; load, generation, API/WebUI, and context remain blocked. |
 | Qwen3 MoE | Official 32.48 GB row is pinned; a bounded 32 MiB prefix confirms all 579 descriptors. | Full-artifact identity/load and MoE parity; remote metadata alone is not a promotion. |
 
 Phase 1 remains active for Qwen2.5, Phi-3, Gemma 2, SmolLM3, and Qwen3 MoE.
@@ -148,11 +153,14 @@ continuations, and the exact one-turn ChatML rendering. Passing that fixture is
 still only raw graph/tokenizer evidence; chat-template/API/context gates remain
 separate.
 
-Current bootstrap result: source, metadata, tokenizer, and template gates pass.
+Current bootstrap result: source, metadata, tokenizer, and template pass. A
+Windows 512-token capture was prepared, but its required verifier transcript is
+not tracked, so the public context gate remains blocked rather than accepting an
+incomplete bundle. Recover the exact checksummed transcript or rerun the lane.
 Raw greedy parity matches 3 of 4 prompts; the remaining prompt reverses two
 near-tied candidates, so it is recorded as a hard parity failure rather than
-waived. Load/smoke, complete API/WebUI, and context gates remain blocked, and
-the row stays experimental/unverified.
+waived. Load/smoke and complete API/WebUI gates remain blocked, and the row
+stays experimental/unverified.
 
 ## Phase 2 factory foundation
 
@@ -166,14 +174,37 @@ Phase 2 has started without weakening the Phase 1 evidence boundary:
   resolves filenames under `CAMELID_MODELS_DIR`, and writes one scrubbed report
   per row plus an index. Missing directories, artifacts, fixtures, binaries, or
   source identities become `blocked`; they never disappear as skipped tests.
+  `--resolve-source` performs the immutable Hub preflight, while
+  `--inspect-header` additionally runs the bounded remote-header lane and keeps
+  per-row failures from aborting the rest of the batch. `--inspect-tokenizer`
+  is the opt-in next gate: it implies source and header inspection, then runs an
+  exact-row tokenizer pack only after metadata passes. A passing tokenizer
+  receipt advances only the report's tokenizer stage; artifact, template,
+  load, generation, API/WebUI, and context gates remain unchanged.
 - `scripts/check-model-qualification-report.mjs` validates the committed report
   contract, fail-closed overall status, and privacy boundary before evidence is
   accepted.
 - `scripts/hf-qualification-header.mjs` range-fetches at most 64 MiB and invokes
   `camelid inspect-prefix` with the pinned full byte length. The command validates
   metadata and every tensor descriptor against the real artifact bounds while
-  redacting the temporary prefix path. It aborts if a server ignores `Range`, so
+  redacting the temporary prefix path. Receipts pin the inspector version and
+  binary SHA-256, immutable source identity, exact `Content-Range`, prefix hash,
+  and compact tensor-inventory hash. It aborts if a server ignores `Range`, so
   inspecting a 30+ GiB candidate cannot silently become a full download.
+- `scripts/hf-qualification-tokenizer.mjs` provides bounded exact-row tokenizer
+  lanes for Gemma 2 and SmolLM3. It compares Camelid against pinned llama.cpp
+  using unchanged tokenizer metadata from an immutable 32 MiB prefix. The
+  SmolLM3 pack includes empty/default-special handling, exact `Hello` IDs,
+  Unicode/contraction/digit splits, ChatML controls, and USER_DEFINED tool tags;
+  both lanes explicitly decline weight-load, generation, template-rendering,
+  API, and support claims. The factory calls the same lane with its already
+  validated source lock. Camelid and pinned llama.cpp identities are checked
+  before the tokenizer range request, and source HEAD plus tracked-clean state
+  are checked again after the probes. Each tokenizer pack pins exactly 32 MiB.
+  When remote metadata is also needed, header and tokenizer qualification make
+  two independent bounded requests (normally 64 MiB total per row), never a
+  full-artifact download; a server that ignores or exceeds either range remains
+  fail-closed.
 
 The factory does not download multi-gigabyte artifacts implicitly and does not
 run smoke or generation unless those probes are explicitly requested. This

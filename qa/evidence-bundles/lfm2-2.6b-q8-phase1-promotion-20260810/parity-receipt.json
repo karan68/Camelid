@@ -28,7 +28,7 @@
       }
     ],
     "max_tokens": 8,
-    "temperature": 0,
+    "temperature": 0.0,
     "top_p": null,
     "top_k": null,
     "seed": null,

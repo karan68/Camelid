@@ -1966,6 +1966,7 @@ fn is_lfm2_5_2_6b_exact_row(row: &str) -> bool {
 /// receipt is narrower: one Mac16,10 with the base Apple M4 CPU, macOS 26.5,
 /// and the exact resident-Metal backend/prefill/decode labels. Every other
 /// platform or fallback remains recognition-only.
+#[allow(clippy::too_many_arguments)]
 fn lfm2_selected_lane_supported(
     profile: &ExecutionProfile,
     platform: &PlanPlatform,

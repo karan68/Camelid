@@ -1,0 +1,30 @@
+   Compiling camelid v0.6.1 ($CAMELID_WORKTREE)
+    Finished `release` profile [optimized] target(s) in 17.19s
+     Running tests/lfm2_parity.rs ($CAMELID_EXTERNAL_VOLUME/cargo-targets/global/release/deps/lfm2_parity-8b7ee991acdb7435)
+
+running 2 tests
+test lfm2_matches_llamacpp_greedy ... === runnable lfm2 vs llama.cpp b9632 (acd79d603) /completion, CPU -ngl 0, -ctk f32 -ctv f32 -fa off --no-repack, greedy (temp=0 top_k=1), cache_prompt=false ===
+[lfm2] resident Metal graph active (Q8_0 weights, short-conv + GQA attention, FFN, logits, GPU greedy)
+  "The capital of France is"
+    ref greedy = [4741, 22, 342, 41, 514, 18, 266, 496, 597, 5205, 302, 3980, 355, 4741, 2426, 342, 42, 514, 18, 266, 496, 597, 5205, 302]
+    cam greedy = [4741, 22, 342, 41, 514, 18, 266, 496, 597, 5205, 302, 3980, 355, 4741, 2426, 342, 42, 514, 18, 266, 496, 597, 5205, 302]
+    match=true first_divergence=None
+  "Water boils at a temperature of"
+    ref greedy = [229, 1595, 8653, 22, 440, 35582, 1628, 302, 1382, 355, 229, 1595, 8653, 22, 440, 4577, 462, 643, 278, 1382, 2019, 2844, 355, 229]
+    cam greedy = [229, 1595, 8653, 22, 440, 35582, 1628, 302, 1382, 355, 229, 1595, 8653, 22, 440, 4577, 462, 643, 278, 1382, 2019, 2844, 355, 229]
+    match=true first_divergence=None
+  "One two three four"
+    ref greedy = [3508, 3749, 7077, 7130, 10675, 3175, 31247, 18775, 39213, 42445, 27222, 42766, 60717, 45530, 14199, 56444, 11082, 11082, 21065, 11082, 40069, 11082, 49865, 11082]
+    cam greedy = [3508, 3749, 7077, 7130, 10675, 3175, 31247, 18775, 39213, 42445, 27222, 42766, 60717, 45530, 14199, 56444, 11082, 11082, 21065, 11082, 40069, 11082, 49865, 11082]
+    match=true first_divergence=None
+  "The quick brown fox"
+    ref greedy = [56085, 890, 278, 45698, 4448, 22, 969, 355, 267, 79951, 3604, 22, 358, 1094, 310, 2096, 64019, 597, 4695, 2997, 34, 496, 49, 1094]
+    cam greedy = [56085, 890, 278, 45698, 4448, 22, 969, 355, 267, 79951, 3604, 22, 358, 1094, 310, 2096, 64019, 597, 4695, 2997, 34, 496, 49, 1094]
+    match=true first_divergence=None
+  ALL greedy match = true
+  parity artifact -> $CAMELID_WORKTREE/qa/runnable/lfm2-parity.json
+ok
+test lfm2_tokenizer_matches_llamacpp ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.32s
+

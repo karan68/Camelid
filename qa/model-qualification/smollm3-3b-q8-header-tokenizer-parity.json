@@ -1,0 +1,413 @@
+{
+  "schema": "camelid.header-tokenizer-parity/v1",
+  "generated_at": "2026-08-10T17:35:12.379Z",
+  "provenance": {
+    "status": "clean_current_head_receipt",
+    "gate_requires_clean_current_head": true,
+    "source_head": "b966895195178edb0f51a04ea7a6501883f2a6e7",
+    "source_tracked_dirty": false,
+    "binary_commit_abbrev": "b9668951",
+    "binary_reports_dirty": false,
+    "binary_matches_source_head": true,
+    "clean_current_head": true
+  },
+  "row_id": "smollm3_3b_q8_0",
+  "host": {
+    "platform": "win32-x64",
+    "hostname_redacted": true
+  },
+  "source": {
+    "repo": "ggml-org/SmolLM3-3B-GGUF",
+    "file": "SmolLM3-Q8_0.gguf",
+    "revision": "4965cb60b150737b68a0408c36aeefb65078f894",
+    "size_bytes": 3275574624,
+    "sha256": "8aa8cc74656137174a1988d993b00828e65a86fd68773412b632a75aa1373248",
+    "license": "apache-2.0"
+  },
+  "bounded_fetch": {
+    "requested_bytes": 33554432,
+    "received_bytes": 33554432,
+    "content_range": {
+      "start": 0,
+      "end": 33554431,
+      "total": 3275574624
+    },
+    "prefix_sha256": "2d043b2114b89100c7ba464e57375a6f32c06c04729542d54ed684b5e8c5016e",
+    "temporary_paths_redacted": true,
+    "temporary_files_deleted": true,
+    "scope_note": "the prefix hash includes opaque initial tensor payload bytes after data_start_offset; it is not a full payload or full artifact hash"
+  },
+  "grounding": {
+    "header_receipt": "qa/model-qualification/smollm3-3b-q8-header-inspection.json",
+    "tokenizer_pre_fixture": "qa/model-qualification/fixtures/smollm3-tokenizer-pre-v1.json"
+  },
+  "tokenizer_metadata": {
+    "token_count": 128256,
+    "merge_count": 280147,
+    "token_type_count": 128256,
+    "normal_token_count": 128000,
+    "special_token_count": 256,
+    "control_token_count": 248,
+    "user_defined_token_count": 8,
+    "bos_token_id": 128000,
+    "eos_token_id": 128012,
+    "padding_token_id": 128012,
+    "declared_add_bos_token": "absent",
+    "declared_add_eos_token": "absent",
+    "declared_add_space_prefix": "absent",
+    "oracle_resolved_add_bos_token": false,
+    "oracle_resolved_add_eos_token": false,
+    "chat_control_token_ids": {
+      "im_start": 128011,
+      "im_end": 128012
+    },
+    "chat_template_utf8_bytes": 5493,
+    "chat_template_sha256": "b9b66f04c64fbb8695cf5b35c37780efd0b8e0829fbfe3e30fafb9f469b7d30e"
+  },
+  "camelid": {
+    "version": "camelid v0.6.1-30-gb9668951",
+    "binary_sha256": "63ad8db2e6f50df98e30e88230e84c5adec8fb7405aca77df02febe2f5380d8e",
+    "prefix_mode": "tokenize --declared-len"
+  },
+  "oracle": {
+    "project": "ggml-org/llama.cpp",
+    "revision": "acd79d603",
+    "build": 9632,
+    "revision_verification": "parsed from the sibling llama-cli --version output in the same binary package",
+    "companion_executable": "llama-cli.exe",
+    "companion_binary_sha256": "2ec09da0b81d0201ce5b21810caefb4e77fd108f383b30c15ca493c5a70f7731",
+    "executable": "llama-tokenize.exe",
+    "binary_sha256": "a44a4d7e1445d22a4cffb0d38f6efa8f1d81e84ae2c3d481af857c5e331b8c7a",
+    "input": "disposable vocabulary-only derivative of the same immutable GGUF prefix; tensor_count is zeroed so llama-tokenize consumes unchanged tokenizer metadata and ignores the original descriptor region plus opaque partial payload bytes",
+    "derivative": {
+      "original_tensor_count": 326,
+      "metadata_count": 26,
+      "patch": "set fixed-header tensor_count at byte offset 8 to zero; all tokenizer metadata bytes remain unchanged",
+      "patch_offset": 8,
+      "sha256": "0256c4ae169c89d4e5f9669e887af25215f6f1717b608800da03020e4c0431f9",
+      "persisted": false
+    }
+  },
+  "cases": [
+    {
+      "id": "empty_with_add_special",
+      "text_utf8_bytes": 0,
+      "text_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "add_special": true,
+      "parse_special": false,
+      "camelid_ids": [],
+      "llama_cpp_ids": [],
+      "exact_match": true,
+      "camelid_decoded_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "plain_ascii_with_add_special",
+      "text_utf8_bytes": 5,
+      "text_sha256": "185f8db32271fe25f561a6fc938b2e264306ec304eda518007d1764826381969",
+      "add_special": true,
+      "parse_special": false,
+      "camelid_ids": [
+        9906
+      ],
+      "llama_cpp_ids": [
+        9906
+      ],
+      "exact_match": true,
+      "camelid_decoded_sha256": "185f8db32271fe25f561a6fc938b2e264306ec304eda518007d1764826381969"
+    },
+    {
+      "id": "plain_ascii_without_add_special",
+      "text_utf8_bytes": 5,
+      "text_sha256": "185f8db32271fe25f561a6fc938b2e264306ec304eda518007d1764826381969",
+      "add_special": false,
+      "parse_special": false,
+      "camelid_ids": [
+        9906
+      ],
+      "llama_cpp_ids": [
+        9906
+      ],
+      "exact_match": true,
+      "camelid_decoded_sha256": "185f8db32271fe25f561a6fc938b2e264306ec304eda518007d1764826381969"
+    },
+    {
+      "id": "smaug_unicode_spacing_and_contractions",
+      "text_utf8_bytes": 45,
+      "text_sha256": "ae4a56fcb50a03cd7a4e8ee61dd273effbc6d5b5a1b93e5611bc724dbc191196",
+      "add_special": true,
+      "parse_special": false,
+      "camelid_ids": [
+        220,
+        95980,
+        588,
+        53050,
+        73958,
+        17161,
+        20713,
+        25963,
+        34617,
+        649,
+        956,
+        358,
+        28703,
+        584,
+        4265
+      ],
+      "llama_cpp_ids": [
+        220,
+        95980,
+        588,
+        53050,
+        73958,
+        17161,
+        20713,
+        25963,
+        34617,
+        649,
+        956,
+        358,
+        28703,
+        584,
+        4265
+      ],
+      "exact_match": true,
+      "camelid_decoded_sha256": "ae4a56fcb50a03cd7a4e8ee61dd273effbc6d5b5a1b93e5611bc724dbc191196"
+    },
+    {
+      "id": "smaug_digits_punctuation_newlines_and_case",
+      "text_utf8_bytes": 28,
+      "text_sha256": "2387665d8e3f87389fa8200715ea83e93531a68efa9cdb17e4068f9db0c9e957",
+      "add_special": true,
+      "parse_special": false,
+      "camelid_ids": [
+        87,
+        220,
+        379,
+        220,
+        4513,
+        19,
+        264,
+        3554,
+        198,
+        43055,
+        17773,
+        584,
+        2351,
+        12340
+      ],
+      "llama_cpp_ids": [
+        87,
+        220,
+        379,
+        220,
+        4513,
+        19,
+        264,
+        3554,
+        198,
+        43055,
+        17773,
+        584,
+        2351,
+        12340
+      ],
+      "exact_match": true,
+      "camelid_decoded_sha256": "2387665d8e3f87389fa8200715ea83e93531a68efa9cdb17e4068f9db0c9e957"
+    },
+    {
+      "id": "single_user_chat_controls",
+      "text_utf8_bytes": 55,
+      "text_sha256": "d9cd4e9d39fa917afdba171d795bac9461fcec0f29437d41026f214b588d49bc",
+      "add_special": true,
+      "parse_special": true,
+      "camelid_ids": [
+        128011,
+        882,
+        198,
+        9906,
+        128012,
+        198,
+        128011,
+        78191,
+        198
+      ],
+      "llama_cpp_ids": [
+        128011,
+        882,
+        198,
+        9906,
+        128012,
+        198,
+        128011,
+        78191,
+        198
+      ],
+      "exact_match": true,
+      "camelid_decoded_sha256": "d9cd4e9d39fa917afdba171d795bac9461fcec0f29437d41026f214b588d49bc"
+    },
+    {
+      "id": "multi_turn_chat_controls",
+      "text_utf8_bytes": 125,
+      "text_sha256": "a3913ec4f86e302f84d11955fd8c8d11f50c9e14d59fb61a824b325bb19048c4",
+      "add_special": true,
+      "parse_special": true,
+      "camelid_ids": [
+        128011,
+        882,
+        198,
+        5451,
+        128012,
+        198,
+        128011,
+        78191,
+        198,
+        4054,
+        128012,
+        198,
+        128011,
+        882,
+        198,
+        16041,
+        128012,
+        198,
+        128011,
+        78191,
+        198
+      ],
+      "llama_cpp_ids": [
+        128011,
+        882,
+        198,
+        5451,
+        128012,
+        198,
+        128011,
+        78191,
+        198,
+        4054,
+        128012,
+        198,
+        128011,
+        882,
+        198,
+        16041,
+        128012,
+        198,
+        128011,
+        78191,
+        198
+      ],
+      "exact_match": true,
+      "camelid_decoded_sha256": "a3913ec4f86e302f84d11955fd8c8d11f50c9e14d59fb61a824b325bb19048c4"
+    },
+    {
+      "id": "chat_controls_as_ordinary_text",
+      "text_utf8_bytes": 33,
+      "text_sha256": "2db1e8b5f8478eb1abab336420ce05e1a4b16f6d605414fc67aa44cd63c668eb",
+      "add_special": true,
+      "parse_special": false,
+      "camelid_ids": [
+        27,
+        91,
+        318,
+        5011,
+        91,
+        29,
+        882,
+        198,
+        9906,
+        27,
+        91,
+        318,
+        6345,
+        91,
+        397
+      ],
+      "llama_cpp_ids": [
+        27,
+        91,
+        318,
+        5011,
+        91,
+        29,
+        882,
+        198,
+        9906,
+        27,
+        91,
+        318,
+        6345,
+        91,
+        397
+      ],
+      "exact_match": true,
+      "camelid_decoded_sha256": "2db1e8b5f8478eb1abab336420ce05e1a4b16f6d605414fc67aa44cd63c668eb"
+    },
+    {
+      "id": "user_defined_tool_tags_with_parse_special",
+      "text_utf8_bytes": 41,
+      "text_sha256": "0411ea549039c9bbfd0467386e6ef9eb0ba246de2c68b8a7eda296d956982681",
+      "add_special": true,
+      "parse_special": true,
+      "camelid_ids": [
+        128015,
+        5018,
+        609,
+        3332,
+        15561,
+        9388,
+        128016
+      ],
+      "llama_cpp_ids": [
+        128015,
+        5018,
+        609,
+        3332,
+        15561,
+        9388,
+        128016
+      ],
+      "exact_match": true,
+      "camelid_decoded_sha256": "0411ea549039c9bbfd0467386e6ef9eb0ba246de2c68b8a7eda296d956982681"
+    },
+    {
+      "id": "user_defined_tool_tags_without_parse_special",
+      "text_utf8_bytes": 41,
+      "text_sha256": "0411ea549039c9bbfd0467386e6ef9eb0ba246de2c68b8a7eda296d956982681",
+      "add_special": true,
+      "parse_special": false,
+      "camelid_ids": [
+        128015,
+        5018,
+        609,
+        3332,
+        15561,
+        9388,
+        128016
+      ],
+      "llama_cpp_ids": [
+        128015,
+        5018,
+        609,
+        3332,
+        15561,
+        9388,
+        128016
+      ],
+      "exact_match": true,
+      "camelid_decoded_sha256": "0411ea549039c9bbfd0467386e6ef9eb0ba246de2c68b8a7eda296d956982681"
+    }
+  ],
+  "result": {
+    "case_count": 10,
+    "exact_match_count": 10,
+    "all_token_ids_match": true,
+    "support_decision": "smollm3_exact_row_tokenizer_gate_only"
+  },
+  "does_not_prove": [
+    "full artifact integrity or presence on this host",
+    "weight load, logits, generation, or greedy-token parity",
+    "API, SSE, Models page, WebUI, or context readiness",
+    "sampling, tools, GPU execution, performance, neighboring rows, or broad SmolLM3 support"
+  ]
+}

@@ -243,7 +243,7 @@
           "required": true,
           "status": "blocked",
           "evidence": [],
-          "reason": "No preflighted 512-token parity receipt exists for this exact row."
+          "reason": "A Windows 512-token capture was prepared, but its required verifier transcript is absent from the public Git tree. The gate remains blocked until the exact transcript is force-added with its recorded checksum or the lane is rerun into a complete bundle."
         }
       }
     },
@@ -393,20 +393,20 @@
         },
         "metadata": {
           "required": true,
-          "status": "blocked",
+          "status": "pass",
           "evidence": [
+            "qa/model-qualification/gemma2-9b-it-q8-header-tokenizer-parity.json",
             "src/model.rs"
-          ],
-          "reason": "Synthetic header coverage exists; no real exact-row inspect receipt exists."
+          ]
         },
         "tokenizer": {
           "required": true,
-          "status": "blocked",
+          "status": "pass",
           "evidence": [
             "src/tokenizer/mod.rs",
-            "qa/model-qualification/fixtures/gemma2-it-chat-template-v1.json"
-          ],
-          "reason": "The Gemma/Llama SPM construction path exists and the pinned metadata contract is known, but no exact-row token-id comparison against the pinned llama.cpp oracle has run."
+            "qa/model-qualification/fixtures/gemma2-it-chat-template-v1.json",
+            "qa/model-qualification/gemma2-9b-it-q8-header-tokenizer-parity.json"
+          ]
         },
         "template": {
           "required": true,
@@ -489,30 +489,32 @@
         },
         "metadata": {
           "required": true,
-          "status": "blocked",
+          "status": "pass",
           "evidence": [
+            "qa/model-qualification/smollm3-3b-q8-header-tokenizer-parity.json",
             "src/model.rs",
             "tests/inference_session.rs"
-          ],
-          "reason": "Synthetic config and NoPE schedule tests are preparatory evidence only; no anchored exact-row camelid inspect receipt exists."
+          ]
         },
         "tokenizer": {
           "required": true,
-          "status": "blocked",
+          "status": "pass",
           "evidence": [
             "src/tokenizer/mod.rs",
-            "qa/model-qualification/fixtures/smollm3-tokenizer-pre-v1.json"
-          ],
-          "reason": "Camelid now resolves the exact row's smaug-bpe metadata as the pinned llama3 alias, and separately implements legacy smollm's two-pass splitter, but no exact-row token-id comparison against the pinned llama.cpp oracle has run."
+            "qa/model-qualification/fixtures/smollm3-tokenizer-pre-v1.json",
+            "qa/model-qualification/smollm3-3b-q8-header-tokenizer-parity.json"
+          ]
         },
         "template": {
           "required": true,
           "status": "blocked",
           "evidence": [
             "qa/model-qualification/fixtures/smollm3-tokenizer-pre-v1.json",
+            "qa/prompt-packs/smollm3-chat-template-shapes-v1.json",
+            "scripts/hf-qualification-smollm3-template.mjs",
             "src/api/mod.rs"
           ],
-          "reason": "The pinned 5,493-byte dynamic ChatML template injects current-date metadata, reasoning policy, system overrides, custom instructions, and tool grammars. An executable HOLD prevents it from falling into generic Qwen3 ChatML until a deterministic exact renderer and oracle fixture exist."
+          "reason": "The pinned 5,493-byte dynamic ChatML template injects current-date metadata, reasoning policy, system overrides, custom instructions, and tool grammars. A preparation-only renderer and two default no-tool oracle shapes now exist, but production wiring, runtime token-ID parity, control-marker safety, and the remaining dynamic branches are unqualified. The executable HOLD still prevents fallback to generic Qwen3 ChatML."
         },
         "load_smoke": {
           "required": true,
