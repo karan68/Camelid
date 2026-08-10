@@ -13974,6 +13974,14 @@ async fn llama_server_apply_template(
             }
         },
     };
+    if let Some(rejection) = reject_qwen3_moe_chat_until_template_qualified(
+        model.gguf.architecture().unwrap_or_default(),
+        &tokenizer,
+        &model.id,
+        None,
+    ) {
+        return rejection;
+    }
     let rendered = match render_chat_prompt_for_tokenization_for_model_result(
         &messages,
         &tokenizer,
@@ -16033,6 +16041,14 @@ async fn prepare_generation(
             token_ids
         }
         PromptInput::Chat(messages) => {
+            if let Some(rejection) = reject_qwen3_moe_chat_until_template_qualified(
+                model.gguf.architecture().unwrap_or_default(),
+                &tokenizer,
+                &model.id,
+                request_tools.as_deref(),
+            ) {
+                return Err(rejection);
+            }
             if let Some(rejection) = reject_smollm3_chat_until_template_qualified(
                 model.gguf.architecture().unwrap_or_default(),
                 &tokenizer,
@@ -20801,6 +20817,69 @@ fn reject_gemma2_with_unrecognized_template(
              Gemma 2 and Gemma 3 share turn markers but disagree on system-message \
              handling, so substituting the Gemma 3 renderer is unsafe and chat fails \
              closed. Re-convert the GGUF with the model's own template."
+        ),
+        Some("messages"),
+    ))
+}
+
+const QWEN3_MOE_EXACT_CHAT_TEMPLATE_UTF8_BYTES: usize = 4_100;
+const QWEN3_MOE_EXACT_CHAT_TEMPLATE_SHA256: &str =
+    "57f1fd00f0013a2be96aa79b857391f27e23df5b5f847072b524c897e24d0361";
+
+/// Exact identity of the embedded template in the pinned
+/// Qwen3-30B-A3B-Q8_0 artifact. This template is also used by dense Qwen3
+/// rows, so it is evidence about the selected artifact, never an architecture
+/// classifier. The production HOLD below is keyed on `qwen3moe` metadata.
+fn is_exact_qwen3_moe_chat_template(template: &str) -> bool {
+    template.len() == QWEN3_MOE_EXACT_CHAT_TEMPLATE_UTF8_BYTES
+        && format!("{:x}", Sha256::digest(template.as_bytes()))
+            == QWEN3_MOE_EXACT_CHAT_TEMPLATE_SHA256
+}
+
+/// Executable HOLD for Qwen3-MoE chat and `/apply-template`.
+///
+/// Header/tokenizer qualification may proceed from a bounded prefix, but the
+/// exact 4,100-byte template has reasoning-content, tool-call, and grouped
+/// tool-response branches that Camelid's generic Qwen3 renderer does not
+/// implement. Keep every qwen3moe chat shape closed until a pinned shape pack
+/// proves a deliberately narrow envelope. Raw completion remains a separate
+/// qualification lane.
+fn reject_qwen3_moe_chat_until_template_qualified(
+    architecture: &str,
+    tokenizer: &Tokenizer,
+    model_id: &str,
+    tools: Option<&[serde_json::Value]>,
+) -> Option<Response> {
+    if architecture != "qwen3moe" {
+        return None;
+    }
+    if tools.is_some_and(|tools| !tools.is_empty()) {
+        return Some(api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "unsupported_tools",
+            format!(
+                "model '{model_id}' declares architecture 'qwen3moe'; Qwen3-MoE tool-definition, tool-call-history, and grouped tool-response semantics are not shape-pack qualified, so tools fail closed instead of borrowing Camelid's generic Qwen3 tool renderer"
+            ),
+            Some("tools"),
+        ));
+    }
+
+    let template_state = match tokenizer.chat_template.as_deref() {
+        Some(template) if is_exact_qwen3_moe_chat_template(template) => {
+            "matches the pinned exact 4,100-byte identity"
+        }
+        Some(_) => "is present but does not match the pinned exact 4,100-byte identity",
+        None => "is missing",
+    };
+    Some(api_error(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "unsupported_chat_template",
+        format!(
+            "model '{model_id}' declares architecture 'qwen3moe'; its embedded chat template \
+             {template_state}. Qwen3-MoE reasoning-content, trailing-assistant, tool-call, and \
+             grouped tool-response branches do not match Camelid's generic Qwen3 renderer, so \
+             chat and /apply-template fail closed until an exact-row shape pack is committed. \
+             Raw completion remains a separate qualification lane."
         ),
         Some("messages"),
     ))
@@ -29835,10 +29914,16 @@ mod default_model_api_tests {
 /// error. One regression test per surface, over the real router.
 #[cfg(test)]
 mod runnable_completions_gate_api_tests {
-    use std::collections::BTreeMap;
+    use std::{
+        collections::{BTreeMap, HashMap},
+        sync::OnceLock,
+    };
 
     use super::*;
     use crate::gguf::{GgufMetadataValue, GgufTensorDescriptor};
+    use crate::tokenizer::{
+        BpePreTokenizer, BpeRegistry, SpecialTokens, TokenizerConfig, TokenizerModel,
+    };
     use axum::{
         body::{to_bytes, Body},
         http::Request,
@@ -29931,6 +30016,128 @@ mod runnable_completions_gate_api_tests {
         state
     }
 
+    fn exact_qwen3_moe_template_from_fixture() -> String {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../qa/model-qualification/fixtures/qwen3-moe-chat-template-v1.json"
+        ))
+        .expect("committed Qwen3-MoE exact-template fixture parses");
+        fn assert_exact_keys(value: &Value, expected: &[&str]) {
+            let object = value.as_object().expect("fixture section is an object");
+            let mut actual = object.keys().map(String::as_str).collect::<Vec<_>>();
+            let mut expected = expected.to_vec();
+            actual.sort_unstable();
+            expected.sort_unstable();
+            assert_eq!(actual, expected, "fixture object has an unexpected field");
+        }
+
+        assert_exact_keys(&fixture, &["grounding", "schema", "source", "template"]);
+        assert_exact_keys(
+            &fixture["source"],
+            &["file", "repo", "revision", "sha256", "size_bytes"],
+        );
+        assert_exact_keys(
+            &fixture["grounding"],
+            &[
+                "extraction_prefix_sha256",
+                "extraction_range",
+                "header_receipt",
+                "header_receipt_sha256",
+                "receipt_prefix_bytes",
+                "receipt_prefix_sha256",
+            ],
+        );
+        assert_exact_keys(&fixture["template"], &["jinja", "sha256", "utf8_bytes"]);
+        assert_eq!(
+            fixture["schema"],
+            "camelid.qwen3_moe_chat_template_fixture.v1"
+        );
+        assert_eq!(fixture["source"]["repo"], "Qwen/Qwen3-30B-A3B-GGUF");
+        assert_eq!(fixture["source"]["file"], "Qwen3-30B-A3B-Q8_0.gguf");
+        assert_eq!(
+            fixture["source"]["revision"],
+            "e4d4bafdfb96a411a163846265362aceb0b9c63a"
+        );
+        assert_eq!(fixture["source"]["size_bytes"], 32_483_931_648_u64);
+        assert_eq!(
+            fixture["source"]["sha256"],
+            "4ad960d180b16f56024f5b704697e5dd5b0837167c2e515ef0569abfc599743c"
+        );
+        assert_eq!(
+            fixture["grounding"]["header_receipt"],
+            "qa/model-qualification/qwen3-30b-a3b-q8-header-inspection.json"
+        );
+        assert_eq!(
+            fixture["grounding"]["header_receipt_sha256"],
+            format!(
+                "{:x}",
+                Sha256::digest(include_bytes!(
+                    "../../qa/model-qualification/qwen3-30b-a3b-q8-header-inspection.json"
+                ))
+            )
+        );
+        assert_eq!(fixture["grounding"]["receipt_prefix_bytes"], 33_554_432_u64);
+        assert_eq!(
+            fixture["grounding"]["receipt_prefix_sha256"],
+            "55c565264523c5862247d983f857b9034c04d762ee14fecfd68a827cdbb2d566"
+        );
+        assert_eq!(
+            fixture["grounding"]["extraction_range"],
+            "bytes 0-5969407/32483931648"
+        );
+        assert_eq!(
+            fixture["grounding"]["extraction_prefix_sha256"],
+            "90cffffb68f602aadb8d3d8fbe3f4224d4bb3db869ebdb494478d64528ad832e"
+        );
+        assert_eq!(
+            fixture["template"]["utf8_bytes"],
+            QWEN3_MOE_EXACT_CHAT_TEMPLATE_UTF8_BYTES
+        );
+        assert_eq!(
+            fixture["template"]["sha256"],
+            QWEN3_MOE_EXACT_CHAT_TEMPLATE_SHA256
+        );
+        fixture["template"]["jinja"]
+            .as_str()
+            .expect("fixture carries the exact tokenizer.chat_template")
+            .to_string()
+    }
+
+    fn qwen3_moe_test_tokenizer() -> Tokenizer {
+        Tokenizer {
+            model: TokenizerModel::Gpt2Bpe,
+            bpe_pre_tokenizer: BpePreTokenizer::default(),
+            tokens: Vec::new(),
+            token_to_id: HashMap::new(),
+            byte_token_to_id: HashMap::new(),
+            bpe_ranks: HashMap::new(),
+            bpe_registry: BpeRegistry::default(),
+            special: SpecialTokens::default(),
+            config: TokenizerConfig {
+                add_bos: false,
+                add_eos: false,
+                add_sep: false,
+                add_space_prefix: false,
+                remove_extra_whitespaces: false,
+            },
+            chat_template: None,
+            specials_index: OnceLock::new(),
+        }
+    }
+
+    async fn state_with_loaded_qwen3_moe_template(template: Option<&str>) -> AppState {
+        let state = state_with_loaded_arch("qwen3moe").await;
+        let mut tokenizer = qwen3_moe_test_tokenizer();
+        tokenizer.chat_template = template.map(str::to_string);
+        state
+            .loaded_models
+            .write()
+            .await
+            .get_mut("gate-test")
+            .expect("synthetic qwen3moe model is loaded")
+            .tokenizer_runtime = Some(Arc::new(tokenizer));
+        state
+    }
+
     async fn post_json(app: axum::Router, uri: &str, body: Value) -> (StatusCode, Value) {
         let request = Request::builder()
             .method("POST")
@@ -29955,6 +30162,174 @@ mod runnable_completions_gate_api_tests {
                 .contains("/v1/chat/completions"),
             "rejection must point callers at the served chat surface: {body}"
         );
+    }
+
+    #[test]
+    fn qwen3_moe_template_identity_is_exact_not_marker_based() {
+        let exact = exact_qwen3_moe_template_from_fixture();
+        assert_eq!(exact.len(), QWEN3_MOE_EXACT_CHAT_TEMPLATE_UTF8_BYTES);
+        assert!(is_exact_qwen3_moe_chat_template(&exact));
+
+        let mut substituted = exact.clone();
+        substituted.push(' ');
+        assert!(!is_exact_qwen3_moe_chat_template(&substituted));
+
+        let mut same_length_bytes = exact.clone().into_bytes();
+        same_length_bytes[0] = if same_length_bytes[0] == b'{' {
+            b'['
+        } else {
+            b'X'
+        };
+        let same_length = String::from_utf8(same_length_bytes).expect("ASCII mutation stays UTF-8");
+        assert_eq!(same_length.len(), exact.len());
+        assert!(!is_exact_qwen3_moe_chat_template(&same_length));
+        assert!(!is_exact_qwen3_moe_chat_template(
+            "<|im_start|>user\n{{ content }}<|im_end|>\n"
+        ));
+    }
+
+    #[test]
+    fn qwen3_moe_hold_is_architecture_scoped_when_template_is_shared() {
+        let mut tokenizer = qwen3_moe_test_tokenizer();
+        tokenizer.chat_template = Some(exact_qwen3_moe_template_from_fixture());
+        let messages = [ChatMessage {
+            image_urls: Vec::new(),
+            unsupported_content_parts: Vec::new(),
+            role: "user".to_string(),
+            content: "hello".to_string(),
+        }];
+        let tools = [json!({
+            "name": "read_file",
+            "description": "Read a file",
+            "parameters": {"type": "object", "properties": {}}
+        })];
+
+        assert!(
+            render_chat_prompt_for_tokenization_with_tools(&messages, &tokenizer, &tools).is_ok(),
+            "the shared exact template must remain available to dense Qwen3 rows"
+        );
+        assert!(reject_qwen3_moe_chat_until_template_qualified(
+            "qwen3",
+            &tokenizer,
+            "dense-qwen3",
+            Some(&tools),
+        )
+        .is_none());
+        let rejection = reject_qwen3_moe_chat_until_template_qualified(
+            "qwen3moe",
+            &tokenizer,
+            "held-qwen3-moe",
+            Some(&tools),
+        )
+        .expect("qwen3moe must fail closed before the shared renderer");
+        assert_eq!(rejection.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn qwen3_moe_apply_template_holds_exact_substituted_and_missing_templates() {
+        let exact = exact_qwen3_moe_template_from_fixture();
+        let variants = [
+            ("exact", Some(exact.as_str())),
+            (
+                "substituted",
+                Some("<|im_start|>user\n{{ content }}<|im_end|>\n"),
+            ),
+            ("missing", None),
+        ];
+
+        for (label, template) in variants {
+            let app = router_with_state(state_with_loaded_qwen3_moe_template(template).await);
+            let (status, body) = post_json(
+                app,
+                "/apply-template",
+                json!({"messages": [{"role": "user", "content": "hello"}]}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{label}: {body}");
+            assert_eq!(
+                body["error"]["code"], "unsupported_chat_template",
+                "{label}: {body}"
+            );
+            assert_eq!(body["error"]["param"], "messages", "{label}: {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn qwen3_moe_dense_chat_hold_is_stream_independent() {
+        let exact = exact_qwen3_moe_template_from_fixture();
+        for stream in [false, true] {
+            let app =
+                router_with_state(state_with_loaded_qwen3_moe_template(Some(exact.as_str())).await);
+            let (status, body) = post_json(
+                app,
+                "/v1/chat/completions",
+                json!({
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "stream": stream
+                }),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "stream={stream}: {body}"
+            );
+            assert_eq!(
+                body["error"]["code"], "unsupported_chat_template",
+                "stream={stream}: {body}"
+            );
+            assert_eq!(
+                body["error"]["param"], "messages",
+                "stream={stream}: {body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn qwen3_moe_explicit_tools_hold_is_template_and_stream_independent() {
+        let exact = exact_qwen3_moe_template_from_fixture();
+        let variants = [
+            ("exact", Some(exact.as_str())),
+            (
+                "substituted",
+                Some("<|im_start|>user\n{{ content }}<|im_end|>\n"),
+            ),
+            ("missing", None),
+        ];
+        for (label, template) in variants {
+            for stream in [false, true] {
+                let app = router_with_state(state_with_loaded_qwen3_moe_template(template).await);
+                let (status, body) = post_json(
+                    app,
+                    "/v1/chat/completions",
+                    json!({
+                        "messages": [{"role": "user", "content": "read notes.txt"}],
+                        "stream": stream,
+                        "tools": [{
+                            "type": "function",
+                            "function": {
+                                "name": "read_file",
+                                "parameters": {"type": "object", "properties": {}}
+                            }
+                        }]
+                    }),
+                )
+                .await;
+                assert_eq!(
+                    status,
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "{label}, stream={stream}: {body}"
+                );
+                assert_eq!(
+                    body["error"]["code"], "unsupported_tools",
+                    "{label}, stream={stream}: {body}"
+                );
+                assert_eq!(
+                    body["error"]["param"], "tools",
+                    "{label}, stream={stream}: {body}"
+                );
+            }
+        }
     }
 
     #[tokio::test]
