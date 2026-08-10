@@ -42,7 +42,7 @@ import { HeaderInspectionError } from './hf-qualification-header.mjs'
 const root = resolve('.')
 const packPath = resolve(root, 'qa/prompt-packs/qwen3-moe-chat-template-shapes-v1.json')
 const analyzerPath = resolve(root, 'target/reference/llama.cpp-b9632/bin/llama-template-analysis.exe')
-const camelidPath = resolve(root, 'target/debug/camelid.exe')
+const camelidPath = resolve(root, 'target/model-qualification/bin/camelid-ded8e95b-clean.exe')
 const clone = (value) => structuredClone(value)
 const sha256 = (value) => createHash('sha256').update(value).digest('hex')
 
