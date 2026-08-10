@@ -90,3 +90,24 @@ Raw greedy parity matches 3 of 4 prompts; the remaining prompt reverses two
 near-tied candidates, so it is recorded as a hard parity failure rather than
 waived. Load/smoke, complete API/WebUI, and context gates remain blocked, and
 the row stays experimental/unverified.
+
+## Phase 2 factory foundation
+
+Phase 2 has started without weakening the Phase 1 evidence boundary:
+
+- `scripts/hf-qualification-source.mjs` resolves a Hugging Face repo/file
+  selector to an immutable revision, LFS byte size, SHA-256, license, and access
+  state using the Hub's file-metadata response. It can independently hash an
+  existing local artifact against that lock.
+- `scripts/model-qualification-factory.mjs` walks the roster in priority order,
+  resolves filenames under `CAMELID_MODELS_DIR`, and writes one scrubbed report
+  per row plus an index. Missing directories, artifacts, fixtures, binaries, or
+  source identities become `blocked`; they never disappear as skipped tests.
+- `scripts/check-model-qualification-report.mjs` validates the committed report
+  contract, fail-closed overall status, and privacy boundary before evidence is
+  accepted.
+
+The factory does not download multi-gigabyte artifacts implicitly and does not
+run smoke or generation unless those probes are explicitly requested. This
+keeps routine inventory runs cheap while making evidence-producing runs
+deliberate and reproducible.

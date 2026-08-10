@@ -1,0 +1,135 @@
+{
+  "schema": "camelid.model-qualification-report/v1",
+  "generated_at": "2026-08-10T06:46:26.933Z",
+  "phase": 1,
+  "row_id": "lfm2_5_2_6b_q8_0",
+  "source_head": "10f1108d0afc3286acda11921393863ca1fd217e",
+  "source_dirty": true,
+  "host": {
+    "platform": "windows-x64",
+    "backend": "cpu_reference",
+    "hostname_redacted": true
+  },
+  "artifact": {
+    "repo": "LiquidAI/LFM2.5-2.6B-GGUF",
+    "revision": "b421ad1d549afeda6a0fb2ad3a697cb5a7879adc",
+    "file": "LFM2.5-2.6B-Q8_0.gguf",
+    "size_bytes": 2874779456,
+    "sha256": "36587fdf27bdfc69caf2637273679a0870ec155162161bde6fd16e8c70bdb757",
+    "git_blob_oid": "4f716bcbb7d01d5ec8c2de6e7f06bbb5c49a2794",
+    "xet_hash": "2c755a534b12a5ffb91f79ffae46351492893c4164c5022277b351e538d9fa26",
+    "license": "LFM Open License v1.0",
+    "license_file": {
+      "path": "LICENSE",
+      "git_blob_oid": "2a513f17eb4b8008fb100349fd2b7551d009fed0"
+    },
+    "local_path_redacted": true,
+    "present_for_this_run": false
+  },
+  "source_evidence": {
+    "publisher": "Liquid AI",
+    "repository_visibility": "public",
+    "repository_gated": false,
+    "revision_url": "https://huggingface.co/LiquidAI/LFM2.5-2.6B-GGUF/tree/b421ad1d549afeda6a0fb2ad3a697cb5a7879adc",
+    "file_url": "https://huggingface.co/LiquidAI/LFM2.5-2.6B-GGUF/blob/b421ad1d549afeda6a0fb2ad3a697cb5a7879adc/LFM2.5-2.6B-Q8_0.gguf",
+    "license_url": "https://huggingface.co/LiquidAI/LFM2.5-2.6B-GGUF/blob/b421ad1d549afeda6a0fb2ad3a697cb5a7879adc/LICENSE",
+    "repository_head_observed": "b421ad1d549afeda6a0fb2ad3a697cb5a7879adc",
+    "file_last_commit": "b22e29ebf6249a8c9fcdda36914743e9980595c4",
+    "file_last_commit_at": "2026-08-04T14:10:33.000Z",
+    "verification_method": "Hugging Face model and tree APIs queried at the immutable revision; the Q8_0 LFS oid is a SHA-256 and exactly matches the pre-existing Camelid parity fixture hash. The pinned LICENSE begins with 'LFM Open License v1.0'."
+  },
+  "stages": {
+    "source": {
+      "status": "pass",
+      "evidence": [
+        "official public LiquidAI Hugging Face repository",
+        "immutable repository revision",
+        "exact Q8_0 filename, byte count, and LFS SHA-256",
+        "pinned license file and license name"
+      ]
+    },
+    "artifact": {
+      "status": "blocked",
+      "reason": "The exact pinned artifact is not present locally for this run; remote identity is proven by the official repository's LFS pointer, but local byte identity was not re-hashed."
+    },
+    "metadata": {
+      "status": "pass",
+      "evidence": [
+        "tests/lfm2_parity.rs",
+        "src/model.rs"
+      ],
+      "note": "Pre-existing exact-row evidence; not rerun because the artifact was absent."
+    },
+    "tokenizer": {
+      "status": "pass",
+      "evidence": [
+        "tests/lfm2_parity.rs",
+        "tests/fixtures/lfm2_parity/lfm2-chat-template.json"
+      ],
+      "note": "Pre-existing exact-row evidence; not rerun because the artifact was absent."
+    },
+    "template": {
+      "status": "pass",
+      "evidence": [
+        "tests/fixtures/lfm2_parity/lfm2-chat-template.json",
+        "src/api/mod.rs"
+      ]
+    },
+    "load_smoke": {
+      "status": "pass",
+      "evidence": [
+        "qa/runnable/lfm2-serve-smoke.json"
+      ],
+      "note": "The committed receipt is non-streaming and is not reference parity."
+    },
+    "parity": {
+      "status": "pass",
+      "evidence": [
+        "qa/runnable/lfm2-parity.json"
+      ],
+      "note": "Four raw prompts times 24 greedy tokens match llama.cpp b9632 for this exact SHA."
+    },
+    "api_webui": {
+      "status": "blocked",
+      "partial_evidence": [
+        "qa/runnable/lfm2-serve-smoke.json"
+      ],
+      "reason": "The exact 2.87 GB artifact is not present locally. The existing exact-row receipt proves non-streaming single-turn, multi-turn, reasoning separation, and typed tool refusal, but it explicitly does not prove streaming SSE or Models-page/WebUI behavior. Those surfaces cannot be upgraded from code-only or model-agnostic tests."
+    },
+    "context": {
+      "status": "blocked",
+      "reason": "The exact 2.87 GB artifact is not present locally, so a 512-token reference-parity receipt cannot be generated. A metadata-declared context length or a short-prompt receipt is not a substitute."
+    }
+  },
+  "hold": {
+    "code": "EXACT_ARTIFACT_NOT_LOCAL",
+    "blocking_artifact": {
+      "file": "LFM2.5-2.6B-Q8_0.gguf",
+      "size_bytes": 2874779456,
+      "sha256": "36587fdf27bdfc69caf2637273679a0870ec155162161bde6fd16e8c70bdb757"
+    },
+    "searched_locations": [
+      "repository target tree",
+      "user Downloads",
+      "user Documents",
+      "Hugging Face cache",
+      "common LM Studio and Nomic model locations"
+    ],
+    "resume_requirements": [
+      "Place the exact pinned file in CAMELID_MODELS_DIR or pass it explicitly to the qualification runner.",
+      "Verify byte count and full SHA-256 before loading.",
+      "Run bounded streaming chat and assert SSE framing, terminal finish_reason, usage, reasoning/content separation, and clean stream termination.",
+      "Run the existing qa/capability/context_parity.mjs harness at a 512-token target against pinned llama.cpp b9632, with its predict-and-abort memory guard enabled.",
+      "Exercise the Models-page load-to-chat path against that same server before changing api_webui to pass."
+    ]
+  },
+  "overall_status": "blocked",
+  "support_decision": "remain_experimental_exact_row",
+  "does_not_prove": [
+    "streaming SSE for the LFM2 row",
+    "Models-page or WebUI load-to-chat behavior for the LFM2 row",
+    "512-token reference parity",
+    "sampling, tools, neighboring quantizations, or other LFM2 variants",
+    "broad LFM2 or LFM2.5 family support"
+  ]
+}

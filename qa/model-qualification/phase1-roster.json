@@ -44,14 +44,14 @@
         "architecture": "lfm2",
         "quantization": "Q8_0",
         "gguf_filename": "LFM2.5-2.6B-Q8_0.gguf",
-        "size_bytes": null,
+        "size_bytes": 2874779456,
         "sha256": "36587fdf27bdfc69caf2637273679a0870ec155162161bde6fd16e8c70bdb757"
       },
       "source": {
-        "repo": null,
+        "repo": "LiquidAI/LFM2.5-2.6B-GGUF",
         "file": "LFM2.5-2.6B-Q8_0.gguf",
-        "revision": null,
-        "license": null
+        "revision": "b421ad1d549afeda6a0fb2ad3a697cb5a7879adc",
+        "license": "LFM Open License v1.0"
       },
       "expected": {
         "tokenizer_model": "gpt2",
@@ -75,11 +75,11 @@
       "gates": {
         "source": {
           "required": true,
-          "status": "blocked",
+          "status": "pass",
           "evidence": [
-            "qa/runnable/lfm2-parity.json"
-          ],
-          "reason": "The exact artifact hash is pinned, but the committed receipt does not carry an immutable public repository revision and license record."
+            "qa/runnable/lfm2-parity.json",
+            "qa/model-qualification/lfm2.5-2.6b-q8-phase1-report.json"
+          ]
         },
         "metadata": {
           "required": true,
@@ -123,15 +123,18 @@
           "required": true,
           "status": "blocked",
           "evidence": [
-            "qa/runnable/lfm2-serve-smoke.json"
+            "qa/runnable/lfm2-serve-smoke.json",
+            "qa/model-qualification/lfm2.5-2.6b-q8-phase1-report.json"
           ],
-          "reason": "The committed smoke is non-streaming and explicitly does not prove SSE, frontend behavior, or reference parity on the chat surface."
+          "reason": "The exact 2.87 GB artifact is not present locally. The committed smoke proves the non-streaming API path but explicitly does not prove SSE, frontend behavior, or reference parity on the chat surface."
         },
         "context": {
           "required": true,
           "status": "blocked",
-          "evidence": [],
-          "reason": "No preflighted 512-token parity receipt exists for this exact row."
+          "evidence": [
+            "qa/model-qualification/lfm2.5-2.6b-q8-phase1-report.json"
+          ],
+          "reason": "The exact 2.87 GB artifact is not present locally, so no preflighted 512-token parity receipt can be generated for this exact row."
         }
       }
     },

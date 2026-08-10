@@ -343,7 +343,7 @@ async function qualify(options) {
   const row = roster.rows.find((candidate) => candidate.id === options.row)
   if (!row) throw new Error(`unknown --row ${JSON.stringify(options.row)}`)
 
-  const artifact = resolve(root, options.artifact)
+  const artifact = options.artifact ? resolve(root, options.artifact) : null
   const binary = resolve(root, options.camelid || 'target/release/camelid')
   const fixturePath = row.probes.oracle_fixture ? resolve(root, row.probes.oracle_fixture) : null
   let fixture = null
@@ -386,9 +386,15 @@ async function qualify(options) {
     : stage('blocked', { reason: row.gates.source.reason || 'source gate is not pinned in the roster' })
 
   let artifactStat
-  try { artifactStat = await stat(artifact) }
-  catch (error) {
-    report.stages.artifact = stage('blocked', { reason: `artifact is absent: ${error.code || error.message}` })
+  if (!artifact) {
+    report.stages.artifact = stage('blocked', {
+      reason: 'artifact path is unresolved; provide --artifact or configure the roster factory models directory',
+    })
+  } else {
+    try { artifactStat = await stat(artifact) }
+    catch (error) {
+      report.stages.artifact = stage('blocked', { reason: `artifact is absent: ${error.code || error.message}` })
+    }
   }
   if (artifactStat) {
     const sha256 = await sha256File(artifact)
