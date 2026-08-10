@@ -5088,7 +5088,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             SupportItem {
                 id: "command_r",
                 status: "experimental_scaffolding",
-                notes: "Command-R tensor, normalization, tokenizer, and logit-scale scaffolding exists, but the runnable parser/admission path still rejects command-r and no exact-row load, generation, parity, or frontend evidence exists.",
+                notes: "Aya Expanse 8B Q4_K_M is the first immutable Command-R candidate: its public 5.056 GB artifact identity and license are pinned, and the complete remote header validates the 32-layer parallel-residual graph, config, admission, binding, adjacent RoPE, and tensor mix. The full artifact is not local, so load, tokenizer/template parity, generation parity, API/WebUI, and context remain blocked; neighboring Command-R/cohere2 rows fail closed.",
             },
             SupportItem {
                 id: "qwen25",
@@ -5098,7 +5098,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             SupportItem {
                 id: "gemma2",
                 status: "planned_exact_row_candidate",
-                notes: "public readiness: planned first Gemma row only for gemma-2-9b-it-Q8_0.gguf; not supported yet. Gemma2 architecture, tokenizer/control-token behavior, template formatting, bounded load, parity, API/WebUI, RSS, and bundle evidence are missing",
+                notes: "public readiness: planned first Gemma row only for gemma-2-9b-it-Q8_0.gguf; not supported yet. The exact embedded Gemma 2 IT template now has a fixture-locked renderer and fail-closed route, but real-row token-id parity, bounded load/generation, parity, API/WebUI, RSS, context, and bundle evidence are still missing",
             },
             SupportItem {
                 id: "phi_falcon_mamba_others",
@@ -6827,46 +6827,46 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 next_step: "acquire and SHA-anchor the exact artifact, then run prompt-token, generation, API/WebUI, memory, and bounded-context gates",
             },
             ModelCompatibilityTarget {
-                id: "c4ai_command_r_v01_q8_0",
+                id: "aya_expanse_8b_q4_k_m",
                 tool_capable: false,
                 family: "command_r",
-                quantization: "Q8_0",
+                quantization: "Q4_K_M",
                 status: "planned_exact_row_candidate",
                 support_scope: "future_exact_row_planning_only",
                 full_support_status: "not_applicable_until_runtime_support",
-                full_support_blockers: "command-r is still rejected by runnable architecture admission; the new tensor/tokenizer scaffolding is unreachable and has no exact-row load or parity evidence",
-                metadata_parses: "header_only_not_runnable",
-                tokenizer_works: "scaffolding_unvalidated",
-                tensors_load: "not_started",
-                generation_runs: "not_started",
-                parity_audited: "not_started",
-                performance_measured: "not_started",
-                frontend_load_path_verified: "fail_closed_planned",
-                frontend_readiness_gate: "fail-closed while command-r runtime admission rejects the architecture",
-                tested_context: "not_started",
-                chat_template_renderer: "command_r_planned",
-                chat_template_shape_pack: "not_started",
+                full_support_blockers: "the exact 5.056 GB artifact is not local; no full-file hash/load, prompt-token or Aya template fixture, real-weight generation parity, API/WebUI/SSE, context, RSS, performance, or portability evidence exists",
+                metadata_parses: "immutable_remote_header_validated_attemptable",
+                tokenizer_works: "command_r_dialect_identified_exact_row_parity_blocked",
+                tensors_load: "blocked_exact_artifact_not_local",
+                generation_runs: "blocked_exact_artifact_not_local",
+                parity_audited: "blocked_no_real_weight_oracle_run",
+                performance_measured: "blocked_no_real_weight_run",
+                frontend_load_path_verified: "fail_closed_header_only_hold",
+                frontend_readiness_gate: "fail-closed: Command-R chat returns a typed template HOLD until the exact Aya template and real-weight parity gates pass",
+                tested_context: "blocked_metadata_declaration_only",
+                chat_template_renderer: "fail_closed_pending_aya_template_fixture",
+                chat_template_shape_pack: "blocked_not_captured",
                 chat_template_shape_pack_id: "command-r-chat-template-pack-v1",
-                bounded_context_512_pack: "not_started",
+                bounded_context_512_pack: "blocked_exact_artifact_not_local",
                 bounded_context_512_pack_id: "command-r-context-512-smoke-v1",
                 bounded_context_window: 512,
-                bounded_context_1024_pack: "not_started",
+                bounded_context_1024_pack: "blocked_exact_artifact_not_local",
                 bounded_context_1024_pack_id: "command-r-context-1024-smoke-v1",
                 bounded_context_1024_window: 1024,
-                bounded_context_2048_pack: "not_started",
+                bounded_context_2048_pack: "blocked_exact_artifact_not_local",
                 bounded_context_2048_pack_id: "command-r-context-2048-smoke-v1",
                 bounded_context_2048_window: 2048,
-                bounded_context_4096_pack: "not_started",
+                bounded_context_4096_pack: "blocked_exact_artifact_not_local",
                 bounded_context_4096_pack_id: "command-r-context-4096-smoke-v1",
                 bounded_context_4096_window: 4096,
-                bounded_context_8192_pack: "not_promoted",
-                bounded_context_8192_pack_id: "not_selected",
+                bounded_context_8192_pack: "blocked_exact_artifact_not_local",
+                bounded_context_8192_pack_id: "command-r-context-8192-smoke-v1",
                 bounded_context_8192_window: 8192,
-                latest_checked_bucket: "candidate_selected",
+                latest_checked_bucket: "immutable_header_shape",
                 latest_checked_result: "planning_only",
-                latest_checked_output: "not_applicable",
-                evidence: "planning only: logit-scale, normalization, and tokenizer scaffolding do not make command-r runnable or supported",
-                next_step: "implement and validate command-r admission/binding, then run exact-artifact tokenizer, generation, parity, API/WebUI, memory, and context gates",
+                latest_checked_output: "qa/model-qualification/phase3-command-r-aya-attemptability-report.json",
+                evidence: "planning only / header-only HOLD: bartowski/aya-expanse-8b-GGUF@f9d62ed0c58e6f2ae17975df990b1b8a4013b596, aya-expanse-8b-Q4_K_M.gguf, 5,056,982,720 bytes, LFS SHA-256 9592bad943fe56cf93200286a0a4b00a158cd84a408f227b9978ec5879002fb8, CC-BY-NC-4.0. The complete immutable remote header proves command-r, GPT-2/command-r tokenizer metadata, 32x4096 geometry, FFN 14336, GQA 32/8, adjacent RoPE, one shared LayerNorm parallel residual, tied output, and F32/Q4_K/Q6_K tensor distribution. Only the first 16 MiB header range was fetched; no weight payload, load, generation, parity, frontend, or context result is claimed.",
+                next_step: "provide and full-hash the exact artifact, capture prompt-token and Aya template fixtures, then run pinned llama.cpp greedy parity before any smoke/API/SSE/Models-page or 512-token context gate",
             },
             ModelCompatibilityTarget {
                 id: "deepseek_r1_distill_llama_8b_q8_0",
@@ -7002,9 +7002,9 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 status: "planned_exact_row_candidate",
                 support_scope: "future_exact_row_planning_only",
                 full_support_status: "not_applicable_until_runtime_support",
-                full_support_blockers: "gemma2 runtime, control-token/template fixtures, bounded load/readiness, API/WebUI, RSS/timing, context, and durable bundle evidence are missing",
+                full_support_blockers: "the exact template renderer is fixture-locked only; real-row tokenizer/control-token parity, bounded load/readiness, generation parity, API/WebUI, RSS/timing, context, and durable bundle evidence are missing",
                 metadata_parses: "acquisition_planned",
-                tokenizer_works: "not_started",
+                tokenizer_works: "construction_path_exists_real_row_token_ids_unverified",
                 tensors_load: "not_started",
                 generation_runs: "not_started",
                 parity_audited: "not_started",
@@ -7012,9 +7012,9 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 frontend_load_path_verified: "fail_closed_planned",
                 frontend_readiness_gate: "fail-closed until an exact supported row plus runtime readiness exist",
                 tested_context: "not_started",
-                chat_template_renderer: "gemma2_it_planned",
-                chat_template_shape_pack: "not_started",
-                chat_template_shape_pack_id: "gemma2-it-chat-template-pack-v1",
+                chat_template_renderer: "gemma2_it_exact_fixture_only",
+                chat_template_shape_pack: "validated_fixture_only_no_real_row_runtime_claim",
+                chat_template_shape_pack_id: "gemma2-it-chat-template-v1",
                 bounded_context_512_pack: "not_started",
                 bounded_context_512_pack_id: "gemma2-context-512-smoke-v1",
                 bounded_context_window: 512,
@@ -7033,8 +7033,8 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 latest_checked_bucket: "candidate_selected",
                 latest_checked_result: "planning_only",
                 latest_checked_output: "not_applicable",
-                evidence: "first Gemma candidate row selected for planning only: gemma-2-9b-it-Q8_0.gguf; Gemma2 architecture details, tokenizer/control-token behavior, template formatting, bounded load, parity, API/WebUI, RSS, and bundle evidence are all still required",
-                next_step: "capture acquisition path, model SHA and license/access notes, then add tokenizer/chat-template fixtures and bounded metadata/load checks before any runtime-support wording",
+                evidence: "first Gemma candidate row remains planning only: gemma-2-9b-it-Q8_0.gguf. qa/model-qualification/fixtures/gemma2-it-chat-template-v1.json pins the exact GGUF template identity, renderer shapes, BOS contract, and typed fail-closed system/alternation behavior; it is template evidence only and supplies no model-load or generation support receipt",
+                next_step: "verify the remotely observed artifact identity independently, acquire the row, and run exact token-id, bounded metadata/load, generation, API/WebUI, parity, RSS, and context gates before any runtime-support wording",
             },
         ],
         runtime_projects: crate::runtime_manifest::runtime_capability_manifest()
@@ -7494,11 +7494,21 @@ struct InspectModelResponse {
     source: Option<ModelSourceInspection>,
     /// Predicted lane (`supported` / `experimental_implemented` / `unsupported`).
     lane_class: ModelLaneClass,
-    /// The exact typed blocker the load would hit â€” predicted WITHOUT binding
-    /// tensors or loading weights. `None` when the architecture is implemented
-    /// (it would load and run, supported or experimental).
+    /// A typed blocker found by header-level inspection without reading weight
+    /// payloads. `None` means the architecture config and any exact-row header
+    /// admission checks passed; it does NOT promise that tensor bytes will load,
+    /// execute, or satisfy parity gates.
     #[serde(skip_serializing_if = "Option::is_none")]
     blocker: Option<InspectBlocker>,
+}
+
+fn inspect_decoder_header_attemptability(gguf: &GgufFile) -> Result<(), BackendError> {
+    let config = LlamaModelConfig::from_gguf(gguf)?;
+    if gguf.architecture() == Some("command-r") {
+        crate::runnable::model::validate_command_r_attemptability_slice(gguf, &config)?;
+        Tokenizer::from_gguf(gguf)?;
+    }
+    Ok(())
 }
 
 /// `POST /api/models/inspect` â€” source-level readiness inspection. GGUF files keep
@@ -7600,14 +7610,16 @@ async fn inspect_model(
         None
     };
 
-    // Parse the config header (no tensor bind, no weight load). Ok â‡’ it would load;
-    // Err â‡’ it would fail closed with this exact typed reason.
+    // Parse the config header without reading tensor payloads. Exact-row runnable
+    // slices add canonical descriptor and tokenizer checks here so inspect agrees
+    // with their load door. Passing remains a header-level attemptability result,
+    // not a promise that weight bytes load or run.
     let config_result = if let Some(result) = bitnet_embedding_config {
         result.map(|_| ())
     } else if architecture.as_deref() == Some("nomic-bert") {
         EncoderConfig::from_gguf(&gguf).map(|_| ())
     } else {
-        LlamaModelConfig::from_gguf(&gguf).map(|_| ())
+        inspect_decoder_header_attemptability(&gguf)
     };
     let (lane_class, blocker) = match config_result {
         Ok(_) => (
@@ -7638,6 +7650,105 @@ async fn inspect_model(
         }),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod inspect_header_attemptability_tests {
+    use std::{collections::BTreeMap, path::PathBuf};
+
+    use super::inspect_decoder_header_attemptability;
+    use crate::gguf::{GgufFile, GgufMetadataValue, GgufTensorDescriptor, GgufTensorType};
+
+    #[test]
+    fn command_r_inspect_runs_exact_descriptor_admission() {
+        let metadata = BTreeMap::from([
+            (
+                "general.architecture".into(),
+                GgufMetadataValue::String("command-r".into()),
+            ),
+            (
+                "general.name".into(),
+                GgufMetadataValue::String("Aya Expanse 8b".into()),
+            ),
+            (
+                "general.license".into(),
+                GgufMetadataValue::String("cc-by-nc-4.0".into()),
+            ),
+            ("general.file_type".into(), GgufMetadataValue::U32(15)),
+            (
+                "tokenizer.ggml.model".into(),
+                GgufMetadataValue::String("gpt2".into()),
+            ),
+            (
+                "tokenizer.ggml.pre".into(),
+                GgufMetadataValue::String("command-r".into()),
+            ),
+            (
+                "command-r.context_length".into(),
+                GgufMetadataValue::U32(8_192),
+            ),
+            (
+                "command-r.embedding_length".into(),
+                GgufMetadataValue::U32(4_096),
+            ),
+            ("command-r.block_count".into(), GgufMetadataValue::U32(32)),
+            (
+                "command-r.feed_forward_length".into(),
+                GgufMetadataValue::U32(14_336),
+            ),
+            (
+                "command-r.attention.head_count".into(),
+                GgufMetadataValue::U32(32),
+            ),
+            (
+                "command-r.attention.head_count_kv".into(),
+                GgufMetadataValue::U32(8),
+            ),
+            (
+                "command-r.attention.layer_norm_epsilon".into(),
+                GgufMetadataValue::F32(1e-5),
+            ),
+            (
+                "command-r.rope.freq_base".into(),
+                GgufMetadataValue::F32(10_000.0),
+            ),
+            (
+                "command-r.rope.scaling.type".into(),
+                GgufMetadataValue::String("none".into()),
+            ),
+            (
+                "command-r.logit_scale".into(),
+                GgufMetadataValue::F32(0.125),
+            ),
+        ]);
+        let tensors = vec![GgufTensorDescriptor {
+            name: "token_embd.weight".into(),
+            dimensions: vec![4_096, 256_000],
+            tensor_type: GgufTensorType::Q6K,
+            relative_offset: 0,
+            absolute_offset: 0,
+            n_bytes: 0,
+        }];
+        let gguf = GgufFile {
+            path: PathBuf::new(),
+            version: 3,
+            tensor_count: tensors.len() as i64,
+            metadata_count: metadata.len() as i64,
+            alignment: 32,
+            data_start_offset: 0,
+            metadata,
+            tensors,
+        };
+
+        let error = inspect_decoder_header_attemptability(&gguf)
+            .expect_err("inspect must reject a lookalike Command-R header before tokenizer/load");
+        assert!(
+            error
+                .to_string()
+                .contains("canonical descriptor count mismatch"),
+            "{error}"
+        );
+    }
 }
 
 /// The Gemma 4 serve path is ON by default: gemma4 chat never falls through to
@@ -9968,6 +10079,63 @@ mod prism_mmproj_discovery_tests {
     }
 }
 
+/// The exact `tokenizer.chat_template` carried by the pinned Gemma 2 9B IT
+/// candidate in `qa/model-qualification/fixtures/gemma2-it-chat-template-v1.json`.
+///
+/// This is deliberately an equality pin, not a marker detector. Gemma 2 and
+/// Gemma 3 share `<start_of_turn>` / `<end_of_turn>`, but their system-message
+/// semantics differ: Gemma 2 rejects system messages while Gemma 3 folds one
+/// into the first user turn. A loose marker check silently routed Gemma 2
+/// through the Gemma 3 renderer and changed the prompt contract.
+const GEMMA2_IT_CHAT_TEMPLATE: &str = "{{ bos_token }}{% if messages[0]['role'] == 'system' %}{{ raise_exception('System role not supported') }}{% endif %}{% for message in messages %}{% if (message['role'] == 'user') != (loop.index0 % 2 == 0) %}{{ raise_exception('Conversation roles must alternate user/assistant/user/assistant/...') }}{% endif %}{% if (message['role'] == 'assistant') %}{% set role = 'model' %}{% else %}{% set role = message['role'] %}{% endif %}{{ '<start_of_turn>' + role + '\n' + message['content'] | trim + '<end_of_turn>\n' }}{% endfor %}{% if add_generation_prompt %}{{'<start_of_turn>model\n'}}{% endif %}";
+
+const GEMMA2_SYSTEM_ROLE_ERROR: &str = "System role not supported";
+const GEMMA2_ALTERNATION_ERROR: &str =
+    "Conversation roles must alternate user/assistant/user/assistant/...";
+const GEMMA2_EMPTY_MESSAGES_ERROR: &str = "Gemma 2 chat requires at least one user message";
+
+fn is_gemma2_it_chat_template(template: &str) -> bool {
+    template == GEMMA2_IT_CHAT_TEMPLATE
+}
+
+/// Render the pinned Gemma 2 IT template without literal BOS text.
+///
+/// The file declares `tokenizer.ggml.add_bos_token=true`, and the runnable
+/// bridge calls the tokenizer with `add_special=true`; BOS therefore lands at
+/// token level exactly once. The source Jinja always appends the model
+/// generation header when `add_generation_prompt=true`, including after a
+/// completed assistant turn. Invalid system/alternation shapes are errors in
+/// the source template and remain errors here rather than being coerced into a
+/// Gemma 3-shaped conversation.
+fn render_gemma2_it_prompt(messages: &[ChatMessage]) -> std::result::Result<String, &'static str> {
+    if messages.is_empty() {
+        return Err(GEMMA2_EMPTY_MESSAGES_ERROR);
+    }
+    if messages[0].role == "system" {
+        return Err(GEMMA2_SYSTEM_ROLE_ERROR);
+    }
+
+    let mut prompt = String::new();
+    for (index, message) in messages.iter().enumerate() {
+        // The pinned Jinja compares the role string directly. Whitespace is
+        // not normalized there, so accepting ` user ` here would render a
+        // shape the source template rejects.
+        let role = message.role.as_str();
+        let expected = if index % 2 == 0 { "user" } else { "assistant" };
+        if role != expected {
+            return Err(GEMMA2_ALTERNATION_ERROR);
+        }
+        let rendered_role = if role == "assistant" { "model" } else { role };
+        prompt.push_str("<start_of_turn>");
+        prompt.push_str(rendered_role);
+        prompt.push('\n');
+        prompt.push_str(message.content.trim());
+        prompt.push_str("<end_of_turn>\n");
+    }
+    prompt.push_str("<start_of_turn>model\n");
+    Ok(prompt)
+}
+
 /// Render a gemma3 chat prompt byte-faithful to the GGUF `tokenizer.chat_template`
 /// (MUSTER M-A1): `<bos>` + per-turn `<start_of_turn>{role}\n{content|trim}<end_of_turn>\n`
 /// with assistant renamed to "model"; a leading system message is folded into the FIRST
@@ -10203,6 +10371,20 @@ mod bitnet_runnable_api_tests {
         assert!(runnable_prompt_add_special("bitnet-b1.58"));
         assert!(runnable_prompt_add_special("lfm2"));
         assert!(!runnable_prompt_add_special("qwen35"));
+    }
+
+    #[test]
+    fn command_r_chat_stays_on_the_template_hold_instead_of_using_ornith() {
+        let response = command_r_chat_template_hold_rejection("aya");
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let details = response.extensions().get::<ApiErrorDetails>().unwrap();
+        assert_eq!(details.code, "unsupported_chat_template");
+        assert!(details
+            .message
+            .contains("Command-R chat remains fail-closed"));
+        assert!(details
+            .message
+            .contains("incompatible qwen35/Ornith renderer"));
     }
 
     #[test]
@@ -10873,7 +11055,15 @@ async fn runnable_chat_nonstreaming(
     let messages = req.messages.clone().unwrap_or_default();
     let enable_thinking = req.camelid_enable_thinking.unwrap_or(false);
     let tools = runnable_request_tools(req);
-    let prompt_text = if runtime.architecture == "gemma2" || runtime.architecture == "gemma3" {
+    let prompt_text = if runtime.architecture == "gemma2" {
+        if !tools.is_empty() {
+            return gemma_runnable_lane_tools_rejection();
+        }
+        match prepare_gemma2_runnable_chat_prompt(&runtime, &id, &messages) {
+            Ok(prompt) => prompt,
+            Err(rejection) => return rejection,
+        }
+    } else if runtime.architecture == "gemma3" {
         if !tools.is_empty() {
             return gemma_runnable_lane_tools_rejection();
         }
@@ -10903,6 +11093,8 @@ async fn runnable_chat_nonstreaming(
             return rejection;
         }
         render_lfm2_chatml_prompt(&messages)
+    } else if runtime.architecture == "command-r" {
+        return command_r_chat_template_hold_rejection(&id);
     } else if tools.is_empty() {
         render_ornith_chatml_prompt(&messages, enable_thinking)
     } else {
@@ -11042,7 +11234,15 @@ async fn runnable_chat_streaming(
     let messages = req.messages.clone().unwrap_or_default();
     let enable_thinking = req.camelid_enable_thinking.unwrap_or(false);
     let tools = runnable_request_tools(req);
-    let prompt_text = if runtime.architecture == "gemma2" || runtime.architecture == "gemma3" {
+    let prompt_text = if runtime.architecture == "gemma2" {
+        if !tools.is_empty() {
+            return gemma_runnable_lane_tools_rejection();
+        }
+        match prepare_gemma2_runnable_chat_prompt(&runtime, &id, &messages) {
+            Ok(prompt) => prompt,
+            Err(rejection) => return rejection,
+        }
+    } else if runtime.architecture == "gemma3" {
         if !tools.is_empty() {
             return gemma_runnable_lane_tools_rejection();
         }
@@ -11072,6 +11272,8 @@ async fn runnable_chat_streaming(
             return rejection;
         }
         render_lfm2_chatml_prompt(&messages)
+    } else if runtime.architecture == "command-r" {
+        return command_r_chat_template_hold_rejection(&id);
     } else if tools.is_empty() {
         render_ornith_chatml_prompt(&messages, enable_thinking)
     } else {
@@ -11925,9 +12127,6 @@ async fn load_model_from_path_with_activation(
             if existing.path == path {
                 let existing = existing.clone();
                 drop(loaded);
-                if set_active {
-                    *state.active_model_id.write().await = Some(requested_id.to_string());
-                }
                 // Heal a missing gemma4 serve runtime: a client that
                 // disconnects mid-load cancels the handler future AFTER the
                 // loaded_models insert but BEFORE the runtime insert, and the
@@ -11942,6 +12141,29 @@ async fn load_model_from_path_with_activation(
                         .contains_key(requested_id)
                 {
                     load_gemma4_serve_runtime(state, requested_id, &existing.path).await?;
+                }
+                // Apply the same healing rule to runnable-only rows. A prior
+                // runtime construction failure or cancelled load must not turn
+                // the idempotent fast path into a false success followed by a
+                // generic model_not_ready response.
+                if runnable_serve_enabled()
+                    && is_runnable_serve_file(&existing.gguf)
+                    && !state
+                        .runnable_runtimes
+                        .read()
+                        .await
+                        .contains_key(requested_id)
+                {
+                    load_runnable_serve_runtime(
+                        state,
+                        requested_id,
+                        &existing.path,
+                        &existing.lane.gguf_sha256,
+                    )
+                    .await?;
+                }
+                if set_active {
+                    *state.active_model_id.write().await = Some(requested_id.to_string());
                 }
                 return Ok(existing);
             }
@@ -11997,6 +12219,14 @@ async fn load_model_from_path_with_activation(
             BackendError::InvalidModelMetadata(format!("model load task panicked: {join_error}"))
         })??;
 
+    // Runnable-only models are published atomically with their runtime. Build
+    // the bridge before inserting LoadedModel/active state so a tokenizer or
+    // graph refusal cannot leave a partial id that the idempotent fast path
+    // later mistakes for a successful load.
+    if runnable_serve_enabled() && is_runnable_serve_file(&loaded.gguf) {
+        load_runnable_serve_runtime(state, &id, &loaded.path, &loaded.lane.gguf_sha256).await?;
+    }
+
     state
         .loaded_models
         .write()
@@ -12022,12 +12252,6 @@ async fn load_model_from_path_with_activation(
     // silently fall back to the Llama path (which would produce garbage here).
     if gemma4_serve_enabled() && model_family(&loaded.gguf) == "gemma4" {
         load_gemma4_serve_runtime(state, &id, &loaded.path).await?;
-    }
-
-    // Runnable serve path (additive, on by default; opt-out CAMELID_RUNNABLE_SERVE=0):
-    // load a runnable-lane runtime (qwen35/Ornith, gemma3) so /v1/chat can route to it.
-    if runnable_serve_enabled() && is_runnable_serve_file(&loaded.gguf) {
-        load_runnable_serve_runtime(state, &id, &loaded.path, &loaded.lane.gguf_sha256).await?;
     }
 
     // DiffusionGemma serve path (additive, on by default; opt-out CAMELID_DG_SERVE=0):
@@ -15220,6 +15444,23 @@ async fn prepare_generation(
             token_ids
         }
         PromptInput::Chat(messages) => {
+            if let Some(rejection) = reject_smollm3_chat_until_template_qualified(
+                model.gguf.architecture().unwrap_or_default(),
+                &tokenizer,
+                &model.id,
+            ) {
+                return Err(rejection);
+            }
+            // Gemma 2 is normally bridge-only, but keep the dense chokepoint
+            // fail-closed too: tests, future routing changes, or a partially
+            // constructed model must not revive the old Gemma 3 fallback.
+            if model.gguf.architecture() == Some("gemma2") {
+                if let Some(rejection) =
+                    reject_gemma2_with_unrecognized_template(&tokenizer, &model.id)
+                {
+                    return Err(rejection);
+                }
+            }
             // Phase 3c triage: the dense-lane gemma3 renderer is keyed on
             // TEMPLATE SHAPE (`is_gemma3_chat_template`) while routing admits
             // by ARCH. A gemma3 GGUF whose embedded template does not carry
@@ -19243,6 +19484,22 @@ fn render_chat_prompt_for_tokenization_for_model_result(
                 ),
             ));
         }
+        if is_smollm3_dynamic_chat_template(template) {
+            return Err(MiniJinjaError::new(
+                MiniJinjaErrorKind::InvalidOperation,
+                "the pinned SmolLM3 dynamic ChatML template is not qualified: its date metadata, reasoning-mode policy, system override, custom instructions, and tool grammar cannot be replaced by Camelid's generic Qwen3 renderer; chat fails closed while raw completion remains separately testable",
+            ));
+        }
+        if is_gemma2_it_chat_template(template) {
+            let text = render_gemma2_it_prompt(messages).map_err(|reason| {
+                MiniJinjaError::new(MiniJinjaErrorKind::InvalidOperation, reason)
+            })?;
+            return Ok(RenderedPrompt {
+                text,
+                add_special: true,
+                parse_special: true,
+            });
+        }
     } else if let Some(row_label) = exact_llama32_metadata_jinja_row {
         return Err(exact_llama32_metadata_jinja_chat_template_error(&format!(
             "{row_label} requires tokenizer.chat_template metadata for chat prompt rendering"
@@ -19280,6 +19537,18 @@ fn render_chat_prompt_for_tokenization_with_tools(
         })
         .collect();
     if let Some(template) = tokenizer.chat_template.as_deref() {
+        if is_smollm3_dynamic_chat_template(template) {
+            return Err(MiniJinjaError::new(
+                MiniJinjaErrorKind::InvalidOperation,
+                "the pinned SmolLM3 dynamic ChatML template and its tool grammars are not qualified; failing closed",
+            ));
+        }
+        if is_gemma2_it_chat_template(template) {
+            return Err(MiniJinjaError::new(
+                MiniJinjaErrorKind::InvalidOperation,
+                "the pinned Gemma 2 IT chat template has no tools branch; tool requests fail closed",
+            ));
+        }
         // gemma3: the template has no tools branch and no tool-call grammar is
         // certified for this row, so tool requests fail closed on the dense
         // lane with the SAME contract the runnable bridge enforces (its typed
@@ -19702,6 +19971,101 @@ fn gemma_runnable_lane_tools_rejection() -> Response {
     )
 }
 
+/// Build the only Gemma 2 chat prompt this bridge is allowed to serve.
+///
+/// Architecture admission alone is insufficient: a community requant can
+/// carry a substituted or missing template, and Gemma 2's markers overlap
+/// Gemma 3's despite incompatible system-message rules. Both streaming and
+/// non-streaming runnable routes call this one gate so neither can fall back
+/// to the Gemma 3 renderer.
+fn prepare_gemma2_runnable_chat_prompt(
+    runtime: &RunnableServeRuntime,
+    model_id: &str,
+    messages: &[ChatMessage],
+) -> std::result::Result<String, Response> {
+    if let Some(rejection) = reject_gemma2_with_unrecognized_template(&runtime.tokenizer, model_id)
+    {
+        return Err(rejection);
+    }
+
+    render_gemma2_it_prompt(messages).map_err(|reason| {
+        api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "unsupported_chat_template_shape",
+            format!(
+                "messages cannot be rendered by the pinned Gemma 2 IT template for \
+                 model '{model_id}': {reason}"
+            ),
+            Some("messages"),
+        )
+    })
+}
+
+fn reject_gemma2_with_unrecognized_template(
+    tokenizer: &Tokenizer,
+    model_id: &str,
+) -> Option<Response> {
+    if tokenizer
+        .chat_template
+        .as_deref()
+        .is_some_and(is_gemma2_it_chat_template)
+    {
+        return None;
+    }
+    Some(api_error(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "unsupported_chat_template",
+        format!(
+            "model '{model_id}' declares architecture 'gemma2', but its embedded \
+             tokenizer.chat_template is not the exact pinned Gemma 2 IT template. \
+             Gemma 2 and Gemma 3 share turn markers but disagree on system-message \
+             handling, so substituting the Gemma 3 renderer is unsafe and chat fails \
+             closed. Re-convert the GGUF with the model's own template."
+        ),
+        Some("messages"),
+    ))
+}
+
+/// Executable HOLD for SmolLM3 chat.
+///
+/// Tokenizer construction and raw completion qualification can proceed, but
+/// the exact row's 5.5 KiB dynamic ChatML template cannot be approximated by
+/// the generic Qwen3 renderer merely because both use `<|im_start|>`. Keep the
+/// architecture's chat lane typed and closed until a deterministic date input,
+/// reasoning-mode shapes, system overrides, and tool grammars are fixture- and
+/// oracle-locked.
+fn reject_smollm3_chat_until_template_qualified(
+    architecture: &str,
+    tokenizer: &Tokenizer,
+    model_id: &str,
+) -> Option<Response> {
+    if architecture != "smollm3" {
+        return None;
+    }
+    let template_state = if tokenizer
+        .chat_template
+        .as_deref()
+        .is_some_and(is_smollm3_dynamic_chat_template)
+    {
+        "matches the pinned dynamic SmolLM3 signature"
+    } else {
+        "is missing or does not match the pinned dynamic SmolLM3 signature"
+    };
+    Some(api_error(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "unsupported_chat_template",
+        format!(
+            "model '{model_id}' declares architecture 'smollm3'; its embedded chat template \
+             {template_state}. SmolLM3's template injects current-date metadata, \
+             reasoning-mode policy, system overrides, custom instructions, and tool grammars. \
+             Camelid's generic Qwen3 ChatML renderer is not equivalent, so chat fails closed \
+             until the exact SmolLM3 contract is oracle-qualified. Raw completion remains a \
+             separate qualification lane."
+        ),
+        Some("messages"),
+    ))
+}
+
 /// Recognize either Microsoft's known-stale 2B GGUF template or the canonical
 /// 2B-4T tokenizer template. The stale branch is admitted only so Camelid can
 /// apply the documented corrective renderer above; it is never rendered as-is.
@@ -19817,6 +20181,26 @@ fn lfm2_runnable_lane_tools_rejection() -> Response {
     )
 }
 
+/// Command R is metadata/config/load-attemptable for the exact Aya Expanse 8B
+/// Q4_K_M header shape, but its START_OF_TURN template has no rendered-byte or
+/// prompt-token fixture yet. Falling through would render the unrelated Ornith
+/// ChatML dialect, so both streaming and non-streaming chat stop here until the
+/// template and real-weight parity gates are anchored.
+fn command_r_chat_template_hold_rejection(model_id: &str) -> Response {
+    api_error(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "unsupported_chat_template",
+        format!(
+            "model '{model_id}' declares architecture 'command-r'. The exact Aya Expanse 8B \
+             Q4_K_M header is attemptable, but its embedded START_OF_TURN/SYSTEM/USER/CHATBOT \
+             template has no rendered-byte or prompt-token parity fixture and the full artifact \
+             has no generation parity receipt. Command-R chat remains fail-closed instead of \
+             borrowing the incompatible qwen35/Ornith renderer."
+        ),
+        Some("messages"),
+    )
+}
+
 /// The gemma chat-template shape the gemma-3 GGUFs ship: `<start_of_turn>` /
 /// `<end_of_turn>` turn markers plus the `first_user_prefix` system-folding
 /// variable (which distinguishes it from other turn-marker templates). Chat
@@ -19838,6 +20222,21 @@ fn is_mistral_instruct_template(template: &str) -> bool {
     template.contains("[INST]")
         && template.contains("[/INST]")
         && (template.contains("bos_token") || template.contains("</s>"))
+}
+
+/// Signature of the pinned SmolLM3-3B GGUF's dynamic ChatML template.
+///
+/// It shares the ordinary `<|im_start|>` markers with Qwen, but its prompt
+/// contract additionally injects current-date metadata, a reasoning-mode
+/// policy, system overrides, custom instructions, and tool grammars. Those
+/// unique markers are fixture-pinned so this template can be refused before
+/// the generic Qwen3 detector silently renders a foreign prompt.
+fn is_smollm3_dynamic_chat_template(template: &str) -> bool {
+    template.contains("<|im_start|>")
+        && template.contains("Knowledge Cutoff Date: June 2025")
+        && template.contains("strftime_now")
+        && template.contains("Reasoning Mode:")
+        && template.contains("/system_override")
 }
 
 fn is_qwen2_chatml_template(template: &str) -> bool {
@@ -20484,7 +20883,13 @@ fn tokenizer_summary(tokenizer: &Tokenizer) -> TokenizerSummary {
 }
 
 fn detect_chat_template_format(template: &str) -> &'static str {
-    if is_llama3_instruct_template(template) {
+    if is_smollm3_dynamic_chat_template(template) {
+        "smollm3_dynamic_chatml_unqualified"
+    } else if is_gemma2_it_chat_template(template) {
+        "gemma2_it_exact"
+    } else if is_gemma3_chat_template(template) {
+        "gemma3_turn_markers"
+    } else if is_llama3_instruct_template(template) {
         "llama3_instruct"
     } else if is_mistral_instruct_template(template) {
         "mistral_instruct"
@@ -23041,7 +23446,7 @@ mod tests {
             "qwen25_7b_instruct_q8_0",
             "gemma2_9b_it_q8_0",
             "deepseek_r1_distill_qwen_7b_q8_0",
-            "c4ai_command_r_v01_q8_0",
+            "aya_expanse_8b_q4_k_m",
             "deepseek_r1_distill_llama_8b_q8_0",
             "qwen25_coder_7b_q8_0",
             "llama31_8b_instruct_q8_0",
@@ -23139,7 +23544,6 @@ mod tests {
             "qwen25_7b_instruct_q8_0",
             "gemma2_9b_it_q8_0",
             "deepseek_r1_distill_qwen_7b_q8_0",
-            "c4ai_command_r_v01_q8_0",
             "deepseek_r1_distill_llama_8b_q8_0",
             "qwen25_coder_7b_q8_0",
             "llama31_8b_instruct_q8_0",
@@ -23169,6 +23573,25 @@ mod tests {
             assert!(target.frontend_readiness_gate.contains("fail-closed"));
             assert!(target.evidence.contains("planning only"));
         }
+
+        let command_r = response
+            .model_compatibility
+            .iter()
+            .find(|target| target.id == "aya_expanse_8b_q4_k_m")
+            .expect("the manageable Aya Command-R candidate must stay advertised");
+        assert_eq!(command_r.status, "planned_exact_row_candidate");
+        assert_eq!(command_r.support_scope, "future_exact_row_planning_only");
+        assert_eq!(
+            command_r.metadata_parses,
+            "immutable_remote_header_validated_attemptable"
+        );
+        assert_eq!(command_r.latest_checked_result, "planning_only");
+        assert!(command_r.frontend_readiness_gate.contains("fail-closed"));
+        assert!(command_r.evidence.contains("header-only HOLD"));
+        assert!(command_r
+            .evidence
+            .contains("9592bad943fe56cf93200286a0a4b00a158cd84a408f227b9978ec5879002fb8"));
+        assert!(!command_r.status.starts_with("supported"));
 
         let phi3 = response
             .model_compatibility
@@ -24564,6 +24987,224 @@ mod tests {
             err.to_string().contains("no tools branch"),
             "the refusal must state the reason: {err}"
         );
+    }
+
+    #[test]
+    fn gemma2_exact_template_fixture_locks_detector_renderer_and_rejections() {
+        #[derive(serde::Deserialize)]
+        struct Pack {
+            pack_id: String,
+            support_scope: String,
+            source_template: String,
+            encode_contract: EncodeContract,
+            shapes: Vec<Shape>,
+            rejections: Vec<RejectedShape>,
+            not_claimed: Vec<String>,
+        }
+        #[derive(serde::Deserialize)]
+        struct EncodeContract {
+            renderer_includes_bos_text: bool,
+            add_special: bool,
+            parse_special: bool,
+        }
+        #[derive(serde::Deserialize)]
+        struct Shape {
+            id: String,
+            messages: Vec<PackMessage>,
+            expected_prompt_without_bos: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct RejectedShape {
+            id: String,
+            messages: Vec<PackMessage>,
+            reason: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct PackMessage {
+            role: String,
+            content: String,
+        }
+
+        let raw =
+            include_str!("../../qa/model-qualification/fixtures/gemma2-it-chat-template-v1.json");
+        let pack: Pack = serde_json::from_str(raw).expect("parse Gemma 2 template fixture");
+        assert_eq!(pack.pack_id, "gemma2-it-chat-template-v1");
+        assert_eq!(
+            pack.support_scope,
+            "template_and_routing_only_no_real_row_support"
+        );
+        assert!(pack
+            .not_claimed
+            .iter()
+            .any(|claim| claim == "real-row support"));
+        assert_eq!(pack.source_template, GEMMA2_IT_CHAT_TEMPLATE);
+        assert!(is_gemma2_it_chat_template(&pack.source_template));
+
+        // Equality is load-bearing. A semantically similar template or even
+        // one appended byte is outside the pinned contract.
+        let mut substituted = pack.source_template.clone();
+        substituted.push(' ');
+        assert!(!is_gemma2_it_chat_template(&substituted));
+        assert!(!is_gemma2_it_chat_template(
+            "{{ '<start_of_turn>' + role }}{{ '<end_of_turn>' }}"
+        ));
+
+        for shape in &pack.shapes {
+            let messages = shape
+                .messages
+                .iter()
+                .map(|message| ChatMessage {
+                    image_urls: Vec::new(),
+                    unsupported_content_parts: Vec::new(),
+                    role: message.role.clone(),
+                    content: message.content.clone(),
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                render_gemma2_it_prompt(&messages).expect("fixture shape must render"),
+                shape.expected_prompt_without_bos,
+                "Gemma 2 fixture shape {} diverged",
+                shape.id
+            );
+
+            let mut tokenizer = test_tokenizer();
+            tokenizer.chat_template = Some(pack.source_template.clone());
+            let routed = render_chat_prompt_for_tokenization_for_model_result(
+                &messages, &tokenizer, None, false,
+            )
+            .expect("exact Gemma 2 template must take the dedicated route");
+            assert_eq!(routed.text, shape.expected_prompt_without_bos);
+            assert_eq!(routed.add_special, pack.encode_contract.add_special);
+            assert_eq!(routed.parse_special, pack.encode_contract.parse_special);
+            assert!(!pack.encode_contract.renderer_includes_bos_text);
+            assert!(!routed.text.starts_with("<bos>"));
+        }
+
+        for rejected in &pack.rejections {
+            let messages = rejected
+                .messages
+                .iter()
+                .map(|message| ChatMessage {
+                    image_urls: Vec::new(),
+                    unsupported_content_parts: Vec::new(),
+                    role: message.role.clone(),
+                    content: message.content.clone(),
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                render_gemma2_it_prompt(&messages).expect_err("shape must fail closed"),
+                rejected.reason,
+                "Gemma 2 rejection shape {} drifted",
+                rejected.id
+            );
+        }
+        assert_eq!(
+            render_gemma2_it_prompt(&[]).expect_err("empty chat must fail closed"),
+            GEMMA2_EMPTY_MESSAGES_ERROR
+        );
+    }
+
+    #[test]
+    fn gemma2_architecture_rejects_missing_or_substituted_templates() {
+        let mut tokenizer = test_tokenizer();
+        tokenizer.chat_template = Some(GEMMA2_IT_CHAT_TEMPLATE.to_string());
+        assert!(reject_gemma2_with_unrecognized_template(&tokenizer, "gemma2-row").is_none());
+        assert_eq!(
+            detect_chat_template_format(tokenizer.chat_template.as_deref().unwrap()),
+            "gemma2_it_exact"
+        );
+
+        for template in [
+            None,
+            Some("{{ '<start_of_turn>' + role }}{{ '<end_of_turn>' }}".to_string()),
+            Some(format!("{GEMMA2_IT_CHAT_TEMPLATE} ")),
+        ] {
+            tokenizer.chat_template = template;
+            let rejection = reject_gemma2_with_unrecognized_template(&tokenizer, "gemma2-row")
+                .expect("non-exact Gemma 2 template must fail closed");
+            assert_eq!(rejection.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            let details = rejection
+                .extensions()
+                .get::<ApiErrorDetails>()
+                .expect("typed error details");
+            assert_eq!(details.code, "unsupported_chat_template");
+        }
+    }
+
+    #[test]
+    fn smollm3_dynamic_chatml_is_an_executable_hold_not_generic_qwen3() {
+        #[derive(serde::Deserialize)]
+        struct Pack {
+            chat_template_blocker: Blocker,
+        }
+        #[derive(serde::Deserialize)]
+        struct Blocker {
+            source_template_utf8_bytes: usize,
+            source_template_sha256: String,
+            required_signature_markers: Vec<String>,
+            reason: String,
+        }
+
+        let raw =
+            include_str!("../../qa/model-qualification/fixtures/smollm3-tokenizer-pre-v1.json");
+        let pack: Pack = serde_json::from_str(raw).expect("parse SmolLM3 blocker fixture");
+        assert_eq!(pack.chat_template_blocker.source_template_utf8_bytes, 5_493);
+        assert_eq!(
+            pack.chat_template_blocker.source_template_sha256,
+            "b9b66f04c64fbb8695cf5b35c37780efd0b8e0829fbfe3e30fafb9f469b7d30e"
+        );
+        assert!(pack
+            .chat_template_blocker
+            .reason
+            .contains("not generic Qwen3 ChatML"));
+
+        // A compact stand-in carrying every independently captured signature
+        // marker takes the exact same routing decision as the 5.5 KiB source
+        // template, without committing the whole dynamic template as code.
+        let signature = pack
+            .chat_template_blocker
+            .required_signature_markers
+            .join(" :: ");
+        assert!(is_smollm3_dynamic_chat_template(&signature));
+        assert!(!is_qwen2_chatml_template(&signature));
+
+        let mut tokenizer = test_tokenizer();
+        tokenizer.chat_template = Some(signature);
+        assert_eq!(
+            detect_chat_template_format(tokenizer.chat_template.as_deref().unwrap()),
+            "smollm3_dynamic_chatml_unqualified"
+        );
+        let rejection = reject_smollm3_chat_until_template_qualified(
+            "smollm3",
+            &tokenizer,
+            "SmolLM3-Q8_0.gguf",
+        )
+        .expect("SmolLM3 chat must remain an executable HOLD");
+        assert_eq!(rejection.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            rejection
+                .extensions()
+                .get::<ApiErrorDetails>()
+                .expect("typed error details")
+                .code,
+            "unsupported_chat_template"
+        );
+        assert!(
+            reject_smollm3_chat_until_template_qualified("qwen3", &tokenizer, "qwen").is_none(),
+            "the HOLD is architecture-scoped"
+        );
+
+        let messages = vec![ChatMessage {
+            image_urls: Vec::new(),
+            unsupported_content_parts: Vec::new(),
+            role: "user".to_string(),
+            content: "hello".to_string(),
+        }];
+        let err = render_chat_prompt_for_tokenization_for_model_result(
+            &messages, &tokenizer, None, false,
+        )
+        .expect_err("template dispatch must fail before generic Qwen3 rendering");
+        assert!(err.to_string().contains("generic Qwen3 renderer"));
     }
 
     /// Phase 3c triage: routing admits gemma3 by ARCH while the dense renderer
@@ -27270,19 +27911,6 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             architecture: "qwen25",
             license: "apache-2.0",
             task_tags: &["reasoning", "coding"],
-        },
-        CatalogItem {
-            catalog_id: "c4ai_command_r_v01_q8_0",
-            name: "Cohere Command R v01 Q8_0",
-            repo_id: "second-state/C4AI-Command-R-v01-GGUF",
-            filename: "c4ai-command-r-v01-Q8_0.gguf",
-            size_bytes: 37179013760,
-            downloads: 0,
-            likes: 0,
-            quant: "Q8_0",
-            architecture: "command-r",
-            license: "cc-by-nc-4.0",
-            task_tags: &["general"],
         },
         CatalogItem {
             catalog_id: "deepseek_r1_distill_llama_8b_q8_0",

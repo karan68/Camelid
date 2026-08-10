@@ -37,7 +37,13 @@ function resolveLicense(info) {
     if (cardLicense.toLowerCase() === 'other'
       && typeof info.cardData?.license_name === 'string'
       && info.cardData.license_name) {
-      return info.cardData.license_name
+      const namedLicense = info.cardData.license_name.trim()
+      // LiquidAI's official card uses the compact Hub identifier `lfm1.0`,
+      // while the immutable LICENSE blob and Camelid roster use its published
+      // title. Keep one canonical value so a live re-resolution does not
+      // falsely report license drift for the same revision.
+      if (namedLicense.toLowerCase() === 'lfm1.0') return 'LFM Open License v1.0'
+      return namedLicense
     }
     return cardLicense.toLowerCase()
   }
@@ -133,6 +139,39 @@ async function rowSelector(root, rosterPath, rowId) {
     repo: row.source.repo,
     file: row.source.file,
     revision: row.source.revision,
+    expected: {
+      size_bytes: row.identity.size_bytes,
+      sha256: row.identity.sha256,
+      license: row.source.license,
+    },
+  }
+}
+
+function validateLockAgainstSelection(lock, selected) {
+  if (!selected.row_id) return
+  const mismatches = []
+  for (const field of ['repo', 'file', 'revision']) {
+    if (selected[field] !== lock[field]) {
+      mismatches.push(`${field} ${JSON.stringify(lock[field])} != roster ${JSON.stringify(selected[field])}`)
+    }
+  }
+  for (const field of ['size_bytes', 'sha256']) {
+    if (selected.expected?.[field] !== lock[field]) {
+      mismatches.push(`${field} ${JSON.stringify(lock[field])} != roster ${JSON.stringify(selected.expected?.[field])}`)
+    }
+  }
+  const expectedLicense = selected.expected?.license
+  if (expectedLicense && String(expectedLicense).trim().toLowerCase() !== String(lock.license || '').trim().toLowerCase()) {
+    mismatches.push(`license ${JSON.stringify(lock.license)} != roster ${JSON.stringify(expectedLicense)}`)
+  }
+  if (mismatches.length) {
+    throw new Error(`resolved source does not match roster row ${selected.row_id}: ${mismatches.join('; ')}`)
+  }
+}
+
+function validateRequestedRevision(selected, requestedRevision) {
+  if (selected.row_id && requestedRevision && requestedRevision !== selected.revision) {
+    throw new Error(`--revision cannot override pinned roster revision ${selected.revision}`)
   }
 }
 
@@ -145,7 +184,7 @@ async function main() {
 
 Options:
   --roster <path>       Roster path (default: Phase 1)
-  --revision <sha>      Expected immutable revision; unpinned selectors resolve current HEAD
+  --revision <sha>      Expected immutable revision; unpinned --repo selectors resolve current HEAD
   --artifact <path>     Hash an existing local artifact against the source lock
   --out <path>          Write the scrubbed source lock/result JSON
   HF_TOKEN              Optional token for gated/private model metadata
@@ -157,8 +196,9 @@ Options:
   const selected = args.get('row')
     ? await rowSelector(root, args.get('roster') || 'qa/model-qualification/phase1-roster.json', args.get('row'))
     : { row_id: null, repo: args.get('repo'), file: args.get('file'), revision: args.get('revision') || null }
-  if (args.get('revision')) selected.revision = args.get('revision')
+  validateRequestedRevision(selected, args.get('revision'))
   const lock = await resolveHfSource({ ...selected, token: process.env.HF_TOKEN || null })
+  validateLockAgainstSelection(lock, selected)
   const result = {
     ...lock,
     row_id: selected.row_id,
@@ -178,6 +218,8 @@ export {
   modelInfoUrl,
   resolveHfSource,
   sourceLockFromModelInfo,
+  validateLockAgainstSelection,
+  validateRequestedRevision,
   verifyArtifact,
 }
 

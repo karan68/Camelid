@@ -848,6 +848,156 @@ pub struct RunnableModel {
     metal_lfm2: std::sync::Mutex<Option<crate::metal::Lfm2MetalDecode>>,
 }
 
+/// Keep the first Command R bring-up deliberately narrower than architecture
+/// admission. The immutable Aya Expanse 8B Q4_K_M row is small enough to qualify
+/// on a normal workstation and has a graph fully described by the pinned
+/// llama.cpp source. Neighboring Command R variants differ structurally (notably
+/// the >=64-layer Q/K-norm layout), so they fail closed until separately proven.
+/// Validate the complete immutable header contract for the only Command-R row
+/// Camelid currently attempts. This is header-only: it deliberately does not
+/// read tensor payload bytes, but it does require every canonical tensor name,
+/// type, and dimension so a lookalike header cannot reach release-mode matvecs
+/// with incompatible widths.
+pub(crate) fn validate_command_r_attemptability_slice(
+    gguf: &GgufFile,
+    cfg: &LlamaModelConfig,
+) -> Result<()> {
+    let exact_metadata = gguf.model_name() == Some("Aya Expanse 8b")
+        && gguf.metadata_string("general.license") == Some("cc-by-nc-4.0")
+        && gguf.metadata_u32("general.file_type") == Some(15)
+        && gguf.metadata_string("tokenizer.ggml.model") == Some("gpt2")
+        && gguf.metadata_string("tokenizer.ggml.pre") == Some("command-r")
+        && cfg.context_length == 8_192
+        && cfg.embedding_length == 4_096
+        && cfg.block_count == 32
+        && cfg.feed_forward_length == 14_336
+        && cfg.attention_head_count == 32
+        && cfg.attention_head_count_kv == 8
+        && cfg.vocab_size == Some(256_000)
+        && cfg.rope_freq_base == Some(10_000.0)
+        && cfg.rope_scaling_type.as_deref() == Some("none")
+        && cfg.rms_norm_epsilon == 1e-5
+        && cfg.logit_scale == Some(0.125);
+    if !exact_metadata {
+        return Err(BackendError::UnsupportedGguf(format!(
+            "command-r runnable attemptability is currently pinned to Aya Expanse 8B \
+             Q4_K_M (name='Aya Expanse 8b', file_type=15, 32x4096, FFN 14336, \
+             GQA 32/8, vocab 256000, context 8192, command-r GPT-2 tokenizer); \
+             observed name={:?}, file_type={:?}, layers={}, embedding={}, ffn={}, \
+             heads={}/{}, vocab={:?}, context={}",
+            gguf.model_name(),
+            gguf.metadata_u32("general.file_type"),
+            cfg.block_count,
+            cfg.embedding_length,
+            cfg.feed_forward_length,
+            cfg.attention_head_count,
+            cfg.attention_head_count_kv,
+            cfg.vocab_size,
+            cfg.context_length
+        )));
+    }
+
+    let mut names = std::collections::HashSet::with_capacity(gguf.tensors.len());
+    for tensor in &gguf.tensors {
+        let Some((expected_type, expected_dimensions)) =
+            command_r_aya_expected_tensor(&tensor.name)
+        else {
+            return Err(BackendError::UnsupportedGguf(format!(
+                "command-r Aya Q4_K_M header contains unexpected tensor {}; the exact \
+                 258-descriptor contract has only token_embd/output_norm and eight tensors \
+                 per layer (shared attn_norm, Q/K/V/output, and SwiGLU gate/up/down)",
+                tensor.name
+            )));
+        };
+        if tensor.tensor_type != expected_type || tensor.dimensions != expected_dimensions {
+            return Err(BackendError::UnsupportedGguf(format!(
+                "command-r Aya Q4_K_M descriptor mismatch for {}: expected {:?} {:?}, \
+                 observed {:?} {:?}",
+                tensor.name,
+                expected_type,
+                expected_dimensions,
+                tensor.tensor_type,
+                tensor.dimensions
+            )));
+        }
+        if !names.insert(tensor.name.as_str()) {
+            return Err(BackendError::UnsupportedGguf(format!(
+                "command-r Aya Q4_K_M header contains duplicate tensor {}; refusing a \
+                 descriptor set whose first-match binding would be ambiguous",
+                tensor.name
+            )));
+        }
+    }
+    // The accepted name universe is exactly 2 globals + 32 * 8 layer tensors.
+    // Requiring 258 unique recognized names therefore also proves none are absent.
+    if names.len() != 258 {
+        return Err(BackendError::UnsupportedGguf(format!(
+            "command-r Aya Q4_K_M canonical descriptor count mismatch: expected 258 \
+             unique tensors, observed {}",
+            names.len()
+        )));
+    }
+
+    Ok(())
+}
+
+fn command_r_aya_expected_tensor(name: &str) -> Option<(GgufTensorType, Vec<u64>)> {
+    match name {
+        "token_embd.weight" => return Some((GgufTensorType::Q6K, vec![4_096, 256_000])),
+        "output_norm.weight" => return Some((GgufTensorType::F32, vec![4_096])),
+        _ => {}
+    }
+
+    let layer_and_tensor = name.strip_prefix("blk.")?;
+    let (layer, tensor) = layer_and_tensor.split_once('.')?;
+    let layer = layer.parse::<usize>().ok()?;
+    if layer >= 32 {
+        return None;
+    }
+
+    const Q6_DOWN_LAYERS: &[usize] = &[0, 1, 2, 3, 8, 10, 13, 16, 18, 21, 24, 27, 28, 29, 30, 31];
+    const Q6_VALUE_LAYERS: &[usize] = &[0, 1, 2, 3, 6, 7, 12, 15, 18, 21, 24, 27, 28, 29, 30, 31];
+
+    Some(match tensor {
+        "attn_norm.weight" => (GgufTensorType::F32, vec![4_096]),
+        "attn_q.weight" | "attn_output.weight" => (GgufTensorType::Q4K, vec![4_096, 4_096]),
+        "attn_k.weight" => (GgufTensorType::Q4K, vec![4_096, 1_024]),
+        "attn_v.weight" => (
+            if Q6_VALUE_LAYERS.contains(&layer) {
+                GgufTensorType::Q6K
+            } else {
+                GgufTensorType::Q4K
+            },
+            vec![4_096, 1_024],
+        ),
+        "ffn_gate.weight" | "ffn_up.weight" => (GgufTensorType::Q4K, vec![4_096, 14_336]),
+        "ffn_down.weight" => (
+            if Q6_DOWN_LAYERS.contains(&layer) {
+                GgufTensorType::Q6K
+            } else {
+                GgufTensorType::Q4K
+            },
+            vec![14_336, 4_096],
+        ),
+        _ => return None,
+    })
+}
+
+/// Reference addition order from llama.cpp `models/command-r.cpp`:
+/// `(ffn_out + residual) + attn_out`. The explicit order matters at f32
+/// cancellation frontiers and is therefore kept in one unit-tested helper.
+fn command_r_parallel_residual(
+    output: &mut [f32],
+    residual: &[f32],
+    ffn_out: &[f32],
+    attn_out: &[f32],
+) {
+    for (((dst, ffn), residual), attn) in output.iter_mut().zip(ffn_out).zip(residual).zip(attn_out)
+    {
+        *dst = (*ffn + *residual) + *attn;
+    }
+}
+
 impl RunnableModel {
     /// Admit, parse config, and read every weight into resident quantized form.
     pub fn load(path: &str) -> Result<Self> {
@@ -874,6 +1024,10 @@ impl RunnableModel {
             .unwrap_or(head_dim);
         let rope_base = cfg.rope_freq_base.unwrap_or(10_000.0);
         let n_layers = cfg.block_count as usize;
+
+        if arch == "command-r" {
+            validate_command_r_attemptability_slice(&gguf, &cfg)?;
+        }
 
         if let Some(kind) = cfg.rope_scaling_type.as_deref() {
             if !kind.is_empty() && kind != "none" {
@@ -1293,6 +1447,7 @@ impl RunnableModel {
         let q_dim = n_heads * head_dim;
         let kv_dim = n_kv_heads * head_dim;
         let ffn = cfg.feed_forward_length as usize;
+        let is_command_r = arch == "command-r";
 
         let mut layers = Vec::with_capacity(n_layers);
         for l in 0..n_layers {
@@ -1324,9 +1479,17 @@ impl RunnableModel {
                 (gu.split_rows(0, ffn), gu.split_rows(ffn, ffn))
             };
 
+            let attn_norm = load_vec(&mut f, &p("attn_norm"))?;
+            // Command R's parallel residual feeds both branches from this one
+            // LayerNorm and has no separate `ffn_norm` tensor.
+            let ffn_norm = if is_command_r {
+                attn_norm.clone()
+            } else {
+                load_vec(&mut f, &p("ffn_norm"))?
+            };
             let layer = Layer {
-                attn_norm: load_vec(&mut f, &p("attn_norm"))?,
-                ffn_norm: load_vec(&mut f, &p("ffn_norm"))?,
+                attn_norm,
+                ffn_norm,
                 wq,
                 wk,
                 wv,
@@ -1353,10 +1516,10 @@ impl RunnableModel {
         }
 
         let is_gemma = arch.starts_with("gemma");
-        let is_command_r = arch == "command-r";
-        // RoPE pairing: NEOX (split-half) for qwen3/gemma/phi3/command-r (unpermuted weights);
-        // LLAMA (interleaved) for standard variants.
-        let rope_neox = cfg.rope_neox_pairing || is_gemma || arch == "phi3" || is_command_r;
+        // RoPE pairing: NEOX (split-half) for qwen3/gemma/phi3; adjacent/interleaved
+        // for standard LLaMA conversions AND Command R. The latter is explicit in
+        // pinned llama.cpp's `LLM_ARCH_COMMAND_R` rope-type classification.
+        let rope_neox = cfg.rope_neox_pairing || is_gemma || arch == "phi3";
         // gemma3 dual RoPE: the per-layer global/local schedule and both RoPE bases
         // come from the SAME parsed `Gemma3Metadata` the resident lane consumes
         // (`LlamaModelConfig::from_gguf` -> `cfg.gemma3`) — single source of truth,
@@ -1467,6 +1630,19 @@ impl RunnableModel {
             }
             return Ok(logits);
         }
+        // Command R uses a parallel attention/FFN residual, while the generic
+        // batched helpers below implement sequential pre-norm blocks. Run the
+        // same corrected KV-cached step that generation uses so smoke/diagnostic
+        // logits cannot accidentally exercise the wrong graph.
+        if self.architecture == "command-r" {
+            let mut cache = self.new_cache();
+            let mut logits = Vec::new();
+            let last = tokens.len().saturating_sub(1);
+            for (pos, &tok) in tokens.iter().enumerate() {
+                logits = self.forward_step_maybe_logits(tok, pos, &mut cache, pos == last)?;
+            }
+            return Ok(logits);
+        }
         let hidden = self.forward_hidden_states(tokens)?;
         let normed = &hidden[hidden.len() - self.d_model..];
         self.project_output_logits(normed)
@@ -1561,7 +1737,7 @@ impl RunnableModel {
                 "empty token sequence".into(),
             ));
         }
-        if self.qwen35.is_some() || self.lfm2.is_some() {
+        if self.qwen35.is_some() || self.lfm2.is_some() || self.architecture == "command-r" {
             return Err(BackendError::UnsupportedGguf(format!(
                 "{} does not expose full-sequence hidden states",
                 self.architecture
@@ -2029,6 +2205,8 @@ impl RunnableModel {
 
         for (li, layer) in self.layers.iter().enumerate() {
             // --- attention (single query position over cached K/V) ---
+            let is_command_r = self.architecture == "command-r";
+            let command_r_residual = is_command_r.then(|| hidden.clone());
             let xn = self.apply_norm(&hidden, &layer.attn_norm);
             let q_input = self.apply_optional_norm(&xn, layer.q_norm_in.as_ref());
             let k_input = self.apply_optional_norm(&xn, layer.k_norm_in.as_ref());
@@ -2092,12 +2270,21 @@ impl RunnableModel {
             if let Some(pn) = &layer.post_attn_norm {
                 proj = self.apply_norm(&proj, pn);
             }
-            for (h, p) in hidden.iter_mut().zip(proj.iter()) {
-                *h += *p;
+            if !is_command_r {
+                for (h, p) in hidden.iter_mut().zip(proj.iter()) {
+                    *h += *p;
+                }
             }
 
             // --- FFN ---
-            let xn2 = self.apply_norm(&hidden, &layer.ffn_norm);
+            // Command R's FFN is parallel with attention: both consume the SAME
+            // LayerNorm result. Every other generic architecture keeps the
+            // established sequential second-norm path.
+            let xn2 = if is_command_r {
+                xn
+            } else {
+                self.apply_norm(&hidden, &layer.ffn_norm)
+            };
             let gate_input = self.apply_optional_norm(&xn2, layer.gate_norm_in.as_ref());
             let up_input = self.apply_optional_norm(&xn2, layer.up_norm_in.as_ref());
             let g = layer
@@ -2129,8 +2316,12 @@ impl RunnableModel {
             if let Some(pn) = &layer.post_ffn_norm {
                 d = self.apply_norm(&d, pn);
             }
-            for (h, dv) in hidden.iter_mut().zip(d.iter()) {
-                *h += *dv;
+            if let Some(residual) = command_r_residual.as_deref() {
+                command_r_parallel_residual(&mut hidden, residual, &d, &proj);
+            } else {
+                for (h, dv) in hidden.iter_mut().zip(d.iter()) {
+                    *h += *dv;
+                }
             }
             // gemma3→CUDA campaign localization instrument (see `forward_logits`).
             // This is the KV-cached step the runnable SERVE lane actually runs, so
@@ -6524,5 +6715,227 @@ mod gemma3_schedule_tests {
             "gemma3 runnable forward fingerprint: len={} sum_bits={sum_bits:#018x} head={head:?}",
             logits.len()
         );
+    }
+}
+
+#[cfg(test)]
+mod command_r_attemptability_tests {
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    use super::{command_r_parallel_residual, validate_command_r_attemptability_slice};
+    use crate::gguf::{GgufFile, GgufMetadataValue, GgufTensorDescriptor, GgufTensorType};
+    use crate::model::LlamaModelConfig;
+
+    fn descriptor(
+        name: impl Into<String>,
+        tensor_type: GgufTensorType,
+        dimensions: Vec<u64>,
+    ) -> GgufTensorDescriptor {
+        GgufTensorDescriptor {
+            name: name.into(),
+            dimensions,
+            tensor_type,
+            relative_offset: 0,
+            absolute_offset: 0,
+            n_bytes: 0,
+        }
+    }
+
+    fn exact_aya_header_shape() -> (GgufFile, LlamaModelConfig) {
+        let mut metadata = BTreeMap::new();
+        let mut put = |key: &str, value| {
+            metadata.insert(key.to_string(), value);
+        };
+        put(
+            "general.architecture",
+            GgufMetadataValue::String("command-r".into()),
+        );
+        put(
+            "general.name",
+            GgufMetadataValue::String("Aya Expanse 8b".into()),
+        );
+        put(
+            "general.license",
+            GgufMetadataValue::String("cc-by-nc-4.0".into()),
+        );
+        put("general.file_type", GgufMetadataValue::U32(15));
+        put(
+            "tokenizer.ggml.model",
+            GgufMetadataValue::String("gpt2".into()),
+        );
+        put(
+            "tokenizer.ggml.pre",
+            GgufMetadataValue::String("command-r".into()),
+        );
+        put("command-r.context_length", GgufMetadataValue::U32(8_192));
+        put("command-r.embedding_length", GgufMetadataValue::U32(4_096));
+        put("command-r.block_count", GgufMetadataValue::U32(32));
+        put(
+            "command-r.feed_forward_length",
+            GgufMetadataValue::U32(14_336),
+        );
+        put("command-r.attention.head_count", GgufMetadataValue::U32(32));
+        put(
+            "command-r.attention.head_count_kv",
+            GgufMetadataValue::U32(8),
+        );
+        put(
+            "command-r.attention.layer_norm_epsilon",
+            GgufMetadataValue::F32(1e-5),
+        );
+        put("command-r.rope.freq_base", GgufMetadataValue::F32(10_000.0));
+        put(
+            "command-r.rope.scaling.type",
+            GgufMetadataValue::String("none".into()),
+        );
+        put("command-r.logit_scale", GgufMetadataValue::F32(0.125));
+
+        const Q6_DOWN_LAYERS: &[usize] =
+            &[0, 1, 2, 3, 8, 10, 13, 16, 18, 21, 24, 27, 28, 29, 30, 31];
+        const Q6_VALUE_LAYERS: &[usize] =
+            &[0, 1, 2, 3, 6, 7, 12, 15, 18, 21, 24, 27, 28, 29, 30, 31];
+        let mut tensors = vec![
+            descriptor(
+                "token_embd.weight",
+                GgufTensorType::Q6K,
+                vec![4_096, 256_000],
+            ),
+            descriptor("output_norm.weight", GgufTensorType::F32, vec![4_096]),
+        ];
+        for layer in 0..32 {
+            tensors.extend([
+                descriptor(
+                    format!("blk.{layer}.attn_norm.weight"),
+                    GgufTensorType::F32,
+                    vec![4_096],
+                ),
+                descriptor(
+                    format!("blk.{layer}.attn_q.weight"),
+                    GgufTensorType::Q4K,
+                    vec![4_096, 4_096],
+                ),
+                descriptor(
+                    format!("blk.{layer}.attn_k.weight"),
+                    GgufTensorType::Q4K,
+                    vec![4_096, 1_024],
+                ),
+                descriptor(
+                    format!("blk.{layer}.attn_v.weight"),
+                    if Q6_VALUE_LAYERS.contains(&layer) {
+                        GgufTensorType::Q6K
+                    } else {
+                        GgufTensorType::Q4K
+                    },
+                    vec![4_096, 1_024],
+                ),
+                descriptor(
+                    format!("blk.{layer}.attn_output.weight"),
+                    GgufTensorType::Q4K,
+                    vec![4_096, 4_096],
+                ),
+                descriptor(
+                    format!("blk.{layer}.ffn_gate.weight"),
+                    GgufTensorType::Q4K,
+                    vec![4_096, 14_336],
+                ),
+                descriptor(
+                    format!("blk.{layer}.ffn_up.weight"),
+                    GgufTensorType::Q4K,
+                    vec![4_096, 14_336],
+                ),
+                descriptor(
+                    format!("blk.{layer}.ffn_down.weight"),
+                    if Q6_DOWN_LAYERS.contains(&layer) {
+                        GgufTensorType::Q6K
+                    } else {
+                        GgufTensorType::Q4K
+                    },
+                    vec![14_336, 4_096],
+                ),
+            ]);
+        }
+        assert_eq!(
+            tensors
+                .iter()
+                .filter(|tensor| tensor.tensor_type == GgufTensorType::F32)
+                .count(),
+            33
+        );
+        assert_eq!(
+            tensors
+                .iter()
+                .filter(|tensor| tensor.tensor_type == GgufTensorType::Q4K)
+                .count(),
+            192
+        );
+        assert_eq!(
+            tensors
+                .iter()
+                .filter(|tensor| tensor.tensor_type == GgufTensorType::Q6K)
+                .count(),
+            33
+        );
+        let gguf = GgufFile {
+            path: PathBuf::new(),
+            version: 3,
+            tensor_count: tensors.len() as i64,
+            metadata_count: metadata.len() as i64,
+            alignment: 32,
+            data_start_offset: 0,
+            metadata,
+            tensors,
+        };
+        let config = LlamaModelConfig::from_gguf(&gguf).expect("exact Aya config");
+        (gguf, config)
+    }
+
+    #[test]
+    fn exact_aya_q4_k_m_header_shape_is_the_only_command_r_load_slice() {
+        let (mut gguf, config) = exact_aya_header_shape();
+        validate_command_r_attemptability_slice(&gguf, &config)
+            .expect("pinned Aya header shape must be attemptable");
+
+        gguf.tensors[2].name = "blk.0.attn_q_norm.weight".into();
+        let err = validate_command_r_attemptability_slice(&gguf, &config)
+            .expect_err("a QK-normalized neighboring Command R graph must fail closed");
+        assert!(err.to_string().contains("unexpected tensor"));
+    }
+
+    #[test]
+    fn aya_attemptability_rejects_wrong_canonical_dimensions_and_types() {
+        let (mut wrong_dimensions, config) = exact_aya_header_shape();
+        let q = wrong_dimensions
+            .tensors
+            .iter_mut()
+            .find(|tensor| tensor.name == "blk.0.attn_q.weight")
+            .expect("q descriptor");
+        q.dimensions = vec![2_048, 4_096];
+        let err = validate_command_r_attemptability_slice(&wrong_dimensions, &config)
+            .expect_err("a truncated projection width must fail at header admission");
+        assert!(err.to_string().contains("descriptor mismatch"));
+
+        let (mut wrong_type, config) = exact_aya_header_shape();
+        let v = wrong_type
+            .tensors
+            .iter_mut()
+            .find(|tensor| tensor.name == "blk.0.attn_v.weight")
+            .expect("value descriptor");
+        v.tensor_type = GgufTensorType::Q4K;
+        let err = validate_command_r_attemptability_slice(&wrong_type, &config)
+            .expect_err("the immutable row's per-tensor quant assignment must be exact");
+        assert!(err.to_string().contains("descriptor mismatch"));
+    }
+
+    #[test]
+    fn command_r_parallel_residual_preserves_reference_addition_order() {
+        let mut output = [0.0f32];
+        command_r_parallel_residual(&mut output, &[1e20], &[-1e20], &[3.0]);
+        assert_eq!(output, [3.0]);
+
+        let residual = 1e20f32;
+        let attention = 3.0f32;
+        let ffn = -1e20f32;
+        assert_eq!((residual + attention) + ffn, 0.0);
     }
 }

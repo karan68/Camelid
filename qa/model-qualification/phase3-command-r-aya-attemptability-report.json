@@ -1,0 +1,125 @@
+{
+  "schema": "camelid.model-qualification-report/v1",
+  "generated_at": "2026-08-10T07:12:24.3186996Z",
+  "phase": 3,
+  "row_id": "aya_expanse_8b_q4_k_m",
+  "source_head": "e5e8359525071c09eecc6d5e4664d45113cfb73e",
+  "source_dirty": true,
+  "source_inspection": "observed",
+  "host": {
+    "platform": "windows-x64-header-only",
+    "hostname_redacted": true
+  },
+  "backend": {
+    "serve": "not_run",
+    "env": {
+      "CAMELID_GPU": "off"
+    }
+  },
+  "artifact": {
+    "repo": "bartowski/aya-expanse-8b-GGUF",
+    "revision": "f9d62ed0c58e6f2ae17975df990b1b8a4013b596",
+    "file": "aya-expanse-8b-Q4_K_M.gguf",
+    "size_bytes": 5056982720,
+    "sha256": "9592bad943fe56cf93200286a0a4b00a158cd84a408f227b9978ec5879002fb8",
+    "license": "cc-by-nc-4.0",
+    "local_path_redacted": true,
+    "present_for_this_run": false
+  },
+  "source_evidence": {
+    "artifact_repository_visibility": "public",
+    "artifact_repository_gated": false,
+    "revision_url": "https://huggingface.co/bartowski/aya-expanse-8b-GGUF/tree/f9d62ed0c58e6f2ae17975df990b1b8a4013b596",
+    "file_url": "https://huggingface.co/bartowski/aya-expanse-8b-GGUF/blob/f9d62ed0c58e6f2ae17975df990b1b8a4013b596/aya-expanse-8b-Q4_K_M.gguf",
+    "upstream_base": "CohereForAI/aya-expanse-8b@5062468bf9bc0c6035fd64e06274333ec127d980",
+    "upstream_revision_url": "https://huggingface.co/CohereForAI/aya-expanse-8b/tree/5062468bf9bc0c6035fd64e06274333ec127d980",
+    "upstream_publisher": "Cohere For AI",
+    "upstream_model_type": "cohere",
+    "upstream_repository_gating": "auto",
+    "reference_graph": "ggml-org/llama.cpp@acd79d603cb2e1c84c0886137b80f1ad649b6857",
+    "verification_method": "Hugging Face APIs at immutable revisions supplied the artifact LFS byte count/SHA-256 and both license declarations; pinned llama.cpp source supplied the graph contract."
+  },
+  "implementation_scope": {
+    "posture": "exact_header_shape_attemptability_only",
+    "accepted_architecture": "command-r",
+    "runtime_pin": "Aya Expanse 8B Q4_K_M metadata plus the canonical 258-tensor name/type/dimension inventory (SHA-256 4f265e72a52670e43532c526229210cdf60e4778cf61dd5559a7a976fa00e329), shared LayerNorm parallel residual, adjacent RoPE, tied output, and no Q/K norms",
+    "fail_closed_neighbors": [
+      "cohere2 and Command R7B",
+      "Command R rows with 64 or more layers and per-head-distinct Q/K norms",
+      "any tensor name, type, dimension, duplicate, or Q4_K_M per-layer assignment mismatch",
+      "unrecognized Command R chat templates",
+      "all oracle smoke promotion until real parity exists"
+    ]
+  },
+  "stages": {
+    "source": {
+      "status": "pass",
+      "evidence": [
+        "public immutable GGUF repository revision",
+        "exact filename, LFS byte count, and LFS SHA-256",
+        "artifact and official upstream license metadata at immutable revisions",
+        "pinned llama.cpp Command R graph and RoPE classification source"
+      ]
+    },
+    "artifact": {
+      "status": "blocked",
+      "reason": "Only the first 16 MiB metadata/header range was fetched. `camelid inspect-prefix` checked every descriptor bound against the declared 5,056,982,720-byte source length while redacting the temporary prefix path; the full artifact was neither downloaded nor locally SHA-256 verified."
+    },
+    "metadata": {
+      "status": "pass",
+      "evidence": [
+        "qa/model-qualification/fixtures/aya-expanse-8b-q4-k-m-command-r-v1.json",
+        "camelid inspect-prefix over the immutable 16 MiB remote header range with --declared-len 5056982720",
+        "Rust config, admission, binding, canonical 258-descriptor exact-load-pin, RoPE, and parallel-residual tests"
+      ],
+      "note": "The complete GGUF metadata and all 258 tensor descriptors end before byte 16 MiB. The fixture records a reproducible sorted descriptor-inventory SHA-256 plus the exact Q6_K attn_v/ffn_down layer sets; Camelid validates every canonical name, type, and dimension before reading weights. inspect-prefix emitted a redacted path and validated tensor bounds against the declared full artifact length; no weight payload was treated as present."
+    },
+    "tokenizer": {
+      "status": "blocked",
+      "reason": "Camelid now maps tokenizer.ggml.pre=command-r to the pinned two-pass legacy GPT-2 splitter, but there is no exact-row prompt-token comparison against the pinned reference yet. Executable construction alone is not tokenizer parity."
+    },
+    "template": {
+      "status": "blocked",
+      "reason": "The embedded Aya START_OF_TURN/SYSTEM/USER/CHATBOT template has no rendered-byte and prompt-token shape fixture. Runnable chat is kept fail-closed instead of borrowing the incompatible Ornith renderer."
+    },
+    "load_smoke": {
+      "status": "blocked",
+      "reason": "The exact full artifact is not local. Header-shape admission and tensor binding do not prove that 5.06 GB of weight payload loads or generates."
+    },
+    "parity": {
+      "status": "blocked",
+      "reason": "No real-weight greedy-token or logit comparison exists against llama.cpp acd79d603. Command R remains absent from the oracle-qualified smoke set."
+    },
+    "api_webui": {
+      "status": "blocked",
+      "reason": "No exact-row non-streaming, SSE, Models-page load-to-chat, or WebUI evidence exists; chat remains typed-fail-closed until the Aya template and runtime parity gates pass."
+    },
+    "context": {
+      "status": "blocked",
+      "reason": "The declared 8192-token context is metadata only. No guarded 512-token reference-parity run exists without the full exact artifact."
+    }
+  },
+  "hold": {
+    "code": "EXACT_ARTIFACT_AND_PARITY_NOT_LOCAL",
+    "blocking_artifact": {
+      "file": "aya-expanse-8b-Q4_K_M.gguf",
+      "size_bytes": 5056982720,
+      "sha256": "9592bad943fe56cf93200286a0a4b00a158cd84a408f227b9978ec5879002fb8"
+    },
+    "resume_requirements": [
+      "Download or otherwise provide the exact pinned file and verify full byte count plus SHA-256 before loading.",
+      "Compare raw prompt token IDs and greedy generated IDs with llama.cpp acd79d603 using identical token inputs.",
+      "Lock ordinary single-turn and multi-turn Aya chat-template rendered bytes and prompt token IDs.",
+      "Run bounded load/coherence only after parity is anchored, then exercise non-streaming and SSE chat plus Models-page load-to-chat.",
+      "Run the guarded 512-token context harness against the same pinned reference and artifact."
+    ]
+  },
+  "overall_status": "blocked",
+  "support_decision": "hold_attemptability_only_not_supported",
+  "does_not_prove": [
+    "full artifact integrity on this host",
+    "successful load, coherent generation, tokenizer parity, template fidelity, or reference parity",
+    "API, SSE, Models-page, WebUI, or bounded-context readiness",
+    "sampling, tools, GPU execution, performance, neighboring quantizations, cohere2, or broad Command R/Cohere support"
+  ]
+}

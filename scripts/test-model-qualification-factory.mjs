@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url'
 import {
   artifactForRow,
   firstUnresolvedStage,
+  publicRosterLabel,
   selectRows,
   summarizeReports,
 } from './model-qualification-factory.mjs'
@@ -25,8 +26,25 @@ assert.equal(
   artifactForRow(qwen, resolve(root, 'models')),
   resolve(root, 'models', qwen.identity.gguf_filename),
 )
-assert.equal(artifactForRow(qwenMoe, resolve(root, 'models')), null, 'unanchored rows must not invent an artifact filename')
+assert.equal(
+  artifactForRow(qwenMoe, resolve(root, 'models')),
+  resolve(root, 'models', qwenMoe.identity.gguf_filename),
+  'newly anchored Qwen3 MoE must resolve its official exact filename',
+)
+const unanchored = structuredClone(qwenMoe)
+unanchored.identity.gguf_filename = null
+unanchored.source.file = null
+assert.equal(artifactForRow(unanchored, resolve(root, 'models')), null, 'unanchored rows must not invent an artifact filename')
 assert.equal(artifactForRow(qwenMoe, null, resolve(root, 'manual.gguf')), resolve(root, 'manual.gguf'))
+assert.equal(
+  publicRosterLabel(root, resolve(root, 'qa/model-qualification/phase1-roster.json')),
+  'qa/model-qualification/phase1-roster.json',
+)
+assert.equal(
+  publicRosterLabel(root, resolve(root, '..', 'private', 'secret-roster.json')),
+  '<external-roster>',
+  'a scrubbed factory index must not copy an external absolute roster path',
+)
 
 const blockedReport = {
   overall_status: 'blocked',

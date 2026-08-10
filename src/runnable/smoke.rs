@@ -376,6 +376,14 @@ mod tests {
         assert!(super::oracle_qualified("nomic-bert", "Q8_0"));
         // Not anchored: a covered architecture we have not HF-anchored.
         assert!(!is_oracle_qualified("gemma2", TokenizerFamily::Spm, "Q8_0"));
+        // Attemptable after the Phase-3 config/admission slice, but deliberately
+        // not supported: no exact-row llama.cpp parity receipt exists yet.
+        assert!(!is_oracle_qualified(
+            "command-r",
+            TokenizerFamily::Bpe,
+            "Q4K"
+        ));
+        assert!(!super::oracle_qualified("command-r", "Q4K"));
         // Not anchored: anchored arch but a quant we did not anchor.
         assert!(!is_oracle_qualified("llama", TokenizerFamily::Spm, "Q4K"));
         // Not anchored: anchored arch but unexpected tokenizer family.
@@ -404,6 +412,17 @@ mod tests {
         assert!(
             !msg.contains("unsupported quant"),
             "refusal must not read as a quant-coverage reject: {msg}"
+        );
+    }
+
+    #[test]
+    fn command_r_q4_k_smoke_refusal_is_not_yet_anchored() {
+        let err = oracle_qualification_gate("command-r", TokenizerFamily::Bpe, "Q4K")
+            .expect_err("command-r must remain smoke-refused until exact-row parity");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("combo not yet anchored: command-r/Q4K/Bpe"),
+            "refusal must be the oracle gate, got: {msg}"
         );
     }
 

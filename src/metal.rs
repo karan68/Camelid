@@ -22,6 +22,35 @@ pub struct MetalDeviceInfo {
     pub note: Option<String>,
 }
 
+/// Whether the resident attention-as-matmul prefill may consume this head width.
+///
+/// The PV kernel writes 64-row tiles. Its ragged-store path is memory-safe after
+/// the row-tail fix, but only complete 64-row tiles carry prefill/decode parity
+/// evidence. In particular, Phi-3's 96-wide heads still produce a repeatable
+/// fresh-prefill versus incremental-decode split after the out-of-bounds/race fix.
+/// Keep that shape on the existing f32 attention fallback until a real-row receipt
+/// proves the partial tile, rather than treating memory safety as numerical parity.
+#[cfg(any(target_os = "macos", test))]
+fn attention_matmul_prefill_head_dim_supported(head_dim: usize) -> bool {
+    head_dim <= 128 && head_dim.is_multiple_of(64)
+}
+
+#[cfg(test)]
+mod attention_matmul_prefill_shape_tests {
+    use super::attention_matmul_prefill_head_dim_supported;
+
+    #[test]
+    fn partial_64_row_pv_tiles_fail_closed() {
+        assert!(attention_matmul_prefill_head_dim_supported(64));
+        assert!(attention_matmul_prefill_head_dim_supported(128));
+
+        // Phi-3: two PV row tiles, with only 32 live rows in the second tile.
+        assert!(!attention_matmul_prefill_head_dim_supported(96));
+        assert!(!attention_matmul_prefill_head_dim_supported(32));
+        assert!(!attention_matmul_prefill_head_dim_supported(192));
+    }
+}
+
 #[cfg(target_os = "macos")]
 struct MetalLinearKernel {
     device: Device,
@@ -22403,8 +22432,7 @@ impl ResidentDecodeState {
             && kv_dim.is_multiple_of(128)
             && self.hidden.is_multiple_of(128)
             && self.ffn_dim.is_multiple_of(128)
-            && self.head_dim.is_multiple_of(8)
-            && self.head_dim <= 128
+            && attention_matmul_prefill_head_dim_supported(self.head_dim)
             && self.n_heads * n_pad * 256 * 4 <= attn_mm_scratch_cap_bytes();
         // Query-block width for the S/P panels: the panels are [head][qb][n_pad], so
         // memory is linear in the block width and the budget sets how many query

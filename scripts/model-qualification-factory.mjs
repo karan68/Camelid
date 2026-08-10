@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
-import { basename, resolve } from 'node:path'
+import { basename, isAbsolute, relative, resolve, sep } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { validateRoster } from './check-model-qualification-roster.mjs'
 import { qualify } from './model-qualification-runner.mjs'
@@ -38,6 +38,15 @@ function artifactForRow(row, modelsDir, explicitArtifact = null) {
 function firstUnresolvedStage(report, gateOrder) {
   if (report.stages.artifact?.status !== 'pass') return 'artifact'
   return gateOrder.find((name) => report.stages[name]?.status !== 'pass') || null
+}
+
+function publicRosterLabel(root, rosterPath) {
+  const candidate = relative(root, rosterPath)
+  if (!candidate || candidate === '.') return '<workspace-roster>'
+  if (isAbsolute(candidate) || candidate === '..' || candidate.startsWith('..' + sep)) {
+    return '<external-roster>'
+  }
+  return candidate.split(sep).join('/')
 }
 
 function summarizeReports(reports, gateOrder) {
@@ -98,7 +107,7 @@ async function runFactory(options) {
   const index = {
     schema: 'camelid.model-qualification-index/v1',
     generated_at: new Date().toISOString(),
-    roster: options.roster || 'qa/model-qualification/phase1-roster.json',
+    roster: publicRosterLabel(root, rosterPath),
     roster_schema: roster.schema,
     models_dir_env: roster.defaults.models_dir_env,
     models_dir_configured: Boolean(modelsDir),
@@ -156,6 +165,7 @@ Options:
 export {
   artifactForRow,
   firstUnresolvedStage,
+  publicRosterLabel,
   runFactory,
   selectRows,
   summarizeReports,

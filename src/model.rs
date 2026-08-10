@@ -148,6 +148,7 @@ pub fn is_implemented_architecture(architecture: &str) -> bool {
             | "gemma3"
             | "gemma4"
             | "phi3"
+            | "command-r"
             | "lfm2"
             | "bitnet-b1.58"
     )
@@ -186,7 +187,10 @@ pub fn is_bitnet_embedding_model(gguf: &GgufFile) -> bool {
 /// lanes now key on. The CPU dense forward remains WRONG for gemma3 (no
 /// window mask; hazard H4) and fails closed at forward dispatch.
 pub fn is_runnable_only_arch(architecture: &str) -> bool {
-    matches!(architecture, "qwen35" | "gemma2" | "lfm2" | "bitnet-b1.58")
+    matches!(
+        architecture,
+        "qwen35" | "gemma2" | "command-r" | "lfm2" | "bitnet-b1.58"
+    )
 }
 
 /// Capability-aware serve/direct-session routing predicate (gemma3→Metal
@@ -339,8 +343,8 @@ impl LlamaModelConfig {
         let architecture = match gguf.architecture() {
             Some(
                 architecture @ ("llama" | "mistral" | "qwen2" | "qwen3" | "qwen3moe" | "qwen35"
-                | "smollm3" | "gemma2" | "gemma3" | "gemma4" | "phi3" | "lfm2"
-                | "bitnet-b1.58"),
+                | "smollm3" | "gemma2" | "gemma3" | "gemma4" | "phi3" | "command-r"
+                | "lfm2" | "bitnet-b1.58"),
             ) => architecture,
             // Gemma 4 MTP/assistant drafter heads ship as a distinct architecture.
             // The tensor map parses (q-only attention layers, per-layer
@@ -466,6 +470,21 @@ impl LlamaModelConfig {
                     architecture,
                     "attention.layer_norm_rms_epsilon",
                 ))
+                // Command R uses ordinary LayerNorm and publishes the epsilon
+                // under `layer_norm_epsilon` (without the RMS qualifier). Keep
+                // the shared config field as the numeric epsilon consumed by
+                // the runnable lane; `RunnableModel::apply_norm` selects the
+                // correct normalization operation from the architecture.
+                .or_else(|| {
+                    (architecture == "command-r")
+                        .then(|| {
+                            gguf.metadata_f32(&architecture_key(
+                                architecture,
+                                "attention.layer_norm_epsilon",
+                            ))
+                        })
+                        .flatten()
+                })
                 .unwrap_or(1e-5),
             vocab_size: gguf
                 .metadata_u32(&architecture_key(architecture, "vocab_size"))
@@ -1645,7 +1664,13 @@ impl LlamaTensorBinding {
         // resident-capable hosts, while the CPU dense forward stays fail-closed
         // for windowed archs (hazard H4).
         let architecture = gguf.architecture().unwrap_or_default();
-        let expects_qk_norm = matches!(architecture, "qwen3" | "qwen3moe" | "command-r" | "gemma3");
+        let requires_qk_norm = matches!(architecture, "qwen3" | "qwen3moe" | "gemma3");
+        // Command R's tensor contract is depth-dependent in the pinned
+        // reference graph: 32-layer Aya Expanse has no Q/K norms, while the
+        // >=64-layer variants carry them. The runnable attemptability slice is
+        // deliberately anchored to the former; the loader rejects the latter's
+        // per-head-distinct layout until that graph has parity evidence.
+        let allows_optional_qk_norm = architecture == "command-r";
         let forbids_qk_norm = matches!(architecture, "llama" | "mistral" | "qwen2");
         // gemma3's 4-norm "sandwich" structure: an extra RMSNorm on the attention
         // output and on the FFN output, each applied BEFORE its residual add
@@ -1662,7 +1687,7 @@ impl LlamaTensorBinding {
         // `LlamaModelConfig.attention_key_length` / `DenseLlamaDims`. The engine
         // assumes a single head_dim for K and V, so require
         // key_length == value_length and fail closed otherwise.
-        if expects_qk_norm {
+        if requires_qk_norm || allows_optional_qk_norm {
             let key_length =
                 gguf.metadata_u32(&architecture_key(architecture, "attention.key_length"));
             let value_length =
@@ -1681,7 +1706,7 @@ impl LlamaTensorBinding {
         for layer_idx in 0..config.block_count {
             let q_norm_name = format!("blk.{layer_idx}.attn_q_norm.weight");
             let k_norm_name = format!("blk.{layer_idx}.attn_k_norm.weight");
-            let (attention_q_norm, attention_k_norm) = if expects_qk_norm {
+            let (attention_q_norm, attention_k_norm) = if requires_qk_norm {
                 // Required for Qwen3: both must be present, or fail closed.
                 let q = find_tensor(gguf, &q_norm_name).cloned();
                 let k = find_tensor(gguf, &k_norm_name).cloned();
@@ -1695,6 +1720,25 @@ impl LlamaTensorBinding {
                     )));
                 }
                 (q, k)
+            } else if allows_optional_qk_norm {
+                // Aya Expanse 8B (32 layers) legitimately omits this pair.
+                // Still reject an incomplete pair: accepting one weight would
+                // silently change only half of the attention graph.
+                let q = find_tensor(gguf, &q_norm_name).cloned();
+                let k = find_tensor(gguf, &k_norm_name).cloned();
+                match (q, k) {
+                    (Some(q), Some(k)) => (Some(q), Some(k)),
+                    (None, None) => (None, None),
+                    (q, k) => {
+                        return Err(BackendError::UnsupportedModelArchitecture(format!(
+                            "command-r layer {layer_idx} has an incomplete optional QK-norm pair \
+                             (attn_q_norm present: {}, attn_k_norm present: {}); refusing rather \
+                             than applying a one-sided norm",
+                            q.is_some(),
+                            k.is_some()
+                        )))
+                    }
+                }
             } else {
                 // Forbidden for the plain Llama-family rows: if a GGUF unexpectedly
                 // carries QK-norm tensors under one of these architectures, the
@@ -1791,18 +1835,27 @@ impl LlamaTensorBinding {
                 }
             };
 
+            let attention_norm =
+                required_tensor(gguf, &format!("blk.{layer_idx}.attn_norm.weight"))?;
+            // Command R is a parallel-residual block: attention and FFN consume
+            // the same LayerNorm output, and there is no `ffn_norm` tensor. The
+            // dense binding remains useful for shape auditing even though all
+            // execution is routed to the runnable lane.
+            let ffn_norm = if architecture == "command-r" {
+                attention_norm.clone()
+            } else {
+                required_tensor(gguf, &format!("blk.{layer_idx}.ffn_norm.weight"))?
+            };
+
             layers.push(LlamaLayerTensors {
-                attention_norm: required_tensor(
-                    gguf,
-                    &format!("blk.{layer_idx}.attn_norm.weight"),
-                )?,
+                attention_norm,
                 attention,
                 attention_output: required_tensor(
                     gguf,
                     &format!("blk.{layer_idx}.attn_output.weight"),
                 )?,
                 post_attention_norm,
-                ffn_norm: required_tensor(gguf, &format!("blk.{layer_idx}.ffn_norm.weight"))?,
+                ffn_norm,
                 post_ffw_norm,
                 ffn: if let Some(moe) = config.moe.as_ref() {
                     LlamaFfnTensors::MoE {
@@ -2822,6 +2875,142 @@ mod tests {
         gguf
     }
 
+    fn f32_tensor(name: &str, dimensions: Vec<u64>) -> GgufTensorDescriptor {
+        let n_bytes = dimensions.iter().product::<u64>() * 4;
+        GgufTensorDescriptor {
+            name: name.to_string(),
+            dimensions,
+            tensor_type: GgufTensorType::F32,
+            relative_offset: 0,
+            absolute_offset: 0,
+            n_bytes,
+        }
+    }
+
+    fn tiny_command_r_gguf() -> GgufFile {
+        let mut gguf = meta_only_gguf(vec![
+            (
+                "general.architecture",
+                GgufMetadataValue::String("command-r".into()),
+            ),
+            ("command-r.context_length", GgufMetadataValue::U32(32)),
+            ("command-r.embedding_length", GgufMetadataValue::U32(4)),
+            ("command-r.block_count", GgufMetadataValue::U32(1)),
+            ("command-r.feed_forward_length", GgufMetadataValue::U32(8)),
+            ("command-r.attention.head_count", GgufMetadataValue::U32(2)),
+            (
+                "command-r.attention.head_count_kv",
+                GgufMetadataValue::U32(1),
+            ),
+            (
+                "command-r.attention.layer_norm_epsilon",
+                GgufMetadataValue::F32(1e-5),
+            ),
+            ("command-r.logit_scale", GgufMetadataValue::F32(0.125)),
+        ]);
+        gguf.tensors = vec![
+            f32_tensor("token_embd.weight", vec![4, 8]),
+            f32_tensor("output_norm.weight", vec![4]),
+            f32_tensor("blk.0.attn_norm.weight", vec![4]),
+            f32_tensor("blk.0.attn_q.weight", vec![4, 4]),
+            f32_tensor("blk.0.attn_k.weight", vec![4, 2]),
+            f32_tensor("blk.0.attn_v.weight", vec![4, 2]),
+            f32_tensor("blk.0.attn_output.weight", vec![4, 4]),
+            f32_tensor("blk.0.ffn_gate.weight", vec![4, 8]),
+            f32_tensor("blk.0.ffn_up.weight", vec![4, 8]),
+            f32_tensor("blk.0.ffn_down.weight", vec![8, 4]),
+        ];
+        gguf.tensor_count = gguf.tensors.len() as i64;
+        gguf
+    }
+
+    #[test]
+    fn command_r_aya_expanse_metadata_is_attemptable_but_runnable_only() {
+        // Exact architecture/config values observed in the immutable
+        // bartowski/aya-expanse-8b-GGUF Q4_K_M header. No weight bytes are
+        // needed to prove config acceptance and the fail-closed routing facts.
+        let mut gguf = meta_only_gguf(vec![
+            (
+                "general.architecture",
+                GgufMetadataValue::String("command-r".into()),
+            ),
+            ("command-r.context_length", GgufMetadataValue::U32(8_192)),
+            ("command-r.embedding_length", GgufMetadataValue::U32(4_096)),
+            ("command-r.block_count", GgufMetadataValue::U32(32)),
+            (
+                "command-r.feed_forward_length",
+                GgufMetadataValue::U32(14_336),
+            ),
+            ("command-r.attention.head_count", GgufMetadataValue::U32(32)),
+            (
+                "command-r.attention.head_count_kv",
+                GgufMetadataValue::U32(8),
+            ),
+            (
+                "command-r.attention.layer_norm_epsilon",
+                GgufMetadataValue::F32(1e-5),
+            ),
+            ("command-r.rope.freq_base", GgufMetadataValue::F32(10_000.0)),
+            (
+                "command-r.rope.scaling.type",
+                GgufMetadataValue::String("none".into()),
+            ),
+            ("command-r.logit_scale", GgufMetadataValue::F32(0.125)),
+        ]);
+        gguf.tensors = vec![f32_tensor("token_embd.weight", vec![4_096, 256_000])];
+        gguf.tensor_count = 1;
+
+        let config = super::LlamaModelConfig::from_gguf(&gguf).expect("command-r config");
+        assert_eq!(config.architecture, "command-r");
+        assert_eq!(config.context_length, 8_192);
+        assert_eq!(config.embedding_length, 4_096);
+        assert_eq!(config.block_count, 32);
+        assert_eq!(config.feed_forward_length, 14_336);
+        assert_eq!(config.attention_head_count, 32);
+        assert_eq!(config.attention_head_count_kv, 8);
+        assert_eq!(config.vocab_size, Some(256_000));
+        assert_eq!(config.rms_norm_epsilon, 1e-5);
+        assert_eq!(config.logit_scale, Some(0.125));
+        assert!(!config.rope_neox_pairing);
+        assert!(super::is_implemented_architecture("command-r"));
+        assert!(super::is_runnable_only_arch("command-r"));
+    }
+
+    #[test]
+    fn command_r_binding_accepts_shared_norm_and_tied_output() {
+        let gguf = tiny_command_r_gguf();
+        let config = super::LlamaModelConfig::from_gguf(&gguf).expect("command-r config");
+        let binding = super::LlamaTensorBinding::bind(&gguf, &config)
+            .expect("32-layer-style command-r tensor contract must bind");
+
+        assert!(binding.output_is_tied_embedding);
+        assert_eq!(
+            binding.layers[0].attention_norm.name,
+            "blk.0.attn_norm.weight"
+        );
+        assert_eq!(binding.layers[0].ffn_norm.name, "blk.0.attn_norm.weight");
+        match &binding.layers[0].attention {
+            super::LlamaAttentionTensors::Standard { q_norm, k_norm, .. } => {
+                assert!(q_norm.is_none());
+                assert!(k_norm.is_none());
+            }
+            super::LlamaAttentionTensors::Mla { .. } => panic!("command-r must bind standard GQA"),
+        }
+    }
+
+    #[test]
+    fn command_r_binding_rejects_an_incomplete_optional_qk_norm_pair() {
+        let mut gguf = tiny_command_r_gguf();
+        gguf.tensors
+            .push(f32_tensor("blk.0.attn_q_norm.weight", vec![2]));
+        gguf.tensor_count = gguf.tensors.len() as i64;
+        let config = super::LlamaModelConfig::from_gguf(&gguf).expect("command-r config");
+        let err = super::LlamaTensorBinding::bind(&gguf, &config)
+            .expect_err("one-sided command-r QK norm must fail closed");
+        let msg = err.to_string();
+        assert!(msg.contains("incomplete optional QK-norm pair"), "{msg}");
+    }
+
     #[test]
     fn exact_bitnet_embedding_rows_are_detected_and_gemma_uses_full_attention() {
         let qwen = meta_only_gguf(vec![
@@ -3083,6 +3272,9 @@ mod tests {
         assert!(!super::arch_uses_neox_rope_pairing("mistral"));
         assert!(!super::arch_uses_neox_rope_pairing("gemma3"));
         assert!(!super::arch_uses_neox_rope_pairing("gemma4"));
+        // llama.cpp classifies LLM_ARCH_COMMAND_R in its ordinary RoPE group:
+        // adjacent pairs, not NEOX split-half.
+        assert!(!super::arch_uses_neox_rope_pairing("command-r"));
     }
 
     #[test]
@@ -3108,6 +3300,7 @@ mod tests {
             "gemma3",
             "gemma4",
             "phi3",
+            "command-r",
             "lfm2",
             "bitnet-b1.58",
         ] {
@@ -3127,7 +3320,7 @@ mod tests {
         // fluent-looking garbage. gemma3 left this set in Phase 3b of the Metal
         // campaign (its routing is capability-aware — pinned by the split test
         // below).
-        for arch in ["qwen35", "gemma2", "lfm2", "bitnet-b1.58"] {
+        for arch in ["qwen35", "gemma2", "command-r", "lfm2", "bitnet-b1.58"] {
             assert!(
                 super::is_runnable_only_arch(arch),
                 "{arch} must be classified runnable-lane-only"
@@ -3154,7 +3347,7 @@ mod tests {
         // bridge-only regardless of capability; dense archs never bridge.
         for capable in [false, true] {
             for q8 in [false, true] {
-                for arch in ["qwen35", "gemma2", "bitnet-b1.58"] {
+                for arch in ["qwen35", "gemma2", "command-r", "bitnet-b1.58"] {
                     assert!(
                         super::arch_requires_runnable_bridge_given(arch, capable, q8),
                         "{arch} must require the runnable bridge on every host"
@@ -3281,6 +3474,7 @@ mod tests {
             "gemma3",
             "gemma4",
             "phi3",
+            "command-r",
             "lfm2",
             "bitnet-b1.58",
         ] {

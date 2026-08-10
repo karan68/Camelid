@@ -15,8 +15,71 @@ const REQUIRED_STAGES = [
   'context',
 ]
 const STATUSES = new Set(['pass', 'fail', 'blocked', 'skipped'])
-const WINDOWS_ABSOLUTE_RE = /(?:^|["'\s])(?:[a-zA-Z]:[\\/]|\\\\)[^"'\r\n]*/
-const HOME_ABSOLUTE_RE = /(?:^|["'\s])\/(?:home|Users|private\/var\/folders)\/[^"]*/
+const WINDOWS_ABSOLUTE_RE = /(?:^|[\s"'=([{,:])(?:[a-zA-Z]:[\\/]|\\\\)/
+const UNIX_ABSOLUTE_RE = /(?:^|[\s"'=([{,:])(\/+[^\s"'<>]*)/g
+const HTTP_URL_RE = /https?:\/\/[^\s"'<>]+/gi
+const FILE_URI_RE = /\bfile:\/\/[^\s"'<>]*/i
+const PUBLIC_ROUTE_LITERALS = new Set([
+  '/apply-template',
+  '/completion',
+  '/health',
+  '/tokenize',
+  '/api/capabilities',
+  '/api/models',
+  '/api/models/current',
+  '/api/models/inspect',
+  '/api/models/load',
+  '/api/models/local',
+  '/v1/chat/completions',
+  '/v1/completions',
+  '/v1/embeddings',
+  '/v1/models',
+  '/v1/rerank',
+])
+
+function routeField(path) {
+  return path.some((part) => /^(?:public_)?(?:route|routes|endpoint|endpoints)$/.test(String(part)))
+}
+
+function routeLiteralContext(path) {
+  return routeField(path)
+    || path.some((part) => /^(?:command|commands)$/.test(String(part)))
+}
+
+function containsAbsoluteLocalPath(value, path) {
+  // Source/revision URLs are intentionally public evidence. Remove only HTTP(S)
+  // spans before examining the remaining command/prose tokens; file:// remains
+  // forbidden and is caught as a slash-absolute value.
+  if (FILE_URI_RE.test(value)) return true
+  const scrubbed = value.replace(HTTP_URL_RE, '<public-url>')
+  if (WINDOWS_ABSOLUTE_RE.test(scrubbed)) return true
+
+  UNIX_ABSOLUTE_RE.lastIndex = 0
+  for (const match of scrubbed.matchAll(UNIX_ABSOLUTE_RE)) {
+    const candidate = match[1].replace(/[),.;:\]}]+$/g, '')
+    if (!candidate || /^\/+$/u.test(candidate)) continue
+    if (PUBLIC_ROUTE_LITERALS.has(candidate) && routeLiteralContext(path)) continue
+    if (routeField(path)
+      && /^\/(?:api|v1)(?:\/[A-Za-z0-9_.:{}-]+)+\/?(?:\?[^\s]*)?$/.test(candidate)
+      && !candidate.includes('..')) {
+      continue
+    }
+    return true
+  }
+  return false
+}
+
+function reportContainsAbsoluteLocalPath(value, path = []) {
+  if (typeof value === 'string') return containsAbsoluteLocalPath(value, path)
+  if (Array.isArray(value)) {
+    return value.some((item, index) => reportContainsAbsoluteLocalPath(item, [...path, index]))
+  }
+  if (value && typeof value === 'object') {
+    return Object.entries(value)
+      .some(([key, item]) => reportContainsAbsoluteLocalPath(item, [...path, key]))
+  }
+  return false
+}
 
 function expectedOverall(stages) {
   const required = REQUIRED_STAGES.map((name) => stages[name]).filter((stage) => stage?.required !== false)
@@ -65,8 +128,7 @@ function validateQualificationReport(report, label = 'report') {
     fail('overall_status', `unsupported status ${JSON.stringify(report?.overall_status)}`)
   }
 
-  const serialized = JSON.stringify(report)
-  if (WINDOWS_ABSOLUTE_RE.test(serialized) || HOME_ABSOLUTE_RE.test(serialized)) {
+  if (reportContainsAbsoluteLocalPath(report)) {
     fail('privacy', 'report contains an absolute local path')
   }
   return errors
@@ -103,7 +165,13 @@ async function main() {
   console.log(JSON.stringify({ checked: paths.length, reports: paths }, null, 2))
 }
 
-export { REQUIRED_STAGES, expectedOverall, validateQualificationReport }
+export {
+  REQUIRED_STAGES,
+  containsAbsoluteLocalPath,
+  expectedOverall,
+  reportContainsAbsoluteLocalPath,
+  validateQualificationReport,
+}
 
 if (import.meta.url === pathToFileURL(process.argv[1] || '').href) {
   main().catch((error) => {

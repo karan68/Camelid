@@ -35,14 +35,32 @@ page progressively harder to scan.
    incremental-decode/KV-cache divergence from fresh-prefill behavior.
 4. **Gemma 2** has a runnable graph but needs a Gemma-2-specific chat-template
    fixture and real-row proof; it must not borrow Gemma 3's renderer by name.
-5. **SmolLM3** needs the `tokenizer.ggml.pre = smollm` dialect before its NoPE
-   schedule can be checked on a real row.
+5. **SmolLM3** actually declares `tokenizer.ggml.pre = smaug-bpe`, an exact
+   llama3-regex alias in the pinned reference. Legacy `smollm` remains a distinct
+   two-pass dialect and must not be used as a shortcut for the real row.
 6. **Qwen3 MoE** needs an authoritative artifact anchor and a routing-semantics
    audit before a large download. Synthetic browse fixtures are not candidates.
 
 The work order reflects implementation closeness. The first newly downloaded
 bootstrap artifact is Qwen2.5 0.5B because it is much smaller than the LFM2 row;
 the existing LFM2 receipts can be audited without reacquiring its weights.
+
+## Phase 1 current dispositions
+
+The first overnight pass closed every unsafe ambiguity it reached without
+turning preparatory evidence into support:
+
+| Family | Current result | Next honest gate |
+|---|---|---|
+| LFM2 | Immutable official source is pinned; six gates pass. | Exact artifact API/SSE/WebUI and 512-token receipts. |
+| Qwen2.5 | Source, metadata, tokenizer, and template pass; strict greedy parity remains failed on one stable cross-engine numeric frontier. | Layer trace under one fully pinned oracle launch recipe; do not waive the token mismatch. |
+| Phi-3 | Generic head-dim-96 CPU cache reads are bit-identical; the unproven partial Metal PV tile now falls back. | Repeat the exact-row Metal prefill/decode receipt before changing the HOLD. |
+| Gemma 2 | Source identity and exact IT template route pass; substituted templates and invalid shapes fail closed. | Exact-row metadata and token-ID oracle, then load/parity. |
+| SmolLM3 | Source is pinned and the real `smaug-bpe` construction gap is closed; its dynamic chat template has an executable HOLD. | Exact-row token IDs, then a deterministic renderer for its date/reasoning/system/tool contract. |
+| Qwen3 MoE | Official 32.48 GB row is pinned; a bounded 32 MiB prefix confirms all 579 descriptors. | Full-artifact identity/load and MoE parity; remote metadata alone is not a promotion. |
+
+The roster remains active because these are dispositions, not six completed
+support promotions. A `blocked` or `fail` gate is intentional information.
 
 ## Qualification gates
 
@@ -117,12 +135,32 @@ run smoke or generation unless those probes are explicitly requested. This
 keeps routine inventory runs cheap while making evidence-producing runs
 deliberate and reproducible.
 
+## Phase 3 first decoder slice
+
+Aya Expanse 8B Q4_K_M replaces the earlier 37.2 GB Command R planning row as a
+manageable representative. Its public 5.06 GB artifact and license are pinned,
+and a 16 MiB header prefix establishes the exact 32-layer Command-R shape. The
+runnable implementation now models ordinary LayerNorm, adjacent/interleaved
+RoPE, tied output, and the parallel attention/FFN residual from one normalized
+input. Admission and loading are pinned to that exact metadata/tensor mix;
+64-layer Q/K-normalized Command-R rows and `cohere2` remain typed refusals.
+
+This is attemptability, not support. The full artifact was not downloaded,
+smoke remains outside the oracle-qualified set, and Command-R chat returns a
+typed 422 until the Aya template and prompt-token fixtures exist. The next
+status-changing evidence is a full-file hash plus tokenizer/template and greedy
+parity against the pinned reference.
+
 ## Phase 4 format boundary started
 
 `camelid inspect-source` exposes the existing format-neutral source manifest for
 either a GGUF file or a local Hugging Face directory containing `config.json`
 and SafeTensors shards. For the SafeTensors lane it validates the supported
 dense-LLaMA config subset, shard index, tensor headers, role names, shapes, and
-currently decoded dtypes. This is readiness inspection only: tokenizer parity,
-weight orientation, one-token execution, and exact-row receipts remain required,
-and native SafeTensors generation is intentionally disabled.
+currently decoded dtypes. The isolated `tokenizer.json` adapter uses the pinned
+Hugging Face `tokenizers` crate with the pure-Rust regex backend, validates the
+serialized pipeline and vocabulary, and records three no-special-token
+encode/decode probes with typed blockers. This is readiness inspection only:
+special-token and chat-template parity, weight orientation, one-token execution,
+and exact-row receipts remain required, and native SafeTensors generation is
+intentionally disabled.

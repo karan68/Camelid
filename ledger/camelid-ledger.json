@@ -1,7 +1,7 @@
 {
   "ledger_version": "camelid.ledger/v1",
   "provenance": {
-    "source_head": "9732c37a",
+    "source_head": "16d88cb6",
     "note": "Derived from the static CapabilitiesResponse literal in src/api/mod.rs and API_CONFORMANCE_CASES in src/api/contract.rs by scripts/extract-capabilities-to-ledger.mjs. Contract fields are byte-faithful (plain serde Serialize, no renames). Per CAIRN Amendment 1, the CODE is the contract source of truth; this ledger is its derived canonical form, and scripts/check-ledger-drift.mjs re-derives from code and fails CI if code and ledger disagree (provenance excluded)."
   },
   "capabilities": {
@@ -139,7 +139,7 @@
       {
         "id": "command_r",
         "status": "experimental_scaffolding",
-        "notes": "Command-R tensor, normalization, tokenizer, and logit-scale scaffolding exists, but the runnable parser/admission path still rejects command-r and no exact-row load, generation, parity, or frontend evidence exists."
+        "notes": "Aya Expanse 8B Q4_K_M is the first immutable Command-R candidate: its public 5.056 GB artifact identity and license are pinned, and the complete remote header validates the 32-layer parallel-residual graph, config, admission, binding, adjacent RoPE, and tensor mix. The full artifact is not local, so load, tokenizer/template parity, generation parity, API/WebUI, and context remain blocked; neighboring Command-R/cohere2 rows fail closed."
       },
       {
         "id": "qwen25",
@@ -149,7 +149,7 @@
       {
         "id": "gemma2",
         "status": "planned_exact_row_candidate",
-        "notes": "public readiness: planned first Gemma row only for gemma-2-9b-it-Q8_0.gguf; not supported yet. Gemma2 architecture, tokenizer/control-token behavior, template formatting, bounded load, parity, API/WebUI, RSS, and bundle evidence are missing"
+        "notes": "public readiness: planned first Gemma row only for gemma-2-9b-it-Q8_0.gguf; not supported yet. The exact embedded Gemma 2 IT template now has a fixture-locked renderer and fail-closed route, but real-row token-id parity, bounded load/generation, parity, API/WebUI, RSS, context, and bundle evidence are still missing"
       },
       {
         "id": "phi_falcon_mamba_others",
@@ -2297,51 +2297,53 @@
     },
     {
       "identity": {
-        "id": "c4ai_command_r_v01_q8_0",
+        "id": "aya_expanse_8b_q4_k_m",
         "family": "command_r",
-        "quantization": "Q8_0"
+        "quantization": "Q4_K_M",
+        "gguf_filename": "aya-expanse-8b-Q4_K_M.gguf",
+        "sha256": "9592bad943fe56cf93200286a0a4b00a158cd84a408f227b9978ec5879002fb8"
       },
       "contract": {
-        "id": "c4ai_command_r_v01_q8_0",
+        "id": "aya_expanse_8b_q4_k_m",
         "tool_capable": false,
         "family": "command_r",
-        "quantization": "Q8_0",
+        "quantization": "Q4_K_M",
         "status": "planned_exact_row_candidate",
         "support_scope": "future_exact_row_planning_only",
         "full_support_status": "not_applicable_until_runtime_support",
-        "full_support_blockers": "command-r is still rejected by runnable architecture admission; the new tensor/tokenizer scaffolding is unreachable and has no exact-row load or parity evidence",
-        "metadata_parses": "header_only_not_runnable",
-        "tokenizer_works": "scaffolding_unvalidated",
-        "tensors_load": "not_started",
-        "generation_runs": "not_started",
-        "parity_audited": "not_started",
-        "performance_measured": "not_started",
-        "frontend_load_path_verified": "fail_closed_planned",
-        "frontend_readiness_gate": "fail-closed while command-r runtime admission rejects the architecture",
-        "tested_context": "not_started",
-        "chat_template_renderer": "command_r_planned",
-        "chat_template_shape_pack": "not_started",
+        "full_support_blockers": "the exact 5.056 GB artifact is not local; no full-file hash/load, prompt-token or Aya template fixture, real-weight generation parity, API/WebUI/SSE, context, RSS, performance, or portability evidence exists",
+        "metadata_parses": "immutable_remote_header_validated_attemptable",
+        "tokenizer_works": "command_r_dialect_identified_exact_row_parity_blocked",
+        "tensors_load": "blocked_exact_artifact_not_local",
+        "generation_runs": "blocked_exact_artifact_not_local",
+        "parity_audited": "blocked_no_real_weight_oracle_run",
+        "performance_measured": "blocked_no_real_weight_run",
+        "frontend_load_path_verified": "fail_closed_header_only_hold",
+        "frontend_readiness_gate": "fail-closed: Command-R chat returns a typed template HOLD until the exact Aya template and real-weight parity gates pass",
+        "tested_context": "blocked_metadata_declaration_only",
+        "chat_template_renderer": "fail_closed_pending_aya_template_fixture",
+        "chat_template_shape_pack": "blocked_not_captured",
         "chat_template_shape_pack_id": "command-r-chat-template-pack-v1",
-        "bounded_context_512_pack": "not_started",
+        "bounded_context_512_pack": "blocked_exact_artifact_not_local",
         "bounded_context_512_pack_id": "command-r-context-512-smoke-v1",
         "bounded_context_window": 512,
-        "bounded_context_1024_pack": "not_started",
+        "bounded_context_1024_pack": "blocked_exact_artifact_not_local",
         "bounded_context_1024_pack_id": "command-r-context-1024-smoke-v1",
         "bounded_context_1024_window": 1024,
-        "bounded_context_2048_pack": "not_started",
+        "bounded_context_2048_pack": "blocked_exact_artifact_not_local",
         "bounded_context_2048_pack_id": "command-r-context-2048-smoke-v1",
         "bounded_context_2048_window": 2048,
-        "bounded_context_4096_pack": "not_started",
+        "bounded_context_4096_pack": "blocked_exact_artifact_not_local",
         "bounded_context_4096_pack_id": "command-r-context-4096-smoke-v1",
         "bounded_context_4096_window": 4096,
-        "bounded_context_8192_pack": "not_promoted",
-        "bounded_context_8192_pack_id": "not_selected",
+        "bounded_context_8192_pack": "blocked_exact_artifact_not_local",
+        "bounded_context_8192_pack_id": "command-r-context-8192-smoke-v1",
         "bounded_context_8192_window": 8192,
-        "latest_checked_bucket": "candidate_selected",
+        "latest_checked_bucket": "immutable_header_shape",
         "latest_checked_result": "planning_only",
-        "latest_checked_output": "not_applicable",
-        "evidence": "planning only: logit-scale, normalization, and tokenizer scaffolding do not make command-r runnable or supported",
-        "next_step": "implement and validate command-r admission/binding, then run exact-artifact tokenizer, generation, parity, API/WebUI, memory, and context gates"
+        "latest_checked_output": "qa/model-qualification/phase3-command-r-aya-attemptability-report.json",
+        "evidence": "planning only / header-only HOLD: bartowski/aya-expanse-8b-GGUF@f9d62ed0c58e6f2ae17975df990b1b8a4013b596, aya-expanse-8b-Q4_K_M.gguf, 5,056,982,720 bytes, LFS SHA-256 9592bad943fe56cf93200286a0a4b00a158cd84a408f227b9978ec5879002fb8, CC-BY-NC-4.0. The complete immutable remote header proves command-r, GPT-2/command-r tokenizer metadata, 32x4096 geometry, FFN 14336, GQA 32/8, adjacent RoPE, one shared LayerNorm parallel residual, tied output, and F32/Q4_K/Q6_K tensor distribution. Only the first 16 MiB header range was fetched; no weight payload, load, generation, parity, frontend, or context result is claimed.",
+        "next_step": "provide and full-hash the exact artifact, capture prompt-token and Aya template fixtures, then run pinned llama.cpp greedy parity before any smoke/API/SSE/Models-page or 512-token context gate"
       }
     },
     {
@@ -2506,9 +2508,9 @@
         "status": "planned_exact_row_candidate",
         "support_scope": "future_exact_row_planning_only",
         "full_support_status": "not_applicable_until_runtime_support",
-        "full_support_blockers": "gemma2 runtime, control-token/template fixtures, bounded load/readiness, API/WebUI, RSS/timing, context, and durable bundle evidence are missing",
+        "full_support_blockers": "the exact template renderer is fixture-locked only; real-row tokenizer/control-token parity, bounded load/readiness, generation parity, API/WebUI, RSS/timing, context, and durable bundle evidence are missing",
         "metadata_parses": "acquisition_planned",
-        "tokenizer_works": "not_started",
+        "tokenizer_works": "construction_path_exists_real_row_token_ids_unverified",
         "tensors_load": "not_started",
         "generation_runs": "not_started",
         "parity_audited": "not_started",
@@ -2516,9 +2518,9 @@
         "frontend_load_path_verified": "fail_closed_planned",
         "frontend_readiness_gate": "fail-closed until an exact supported row plus runtime readiness exist",
         "tested_context": "not_started",
-        "chat_template_renderer": "gemma2_it_planned",
-        "chat_template_shape_pack": "not_started",
-        "chat_template_shape_pack_id": "gemma2-it-chat-template-pack-v1",
+        "chat_template_renderer": "gemma2_it_exact_fixture_only",
+        "chat_template_shape_pack": "validated_fixture_only_no_real_row_runtime_claim",
+        "chat_template_shape_pack_id": "gemma2-it-chat-template-v1",
         "bounded_context_512_pack": "not_started",
         "bounded_context_512_pack_id": "gemma2-context-512-smoke-v1",
         "bounded_context_window": 512,
@@ -2537,8 +2539,8 @@
         "latest_checked_bucket": "candidate_selected",
         "latest_checked_result": "planning_only",
         "latest_checked_output": "not_applicable",
-        "evidence": "first Gemma candidate row selected for planning only: gemma-2-9b-it-Q8_0.gguf; Gemma2 architecture details, tokenizer/control-token behavior, template formatting, bounded load, parity, API/WebUI, RSS, and bundle evidence are all still required",
-        "next_step": "capture acquisition path, model SHA and license/access notes, then add tokenizer/chat-template fixtures and bounded metadata/load checks before any runtime-support wording"
+        "evidence": "first Gemma candidate row remains planning only: gemma-2-9b-it-Q8_0.gguf. qa/model-qualification/fixtures/gemma2-it-chat-template-v1.json pins the exact GGUF template identity, renderer shapes, BOS contract, and typed fail-closed system/alternation behavior; it is template evidence only and supplies no model-load or generation support receipt",
+        "next_step": "verify the remotely observed artifact identity independently, acquire the row, and run exact token-id, bounded metadata/load, generation, API/WebUI, parity, RSS, and context gates before any runtime-support wording"
       }
     }
   ]

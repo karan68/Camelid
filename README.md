@@ -129,7 +129,6 @@ Run `camelid pull <id>` to download a model into `./models`. Pull IDs resolve by
 | **DeepSeek R1 Distill Qwen 7B** | `Q8_0` | `qwen25` | 8.1 GB | `distill_qwen` | `DeepSeek-R1-Distill-Qwen-7B-Q8_0.gguf` |
 | **DeepSeek R1 Distill Llama 8B** | `Q8_0` | `llama` | 8.5 GB | `distill_llama` | `DeepSeek-R1-Distill-Llama-8B-Q8_0.gguf` |
 | **Qwen2.5 Coder 7B** | `Q8_0` | `qwen25` | 8.1 GB | `qwen25_coder` | `qwen2.5-coder-7b-instruct-q8_0.gguf` |
-| **Cohere Command R v01** | `Q8_0` | `command-r` | 37.2 GB | `command_r` | `c4ai-command-r-v01-Q8_0.gguf` |
 | **Ornith 1.0 9B** — hybrid DeltaNet, `tool_capable` | `Q8_0` | `qwen35` | 9.5 GB | `ornith` | `ornith-1.0-9b-Q8_0.gguf` |
 | **Bonsai 4B** | `Q1_0` | `qwen3` | 0.6 GB | `bonsai_4b_q1` | `Bonsai-4B-Q1_0.gguf` |
 | **Ternary Bonsai 4B** | `Q2_0` | `qwen3` | 1.1 GB | `bonsai_4b_q2` | `Ternary-Bonsai-4B-Q2_0.gguf` |
@@ -139,7 +138,7 @@ Run `camelid pull <id>` to download a model into `./models`. Pull IDs resolve by
 | **Bonsai 27B** | `Q1_0` | `qwen35` | 3.8 GB | `bonsai_27b_q1` | `Bonsai-27B-Q1_0.gguf` |
 | **Ternary Bonsai 27B** | `Q2_0` | `qwen35` | 7.2 GB | `bonsai_27b_q2` | `Ternary-Bonsai-27B-Q2_0.gguf` |
 
-The two distributed Gemma 4 rows are validated on a layer-sharded two-host lane and do not fit on a single 16 GB machine. Command R requires a workstation-class host.
+The two distributed Gemma 4 rows are validated on a layer-sharded two-host lane and do not fit on a single 16 GB machine. Aya Expanse 8B is tracked in the compatibility ledger as a header-only Command R planning candidate and is intentionally absent from the supported `camelid pull` catalog: chat fails closed until the exact artifact, Aya template/tokenizer parity, real-weight generation parity, and frontend/context gates are complete.
 
 The three BitNet rows are bring-up targets, not promoted support rows yet. Camelid
 can parse and execute their official canonical `I2_S` GGUF graphs through cleanroom

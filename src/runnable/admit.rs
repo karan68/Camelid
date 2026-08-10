@@ -15,8 +15,10 @@
 //! The covered-set here is **authoritative for the runnable lane** and is taken
 //! verbatim from the spec — it intentionally differs from `model.rs`'s
 //! optimized-lane architecture allowlist (see `BACKEND_ASKS.md` RA-4). In
-//! particular the runnable set includes `gemma2` and excludes
-//! `mistral`/`smollm3`/`gemma4`. `lfm2` JOINED the runnable set with the
+//! particular the runnable set includes `gemma2`/`command-r` and excludes
+//! `mistral`/`smollm3`/`gemma4`. Command R admission is only a coverage-axis
+//! statement: the loader pins execution to the immutable Aya Expanse 8B Q4_K_M
+//! header shape, and smoke remains oracle-blocked. `lfm2` JOINED the runnable set with the
 //! short-conv bring-up: like `qwen35` its conv layers carry no `attn_q/k/v`,
 //! so the runnable lane is the only lane that can run it correctly (see
 //! `model.rs::is_runnable_only_arch`). That is not an admit-then-fail gap:
@@ -60,6 +62,7 @@ pub const COVERED_ARCHITECTURES: &[&str] = &[
     "gemma2",
     "gemma3",
     "phi3",
+    "command-r",
     "lfm2",
     "bitnet-b1.58",
 ];
@@ -496,6 +499,34 @@ mod tests {
         set_meta(&mut file, "tokenizer.ggml.model", "gpt2");
         let ok = admit(&file).expect("qwen3 + gpt2-BPE must admit");
         assert_eq!(ok.tokenizer, TokenizerFamily::Bpe);
+    }
+
+    #[test]
+    fn aya_expanse_q4_k_m_attemptability_mix_admits() {
+        // Immutable bartowski/aya-expanse-8b-GGUF Q4_K_M header:
+        // general.architecture=command-r, tokenizer=gpt2, and only F32/Q4_K/Q6_K
+        // tensors. Admission is a loadability/coverage statement, not parity;
+        // smoke remains blocked by the independent oracle-qualification gate.
+        let mut file = base_fixture();
+        set_meta(&mut file, "general.architecture", "command-r");
+        set_meta(&mut file, "tokenizer.ggml.model", "gpt2");
+        file.tensors = vec![
+            tensor("blk.0.attn_norm.weight", GgufTensorType::F32),
+            tensor("blk.0.attn_q.weight", GgufTensorType::Q4K),
+            tensor("token_embd.weight", GgufTensorType::Q6K),
+        ];
+
+        let ok = admit(&file).expect("Aya Expanse Q4_K_M coverage axes must admit");
+        assert_eq!(ok.architecture, "command-r");
+        assert_eq!(ok.tokenizer, TokenizerFamily::Bpe);
+        assert_eq!(
+            ok.quants,
+            BTreeSet::from([
+                GgufTensorType::F32,
+                GgufTensorType::Q4K,
+                GgufTensorType::Q6K,
+            ])
+        );
     }
 
     #[test]

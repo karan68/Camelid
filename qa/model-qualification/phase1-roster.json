@@ -221,9 +221,10 @@
           "required": true,
           "status": "fail",
           "evidence": [
-            "qa/model-qualification/qwen2.5-0.5b-q8-bootstrap-report.json"
+            "qa/model-qualification/qwen2.5-0.5b-q8-bootstrap-report.json",
+            "qa/model-qualification/qwen2.5-0.5b-q8-parity-localization.json"
           ],
-          "reason": "Three of four 16-token raw greedy probes match exactly; The quick brown fox flips at generated index 6 on an opposite immediate-top-two near-tie (llama.cpp gap 0.00715 log-prob)."
+          "reason": "Three of four 16-token raw greedy probes match exactly. At the remaining flip, Camelid continuous/fresh-prefix logits are bit-identical and llama.cpp continuous/fresh-prefix logits are independently identical; this is a stable cross-engine numerical frontier, not a KV-cache split. The originating layer/operation is not yet localized, and strict parity remains failed."
         },
         "api_webui": {
           "required": true,
@@ -321,9 +322,10 @@
           "required": true,
           "status": "fail",
           "evidence": [
-            "qa/muster/phi3-hold-evidence/generation-divergence-q8-20260727.json"
+            "qa/muster/phi3-hold-evidence/generation-divergence-q8-20260727.json",
+            "qa/model-qualification/phi3-mini-head96-prefill-localization.json"
           ],
-          "reason": "Incremental decode diverges at generated token 2 while a fresh prefill of the same prefix returns the reference token; debug the head_dim=96 KV-cache path."
+          "reason": "The exact row still has a fresh-prefill/incremental split. A new head_dim=96 CPU batch-vs-incremental test is bit-identical, ruling out the generic cache stride; the unproven Metal partial 64-row PV tile now fails closed to the f32 fallback, and parity stays failed until the pinned artifact is rerun on Metal."
         },
         "api_webui": {
           "required": true,
@@ -347,19 +349,19 @@
         "architecture": "gemma2",
         "quantization": "Q8_0",
         "gguf_filename": "gemma-2-9b-it-q8_0.gguf",
-        "size_bytes": null,
-        "sha256": null
+        "size_bytes": 9827149312,
+        "sha256": "59f2e1125fc3af738c256336fb11095da855050305b3705c6c779730a3a8d84e"
       },
       "source": {
         "repo": "BenevolenceMessiah/gemma-2-9b-it-Q8_0-GGUF",
         "file": "gemma-2-9b-it-q8_0.gguf",
-        "revision": null,
-        "license": null
+        "revision": "eb4741d7b2aece6d8519db62dc31d89029a40af8",
+        "license": "gemma"
       },
       "expected": {
-        "tokenizer_model": "gemma2",
-        "tokenizer_pre": null,
-        "chat_template": "gemma2_turn_markers"
+        "tokenizer_model": "llama",
+        "tokenizer_pre": "default",
+        "chat_template": "gemma2_it_exact"
       },
       "lane": {
         "serve": "runnable",
@@ -374,15 +376,15 @@
         ]
       },
       "target_tier": "experimental_exact_row",
-      "disposition": "backlog",
+      "disposition": "active_validation",
       "gates": {
         "source": {
           "required": true,
-          "status": "blocked",
+          "status": "pass",
           "evidence": [
-            "qa/validation-notes/2026-05-06-deep-support-expansion-set.md"
-          ],
-          "reason": "The repository/file is known, but immutable revision, size, SHA-256, and license/access evidence are not pinned."
+            "qa/model-qualification/gemma2-9b-it-q8-source-lock.json",
+            "qa/model-qualification/fixtures/gemma2-it-chat-template-v1.json"
+          ]
         },
         "metadata": {
           "required": true,
@@ -394,14 +396,20 @@
         },
         "tokenizer": {
           "required": true,
-          "status": "pending",
-          "evidence": []
+          "status": "blocked",
+          "evidence": [
+            "src/tokenizer/mod.rs",
+            "qa/model-qualification/fixtures/gemma2-it-chat-template-v1.json"
+          ],
+          "reason": "The Gemma/Llama SPM construction path exists and the pinned metadata contract is known, but no exact-row token-id comparison against the pinned llama.cpp oracle has run."
         },
         "template": {
           "required": true,
-          "status": "blocked",
-          "evidence": [],
-          "reason": "Gemma2 currently borrows the Gemma3 renderer route without an exact Gemma2 template fixture."
+          "status": "pass",
+          "evidence": [
+            "qa/model-qualification/fixtures/gemma2-it-chat-template-v1.json",
+            "src/api/mod.rs"
+          ]
         },
         "load_smoke": {
           "required": true,
@@ -435,19 +443,19 @@
         "architecture": "smollm3",
         "quantization": "Q8_0",
         "gguf_filename": "SmolLM3-Q8_0.gguf",
-        "size_bytes": null,
-        "sha256": null
+        "size_bytes": 3275574624,
+        "sha256": "8aa8cc74656137174a1988d993b00828e65a86fd68773412b632a75aa1373248"
       },
       "source": {
         "repo": "ggml-org/SmolLM3-3B-GGUF",
         "file": "SmolLM3-Q8_0.gguf",
-        "revision": null,
+        "revision": "4965cb60b150737b68a0408c36aeefb65078f894",
         "license": "apache-2.0"
       },
       "expected": {
         "tokenizer_model": "gpt2",
-        "tokenizer_pre": "smollm",
-        "chat_template": "smollm3"
+        "tokenizer_pre": "smaug-bpe",
+        "chat_template": "smollm3_dynamic_chatml"
       },
       "lane": {
         "serve": "cpu_reference",
@@ -468,9 +476,11 @@
       "gates": {
         "source": {
           "required": true,
-          "status": "blocked",
-          "evidence": [],
-          "reason": "A public candidate exists, but its immutable revision, size, and SHA-256 have not been anchored in-repo."
+          "status": "pass",
+          "evidence": [
+            "qa/model-qualification/smollm3-3b-q8-source-lock.json",
+            "qa/model-qualification/fixtures/smollm3-tokenizer-pre-v1.json"
+          ]
         },
         "metadata": {
           "required": true,
@@ -483,17 +493,21 @@
         },
         "tokenizer": {
           "required": true,
-          "status": "fail",
+          "status": "blocked",
           "evidence": [
-            "src/tokenizer/mod.rs"
+            "src/tokenizer/mod.rs",
+            "qa/model-qualification/fixtures/smollm3-tokenizer-pre-v1.json"
           ],
-          "reason": "Real SmolLM3 uses tokenizer.ggml.pre=smollm, which Camelid currently rejects."
+          "reason": "Camelid now resolves the exact row's smaug-bpe metadata as the pinned llama3 alias, and separately implements legacy smollm's two-pass splitter, but no exact-row token-id comparison against the pinned llama.cpp oracle has run."
         },
         "template": {
           "required": true,
           "status": "blocked",
-          "evidence": [],
-          "reason": "Tokenizer support and an exact template fixture are missing."
+          "evidence": [
+            "qa/model-qualification/fixtures/smollm3-tokenizer-pre-v1.json",
+            "src/api/mod.rs"
+          ],
+          "reason": "The pinned 5,493-byte dynamic ChatML template injects current-date metadata, reasoning policy, system overrides, custom instructions, and tool grammars. An executable HOLD prevents it from falling into generic Qwen3 ChatML until a deterministic exact renderer and oracle fixture exist."
         },
         "load_smoke": {
           "required": true,
@@ -526,15 +540,15 @@
         "family": "qwen3_moe",
         "architecture": "qwen3moe",
         "quantization": "Q8_0",
-        "gguf_filename": null,
-        "size_bytes": null,
-        "sha256": null
+        "gguf_filename": "Qwen3-30B-A3B-Q8_0.gguf",
+        "size_bytes": 32483931648,
+        "sha256": "4ad960d180b16f56024f5b704697e5dd5b0837167c2e515ef0569abfc599743c"
       },
       "source": {
-        "repo": null,
-        "file": null,
-        "revision": null,
-        "license": null
+        "repo": "Qwen/Qwen3-30B-A3B-GGUF",
+        "file": "Qwen3-30B-A3B-Q8_0.gguf",
+        "revision": "e4d4bafdfb96a411a163846265362aceb0b9c63a",
+        "license": "apache-2.0"
       },
       "expected": {
         "tokenizer_model": "gpt2",
@@ -556,21 +570,24 @@
         ]
       },
       "target_tier": "experimental_exact_row",
-      "disposition": "blocked",
+      "disposition": "hold",
       "gates": {
         "source": {
           "required": true,
-          "status": "blocked",
-          "evidence": [],
-          "reason": "No authoritative exact public GGUF is anchored in-repo; the browse-test org/Qwen3-MoE-GGUF row is synthetic."
+          "status": "pass",
+          "evidence": [
+            "qa/model-qualification/qwen3-30b-a3b-q8-source-report.json"
+          ]
         },
         "metadata": {
           "required": true,
           "status": "blocked",
           "evidence": [
-            "src/model.rs"
+            "src/model.rs",
+            "qa/model-qualification/qwen3-30b-a3b-q8-source-report.json",
+            "qa/model-qualification/qwen3-30b-a3b-q8-header-inspection.json"
           ],
-          "reason": "Binding code exists, but there is no real-row metadata receipt."
+          "reason": "A bounded remote prefix confirms the qwen3moe/gpt2/qwen2 metadata and all 579 tensor descriptors against the pinned full length. The 32.48 GB payload is not local or fully rehashed, so exact-byte load/parity qualification remains blocked."
         },
         "tokenizer": {
           "required": true,

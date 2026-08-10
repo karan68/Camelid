@@ -4,6 +4,8 @@ import {
   modelInfoUrl,
   resolveHfSource,
   sourceLockFromModelInfo,
+  validateLockAgainstSelection,
+  validateRequestedRevision,
 } from './hf-qualification-source.mjs'
 
 const revision = '1'.repeat(40)
@@ -37,7 +39,7 @@ assert.equal(lock.license, 'apache-2.0')
 assert.equal(lock.download_url, `https://huggingface.co/org/model/resolve/${revision}/weights/model-q8_0.gguf?download=true`)
 
 const namedOtherLicense = structuredClone(info)
-namedOtherLicense.cardData = { license: 'other', license_name: 'LFM Open License v1.0' }
+namedOtherLicense.cardData = { license: 'other', license_name: 'lfm1.0' }
 assert.equal(
   sourceLockFromModelInfo({
     repo: 'org/model',
@@ -75,5 +77,23 @@ const fetched = await resolveHfSource({
 })
 assert.equal(requestedUrl, modelInfoUrl('org/model', revision))
 assert.equal(fetched.sha256, sha256)
+
+const selected = {
+  row_id: 'fixture_row',
+  repo: 'org/model',
+  file: 'weights/model-q8_0.gguf',
+  revision,
+  expected: { size_bytes: 1234, sha256, license: 'apache-2.0' },
+}
+assert.doesNotThrow(() => validateRequestedRevision(selected, revision))
+assert.throws(() => validateRequestedRevision(selected, '2'.repeat(40)), /cannot override pinned roster revision/)
+assert.doesNotThrow(() => validateLockAgainstSelection(lock, selected))
+const wrongIdentity = structuredClone(lock)
+wrongIdentity.sha256 = 'b'.repeat(64)
+assert.throws(
+  () => validateLockAgainstSelection(wrongIdentity, selected),
+  /resolved source does not match roster row fixture_row: sha256/,
+  'row-labelled locks must agree with the roster exact-byte identity',
+)
 
 console.log('test-hf-qualification-source: all checks passed')
