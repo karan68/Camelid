@@ -229,6 +229,8 @@ assert.match(dashboardHookSource, /max_tokens:\s*requestMaxTokens/, 'the compute
 assert.match(dashboardHookSource, /const useExperimentalSampling = selectedModelExperimental && !bitNetB158Chat/, 'experimental BitNet chat must stay on its honest greedy lane')
 assert.match(dashboardHookSource, /temperature:\s*useExperimentalSampling \? 0\.7 : 0/, 'BitNet and supported rows must send greedy temperature zero')
 assert.match(dashboardHookSource, /\.\.\.\(useExperimentalSampling \? \{ top_p: 0\.95, top_k: 20, min_p: 0 \} : \{\}\)/, 'unsupported experimental sampling fields must be omitted from BitNet requests')
+assert.match(dashboardHookSource, /thinkingMode && !bitNetB158Chat \? \{ camelid_enable_thinking: true \}/, 'a stale thinking toggle must not make a BitNet request fail before the UI effect clears it')
+assert.match(chatWorkspaceSource, /isBitNetB158ChatModel\(selectedModel, runtime, selectedModelId\)/, 'BitNet controls must use the exact causal-model detector rather than architecture display metadata alone')
 assert.match(dashboardHookSource, /const outputElapsedMs = liveElapsedMs[\s\S]*tokensPerSecond\(realTokens, outputElapsedMs\)/, 'live output rate must use wall time from request start, matching its end-to-end label')
 assert.match(dashboardHookSource, /getRuntimeRequestModelId\(selectedModel, runtime, selectedModelId\)/, 'chat sends should use the backend active runtime model id when a browser alias is selected')
 assert.doesNotMatch(dashboardHookSource, /Camelid streamed the local reply\./, 'successful streams should not show a noisy demo-breaking toast')
@@ -374,7 +376,7 @@ assert.match(catalogBrowseSource, /refusedByFit[\s\S]*item\.oracle_qualified/, '
 assert.match(catalogBrowseSource, /const refusedByFit = isRefusingFit\(item\.fit\)/, 'auto-start must gate on every load-refusing verdict, not just wont_fit')
 assert.match(modelActivationSource, /if \(!inspectRes\.ok\)[\s\S]*return \{ ok: false, stage: CHECKING, message, code, blocker/, 'automatic activation must fail closed on an HTTP-level inspect failure')
 assert.match(modelActivationSource, /activeFilename !== filename[\s\S]*did not confirm/, 'automatic navigation must wait for current-model confirmation')
-assert.match(modelActivationSource, /v1\/health[\s\S]*health\.loaded_now[\s\S]*health\.generation_ready[\s\S]*health\.active_model_id !== filename/, 'automatic navigation must wait for live generation readiness and active-model identity')
+assert.match(modelActivationSource, /v1\/health[\s\S]*health\.loaded_now[\s\S]*health\.generation_ready[\s\S]*health\.active_model_id !== requestModelId/, 'automatic navigation must wait for live generation readiness and the requested active-model identity')
 assert.match(modelsViewSource, /readActiveFilename: async \(\) => modelFilenameFromPath\(\(await spine\.refreshCurrent\(\)\)\?\.path\)/, 'the Models page must answer the identity check from its own current-model refresh')
 assert.match(appSource, /modelsVisited[\s\S]*hidden=\{tab !== 'library'\}/, 'Models must remain mounted after first visit so active downloads retain their activation coordinator')
 /* First-run activation, same rule for the same reason: an in-flight install must keep

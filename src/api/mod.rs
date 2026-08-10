@@ -7483,6 +7483,13 @@ struct InspectModelResponse {
     /// Fixed native vector width for embedding-only artifacts.
     #[serde(skip_serializing_if = "Option::is_none")]
     native_embedding_dimensions: Option<usize>,
+    /// The file exposes an embedding/reranking runtime rather than a token-
+    /// generation head. This is metadata-derived and independent of whether the
+    /// current host can admit the model.
+    embedding_capable: bool,
+    /// The file can produce completion tokens. Keep this separate from
+    /// `chat_capable`: base completion models may not ship a chat template.
+    generation_capable: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     source: Option<ModelSourceInspection>,
     /// Predicted lane (`supported` / `experimental_implemented` / `unsupported`).
@@ -7524,6 +7531,8 @@ async fn inspect_model(
                     quant: None,
                     embedding_only: false,
                     native_embedding_dimensions: None,
+                    embedding_capable: false,
+                    generation_capable: false,
                     source: Some(source),
                     lane_class: ModelLaneClass::Unsupported,
                     blocker: Some(InspectBlocker {
@@ -7568,6 +7577,8 @@ async fn inspect_model(
     };
 
     let architecture = gguf.architecture().map(ToOwned::to_owned);
+    let embedding_capable = is_embedding_model(&gguf);
+    let generation_capable = is_generation_model(&gguf);
     let filename = req
         .path
         .file_name()
@@ -7576,7 +7587,7 @@ async fn inspect_model(
         .to_string();
     let quant = Some(crate::runnable::headline_quant_of(&gguf)).filter(|q| !q.is_empty());
     let bitnet_embedding = crate::model::is_bitnet_embedding_model(&gguf);
-    let embedding_only = architecture.as_deref() == Some("nomic-bert") || bitnet_embedding;
+    let embedding_only = embedding_capable && !generation_capable;
     let bitnet_embedding_config =
         bitnet_embedding.then(|| validate_bitnet_embedding_metadata(&gguf));
     let native_embedding_dimensions = if let Some(config) = bitnet_embedding_config.as_ref() {
@@ -7619,6 +7630,8 @@ async fn inspect_model(
             quant,
             embedding_only,
             native_embedding_dimensions,
+            embedding_capable,
+            generation_capable,
             source: None,
             lane_class,
             blocker,
@@ -7840,6 +7853,81 @@ fn model_family(gguf: &GgufFile) -> &'static str {
 
 fn is_embedding_model(gguf: &GgufFile) -> bool {
     gguf.architecture() == Some("nomic-bert") || crate::model::is_bitnet_embedding_model(gguf)
+}
+
+/// Whether the GGUF carries the decoder-side token embedding table required by
+/// a text-generation graph. This deliberately leaves companion projectors (for
+/// example CLIP/mmproj GGUFs) in the third, neither-generation-nor-embedding
+/// state instead of treating every non-encoder file as generative.
+fn is_generation_model(gguf: &GgufFile) -> bool {
+    !is_embedding_model(gguf)
+        && gguf
+            .tensors
+            .iter()
+            .any(|tensor| tensor.name == "token_embd.weight")
+}
+
+#[cfg(test)]
+mod model_capability_tests {
+    use std::{collections::BTreeMap, path::PathBuf};
+
+    use super::{is_embedding_model, is_generation_model};
+    use crate::gguf::{GgufFile, GgufMetadataValue, GgufTensorDescriptor, GgufTensorType};
+
+    fn fixture(architecture: &str, name: &str, tensor_names: &[&str]) -> GgufFile {
+        GgufFile {
+            path: PathBuf::from("capability.gguf"),
+            version: 3,
+            tensor_count: tensor_names.len() as i64,
+            metadata_count: 2,
+            alignment: 32,
+            data_start_offset: 0,
+            metadata: BTreeMap::from([
+                (
+                    "general.architecture".to_string(),
+                    GgufMetadataValue::String(architecture.to_string()),
+                ),
+                (
+                    "general.name".to_string(),
+                    GgufMetadataValue::String(name.to_string()),
+                ),
+            ]),
+            tensors: tensor_names
+                .iter()
+                .map(|tensor_name| GgufTensorDescriptor {
+                    name: (*tensor_name).to_string(),
+                    dimensions: vec![8, 8],
+                    tensor_type: GgufTensorType::F32,
+                    relative_offset: 0,
+                    absolute_offset: 0,
+                    n_bytes: 256,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn decoder_encoder_and_projector_capabilities_are_distinct() {
+        let decoder = fixture(
+            "bitnet-b1.58",
+            "bitnet2b",
+            &["token_embd.weight", "output.weight"],
+        );
+        assert!(is_generation_model(&decoder));
+        assert!(!is_embedding_model(&decoder));
+
+        let encoder = fixture(
+            "gemma3",
+            "bitnet-embeddings-270m",
+            &["token_embd.weight", "output_norm.weight"],
+        );
+        assert!(is_embedding_model(&encoder));
+        assert!(!is_generation_model(&encoder));
+
+        let projector = fixture("clip", "vision-projector", &["mm.0.weight"]);
+        assert!(!is_embedding_model(&projector));
+        assert!(!is_generation_model(&projector));
+    }
 }
 
 /// Gemma 4 chat template constants + renderer. Turns are
@@ -27440,6 +27528,11 @@ pub struct LocalModelEntry {
     /// The GGUF ships a chat template â€” i.e. it is an instruction-tuned chat model
     /// (vs a base text-completion model). A model capability, not a system fact.
     pub chat_capable: bool,
+    /// The file exposes an embedding/reranking runtime.
+    pub embedding_capable: bool,
+    /// The file exposes a token-generation head. This intentionally differs from
+    /// `chat_capable`, because base completion models need no chat template.
+    pub generation_capable: bool,
     /// Trained context window (tokens) from the GGUF â€” a model capability.
     pub context_length: Option<u32>,
     /// A validated catalog-managed marker and sibling `.cghost` are present, so
@@ -28602,6 +28695,8 @@ struct CachedLocalMeta {
     admission_reason: Option<String>,
     oracle_qualified: bool,
     chat_capable: bool,
+    embedding_capable: bool,
+    generation_capable: bool,
     context_length: Option<u32>,
 }
 
@@ -28749,10 +28844,14 @@ async fn local_models(
                         admission_reason: None,
                         oracle_qualified: false,
                         chat_capable: false,
+                        embedding_capable: false,
+                        generation_capable: false,
                         context_length: None,
                     };
                     match read_metadata(&path) {
                         Ok(gguf) => {
+                            c.embedding_capable = is_embedding_model(&gguf);
+                            c.generation_capable = is_generation_model(&gguf);
                             let quant = crate::runnable::headline_quant_of(&gguf);
                             c.quantization = Some(quant.clone());
                             // Model capabilities (system-independent): a chat template
@@ -28815,6 +28914,8 @@ async fn local_models(
                 admission_reason: meta.admission_reason,
                 oracle_qualified: meta.oracle_qualified,
                 chat_capable: meta.chat_capable,
+                embedding_capable: meta.embedding_capable,
+                generation_capable: meta.generation_capable,
                 context_length: meta.context_length,
                 ghost_moe_prepared: crate::ghost_install::is_prepared(&path),
                 lane_class,

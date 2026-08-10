@@ -187,8 +187,8 @@ pub struct NomicBertRuntime {
 /// intact while admitting Microsoft's two exact decoder-only BitNet embedding
 /// artifacts through the generic runnable graph.
 pub enum EmbeddingRuntime {
-    Nomic(NomicBertRuntime),
-    BitNet(BitNetEmbeddingRuntime),
+    Nomic(Box<NomicBertRuntime>),
+    BitNet(Box<BitNetEmbeddingRuntime>),
 }
 
 impl std::fmt::Debug for EmbeddingRuntime {
@@ -205,10 +205,12 @@ impl EmbeddingRuntime {
         let path = path.as_ref();
         let gguf = read_metadata(path)?;
         if gguf.architecture() == Some(NOMIC_BERT_ARCH) {
-            return NomicBertRuntime::load(path).map(Self::Nomic);
+            return NomicBertRuntime::load(path).map(Box::new).map(Self::Nomic);
         }
         if is_bitnet_embedding_model(&gguf) {
-            return BitNetEmbeddingRuntime::load(path).map(Self::BitNet);
+            return BitNetEmbeddingRuntime::load(path)
+                .map(Box::new)
+                .map(Self::BitNet);
         }
         Err(BackendError::UnsupportedModelArchitecture(format!(
             "embedding runtime supports {NOMIC_BERT_ARCH:?} and the exact Microsoft BitNet embedding GGUFs; got architecture {:?}, model {:?}",

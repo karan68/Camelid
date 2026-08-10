@@ -21,6 +21,7 @@ import {
 } from '../../lib/catalogBrowse'
 import { SUPPORTED_MODELS } from '../../lib/supportedModels'
 import { formatBytes } from '../../lib/formatters'
+import { isEmbeddingOnlyModel } from '../../lib/modelCapabilities.js'
 import { Button } from '../ui/Button'
 import { EvidenceChip } from '../ui/EvidenceChip'
 import { IconCheck } from '../ui/icons'
@@ -292,6 +293,7 @@ function CatalogRow({
   const acquisitionItemRef = useRef(item)
   const settlementInFlightRef = useRef(false)
   const lane = predictedLane(item, capabilities)
+  const embeddingOnly = isEmbeddingOnlyModel(item)
   const decoration = item.group === 'experimental' ? null : CURATED_DECORATION.get(item.catalog_id)
   // ANY load-refusing verdict must stop the auto-start chain, not just `wont_fit`:
   // the load-time guard refuses both, so chaining into it would end in a 422.
@@ -544,7 +546,9 @@ function CatalogRow({
             {phase === 'checking'
               ? 'Download complete — checking the model…'
               : phase === 'loading'
-                ? 'Check passed — loading the model for Chat…'
+                ? embeddingOnly
+                  ? 'Check passed — loading the embedding sidecar…'
+                  : 'Check passed — loading the model for Chat…'
                 : preparingGhost
                   ? 'Preparing Ghost MoE — repacking routed experts and reclaiming the full download…'
                 : downloading
