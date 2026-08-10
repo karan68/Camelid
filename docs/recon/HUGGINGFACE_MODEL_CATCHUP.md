@@ -44,8 +44,10 @@ page progressively harder to scan.
    passes, including the dialect-specific absent-BOS default. Legacy `smollm`
    remains a distinct two-pass dialect and must not be used as a shortcut; the
    real row's dynamic chat renderer remains the next gate.
-6. **Qwen3 MoE** needs an authoritative artifact anchor and a routing-semantics
-   audit before a large download. Synthetic browse fixtures are not candidates.
+6. **Qwen3 MoE** now has an authoritative official 32.48 GB artifact anchor and
+   clean-head bounded metadata evidence. It still needs exact-row tokenizer and
+   template qualification plus a routing-semantics audit before a large download.
+   Synthetic browse fixtures are not candidates.
 
 The work order reflects implementation closeness. The full LFM2 artifact has
 now been identity-checked and exercised at its pinned SHA-256; its promotion no
@@ -65,7 +67,7 @@ promotion; the other five families remain active dispositions:
 | Phi-3 | Generic head-dim-96 CPU cache reads are bit-identical; the unproven partial Metal PV tile now falls back. | Repeat the exact-row Metal prefill/decode receipt before changing the HOLD. |
 | Gemma 2 | Source identity, clean-head bounded exact-row metadata, seven-case tokenizer parity, and the exact IT template route pass; substituted templates and invalid shapes fail closed. | Full-artifact identity/load and greedy parity, then API/WebUI/context. |
 | SmolLM3 | Source, clean-head bounded exact-row metadata, and the 10-case `smaug-bpe` tokenizer pack pass. Its absent BOS metadata resolves exactly like pinned llama.cpp, while the dynamic chat template remains under an executable HOLD. | Build a deterministic renderer for its date/reasoning/system/tool contract; load, generation, API/WebUI, and context remain blocked behind that template/runtime work. |
-| Qwen3 MoE | Official 32.48 GB row is pinned; a bounded 32 MiB prefix confirms all 579 descriptors. | Full-artifact identity/load and MoE parity; remote metadata alone is not a promotion. |
+| Qwen3 MoE | Source identity and clean-head bounded metadata pass for the official 32.48 GB row; the exact 32 MiB prefix confirms `qwen3moe` / `gpt2` / `qwen2`, the Q8_0/F32 inventory, and all 579 descriptors. | Qualify the exact-row tokenizer and embedded Qwen3 template, then full-artifact identity/load and MoE parity; remote metadata alone is not a support promotion. |
 
 Phase 1 remains active for Qwen2.5, Phi-3, Gemma 2, SmolLM3, and Qwen3 MoE.
 LFM2's completed exact row does not promote those families or any adjacent

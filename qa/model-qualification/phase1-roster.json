@@ -589,13 +589,11 @@
         },
         "metadata": {
           "required": true,
-          "status": "blocked",
+          "status": "pass",
           "evidence": [
             "src/model.rs",
-            "qa/model-qualification/qwen3-30b-a3b-q8-source-report.json",
             "qa/model-qualification/qwen3-30b-a3b-q8-header-inspection.json"
-          ],
-          "reason": "A bounded remote prefix confirms the qwen3moe/gpt2/qwen2 metadata and all 579 tensor descriptors against the pinned full length. The 32.48 GB payload is not local or fully rehashed, so exact-byte load/parity qualification remains blocked."
+          ]
         },
         "tokenizer": {
           "required": true,

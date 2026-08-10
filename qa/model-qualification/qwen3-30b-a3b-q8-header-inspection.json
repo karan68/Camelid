@@ -1,57 +1,77 @@
 {
-  "schema": "camelid.remote-gguf-header-inspection-summary/v1",
-  "generated_at": "2026-08-10T07:18:56Z",
+  "schema": "camelid.remote-gguf-header-inspection/v1",
   "row_id": "qwen3_30b_a3b_q8_0",
+  "generated_at": "2026-08-10T19:00:49.656Z",
+  "host": {
+    "hostname_redacted": true,
+    "platform": "win32",
+    "release": "10.0.26220",
+    "arch": "x64"
+  },
+  "inspector": {
+    "version": "camelid v0.6.1-33-g115d793f",
+    "binary_sha256": "a60713982d012c162bb1c02083b98ed5dc1eb1f457dc2706ef46fd03e700171b",
+    "source_head": "115d793f851c0abf564ba99aa754757de7104ebb",
+    "binary_commit_abbrev": "115d793f",
+    "binary_reports_dirty": false,
+    "binary_matches_source_head": true,
+    "clean_current_head": true,
+    "binary_path_redacted": true,
+    "command": [
+      "<camelid>",
+      "inspect-prefix",
+      "<remote-gguf-prefix>",
+      "--declared-len",
+      "32483931648"
+    ]
+  },
   "source": {
     "repo": "Qwen/Qwen3-30B-A3B-GGUF",
     "file": "Qwen3-30B-A3B-Q8_0.gguf",
     "revision": "e4d4bafdfb96a411a163846265362aceb0b9c63a",
     "size_bytes": 32483931648,
-    "hf_lfs_sha256": "4ad960d180b16f56024f5b704697e5dd5b0837167c2e515ef0569abfc599743c"
+    "sha256": "4ad960d180b16f56024f5b704697e5dd5b0837167c2e515ef0569abfc599743c"
   },
-  "probe": {
-    "command": "node scripts/hf-qualification-header.mjs --row qwen3_30b_a3b_q8_0 --camelid <camelid>",
-    "prefix_requested_bytes": 33554432,
-    "prefix_received_bytes": 33554432,
+  "range": {
+    "requested_bytes": 33554432,
+    "received_bytes": 33554432,
     "content_range": {
       "start": 0,
       "end": 33554431,
       "total": 32483931648
     },
-    "temporary_path_redacted": true
+    "prefix_sha256": "55c565264523c5862247d983f857b9034c04d762ee14fecfd68a827cdbb2d566"
   },
-  "observed": {
-    "gguf_version": 3,
+  "inspection": {
+    "version": 3,
+    "tensor_count": 579,
+    "metadata_count": 31,
     "alignment": 32,
     "data_start_offset": 5969408,
-    "metadata_count": 31,
-    "tensor_count": 579,
-    "general_name": "Qwen3 30Ba3 Instruct",
-    "architecture": "qwen3moe",
-    "general_file_type": 7,
-    "tokenizer_model": "gpt2",
-    "tokenizer_pre": "qwen2",
-    "context_length": 40960,
-    "embedding_length": 2048,
-    "block_count": 48,
-    "expert_count": 128,
-    "expert_used_count": 8,
-    "expert_weights_norm_present": false,
-    "expert_weights_scale_present": false,
-    "expert_gating_func_present": false,
-    "tensor_types": {
-      "Q8_0": 338,
-      "F32": 241
+    "observed": {
+      "architecture": "qwen3moe",
+      "general_file_type": 7,
+      "tokenizer_model": "gpt2",
+      "tokenizer_pre": "qwen2",
+      "headline_quant": "Q8_0"
     },
-    "tensor_payload_n_bytes": 32477962240,
-    "tensor_inventory_sha256": "8cf88e2856a5aff086e8ea0f2767e7af63a9feac1b721e7df676b472d9f2cdcf"
+    "tensor_inventory": {
+      "sha256": "8cf88e2856a5aff086e8ea0f2767e7af63a9feac1b721e7df676b472d9f2cdcf",
+      "total_n_bytes": 32477962240,
+      "types": {
+        "Q8_0": 338,
+        "F32": 241
+      }
+    }
   },
-  "result": {
-    "header_parse": "pass",
-    "full_artifact_hash": "not_run",
+  "scope": {
+    "prefix_sha256": "all_received_prefix_bytes",
+    "tensor_payload": "partially_range_fetched_opaque",
+    "full_artifact_sha256": "not_run",
+    "tensor_payload_interpretation": "not_run",
     "load": "not_run",
-    "generation": "not_run",
-    "support_decision": "hold"
+    "generation": "not_run"
   },
-  "note": "The remote prefix is served from the immutable Hugging Face revision and every tensor descriptor is bounds-checked against the pinned full length. The full 32.48 GB payload was not downloaded or locally rehashed, so this is metadata preflight evidence only and cannot promote load, parity, API, context, or support."
+  "support_claim": false,
+  "note": "Remote header inspection validates metadata and tensor descriptors against the pinned full length. The prefix SHA-256 covers every received byte, including any opaque initial tensor payload after data_start_offset; the remaining payload is not fetched, and no tensor payload is interpreted, loaded as model weights, or used for inference or generation."
 }
