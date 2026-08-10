@@ -1,6 +1,7 @@
 import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { getChatGateState } from '../lib/chatGate'
 import { displayQuantLabel, exactArtifactFilenameForRow } from '../lib/capabilities'
+import { formatModelLabel } from '../lib/formatters'
 import { applyGemma4GhostChatTokenCap, getConfiguredMaxTokens, modelContextLength, validateSendBudget } from '../lib/responseLimits'
 import { CamelidMark } from '../components/ui/CamelidMark'
 import { Avatar } from '../components/ui/Avatar'
@@ -444,14 +445,18 @@ export default function ChatWorkspace({
   const runnableModels = models.filter(modelCanChat)
   const waitingModels = models.filter((model) => !modelCanChat(model))
   const selectedPickerModelId = models.some((model) => model.id === selectedModel?.id) ? selectedModel.id : ''
+  /* The picker sat next to a top bar and message footer that both render clean
+     names, while it showed the raw GGUF filename — one model wearing two names
+     in the same view. formatModelLabel passes display names through untouched. */
   const modelOptionLabel = (model) => {
     const gate = getChatGateState(capabilities, model, runtime)
-    if (gate.chatUnlocked) return `${model.name} · Ready`
-    if (gate.chatMode === 'experimental') return `${model.name} · Experimental ready`
-    if (apiUnavailable) return `${model.name} · Not connected`
-    if (gate.runtimeReady) return `${model.name} · Not verified`
-    if (gate.runtimeLoaded) return `${model.name} · Loading`
-    return `${model.name} · Not loaded`
+    const name = formatModelLabel(model.name)
+    if (gate.chatUnlocked) return `${name} · Ready`
+    if (gate.chatMode === 'experimental') return `${name} · Experimental ready`
+    if (apiUnavailable) return `${name} · Not connected`
+    if (gate.runtimeReady) return `${name} · Not verified`
+    if (gate.runtimeLoaded) return `${name} · Loading`
+    return `${name} · Not loaded`
   }
 
   /* Send-time budget check: the response limit is an upper bound the backend
