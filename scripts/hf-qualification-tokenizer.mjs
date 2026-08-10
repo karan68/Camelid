@@ -25,6 +25,8 @@ const PINNED_LLAMA_TOKENIZE_SHA256 = 'a44a4d7e1445d22a4cffb0d38f6efa8f1d81e84ae2
 const PINNED_LLAMA_CLI_SHA256 = '2ec09da0b81d0201ce5b21810caefb4e77fd108f383b30c15ca493c5a70f7731'
 const GEMMA2_TEMPLATE_SHA256 = 'ecd6ae513fe103f0eb62e8ab5bfa8d0fe45c1074fa398b089c93a7e70c15cfd6'
 const SMOLLM3_TEMPLATE_SHA256 = 'b9b66f04c64fbb8695cf5b35c37780efd0b8e0829fbfe3e30fafb9f469b7d30e'
+const QWEN3_MOE_TEMPLATE_SHA256 = '57f1fd00f0013a2be96aa79b857391f27e23df5b5f847072b524c897e24d0361'
+const TOKENIZER_SCOPE_NOTE = 'the prefix hash includes opaque initial tensor payload bytes after data_start_offset; it is not a full payload or full artifact hash'
 
 const TOKENIZER_ERROR_CONTRACTS = Object.freeze({
   tokenizer_pack_unavailable: ['blocked', 'no bounded tokenizer pack is defined for this exact row'],
@@ -197,6 +199,113 @@ const SMOLLM3_CASES = [
   },
 ]
 
+const QWEN3_MOE_CASES = [
+  {
+    id: 'empty_with_add_special',
+    text: '',
+    add_special: true,
+    parse_special: false,
+    expected_ids: [],
+  },
+  {
+    id: 'plain_ascii_with_add_special',
+    text: 'Hello',
+    add_special: true,
+    parse_special: false,
+    expected_ids: [9_707],
+  },
+  {
+    id: 'plain_ascii_without_add_special',
+    text: 'Hello',
+    add_special: false,
+    parse_special: false,
+    expected_ids: [9_707],
+  },
+  {
+    id: 'qwen2_unicode_spacing_and_contractions',
+    text: "  na\u00efve caf\u00e9 \u4e2d\u6587\uff11\uff12\uff13 can't I'M we'd",
+    add_special: true,
+    parse_special: false,
+    expected_ids: [
+      220, 94_880, 586, 51_950, 72_858, 16_744, 20_109, 24_918,
+      33_517, 646, 944, 358, 27_603, 582, 4_172,
+    ],
+  },
+  {
+    id: 'qwen2_digits_punctuation_newlines_and_case',
+    text: "x  y 1234 a/b\nCAN'T we're!!!",
+    add_special: true,
+    parse_special: false,
+    expected_ids: [
+      87, 220, 379, 220, 16, 17, 18, 19, 264, 3_470, 198,
+      41_955, 17_323, 582, 2_299, 12_069,
+    ],
+  },
+  {
+    id: 'single_user_chat_controls',
+    text: '<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n',
+    add_special: true,
+    parse_special: true,
+    expected_ids: [151_644, 872, 198, 9_707, 151_645, 198, 151_644, 77_091, 198],
+  },
+  {
+    id: 'multi_turn_chat_controls',
+    text: '<|im_start|>user\nFirst<|im_end|>\n<|im_start|>assistant\nOne<|im_end|>\n<|im_start|>user\nSecond<|im_end|>\n<|im_start|>assistant\n',
+    add_special: true,
+    parse_special: true,
+    expected_ids: [
+      151_644, 872, 198, 5_338, 151_645, 198, 151_644, 77_091, 198,
+      3_966, 151_645, 198, 151_644, 872, 198, 15_666, 151_645, 198,
+      151_644, 77_091, 198,
+    ],
+  },
+  {
+    id: 'chat_controls_as_ordinary_text',
+    text: '<|im_start|>user\nHello<|im_end|>\n',
+    add_special: true,
+    parse_special: false,
+    expected_ids: [
+      27, 91, 318, 4_906, 91, 29, 872, 198, 9_707,
+      27, 91, 318, 6_213, 91, 397,
+    ],
+  },
+  {
+    id: 'user_defined_tool_tags_with_parse_special',
+    text: '<tool_call>{"name":"weather"}</tool_call>',
+    add_special: true,
+    parse_special: true,
+    expected_ids: [151_657, 4_913, 606, 3_252, 15_206, 9_207, 151_658],
+  },
+  {
+    id: 'user_defined_tool_tags_without_parse_special',
+    text: '<tool_call>{"name":"weather"}</tool_call>',
+    add_special: true,
+    parse_special: false,
+    expected_ids: [151_657, 4_913, 606, 3_252, 15_206, 9_207, 151_658],
+  },
+  {
+    id: 'user_defined_think_tags_with_parse_special',
+    text: '<think>reason</think>',
+    add_special: true,
+    parse_special: true,
+    expected_ids: [151_667, 19_895, 151_668],
+  },
+  {
+    id: 'unused_pad_with_parse_special',
+    text: '[PAD151669]',
+    add_special: true,
+    parse_special: true,
+    expected_ids: [42_347, 1_808, 16, 20, 16, 21, 21, 24, 60],
+  },
+  {
+    id: 'unused_pad_without_parse_special',
+    text: '[PAD151669]',
+    add_special: true,
+    parse_special: false,
+    expected_ids: [42_347, 1_808, 16, 20, 16, 21, 21, 24, 60],
+  },
+]
+
 function parseArgs(argv) {
   const args = new Map()
   for (let index = 0; index < argv.length; index += 1) {
@@ -211,6 +320,22 @@ function parseArgs(argv) {
 
 function sha256(bytes) {
   return createHash('sha256').update(bytes).digest('hex')
+}
+
+function exactObjectKeys(value, expectedKeys) {
+  return value !== null
+    && typeof value === 'object'
+    && !Array.isArray(value)
+    && JSON.stringify(Object.keys(value).sort()) === JSON.stringify([...expectedKeys].sort())
+}
+
+function tokenizerDoesNotProve(pack) {
+  return [
+    'full artifact integrity or presence on this host',
+    'weight load, logits, generation, or greedy-token parity',
+    'API, SSE, Models page, WebUI, or context readiness',
+    `sampling, tools, GPU execution, performance, neighboring rows, or broad ${pack.family} support`,
+  ]
 }
 
 function makeVocabOnlyGguf(prefix) {
@@ -314,10 +439,11 @@ async function readSourceProvenance(root) {
 async function verifyLlamaCppPackage(llamaTokenize, {
   execImpl = execFileAsync,
   readFileImpl = readFile,
+  platform = process.platform,
 } = {}) {
   const companion = join(
     dirname(llamaTokenize),
-    process.platform === 'win32' ? 'llama-cli.exe' : 'llama-cli',
+    platform === 'win32' ? 'llama-cli.exe' : 'llama-cli',
   )
   let output = ''
   try {
@@ -329,6 +455,11 @@ async function verifyLlamaCppPackage(llamaTokenize, {
   } catch (error) {
     // The pinned Windows b9632 launcher reports its version and exits 1. Accept
     // that historical quirk only when the output still carries the exact pin.
+    const knownWindowsExitOne = platform === 'win32'
+      && error?.code === 1
+      && error?.killed !== true
+      && (error?.signal === null || error?.signal === undefined)
+    if (!knownWindowsExitOne) throw error
     output = `${error.stdout || ''}\n${error.stderr || ''}`
     if (!output.trim()) throw error
   }
@@ -559,6 +690,128 @@ function assertSmolLM3TokenizerMetadata(inspection) {
   }
 }
 
+function assertQwen3MoeTokenizerMetadata(inspection) {
+  const metadata = inspection?.metadata
+  if (!metadata || typeof metadata !== 'object') {
+    throw new Error('prefix inspection did not return metadata')
+  }
+  const exact = [
+    ['general.architecture', 'qwen3moe'],
+    ['tokenizer.ggml.model', 'gpt2'],
+    ['tokenizer.ggml.pre', 'qwen2'],
+    ['tokenizer.ggml.bos_token_id', 151_643],
+    ['tokenizer.ggml.eos_token_id', 151_645],
+    ['tokenizer.ggml.padding_token_id', 151_643],
+    ['tokenizer.ggml.add_bos_token', false],
+  ]
+  for (const [key, expected] of exact) {
+    if (metadata[key] !== expected) {
+      throw new Error(`Qwen3 MoE tokenizer metadata ${key} mismatch`)
+    }
+  }
+  for (const key of [
+    'tokenizer.ggml.add_eos_token',
+    'tokenizer.ggml.add_space_prefix',
+  ]) {
+    if (Object.hasOwn(metadata, key)) {
+      throw new Error(`Qwen3 MoE exact row unexpectedly declares ${key}`)
+    }
+  }
+
+  const tokens = metadata['tokenizer.ggml.tokens']
+  const merges = metadata['tokenizer.ggml.merges']
+  const types = metadata['tokenizer.ggml.token_type']
+  if (!Array.isArray(tokens) || tokens.length !== 151_936) {
+    throw new Error('Qwen3 MoE tokenizer token array is missing or not 151936 entries')
+  }
+  if (!Array.isArray(merges) || merges.length !== 151_387) {
+    throw new Error('Qwen3 MoE tokenizer merge array is missing or not 151387 entries')
+  }
+  if (!Array.isArray(types) || types.length !== tokens.length) {
+    throw new Error('Qwen3 MoE tokenizer type array is missing or length-mismatched')
+  }
+  if (!types.every((type) => Number.isSafeInteger(type))) {
+    throw new Error('Qwen3 MoE tokenizer type array contains a non-integer entry')
+  }
+
+  const tokenTypeCounts = Object.create(null)
+  for (const type of types) tokenTypeCounts[type] = (tokenTypeCounts[type] || 0) + 1
+  const normalTokenCount = tokenTypeCounts[1] || 0
+  const controlTokenCount = tokenTypeCounts[3] || 0
+  const userDefinedTokenCount = tokenTypeCounts[4] || 0
+  const unusedTokenCount = tokenTypeCounts[5] || 0
+  const specialTokenCount = tokens.length - normalTokenCount
+  if (normalTokenCount !== 151_643
+    || controlTokenCount !== 20
+    || userDefinedTokenCount !== 6
+    || unusedTokenCount !== 267
+    || specialTokenCount !== 293
+    || Object.keys(tokenTypeCounts).some((type) => !['1', '3', '4', '5'].includes(type))) {
+    throw new Error('Qwen3 MoE tokenizer special-token type counts mismatch')
+  }
+
+  for (const [id, expected, expectedType] of [
+    [151_643, '<|endoftext|>', 3],
+    [151_644, '<|im_start|>', 3],
+    [151_645, '<|im_end|>', 3],
+    [151_657, '<tool_call>', 4],
+    [151_658, '</tool_call>', 4],
+    [151_665, '<tool_response>', 4],
+    [151_666, '</tool_response>', 4],
+    [151_667, '<think>', 4],
+    [151_668, '</think>', 4],
+  ]) {
+    if (tokens[id] !== expected || types[id] !== expectedType) {
+      throw new Error(`Qwen3 MoE tokenizer special token ${id} mismatch`)
+    }
+  }
+  for (let id = 151_669; id < 151_936; id += 1) {
+    if (tokens[id] !== `[PAD${id}]` || types[id] !== 5) {
+      throw new Error(`Qwen3 MoE tokenizer unused token ${id} mismatch`)
+    }
+  }
+
+  const template = metadata['tokenizer.chat_template']
+  if (typeof template !== 'string'
+    || Buffer.byteLength(template) !== 4_100
+    || sha256(Buffer.from(template)) !== QWEN3_MOE_TEMPLATE_SHA256) {
+    throw new Error('Qwen3 MoE tokenizer chat template does not match the pinned exact-row hash')
+  }
+  return {
+    token_count: tokens.length,
+    merge_count: merges.length,
+    token_type_count: types.length,
+    normal_token_count: normalTokenCount,
+    special_token_count: specialTokenCount,
+    control_token_count: controlTokenCount,
+    user_defined_token_count: userDefinedTokenCount,
+    unused_token_count: unusedTokenCount,
+    bos_token_id: 151_643,
+    eos_token_id: 151_645,
+    padding_token_id: 151_643,
+    declared_add_bos_token: false,
+    declared_add_eos_token: 'absent',
+    declared_add_space_prefix: 'absent',
+    oracle_resolved_add_bos_token: false,
+    oracle_resolved_add_eos_token: false,
+    special_token_ids: {
+      endoftext: 151_643,
+      im_start: 151_644,
+      im_end: 151_645,
+      tool_call_start: 151_657,
+      tool_call_end: 151_658,
+      tool_response_start: 151_665,
+      tool_response_end: 151_666,
+      think_start: 151_667,
+      think_end: 151_668,
+      unused_first: 151_669,
+      unused_last: 151_935,
+    },
+    chat_template_utf8_bytes: Buffer.byteLength(template),
+    chat_template_sha256: sha256(Buffer.from(template)),
+  }
+}
+
 const TOKENIZER_PACKS = Object.freeze({
   gemma2_9b_it_q8_0: Object.freeze({
     family: 'Gemma',
@@ -615,6 +868,55 @@ const TOKENIZER_PACKS = Object.freeze({
       }),
       chat_template_utf8_bytes: 5_493,
       chat_template_sha256: SMOLLM3_TEMPLATE_SHA256,
+    }),
+  }),
+  qwen3_30b_a3b_q8_0: Object.freeze({
+    family: 'Qwen3 MoE',
+    cases: QWEN3_MOE_CASES,
+    assertMetadata: assertQwen3MoeTokenizerMetadata,
+    tensorCount: 579,
+    metadataCount: 31,
+    prefixBytes: DEFAULT_PREFIX_BYTES,
+    prefixSha256: '55c565264523c5862247d983f857b9034c04d762ee14fecfd68a827cdbb2d566',
+    derivativeSha256: '39c4ed3e1ec5dbf8b1582bef982b97436e2d83709cf02195255d7908c595a54d',
+    supportDecision: 'qwen3_moe_exact_row_tokenizer_gate_only',
+    requireReceiptLicense: true,
+    grounding: Object.freeze({
+      header_receipt: 'qa/model-qualification/qwen3-30b-a3b-q8-header-inspection.json',
+      header_receipt_sha256: '293f8dd99f4f31478a0a6a7b3fc9c3e6a1c224a9df0b1dc3253e619d93a2dc33',
+    }),
+    metadataSummary: Object.freeze({
+      token_count: 151_936,
+      merge_count: 151_387,
+      token_type_count: 151_936,
+      normal_token_count: 151_643,
+      special_token_count: 293,
+      control_token_count: 20,
+      user_defined_token_count: 6,
+      unused_token_count: 267,
+      bos_token_id: 151_643,
+      eos_token_id: 151_645,
+      padding_token_id: 151_643,
+      declared_add_bos_token: false,
+      declared_add_eos_token: 'absent',
+      declared_add_space_prefix: 'absent',
+      oracle_resolved_add_bos_token: false,
+      oracle_resolved_add_eos_token: false,
+      special_token_ids: Object.freeze({
+        endoftext: 151_643,
+        im_start: 151_644,
+        im_end: 151_645,
+        tool_call_start: 151_657,
+        tool_call_end: 151_658,
+        tool_response_start: 151_665,
+        tool_response_end: 151_666,
+        think_start: 151_667,
+        think_end: 151_668,
+        unused_first: 151_669,
+        unused_last: 151_935,
+      }),
+      chat_template_utf8_bytes: 4_100,
+      chat_template_sha256: QWEN3_MOE_TEMPLATE_SHA256,
     }),
   }),
 })
@@ -684,7 +986,26 @@ function assessTokenizerReceiptForPack(receipt, row, defaults, pack, {
   const check = (condition, message) => { if (!condition) errors.push(message) }
   const parityCheck = (condition, message) => { if (!condition) parityErrors.push(message) }
   const shaRe = /^[0-9a-f]{64}$/
+  const expectedTopLevelKeys = [
+    'schema',
+    'generated_at',
+    'provenance',
+    'row_id',
+    'host',
+    'source',
+    'bounded_fetch',
+    ...(pack.grounding ? ['grounding'] : []),
+    'tokenizer_metadata',
+    'camelid',
+    'oracle',
+    'cases',
+    'result',
+    'does_not_prove',
+  ]
   check(row?.id && TOKENIZER_PACKS[row.id] === pack, 'row is not bound to this tokenizer pack')
+  if (row?.id === 'qwen3_30b_a3b_q8_0') {
+    check(exactObjectKeys(receipt, expectedTopLevelKeys), 'receipt top-level fields mismatch')
+  }
   check(receipt?.schema === 'camelid.header-tokenizer-parity/v1', 'schema mismatch')
   check(receipt?.row_id === row.id, 'row_id mismatch')
   check(typeof receipt?.generated_at === 'string'
@@ -741,9 +1062,13 @@ function assessTokenizerReceiptForPack(receipt, row, defaults, pack, {
   check(bounded.prefix_sha256 === pack.prefixSha256, 'prefix SHA-256 does not match the grounded exact-row prefix')
   check(bounded.temporary_paths_redacted === true, 'temporary paths are not redacted')
   check(bounded.temporary_files_deleted === true, 'temporary files were not confirmed deleted')
+  if (row?.id === 'qwen3_30b_a3b_q8_0') {
+    check(bounded.scope_note === TOKENIZER_SCOPE_NOTE, 'bounded scope note mismatch')
+  }
   if (pack.grounding) {
-    check(receipt?.grounding?.header_receipt === pack.grounding.header_receipt, 'grounding header receipt mismatch')
-    check(receipt?.grounding?.tokenizer_pre_fixture === pack.grounding.tokenizer_pre_fixture, 'grounding tokenizer fixture mismatch')
+    for (const [field, expected] of Object.entries(pack.grounding)) {
+      check(receipt?.grounding?.[field] === expected, `grounding ${field} mismatch`)
+    }
   }
 
   const metadata = receipt?.tokenizer_metadata || {}
@@ -765,7 +1090,12 @@ function assessTokenizerReceiptForPack(receipt, row, defaults, pack, {
   check(receipt?.oracle?.derivative?.original_tensor_count === pack.tensorCount, 'derivative tensor count mismatch')
   check(receipt?.oracle?.derivative?.metadata_count === pack.metadataCount, 'derivative metadata count mismatch')
   check(receipt?.oracle?.derivative?.patch_offset === 8, 'derivative patch offset mismatch')
-  check(shaRe.test(receipt?.oracle?.derivative?.sha256 || ''), 'derivative SHA-256 is invalid')
+  if (pack.derivativeSha256) {
+    check(receipt?.oracle?.derivative?.sha256 === pack.derivativeSha256,
+      'derivative SHA-256 does not match the deterministic exact-row derivative')
+  } else {
+    check(shaRe.test(receipt?.oracle?.derivative?.sha256 || ''), 'derivative SHA-256 is invalid')
+  }
 
   const tokenCount = pack.metadataSummary.token_count
   const cases = Array.isArray(receipt?.cases) ? receipt.cases : []
@@ -785,6 +1115,12 @@ function assessTokenizerReceiptForPack(receipt, row, defaults, pack, {
     check(observed.add_special === expected.add_special, `case ${expected.id} add_special mismatch`)
     check(observed.parse_special === expected.parse_special, `case ${expected.id} parse_special mismatch`)
     check(idsValid, `case ${expected.id} has invalid token IDs`)
+    if (Array.isArray(expected.expected_ids)) {
+      check(JSON.stringify(observed.camelid_ids) === JSON.stringify(expected.expected_ids),
+        `case ${expected.id} Camelid IDs do not match the pinned exact array`)
+      check(JSON.stringify(observed.llama_cpp_ids) === JSON.stringify(expected.expected_ids),
+        `case ${expected.id} llama.cpp IDs do not match the pinned exact array`)
+    }
     check(observed.exact_match === idsMatch, `case ${expected.id} exact_match is not derived from token IDs`)
     parityCheck(idsMatch, `case ${expected.id} token IDs diverge`)
     check(shaRe.test(observed.camelid_decoded_sha256 || ''), `case ${expected.id} decoded SHA-256 is invalid`)
@@ -793,6 +1129,16 @@ function assessTokenizerReceiptForPack(receipt, row, defaults, pack, {
   check(receipt?.result?.exact_match_count === exactMatches, 'result exact_match_count mismatch')
   check(receipt?.result?.all_token_ids_match === (exactMatches === pack.cases.length), 'result all_token_ids_match mismatch')
   check(receipt?.result?.support_decision === pack.supportDecision, 'support decision widened unexpectedly')
+  if (row?.id === 'qwen3_30b_a3b_q8_0') {
+    check(exactObjectKeys(receipt?.result, [
+      'case_count',
+      'exact_match_count',
+      'all_token_ids_match',
+      'support_decision',
+    ]), 'result fields mismatch')
+    check(JSON.stringify(receipt?.does_not_prove) === JSON.stringify(tokenizerDoesNotProve(pack)),
+      'does_not_prove exclusions mismatch')
+  }
 
   if (row.id === 'smollm3_3b_q8_0') {
     const emptyWithSpecial = cases.find((testCase) => testCase?.id === 'empty_with_add_special')
@@ -854,6 +1200,69 @@ function assessTokenizerReceiptForPack(receipt, row, defaults, pack, {
     'SmolLM3 USER_DEFINED tool tags changed with parse_special or lost exact boundary IDs')
   }
 
+  if (row.id === 'qwen3_30b_a3b_q8_0') {
+    const emptyWithSpecial = cases.find((testCase) => testCase?.id === 'empty_with_add_special')
+    const helloWithSpecial = cases.find((testCase) => testCase?.id === 'plain_ascii_with_add_special')
+    const helloWithoutSpecial = cases.find((testCase) => testCase?.id === 'plain_ascii_without_add_special')
+    check(Boolean(emptyWithSpecial)
+      && validIdArray(emptyWithSpecial.camelid_ids, tokenCount)
+      && validIdArray(emptyWithSpecial.llama_cpp_ids, tokenCount)
+      && emptyWithSpecial.camelid_ids.length === 0
+      && emptyWithSpecial.llama_cpp_ids.length === 0,
+    'Qwen3 MoE add_bos=false did not preserve empty add-special output')
+    check(Boolean(helloWithSpecial && helloWithoutSpecial)
+      && JSON.stringify(helloWithSpecial.camelid_ids) === '[9707]'
+      && JSON.stringify(helloWithSpecial.llama_cpp_ids) === '[9707]'
+      && JSON.stringify(helloWithoutSpecial.camelid_ids) === '[9707]'
+      && JSON.stringify(helloWithoutSpecial.llama_cpp_ids) === '[9707]',
+    'Qwen3 MoE add_bos=false did not preserve exact Hello token IDs')
+
+    const parsedChat = cases.find((testCase) => testCase?.id === 'single_user_chat_controls')
+    const ordinaryChat = cases.find((testCase) => testCase?.id === 'chat_controls_as_ordinary_text')
+    check(Boolean(parsedChat)
+      && validIdArray(parsedChat.camelid_ids, tokenCount)
+      && validIdArray(parsedChat.llama_cpp_ids, tokenCount)
+      && parsedChat.camelid_ids.includes(151_644)
+      && parsedChat.camelid_ids.includes(151_645)
+      && parsedChat.llama_cpp_ids.includes(151_644)
+      && parsedChat.llama_cpp_ids.includes(151_645),
+    'Qwen3 MoE CONTROL ChatML markers were not parsed to their exact IDs')
+    check(Boolean(ordinaryChat)
+      && validIdArray(ordinaryChat.camelid_ids, tokenCount)
+      && validIdArray(ordinaryChat.llama_cpp_ids, tokenCount)
+      && !ordinaryChat.camelid_ids.includes(151_644)
+      && !ordinaryChat.camelid_ids.includes(151_645)
+      && !ordinaryChat.llama_cpp_ids.includes(151_644)
+      && !ordinaryChat.llama_cpp_ids.includes(151_645),
+    'Qwen3 MoE CONTROL ChatML markers parsed despite parse_special=false')
+
+    const toolWithParse = cases.find((testCase) => testCase?.id === 'user_defined_tool_tags_with_parse_special')
+    const toolWithoutParse = cases.find((testCase) => testCase?.id === 'user_defined_tool_tags_without_parse_special')
+    check(Boolean(toolWithParse && toolWithoutParse)
+      && JSON.stringify(toolWithParse.camelid_ids) === JSON.stringify(toolWithoutParse.camelid_ids)
+      && JSON.stringify(toolWithParse.llama_cpp_ids) === JSON.stringify(toolWithoutParse.llama_cpp_ids)
+      && toolWithParse.camelid_ids?.[0] === 151_657
+      && toolWithParse.camelid_ids?.at?.(-1) === 151_658
+      && toolWithParse.llama_cpp_ids?.[0] === 151_657
+      && toolWithParse.llama_cpp_ids?.at?.(-1) === 151_658,
+    'Qwen3 MoE USER_DEFINED tool tags changed with parse_special or lost exact boundary IDs')
+
+    const parsedThink = cases.find((testCase) => testCase?.id === 'user_defined_think_tags_with_parse_special')
+    check(Boolean(parsedThink)
+      && JSON.stringify(parsedThink.camelid_ids) === '[151667,19895,151668]'
+      && JSON.stringify(parsedThink.llama_cpp_ids) === '[151667,19895,151668]',
+    'Qwen3 MoE USER_DEFINED think tags lost their exact boundary IDs')
+
+    const padWithParse = cases.find((testCase) => testCase?.id === 'unused_pad_with_parse_special')
+    const padWithoutParse = cases.find((testCase) => testCase?.id === 'unused_pad_without_parse_special')
+    check(Boolean(padWithParse && padWithoutParse)
+      && JSON.stringify(padWithParse.camelid_ids) === JSON.stringify(padWithoutParse.camelid_ids)
+      && JSON.stringify(padWithParse.llama_cpp_ids) === JSON.stringify(padWithoutParse.llama_cpp_ids)
+      && !padWithParse.camelid_ids?.includes?.(151_669)
+      && !padWithParse.llama_cpp_ids?.includes?.(151_669),
+    'Qwen3 MoE UNUSED padding token was parsed as a special token')
+  }
+
   const serialized = JSON.stringify(receipt)
   check(!/[A-Za-z]:[\\/]/.test(serialized), 'receipt exposes an absolute Windows path')
   check(!/(?:\/Users\/|\/home\/|\/tmp\/)/i.test(serialized), 'receipt exposes an absolute local path')
@@ -888,6 +1297,16 @@ function validateSmolLM3TokenizerReceipt(receipt, row, defaults) {
     row,
     defaults,
     TOKENIZER_PACKS.smollm3_3b_q8_0,
+  )
+  return [...assessed.errors, ...assessed.parity_errors]
+}
+
+function validateQwen3MoeTokenizerReceipt(receipt, row, defaults) {
+  const assessed = assessTokenizerReceiptForPack(
+    receipt,
+    row,
+    defaults,
+    TOKENIZER_PACKS.qwen3_30b_a3b_q8_0,
   )
   return [...assessed.errors, ...assessed.parity_errors]
 }
@@ -1009,6 +1428,7 @@ async function inspectRemoteTokenizer(lock, {
   writeFileImpl = writeFile,
   rmImpl = rm,
   prefixSha256Impl = sha256,
+  derivativeSha256Impl = sha256,
   now = () => new Date(),
 } = {}) {
   if (!tokenizerPackAvailable(row?.id)) {
@@ -1215,7 +1635,7 @@ async function inspectRemoteTokenizer(lock, {
         prefix_sha256: ranged.prefix_sha256,
         temporary_paths_redacted: true,
         temporary_files_deleted: true,
-        scope_note: 'the prefix hash includes opaque initial tensor payload bytes after data_start_offset; it is not a full payload or full artifact hash',
+        scope_note: TOKENIZER_SCOPE_NOTE,
       },
       ...(pack.grounding ? { grounding: pack.grounding } : {}),
       tokenizer_metadata: tokenizerMetadata,
@@ -1239,7 +1659,7 @@ async function inspectRemoteTokenizer(lock, {
           metadata_count: derived.metadata_count,
           patch: 'set fixed-header tensor_count at byte offset 8 to zero; all tokenizer metadata bytes remain unchanged',
           patch_offset: derived.patched_offset,
-          sha256: sha256(derived.bytes),
+          sha256: derivativeSha256Impl(derived.bytes),
           persisted: false,
         },
       },
@@ -1250,12 +1670,7 @@ async function inspectRemoteTokenizer(lock, {
         all_token_ids_match: allMatch,
         support_decision: pack.supportDecision,
       },
-      does_not_prove: [
-        'full artifact integrity or presence on this host',
-        'weight load, logits, generation, or greedy-token parity',
-        'API, SSE, Models page, WebUI, or context readiness',
-        `sampling, tools, GPU execution, performance, neighboring rows, or broad ${pack.family} support`,
-      ],
+      does_not_prove: tokenizerDoesNotProve(pack),
     }
   } catch (error) {
     if (error instanceof TokenizerQualificationError) throw error
@@ -1263,6 +1678,12 @@ async function inspectRemoteTokenizer(lock, {
   } finally {
     try { await rmImpl(temporary, { recursive: true, force: true }) }
     catch { throw tokenizerError('tokenizer_cleanup_failed') }
+  }
+  const selfAssessment = assessTokenizerReceiptForPack(report, row, defaults, pack, {
+    expectedSourceHead: sourceBefore.sourceHead,
+  })
+  if (selfAssessment.errors.length > 0) {
+    throw tokenizerError('tokenizer_probe_failed')
   }
   return report
 }
@@ -1273,7 +1694,7 @@ async function runTokenizerCli(argv = process.argv.slice(2), {
   const args = parseArgs(argv)
   if (args.has('help') || !args.get('row')) {
     console.log(`Usage:
-  node scripts/hf-qualification-tokenizer.mjs --row <gemma2_9b_it_q8_0|smollm3_3b_q8_0> [options]
+  node scripts/hf-qualification-tokenizer.mjs --row <gemma2_9b_it_q8_0|smollm3_3b_q8_0|qwen3_30b_a3b_q8_0> [options]
 
 Options:
   --roster <path>          Roster path (default: Phase 1)
@@ -1344,10 +1765,12 @@ Options:
 export {
   DEFAULT_PREFIX_BYTES as DEFAULT_TOKENIZER_PREFIX_BYTES,
   GEMMA2_CASES,
+  QWEN3_MOE_CASES,
   SMOLLM3_CASES,
   TokenizerQualificationError,
   assessTokenizerReceipt,
   assertGemma2TokenizerMetadata,
+  assertQwen3MoeTokenizerMetadata,
   assertSmolLM3TokenizerMetadata,
   buildCamelidArgs,
   buildLlamaArgs,
@@ -1363,7 +1786,9 @@ export {
   tokenizerPackAvailable,
   tokenizerPrefixBytesForRow,
   validateGemma2TokenizerReceipt,
+  validateQwen3MoeTokenizerReceipt,
   validateSmolLM3TokenizerReceipt,
+  verifyLlamaCppPackage,
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1] || '').href) {
