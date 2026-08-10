@@ -1,6 +1,6 @@
 import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { getChatGateState } from '../lib/chatGate'
-import { exactArtifactFilenameForRow } from '../lib/capabilities'
+import { displayQuantLabel, exactArtifactFilenameForRow } from '../lib/capabilities'
 import { applyGemma4GhostChatTokenCap, getConfiguredMaxTokens, modelContextLength, validateSendBudget } from '../lib/responseLimits'
 import { CamelidMark } from '../components/ui/CamelidMark'
 import { Avatar } from '../components/ui/Avatar'
@@ -204,9 +204,24 @@ export default function ChatWorkspace({
   const supportBlocked = selectedRuntimeReady && !selectedModelCapabilitySupported
   /* Only set when the row was matched but the loaded GGUF is not its exact
      artifact — the one blocked state with a concrete next step. */
-  const blockedArtifactFilename = selectedChatGate.hint?.kind === 'artifact_mismatch'
-    ? exactArtifactFilenameForRow(selectedChatGate.hint.target)
-    : null
+  /* The two blocked states a reader can actually act on, each named concretely.
+     "Pick a verified model" alone leaves someone who is one file away from
+     working guessing at which file that is. */
+  const blockedSpecifics = (() => {
+    const hint = selectedChatGate.hint
+    if (hint?.kind === 'artifact_mismatch') {
+      const filename = exactArtifactFilenameForRow(hint.target)
+      return filename ? `it requires the exact ${filename} artifact` : null
+    }
+    if (hint?.kind === 'quant_mismatch') {
+      // observedQuant is a match key ("Q40"), not something to show a reader.
+      const verified = displayQuantLabel(hint.target?.quantization)
+      const observed = displayQuantLabel(selectedModel?.quant || hint.observedQuant)
+      if (verified && observed) return `this build is ${observed} and the verified build is ${verified}`
+      if (verified) return `only the ${verified} build is verified`
+    }
+    return null
+  })()
   const selectedRuntimeMatchesLoadedModel = Boolean(selectedChatGate.runtimeLoaded)
   const selectedModelName = selectedModel?.name || selectedModelId || 'No model selected'
   const selectedModelIssue = selectedModel?.load_error || selectedModel?.install_error || ''
@@ -243,11 +258,12 @@ export default function ChatWorkspace({
     : apiUnavailable
       ? 'Keep writing here. Send unlocks again once the local API responds.'
       : supportBlocked
-        /* When the blocker is a near-miss GGUF, naming the file the reader
-           actually needs is far more actionable than "pick a verified model" —
-           they are usually one download away, not one decision away. */
-        ? (blockedArtifactFilename
-            ? `This model isn't verified for chat yet: it requires the exact ${blockedArtifactFilename} artifact. Pick a verified model to unlock send.`
+        /* When the blocker is a near miss — wrong file, or the right model at an
+           unverified quantization — naming it is far more actionable than "pick a
+           verified model": they are usually one download away, not one decision
+           away. */
+        ? (blockedSpecifics
+            ? `This model isn't verified for chat yet: ${blockedSpecifics}. Pick a verified model to unlock send.`
             : "This model isn't verified for chat yet. Pick a verified model to unlock send.")
         : selectedModel
           ? 'Your draft is ready now. Send unlocks as soon as this model is ready.'
