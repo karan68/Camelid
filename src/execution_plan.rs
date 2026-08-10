@@ -2427,6 +2427,7 @@ fn env_flag_disabled(key: &str) -> bool {
 /// Whether the LFM2 resident-Metal plan may be selected from operator policy.
 /// Runtime routing calls the same predicate so `CAMELID_PROFILE=safe` and the
 /// explicit LFM opt-out cannot leave health reporting CPU while Metal runs.
+#[cfg(any(target_os = "macos", test))]
 pub(crate) fn lfm2_metal_plan_selectable() -> bool {
     lfm2_metal_policy_allows(
         &requested_profile().0,

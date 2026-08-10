@@ -119,6 +119,7 @@ fn resident_metal_format(tt: GgufTensorType) -> Option<crate::metal::ResidentWei
 /// Formats accepted by the small hybrid projection bridge. Dense F16 is not a
 /// general resident-model admission: it is used only for BitNet's explicitly
 /// page-backed tied output head (see `load_raw`).
+#[cfg(target_os = "macos")]
 fn hybrid_metal_format(tt: GgufTensorType) -> Option<crate::metal::ResidentWeightFormat> {
     match tt {
         GgufTensorType::F16 => Some(crate::metal::ResidentWeightFormat::DenseF16),
