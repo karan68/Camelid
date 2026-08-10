@@ -4047,6 +4047,120 @@ async fn llama_server_props(
 }
 
 fn llama_server_chat_template_caps(model: Option<&LoadedModel>) -> serde_json::Value {
+    if let Some(model) = model.filter(|model| model.gguf.architecture() == Some("smollm3")) {
+        let template = model
+            .tokenizer_runtime
+            .as_deref()
+            .and_then(|tokenizer| tokenizer.chat_template.as_deref());
+        return match template {
+            Some(template) if is_exact_smollm3_chat_template(template) => serde_json::json!({
+                "available": true,
+                "requires_loaded_model": true,
+                "source": "tokenizer.chat_template",
+                "detected_format": "smollm3_exact_default_thinking_text_qualified",
+                "length": template.len(),
+                "supported_operations": ["render_prompt"],
+                "render_prompt_envelope": {
+                    "public_surfaces": {
+                        "/apply-template": {
+                            "thinking": ["omitted_effective_true"]
+                        },
+                        "/v1/chat/completions": {
+                            "thinking": ["omitted_defaults_true", "explicit_true"],
+                            "streaming": [false, true]
+                        }
+                    },
+                    "content": "text_only",
+                    "roles": ["user", "assistant"],
+                    "history": "strict_alternation_ending_user",
+                    "add_generation_prompt": true,
+                    "today_date": "system_local_english_dd_month_yyyy"
+                },
+                "unsupported": [
+                    "system_messages",
+                    "custom_instructions",
+                    "system_override",
+                    "tools",
+                    "tool_messages",
+                    "thinking_disabled",
+                    "invalid_roles",
+                    "non_alternating_history",
+                    "history_not_ending_user",
+                    "multimodal_content",
+                    "non_text_content",
+                    "arbitrary_template_kwargs",
+                    "full_llama_server_template_parity"
+                ],
+            }),
+            Some(template) => serde_json::json!({
+                "available": true,
+                "requires_loaded_model": true,
+                "source": "tokenizer.chat_template",
+                "detected_format": detect_chat_template_format(template),
+                "length": template.len(),
+                "supported_operations": [],
+                "render_prompt_envelope": null,
+                "unsupported": [
+                    "smollm3_exact_template_required",
+                    "render_prompt",
+                    "arbitrary_template_kwargs",
+                    "tool_call_templates",
+                    "multimodal_templates",
+                    "full_llama_server_template_parity"
+                ],
+            }),
+            None => serde_json::json!({
+                "available": false,
+                "requires_loaded_model": true,
+                "source": null,
+                "detected_format": null,
+                "length": null,
+                "supported_operations": [],
+                "render_prompt_envelope": null,
+                "unsupported": [
+                    "smollm3_chat_template_missing",
+                    "render_prompt",
+                    "arbitrary_template_kwargs",
+                    "tool_call_templates",
+                    "multimodal_templates",
+                    "full_llama_server_template_parity"
+                ],
+            }),
+        };
+    }
+
+    if let Some((model, template)) = model.and_then(|model| {
+        (model.gguf.architecture() != Some("smollm3"))
+            .then_some(model)
+            .and_then(|model| {
+                model
+                    .tokenizer_runtime
+                    .as_deref()
+                    .and_then(|tokenizer| tokenizer.chat_template.as_deref())
+                    .filter(|template| is_exact_smollm3_chat_template(template))
+                    .map(|template| (model, template))
+            })
+    }) {
+        return serde_json::json!({
+            "available": true,
+            "requires_loaded_model": true,
+            "source": "tokenizer.chat_template",
+            "detected_format": "smollm3_exact_template_architecture_mismatch",
+            "length": template.len(),
+            "declared_architecture": model.gguf.architecture(),
+            "supported_operations": [],
+            "render_prompt_envelope": null,
+            "unsupported": [
+                "smollm3_architecture_template_mismatch",
+                "render_prompt",
+                "arbitrary_template_kwargs",
+                "tool_call_templates",
+                "multimodal_templates",
+                "full_llama_server_template_parity"
+            ],
+        });
+    }
+
     let template = model.and_then(|model| match &model.tokenizer {
         TokenizerLoadState::Available(summary) => summary.chat_template.as_ref(),
         TokenizerLoadState::Unavailable { .. } => None,
@@ -13974,6 +14088,25 @@ async fn llama_server_apply_template(
             }
         },
     };
+    if let Some(rendered) = render_smollm3_production_chat_prompt(
+        model.gguf.architecture().unwrap_or_default(),
+        &tokenizer,
+        &model.id,
+        &messages,
+        None,
+        None,
+    ) {
+        return match rendered {
+            Ok(rendered) => (
+                StatusCode::OK,
+                Json(LlamaServerApplyTemplateResponse {
+                    prompt: rendered.text,
+                }),
+            )
+                .into_response(),
+            Err(response) => response,
+        };
+    }
     if let Some(rejection) = reject_qwen3_moe_chat_until_template_qualified(
         model.gguf.architecture().unwrap_or_default(),
         &tokenizer,
@@ -16041,18 +16174,20 @@ async fn prepare_generation(
             token_ids
         }
         PromptInput::Chat(messages) => {
+            let smollm3_rendered_prompt = render_smollm3_production_chat_prompt(
+                model.gguf.architecture().unwrap_or_default(),
+                &tokenizer,
+                &model.id,
+                &messages,
+                req.camelid_enable_thinking,
+                request_tools.as_deref(),
+            )
+            .transpose()?;
             if let Some(rejection) = reject_qwen3_moe_chat_until_template_qualified(
                 model.gguf.architecture().unwrap_or_default(),
                 &tokenizer,
                 &model.id,
                 request_tools.as_deref(),
-            ) {
-                return Err(rejection);
-            }
-            if let Some(rejection) = reject_smollm3_chat_until_template_qualified(
-                model.gguf.architecture().unwrap_or_default(),
-                &tokenizer,
-                &model.id,
             ) {
                 return Err(rejection);
             }
@@ -16082,18 +16217,22 @@ async fn prepare_generation(
             ) {
                 return Err(rejection);
             }
-            let rendered_prompt = match request_tools.as_deref() {
-                Some(tools) if !tools.is_empty() => {
-                    render_chat_prompt_for_tokenization_with_tools(&messages, &tokenizer, tools)
+            let rendered_prompt = if let Some(rendered_prompt) = smollm3_rendered_prompt {
+                rendered_prompt
+            } else {
+                match request_tools.as_deref() {
+                    Some(tools) if !tools.is_empty() => {
+                        render_chat_prompt_for_tokenization_with_tools(&messages, &tokenizer, tools)
+                    }
+                    _ => render_chat_prompt_for_tokenization_for_model_result(
+                        &messages,
+                        &tokenizer,
+                        Some(&model.id),
+                        req.camelid_enable_thinking.unwrap_or(false),
+                    ),
                 }
-                _ => render_chat_prompt_for_tokenization_for_model_result(
-                    &messages,
-                    &tokenizer,
-                    Some(&model.id),
-                    req.camelid_enable_thinking.unwrap_or(false),
-                ),
-            }
-            .map_err(|err| unsupported_chat_template_response(&model.id, &err))?;
+                .map_err(|err| unsupported_chat_template_response(&model.id, &err))?
+            };
             let mut token_ids = tokenizer
                 .encode(
                     &rendered_prompt.text,
@@ -20016,20 +20155,13 @@ struct RenderedPrompt {
     parse_special: bool,
 }
 
-#[allow(dead_code)]
 const SMOLLM3_EXACT_CHAT_TEMPLATE_UTF8_BYTES: usize = 5_493;
-#[allow(dead_code)]
 const SMOLLM3_EXACT_CHAT_TEMPLATE_SHA256: &str =
     "b9b66f04c64fbb8695cf5b35c37780efd0b8e0829fbfe3e30fafb9f469b7d30e";
-#[allow(dead_code)]
 const SMOLLM3_DEFAULT_THINKING_INSTRUCTION: &str = "You are a helpful AI assistant named SmolLM, trained by Hugging Face. Your role as an assistant involves thoroughly exploring questions through a systematic thinking process before providing the final precise and accurate solutions. This requires engaging in a comprehensive cycle of analysis, summarizing, exploration, reassessment, reflection, backtracking, and iteration to develop well-considered thinking process. Please structure your response into two main sections: Thought and Solution using the specified format: <think> Thought section </think> Solution section. In the Thought section, detail your reasoning process in steps. Each step should include detailed considerations such as analysing questions, summarizing relevant findings, brainstorming new ideas, verifying the accuracy of the current steps, refining any errors, and revisiting previous steps. In the Solution section, based on various attempts, explorations, and reflections from the Thought section, systematically present the final solution that you deem correct. The Solution section should be logical, accurate, and concise and detail necessary steps needed to reach the conclusion.";
 
-/// Typed boundary for the exact-row SmolLM3 prompt-shape preparation helper.
-///
-/// This is deliberately not wired into chat dispatch. The architecture-wide
-/// runtime HOLD remains authoritative until every dynamic branch is qualified.
+/// Typed boundary for the fixture-locked SmolLM3 production envelope.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 enum SmolLm3TemplatePreparationError {
     TemplateIdentityMismatch,
     EmptyMessages,
@@ -20047,7 +20179,6 @@ enum SmolLm3TemplatePreparationError {
     StructuredContentUnsupported,
 }
 
-#[allow(dead_code)]
 impl SmolLm3TemplatePreparationError {
     fn code(self) -> &'static str {
         match self {
@@ -20069,7 +20200,6 @@ impl SmolLm3TemplatePreparationError {
     }
 }
 
-#[allow(dead_code)]
 fn valid_smollm3_injected_date(value: &str) -> bool {
     let mut parts = value.split(' ');
     let (Some(day), Some(month), Some(year), None) =
@@ -20100,24 +20230,78 @@ fn valid_smollm3_injected_date(value: &str) -> bool {
     year > 0 && (1..=max_day).contains(&day)
 }
 
-/// Render the fixture-locked, deterministic subset of the pinned SmolLM3
-/// template from Camelid's post-canonicalization [`ChatMessage`] shape. A
-/// text-only content-parts array has already become the same string as plain
-/// text at this boundary; non-text parts remain recorded and are refused.
-/// This helper prepares exact prompt shapes for qualification only; production
-/// chat continues to fail closed in the dynamic-template guard.
-#[allow(dead_code)]
-fn render_smollm3_template_preparation_prompt(
+fn format_smollm3_local_date(day: u16, month: u16, year: u16) -> Option<String> {
+    let month = [
+        "January",
+        "February",
+        "March",
+        "April",
+        "May",
+        "June",
+        "July",
+        "August",
+        "September",
+        "October",
+        "November",
+        "December",
+    ]
+    .get(usize::from(month.checked_sub(1)?))?;
+    let rendered = format!("{day:02} {month} {year:04}");
+    valid_smollm3_injected_date(&rendered).then_some(rendered)
+}
+
+/// Match the pinned llama.cpp b9632 `strftime_now` clock contract: one system-
+/// local calendar reading per render. Month names are fixed to English because
+/// that is the exact prompt grammar captured by the Windows oracle pack; they
+/// must not drift with the process locale.
+#[cfg(windows)]
+fn current_smollm3_local_date() -> Option<String> {
+    use windows_sys::Win32::{Foundation::SYSTEMTIME, System::SystemInformation::GetLocalTime};
+
+    let mut local: SYSTEMTIME = unsafe { std::mem::zeroed() };
+    unsafe { GetLocalTime(&mut local) };
+    format_smollm3_local_date(local.wDay, local.wMonth, local.wYear)
+}
+
+#[cfg(unix)]
+fn current_smollm3_local_date() -> Option<String> {
+    let mut timestamp: libc::time_t = 0;
+    if unsafe { libc::time(&mut timestamp) } == -1 {
+        return None;
+    }
+    let mut local: libc::tm = unsafe { std::mem::zeroed() };
+    if unsafe { libc::localtime_r(&timestamp, &mut local) }.is_null() {
+        return None;
+    }
+    let day = u16::try_from(local.tm_mday).ok()?;
+    let month = u16::try_from(local.tm_mon.checked_add(1)?).ok()?;
+    let year = u16::try_from(local.tm_year.checked_add(1900)?).ok()?;
+    format_smollm3_local_date(day, month, year)
+}
+
+#[cfg(not(any(windows, unix)))]
+fn current_smollm3_local_date() -> Option<String> {
+    None
+}
+
+fn is_exact_smollm3_chat_template(template: &str) -> bool {
+    template.len() == SMOLLM3_EXACT_CHAT_TEMPLATE_UTF8_BYTES
+        && format!("{:x}", Sha256::digest(template.as_bytes()))
+            == SMOLLM3_EXACT_CHAT_TEMPLATE_SHA256
+}
+
+/// Render the deliberately narrow, fixture-locked subset of the pinned
+/// SmolLM3 template from Camelid's post-canonicalization [`ChatMessage`] shape.
+/// A text-only content-parts array is already the same string as plain text at
+/// this boundary; images and every remaining structured shape fail closed.
+fn render_smollm3_exact_chat_prompt(
     messages: &[ChatMessage],
     source_template: &str,
     enable_thinking: Option<bool>,
     add_generation_prompt: bool,
     injected_today: &str,
 ) -> std::result::Result<RenderedPrompt, SmolLm3TemplatePreparationError> {
-    let template_sha256 = format!("{:x}", Sha256::digest(source_template.as_bytes()));
-    if source_template.len() != SMOLLM3_EXACT_CHAT_TEMPLATE_UTF8_BYTES
-        || template_sha256 != SMOLLM3_EXACT_CHAT_TEMPLATE_SHA256
-    {
+    if !is_exact_smollm3_chat_template(source_template) {
         return Err(SmolLm3TemplatePreparationError::TemplateIdentityMismatch);
     }
     if matches!(enable_thinking, Some(false)) {
@@ -20188,6 +20372,83 @@ fn render_smollm3_template_preparation_prompt(
         add_special: false,
         parse_special: true,
     })
+}
+
+fn smollm3_template_error_response(
+    model_id: &str,
+    error: SmolLm3TemplatePreparationError,
+) -> Response {
+    match error {
+        SmolLm3TemplatePreparationError::ExplicitFalseThinkingUnsupported => api_error(
+            StatusCode::BAD_REQUEST,
+            "unsupported_parameter",
+            format!(
+                "model '{model_id}' uses the exact SmolLM3 template, whose thinking-disabled \
+                 branch is not oracle-qualified; omit camelid_enable_thinking or set it to true"
+            ),
+            Some("camelid_enable_thinking"),
+        ),
+        _ => api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "unsupported_chat_template",
+            format!(
+                "SmolLM3 chat template rendering failed for model '{model_id}': {}",
+                error.code()
+            ),
+            Some("messages"),
+        ),
+    }
+}
+
+/// Architecture-scoped production entry for the exact SmolLM3 template.
+///
+/// Only the oracle-locked default-thinking text envelope is open. In
+/// particular, OpenAI `tools` must not be reinterpreted as the source
+/// template's unrelated `xml_tools` or `python_tools` variables.
+fn render_smollm3_production_chat_prompt(
+    architecture: &str,
+    tokenizer: &Tokenizer,
+    model_id: &str,
+    messages: &[ChatMessage],
+    enable_thinking: Option<bool>,
+    tools: Option<&[serde_json::Value]>,
+) -> Option<std::result::Result<RenderedPrompt, Response>> {
+    if architecture != "smollm3" {
+        return None;
+    }
+    if tools.is_some_and(|tools| !tools.is_empty()) {
+        return Some(Err(api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "unsupported_tools",
+            format!(
+                "model '{model_id}' declares architecture 'smollm3'; SmolLM3's xml_tools, \
+                 python_tools, and tool-result-history semantics are not oracle-qualified, so \
+                 OpenAI tools fail closed regardless of embedded-template identity instead of \
+                 being dropped or translated"
+            ),
+            Some("tools"),
+        )));
+    }
+
+    let template = tokenizer.chat_template.as_deref().unwrap_or_default();
+    if !is_exact_smollm3_chat_template(template) {
+        return Some(Err(smollm3_template_error_response(
+            model_id,
+            SmolLm3TemplatePreparationError::TemplateIdentityMismatch,
+        )));
+    }
+    let Some(today) = current_smollm3_local_date() else {
+        return Some(Err(api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "template_clock_unavailable",
+            format!("could not read the system-local calendar date required by model '{model_id}'"),
+            None,
+        )));
+    };
+    Some(
+        render_smollm3_exact_chat_prompt(messages, template, enable_thinking, true, &today)
+            .map_err(|error| smollm3_template_error_response(model_id, error)),
+    )
 }
 
 #[derive(Debug, Serialize)]
@@ -20276,7 +20537,7 @@ fn render_chat_prompt_for_tokenization_for_model_result(
         if is_smollm3_dynamic_chat_template(template) {
             return Err(MiniJinjaError::new(
                 MiniJinjaErrorKind::InvalidOperation,
-                "the pinned SmolLM3 dynamic ChatML template is not qualified: its date metadata, reasoning-mode policy, system override, custom instructions, and tool grammar cannot be replaced by Camelid's generic Qwen3 renderer; chat fails closed while raw completion remains separately testable",
+                "SmolLM3 dynamic ChatML must pass through its architecture-scoped exact-template renderer; this generic entry cannot establish the template identity, system-local date, or qualified reasoning shape and must not borrow Camelid's Qwen3 renderer",
             ));
         }
         if is_gemma2_it_chat_template(template) {
@@ -20336,7 +20597,7 @@ fn render_chat_prompt_for_tokenization_with_tools(
         if is_smollm3_dynamic_chat_template(template) {
             return Err(MiniJinjaError::new(
                 MiniJinjaErrorKind::InvalidOperation,
-                "the pinned SmolLM3 dynamic ChatML template and its tool grammars are not qualified; failing closed",
+                "SmolLM3 xml_tools/python_tools and tool-result history are not oracle-qualified; OpenAI tools fail closed at the architecture-scoped entry",
             ));
         }
         if is_gemma2_it_chat_template(template) {
@@ -20880,46 +21141,6 @@ fn reject_qwen3_moe_chat_until_template_qualified(
              grouped tool-response branches do not match Camelid's generic Qwen3 renderer, so \
              chat and /apply-template fail closed until an exact-row shape pack is committed. \
              Raw completion remains a separate qualification lane."
-        ),
-        Some("messages"),
-    ))
-}
-
-/// Executable HOLD for SmolLM3 chat.
-///
-/// Tokenizer construction and raw completion qualification can proceed, but
-/// the exact row's 5.5 KiB dynamic ChatML template cannot be approximated by
-/// the generic Qwen3 renderer merely because both use `<|im_start|>`. Keep the
-/// architecture's chat lane typed and closed until a deterministic date input,
-/// reasoning-mode shapes, system overrides, and tool grammars are fixture- and
-/// oracle-locked.
-fn reject_smollm3_chat_until_template_qualified(
-    architecture: &str,
-    tokenizer: &Tokenizer,
-    model_id: &str,
-) -> Option<Response> {
-    if architecture != "smollm3" {
-        return None;
-    }
-    let template_state = if tokenizer
-        .chat_template
-        .as_deref()
-        .is_some_and(is_smollm3_dynamic_chat_template)
-    {
-        "matches the pinned dynamic SmolLM3 signature"
-    } else {
-        "is missing or does not match the pinned dynamic SmolLM3 signature"
-    };
-    Some(api_error(
-        StatusCode::UNPROCESSABLE_ENTITY,
-        "unsupported_chat_template",
-        format!(
-            "model '{model_id}' declares architecture 'smollm3'; its embedded chat template \
-             {template_state}. SmolLM3's template injects current-date metadata, \
-             reasoning-mode policy, system overrides, custom instructions, and tool grammars. \
-             Camelid's generic Qwen3 ChatML renderer is not equivalent, so chat fails closed \
-             until the exact SmolLM3 contract is oracle-qualified. Raw completion remains a \
-             separate qualification lane."
         ),
         Some("messages"),
     ))
@@ -21751,7 +21972,9 @@ fn tokenizer_summary(tokenizer: &Tokenizer) -> TokenizerSummary {
 }
 
 fn detect_chat_template_format(template: &str) -> &'static str {
-    if is_smollm3_dynamic_chat_template(template) {
+    if is_exact_smollm3_chat_template(template) {
+        "smollm3_exact_template_identity"
+    } else if is_smollm3_dynamic_chat_template(template) {
         "smollm3_dynamic_chatml_unqualified"
     } else if is_gemma2_it_chat_template(template) {
         "gemma2_it_exact"
@@ -26007,7 +26230,7 @@ mod tests {
     }
 
     #[test]
-    fn smollm3_dynamic_chatml_is_an_executable_hold_not_generic_qwen3() {
+    fn smollm3_exact_renderer_is_architecture_scoped_and_not_generic_qwen3() {
         #[derive(serde::Deserialize)]
         struct Pack {
             chat_template_blocker: Blocker,
@@ -26033,28 +26256,38 @@ mod tests {
             .reason
             .contains("not generic Qwen3 ChatML"));
 
-        // A compact stand-in carrying every independently captured signature
-        // marker takes the exact same routing decision as the 5.5 KiB source
-        // template, without committing the whole dynamic template as code.
+        // A compact stand-in carrying every signature marker must still fail
+        // exact identity. Marker-only routing is the bug this gate prevents.
         let signature = pack
             .chat_template_blocker
             .required_signature_markers
             .join(" :: ");
         assert!(is_smollm3_dynamic_chat_template(&signature));
+        assert!(!is_exact_smollm3_chat_template(&signature));
         assert!(!is_qwen2_chatml_template(&signature));
 
         let mut tokenizer = test_tokenizer();
-        tokenizer.chat_template = Some(signature);
+        tokenizer.chat_template = Some(signature.clone());
         assert_eq!(
             detect_chat_template_format(tokenizer.chat_template.as_deref().unwrap()),
             "smollm3_dynamic_chatml_unqualified"
         );
-        let rejection = reject_smollm3_chat_until_template_qualified(
+        let messages = vec![ChatMessage {
+            image_urls: Vec::new(),
+            unsupported_content_parts: Vec::new(),
+            role: "user".to_string(),
+            content: "hello".to_string(),
+        }];
+        let rejection = render_smollm3_production_chat_prompt(
             "smollm3",
             &tokenizer,
             "SmolLM3-Q8_0.gguf",
+            &messages,
+            None,
+            None,
         )
-        .expect("SmolLM3 chat must remain an executable HOLD");
+        .expect("the architecture owns the exact-template decision")
+        .expect_err("marker-only substitution must fail closed");
         assert_eq!(rejection.status(), StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(
             rejection
@@ -26064,26 +26297,49 @@ mod tests {
                 .code,
             "unsupported_chat_template"
         );
-        assert!(
-            reject_smollm3_chat_until_template_qualified("qwen3", &tokenizer, "qwen").is_none(),
-            "the HOLD is architecture-scoped"
-        );
+        assert!(render_smollm3_production_chat_prompt(
+            "qwen3", &tokenizer, "qwen", &messages, None, None,
+        )
+        .is_none());
 
-        let messages = vec![ChatMessage {
-            image_urls: Vec::new(),
-            unsupported_content_parts: Vec::new(),
-            role: "user".to_string(),
-            content: "hello".to_string(),
-        }];
         let err = render_chat_prompt_for_tokenization_for_model_result(
             &messages, &tokenizer, None, false,
         )
         .expect_err("template dispatch must fail before generic Qwen3 rendering");
-        assert!(err.to_string().contains("generic Qwen3 renderer"));
+        assert!(err
+            .to_string()
+            .contains("architecture-scoped exact-template renderer"));
+
+        let shape_pack: serde_json::Value = serde_json::from_str(include_str!(
+            "../../qa/prompt-packs/smollm3-chat-template-shapes-v1.json"
+        ))
+        .expect("parse exact SmolLM3 shape pack");
+        let exact = shape_pack["source_template"]["text"]
+            .as_str()
+            .expect("shape pack carries exact source template");
+        assert!(is_smollm3_dynamic_chat_template(exact));
+        assert!(is_exact_smollm3_chat_template(exact));
+        assert_eq!(
+            detect_chat_template_format(exact),
+            "smollm3_exact_template_identity"
+        );
+        tokenizer.chat_template = Some(exact.to_string());
+        let rendered = render_smollm3_production_chat_prompt(
+            "smollm3",
+            &tokenizer,
+            "SmolLM3-Q8_0.gguf",
+            &messages,
+            None,
+            None,
+        )
+        .expect("the architecture owns the exact-template decision")
+        .expect("exact default-thinking text chat is open");
+        assert!(rendered.text.contains("Reasoning Mode: /think"));
+        assert!(rendered.text.ends_with("<|im_start|>assistant\n"));
     }
 
     #[test]
-    fn smollm3_template_preparation_helper_matches_bounded_oracle_shapes() {
+    fn smollm3_exact_renderer_matches_bounded_oracle_shapes() {
         let pack: serde_json::Value = serde_json::from_str(include_str!(
             "../../qa/prompt-packs/smollm3-chat-template-shapes-v1.json"
         ))
@@ -26096,6 +26352,19 @@ mod tests {
             format!("{:x}", Sha256::digest(template.as_bytes())),
             SMOLLM3_EXACT_CHAT_TEMPLATE_SHA256
         );
+        assert_eq!(
+            format_smollm3_local_date(10, 8, 2026).as_deref(),
+            Some("10 August 2026")
+        );
+        assert_eq!(
+            format_smollm3_local_date(29, 2, 2024).as_deref(),
+            Some("29 February 2024")
+        );
+        assert!(format_smollm3_local_date(29, 2, 2025).is_none());
+        assert!(format_smollm3_local_date(1, 13, 2026).is_none());
+        assert!(current_smollm3_local_date()
+            .as_deref()
+            .is_some_and(valid_smollm3_injected_date));
 
         let message = |role: &str, content: &str| ChatMessage {
             role: role.to_string(),
@@ -26115,7 +26384,7 @@ mod tests {
         assert!(text_parts_message.image_urls.is_empty());
         assert!(text_parts_message.unsupported_content_parts.is_empty());
         assert_eq!(
-            render_smollm3_template_preparation_prompt(
+            render_smollm3_exact_chat_prompt(
                 std::slice::from_ref(&text_parts_message),
                 template,
                 None,
@@ -26123,7 +26392,7 @@ mod tests {
                 "10 August 2026",
             )
             .expect("post-canonicalization text parts are the plain-text shape"),
-            render_smollm3_template_preparation_prompt(
+            render_smollm3_exact_chat_prompt(
                 &[message("user", "Hello, please help me.")],
                 template,
                 None,
@@ -26148,15 +26417,10 @@ mod tests {
                 .as_str()
                 .expect("normalized prompt")
                 .replace("{{CURRENT_DATE_DD_MONTH_YYYY}}", "10 August 2026");
-            let omitted = render_smollm3_template_preparation_prompt(
-                &messages,
-                template,
-                None,
-                true,
-                "10 August 2026",
-            )
-            .expect("omitted thinking defaults to true");
-            let explicit = render_smollm3_template_preparation_prompt(
+            let omitted =
+                render_smollm3_exact_chat_prompt(&messages, template, None, true, "10 August 2026")
+                    .expect("omitted thinking defaults to true");
+            let explicit = render_smollm3_exact_chat_prompt(
                 &messages,
                 template,
                 Some(true),
@@ -26181,7 +26445,7 @@ mod tests {
             message("assistant", "\n\nAnswer"),
             message("user", "Second"),
         ];
-        let rendered = render_smollm3_template_preparation_prompt(
+        let rendered = render_smollm3_exact_chat_prompt(
             &leading_newline_history,
             template,
             Some(true),
@@ -26196,7 +26460,7 @@ mod tests {
     }
 
     #[test]
-    fn smollm3_template_preparation_helper_typed_blocks_every_unqualified_branch() {
+    fn smollm3_exact_renderer_typed_blocks_every_unqualified_branch() {
         let pack: serde_json::Value = serde_json::from_str(include_str!(
             "../../qa/prompt-packs/smollm3-chat-template-shapes-v1.json"
         ))
@@ -26215,7 +26479,7 @@ mod tests {
                       thinking: Option<bool>,
                       add_generation_prompt: bool,
                       today: &str| {
-            render_smollm3_template_preparation_prompt(
+            render_smollm3_exact_chat_prompt(
                 messages,
                 source_template,
                 thinking,
@@ -30138,12 +30402,60 @@ mod runnable_completions_gate_api_tests {
         state
     }
 
+    fn exact_smollm3_template_from_pack() -> String {
+        let pack: Value = serde_json::from_str(include_str!(
+            "../../qa/prompt-packs/smollm3-chat-template-shapes-v1.json"
+        ))
+        .expect("committed SmolLM3 template pack parses");
+        let template = pack["source_template"]["text"]
+            .as_str()
+            .expect("pack carries the exact tokenizer.chat_template");
+        assert_eq!(template.len(), SMOLLM3_EXACT_CHAT_TEMPLATE_UTF8_BYTES);
+        assert!(is_exact_smollm3_chat_template(template));
+        template.to_string()
+    }
+
+    async fn state_with_loaded_arch_and_template(
+        architecture: &str,
+        template: Option<&str>,
+    ) -> AppState {
+        let state = state_with_loaded_arch(architecture).await;
+        let mut tokenizer = qwen3_moe_test_tokenizer();
+        tokenizer.chat_template = template.map(str::to_string);
+        let tokenizer_summary = tokenizer_summary(&tokenizer);
+        let mut loaded_models = state.loaded_models.write().await;
+        let model = loaded_models
+            .get_mut("gate-test")
+            .expect("synthetic smollm3 model is loaded");
+        model.tokenizer = TokenizerLoadState::Available(tokenizer_summary);
+        model.tokenizer_runtime = Some(Arc::new(tokenizer));
+        drop(loaded_models);
+        state
+    }
+
+    async fn state_with_loaded_smollm3_template(template: Option<&str>) -> AppState {
+        state_with_loaded_arch_and_template("smollm3", template).await
+    }
+
     async fn post_json(app: axum::Router, uri: &str, body: Value) -> (StatusCode, Value) {
         let request = Request::builder()
             .method("POST")
             .uri(uri)
             .header("content-type", "application/json")
             .body(Body::from(body.to_string()))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        (status, body)
+    }
+
+    async fn get_json(app: axum::Router, uri: &str) -> (StatusCode, Value) {
+        let request = Request::builder()
+            .method("GET")
+            .uri(uri)
+            .body(Body::empty())
             .unwrap();
         let response = app.oneshot(request).await.unwrap();
         let status = response.status();
@@ -30162,6 +30474,389 @@ mod runnable_completions_gate_api_tests {
                 .contains("/v1/chat/completions"),
             "rejection must point callers at the served chat surface: {body}"
         );
+    }
+
+    #[tokio::test]
+    async fn smollm3_props_caps_are_exact_template_and_envelope_aware() {
+        let exact = exact_smollm3_template_from_pack();
+        for (label, template, expected_available, expected_format, expected_blocker) in [
+            (
+                "exact",
+                Some(exact.as_str()),
+                true,
+                Some("smollm3_exact_default_thinking_text_qualified"),
+                None,
+            ),
+            (
+                "substituted",
+                Some("<|im_start|>system\nKnowledge Cutoff Date: June 2025\n{{ strftime_now('%d %B %Y') }}\nReasoning Mode:\n/system_override\n<|im_end|>\n"),
+                true,
+                Some("smollm3_dynamic_chatml_unqualified"),
+                Some("smollm3_exact_template_required"),
+            ),
+            (
+                "missing",
+                None,
+                false,
+                None,
+                Some("smollm3_chat_template_missing"),
+            ),
+        ] {
+            let app =
+                router_with_state(state_with_loaded_smollm3_template(template).await);
+            let (status, body) = get_json(app, "/props").await;
+            assert_eq!(status, StatusCode::OK, "{label}: {body}");
+            let caps = &body["chat_template_caps"];
+            assert_eq!(caps["available"], expected_available, "{label}: {caps}");
+            match expected_format {
+                Some(format) => assert_eq!(caps["detected_format"], format, "{label}: {caps}"),
+                None => assert!(caps["detected_format"].is_null(), "{label}: {caps}"),
+            }
+
+            let operations = caps["supported_operations"]
+                .as_array()
+                .expect("caps carry supported_operations");
+            let unsupported = caps["unsupported"]
+                .as_array()
+                .expect("caps carry unsupported exclusions");
+            if label == "exact" {
+                assert_eq!(operations, &[json!("render_prompt")]);
+                assert_eq!(caps["length"], SMOLLM3_EXACT_CHAT_TEMPLATE_UTF8_BYTES);
+                assert_eq!(caps["render_prompt_envelope"]["content"], "text_only");
+                assert_eq!(
+                    caps["render_prompt_envelope"]["history"],
+                    "strict_alternation_ending_user"
+                );
+                assert_eq!(
+                    caps["render_prompt_envelope"]["public_surfaces"]["/apply-template"]
+                        ["thinking"],
+                    json!(["omitted_effective_true"])
+                );
+                assert_eq!(
+                    caps["render_prompt_envelope"]["public_surfaces"]
+                        ["/v1/chat/completions"]["thinking"],
+                    json!(["omitted_defaults_true", "explicit_true"])
+                );
+                assert_eq!(
+                    caps["render_prompt_envelope"]["public_surfaces"]
+                        ["/v1/chat/completions"]["streaming"],
+                    json!([false, true])
+                );
+                assert!(caps["render_prompt_envelope"]["surfaces"].is_null());
+                assert!(caps["render_prompt_envelope"]["thinking"].is_null());
+                for exclusion in [
+                    "system_messages",
+                    "custom_instructions",
+                    "system_override",
+                    "tools",
+                    "tool_messages",
+                    "thinking_disabled",
+                    "multimodal_content",
+                    "non_text_content",
+                ] {
+                    assert!(unsupported.contains(&json!(exclusion)), "{exclusion}: {caps}");
+                }
+            } else {
+                assert!(
+                    operations.is_empty(),
+                    "{label} SmolLM3 template must never advertise render_prompt: {caps}"
+                );
+                assert!(caps["render_prompt_envelope"].is_null(), "{label}: {caps}");
+                assert!(
+                    unsupported.contains(&json!(expected_blocker.unwrap())),
+                    "{label}: {caps}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn smollm3_props_caps_refuse_exact_template_on_foreign_architecture() {
+        let exact = exact_smollm3_template_from_pack();
+        let app = router_with_state(
+            state_with_loaded_arch_and_template("qwen3", Some(exact.as_str())).await,
+        );
+        let (tokenizer_status, tokenizer_body) =
+            get_json(app.clone(), "/api/models/tokenizer").await;
+        assert_eq!(tokenizer_status, StatusCode::OK, "{tokenizer_body}");
+        assert_eq!(
+            tokenizer_body["chat_template"]["detected_format"], "smollm3_exact_template_identity",
+            "template-only diagnostics must report identity, not architecture-aware qualification"
+        );
+
+        let (status, body) = get_json(app, "/props").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let caps = &body["chat_template_caps"];
+        assert_eq!(caps["available"], true);
+        assert_eq!(caps["source"], "tokenizer.chat_template");
+        assert_eq!(
+            caps["detected_format"],
+            "smollm3_exact_template_architecture_mismatch"
+        );
+        assert_eq!(caps["declared_architecture"], "qwen3");
+        assert_eq!(caps["length"], SMOLLM3_EXACT_CHAT_TEMPLATE_UTF8_BYTES);
+        assert!(caps["supported_operations"].as_array().unwrap().is_empty());
+        assert!(caps["render_prompt_envelope"].is_null());
+        assert!(caps["unsupported"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("smollm3_architecture_template_mismatch")));
+        assert!(caps["unsupported"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("render_prompt")));
+        assert_eq!(body["chat_template"], exact);
+    }
+
+    #[tokio::test]
+    async fn smollm3_apply_template_renders_the_exact_default_thinking_shape() {
+        let exact = exact_smollm3_template_from_pack();
+        let before = current_smollm3_local_date().expect("system-local date is available");
+        let app = router_with_state(state_with_loaded_smollm3_template(Some(exact.as_str())).await);
+        let (status, body) = post_json(
+            app,
+            "/apply-template",
+            json!({"messages": [{"role": "user", "content": "Hello, please help me."}]}),
+        )
+        .await;
+        let after = current_smollm3_local_date().expect("system-local date is available");
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let messages = [ChatMessage {
+            role: "user".to_string(),
+            content: "Hello, please help me.".to_string(),
+            image_urls: Vec::new(),
+            unsupported_content_parts: Vec::new(),
+        }];
+        let prompt = body["prompt"].as_str().expect("prompt response");
+        assert!(
+            [before, after].iter().any(|today| {
+                render_smollm3_exact_chat_prompt(&messages, &exact, None, true, today)
+                    .is_ok_and(|expected| expected.text == prompt)
+            }),
+            "endpoint prompt must use one system-local date reading"
+        );
+        assert!(prompt.contains("Reasoning Mode: /think"));
+        assert!(prompt.ends_with("<|im_start|>assistant\n"));
+    }
+
+    #[tokio::test]
+    async fn smollm3_apply_template_rejects_substituted_and_missing_templates() {
+        for (label, template) in [
+            (
+                "substituted",
+                Some("<|im_start|>user\n{{ content }}<|im_end|>\n"),
+            ),
+            ("missing", None),
+        ] {
+            let app = router_with_state(state_with_loaded_smollm3_template(template).await);
+            let (status, body) = post_json(
+                app,
+                "/apply-template",
+                json!({"messages": [{"role": "user", "content": "hello"}]}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{label}: {body}");
+            assert_eq!(body["error"]["code"], "unsupported_chat_template");
+            assert_eq!(body["error"]["param"], "messages");
+        }
+    }
+
+    #[tokio::test]
+    async fn smollm3_exact_chat_opens_before_tokenization_for_stream_and_nonstream() {
+        let exact = exact_smollm3_template_from_pack();
+        for stream in [false, true] {
+            for thinking in [None, Some(true)] {
+                let app = router_with_state(
+                    state_with_loaded_smollm3_template(Some(exact.as_str())).await,
+                );
+                let mut request = json!({
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "stream": stream
+                });
+                if let Some(thinking) = thinking {
+                    request["camelid_enable_thinking"] = Value::Bool(thinking);
+                }
+                let (status, body) = post_json(app, "/v1/chat/completions", request).await;
+                assert_eq!(
+                    status,
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "stream={stream}, thinking={thinking:?}: {body}"
+                );
+                assert_eq!(
+                    body["error"]["code"], "tokenization_failed",
+                    "omitted and explicit-true thinking must both pass template rendering: {body}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn smollm3_unqualified_chat_branches_fail_typed_for_stream_and_nonstream() {
+        let exact = exact_smollm3_template_from_pack();
+        for stream in [false, true] {
+            for (label, request, expected_status, expected_code, expected_param) in [
+                (
+                    "system",
+                    json!({
+                        "messages": [
+                            {"role": "system", "content": "custom instructions"},
+                            {"role": "user", "content": "hello"}
+                        ],
+                        "stream": stream
+                    }),
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "unsupported_chat_template",
+                    "messages",
+                ),
+                (
+                    "system-override",
+                    json!({
+                        "messages": [
+                            {"role": "system", "content": "/system_override custom"},
+                            {"role": "user", "content": "hello"}
+                        ],
+                        "stream": stream
+                    }),
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "unsupported_chat_template",
+                    "messages",
+                ),
+                (
+                    "false-thinking",
+                    json!({
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "camelid_enable_thinking": false,
+                        "stream": stream
+                    }),
+                    StatusCode::BAD_REQUEST,
+                    "unsupported_parameter",
+                    "camelid_enable_thinking",
+                ),
+                (
+                    "tools",
+                    json!({
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "tools": [{
+                            "type": "function",
+                            "function": {
+                                "name": "read_file",
+                                "parameters": {"type": "object", "properties": {}}
+                            }
+                        }],
+                        "stream": stream
+                    }),
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "unsupported_tools",
+                    "tools",
+                ),
+                (
+                    "tool-history",
+                    json!({
+                        "messages": [
+                            {"role": "user", "content": "hello"},
+                            {"role": "assistant", "content": "calling"},
+                            {"role": "tool", "content": "result"}
+                        ],
+                        "stream": stream
+                    }),
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "unsupported_chat_template",
+                    "messages",
+                ),
+            ] {
+                let app = router_with_state(
+                    state_with_loaded_smollm3_template(Some(exact.as_str())).await,
+                );
+                let (status, body) = post_json(app, "/v1/chat/completions", request).await;
+                assert_eq!(status, expected_status, "{label}, stream={stream}: {body}");
+                assert_eq!(body["error"]["code"], expected_code, "{label}: {body}");
+                assert_eq!(body["error"]["param"], expected_param, "{label}: {body}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn smollm3_tools_fail_closed_independent_of_template_identity_and_stream_mode() {
+        let exact = exact_smollm3_template_from_pack();
+        for stream in [false, true] {
+            for (label, template) in [
+                ("exact", Some(exact.as_str())),
+                (
+                    "substituted",
+                    Some("<|im_start|>user\n{{ content }}<|im_end|>\n"),
+                ),
+                ("missing", None),
+            ] {
+                let app = router_with_state(state_with_loaded_smollm3_template(template).await);
+                let (status, body) = post_json(
+                    app,
+                    "/v1/chat/completions",
+                    json!({
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "tools": [{
+                            "type": "function",
+                            "function": {
+                                "name": "read_file",
+                                "parameters": {"type": "object", "properties": {}}
+                            }
+                        }],
+                        "stream": stream
+                    }),
+                )
+                .await;
+                assert_eq!(
+                    status,
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "{label}, stream={stream}: {body}"
+                );
+                assert_eq!(
+                    body["error"]["code"], "unsupported_tools",
+                    "{label}, stream={stream}: {body}"
+                );
+                assert_eq!(body["error"]["param"], "tools", "{label}: {body}");
+                let message = body["error"]["message"]
+                    .as_str()
+                    .expect("typed tools error includes a message");
+                assert!(
+                    message.contains("declares architecture 'smollm3'")
+                        && message.contains("regardless of embedded-template identity"),
+                    "diagnostic must describe the architecture-scoped refusal: {body}"
+                );
+                assert!(
+                    !message.contains("uses the exact SmolLM3 template"),
+                    "diagnostic must not claim substituted or missing templates are exact: {body}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn smollm3_chat_rejects_nonexact_templates_for_stream_and_nonstream() {
+        for stream in [false, true] {
+            for (label, template) in [
+                (
+                    "substituted",
+                    Some("<|im_start|>user\n{{ content }}<|im_end|>\n"),
+                ),
+                ("missing", None),
+            ] {
+                let app = router_with_state(state_with_loaded_smollm3_template(template).await);
+                let (status, body) = post_json(
+                    app,
+                    "/v1/chat/completions",
+                    json!({
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "stream": stream
+                    }),
+                )
+                .await;
+                assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{label}: {body}");
+                assert_eq!(body["error"]["code"], "unsupported_chat_template");
+                assert_eq!(body["error"]["param"], "messages");
+            }
+        }
     }
 
     #[test]
