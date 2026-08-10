@@ -10,6 +10,14 @@ import {
   inspectRemoteHeader,
   normalizePrefixBytes,
 } from './hf-qualification-header.mjs'
+import {
+  DEFAULT_TOKENIZER_PREFIX_BYTES,
+  assessTokenizerReceipt,
+  classifyTokenizerQualificationError,
+  inspectRemoteTokenizer,
+  tokenizerPackAvailable,
+  tokenizerPrefixBytesForRow,
+} from './hf-qualification-tokenizer.mjs'
 import { resolveHfSource, validateLockAgainstSelection } from './hf-qualification-source.mjs'
 import { deriveOverall, qualify, redactLocalPaths } from './model-qualification-runner.mjs'
 
@@ -47,6 +55,12 @@ function defaultCamelidBinary() {
   return process.platform === 'win32'
     ? 'target/release/camelid.exe'
     : 'target/release/camelid'
+}
+
+function defaultLlamaTokenizerBinary() {
+  return process.platform === 'win32'
+    ? 'target/reference/llama.cpp-b9632/bin/llama-tokenize.exe'
+    : 'target/reference/llama.cpp-b9632/bin/llama-tokenize'
 }
 
 function firstUnresolvedStage(report, gateOrder) {
@@ -438,6 +452,117 @@ function metadataStageFromHeaderError(error) {
   }
 }
 
+function tokenizerStageFromReceipt(row, receipt, defaults, {
+  expectedSourceHead,
+} = {}) {
+  if (!/^[0-9a-f]{40}$/.test(expectedSourceHead || '')) {
+    return {
+      status: 'fail',
+      mode: 'remote_immutable_prefix_tokenizer',
+      error_code: 'tokenizer_receipt_invalid',
+      reason: 'bounded tokenizer receipt is not bound to the factory source HEAD',
+    }
+  }
+  const assessed = assessTokenizerReceipt(receipt, row, defaults, { expectedSourceHead })
+  if (assessed.errors.length) {
+    return {
+      status: 'fail',
+      mode: 'remote_immutable_prefix_tokenizer',
+      error_code: 'tokenizer_receipt_invalid',
+      reason: 'bounded tokenizer inspector returned an invalid compact receipt',
+    }
+  }
+
+  const provenance = receipt.provenance
+  const bounded = receipt.bounded_fetch
+  const contentRange = bounded.content_range
+  const details = {
+    mode: 'remote_immutable_prefix_tokenizer',
+    inspection_generated_at: receipt.generated_at,
+    host: {
+      hostname_redacted: true,
+      platform: receipt.host.platform,
+    },
+    inspector: {
+      version: receipt.camelid.version,
+      binary_sha256: receipt.camelid.binary_sha256,
+      source_head: provenance.source_head,
+      binary_commit_abbrev: provenance.binary_commit_abbrev,
+      binary_reports_dirty: provenance.binary_reports_dirty,
+      binary_matches_source_head: provenance.binary_matches_source_head,
+      source_tracked_dirty: provenance.source_tracked_dirty,
+      clean_current_head: provenance.clean_current_head,
+      binary_path_redacted: true,
+      prefix_mode: 'tokenize --declared-len',
+    },
+    source: {
+      repo: row.source.repo,
+      file: row.source.file,
+      revision: row.source.revision,
+      size_bytes: row.identity.size_bytes,
+      sha256: row.identity.sha256,
+      license: row.source.license,
+    },
+    range: {
+      requested_bytes: bounded.requested_bytes,
+      received_bytes: bounded.received_bytes,
+      content_range: {
+        start: contentRange.start,
+        end: contentRange.end,
+        total: contentRange.total,
+      },
+      prefix_sha256: bounded.prefix_sha256,
+    },
+    oracle: {
+      project: 'ggml-org/llama.cpp',
+      revision: receipt.oracle.revision,
+      build: receipt.oracle.build,
+      binary_sha256: receipt.oracle.binary_sha256,
+      companion_binary_sha256: receipt.oracle.companion_binary_sha256,
+      derivative_sha256: receipt.oracle.derivative.sha256,
+      derivative_persisted: false,
+    },
+    observed: assessed.tokenizer_metadata,
+    result: {
+      case_count: assessed.case_count,
+      exact_match_count: assessed.exact_match_count,
+      all_token_ids_match: assessed.all_token_ids_match,
+    },
+    scope: {
+      prefix_sha256: 'all_received_prefix_bytes',
+      tokenizer_metadata: 'unchanged_from_immutable_prefix',
+      tensor_payload: 'partially_range_fetched_opaque',
+      full_artifact_sha256: 'not_run',
+      tensor_payload_interpretation: 'not_run',
+      template_rendering: 'not_run',
+      load: 'not_run',
+      generation: 'not_run',
+      api_webui: 'not_run',
+      context: 'not_run',
+      support_claim: false,
+    },
+  }
+  if (assessed.parity_errors.length || !assessed.all_token_ids_match) {
+    return {
+      status: 'fail',
+      ...details,
+      error_code: 'tokenizer_parity_mismatch',
+      reason: 'one or more exact-row tokenizer probes diverged from the pinned oracle',
+    }
+  }
+  return { status: 'pass', ...details }
+}
+
+function tokenizerStageFromError(error) {
+  const failure = classifyTokenizerQualificationError(error)
+  return {
+    status: failure.status,
+    mode: 'remote_immutable_prefix_tokenizer',
+    error_code: failure.error_code,
+    reason: failure.reason,
+  }
+}
+
 function summarizeHeaderInspections(reports, prefixBytes) {
   const counts = { pass: 0, fail: 0, blocked: 0, not_run: 0 }
   let requestedBytes = 0
@@ -457,6 +582,25 @@ function summarizeHeaderInspections(reports, prefixBytes) {
   }
 }
 
+function summarizeTokenizerInspections(reports) {
+  const counts = { pass: 0, fail: 0, blocked: 0, not_run: 0 }
+  let requestedBytes = 0
+  let receivedBytes = 0
+  for (const { tokenizerOutcome } of reports) {
+    const status = tokenizerOutcome?.status || 'not_run'
+    counts[status] = (counts[status] || 0) + 1
+    requestedBytes += tokenizerOutcome?.range?.requested_bytes || 0
+    receivedBytes += tokenizerOutcome?.range?.received_bytes || 0
+  }
+  return {
+    mode: 'remote_immutable_prefix_tokenizer',
+    per_row_byte_budget: DEFAULT_TOKENIZER_PREFIX_BYTES,
+    verified_receipt_requested_bytes: requestedBytes,
+    verified_receipt_received_bytes: receivedBytes,
+    counts,
+  }
+}
+
 function summarizeSourceResolution(reports) {
   const counts = { pass: 0, fail: 0, blocked: 0 }
   for (const { report } of reports) {
@@ -464,6 +608,17 @@ function summarizeSourceResolution(reports) {
     counts[status] = (counts[status] || 0) + 1
   }
   return { mode: 'live_huggingface', counts }
+}
+
+function summarizeBatchSourceHeads(reports) {
+  const heads = reports.map(({ report }) => report?.source_head)
+  if (!heads.length || heads.some((head) => !/^[0-9a-f]{40}$/.test(head || ''))) {
+    return { source_head: null, state: 'unknown' }
+  }
+  const unique = new Set(heads)
+  return unique.size === 1
+    ? { source_head: heads[0], state: 'uniform' }
+    : { source_head: null, state: 'mixed' }
 }
 
 function summarizeReports(reports, gateOrder, { sourcePreflight = false } = {}) {
@@ -495,7 +650,8 @@ async function runFactory(options) {
   if (options.artifact && rows.length !== 1) {
     throw new Error('--artifact is only valid when exactly one row is selected')
   }
-  const inspectHeader = Boolean(options.inspectHeader)
+  const inspectTokenizer = Boolean(options.inspectTokenizer)
+  const inspectHeader = Boolean(options.inspectHeader || inspectTokenizer)
   const sourcePreflightEnabled = Boolean(options.resolveSource || inspectHeader)
   const prefixBytes = inspectHeader
     ? normalizePrefixBytes(options.prefixBytes ?? DEFAULT_PREFIX_BYTES)
@@ -520,7 +676,7 @@ async function runFactory(options) {
       : null
     const resolvedSource = sourcePreflight?.stage || null
     const sourcePassed = !resolvedSource || resolvedSource.status === 'pass'
-    let report = await qualify({
+    let report = await (options.qualifier || qualify)({
       root,
       roster: options.roster,
       row: row.id,
@@ -531,6 +687,7 @@ async function runFactory(options) {
       promptLimit: options.promptLimit,
     })
     let headerOutcome = null
+    let tokenizerOutcome = null
     if (resolvedSource) {
       report.stages.source = resolvedSource
       if (!sourcePassed && artifact) {
@@ -572,6 +729,73 @@ async function runFactory(options) {
         report.stages.metadata = headerOutcome
       }
     }
+    if (inspectTokenizer) {
+      if (!sourcePassed || !sourcePreflight?.lock) {
+        tokenizerOutcome = {
+          status: 'blocked',
+          mode: 'remote_immutable_prefix_tokenizer',
+          error_code: 'tokenizer_source_preflight_blocked',
+          reason: 'bounded tokenizer qualification is downstream of a passing live source preflight',
+        }
+        report.stages.tokenizer = tokenizerOutcome
+      } else if (report.stages.metadata?.status !== 'pass') {
+        tokenizerOutcome = {
+          status: 'blocked',
+          mode: 'remote_immutable_prefix_tokenizer',
+          error_code: 'tokenizer_metadata_preflight_blocked',
+          reason: 'bounded tokenizer qualification is downstream of a passing metadata inspection',
+        }
+        report.stages.tokenizer = tokenizerOutcome
+      } else if (!/^[0-9a-f]{40}$/.test(report.source_head || '')) {
+        tokenizerOutcome = {
+          status: 'blocked',
+          mode: 'remote_immutable_prefix_tokenizer',
+          error_code: 'tokenizer_source_head_unavailable',
+          reason: 'bounded tokenizer qualification requires an observed factory source HEAD',
+        }
+        report.stages.tokenizer = tokenizerOutcome
+      } else if (report.stages.artifact?.status === 'pass'
+        && ['pass', 'fail'].includes(report.stages.tokenizer?.status)) {
+        tokenizerOutcome = {
+          status: 'not_run',
+          reason: report.stages.tokenizer.status === 'pass'
+            ? 'an exact local artifact already passed the authoritative tokenizer lane'
+            : 'an exact local artifact already failed the authoritative tokenizer lane; remote evidence cannot overwrite that failure',
+        }
+      } else if (!tokenizerPackAvailable(row.id)) {
+        tokenizerOutcome = {
+          status: 'blocked',
+          mode: 'remote_immutable_prefix_tokenizer',
+          error_code: 'tokenizer_pack_unavailable',
+          reason: 'no bounded tokenizer pack is defined for this exact row',
+        }
+        report.stages.tokenizer = tokenizerOutcome
+      } else {
+        try {
+          const receipt = await (options.tokenizerInspector || inspectRemoteTokenizer)(
+            sourcePreflight.lock,
+            {
+              row,
+              defaults: roster.defaults,
+              binary: resolve(root, options.camelid || defaultCamelidBinary()),
+              llamaTokenize: resolve(
+                root,
+                options.llamaTokenize || defaultLlamaTokenizerBinary(),
+              ),
+              sourceRoot: root,
+              prefixBytes: tokenizerPrefixBytesForRow(row.id),
+              token: hfToken,
+            },
+          )
+          tokenizerOutcome = tokenizerStageFromReceipt(row, receipt, roster.defaults, {
+            expectedSourceHead: report.source_head,
+          })
+        } catch (error) {
+          tokenizerOutcome = tokenizerStageFromError(error)
+        }
+        report.stages.tokenizer = tokenizerOutcome
+      }
+    }
     report.overall_status = deriveOverall(report.stages)
     report = redactLocalPaths(report, [
       [artifact, '<artifact>'],
@@ -579,13 +803,14 @@ async function runFactory(options) {
     ])
     const reportFile = `${row.id}.json`
     await writeFile(resolve(outDir, reportFile), `${JSON.stringify(report, null, 2)}\n`)
-    reports.push({ row, report, reportFile, headerOutcome })
+    reports.push({ row, report, reportFile, headerOutcome, tokenizerOutcome })
   }
 
   const summary = summarizeReports(reports, roster.gate_order, {
     sourcePreflight: sourcePreflightEnabled,
   })
   const sourceDirtyValues = reports.map(({ report }) => report.source_dirty)
+  const sourceHeadSummary = summarizeBatchSourceHeads(reports)
   const index = {
     schema: 'camelid.model-qualification-index/v1',
     generated_at: new Date().toISOString(),
@@ -593,7 +818,10 @@ async function runFactory(options) {
     roster_schema: roster.schema,
     models_dir_env: roster.defaults.models_dir_env,
     models_dir_configured: Boolean(modelsDir),
-    source_head: reports[0]?.report.source_head ?? null,
+    source_head: sourceHeadSummary.source_head,
+    ...(sourceHeadSummary.state === 'uniform'
+      ? {}
+      : { source_head_state: sourceHeadSummary.state }),
     source_dirty: sourceDirtyValues.some((value) => value === null)
       ? null
       : sourceDirtyValues.some(Boolean),
@@ -602,6 +830,9 @@ async function runFactory(options) {
       : {}),
     ...(inspectHeader
       ? { header_inspection: summarizeHeaderInspections(reports, prefixBytes) }
+      : {}),
+    ...(inspectTokenizer
+      ? { tokenizer_inspection: summarizeTokenizerInspections(reports) }
       : {}),
     ...summary,
   }
@@ -624,6 +855,8 @@ Options:
   --resolve-source         Live-resolve each pinned HF selector before local probes
   --inspect-header         Bounded immutable-prefix inspection; implies --resolve-source
   --prefix-bytes <n>       Per-row header range budget, max 64 MiB (default: 32 MiB)
+  --inspect-tokenizer      Exact 32 MiB tokenizer/oracle lane; implies header + source
+  --llama-tokenize <path>  Pinned llama-tokenize binary/package
   --run-smoke              Execute configured smoke probes
   --run-generation         Execute pinned greedy parity probes
   --prompt-limit <n>       Deliberately partial parity run (remains blocked)
@@ -638,7 +871,8 @@ Options:
   if (promptLimitRaw && (!Number.isInteger(promptLimit) || promptLimit < 1)) {
     throw new Error('--prompt-limit must be a positive integer')
   }
-  const inspectHeader = args.has('inspect-header')
+  const inspectTokenizer = args.has('inspect-tokenizer')
+  const inspectHeader = args.has('inspect-header') || inspectTokenizer
   const prefixBytes = args.has('prefix-bytes')
     ? normalizePrefixBytes(args.get('prefix-bytes'))
     : DEFAULT_PREFIX_BYTES
@@ -649,9 +883,11 @@ Options:
     modelsDir: args.get('models-dir'),
     artifact: args.get('artifact'),
     camelid: args.get('camelid'),
+    llamaTokenize: args.get('llama-tokenize'),
     outDir: args.get('out-dir'),
     resolveSource: args.has('resolve-source') || inspectHeader,
     inspectHeader,
+    inspectTokenizer,
     prefixBytes,
     runSmoke: args.has('run-smoke'),
     runGeneration: args.has('run-generation'),
@@ -663,6 +899,7 @@ Options:
 export {
   artifactForRow,
   defaultCamelidBinary,
+  defaultLlamaTokenizerBinary,
   firstUnresolvedStage,
   metadataStageFromHeader,
   metadataStageFromHeaderError,
@@ -673,9 +910,13 @@ export {
   selectRows,
   sourceLookupErrorCode,
   sourceSelectionForRow,
+  summarizeBatchSourceHeads,
   summarizeHeaderInspections,
+  summarizeTokenizerInspections,
   summarizeSourceResolution,
   summarizeReports,
+  tokenizerStageFromError,
+  tokenizerStageFromReceipt,
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1] || '').href) {

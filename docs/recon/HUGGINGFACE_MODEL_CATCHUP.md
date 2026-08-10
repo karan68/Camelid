@@ -159,7 +159,11 @@ Phase 2 has started without weakening the Phase 1 evidence boundary:
   source identities become `blocked`; they never disappear as skipped tests.
   `--resolve-source` performs the immutable Hub preflight, while
   `--inspect-header` additionally runs the bounded remote-header lane and keeps
-  per-row failures from aborting the rest of the batch.
+  per-row failures from aborting the rest of the batch. `--inspect-tokenizer`
+  is the opt-in next gate: it implies source and header inspection, then runs an
+  exact-row tokenizer pack only after metadata passes. A passing tokenizer
+  receipt advances only the report's tokenizer stage; artifact, template,
+  load, generation, API/WebUI, and context gates remain unchanged.
 - `scripts/check-model-qualification-report.mjs` validates the committed report
   contract, fail-closed overall status, and privacy boundary before evidence is
   accepted.
@@ -176,7 +180,14 @@ Phase 2 has started without weakening the Phase 1 evidence boundary:
   SmolLM3 pack includes empty/default-special handling, exact `Hello` IDs,
   Unicode/contraction/digit splits, ChatML controls, and USER_DEFINED tool tags;
   both lanes explicitly decline weight-load, generation, template-rendering,
-  API, and support claims.
+  API, and support claims. The factory calls the same lane with its already
+  validated source lock. Camelid and pinned llama.cpp identities are checked
+  before the tokenizer range request, and source HEAD plus tracked-clean state
+  are checked again after the probes. Each tokenizer pack pins exactly 32 MiB.
+  When remote metadata is also needed, header and tokenizer qualification make
+  two independent bounded requests (normally 64 MiB total per row), never a
+  full-artifact download; a server that ignores or exceeds either range remains
+  fail-closed.
 
 The factory does not download multi-gigabyte artifacts implicitly and does not
 run smoke or generation unless those probes are explicitly requested. This

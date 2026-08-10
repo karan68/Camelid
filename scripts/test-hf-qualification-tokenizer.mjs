@@ -6,16 +6,23 @@ import { readFileSync } from 'node:fs'
 import {
   GEMMA2_CASES,
   SMOLLM3_CASES,
+  TokenizerQualificationError,
+  assessTokenizerReceipt,
   assertGemma2TokenizerMetadata,
   assertSmolLM3TokenizerMetadata,
   buildCamelidArgs,
   buildLlamaArgs,
   classifyCamelidProvenance,
+  classifyTokenizerQualificationError,
+  inspectRemoteTokenizer,
   makeVocabOnlyGguf,
   normalizeTokenizerPrefixBytes,
   parseLlamaIds,
   parseLlamaVersionOutput,
+  runTokenizerCli,
   sourceSelectionForRow,
+  tokenizerPackAvailable,
+  tokenizerPrefixBytesForRow,
   validateGemma2TokenizerReceipt,
   validateSmolLM3TokenizerReceipt,
 } from './hf-qualification-tokenizer.mjs'
@@ -50,6 +57,50 @@ assert.throws(
   () => parseLlamaVersionOutput('version: 9632 (deadbeef0)'),
   /does not match pin/,
 )
+assert.equal(tokenizerPackAvailable('gemma2_9b_it_q8_0'), true)
+assert.equal(tokenizerPackAvailable('smollm3_3b_q8_0'), true)
+assert.equal(tokenizerPackAvailable('not_a_pack'), false)
+assert.equal(tokenizerPrefixBytesForRow('gemma2_9b_it_q8_0'), 32 * 1024 * 1024)
+assert.equal(tokenizerPrefixBytesForRow('not_a_pack'), null)
+
+const typedTokenizerFailure = classifyTokenizerQualificationError(
+  new TokenizerQualificationError(
+    'tokenizer_oracle_unavailable',
+    'fail',
+    'C:\\private\\llama-tokenize.exe test-secret-token',
+  ),
+)
+assert.deepEqual(typedTokenizerFailure, {
+  status: 'blocked',
+  error_code: 'tokenizer_oracle_unavailable',
+  reason: 'the pinned llama.cpp tokenizer oracle is unavailable',
+})
+const mutatedTokenizerError = new TokenizerQualificationError(
+  'tokenizer_probe_failed',
+  'fail',
+  'safe',
+)
+mutatedTokenizerError.code = 'forged'
+mutatedTokenizerError.status = 'pass'
+mutatedTokenizerError.message = 'C:\\private\\model.gguf bearer-token'
+assert.deepEqual(classifyTokenizerQualificationError(mutatedTokenizerError), {
+  status: 'fail',
+  error_code: 'tokenizer_probe_failed',
+  reason: 'an exact-row tokenizer probe failed to produce a valid result',
+})
+const mutatedKnownTokenizerError = new TokenizerQualificationError(
+  'tokenizer_oracle_unavailable',
+  'blocked',
+  'safe',
+)
+mutatedKnownTokenizerError.code = 'tokenizer_source_identity_mismatch'
+mutatedKnownTokenizerError.status = 'fail'
+mutatedKnownTokenizerError.message = 'C:\\private\\model.gguf bearer-token'
+assert.deepEqual(classifyTokenizerQualificationError(mutatedKnownTokenizerError), {
+  status: 'blocked',
+  error_code: 'tokenizer_oracle_unavailable',
+  reason: 'the pinned llama.cpp tokenizer oracle is unavailable',
+})
 assert.throws(() => parseLlamaVersionOutput('unknown version'), /parseable build revision/)
 
 assert.deepEqual(classifyCamelidProvenance({
@@ -282,6 +333,322 @@ assert(receipt.cases.every((testCase) => testCase.exact_match))
 assert.match(receipt.oracle.input, /tensor_count is zeroed/)
 assert.match(receipt.bounded_fetch.scope_note, /opaque initial tensor payload bytes/)
 assert(!/[A-Za-z]:[\\/]/.test(JSON.stringify(receipt)), 'receipt must not expose an absolute Windows path')
+
+const boundAssessment = assessTokenizerReceipt(receipt, receiptRow, roster.defaults, {
+  expectedSourceHead: receipt.provenance.source_head,
+})
+assert.deepEqual(boundAssessment.errors, [])
+assert.deepEqual(boundAssessment.parity_errors, [])
+assert.equal(boundAssessment.all_token_ids_match, true)
+const staleHeadAssessment = assessTokenizerReceipt(receipt, receiptRow, roster.defaults, {
+  expectedSourceHead: 'f'.repeat(40),
+})
+assert(
+  staleHeadAssessment.errors.some((error) => error.includes('expected source HEAD')),
+  'factory receipt assessment must bind the Camelid binary to the report source HEAD',
+)
+
+const honestMismatch = structuredClone(receipt)
+honestMismatch.cases[0].llama_cpp_ids[0] = (honestMismatch.cases[0].llama_cpp_ids[0] + 1) % 256_000
+honestMismatch.cases[0].exact_match = false
+honestMismatch.result.exact_match_count -= 1
+honestMismatch.result.all_token_ids_match = false
+const honestMismatchAssessment = assessTokenizerReceipt(
+  honestMismatch,
+  receiptRow,
+  roster.defaults,
+  { expectedSourceHead: receipt.provenance.source_head },
+)
+assert.deepEqual(honestMismatchAssessment.errors, [], 'an honest mismatch remains a valid receipt')
+assert.equal(honestMismatchAssessment.all_token_ids_match, false)
+assert.equal(honestMismatchAssessment.parity_errors.length, 1)
+
+const forgedMismatchFlags = structuredClone(honestMismatch)
+forgedMismatchFlags.cases[0].exact_match = true
+forgedMismatchFlags.result.exact_match_count = forgedMismatchFlags.cases.length
+forgedMismatchFlags.result.all_token_ids_match = true
+const forgedMismatchAssessment = assessTokenizerReceipt(
+  forgedMismatchFlags,
+  receiptRow,
+  roster.defaults,
+  { expectedSourceHead: receipt.provenance.source_head },
+)
+assert(forgedMismatchAssessment.errors.some((error) => error.includes('exact_match is not derived')))
+assert(forgedMismatchAssessment.errors.some((error) => error.includes('result exact_match_count mismatch')))
+
+const callableLock = {
+  repo: receiptRow.source.repo,
+  file: receiptRow.source.file,
+  revision: receiptRow.source.revision,
+  size_bytes: receiptRow.identity.size_bytes,
+  sha256: receiptRow.identity.sha256,
+  license: receiptRow.source.license,
+  download_url: 'https://huggingface.co/example/unused-in-injected-tests',
+}
+const callableHead = '1'.repeat(40)
+const callableSource = { sourceHead: callableHead, sourceTrackedDirty: false }
+const callableProvenance = classifyCamelidProvenance({
+  version: 'camelid v0.6.1-g11111111',
+  ...callableSource,
+})
+const callableIdentity = {
+  version: 'camelid v0.6.1-g11111111',
+  binary_sha256: 'a'.repeat(64),
+  provenance: callableProvenance,
+}
+
+let dirtyPreflightFetched = false
+await assert.rejects(
+  inspectRemoteTokenizer(callableLock, {
+    row: receiptRow,
+    defaults: roster.defaults,
+    binary: 'camelid',
+    llamaTokenize: 'llama-tokenize',
+    sourceProvenanceImpl: async () => ({ sourceHead: callableHead, sourceTrackedDirty: true }),
+    fetchPrefixImpl: async () => { dirtyPreflightFetched = true },
+  }),
+  (error) => error instanceof TokenizerQualificationError
+    && error.code === 'tokenizer_inspector_not_clean_current_head',
+)
+assert.equal(dirtyPreflightFetched, false, 'tracked-dirty source must block before the range fetch')
+
+let invalidBudgetSourceCalled = false
+await assert.rejects(
+  inspectRemoteTokenizer(callableLock, {
+    row: receiptRow,
+    defaults: roster.defaults,
+    binary: 'camelid',
+    llamaTokenize: 'llama-tokenize',
+    prefixBytes: 16 * 1024 * 1024,
+    sourceProvenanceImpl: async () => { invalidBudgetSourceCalled = true },
+  }),
+  (error) => error instanceof TokenizerQualificationError
+    && error.code === 'tokenizer_prefix_budget_invalid',
+)
+assert.equal(invalidBudgetSourceCalled, false, 'invalid pack budget must fail before local or network probes')
+
+let staleOracleFetched = false
+await assert.rejects(
+  inspectRemoteTokenizer(callableLock, {
+    row: receiptRow,
+    defaults: roster.defaults,
+    binary: 'camelid',
+    llamaTokenize: 'llama-tokenize',
+    sourceProvenanceImpl: async () => callableSource,
+    camelidIdentityImpl: async () => callableIdentity,
+    llamaPackageImpl: async () => ({
+      revision: roster.defaults.llama_cpp.revision,
+      build: Number(roster.defaults.llama_cpp.build.slice(1)),
+      binary_sha256: '0'.repeat(64),
+      companion_binary_sha256: '0'.repeat(64),
+    }),
+    fetchPrefixImpl: async () => { staleOracleFetched = true },
+  }),
+  (error) => error instanceof TokenizerQualificationError
+    && error.code === 'tokenizer_oracle_identity_mismatch',
+)
+assert.equal(staleOracleFetched, false, 'oracle identity drift must fail before the range fetch')
+
+let invalidCliBudgetResolved = false
+await assert.rejects(
+  runTokenizerCli([
+    '--row', 'gemma2_9b_it_q8_0',
+    '--prefix-bytes', '1',
+  ], {
+    sourceResolver: async () => {
+      invalidCliBudgetResolved = true
+      return callableLock
+    },
+  }),
+  (error) => error instanceof TokenizerQualificationError
+    && error.code === 'tokenizer_prefix_budget_invalid'
+    && classifyTokenizerQualificationError(error).status === 'fail',
+)
+assert.equal(invalidCliBudgetResolved, false, 'invalid CLI budget must fail before HF source lookup')
+
+let sourceDriftPreflightCalled = false
+await assert.rejects(
+  inspectRemoteTokenizer({ ...callableLock, sha256: '0'.repeat(64) }, {
+    row: receiptRow,
+    defaults: roster.defaults,
+    binary: 'camelid',
+    llamaTokenize: 'llama-tokenize',
+    sourceProvenanceImpl: async () => { sourceDriftPreflightCalled = true },
+  }),
+  (error) => error instanceof TokenizerQualificationError
+    && error.code === 'tokenizer_source_identity_mismatch',
+)
+assert.equal(sourceDriftPreflightCalled, false, 'source drift must fail before local or network probes')
+
+const callablePrefix = Buffer.alloc(32 * 1024 * 1024)
+callablePrefix.write('GGUF', 0, 'ascii')
+callablePrefix.writeUInt32LE(3, 4)
+callablePrefix.writeBigInt64LE(464n, 8)
+callablePrefix.writeBigInt64LE(26n, 16)
+const callableMetadataSummary = {
+  token_count: 256_000,
+  score_count: 256_000,
+  token_type_count: 256_000,
+  chat_template_utf8_bytes: 591,
+  chat_template_sha256: 'ecd6ae513fe103f0eb62e8ab5bfa8d0fe45c1074fa398b089c93a7e70c15cfd6',
+}
+const callableLlamaPackage = {
+  revision: roster.defaults.llama_cpp.revision,
+  build: Number(roster.defaults.llama_cpp.build.slice(1)),
+  executable: 'llama-tokenize',
+  binary_sha256: 'a44a4d7e1445d22a4cffb0d38f6efa8f1d81e84ae2c3d481af857c5e331b8c7a',
+  companion_executable: 'llama-cli',
+  companion_binary_sha256: '2ec09da0b81d0201ce5b21810caefb4e77fd108f383b30c15ca493c5a70f7731',
+}
+const callableOptions = (overrides = {}) => ({
+  row: receiptRow,
+  defaults: roster.defaults,
+  binary: 'camelid',
+  llamaTokenize: 'llama-tokenize',
+  sourceRoot: 'virtual-source-root',
+  prefixBytes: 32 * 1024 * 1024,
+  token: 'test-secret-token',
+  sourceProvenanceImpl: async () => callableSource,
+  camelidIdentityImpl: async () => callableIdentity,
+  llamaPackageImpl: async () => callableLlamaPackage,
+  fetchPrefixImpl: async (_lock, options) => {
+    assert.equal(options.prefixBytes, 32 * 1024 * 1024)
+    assert.equal(options.token, 'test-secret-token')
+    return {
+      bytes: callablePrefix,
+      requested_bytes: 32 * 1024 * 1024,
+      content_range: {
+        start: 0,
+        end: 32 * 1024 * 1024 - 1,
+        total: receiptRow.identity.size_bytes,
+      },
+      prefix_sha256: 'b2bcc601c188ffc7c306f0011944a7a5492bfde490c34ddc390b69424c09a5e5',
+    }
+  },
+  prefixSha256Impl: () => 'b2bcc601c188ffc7c306f0011944a7a5492bfde490c34ddc390b69424c09a5e5',
+  mkdtempImpl: async () => 'virtual-tokenizer-temp',
+  writeFileImpl: async () => {},
+  inspectImpl: async () => ({ tensor_count: 464 }),
+  metadataValidatorImpl: () => callableMetadataSummary,
+  deriveImpl: () => ({
+    bytes: Buffer.from('vocab-only-derivative'),
+    original_tensor_count: 464,
+    metadata_count: 26,
+    patched_offset: 8,
+  }),
+  camelidCaseImpl: async () => ({ ids: [42], decoded: 'probe' }),
+  llamaCaseImpl: async () => [42],
+  now: () => new Date('2026-08-10T19:30:00.000Z'),
+  ...overrides,
+})
+
+let successCleanupCalls = 0
+let successSourceCalls = 0
+const callableSuccessReceipt = await inspectRemoteTokenizer(callableLock, callableOptions({
+  sourceProvenanceImpl: async () => {
+    successSourceCalls += 1
+    return callableSource
+  },
+  rmImpl: async (path, options) => {
+    successCleanupCalls += 1
+    assert.equal(path, 'virtual-tokenizer-temp')
+    assert.deepEqual(options, { recursive: true, force: true })
+  },
+}))
+assert.equal(successSourceCalls, 2, 'successful qualification must inspect source before and after probes')
+assert.equal(successCleanupCalls, 1, 'successful qualification must delete its temporary directory')
+assert.equal(callableSuccessReceipt.bounded_fetch.temporary_files_deleted, true)
+assert.equal(callableSuccessReceipt.result.all_token_ids_match, true)
+assert.equal(JSON.stringify(callableSuccessReceipt).includes('test-secret-token'), false)
+const callableSuccessAssessment = assessTokenizerReceipt(
+  callableSuccessReceipt,
+  receiptRow,
+  roster.defaults,
+  { expectedSourceHead: callableHead },
+)
+assert.deepEqual(callableSuccessAssessment.errors, [])
+assert.deepEqual(callableSuccessAssessment.parity_errors, [])
+
+let changedCamelidIdentityCalls = 0
+let changedCamelidCleanupCalls = 0
+await assert.rejects(
+  inspectRemoteTokenizer(callableLock, callableOptions({
+    camelidIdentityImpl: async () => {
+      changedCamelidIdentityCalls += 1
+      return changedCamelidIdentityCalls === 1
+        ? callableIdentity
+        : { ...callableIdentity, binary_sha256: 'b'.repeat(64) }
+    },
+    rmImpl: async () => { changedCamelidCleanupCalls += 1 },
+  })),
+  (error) => error instanceof TokenizerQualificationError
+    && error.code === 'tokenizer_inspector_changed',
+)
+assert.equal(changedCamelidIdentityCalls, 2, 'Camelid identity must be checked before and after probes')
+assert.equal(changedCamelidCleanupCalls, 1, 'Camelid identity drift must still clean temporary files')
+
+let changedOracleIdentityCalls = 0
+let changedOracleCleanupCalls = 0
+await assert.rejects(
+  inspectRemoteTokenizer(callableLock, callableOptions({
+    llamaPackageImpl: async () => {
+      changedOracleIdentityCalls += 1
+      return changedOracleIdentityCalls === 1
+        ? callableLlamaPackage
+        : { ...callableLlamaPackage, binary_sha256: 'b'.repeat(64) }
+    },
+    rmImpl: async () => { changedOracleCleanupCalls += 1 },
+  })),
+  (error) => error instanceof TokenizerQualificationError
+    && error.code === 'tokenizer_oracle_changed',
+)
+assert.equal(changedOracleIdentityCalls, 2, 'oracle identity must be checked before and after probes')
+assert.equal(changedOracleCleanupCalls, 1, 'oracle identity drift must still clean temporary files')
+
+const callableMismatchReceipt = await inspectRemoteTokenizer(callableLock, callableOptions({
+  llamaCaseImpl: async (_binary, _model, _temporary, testCase) => (
+    testCase.id === GEMMA2_CASES[0].id ? [43] : [42]
+  ),
+  rmImpl: async () => {},
+}))
+assert.equal(callableMismatchReceipt.result.all_token_ids_match, false)
+assert.equal(callableMismatchReceipt.result.exact_match_count, GEMMA2_CASES.length - 1)
+const callableMismatchAssessment = assessTokenizerReceipt(
+  callableMismatchReceipt,
+  receiptRow,
+  roster.defaults,
+  { expectedSourceHead: callableHead },
+)
+assert.deepEqual(callableMismatchAssessment.errors, [])
+assert.equal(callableMismatchAssessment.parity_errors.length, 1)
+
+let driftSourceCalls = 0
+let driftCleanupCalls = 0
+await assert.rejects(
+  inspectRemoteTokenizer(callableLock, callableOptions({
+    sourceProvenanceImpl: async () => {
+      driftSourceCalls += 1
+      return driftSourceCalls === 1
+        ? callableSource
+        : { sourceHead: '2'.repeat(40), sourceTrackedDirty: false }
+    },
+    rmImpl: async () => { driftCleanupCalls += 1 },
+  })),
+  (error) => error instanceof TokenizerQualificationError
+    && error.code === 'tokenizer_source_changed',
+)
+assert.equal(driftSourceCalls, 2, 'post-probe source identity must be re-read')
+assert.equal(driftCleanupCalls, 1, 'post-probe source drift must still clean temporary files')
+
+await assert.rejects(
+  inspectRemoteTokenizer(callableLock, callableOptions({
+    rmImpl: async () => { throw new Error('C:\\private\\locked test-secret-token') },
+  })),
+  (error) => error instanceof TokenizerQualificationError
+    && error.code === 'tokenizer_cleanup_failed'
+    && !error.message.includes('private')
+    && !error.message.includes('test-secret-token'),
+)
 
 const forgedIds = structuredClone(receipt)
 forgedIds.cases[0].llama_cpp_ids = [999]

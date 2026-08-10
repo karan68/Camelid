@@ -8,7 +8,11 @@ import { basename, dirname, join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { promisify } from 'node:util'
 import { validateRoster } from './check-model-qualification-roster.mjs'
-import { fetchHeaderPrefix } from './hf-qualification-header.mjs'
+import {
+  HeaderInspectionError,
+  classifyHeaderInspectionError,
+  fetchHeaderPrefix,
+} from './hf-qualification-header.mjs'
 import {
   resolveHfSource,
   validateLockAgainstSelection,
@@ -21,6 +25,69 @@ const PINNED_LLAMA_TOKENIZE_SHA256 = 'a44a4d7e1445d22a4cffb0d38f6efa8f1d81e84ae2
 const PINNED_LLAMA_CLI_SHA256 = '2ec09da0b81d0201ce5b21810caefb4e77fd108f383b30c15ca493c5a70f7731'
 const GEMMA2_TEMPLATE_SHA256 = 'ecd6ae513fe103f0eb62e8ab5bfa8d0fe45c1074fa398b089c93a7e70c15cfd6'
 const SMOLLM3_TEMPLATE_SHA256 = 'b9b66f04c64fbb8695cf5b35c37780efd0b8e0829fbfe3e30fafb9f469b7d30e'
+
+const TOKENIZER_ERROR_CONTRACTS = Object.freeze({
+  tokenizer_pack_unavailable: ['blocked', 'no bounded tokenizer pack is defined for this exact row'],
+  tokenizer_prefix_budget_invalid: ['fail', 'bounded tokenizer qualification requires the exact pack byte budget'],
+  tokenizer_source_identity_mismatch: ['fail', 'bounded tokenizer source identity does not match the roster row'],
+  tokenizer_inspector_unavailable: ['blocked', 'the Camelid tokenizer inspector is unavailable'],
+  tokenizer_inspector_not_clean_current_head: ['blocked', 'the Camelid tokenizer inspector is not a clean build of current source HEAD'],
+  tokenizer_inspector_changed: ['blocked', 'the Camelid tokenizer inspector changed during qualification'],
+  tokenizer_oracle_unavailable: ['blocked', 'the pinned llama.cpp tokenizer oracle is unavailable'],
+  tokenizer_oracle_identity_mismatch: ['fail', 'the llama.cpp tokenizer oracle does not match the pinned package'],
+  tokenizer_oracle_changed: ['blocked', 'the pinned llama.cpp tokenizer oracle changed during qualification'],
+  tokenizer_range_unavailable: ['blocked', 'the bounded tokenizer range fetch is unavailable'],
+  tokenizer_range_invalid: ['fail', 'the bounded tokenizer range response is invalid'],
+  tokenizer_prefix_identity_mismatch: ['fail', 'the bounded tokenizer prefix does not match the grounded exact-row hash'],
+  tokenizer_metadata_mismatch: ['fail', 'the bounded tokenizer metadata does not match the exact-row pack'],
+  tokenizer_probe_failed: ['fail', 'an exact-row tokenizer probe failed to produce a valid result'],
+  tokenizer_source_changed: ['blocked', 'source HEAD or tracked state changed during tokenizer qualification'],
+  tokenizer_receipt_time_invalid: ['fail', 'the tokenizer receipt time could not be recorded'],
+  tokenizer_cleanup_failed: ['blocked', 'temporary tokenizer qualification files could not be removed'],
+  tokenizer_qualification_error: ['blocked', 'bounded tokenizer qualification could not complete'],
+})
+const FALLBACK_TOKENIZER_ERROR = TOKENIZER_ERROR_CONTRACTS.tokenizer_qualification_error
+const TOKENIZER_ERROR_CODES = new WeakMap()
+
+class TokenizerQualificationError extends Error {
+  constructor(code, _status, _message, _details = {}) {
+    const knownCode = typeof code === 'string' && Object.hasOwn(TOKENIZER_ERROR_CONTRACTS, code)
+    const contract = knownCode ? TOKENIZER_ERROR_CONTRACTS[code] : FALLBACK_TOKENIZER_ERROR
+    super(contract[1])
+    this.name = 'TokenizerQualificationError'
+    this.code = knownCode ? code : 'tokenizer_qualification_error'
+    this.status = contract[0]
+    TOKENIZER_ERROR_CODES.set(this, this.code)
+  }
+}
+
+function tokenizerError(code) {
+  return new TokenizerQualificationError(code)
+}
+
+function classifyTokenizerQualificationError(error) {
+  if (error instanceof TokenizerQualificationError) {
+    const canonicalCode = TOKENIZER_ERROR_CODES.get(error)
+    const knownCode = typeof canonicalCode === 'string'
+      && Object.hasOwn(TOKENIZER_ERROR_CONTRACTS, canonicalCode)
+    const code = knownCode ? canonicalCode : 'tokenizer_qualification_error'
+    const contract = knownCode ? TOKENIZER_ERROR_CONTRACTS[code] : FALLBACK_TOKENIZER_ERROR
+    return { status: contract[0], error_code: code, reason: contract[1] }
+  }
+  if (error instanceof HeaderInspectionError) {
+    const failure = classifyHeaderInspectionError(error)
+    const code = failure.status === 'fail'
+      ? 'tokenizer_range_invalid'
+      : 'tokenizer_range_unavailable'
+    const contract = TOKENIZER_ERROR_CONTRACTS[code]
+    return { status: contract[0], error_code: code, reason: contract[1] }
+  }
+  return {
+    status: FALLBACK_TOKENIZER_ERROR[0],
+    error_code: 'tokenizer_qualification_error',
+    reason: FALLBACK_TOKENIZER_ERROR[1],
+  }
+}
 
 const GEMMA2_CASES = [
   {
@@ -203,7 +270,7 @@ function parseLlamaVersionOutput(output, expectedRevision = PINNED_LLAMA_REVISIO
 }
 
 function classifyCamelidProvenance({ version, sourceHead, sourceTrackedDirty }) {
-  const match = /(?:^|-)g([0-9a-f]{7,40})(-dirty)?$/i.exec(String(version))
+  const match = /^camelid [A-Za-z0-9._+()-]+-g([0-9a-f]{7,40})(-dirty)?$/i.exec(String(version))
   const binaryCommit = match?.[1]?.toLowerCase() || null
   const binaryReportsDirty = Boolean(match?.[2])
   const normalizedHead = String(sourceHead || '').trim().toLowerCase()
@@ -244,14 +311,17 @@ async function readSourceProvenance(root) {
   }
 }
 
-async function verifyLlamaCppPackage(llamaTokenize) {
+async function verifyLlamaCppPackage(llamaTokenize, {
+  execImpl = execFileAsync,
+  readFileImpl = readFile,
+} = {}) {
   const companion = join(
     dirname(llamaTokenize),
     process.platform === 'win32' ? 'llama-cli.exe' : 'llama-cli',
   )
   let output = ''
   try {
-    const result = await execFileAsync(companion, ['--version'], {
+    const result = await execImpl(companion, ['--version'], {
       timeout: 10_000,
       windowsHide: true,
     })
@@ -266,8 +336,41 @@ async function verifyLlamaCppPackage(llamaTokenize) {
   return {
     ...version,
     companion_executable: basename(companion),
-    companion_binary_sha256: sha256(await readFile(companion)),
+    companion_binary_sha256: sha256(await readFileImpl(companion)),
+    executable: basename(llamaTokenize),
+    binary_sha256: sha256(await readFileImpl(llamaTokenize)),
   }
+}
+
+async function inspectCamelidTokenizerIdentity(binary, {
+  sourceProvenance,
+  execImpl = execFileAsync,
+  readFileImpl = readFile,
+} = {}) {
+  if (typeof binary !== 'string' || !binary.trim()) {
+    throw tokenizerError('tokenizer_inspector_unavailable')
+  }
+  let version
+  let binarySha256
+  try {
+    const result = await execImpl(binary, ['--version'], {
+      timeout: 10_000,
+      maxBuffer: 1024 * 1024,
+      windowsHide: true,
+    })
+    version = String(result.stdout || '').trim()
+    binarySha256 = sha256(await readFileImpl(binary))
+  } catch {
+    throw tokenizerError('tokenizer_inspector_unavailable')
+  }
+  const provenance = classifyCamelidProvenance({
+    version,
+    ...sourceProvenance,
+  })
+  if (!provenance.clean_current_head) {
+    throw tokenizerError('tokenizer_inspector_not_clean_current_head')
+  }
+  return { version, binary_sha256: binarySha256, provenance }
 }
 
 function buildCamelidArgs({ prefixPath, declaredLength, inputPath, addSpecial, parseSpecial }) {
@@ -524,6 +627,14 @@ function tokenizerPackForRow(rowId) {
   return pack
 }
 
+function tokenizerPackAvailable(rowId) {
+  return typeof rowId === 'string' && Object.hasOwn(TOKENIZER_PACKS, rowId)
+}
+
+function tokenizerPrefixBytesForRow(rowId) {
+  return tokenizerPackAvailable(rowId) ? TOKENIZER_PACKS[rowId].prefixBytes : null
+}
+
 function normalizeTokenizerPrefixBytes(rowId, value = DEFAULT_PREFIX_BYTES) {
   const pack = tokenizerPackForRow(rowId)
   const prefixBytes = typeof value === 'number' ? value : Number(value)
@@ -565,9 +676,13 @@ function validIdArray(value, tokenCount) {
     && value.every((id) => Number.isSafeInteger(id) && id >= 0 && id < tokenCount)
 }
 
-function validateTokenizerReceipt(receipt, row, defaults, pack) {
+function assessTokenizerReceiptForPack(receipt, row, defaults, pack, {
+  expectedSourceHead = null,
+} = {}) {
   const errors = []
+  const parityErrors = []
   const check = (condition, message) => { if (!condition) errors.push(message) }
+  const parityCheck = (condition, message) => { if (!condition) parityErrors.push(message) }
   const shaRe = /^[0-9a-f]{64}$/
   check(row?.id && TOKENIZER_PACKS[row.id] === pack, 'row is not bound to this tokenizer pack')
   check(receipt?.schema === 'camelid.header-tokenizer-parity/v1', 'schema mismatch')
@@ -577,6 +692,8 @@ function validateTokenizerReceipt(receipt, row, defaults, pack) {
     && !Number.isNaN(Date.parse(receipt.generated_at)), 'generated_at is invalid')
   check(receipt?.host?.hostname_redacted === true, 'hostname is not redacted')
   check(!Object.hasOwn(receipt?.host || {}, 'hostname'), 'raw hostname is present')
+  check(typeof receipt?.host?.platform === 'string'
+    && /^[A-Za-z0-9_.:+-]{1,128}$/.test(receipt.host.platform), 'host platform is invalid')
 
   for (const [field, expected] of [
     ['repo', row.source.repo],
@@ -605,6 +722,9 @@ function validateTokenizerReceipt(receipt, row, defaults, pack) {
   check(provenance.binary_reports_dirty === false, 'Camelid binary reports dirty')
   check(provenance.binary_matches_source_head === true, 'Camelid binary does not match source head')
   check(provenance.clean_current_head === true, 'clean_current_head is not true')
+  check(expectedSourceHead === null
+    || (/^[0-9a-f]{40}$/.test(expectedSourceHead)
+      && provenance.source_head === expectedSourceHead), 'provenance source_head does not match expected source HEAD')
   for (const [field, expected] of Object.entries(recomputedProvenance)) {
     check(provenance[field] === expected, `provenance.${field} is not derivable from Camelid version and source head`)
   }
@@ -666,7 +786,7 @@ function validateTokenizerReceipt(receipt, row, defaults, pack) {
     check(observed.parse_special === expected.parse_special, `case ${expected.id} parse_special mismatch`)
     check(idsValid, `case ${expected.id} has invalid token IDs`)
     check(observed.exact_match === idsMatch, `case ${expected.id} exact_match is not derived from token IDs`)
-    check(idsMatch, `case ${expected.id} token IDs diverge`)
+    parityCheck(idsMatch, `case ${expected.id} token IDs diverge`)
     check(shaRe.test(observed.camelid_decoded_sha256 || ''), `case ${expected.id} decoded SHA-256 is invalid`)
   }
   check(receipt?.result?.case_count === cases.length, 'result case_count mismatch')
@@ -738,15 +858,59 @@ function validateTokenizerReceipt(receipt, row, defaults, pack) {
   check(!/[A-Za-z]:[\\/]/.test(serialized), 'receipt exposes an absolute Windows path')
   check(!/(?:\/Users\/|\/home\/|\/tmp\/)/i.test(serialized), 'receipt exposes an absolute local path')
   check(!/(?:Bearer\s+|hf_[A-Za-z0-9]{8,})/i.test(serialized), 'receipt exposes an access token')
-  return errors
+  const compactMetadata = Object.fromEntries(
+    Object.keys(pack.metadataSummary).map((field) => [field, structuredClone(metadata[field])]),
+  )
+  return {
+    errors,
+    parity_errors: parityErrors,
+    case_count: cases.length,
+    exact_match_count: exactMatches,
+    all_token_ids_match: exactMatches === pack.cases.length,
+    tokenizer_metadata: compactMetadata,
+    prefix_bytes: pack.prefixBytes,
+  }
 }
 
 function validateGemma2TokenizerReceipt(receipt, row, defaults) {
-  return validateTokenizerReceipt(receipt, row, defaults, TOKENIZER_PACKS.gemma2_9b_it_q8_0)
+  const assessed = assessTokenizerReceiptForPack(
+    receipt,
+    row,
+    defaults,
+    TOKENIZER_PACKS.gemma2_9b_it_q8_0,
+  )
+  return [...assessed.errors, ...assessed.parity_errors]
 }
 
 function validateSmolLM3TokenizerReceipt(receipt, row, defaults) {
-  return validateTokenizerReceipt(receipt, row, defaults, TOKENIZER_PACKS.smollm3_3b_q8_0)
+  const assessed = assessTokenizerReceiptForPack(
+    receipt,
+    row,
+    defaults,
+    TOKENIZER_PACKS.smollm3_3b_q8_0,
+  )
+  return [...assessed.errors, ...assessed.parity_errors]
+}
+
+function assessTokenizerReceipt(receipt, row, defaults, options = {}) {
+  if (!tokenizerPackAvailable(row?.id)) {
+    return {
+      errors: ['bounded tokenizer pack is unavailable for this row'],
+      parity_errors: [],
+      case_count: 0,
+      exact_match_count: 0,
+      all_token_ids_match: false,
+      tokenizer_metadata: {},
+      prefix_bytes: null,
+    }
+  }
+  return assessTokenizerReceiptForPack(
+    receipt,
+    row,
+    defaults,
+    TOKENIZER_PACKS[row.id],
+    options,
+  )
 }
 
 async function inspectPrefix(binary, prefixPath, declaredLength) {
@@ -785,114 +949,252 @@ async function runLlamaCase(binary, vocabOnlyPath, temporary, testCase) {
   return parseLlamaIds(stdout)
 }
 
-async function main() {
-  const args = parseArgs(process.argv.slice(2))
-  if (args.has('help') || !args.get('row')) {
-    console.log(`Usage:
-  node scripts/hf-qualification-tokenizer.mjs --row <gemma2_9b_it_q8_0|smollm3_3b_q8_0> [options]
+function validSourceProvenance(value) {
+  return value
+    && typeof value === 'object'
+    && /^[0-9a-f]{40}$/.test(value.sourceHead || '')
+    && value.sourceTrackedDirty === false
+}
 
-Options:
-  --roster <path>          Roster path (default: Phase 1)
-  --camelid <path>         Camelid binary (default: target/debug/camelid)
-  --llama-tokenize <path>  Pinned llama-tokenize binary
-  --prefix-bytes <n>       Exact range budget; only 32 MiB is accepted
-  --out <path>             Write the scrubbed parity receipt
-  HF_TOKEN                 Optional token for gated/private rows
-`)
-    process.exit(args.has('help') ? 0 : 1)
+function validateCamelidTokenizerIdentity(identity, sourceProvenance) {
+  const recomputed = classifyCamelidProvenance({
+    version: identity?.version,
+    ...sourceProvenance,
+  })
+  const provenanceMatches = Object.entries(recomputed)
+    .every(([field, expected]) => identity?.provenance?.[field] === expected)
+  if (!identity
+    || typeof identity !== 'object'
+    || !/^[0-9a-f]{64}$/.test(identity.binary_sha256 || '')
+    || !recomputed.clean_current_head
+    || !provenanceMatches) {
+    throw tokenizerError('tokenizer_inspector_not_clean_current_head')
+  }
+  return { version: identity.version, binary_sha256: identity.binary_sha256, provenance: recomputed }
+}
+
+function validateLlamaPackageIdentity(llamaPackage, defaults) {
+  const expectedBuild = Number(String(defaults?.llama_cpp?.build || '').replace(/^b/, ''))
+  if (!llamaPackage
+    || typeof llamaPackage !== 'object'
+    || llamaPackage.revision !== PINNED_LLAMA_REVISION
+    || llamaPackage.revision !== defaults?.llama_cpp?.revision
+    || llamaPackage.build !== expectedBuild
+    || llamaPackage.binary_sha256 !== PINNED_LLAMA_TOKENIZE_SHA256
+    || llamaPackage.companion_binary_sha256 !== PINNED_LLAMA_CLI_SHA256) {
+    throw tokenizerError('tokenizer_oracle_identity_mismatch')
+  }
+  return llamaPackage
+}
+
+async function inspectRemoteTokenizer(lock, {
+  row,
+  defaults,
+  binary,
+  llamaTokenize,
+  sourceRoot = resolve('.'),
+  prefixBytes = DEFAULT_PREFIX_BYTES,
+  token = null,
+  fetchImpl = fetch,
+  fetchPrefixImpl = fetchHeaderPrefix,
+  sourceProvenanceImpl = readSourceProvenance,
+  camelidIdentityImpl = inspectCamelidTokenizerIdentity,
+  llamaPackageImpl = verifyLlamaCppPackage,
+  inspectImpl = inspectPrefix,
+  metadataValidatorImpl = (selectedPack, inspection) => selectedPack.assertMetadata(inspection),
+  deriveImpl = makeVocabOnlyGguf,
+  camelidCaseImpl = runCamelidCase,
+  llamaCaseImpl = runLlamaCase,
+  mkdtempImpl = mkdtemp,
+  writeFileImpl = writeFile,
+  rmImpl = rm,
+  prefixSha256Impl = sha256,
+  now = () => new Date(),
+} = {}) {
+  if (!tokenizerPackAvailable(row?.id)) {
+    throw tokenizerError('tokenizer_pack_unavailable')
+  }
+  const pack = TOKENIZER_PACKS[row.id]
+  try {
+    normalizeTokenizerPrefixBytes(row.id, prefixBytes)
+  } catch {
+    throw tokenizerError('tokenizer_prefix_budget_invalid')
+  }
+  try {
+    validateLockAgainstSelection(lock, sourceSelectionForRow(row))
+  } catch {
+    throw tokenizerError('tokenizer_source_identity_mismatch')
   }
 
-  const root = resolve('.')
-  const row = await selectRow(
-    root,
-    args.get('roster') || 'qa/model-qualification/phase1-roster.json',
-    args.get('row'),
-  )
-  const pack = tokenizerPackForRow(row.id)
-  const lock = await resolveHfSource({
-    repo: row.source.repo,
-    file: row.source.file,
-    revision: row.source.revision,
-    token: process.env.HF_TOKEN || null,
-  })
-  // A successful immutable Hub lookup is insufficient by itself: the bytes must
-  // also agree with the roster's exact revision, size, SHA-256, and license.
-  // Otherwise a row-labelled receipt could silently qualify a different file.
-  validateLockAgainstSelection(lock, sourceSelectionForRow(row))
-  const prefixBytes = normalizeTokenizerPrefixBytes(
-    row.id,
-    args.get('prefix-bytes') || DEFAULT_PREFIX_BYTES,
-  )
-  const ranged = await fetchHeaderPrefix(lock, {
-    prefixBytes,
-    token: process.env.HF_TOKEN || null,
-  })
-  if (ranged.prefix_sha256 !== pack.prefixSha256) {
-    throw new Error(`${row.id} prefix SHA-256 does not match the grounded exact-row header receipt`)
+  let sourceBefore
+  try { sourceBefore = await sourceProvenanceImpl(sourceRoot) }
+  catch { throw tokenizerError('tokenizer_inspector_unavailable') }
+  if (!validSourceProvenance(sourceBefore)) {
+    throw tokenizerError('tokenizer_inspector_not_clean_current_head')
   }
-  const defaultCamelid = process.platform === 'win32'
-    ? 'target/debug/camelid.exe'
-    : 'target/debug/camelid'
-  const defaultLlama = process.platform === 'win32'
-    ? 'target/reference/llama.cpp-b9632/bin/llama-tokenize.exe'
-    : 'target/reference/llama.cpp-b9632/bin/llama-tokenize'
-  const camelid = resolve(args.get('camelid') || process.env.CAMELID_BIN || defaultCamelid)
-  const llamaTokenize = resolve(args.get('llama-tokenize') || defaultLlama)
-  const llamaPackage = await verifyLlamaCppPackage(llamaTokenize)
-  const temporary = await mkdtemp(join(tmpdir(), 'camelid-hf-tokenizer-'))
+
+  let camelidIdentity
+  try {
+    camelidIdentity = validateCamelidTokenizerIdentity(
+      await camelidIdentityImpl(binary, { sourceProvenance: sourceBefore }),
+      sourceBefore,
+    )
+  } catch (error) {
+    if (error instanceof TokenizerQualificationError) throw error
+    throw tokenizerError('tokenizer_inspector_unavailable')
+  }
+
+  let llamaPackage
+  try {
+    llamaPackage = validateLlamaPackageIdentity(
+      await llamaPackageImpl(llamaTokenize),
+      defaults,
+    )
+  } catch (error) {
+    if (error instanceof TokenizerQualificationError) throw error
+    throw tokenizerError('tokenizer_oracle_unavailable')
+  }
+
+  let ranged
+  try {
+    ranged = await fetchPrefixImpl(lock, { prefixBytes: pack.prefixBytes, token, fetchImpl })
+  } catch (error) {
+    if (error instanceof HeaderInspectionError) {
+      const classified = classifyHeaderInspectionError(error)
+      throw tokenizerError(classified.status === 'fail'
+        ? 'tokenizer_range_invalid'
+        : 'tokenizer_range_unavailable')
+    }
+    throw tokenizerError('tokenizer_range_unavailable')
+  }
+  const contentRange = ranged?.content_range
+  if (!Buffer.isBuffer(ranged?.bytes)
+    || ranged.requested_bytes !== pack.prefixBytes
+    || ranged.bytes.length !== pack.prefixBytes
+    || contentRange?.start !== 0
+    || contentRange?.end + 1 !== pack.prefixBytes
+    || contentRange?.total !== row.identity.size_bytes) {
+    throw tokenizerError('tokenizer_range_invalid')
+  }
+  if (ranged.prefix_sha256 !== pack.prefixSha256
+    || prefixSha256Impl(ranged.bytes) !== pack.prefixSha256) {
+    throw tokenizerError('tokenizer_prefix_identity_mismatch')
+  }
+
+  let temporary
+  try { temporary = await mkdtempImpl(join(tmpdir(), 'camelid-hf-tokenizer-')) }
+  catch { throw tokenizerError('tokenizer_qualification_error') }
   let report
-  let allMatch = false
-
   try {
     const prefixPath = join(temporary, 'header.gguf')
     const vocabOnlyPath = join(temporary, 'vocab-only.gguf')
-    await writeFile(prefixPath, ranged.bytes)
-    const inspection = await inspectPrefix(camelid, prefixPath, lock.size_bytes)
-    const tokenizerMetadata = pack.assertMetadata(inspection)
-    const derived = makeVocabOnlyGguf(ranged.bytes)
-    if (derived.original_tensor_count !== inspection.tensor_count) {
-      throw new Error('vocab-only derivative tensor count does not match prefix inspection')
+    await writeFileImpl(prefixPath, ranged.bytes)
+    let inspection
+    let tokenizerMetadata
+    let derived
+    try {
+      inspection = await inspectImpl(binary, prefixPath, lock.size_bytes)
+      tokenizerMetadata = metadataValidatorImpl(pack, inspection)
+      derived = deriveImpl(ranged.bytes)
+      if (derived.original_tensor_count !== inspection.tensor_count
+        || derived.original_tensor_count !== pack.tensorCount
+        || derived.metadata_count !== pack.metadataCount) {
+        throw new Error('descriptor counts drifted')
+      }
+    } catch {
+      throw tokenizerError('tokenizer_metadata_mismatch')
     }
-    await writeFile(vocabOnlyPath, derived.bytes)
+    await writeFileImpl(vocabOnlyPath, derived.bytes)
 
     const cases = []
-    for (const testCase of pack.cases) {
-      const camelidResult = await runCamelidCase(
-        camelid,
-        prefixPath,
-        lock.size_bytes,
-        temporary,
-        testCase,
-      )
-      const llamaIds = await runLlamaCase(llamaTokenize, vocabOnlyPath, temporary, testCase)
-      cases.push({
-        id: testCase.id,
-        text_utf8_bytes: Buffer.byteLength(testCase.text),
-        text_sha256: sha256(Buffer.from(testCase.text)),
-        add_special: testCase.add_special,
-        parse_special: testCase.parse_special,
-        camelid_ids: camelidResult.ids,
-        llama_cpp_ids: llamaIds,
-        exact_match: JSON.stringify(camelidResult.ids) === JSON.stringify(llamaIds),
-        camelid_decoded_sha256: sha256(Buffer.from(String(camelidResult.decoded ?? ''))),
-      })
+    try {
+      for (const testCase of pack.cases) {
+        const camelidResult = await camelidCaseImpl(
+          binary,
+          prefixPath,
+          lock.size_bytes,
+          temporary,
+          testCase,
+        )
+        const llamaIds = await llamaCaseImpl(
+          llamaTokenize,
+          vocabOnlyPath,
+          temporary,
+          testCase,
+        )
+        if (!validIdArray(camelidResult?.ids, pack.metadataSummary.token_count)
+          || !validIdArray(llamaIds, pack.metadataSummary.token_count)) {
+          throw new Error('invalid token IDs')
+        }
+        cases.push({
+          id: testCase.id,
+          text_utf8_bytes: Buffer.byteLength(testCase.text),
+          text_sha256: sha256(Buffer.from(testCase.text)),
+          add_special: testCase.add_special,
+          parse_special: testCase.parse_special,
+          camelid_ids: camelidResult.ids,
+          llama_cpp_ids: llamaIds,
+          exact_match: JSON.stringify(camelidResult.ids) === JSON.stringify(llamaIds),
+          camelid_decoded_sha256: sha256(Buffer.from(String(camelidResult.decoded ?? ''))),
+        })
+      }
+    } catch (error) {
+      if (error instanceof TokenizerQualificationError) throw error
+      throw tokenizerError('tokenizer_probe_failed')
     }
 
-    const camelidVersion = (await execFileAsync(camelid, ['--version'], {
-      timeout: 10_000,
-      windowsHide: true,
-    })).stdout.trim()
-    const provenance = classifyCamelidProvenance({
-      version: camelidVersion,
-      ...await readSourceProvenance(root),
-    })
-    const camelidBytes = await readFile(camelid)
-    const llamaBytes = await readFile(llamaTokenize)
-    allMatch = cases.every((testCase) => testCase.exact_match)
+    let sourceAfter
+    try { sourceAfter = await sourceProvenanceImpl(sourceRoot) }
+    catch { throw tokenizerError('tokenizer_source_changed') }
+    if (!validSourceProvenance(sourceAfter)
+      || sourceAfter.sourceHead !== sourceBefore.sourceHead) {
+      throw tokenizerError('tokenizer_source_changed')
+    }
+
+    let camelidAfter
+    try {
+      camelidAfter = validateCamelidTokenizerIdentity(
+        await camelidIdentityImpl(binary, { sourceProvenance: sourceAfter }),
+        sourceAfter,
+      )
+    } catch {
+      throw tokenizerError('tokenizer_inspector_changed')
+    }
+    if (camelidAfter.version !== camelidIdentity.version
+      || camelidAfter.binary_sha256 !== camelidIdentity.binary_sha256
+      || JSON.stringify(camelidAfter.provenance) !== JSON.stringify(camelidIdentity.provenance)) {
+      throw tokenizerError('tokenizer_inspector_changed')
+    }
+
+    let llamaPackageAfter
+    try {
+      llamaPackageAfter = validateLlamaPackageIdentity(
+        await llamaPackageImpl(llamaTokenize),
+        defaults,
+      )
+    } catch {
+      throw tokenizerError('tokenizer_oracle_changed')
+    }
+    if (llamaPackageAfter.revision !== llamaPackage.revision
+      || llamaPackageAfter.build !== llamaPackage.build
+      || llamaPackageAfter.binary_sha256 !== llamaPackage.binary_sha256
+      || llamaPackageAfter.companion_binary_sha256 !== llamaPackage.companion_binary_sha256
+      || llamaPackageAfter.executable !== llamaPackage.executable
+      || llamaPackageAfter.companion_executable !== llamaPackage.companion_executable) {
+      throw tokenizerError('tokenizer_oracle_changed')
+    }
+    let generatedAt
+    try { generatedAt = now().toISOString() }
+    catch { throw tokenizerError('tokenizer_receipt_time_invalid') }
+    if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/.test(generatedAt)) {
+      throw tokenizerError('tokenizer_receipt_time_invalid')
+    }
+
+    const allMatch = cases.every((testCase) => testCase.exact_match)
     report = {
       schema: 'camelid.header-tokenizer-parity/v1',
-      generated_at: new Date().toISOString(),
-      provenance,
+      generated_at: generatedAt,
+      provenance: camelidIdentity.provenance,
       row_id: row.id,
       host: {
         platform: `${process.platform}-${process.arch}`,
@@ -910,7 +1212,7 @@ Options:
         requested_bytes: ranged.requested_bytes,
         received_bytes: ranged.bytes.length,
         content_range: ranged.content_range,
-        prefix_sha256: sha256(ranged.bytes),
+        prefix_sha256: ranged.prefix_sha256,
         temporary_paths_redacted: true,
         temporary_files_deleted: true,
         scope_note: 'the prefix hash includes opaque initial tensor payload bytes after data_start_offset; it is not a full payload or full artifact hash',
@@ -918,8 +1220,8 @@ Options:
       ...(pack.grounding ? { grounding: pack.grounding } : {}),
       tokenizer_metadata: tokenizerMetadata,
       camelid: {
-        version: camelidVersion,
-        binary_sha256: sha256(camelidBytes),
+        version: camelidIdentity.version,
+        binary_sha256: camelidIdentity.binary_sha256,
         prefix_mode: 'tokenize --declared-len',
       },
       oracle: {
@@ -929,8 +1231,8 @@ Options:
         revision_verification: 'parsed from the sibling llama-cli --version output in the same binary package',
         companion_executable: llamaPackage.companion_executable,
         companion_binary_sha256: llamaPackage.companion_binary_sha256,
-        executable: basename(llamaTokenize),
-        binary_sha256: sha256(llamaBytes),
+        executable: llamaPackage.executable,
+        binary_sha256: llamaPackage.binary_sha256,
         input: 'disposable vocabulary-only derivative of the same immutable GGUF prefix; tensor_count is zeroed so llama-tokenize consumes unchanged tokenizer metadata and ignores the original descriptor region plus opaque partial payload bytes',
         derivative: {
           original_tensor_count: derived.original_tensor_count,
@@ -955,9 +1257,76 @@ Options:
         `sampling, tools, GPU execution, performance, neighboring rows, or broad ${pack.family} support`,
       ],
     }
+  } catch (error) {
+    if (error instanceof TokenizerQualificationError) throw error
+    throw tokenizerError('tokenizer_qualification_error')
   } finally {
-    await rm(temporary, { recursive: true, force: true })
+    try { await rmImpl(temporary, { recursive: true, force: true }) }
+    catch { throw tokenizerError('tokenizer_cleanup_failed') }
   }
+  return report
+}
+
+async function runTokenizerCli(argv = process.argv.slice(2), {
+  sourceResolver = resolveHfSource,
+} = {}) {
+  const args = parseArgs(argv)
+  if (args.has('help') || !args.get('row')) {
+    console.log(`Usage:
+  node scripts/hf-qualification-tokenizer.mjs --row <gemma2_9b_it_q8_0|smollm3_3b_q8_0> [options]
+
+Options:
+  --roster <path>          Roster path (default: Phase 1)
+  --camelid <path>         Camelid binary (default: target/debug/camelid)
+  --llama-tokenize <path>  Pinned llama-tokenize binary
+  --prefix-bytes <n>       Exact range budget; only 32 MiB is accepted
+  --out <path>             Write the scrubbed parity receipt
+  HF_TOKEN                 Optional token for gated/private rows
+`)
+    process.exit(args.has('help') ? 0 : 1)
+  }
+
+  const root = resolve('.')
+  const row = await selectRow(
+    root,
+    args.get('roster') || 'qa/model-qualification/phase1-roster.json',
+    args.get('row'),
+  )
+  let prefixBytes
+  try {
+    prefixBytes = normalizeTokenizerPrefixBytes(
+      row.id,
+      args.get('prefix-bytes') || DEFAULT_PREFIX_BYTES,
+    )
+  } catch {
+    throw tokenizerError('tokenizer_prefix_budget_invalid')
+  }
+  const lock = await sourceResolver({
+    repo: row.source.repo,
+    file: row.source.file,
+    revision: row.source.revision,
+    token: process.env.HF_TOKEN || null,
+  })
+  const defaultCamelid = process.platform === 'win32'
+    ? 'target/debug/camelid.exe'
+    : 'target/debug/camelid'
+  const defaultLlama = process.platform === 'win32'
+    ? 'target/reference/llama.cpp-b9632/bin/llama-tokenize.exe'
+    : 'target/reference/llama.cpp-b9632/bin/llama-tokenize'
+  const camelid = resolve(args.get('camelid') || process.env.CAMELID_BIN || defaultCamelid)
+  const llamaTokenize = resolve(args.get('llama-tokenize') || defaultLlama)
+  const report = await inspectRemoteTokenizer(lock, {
+    row,
+    defaults: JSON.parse(await readFile(
+      resolve(root, args.get('roster') || 'qa/model-qualification/phase1-roster.json'),
+      'utf8',
+    )).defaults,
+    binary: camelid,
+    llamaTokenize,
+    sourceRoot: root,
+    prefixBytes,
+    token: process.env.HF_TOKEN || null,
+  })
 
   // Emit durable evidence only after the temporary prefix, derivative model,
   // and plaintext probe files have been removed successfully. This makes the
@@ -969,29 +1338,38 @@ Options:
     await writeFile(out, rendered)
   }
   process.stdout.write(rendered)
-  if (!allMatch) process.exitCode = 2
+  if (!report.result.all_token_ids_match) process.exitCode = 2
 }
 
 export {
+  DEFAULT_PREFIX_BYTES as DEFAULT_TOKENIZER_PREFIX_BYTES,
   GEMMA2_CASES,
   SMOLLM3_CASES,
+  TokenizerQualificationError,
+  assessTokenizerReceipt,
   assertGemma2TokenizerMetadata,
   assertSmolLM3TokenizerMetadata,
   buildCamelidArgs,
   buildLlamaArgs,
   classifyCamelidProvenance,
+  classifyTokenizerQualificationError,
+  inspectRemoteTokenizer,
   makeVocabOnlyGguf,
   normalizeTokenizerPrefixBytes,
   parseLlamaIds,
   parseLlamaVersionOutput,
+  runTokenizerCli,
   sourceSelectionForRow,
+  tokenizerPackAvailable,
+  tokenizerPrefixBytesForRow,
   validateGemma2TokenizerReceipt,
   validateSmolLM3TokenizerReceipt,
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1] || '').href) {
-  main().catch((error) => {
-    console.error(error)
+  runTokenizerCli().catch((error) => {
+    const failure = classifyTokenizerQualificationError(error)
+    console.error(`${failure.error_code}: ${failure.reason}`)
     process.exit(1)
   })
 }

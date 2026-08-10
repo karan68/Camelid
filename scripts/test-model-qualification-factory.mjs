@@ -8,9 +8,11 @@ import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 import { validateQualificationReport } from './check-model-qualification-report.mjs'
 import { HeaderInspectionError, MAX_PREFIX_BYTES } from './hf-qualification-header.mjs'
+import { TokenizerQualificationError } from './hf-qualification-tokenizer.mjs'
 import {
   artifactForRow,
   defaultCamelidBinary,
+  defaultLlamaTokenizerBinary,
   firstUnresolvedStage,
   metadataStageFromHeader,
   metadataStageFromHeaderError,
@@ -21,9 +23,13 @@ import {
   selectRows,
   sourceLookupErrorCode,
   sourceSelectionForRow,
+  summarizeBatchSourceHeads,
   summarizeHeaderInspections,
+  summarizeTokenizerInspections,
   summarizeSourceResolution,
   summarizeReports,
+  tokenizerStageFromError,
+  tokenizerStageFromReceipt,
 } from './model-qualification-factory.mjs'
 
 const execFileAsync = promisify(execFile)
@@ -37,9 +43,40 @@ assert.equal(
   defaultCamelidBinary(),
   process.platform === 'win32' ? 'target/release/camelid.exe' : 'target/release/camelid',
 )
+assert.equal(
+  defaultLlamaTokenizerBinary(),
+  process.platform === 'win32'
+    ? 'target/reference/llama.cpp-b9632/bin/llama-tokenize.exe'
+    : 'target/reference/llama.cpp-b9632/bin/llama-tokenize',
+)
+assert.deepEqual(
+  summarizeBatchSourceHeads([
+    { report: { source_head: 'a'.repeat(40) } },
+    { report: { source_head: 'a'.repeat(40) } },
+  ]),
+  { source_head: 'a'.repeat(40), state: 'uniform' },
+)
+assert.deepEqual(
+  summarizeBatchSourceHeads([
+    { report: { source_head: 'a'.repeat(40) } },
+    { report: { source_head: 'b'.repeat(40) } },
+  ]),
+  { source_head: null, state: 'mixed' },
+  'a multi-row batch must not claim the first row HEAD when later rows differ',
+)
+assert.deepEqual(
+  summarizeBatchSourceHeads([
+    { report: { source_head: 'a'.repeat(40) } },
+    { report: { source_head: null } },
+  ]),
+  { source_head: null, state: 'unknown' },
+  'one unknown per-row HEAD must not be masked by an earlier valid row',
+)
 const roster = JSON.parse(await readFile(resolve(root, 'qa/model-qualification/phase1-roster.json'), 'utf8'))
 const qwen = roster.rows.find((row) => row.id === 'qwen2_5_0_5b_instruct_q8_0')
 const qwenMoe = roster.rows.find((row) => row.id === 'qwen3_30b_a3b_q8_0')
+const gemma = roster.rows.find((row) => row.id === 'gemma2_9b_it_q8_0')
+const smol = roster.rows.find((row) => row.id === 'smollm3_3b_q8_0')
 
 assert.deepEqual(
   selectRows(roster, ['qwen3_30b_a3b_q8_0', 'lfm2_5_2_6b_q8_0']).map((row) => row.id),
@@ -165,6 +202,34 @@ const headerReceiptFor = (row, overrides = {}) => ({
   note: 'test receipt',
   ...overrides,
 })
+
+const tokenizerReceiptPaths = new Map([
+  [gemma.id, 'qa/model-qualification/gemma2-9b-it-q8-header-tokenizer-parity.json'],
+  [smol.id, 'qa/model-qualification/smollm3-3b-q8-header-tokenizer-parity.json'],
+])
+const durableTokenizerReceipts = new Map(await Promise.all(
+  [...tokenizerReceiptPaths].map(async ([rowId, path]) => [
+    rowId,
+    JSON.parse(await readFile(resolve(root, path), 'utf8')),
+  ]),
+))
+const tokenizerReceiptFor = (row) => {
+  const receipt = structuredClone(durableTokenizerReceipts.get(row.id))
+  receipt.generated_at = '2026-08-10T19:00:00.000Z'
+  receipt.provenance = {
+    status: 'clean_current_head_receipt',
+    gate_requires_clean_current_head: true,
+    source_head: currentSourceHead,
+    source_tracked_dirty: false,
+    binary_commit_abbrev: currentCommitAbbrev,
+    binary_reports_dirty: false,
+    binary_matches_source_head: true,
+    clean_current_head: true,
+  }
+  receipt.camelid.version = `camelid v0.6.1-test-g${currentCommitAbbrev}`
+  receipt.camelid.binary_sha256 = 'a'.repeat(64)
+  return receipt
+}
 
 for (const [rowId, receiptPath] of [
   ['gemma2_9b_it_q8_0', 'qa/model-qualification/gemma2-9b-it-q8-header-inspection.json'],
@@ -304,6 +369,86 @@ assert.equal(scrubbedUnknownHeaderFailure.error_code, 'header_inspection_error')
 assert.equal(JSON.stringify(scrubbedUnknownHeaderFailure).includes('test-secret-token'), false)
 assert.equal(JSON.stringify(scrubbedUnknownHeaderFailure).includes('private'), false)
 
+const passingTokenizerStage = tokenizerStageFromReceipt(
+  smol,
+  tokenizerReceiptFor(smol),
+  roster.defaults,
+  { expectedSourceHead: currentSourceHead },
+)
+assert.equal(passingTokenizerStage.status, 'pass')
+assert.equal(passingTokenizerStage.mode, 'remote_immutable_prefix_tokenizer')
+assert.equal(passingTokenizerStage.result.all_token_ids_match, true)
+assert.equal(passingTokenizerStage.result.case_count, 10)
+assert.equal(passingTokenizerStage.inspector.source_head, currentSourceHead)
+assert.equal(passingTokenizerStage.inspector.clean_current_head, true)
+assert.equal(passingTokenizerStage.range.requested_bytes, 32 * 1024 * 1024)
+assert.equal(passingTokenizerStage.scope.full_artifact_sha256, 'not_run')
+assert.equal(passingTokenizerStage.scope.template_rendering, 'not_run')
+assert.equal(passingTokenizerStage.scope.load, 'not_run')
+assert.equal(passingTokenizerStage.scope.generation, 'not_run')
+assert.equal(passingTokenizerStage.scope.api_webui, 'not_run')
+assert.equal(passingTokenizerStage.scope.context, 'not_run')
+assert.equal(passingTokenizerStage.scope.support_claim, false)
+assert.equal(Object.hasOwn(passingTokenizerStage, 'cases'), false, 'full token arrays must stay out of factory reports')
+assert.equal(Object.hasOwn(passingTokenizerStage, 'does_not_prove'), false, 'arbitrary receipt prose must stay out of factory reports')
+
+const staleTokenizerStage = tokenizerStageFromReceipt(
+  smol,
+  durableTokenizerReceipts.get(smol.id),
+  roster.defaults,
+  { expectedSourceHead: currentSourceHead },
+)
+assert.equal(staleTokenizerStage.status, 'fail')
+assert.equal(staleTokenizerStage.error_code, 'tokenizer_receipt_invalid')
+
+const honestTokenizerMismatch = tokenizerReceiptFor(gemma)
+honestTokenizerMismatch.cases[0].llama_cpp_ids[0] = (
+  honestTokenizerMismatch.cases[0].llama_cpp_ids[0] + 1
+) % 256_000
+honestTokenizerMismatch.cases[0].exact_match = false
+honestTokenizerMismatch.result.exact_match_count -= 1
+honestTokenizerMismatch.result.all_token_ids_match = false
+const mismatchTokenizerStage = tokenizerStageFromReceipt(
+  gemma,
+  honestTokenizerMismatch,
+  roster.defaults,
+  { expectedSourceHead: currentSourceHead },
+)
+assert.equal(mismatchTokenizerStage.status, 'fail')
+assert.equal(mismatchTokenizerStage.error_code, 'tokenizer_parity_mismatch')
+assert.equal(mismatchTokenizerStage.result.all_token_ids_match, false)
+
+const forgedTokenizerMatch = structuredClone(honestTokenizerMismatch)
+forgedTokenizerMatch.cases[0].exact_match = true
+forgedTokenizerMatch.result.exact_match_count = forgedTokenizerMatch.cases.length
+forgedTokenizerMatch.result.all_token_ids_match = true
+const forgedTokenizerStage = tokenizerStageFromReceipt(
+  gemma,
+  forgedTokenizerMatch,
+  roster.defaults,
+  { expectedSourceHead: currentSourceHead },
+)
+assert.equal(forgedTokenizerStage.status, 'fail')
+assert.equal(forgedTokenizerStage.error_code, 'tokenizer_receipt_invalid')
+
+const safeTokenizerFailure = tokenizerStageFromError(new TokenizerQualificationError(
+  'tokenizer_oracle_unavailable',
+  'fail',
+  'C:\\outside-workspace\\llama-tokenize.exe test-secret-token',
+))
+assert.deepEqual(safeTokenizerFailure, {
+  status: 'blocked',
+  mode: 'remote_immutable_prefix_tokenizer',
+  error_code: 'tokenizer_oracle_unavailable',
+  reason: 'the pinned llama.cpp tokenizer oracle is unavailable',
+})
+const unknownTokenizerFailure = tokenizerStageFromError(
+  new Error('C:\\private\\prefix.gguf test-secret-token'),
+)
+assert.equal(unknownTokenizerFailure.error_code, 'tokenizer_qualification_error')
+assert.equal(JSON.stringify(unknownTokenizerFailure).includes('private'), false)
+assert.equal(JSON.stringify(unknownTokenizerFailure).includes('test-secret-token'), false)
+
 const driftStage = await resolveSourceStage(qwen, {
   resolver: async () => ({ ...lockFor(qwen), sha256: '0'.repeat(64) }),
 })
@@ -402,10 +547,26 @@ assert.deepEqual(
   },
 )
 
+assert.deepEqual(
+  summarizeTokenizerInspections([
+    { tokenizerOutcome: passingTokenizerStage },
+    { tokenizerOutcome: safeTokenizerFailure },
+    { tokenizerOutcome: { status: 'not_run' } },
+  ]),
+  {
+    mode: 'remote_immutable_prefix_tokenizer',
+    per_row_byte_budget: 32 * 1024 * 1024,
+    verified_receipt_requested_bytes: 32 * 1024 * 1024,
+    verified_receipt_received_bytes: 32 * 1024 * 1024,
+    counts: { pass: 1, fail: 0, blocked: 1, not_run: 1 },
+  },
+)
+
 const factoryOut = await mkdtemp(join(tmpdir(), 'camelid-qualification-factory-test-'))
 try {
   let offlineResolverCalled = false
   let offlineHeaderInspectorCalled = false
+  let offlineTokenizerInspectorCalled = false
   const offlineIndex = await runFactory({
     root,
     rows: [qwen.id],
@@ -418,11 +579,17 @@ try {
       offlineHeaderInspectorCalled = true
       throw new Error('must not run')
     },
+    tokenizerInspector: async () => {
+      offlineTokenizerInspectorCalled = true
+      throw new Error('must not run')
+    },
   })
   assert.equal(offlineResolverCalled, false, 'the default factory mode must remain fully offline')
   assert.equal(offlineHeaderInspectorCalled, false, 'the default factory mode must not inspect remote headers')
+  assert.equal(offlineTokenizerInspectorCalled, false, 'the default factory mode must not inspect remote tokenizers')
   assert.equal(Object.hasOwn(offlineIndex, 'source_resolution'), false, 'default index shape must remain unchanged')
   assert.equal(Object.hasOwn(offlineIndex, 'header_inspection'), false, 'default index shape must not gain a header summary')
+  assert.equal(Object.hasOwn(offlineIndex, 'tokenizer_inspection'), false, 'default index shape must not gain a tokenizer summary')
 
   const requested = [qwen.id, qwenMoe.id]
   const index = await runFactory({
@@ -474,6 +641,7 @@ try {
   const headerOut = join(factoryOut, 'header-batch')
   let headerCalls = 0
   let headerResolverCalls = 0
+  let headerOnlyTokenizerCalls = 0
   const headerIndex = await runFactory({
     root,
     rows: requested,
@@ -503,9 +671,14 @@ try {
       }
       return headerReceiptFor(qwenMoe)
     },
+    tokenizerInspector: async () => {
+      headerOnlyTokenizerCalls += 1
+      throw new Error('must not run')
+    },
   })
   assert.equal(headerResolverCalls, 2, '--inspect-header must imply one source preflight per row')
   assert.equal(headerCalls, 2, 'a row-local header failure must not abort the remaining batch')
+  assert.equal(headerOnlyTokenizerCalls, 0, '--inspect-header alone must not run tokenizer qualification')
   assert.deepEqual(headerIndex.source_resolution, {
     mode: 'live_huggingface',
     counts: { pass: 2, fail: 0, blocked: 0 },
@@ -559,6 +732,169 @@ try {
   assert.equal(JSON.stringify(headerPassedReport).includes('download_url'), false)
   assert.equal(JSON.stringify(headerPassedReport).includes('test-secret-token'), false)
   assert.deepEqual(validateQualificationReport(headerPassedReport), [])
+
+  const tokenizerOut = join(factoryOut, 'tokenizer-batch')
+  let tokenizerResolverCalls = 0
+  let tokenizerHeaderCalls = 0
+  let tokenizerCalls = 0
+  const tokenizerIndex = await runFactory({
+    root,
+    rows: [gemma.id, smol.id],
+    outDir: tokenizerOut,
+    inspectTokenizer: true,
+    prefixBytes: 16,
+    hfToken: 'test-secret-token',
+    sourceResolver: async ({ repo, token }) => {
+      tokenizerResolverCalls += 1
+      assert.equal(token, 'test-secret-token')
+      return repo === gemma.source.repo ? lockFor(gemma) : lockFor(smol)
+    },
+    headerInspector: async (sourceLock, options) => {
+      tokenizerHeaderCalls += 1
+      assert.equal(options.prefixBytes, 16)
+      assert.equal(options.token, 'test-secret-token')
+      if (sourceLock.repo === gemma.source.repo) {
+        throw new Error('C:\\private\\header.gguf test-secret-token')
+      }
+      return headerReceiptFor(smol)
+    },
+    tokenizerInspector: async (sourceLock, options) => {
+      tokenizerCalls += 1
+      assert.equal(sourceLock.repo, smol.source.repo, 'metadata-blocked rows must not reach tokenizer probes')
+      assert.equal(options.row.id, smol.id)
+      assert.deepEqual(options.defaults, roster.defaults)
+      assert.equal(options.sourceRoot, root)
+      assert.equal(options.prefixBytes, 32 * 1024 * 1024)
+      assert.equal(options.token, 'test-secret-token')
+      assert.match(
+        options.binary,
+        process.platform === 'win32'
+          ? /target[\\/]release[\\/]camelid\.exe$/
+          : /target[\\/]release[\\/]camelid$/,
+      )
+      assert.match(
+        options.llamaTokenize,
+        process.platform === 'win32'
+          ? /target[\\/]reference[\\/]llama\.cpp-b9632[\\/]bin[\\/]llama-tokenize\.exe$/
+          : /target[\\/]reference[\\/]llama\.cpp-b9632[\\/]bin[\\/]llama-tokenize$/,
+      )
+      return tokenizerReceiptFor(smol)
+    },
+  })
+  assert.equal(tokenizerResolverCalls, 2, '--inspect-tokenizer must imply source preflight')
+  assert.equal(tokenizerHeaderCalls, 2, '--inspect-tokenizer must imply bounded header inspection')
+  assert.equal(tokenizerCalls, 1, 'one metadata-blocked row must not abort a later tokenizer row')
+  assert.deepEqual(tokenizerIndex.tokenizer_inspection, {
+    mode: 'remote_immutable_prefix_tokenizer',
+    per_row_byte_budget: 32 * 1024 * 1024,
+    verified_receipt_requested_bytes: 32 * 1024 * 1024,
+    verified_receipt_received_bytes: 32 * 1024 * 1024,
+    counts: { pass: 1, fail: 0, blocked: 1, not_run: 0 },
+  })
+  const tokenizerBlockedReport = JSON.parse(await readFile(
+    join(tokenizerOut, `${gemma.id}.json`),
+    'utf8',
+  ))
+  assert.equal(tokenizerBlockedReport.stages.metadata.status, 'blocked')
+  assert.equal(tokenizerBlockedReport.stages.tokenizer.status, 'blocked')
+  assert.equal(
+    tokenizerBlockedReport.stages.tokenizer.error_code,
+    'tokenizer_metadata_preflight_blocked',
+  )
+  assert.equal(JSON.stringify(tokenizerBlockedReport).includes('test-secret-token'), false)
+  assert.equal(JSON.stringify(tokenizerBlockedReport).includes('header.gguf'), false)
+  assert.deepEqual(validateQualificationReport(tokenizerBlockedReport), [])
+
+  const tokenizerPassedReport = JSON.parse(await readFile(
+    join(tokenizerOut, `${smol.id}.json`),
+    'utf8',
+  ))
+  assert.equal(tokenizerPassedReport.stages.artifact.status, 'blocked')
+  assert.equal(tokenizerPassedReport.stages.metadata.status, 'pass')
+  assert.equal(tokenizerPassedReport.stages.tokenizer.status, 'pass')
+  assert.equal(tokenizerPassedReport.stages.template.status, 'blocked')
+  assert.equal(tokenizerPassedReport.stages.load_smoke.status, 'blocked')
+  assert.equal(tokenizerPassedReport.stages.parity.status, 'blocked')
+  assert.equal(tokenizerPassedReport.stages.api_webui.status, 'blocked')
+  assert.equal(tokenizerPassedReport.stages.context.status, 'blocked')
+  assert.equal(tokenizerPassedReport.overall_status, 'blocked')
+  assert.equal(Object.hasOwn(tokenizerPassedReport.stages.tokenizer, 'cases'), false)
+  assert.equal(JSON.stringify(tokenizerPassedReport).includes('download_url'), false)
+  assert.equal(JSON.stringify(tokenizerPassedReport).includes('test-secret-token'), false)
+  assert.deepEqual(validateQualificationReport(tokenizerPassedReport), [])
+
+  let localFailHeaderCalls = 0
+  let localFailTokenizerCalls = 0
+  const localFailOut = join(factoryOut, 'tokenizer-local-fail-preserved')
+  const localFailBase = structuredClone(tokenizerPassedReport)
+  localFailBase.stages.artifact = { status: 'pass' }
+  localFailBase.stages.tokenizer = {
+    status: 'fail',
+    error_code: 'local_tokenizer_parity_mismatch',
+    reason: 'the exact local tokenizer fixture diverged',
+  }
+  await runFactory({
+    root,
+    rows: [smol.id],
+    outDir: localFailOut,
+    inspectTokenizer: true,
+    qualifier: async () => structuredClone(localFailBase),
+    sourceResolver: async () => lockFor(smol),
+    headerInspector: async () => { localFailHeaderCalls += 1 },
+    tokenizerInspector: async () => { localFailTokenizerCalls += 1; return tokenizerReceiptFor(smol) },
+  })
+  assert.equal(localFailHeaderCalls, 0, 'an exact local artifact keeps its authoritative metadata lane')
+  assert.equal(localFailTokenizerCalls, 0, 'remote pass must not overwrite an authoritative local tokenizer failure')
+  const localFailReport = JSON.parse(await readFile(
+    join(localFailOut, `${smol.id}.json`),
+    'utf8',
+  ))
+  assert.equal(localFailReport.stages.tokenizer.status, 'fail')
+  assert.equal(localFailReport.stages.tokenizer.error_code, 'local_tokenizer_parity_mismatch')
+  assert.equal(localFailReport.overall_status, 'fail')
+
+  let sourceBlockedHeaderCalls = 0
+  let sourceBlockedTokenizerCalls = 0
+  const sourceBlockedOut = join(factoryOut, 'tokenizer-source-blocked')
+  await runFactory({
+    root,
+    rows: [smol.id],
+    outDir: sourceBlockedOut,
+    inspectTokenizer: true,
+    sourceResolver: async () => { throw new Error('C:\\private\\source test-secret-token') },
+    headerInspector: async () => { sourceBlockedHeaderCalls += 1 },
+    tokenizerInspector: async () => { sourceBlockedTokenizerCalls += 1 },
+  })
+  assert.equal(sourceBlockedHeaderCalls, 0)
+  assert.equal(sourceBlockedTokenizerCalls, 0)
+  const sourceBlockedTokenizerReport = JSON.parse(await readFile(
+    join(sourceBlockedOut, `${smol.id}.json`),
+    'utf8',
+  ))
+  assert.equal(sourceBlockedTokenizerReport.stages.tokenizer.error_code, 'tokenizer_source_preflight_blocked')
+  assert.equal(JSON.stringify(sourceBlockedTokenizerReport).includes('test-secret-token'), false)
+
+  let unsupportedTokenizerCalls = 0
+  const unsupportedOut = join(factoryOut, 'tokenizer-pack-unavailable')
+  await runFactory({
+    root,
+    rows: [qwen.id],
+    outDir: unsupportedOut,
+    inspectTokenizer: true,
+    prefixBytes: 16,
+    sourceResolver: async () => lockFor(qwen),
+    headerInspector: async () => headerReceiptFor(qwen),
+    tokenizerInspector: async () => { unsupportedTokenizerCalls += 1 },
+  })
+  assert.equal(unsupportedTokenizerCalls, 0, 'unsupported rows must block before tokenizer inspection')
+  const unsupportedTokenizerReport = JSON.parse(await readFile(
+    join(unsupportedOut, `${qwen.id}.json`),
+    'utf8',
+  ))
+  assert.equal(unsupportedTokenizerReport.stages.metadata.status, 'pass')
+  assert.equal(unsupportedTokenizerReport.stages.tokenizer.status, 'blocked')
+  assert.equal(unsupportedTokenizerReport.stages.tokenizer.error_code, 'tokenizer_pack_unavailable')
+  assert.deepEqual(validateQualificationReport(unsupportedTokenizerReport), [])
 
   let invalidBudgetResolverCalled = false
   let invalidBudgetInspectorCalled = false
