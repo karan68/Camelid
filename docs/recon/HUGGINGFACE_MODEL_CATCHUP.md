@@ -106,8 +106,23 @@ Phase 2 has started without weakening the Phase 1 evidence boundary:
 - `scripts/check-model-qualification-report.mjs` validates the committed report
   contract, fail-closed overall status, and privacy boundary before evidence is
   accepted.
+- `scripts/hf-qualification-header.mjs` range-fetches at most 64 MiB and invokes
+  `camelid inspect-prefix` with the pinned full byte length. The command validates
+  metadata and every tensor descriptor against the real artifact bounds while
+  redacting the temporary prefix path. It aborts if a server ignores `Range`, so
+  inspecting a 30+ GiB candidate cannot silently become a full download.
 
 The factory does not download multi-gigabyte artifacts implicitly and does not
 run smoke or generation unless those probes are explicitly requested. This
 keeps routine inventory runs cheap while making evidence-producing runs
 deliberate and reproducible.
+
+## Phase 4 format boundary started
+
+`camelid inspect-source` exposes the existing format-neutral source manifest for
+either a GGUF file or a local Hugging Face directory containing `config.json`
+and SafeTensors shards. For the SafeTensors lane it validates the supported
+dense-LLaMA config subset, shard index, tensor headers, role names, shapes, and
+currently decoded dtypes. This is readiness inspection only: tokenizer parity,
+weight orientation, one-token execution, and exact-row receipts remain required,
+and native SafeTensors generation is intentionally disabled.

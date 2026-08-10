@@ -88,6 +88,41 @@ mod ghost_moe_cli_tests {
     }
 
     #[test]
+    fn inspect_source_accepts_a_hugging_face_directory() {
+        on_cli_test_stack(|| {
+            let cli = Cli::try_parse_from(["camelid", "inspect-source", "hf-model"])
+                .expect("parse source inspection command");
+            match cli.command {
+                Some(Command::InspectSource { path }) => {
+                    assert_eq!(path, PathBuf::from("hf-model"));
+                }
+                other => panic!("expected InspectSource, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn inspect_prefix_requires_the_declared_artifact_length() {
+        on_cli_test_stack(|| {
+            let cli = Cli::try_parse_from([
+                "camelid",
+                "inspect-prefix",
+                "header.gguf",
+                "--declared-len",
+                "32483931648",
+            ])
+            .expect("parse ranged GGUF inspection command");
+            match cli.command {
+                Some(Command::InspectPrefix { path, declared_len }) => {
+                    assert_eq!(path, PathBuf::from("header.gguf"));
+                    assert_eq!(declared_len, 32_483_931_648);
+                }
+                other => panic!("expected InspectPrefix, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
     fn serve_parses_ghost_moe_artifact_and_cache_budget() {
         on_cli_test_stack(|| {
             let cli = Cli::try_parse_from([
@@ -150,7 +185,7 @@ use camelid::{
     cluster::{
         recv_activation_packet, recv_token_feedback, send_activation_packet, send_token_feedback,
     },
-    gguf::{read_metadata, GgufTensorType},
+    gguf::{read_metadata, read_metadata_with_len, GgufTensorType},
     ghost::{GhostFile, GhostPipelinePrefetcher, GhostPrefetcher},
     inference::{
         speculative::{
@@ -162,6 +197,7 @@ use camelid::{
     },
     metal::detect_metal_device,
     model::{KvCacheQuantization, LlamaModelConfig, LlamaTensorBinding},
+    model_source::inspect_model_source,
     tensor::{CpuTensor, Q8_0TensorBlocks, TensorStore},
     tokenizer::Tokenizer,
 };
@@ -1391,6 +1427,17 @@ enum Command {
     },
     /// Inspect GGUF metadata and tensor descriptors.
     Inspect { path: PathBuf },
+    /// Inspect a ranged GGUF header prefix while validating tensor bounds against
+    /// the source artifact's declared full length. The emitted path is redacted.
+    InspectPrefix {
+        path: PathBuf,
+        #[arg(long)]
+        declared_len: u64,
+    },
+    /// Inspect a GGUF file or local Hugging Face SafeTensors directory as a
+    /// model source. This reports sidecar/header readiness only; SafeTensors
+    /// generation stays disabled until its independent runtime gates pass.
+    InspectSource { path: PathBuf },
     /// Runnable-lane smoke-admission for a single GGUF: admit -> load -> greedy
     /// forward sanity -> coherence, on oracle-qualified combos only. Prints a
     /// RUNNABLE receipt (lane=runnable, never copper; attests deterministic
@@ -2721,6 +2768,20 @@ async fn main() -> anyhow::Result<()> {
         Command::Inspect { path } => {
             let gguf = read_metadata(path)?;
             println!("{}", serde_json::to_string_pretty(&gguf)?);
+        }
+        Command::InspectPrefix { path, declared_len } => {
+            let prefix_len = std::fs::metadata(&path)?.len();
+            anyhow::ensure!(
+                prefix_len <= declared_len,
+                "GGUF prefix is {prefix_len} bytes, larger than declared artifact length {declared_len}"
+            );
+            let mut gguf = read_metadata_with_len(&path, declared_len)?;
+            gguf.path = PathBuf::from("<remote-gguf-prefix>");
+            println!("{}", serde_json::to_string_pretty(&gguf)?);
+        }
+        Command::InspectSource { path } => {
+            let inspection = inspect_model_source(path)?;
+            println!("{}", serde_json::to_string_pretty(&inspection)?);
         }
         Command::Tokenize {
             model,
