@@ -26,6 +26,7 @@ const modelPath = rawModelPath ? resolve(rawModelPath) : undefined
 const modelId = args.get('model-id') || process.env.CAMELID_SMOKE_MODEL_ID || (modelPath ? 'smoke-model' : 'tiny-generation')
 const requireGeneration = args.has('require-generation') || process.env.CAMELID_SMOKE_REQUIRE_GENERATION === '1'
 const allowGuardedChat = args.has('allow-guarded-chat') || process.env.CAMELID_SMOKE_ALLOW_GUARDED_CHAT === '1'
+const replaceLoadedModel = args.has('replace-loaded-model') || process.env.CAMELID_SMOKE_REPLACE_LOADED_MODEL === '1'
 const chatRepeats = Number.parseInt(args.get('chat-repeats') || process.env.CAMELID_SMOKE_CHAT_REPEATS || '1', 10)
 const streamMaxTokens = Number.parseInt(args.get('stream-max-tokens') || process.env.CAMELID_SMOKE_STREAM_MAX_TOKENS || '24', 10)
 const expectCompatibilityRow = args.get('expect-compatibility-row') || process.env.CAMELID_SMOKE_EXPECT_COMPATIBILITY_ROW || ''
@@ -328,7 +329,7 @@ if (loadTiny || modelPath) {
 
   const { result: loaded } = await timed('model_load', () => fetchJson(`${apiBase}/api/models/load`, {
     method: 'POST',
-    body: JSON.stringify({ path: pathToLoad, id: modelId }),
+    body: JSON.stringify({ path: pathToLoad, id: modelId, ...(replaceLoadedModel ? { replace: true } : {}) }),
   }))
   const tensorState = loaded.llama_tensors ? 'dense tensors bound' : 'dense tensors not bound'
   const tokenizerState = loaded.tokenizer?.status || 'unknown tokenizer state'

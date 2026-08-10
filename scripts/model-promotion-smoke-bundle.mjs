@@ -23,6 +23,7 @@ Common options:
   --stream-max-tokens <n>              Frontend streaming token budget (default: 24)
   --temperature <number>               Sampling temperature (default: 0)
   --skip-completions, --chat-only       Do not call the unsupported legacy /v1/completions route
+  --replace-loaded-model                Replace an auto-selected/resident model while loading the qualified row
   --skip-frontend                      Capture API artifacts only
   --allow-guarded-chat                 Let frontend smoke pass guarded-chat state instead of requiring generation
   --frontend-script <path>             Frontend smoke script (default: frontend/scripts/smoke.mjs)
@@ -48,6 +49,7 @@ const maxTokens = parsePositiveInt('max-tokens', args.get('max-tokens') || '1')
 const streamMaxTokens = parsePositiveInt('stream-max-tokens', args.get('stream-max-tokens') || '24')
 const temperature = Number.parseFloat(args.get('temperature') || '0')
 const skipCompletions = args.has('skip-completions') || args.has('skip-completion') || args.has('chat-only')
+const replaceLoadedModel = args.has('replace-loaded-model') || args.has('replace')
 const skipFrontend = args.has('skip-frontend')
 const allowGuardedChat = args.has('allow-guarded-chat')
 const frontendScript = resolve(args.get('frontend-script') || 'frontend/scripts/smoke.mjs')
@@ -81,6 +83,7 @@ const summary = {
   stream_max_tokens: streamMaxTokens,
   temperature,
   skip_completions: skipCompletions,
+  replace_loaded_model: replaceLoadedModel,
   allow_guarded_chat: allowGuardedChat,
   skip_frontend: skipFrontend,
   steps: {},
@@ -91,7 +94,7 @@ try {
   const healthBefore = await tryFetchJson(`${apiBase}/v1/health`)
   await recordStep('health_before', healthBefore, join(outDir, 'health-before.json'))
 
-  const loadRequest = { path: modelPath, id: modelId }
+  const loadRequest = { path: modelPath, id: modelId, ...(replaceLoadedModel ? { replace: true } : {}) }
   await writeJson(join(outDir, 'load.request.json'), loadRequest)
   const loadResponse = await fetchJson(`${apiBase}/api/models/load`, {
     method: 'POST',
@@ -215,6 +218,7 @@ try {
     if (expectWebUiChat) frontendCommand.push('--expect-webui-chat', expectWebUiChat)
     if (expectLocalLaneClass) frontendCommand.push('--expect-local-lane-class', expectLocalLaneClass)
     if (expectGgufSha256) frontendCommand.push('--expect-gguf-sha256', expectGgufSha256)
+    if (replaceLoadedModel) frontendCommand.push('--replace-loaded-model')
     await writeFile(join(outDir, 'frontend.command.txt'), `${shellJoin(frontendCommand)}\n`)
     const frontendRun = await run(frontendCommand[0], frontendCommand.slice(1))
     await writeFile(join(outDir, 'frontend.stdout.log'), frontendRun.stdout)

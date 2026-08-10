@@ -26,6 +26,7 @@ let loadedPath = modelPath
 let includeTerminalUsage = true
 let localLaneClass = 'supported'
 const streamRequests = []
+let lastLoadReplace = null
 
 const server = createServer(async (request, response) => {
   try {
@@ -37,6 +38,7 @@ const server = createServer(async (request, response) => {
     if (request.url === '/api/models/load' && request.method === 'POST') {
       loadedId = body.id
       loadedPath = body.path
+      lastLoadReplace = body.replace ?? null
       return json(response, 200, currentModel())
     }
     if (request.url === '/v1/health') {
@@ -123,6 +125,7 @@ try {
     '--model', modelPath,
     '--model-id', 'fixture-row',
     '--require-generation',
+    '--replace-loaded-model',
     '--require-local-model',
     '--expect-local-lane-class', 'supported',
     '--expect-gguf-sha256', ggufSha256,
@@ -138,6 +141,7 @@ try {
   assert.equal(streamRequests.length, 1)
   assert.equal(streamRequests[0].max_tokens, 77, 'frontend stream max must be configurable')
   assert.deepEqual(streamRequests[0].stream_options, { include_usage: true }, 'frontend smoke must request terminal usage')
+  assert.equal(lastLoadReplace, true, 'frontend replacement flag must reach the backend load request')
 
   localLaneClass = 'experimental_implemented'
   const experimentalArgs = replaceOption(

@@ -27,6 +27,7 @@ let chatCalls = 0
 let loadedId = 'fixture-row'
 let loadedPath = modelPath
 let includeTimings = true
+let lastLoadReplace = null
 
 const server = createServer(async (request, response) => {
   try {
@@ -34,6 +35,7 @@ const server = createServer(async (request, response) => {
     if (request.url === '/api/models/load' && request.method === 'POST') {
       loadedId = body.id
       loadedPath = body.path
+      lastLoadReplace = body.replace ?? null
       return json(response, 200, currentModel())
     }
     if (request.url === '/v1/health') {
@@ -92,6 +94,7 @@ try {
     '--model-id', 'fixture-row',
     '--out-dir', outDir,
     '--chat-only',
+    '--replace-loaded-model',
     '--skip-frontend',
     '--expect-local-lane-class', 'supported',
     '--expect-gguf-sha256', ggufSha256,
@@ -99,6 +102,7 @@ try {
   assert.equal(stdout.includes('legacy completions'), false)
   assert.equal(completionCalls, 0, 'chat-only mode must not probe /v1/completions')
   assert.equal(chatCalls, 1, 'chat-only mode must still probe /v1/chat/completions')
+  assert.equal(lastLoadReplace, true, 'explicit replacement must reach the backend load request')
 
   const summary = await readJson(join(outDir, 'summary.json'))
   assert.equal(summary.passed, true)
