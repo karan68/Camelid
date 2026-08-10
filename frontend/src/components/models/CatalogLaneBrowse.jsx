@@ -26,6 +26,7 @@ import { Button } from '../ui/Button'
 import { EvidenceChip } from '../ui/EvidenceChip'
 import { IconCheck } from '../ui/icons'
 import { Notice } from '../ui/Notice'
+import { ModelFamilyGroups } from './ModelFamilyGroups'
 
 /* Zone 5 — Get models. Curated picks first, then live Hugging Face GGUF search
    (>= 2 chars). Each row shows which lane it WOULD land in (derived: supported
@@ -772,6 +773,16 @@ function CatalogGroup({ title, marker, count, emptyText, children }) {
   )
 }
 
+function CatalogFamilyGroups({ items, renderItem }) {
+  return (
+    <ModelFamilyGroups
+      items={items}
+      renderItem={renderItem}
+      className="model-family-group--catalog"
+    />
+  )
+}
+
 export function CatalogLaneBrowse({
   apiBase = '',
   capabilities,
@@ -1045,7 +1056,7 @@ export function CatalogLaneBrowse({
           count={curated.length}
           emptyText="No curated entries match."
         >
-          {curated.map((item) => renderRow(item))}
+          <CatalogFamilyGroups items={curated} renderItem={(item) => renderRow(item)} />
         </CatalogGroup>
       ) : (
         <>
@@ -1059,7 +1070,10 @@ export function CatalogLaneBrowse({
             count={curatedRunnable.length}
             emptyText="No curated model matches."
           >
-            {curatedRunnable.map((item) => renderRow(item))}
+            <CatalogFamilyGroups
+              items={curatedRunnable}
+              renderItem={(item) => renderRow(item)}
+            />
           </CatalogGroup>
           {curatedBlocked.length ? (
             <details className="catalog-collapsed">
@@ -1067,7 +1081,12 @@ export function CatalogLaneBrowse({
                 {curatedBlocked.length} model{curatedBlocked.length === 1 ? '' : 's'} too big for this
                 machine
               </summary>
-              <div className="catalog-list">{curatedBlocked.map((item) => renderRow(item))}</div>
+              <div className="catalog-list">
+                <CatalogFamilyGroups
+                  items={curatedBlocked}
+                  renderItem={(item) => renderRow(item)}
+                />
+              </div>
             </details>
           ) : null}
         </>
@@ -1092,7 +1111,9 @@ export function CatalogLaneBrowse({
                 : 'No live Hugging Face GGUFs match (or the Hub is unreachable).'
             }
           >
-            {loading ? <SearchSkeleton /> : loadable.map(renderHfCard)}
+            {loading ? <SearchSkeleton /> : (
+              <CatalogFamilyGroups items={loadable} renderItem={renderHfCard} />
+            )}
           </CatalogGroup>
           {!loading && unimplemented.length ? (
             <details className="catalog-collapsed">
@@ -1101,7 +1122,9 @@ export function CatalogLaneBrowse({
                 Camelid can&rsquo;t run
               </summary>
               <p className="catalog-row-faint">{HF_GUESS_EXPLANATION}</p>
-              <div className="catalog-list">{unimplemented.map(renderHfCard)}</div>
+              <div className="catalog-list">
+                <CatalogFamilyGroups items={unimplemented} renderItem={renderHfCard} />
+              </div>
             </details>
           ) : null}
           {nextCursor && !loading ? (

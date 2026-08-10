@@ -8021,14 +8021,21 @@ mod gemma4_template_tests {
             image_urls: Vec::new(),
             unsupported_content_parts: Vec::new(),
             role: "user".to_string(),
-            content: "Reply with exactly: hello".to_string(),
+            content: "What is the capital of France?".to_string(),
         }];
+
+        let oracle: serde_json::Value = serde_json::from_str(include_str!(
+            "../../qa/model-qualification/fixtures/qwen2.5-0.5b-q8-llamacpp-b9632.json"
+        ))
+        .expect("Qwen2.5 qualification oracle fixture parses");
+        let oracle_rendered = oracle["chat_templates"][0]["rendered"]
+            .as_str()
+            .expect("oracle fixture carries rendered chat bytes");
 
         assert_eq!(
             render_qwen2_chatml_prompt(&messages),
-            "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n\
-             <|im_start|>user\nReply with exactly: hello<|im_end|>\n\
-             <|im_start|>assistant\n"
+            oracle_rendered,
+            "Camelid's Qwen2.5 renderer must stay byte-identical to llama.cpp b9632 /apply-template"
         );
         let qwen2_template = "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. \
                               You are a helpful assistant.<|im_end|>";
@@ -12081,8 +12088,14 @@ fn build_loaded_model(
     } else {
         llama_config_result.ok()
     };
+    // Runnable-only architectures parse the shared config for inspection and
+    // routing, but their correct tensor graph lives in `runnable::model`. Never
+    // publish a dense binding for them: Gemma 2, in particular, is Llama-shaped
+    // enough for the dense binder to appear successful while silently dropping
+    // its sandwich norms and logit soft-cap.
     let llama_tensors = llama_config
         .as_ref()
+        .filter(|config| !crate::model::is_runnable_only_arch(&config.architecture))
         .and_then(|config| LlamaTensorBinding::bind(&gguf, config).ok());
     let tokenizer_result = Tokenizer::from_gguf(&gguf);
     let tokenizer = tokenizer_state_from_result(tokenizer_result.as_ref());
@@ -22414,6 +22427,11 @@ mod tests {
         assert_eq!(
             classify_model_lane(Some("mistral"), "some-random-mistral-finetune-Q8_0.gguf"),
             ModelLaneClass::ExperimentalImplemented,
+        );
+        assert_eq!(
+            classify_model_lane(Some("gemma2"), "community-gemma-2-9b-Q4_K_M.gguf"),
+            ModelLaneClass::ExperimentalImplemented,
+            "Gemma 2 reaches the runnable bridge but gains no exact-row support claim",
         );
         // Architecture not in the implemented set â†’ Unsupported (fails closed at load).
         assert_eq!(

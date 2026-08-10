@@ -4,6 +4,7 @@ import { TokenizerPlayground } from '../components/models/TokenizerPlayground'
 import { ActiveModelBar } from '../components/models/ActiveModelBar'
 import { CatalogLaneBrowse } from '../components/models/CatalogLaneBrowse'
 import { DownloadsPanel } from '../components/models/DownloadsPanel'
+import { ModelFamilyGroups } from '../components/models/ModelFamilyGroups'
 import { UnsupportedBlocker } from '../components/models/UnsupportedBlocker'
 import { Section, SupportedRow, CompatibleRow, EligibleRow, NotAnchoredRow } from '../components/models/LaneRows'
 import { Button } from '../components/ui/Button'
@@ -82,7 +83,11 @@ export default function ModelsView({
     [spine.local],
   )
   const experimentalRows = laneBuckets
-    ? [...laneBuckets.compatible, ...laneBuckets.eligible, ...laneBuckets.not_anchored]
+    ? [
+        ...laneBuckets.compatible.map((entry) => ({ ...entry, _familyLane: 'compatible' })),
+        ...laneBuckets.eligible.map((entry) => ({ ...entry, _familyLane: 'eligible' })),
+        ...laneBuckets.not_anchored.map((entry) => ({ ...entry, _familyLane: 'not_anchored' })),
+      ]
     : []
   const deleteBlockedReason = modelDeleteBlockedReason({
     activeFilename: spine.activeFilename,
@@ -402,23 +407,27 @@ export default function ModelsView({
             {spine.localLoading ? 'Scanning local models…' : runtimeOnline ? 'Local model scan unavailable.' : 'Runtime offline — the local scan resumes when the backend is back.'}
           </p>
         ) : laneBuckets.supported.length ? (
-          laneBuckets.supported.map((m) => (
-            <SupportedRow
-              key={m.filename}
-              entry={m}
-              active={m.filename === spine.activeFilename}
-              resident={m.filename === spine.activeFilename || spine.loadedModelIds.has(m.filename)}
-              busy={usingFilename === m.filename}
-              deleteBusy={deletingFilename === m.filename}
-              defaultBusy={defaultingFilename === m.filename}
-              isDefault={spine.defaultFilename === m.filename}
-              blockedReason={deleteBlockedReason}
-              onUse={() => loadModelForChat(m.filename)}
-              onUnload={unloadEmbeddingModel}
-              onDelete={requestDeleteModel}
-              onMakeDefault={makeDefaultModel}
-            />
-          ))
+          <ModelFamilyGroups
+            items={laneBuckets.supported}
+            initiallyOpen={(group) => group.items.some((model) => model.filename === spine.activeFilename)}
+            renderItem={(m) => (
+              <SupportedRow
+                key={m.filename}
+                entry={m}
+                active={m.filename === spine.activeFilename}
+                resident={m.filename === spine.activeFilename || spine.loadedModelIds.has(m.filename)}
+                busy={usingFilename === m.filename}
+                deleteBusy={deletingFilename === m.filename}
+                defaultBusy={defaultingFilename === m.filename}
+                isDefault={spine.defaultFilename === m.filename}
+                blockedReason={deleteBlockedReason}
+                onUse={() => loadModelForChat(m.filename)}
+                onUnload={unloadEmbeddingModel}
+                onDelete={requestDeleteModel}
+                onMakeDefault={makeDefaultModel}
+              />
+            )}
+          />
         ) : (
           <p className="lane-empty">No verified models on this machine yet — download one below in “Get models”.</p>
         )}
@@ -436,8 +445,10 @@ export default function ModelsView({
             {spine.localLoading ? 'Scanning local models…' : runtimeOnline ? 'Local model scan unavailable.' : 'Runtime offline — the local scan resumes when the backend is back.'}
           </p>
         ) : experimentalRows.length ? (
-          <>
-            {laneBuckets.compatible.map((m) => (
+          <ModelFamilyGroups
+            items={experimentalRows}
+            initiallyOpen={(group) => group.items.some((model) => model.filename === spine.activeFilename)}
+            renderItem={(m) => m._familyLane === 'compatible' ? (
               <CompatibleRow
                 key={m.filename}
                 entry={m}
@@ -454,8 +465,7 @@ export default function ModelsView({
                 onDelete={requestDeleteModel}
                 onMakeDefault={makeDefaultModel}
               />
-            ))}
-            {laneBuckets.eligible.map((m) => (
+            ) : m._familyLane === 'eligible' ? (
               <EligibleRow
                 key={m.filename}
                 entry={m}
@@ -465,8 +475,7 @@ export default function ModelsView({
                 onRun={() => runSmoke(m.filename)}
                 onDelete={requestDeleteModel}
               />
-            ))}
-            {laneBuckets.not_anchored.map((m) => (
+            ) : (
               <NotAnchoredRow
                 key={m.filename}
                 entry={m}
@@ -482,8 +491,8 @@ export default function ModelsView({
                 onDelete={requestDeleteModel}
                 onMakeDefault={makeDefaultModel}
               />
-            ))}
-          </>
+            )}
+          />
         ) : (
           <p className="lane-empty">Nothing experimental on this machine — every downloaded model is verified.</p>
         )}

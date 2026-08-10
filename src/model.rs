@@ -144,6 +144,7 @@ pub fn is_implemented_architecture(architecture: &str) -> bool {
             | "qwen3moe"
             | "qwen35"
             | "smollm3"
+            | "gemma2"
             | "gemma3"
             | "gemma4"
             | "phi3"
@@ -338,7 +339,7 @@ impl LlamaModelConfig {
         let architecture = match gguf.architecture() {
             Some(
                 architecture @ ("llama" | "mistral" | "qwen2" | "qwen3" | "qwen3moe" | "qwen35"
-                | "smollm3" | "gemma3" | "gemma4" | "phi3" | "lfm2"
+                | "smollm3" | "gemma2" | "gemma3" | "gemma4" | "phi3" | "lfm2"
                 | "bitnet-b1.58"),
             ) => architecture,
             // Gemma 4 MTP/assistant drafter heads ship as a distinct architecture.
@@ -2863,6 +2864,36 @@ mod tests {
         assert_eq!(config.attention_key_length, Some(256));
     }
 
+    #[test]
+    fn gemma2_header_parses_for_the_runnable_bridge() {
+        // The runnable runtime already implements Gemma 2's sandwich norms and
+        // logit soft-cap. The shared config is still required by the load/inspect
+        // pipeline before routing reaches that runtime, so this header parse is
+        // attemptability plumbing rather than a broad-family support claim.
+        let gguf = meta_only_gguf(vec![
+            (
+                "general.architecture",
+                GgufMetadataValue::String("gemma2".into()),
+            ),
+            ("gemma2.context_length", GgufMetadataValue::U32(8_192)),
+            ("gemma2.embedding_length", GgufMetadataValue::U32(3_584)),
+            ("gemma2.block_count", GgufMetadataValue::U32(42)),
+            ("gemma2.feed_forward_length", GgufMetadataValue::U32(14_336)),
+            ("gemma2.attention.head_count", GgufMetadataValue::U32(16)),
+            ("gemma2.attention.head_count_kv", GgufMetadataValue::U32(8)),
+            (
+                "gemma2.attention.layer_norm_rms_epsilon",
+                GgufMetadataValue::F32(1e-6),
+            ),
+        ]);
+
+        let config = super::LlamaModelConfig::from_gguf(&gguf)
+            .expect("gemma2 header must reach its runnable-only route");
+        assert_eq!(config.architecture, "gemma2");
+        assert!(super::is_implemented_architecture("gemma2"));
+        assert!(super::is_runnable_only_arch("gemma2"));
+    }
+
     /// The real LFM2.5-2.6B row: 30 layers, `head_count_kv` an **i32 array**
     /// whose zeros mark the 22 short-conv layers and whose 8s mark the 8 GQA
     /// layers (verbatim from the published GGUF).
@@ -3246,6 +3277,7 @@ mod tests {
             "qwen3",
             "qwen3moe",
             "smollm3",
+            "gemma2",
             "gemma3",
             "gemma4",
             "phi3",

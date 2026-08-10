@@ -1,0 +1,67 @@
+{
+  "schema": "camelid.model-qualification-oracle/v1",
+  "row_id": "qwen2_5_0_5b_instruct_q8_0",
+  "artifact": {
+    "repo": "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+    "revision": "9217f5db79a29953eb74d5343926648285ec7e67",
+    "file": "qwen2.5-0.5b-instruct-q8_0.gguf",
+    "size_bytes": 675710816,
+    "sha256": "ca59ca7f13d0e15a8cfa77bd17e65d24f6844b554a7b6c12e07a5f89ff76844e",
+    "license": "apache-2.0"
+  },
+  "oracle": {
+    "engine": "llama.cpp",
+    "build": "b9632",
+    "revision": "acd79d603",
+    "archive": "llama-b9632-bin-win-cpu-x64.zip",
+    "archive_sha256": "b835d5c5155dd2a5ed748a0351debf2ede0dc9f808757e0429f8700a11832dcd",
+    "platform": "windows-x64-cpu"
+  },
+  "decode": {
+    "temperature": 0,
+    "top_k": 1,
+    "cache_prompt": false,
+    "max_new_tokens": 16
+  },
+  "raw_prompts": [
+    {
+      "text": "The capital of France is",
+      "prompt_ids": [785, 6722, 315, 9625, 374],
+      "generated_ids": [12095, 13, 1084, 374, 279, 7772, 3283, 304, 4505, 323, 279, 2086, 7772, 304, 279, 1879],
+      "generated_text": " Paris. It is the largest city in Europe and the second largest in the world"
+    },
+    {
+      "text": "Once upon a time",
+      "prompt_ids": [12522, 5193, 264, 882],
+      "generated_ids": [11, 1052, 572, 264, 3908, 883, 6941, 3757, 879, 12163, 304, 264, 2613, 14126, 13, 3757],
+      "generated_text": ", there was a young man named John who lived in a small village. John"
+    },
+    {
+      "text": "The quick brown fox",
+      "prompt_ids": [785, 3974, 13876, 38835],
+      "generated_ids": [34208, 916, 264, 15678, 5562, 11, 374, 279, 1852, 438, 279, 2701, 11652, 25, 330, 785],
+      "generated_text": " jumps over a lazy dog, is the same as the following sentence: \"The"
+    },
+    {
+      "text": "2 + 2 =",
+      "prompt_ids": [17, 488, 220, 17, 284],
+      "generated_ids": [220, 19, 198, 59, 2533, 54815, 11, 279, 897, 315, 17767, 64, 488, 293, 488, 272],
+      "generated_text": " 4\n\\]\n\nTherefore, the value of \\(a + b + c"
+    }
+  ],
+  "chat_templates": [
+    {
+      "name": "one_user_turn_with_default_system",
+      "messages": [
+        {
+          "role": "user",
+          "content": "What is the capital of France?"
+        }
+      ],
+      "add_assistant": true,
+      "rendered": "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n",
+      "prompt_ids": [151644, 8948, 198, 2610, 525, 1207, 16948, 11, 3465, 553, 54364, 14817, 13, 1446, 525, 264, 10950, 17847, 13, 151645, 198, 151644, 872, 198, 3838, 374, 279, 6722, 315, 9625, 30, 151645, 198, 151644, 77091, 198]
+    }
+  ]
+}
+
