@@ -34,6 +34,9 @@ Common options:
   --expect-webui-chat <state>          Assert WebUI chat state, e.g. enabled
   --expect-local-lane-class <class>    Assert /api/models/local lane_class for the exact file
   --expect-gguf-sha256 <hex>           Assert the loaded lane's exact GGUF SHA-256
+  --expect-selected-backend <name>    Assert /v1/health execution_plan.selected_backend
+  --expect-prefill-path <name>        Assert /v1/health execution_plan.prefill_path
+  --expect-decode-path <name>         Assert /v1/health execution_plan.decode_path
   --help, -h                           Print this help without writing files
 `)
   process.exit(0)
@@ -61,6 +64,11 @@ const expectWebUiChat = args.get('expect-webui-chat') || ''
 const expectedContractSupported = parseOptionalBoolean('expect-contract-supported', expectContractSupported)
 const expectLocalLaneClass = args.get('expect-local-lane-class') || (expectedContractSupported === true ? 'supported' : '')
 const expectGgufSha256 = normalizeSha256(args.get('expect-gguf-sha256') || '')
+const expectedExecutionPlan = {
+  selected_backend: args.get('expect-selected-backend'),
+  prefill_path: args.get('expect-prefill-path'),
+  decode_path: args.get('expect-decode-path'),
+}
 
 if (!modelPath) throw new Error('--model is required')
 if (!outDir) throw new Error('--out-dir is required')
@@ -194,6 +202,10 @@ try {
 
   const healthAfter = await tryFetchJson(`${apiBase}/v1/health`)
   await recordStep('health_after', healthAfter, join(outDir, 'health-after.json'))
+  if (Object.values(expectedExecutionPlan).some(value => value !== undefined)) {
+    const executionPlan = executionPlanEvidence(healthAfter, expectedExecutionPlan)
+    await recordStep('execution_plan', executionPlan, join(outDir, 'execution-plan.json'))
+  }
 
   if (!skipFrontend) {
     const frontendCommand = [
@@ -228,10 +240,17 @@ try {
       exit_code: frontendRun.code,
       mode: allowGuardedChat ? 'allow_guarded_chat' : 'require_generation',
     }
-    await recordStep('frontend_smoke', frontendSummary, join(outDir, 'frontend.summary.json'))
     if (frontendRun.code !== 0) {
-      throw new Error(`frontend smoke exited ${frontendRun.code}`)
+      frontendSummary.__error = `frontend smoke exited ${frontendRun.code}`
     }
+    await recordStep('frontend_smoke', frontendSummary, join(outDir, 'frontend.summary.json'))
+  }
+
+  const healthFinal = await tryFetchJson(`${apiBase}/v1/health`)
+  await recordStep('health_final', healthFinal, join(outDir, 'health-final.json'))
+  if (Object.values(expectedExecutionPlan).some(value => value !== undefined)) {
+    const executionPlanFinal = executionPlanEvidence(healthFinal, expectedExecutionPlan)
+    await recordStep('execution_plan_final', executionPlanFinal, join(outDir, 'execution-plan-final.json'))
   }
 
   summary.passed = true
@@ -367,6 +386,22 @@ function normalizedPath(value) {
 
 function check(name, actual, expected) {
   return { name, expected, actual: actual ?? null, passed: actual === expected }
+}
+
+function executionPlanEvidence(health, expected) {
+  const actual = health?.execution_plan || null
+  const checks = Object.entries(expected)
+    .filter(([, value]) => value !== undefined)
+    .map(([field, value]) => check(`execution plan ${field}`, actual?.[field], value))
+  const failed = checks.filter(item => !item.passed)
+  return {
+    schema: 'camelid.model-promotion.execution-plan.v1',
+    expected,
+    actual,
+    checks,
+    passed: failed.length === 0,
+    ...(failed.length ? { __error: failed.map(item => `${item.name}: expected ${JSON.stringify(item.expected)}, got ${JSON.stringify(item.actual)}`).join('; ') } : {}),
+  }
 }
 
 function run(command, commandArgs) {

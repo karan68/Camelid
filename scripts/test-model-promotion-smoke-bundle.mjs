@@ -44,6 +44,11 @@ const server = createServer(async (request, response) => {
         active_model_id: loadedId,
         loaded_now: true,
         generation_ready: true,
+        execution_plan: {
+          selected_backend: 'metal_resident_fixture_runtime',
+          prefill_path: 'fixture_metal_resident_prefill',
+          decode_path: 'fixture_metal_resident_decode',
+        },
       })
     }
     if (request.url === '/api/models/current') return json(response, 200, currentModel())
@@ -98,6 +103,9 @@ try {
     '--skip-frontend',
     '--expect-local-lane-class', 'supported',
     '--expect-gguf-sha256', ggufSha256,
+    '--expect-selected-backend', 'metal_resident_fixture_runtime',
+    '--expect-prefill-path', 'fixture_metal_resident_prefill',
+    '--expect-decode-path', 'fixture_metal_resident_decode',
   ], { cwd: repoRoot })
   assert.equal(stdout.includes('legacy completions'), false)
   assert.equal(completionCalls, 0, 'chat-only mode must not probe /v1/completions')
@@ -109,6 +117,8 @@ try {
   assert.equal(summary.skip_completions, true)
   assert.equal(summary.steps.v1_completions.skipped, true)
   assert.equal(summary.steps.exact_model_identity.ok, true)
+  assert.equal(summary.steps.execution_plan.ok, true)
+  assert.equal(summary.steps.execution_plan_final.ok, true)
   const skipped = await readJson(join(outDir, 'completion.skipped.json'))
   assert.equal(skipped.skipped, true)
   const identity = await readJson(join(outDir, 'exact-model-identity.json'))
@@ -118,6 +128,11 @@ try {
   const timings = await readJson(join(outDir, 'generation-timings.summary.json'))
   assert.equal(timings.inputs.length, 1, 'chat-only timing summary must contain only the chat response')
   assert.equal(timings.inputs[0].file, 'chat.response.json')
+  const executionPlan = await readJson(join(outDir, 'execution-plan.json'))
+  assert.equal(executionPlan.passed, true)
+  assert.equal(executionPlan.actual.selected_backend, 'metal_resident_fixture_runtime')
+  const executionPlanFinal = await readJson(join(outDir, 'execution-plan-final.json'))
+  assert.equal(executionPlanFinal.passed, true)
 
   includeTimings = false
   const noTimingsDir = join(tempDir, 'no-timings')
@@ -156,6 +171,26 @@ try {
   const failedSummary = await readJson(join(failDir, 'summary.json'))
   assert.equal(failedSummary.passed, false)
   assert.match(failedSummary.error, /local lane class.*supported.*experimental_implemented/)
+
+  laneClass = 'supported'
+  const executionPlanFailDir = join(tempDir, 'execution-plan-mismatch')
+  await assert.rejects(
+    () => execFileAsync(process.execPath, [
+      bundleScript,
+      '--api', apiBase,
+      '--model', modelPath,
+      '--model-id', 'fixture-row',
+      '--out-dir', executionPlanFailDir,
+      '--chat-only',
+      '--skip-frontend',
+      '--expect-local-lane-class', 'supported',
+      '--expect-gguf-sha256', ggufSha256,
+      '--expect-selected-backend', 'cpu_reference',
+    ], { cwd: repoRoot }),
+  )
+  const executionPlanFailedSummary = await readJson(join(executionPlanFailDir, 'summary.json'))
+  assert.equal(executionPlanFailedSummary.passed, false)
+  assert.match(executionPlanFailedSummary.error, /execution plan selected_backend.*cpu_reference.*metal_resident_fixture_runtime/)
 
   console.log('model-promotion-smoke-bundle self-test passed')
 } finally {

@@ -6537,14 +6537,14 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 status: "supported_exact_row_smoke",
                 support_scope: "exact_row_greedy_runnable_chat_and_512_context_smoke_only",
                 full_support_status: "blocked_pending_normalized_full_support",
-                full_support_blockers: "tool calling, sampling semantics beyond greedy, context beyond the checked 512-token chat bucket, CUDA and non-Metal GPU lanes, non-Apple-Silicon GPU execution, production throughput, neighboring LFM2 variants/quants, and normalized cross-platform support bundles remain missing",
+                full_support_blockers: "tool calling, sampling semantics beyond greedy, context beyond the checked 512-token chat bucket, Linux portability, CUDA and non-Apple-Silicon GPU execution, production throughput, neighboring LFM2 variants/quants, and broader normalized support bundles remain missing",
                 metadata_parses: "validated",
                 tokenizer_works: "validated_against_pinned_llamacpp",
                 tensors_load: "validated",
                 generation_runs: "raw_greedy_plus_non_streaming_and_streaming_runnable_chat_smoke",
-                parity_audited: "96_of_96_short_greedy_tokens_plus_tokenizer_template_and_512_chat_context_parity_pass",
+                parity_audited: "windows_cpu_and_macos_metal_96_of_96_short_greedy_tokens_plus_tokenizer_template_and_512_chat_context_parity_pass",
                 performance_measured: "macos_m4_measurement_only_not_promoted_as_sla",
-                frontend_load_path_verified: "validated_current_head_windows_models_page_smoke",
+                frontend_load_path_verified: "validated_current_head_windows_and_macos_models_page_smoke",
                 frontend_readiness_gate: "green only when this exact hash-pinned GGUF row plus Q8_0 quant match /api/capabilities and /api/models/local reports lane_class=supported for the loaded exact bytes",
                 tested_context: "short_raw_and_chat_prompts_plus_exact_512_token_rendered_chat_prompt",
                 chat_template_renderer: "lfm2_5_chatml_open_think",
@@ -6565,11 +6565,11 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 bounded_context_8192_pack: "not_promoted",
                 bounded_context_8192_pack_id: "not_selected",
                 bounded_context_8192_window: 8192,
-                latest_checked_bucket: "current_head_api_webui_sse_and_exact_512_chat_context",
+                latest_checked_bucket: "current_head_windows_cpu_and_macos_metal_api_webui_sse_and_exact_512_chat_context",
                 latest_checked_result: "pass",
-                latest_checked_output: "qa/evidence-bundles/lfm2-2.6b-q8-phase1-promotion-20260810/manifest.json",
-                evidence: "exact LFM2.5-2.6B-Q8_0.gguf bytes (sha256 36587fdf27bdfc69caf2637273679a0870ec155162161bde6fd16e8c70bdb757, 2874779456 B): tokenizer/template fixtures and 4 prompts x 24 greedy tokens match pinned llama.cpp b9632/acd79d603; native runnable chat emits sealed prompt/generated-token receipts; exact 512-token rendered chat matches the same oracle for 8/8 generated tokens and text; current-head Windows API/WebUI smoke covers non-streaming chat, 128-token SSE with terminal usage, exact local identity, and supported Models-page state",
-                next_step: "run the same normalized promotion bundle on the Mac resident Metal lane; add 1024+ chat context buckets before widening the checked context envelope",
+                latest_checked_output: "qa/evidence-bundles/lfm2-2.6b-q8-macos-metal-20260810-head-35ca855f/manifest.json",
+                evidence: "exact LFM2.5-2.6B-Q8_0.gguf bytes (sha256 36587fdf27bdfc69caf2637273679a0870ec155162161bde6fd16e8c70bdb757, 2874779456 B): tokenizer/template fixtures and 4 prompts x 24 greedy tokens match pinned llama.cpp b9632/acd79d603 on Windows CPU and macOS Metal; native runnable chat emits sealed prompt/generated-token receipts; exact 512-token rendered chat matches the same oracle for 8/8 generated tokens and text on both lanes; current-head Windows CPU and macOS resident-Metal API/WebUI smokes cover non-streaming chat, 128-token SSE with terminal usage, exact local identity, and supported Models-page state; the macOS receipt asserts selected_backend=metal_resident_lfm2_runtime, prefill_path=lfm2_metal_resident_prefill, and decode_path=lfm2_metal_resident_decode",
+                next_step: "add 1024+ chat context buckets before widening the checked context envelope; qualify Linux CPU, CUDA, sampling, tools, neighboring artifacts, and throughput independently",
             },
             ModelCompatibilityTarget {
                 id: "qwen3_0_6b_instruct_q8_0",
@@ -7259,6 +7259,18 @@ impl ResidentReclaim {
     }
 }
 
+fn resident_load_is_idempotent(
+    resident_id: &str,
+    resident_path: &std::path::Path,
+    requested_id: Option<&str>,
+    requested_path: &std::path::Path,
+) -> bool {
+    if resident_path != requested_path {
+        return false;
+    }
+    requested_id.map_or(true, |id| id == resident_id)
+}
+
 /// The refusal for a load-blocking verdict: a stable error code plus its message.
 ///
 /// A host that is out of room *because something else is already loaded* is a
@@ -7496,12 +7508,14 @@ async fn load_model(State(state): State<AppState>, Json(req): Json<LoadModelRequ
             Some("path"),
         );
     }
-    // What is resident BESIDES the model being requested. A second copy of the
-    // same file is not reclaimable room (the load would be idempotent), so it is
-    // excluded — otherwise a repeat load would offer to release itself.
+    // What is resident BESIDES the model identity being requested. The same
+    // path is idempotent only when the request also keeps the same explicit id
+    // (or omits an id). A UI promotion smoke may intentionally replace the
+    // startup hash id with the catalog row id for the same GGUF; that is a real
+    // switch and must release the old resident runtime before the fit check.
     let mut reclaim = ResidentReclaim::default();
     for (id, loaded) in state.loaded_models.read().await.iter() {
-        if loaded.path == path {
+        if resident_load_is_idempotent(id, &loaded.path, req.id.as_deref(), &path) {
             continue;
         }
         reclaim.bytes += std::fs::metadata(&loaded.path)
@@ -32559,6 +32573,35 @@ mod catalog_fit_tests {
             ),
             super::ModelLaneClass::ExperimentalImplemented
         );
+    }
+
+    #[test]
+    fn replace_treats_the_same_path_with_a_different_explicit_id_as_reclaimable() {
+        let path = std::path::Path::new("models/LFM2.5-2.6B-Q8_0.gguf");
+        assert!(super::resident_load_is_idempotent(
+            "startup-hash",
+            path,
+            None,
+            path,
+        ));
+        assert!(super::resident_load_is_idempotent(
+            "lfm2_5_2_6b_q8_0",
+            path,
+            Some("lfm2_5_2_6b_q8_0"),
+            path,
+        ));
+        assert!(!super::resident_load_is_idempotent(
+            "startup-hash",
+            path,
+            Some("lfm2_5_2_6b_q8_0"),
+            path,
+        ));
+        assert!(!super::resident_load_is_idempotent(
+            "lfm2_5_2_6b_q8_0",
+            std::path::Path::new("models/other.gguf"),
+            Some("lfm2_5_2_6b_q8_0"),
+            path,
+        ));
     }
 
     #[test]

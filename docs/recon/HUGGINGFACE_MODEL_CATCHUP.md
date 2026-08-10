@@ -1,7 +1,8 @@
 # Hugging Face Model Catch-up
 
 Status: active, Phase 1 started 2026-08-09. The first exact row, LFM2.5 2.6B
-Q8_0, completed all eight gates and was promoted on 2026-08-10; Phase 1
+Q8_0, completed all eight gates and was promoted on 2026-08-10; its exact-row
+Mac handoff is also complete on one Apple M4 / macOS 26.5 / arm64 host. Phase 1
 continues for the remaining families.
 
 ## Goal
@@ -27,9 +28,12 @@ page progressively harder to scan.
 ## Phase 1 work order
 
 1. **LFM2** is complete for the exact `LFM2.5-2.6B-Q8_0.gguf` row. Its
-   immutable source identity, tokenizer/template, runnable CPU smoke/parity,
-   API/SSE/Models-page contract, and exact 512-token receipt all pass. This is
-   an exact-row promotion, not family-wide LFM2 support.
+   immutable source identity, tokenizer/template, Windows runnable CPU
+   smoke/parity, API/SSE/Models-page contract, and exact 512-token receipt all
+   pass. The same exact artifact independently passes the short and 512-token
+   oracle gates plus the API/Models-page/WebUI smoke on an Apple M4
+   resident-Metal lane. This is an exact-row, host-bounded promotion, not
+   family-wide LFM2 support or broad Apple portability.
 2. **Qwen2.5 0.5B** is the cheapest new-family proof. The bootstrap row is the
    official Q8_0 GGUF so graph parity is measured with the least quantization
    ambiguity. Start on the CPU reference lane because Qwen2 projection biases
@@ -57,7 +61,7 @@ promotion; the other five families remain active dispositions:
 
 | Family | Current result | Next honest gate |
 |---|---|---|
-| LFM2 | **Complete / promoted exact-row smoke.** All eight Phase 1 gates pass for `LFM2.5-2.6B-Q8_0.gguf` on the Windows CPU runnable lane. | Apple-Silicon resident-Metal parity, context above 512 tokens, and separately evidenced neighboring sizes/quants or broader sampling/tool boundaries. |
+| LFM2 | **Complete / promoted exact-row smoke.** All eight Phase 1 gates pass for `LFM2.5-2.6B-Q8_0.gguf` on the Windows CPU runnable lane, and the exact-row handoff independently passes on the resident-Metal lane on one Apple M4 / macOS 26.5 / arm64 host. | Context above 512 tokens, CUDA, other Apple hardware, and separately evidenced neighboring sizes/quants or broader sampling/tool boundaries. |
 | Qwen2.5 | Source, metadata, tokenizer, and template pass; strict greedy parity remains failed on one stable cross-engine numeric frontier. | Layer trace under one fully pinned oracle launch recipe; do not waive the token mismatch. |
 | Phi-3 | Generic head-dim-96 CPU cache reads are bit-identical; the unproven partial Metal PV tile now falls back. | Repeat the exact-row Metal prefill/decode receipt before changing the HOLD. |
 | Gemma 2 | Source identity and exact IT template route pass; substituted templates and invalid shapes fail closed. | Exact-row metadata and token-ID oracle, then load/parity. |
@@ -111,9 +115,21 @@ Phase 1 gates as passing for one immutable artifact:
   chat plus the Models-page identity/readiness contract pass, while legacy raw
   completions and tools remain intentionally typed fail-closed
 
-Next evidence is the bundle's Apple-Silicon Metal handoff, then bounded context
-above 512 tokens and separately qualified broader sizes, quants, sampling, and
-tool behavior. None of those follow-ups is implied by the Windows CPU promotion.
+The exact-row Mac handoff at
+`qa/evidence-bundles/lfm2-2.6b-q8-macos-metal-20260810-head-35ca855f/` is complete
+on Apple M4 / macOS 26.5 / arm64. Against pinned llama.cpp b9632
+(`acd79d603`), its release gate matches all 96/96 short greedy generated IDs and
+its reference-only context gate matches an exact 512-token rendered chat prompt
+plus all 8 generated IDs/text. Health asserts
+`selected_backend=metal_resident_lfm2_runtime`,
+`prefill_path=lfm2_metal_resident_prefill`, and
+`decode_path=lfm2_metal_resident_decode`; API/Models-page/WebUI non-streaming and
+128-ceiling SSE smoke also pass.
+
+Next evidence is bounded context above 512 tokens and independently qualified
+broader sizes, quants, sampling, tool behavior, CUDA, and additional Apple
+hardware. None of those follow-ups is implied by either completed lane, and no
+throughput claim is attached to the M4 receipt.
 
 ## Phase 1 bootstrap receipt
 

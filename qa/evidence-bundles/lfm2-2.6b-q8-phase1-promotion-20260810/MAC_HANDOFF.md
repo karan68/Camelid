@@ -1,8 +1,21 @@
-# Mac handoff
+# Mac handoff — completed
 
-Start from branch `codex/huggingface-model-catchup`. The Windows CPU proof is
-complete for the exact file below; the Mac task is a portability/resident-Metal
-follow-up, not a prerequisite for the Windows exact-row smoke claim.
+The handoff from branch `codex/huggingface-model-catchup` is complete for the
+exact file below on one Apple M4 host running macOS 26.5 arm64. The independently
+committed receipt is
+`qa/evidence-bundles/lfm2-2.6b-q8-macos-metal-20260810-head-35ca855f/`.
+
+That receipt records 96/96 short greedy generated IDs and an exact
+512-rendered-prompt-token plus 8-generated-ID/text match against pinned llama.cpp b9632
+(`acd79d603`). `/v1/health` asserts
+`selected_backend=metal_resident_lfm2_runtime`,
+`prefill_path=lfm2_metal_resident_prefill`, and
+`decode_path=lfm2_metal_resident_decode`. The exact-row API/Models-page/WebUI
+non-streaming smoke and SSE smoke with a 128-token ceiling also pass.
+
+The original Windows x86_64 CPU/runnable promotion in this bundle remains an
+independent supported lane; the M4 result neither replaces nor weakens it. The
+recipe used to close the handoff is retained below for reproducibility.
 
 1. Acquire the immutable artifact if it is not already present, then verify it
    before loading (the download is about 2.87 GB):
@@ -39,6 +52,10 @@ follow-up, not a prerequisite for the Windows exact-row smoke claim.
      --llama-ctx 640 \
      --max-gen 8 \
      --verify-mode reference-only \
+     --camelid-lane metal \
+     --expect-selected-backend metal_resident_lfm2_runtime \
+     --expect-prefill-path lfm2_metal_resident_prefill \
+     --expect-decode-path lfm2_metal_resident_decode \
      --camelid-exe target/release/camelid \
      --llama-server target/reference/llama.cpp-b9632/bin/llama-server \
      --camelid-port 8231 \
@@ -66,10 +83,15 @@ follow-up, not a prerequisite for the Windows exact-row smoke claim.
      --expect-contract-supported true \
      --expect-webui-chat enabled \
      --expect-local-lane-class supported \
+     --expect-selected-backend metal_resident_lfm2_runtime \
+     --expect-prefill-path lfm2_metal_resident_prefill \
+     --expect-decode-path lfm2_metal_resident_decode \
      --expect-gguf-sha256 36587fdf27bdfc69caf2637273679a0870ec155162161bde6fd16e8c70bdb757
    ```
 
-Do not widen the result to other LFM2 files, other quants, context above 512,
-sampling, tools, or a throughput claim. If the Mac selects a resident Metal
-lane, its token IDs/text still need their own pinned-oracle receipt before a
-Metal-specific parity claim is added.
+The completed Mac claim is limited to this exact GGUF, Apple M4, macOS 26.5,
+arm64, the asserted resident-Metal execution plan, deterministic greedy parity,
+the exact 512-token prompt bucket, and the recorded chat/API/WebUI smoke. Do not
+widen it to other Apple hardware, broader platform portability, other LFM2
+files or quants, context above 512, non-greedy sampling, tools, CUDA, or
+throughput.

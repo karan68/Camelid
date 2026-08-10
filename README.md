@@ -92,7 +92,7 @@ Good starting points:
 |---|---|---|
 | Smallest end-to-end test (~1.2 GB) | TinyLlama 1.1B Chat Q8_0 | `tinyllama` |
 | **Recommended first model** | Llama 3.2 3B Instruct Q8_0 | `3b_instruct_q8` |
-| Compact Windows CPU chat (~2.9 GB) | LFM2.5 2.6B Q8_0 | `lfm2_5_2_6b` |
+| Compact Windows CPU or tested M4 Metal chat (~2.9 GB) | LFM2.5 2.6B Q8_0 | `lfm2_5_2_6b` |
 | Fits a 16 GB Apple Silicon Mac | Mistral 7B Instruct v0.3 Q8_0 | `mistral` |
 | Reasoning and coding on a small budget | Qwen3 4B Q4_K_M | `qwen3_4b_q4` |
 | Compact PrismML GPU model | Bonsai 4B Q1_0 | `bonsai_4b_q1` |
@@ -174,9 +174,9 @@ Selected validation highlight:
 | Model row | Quant | Evidence |
 |---|---|---|
 | Mistral 7B Instruct v0.3 | Q8_0 | Exact-row smoke + bounded context 512→8192 + GPU/CPU parity |
-| LFM2.5 2.6B | Q8_0 | Hash-pinned Windows CPU/runnable exact-row smoke: tokenizer/template + 96/96 short greedy tokens, exact 512-token chat prompt + 8/8 reference-oracle tokens/text, and API/WebUI/SSE smoke |
+| LFM2.5 2.6B | Q8_0 | Hash-pinned exact-row smoke on Windows CPU/runnable and Apple M4 macOS 26.5 arm64 resident Metal: 96/96 short greedy tokens, exact 512-token chat prompt + 8/8 reference-oracle tokens/text, and API/Models-page/WebUI/SSE smoke |
 
-The LFM2.5 promotion is limited to `LiquidAI/LFM2.5-2.6B-GGUF@b421ad1d549afeda6a0fb2ad3a697cb5a7879adc`, file `LFM2.5-2.6B-Q8_0.gguf` (2,874,779,456 bytes, SHA-256 `36587fdf27bdfc69caf2637273679a0870ec155162161bde6fd16e8c70bdb757`). The 512-token/8-token oracle check is reference-only; raw `/v1/completions` and tools remain typed fail-closed. Sampling beyond deterministic greedy, context above 512, neighboring rows, production throughput, CUDA, Metal parity, and broader LFM2 support remain unclaimed. See `qa/evidence-bundles/lfm2-2.6b-q8-phase1-promotion-20260810/`.
+The LFM2.5 promotion is limited to `LiquidAI/LFM2.5-2.6B-GGUF@b421ad1d549afeda6a0fb2ad3a697cb5a7879adc`, file `LFM2.5-2.6B-Q8_0.gguf` (2,874,779,456 bytes, SHA-256 `36587fdf27bdfc69caf2637273679a0870ec155162161bde6fd16e8c70bdb757`). The Windows x86_64 CPU/runnable proof remains recorded at `qa/evidence-bundles/lfm2-2.6b-q8-phase1-promotion-20260810/`. The Apple M4 macOS 26.5 arm64 receipt at `qa/evidence-bundles/lfm2-2.6b-q8-macos-metal-20260810-head-35ca855f/` independently asserts the resident-Metal execution plan, 96/96 short greedy token IDs, the exact 512-token prompt plus 8/8 generated IDs/text against pinned llama.cpp b9632 (`acd79d603`), and API/Models-page/WebUI non-streaming plus 128-ceiling SSE smoke. The 512-token/8-token oracle checks are reference-only; raw `/v1/completions` and tools remain typed fail-closed. Sampling beyond deterministic greedy, context above 512, neighboring rows, production throughput, CUDA, other Apple hardware, broad platform portability, and broader LFM2 support remain unclaimed.
 
 ### PrismML Bonsai and vision
 

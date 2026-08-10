@@ -20,7 +20,7 @@
 //     --target-tokens 681 --expect-actual-tokens 512 --kv-bytes-per-token 32768 \
 //     --verify-mode reference-only
 import { execFile, spawn } from 'node:child_process'
-import { mkdtemp, mkdir, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, open, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { promisify } from 'node:util'
@@ -30,6 +30,7 @@ import {
   buildGenerationRequest,
   buildLongPrompt,
   buildMessages,
+  camelidLaunchConfig,
   oracleConfig,
   parseArgs,
   positiveInt,
@@ -55,6 +56,9 @@ const camelidPort = positiveInt(args.get('camelid-port') || '8231', '--camelid-p
 const llamaPort = positiveInt(args.get('llama-port') || '8233', '--llama-port')
 const out = resolve(args.get('out') || `qa/capability/ctx_out/${row}`)
 const verifyMode = args.get('verify-mode') || (mode === 'chat' ? 'reference-only' : 'full')
+const expectedSelectedBackend = args.get('expect-selected-backend')
+const expectedPrefillPath = args.get('expect-prefill-path')
+const expectedDecodePath = args.get('expect-decode-path')
 if (!['full', 'reference-only', 'self-only'].includes(verifyMode)) {
   throw new Error(`--verify-mode must be full, reference-only, or self-only, got ${JSON.stringify(verifyMode)}`)
 }
@@ -70,7 +74,8 @@ const safeBudget = positiveInt(
   '--safe-kv-budget-bytes',
 )
 const camelidBase = `http://127.0.0.1:${camelidPort}`
-const env = { ...process.env, CUDA_VISIBLE_DEVICES: '-1' }
+const launch = camelidLaunchConfig(args)
+const env = launch.env
 
 const preflightProjectedKv = targetTokens * kvBytesPerToken
 const gib = value => `${(value / 1024 ** 3).toFixed(2)} GiB`
@@ -116,26 +121,81 @@ async function waitUrl(url, ms = 120000) {
   throw new Error(`not reachable at ${url}: ${last?.message}`)
 }
 
+async function fetchJson(url) {
+  const response = await fetch(url)
+  const text = await response.text()
+  let payload
+  try {
+    payload = text ? JSON.parse(text) : null
+  } catch {
+    throw new Error(`${url} returned non-JSON HTTP ${response.status}: ${text.slice(0, 300)}`)
+  }
+  if (!response.ok) {
+    throw new Error(`${url} returned HTTP ${response.status}: ${JSON.stringify(payload).slice(0, 300)}`)
+  }
+  return payload
+}
+
+function assertExecutionPlan(health) {
+  const plan = health?.execution_plan
+  const expected = [
+    ['selected_backend', expectedSelectedBackend],
+    ['prefill_path', expectedPrefillPath],
+    ['decode_path', expectedDecodePath],
+  ]
+  for (const [field, value] of expected) {
+    if (value !== undefined && plan?.[field] !== value) {
+      throw new Error(
+        `expected /v1/health execution_plan.${field}=${JSON.stringify(value)}, ` +
+        `got ${JSON.stringify(plan?.[field])}`,
+      )
+    }
+  }
+}
+
+async function stopChild(child, timeoutMs = 15000) {
+  if (child.exitCode !== null || child.signalCode !== null) return
+  const closed = new Promise(resolvePromise => child.once('close', resolvePromise))
+  child.kill('SIGTERM')
+  const exited = await Promise.race([
+    closed.then(() => true),
+    new Promise(resolvePromise => setTimeout(() => resolvePromise(false), timeoutMs)),
+  ])
+  if (!exited) {
+    child.kill('SIGKILL')
+    await closed
+  }
+}
+
 const prompt = buildLongPrompt(targetTokens)
 const messages = buildMessages(prompt, args.get('system-message'))
 const endpoint = mode === 'chat' ? '/v1/chat/completions' : '/v1/completions'
 const requestBody = buildGenerationRequest({ mode, prompt, messages, maxGen })
 
 await mkdir(out, { recursive: true })
+const camelidLogPath = resolve(out, 'camelid.log')
+const camelidLog = await open(camelidLogPath, 'w')
 const camelid = spawn(
   camelidExe,
   [
     'serve', '--addr', `127.0.0.1:${camelidPort}`, '--model', gguf,
-    '--gpu', 'off', '--deterministic', '--no-open',
+    ...launch.serveArgs, '--no-open',
   ],
-  { stdio: 'ignore', env },
+  { stdio: ['ignore', camelidLog.fd, camelidLog.fd], env },
 )
 let parityReceipt
 let promptTokens
 let generatedText
 let gate
+let health
+let currentModel
 try {
   await waitUrl(`${camelidBase}/api/models/current`)
+  currentModel = await fetchJson(`${camelidBase}/api/models/current`)
+  health = await fetchJson(`${camelidBase}/v1/health`)
+  await writeFile(resolve(out, 'current-model.json'), `${JSON.stringify(currentModel, null, 2)}\n`)
+  await writeFile(resolve(out, 'health.json'), `${JSON.stringify(health, null, 2)}\n`)
+  assertExecutionPlan(health)
   const response = await curlJson(`${camelidBase}${endpoint}`, requestBody)
   const native = requireNativeReceipt(response, mode)
   parityReceipt = native.receipt
@@ -167,8 +227,8 @@ try {
   }
   generatedText = native.generatedText
 } finally {
-  camelid.kill('SIGTERM')
-  await new Promise(resolvePromise => setTimeout(resolvePromise, 800))
+  await stopChild(camelid)
+  await camelidLog.close()
 }
 
 const receiptPath = resolve(out, 'parity-receipt.json')
@@ -208,6 +268,11 @@ const summary = {
   label,
   gguf,
   request_mode: mode,
+  camelid_lane_requested: launch.lane,
+  camelid_execution_plan: health?.execution_plan || null,
+  camelid_backend: health?.backend || null,
+  camelid_active_model_id: health?.active_model_id || currentModel?.id || null,
+  camelid_log: 'camelid.log',
   endpoint,
   target_tokens: targetTokens,
   actual_prompt_tokens: promptTokens,

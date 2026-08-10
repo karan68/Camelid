@@ -5,6 +5,7 @@ import {
   actualTokenGate,
   buildGenerationRequest,
   buildMessages,
+  camelidLaunchConfig,
   oracleConfig,
   parseArgs,
   requireNativeReceipt,
@@ -27,6 +28,20 @@ assert.deepEqual(oracleConfig(chatArgs), {
   flashAttn: 'off',
   repack: 'off',
 })
+
+assert.deepEqual(camelidLaunchConfig(chatArgs, { KEEP: 'yes' }), {
+  lane: 'cpu',
+  env: { KEEP: 'yes', CUDA_VISIBLE_DEVICES: '-1', CAMELID_LFM2_METAL: '0' },
+  serveArgs: ['--gpu', 'off', '--deterministic'],
+})
+assert.deepEqual(
+  camelidLaunchConfig(parseArgs(['--camelid-lane', 'metal']), { KEEP: 'yes' }),
+  {
+    lane: 'metal',
+    env: { KEEP: 'yes', CUDA_VISIBLE_DEVICES: '-1', CAMELID_LFM2_METAL: '1' },
+    serveArgs: ['--gpu', 'on'],
+  },
+)
 
 const messages = buildMessages('long prompt', 'system rule')
 assert.deepEqual(messages, [
@@ -97,5 +112,9 @@ assert.deepEqual(verify.slice(-8), [
 assert.throws(() => requestMode(parseArgs(['--request-mode', 'other'])), /raw or chat/)
 assert.throws(() => oracleConfig(parseArgs(['--llama-flash-attn', 'maybe'])), /on, off, or auto/)
 assert.throws(() => actualTokenGate(512, '512x'), /positive integer/)
+assert.throws(
+  () => camelidLaunchConfig(parseArgs(['--camelid-lane', 'cuda'])),
+  /cpu or metal/,
+)
 
 console.log('context parity helper tests passed')

@@ -5,7 +5,8 @@ This bundle closes the Phase 1 qualification gates for one exact artifact:
 `LFM2.5-2.6B-Q8_0.gguf` (2,874,779,456 bytes, SHA-256
 `36587fdf27bdfc69caf2637273679a0870ec155162161bde6fd16e8c70bdb757`).
 
-The Windows deterministic CPU lane passed all Phase 1 exact-row gates:
+This directory remains the historical Windows x86_64 deterministic CPU/runnable
+promotion anchor. That lane passed all Phase 1 exact-row gates:
 
 - the frozen tokenizer/template fixtures and four 24-token raw prompts pass;
   all 96 generated token IDs match llama.cpp b9632 (`acd79d603`);
@@ -33,5 +34,10 @@ explicitly replace an auto-selected resident model.
 This is exact-row smoke support, not broad LFM2 support. Tools remain typed
 fail-closed; sampling beyond the deterministic greedy lane, context above the
 checked 512-token bucket, neighboring sizes/quants, production throughput,
-CUDA, and a resident Apple-Silicon Metal rerun remain unclaimed. The Mac handoff
-is documented in `MAC_HANDOFF.md`.
+and CUDA remain unclaimed. The later resident-Metal handoff completed on one
+Apple M4 host running macOS 26.5 arm64 and is recorded independently at
+`qa/evidence-bundles/lfm2-2.6b-q8-macos-metal-20260810-head-35ca855f/`; see
+`MAC_HANDOFF.md` for the retained recipe. That receipt does not retroactively
+change this bundle's Windows scope, and it does not claim other Apple hardware,
+broad platform portability, context above 512, sampling beyond greedy, tools,
+or throughput.

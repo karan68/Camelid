@@ -30,6 +30,26 @@ export function requestMode(args) {
   return mode
 }
 
+export function camelidLaunchConfig(args, baseEnv = process.env) {
+  const lane = args.get('camelid-lane') || 'cpu'
+  if (!['cpu', 'metal'].includes(lane)) {
+    throw new Error(`--camelid-lane must be cpu or metal, got ${JSON.stringify(lane)}`)
+  }
+  const env = { ...baseEnv, CUDA_VISIBLE_DEVICES: '-1' }
+  if (lane === 'metal') {
+    return {
+      lane,
+      env: { ...env, CAMELID_LFM2_METAL: '1' },
+      serveArgs: ['--gpu', 'on'],
+    }
+  }
+  return {
+    lane,
+    env: { ...env, CAMELID_LFM2_METAL: '0' },
+    serveArgs: ['--gpu', 'off', '--deterministic'],
+  }
+}
+
 export function positiveInt(value, label) {
   const parsed = Number.parseInt(value, 10)
   if (!Number.isInteger(parsed) || parsed < 1 || String(parsed) !== String(value).trim()) {

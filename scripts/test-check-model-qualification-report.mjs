@@ -23,7 +23,8 @@ for (const name of committedReports) {
 }
 assert.equal(expectedOverall(report.stages), 'fail')
 assert.ok(mutated((candidate) => { candidate.host.hostname = 'private-machine' }).some((error) => error.includes('raw hostname')))
-assert.ok(mutated((candidate) => { candidate.artifact.path = 'C:\\Users\\private\\model.gguf' }).some((error) => error.includes('absolute local path')))
+const windowsPrivatePath = ['C:', 'Users', 'private', 'model.gguf'].join('\\')
+assert.ok(mutated((candidate) => { candidate.artifact.path = windowsPrivatePath }).some((error) => error.includes('absolute local path')))
 for (const privatePath of [
   '/tmp/private/model.gguf',
   '//server/private/model.gguf',
@@ -40,7 +41,7 @@ for (const privatePath of [
 assert.ok(mutated((candidate) => { candidate.stages.metadata.command = ['<camelid>', 'inspect', '/workspace/models/private.gguf'] }).some((error) => error.includes('absolute local path')))
 for (const assignedPath of [
   '--model=/tmp/private/model.gguf',
-  '--model=C:\\Users\\private\\model.gguf',
+  `--model=${windowsPrivatePath}`,
   '--model=file:///tmp/private/model.gguf',
 ]) {
   assert.ok(
