@@ -784,10 +784,19 @@ export function CatalogLaneBrowse({
   onStartModel,
   onModelStarted,
   onOperationBusy,
+  seedQuery = '',
 }) {
   const base = (apiBase || '').replace(/\/$/, '')
   const [items, setItems] = useState(null)
   const [query, setQuery] = useState('')
+  /* The page header's model search hands its term down here when it finds
+     nothing installed, so one keystroke sequence carries from "do I have this?"
+     to "can I get it?". Seeding only follows a NEW term; it never fights typing
+     that is already underway in this box. */
+  useEffect(() => {
+    const seed = String(seedQuery || '').trim()
+    if (seed) setQuery(seed)
+  }, [seedQuery])
   const [debouncedQuery, setDebouncedQuery] = useState('')
   const [nextCursor, setNextCursor] = useState(null)
   const [loading, setLoading] = useState(false)

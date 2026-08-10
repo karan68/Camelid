@@ -139,6 +139,7 @@ const supportContractSummarySource = read('../src/components/api/SupportContract
 const streamPacingSource = read('../src/lib/streamPacing.js')
 const systemViewSource = read('../src/views/SystemView.jsx')
 const modelsViewSource = read('../src/views/ModelsView.jsx')
+const catalogLaneBrowseSource = read('../src/components/models/CatalogLaneBrowse.jsx')
 const topBarSource = read('../src/components/TopBar.jsx')
 const analyticsViewSource = read('../src/views/AnalyticsView.jsx')
 const runtimeMemoryPanelSource = read('../src/components/analytics/RuntimeMemoryPanel.jsx')
@@ -339,6 +340,25 @@ const firstRunCardSource = read('../src/components/onboarding/FirstRunCard.jsx')
 assert.match(modelsViewSource, /bucketByLane\(spine\.local\.models, capabilities\)/, 'Models section membership must be derived from the live scan + contract at render time')
 assert.match(modelLanesSource, /isCompatibilitySupportedForModel\(capabilities, matchModel\(entry\)\)/, 'Models lane derivation must ask the shared contract matcher — the supported gate stays the contract voice')
 assert.doesNotMatch(modelsViewSource, /SUPPORTED_MODELS/, 'Models view must not place models from a hand-authored array')
+
+/* ---- Models page: search the models on this machine ---- */
+// The filter spans Supported AND Experimental, so both sections must read from
+// the filtered lists rather than the raw buckets — otherwise a section keeps
+// showing rows the search excluded.
+assert.match(modelsViewSource, /supportedRows\s*=\s*\(laneBuckets \? laneBuckets\.supported : \[\]\)\.filter\(matchesModelQuery\)/, 'the Supported section must render the filtered rows')
+assert.match(modelsViewSource, /experimentalRows\s*=\s*allExperimentalRows\.filter\(matchesModelQuery\)/, 'the Experimental section must render the filtered rows')
+// A GGUF's filename is often the only place the quantization appears, so a
+// search for "q4" has to reach it.
+assert.match(modelsViewSource, /model\?\.name \|\| ''\} \$\{model\?\.filename \|\| ''/, 'the model search must match filename as well as display name')
+// Finding nothing installed is exactly when someone is looking for a model they
+// do not have yet, so the term is handed to the catalog instead of dead-ending.
+assert.match(modelsViewSource, /setCatalogSeedQuery\(modelQuery\.trim\(\)\)/, 'an empty local result must hand its term to the catalog search')
+assert.match(modelsViewSource, /seedQuery=\{catalogSeedQuery\}/, 'the seeded term must reach CatalogLaneBrowse')
+assert.match(catalogLaneBrowseSource, /if \(seed\) setQuery\(seed\)/, 'the catalog must adopt a seeded term without clobbering typing already underway')
+// Empty states must not keep claiming the machine has nothing while a filter is
+// simply hiding it.
+assert.match(modelsViewSource, /filteringModels \? 'No verified model matches this search\.'/, 'the Supported empty state must say when a filter is what emptied it')
+assert.match(modelsViewSource, /filteringModels \? 'No experimental model matches this search\.'/, 'the Experimental empty state must say when a filter is what emptied it')
 assert.doesNotMatch(modelsViewSource, /localStorage\.(get|set|remove)Item/, 'Models view must not read or write localStorage truth')
 /* The inspect-first load protocol moved into lib/modelActivation.js when the
    first-run card became a second caller: two hand-written copies of an ordered

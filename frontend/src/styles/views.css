@@ -361,6 +361,28 @@
 .cxv-sub { margin-top: var(--space-2); max-width: 66ch; color: var(--color-text-muted); font-size: var(--text-sm); line-height: var(--leading-snug); }
 .cxv-head__actions { display: flex; flex-wrap: wrap; gap: var(--space-2); align-items: center; }
 
+/* Models page header: the name search sits above Refresh in the top-right, so
+   the actions column stacks instead of running as a row. Right-aligned so both
+   controls share an edge with the heading block opposite them. */
+.models-head-actions { flex-direction: column; align-items: flex-end; }
+.models-head-actions .cxv-search { flex: none; width: min(280px, 60vw); }
+.cxv-search__clear { display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; margin-right: calc(var(--space-1) * -1); border-radius: var(--radius-sm); color: var(--color-text-faint); }
+.cxv-search__clear:hover { background: var(--color-surface-hover); color: var(--color-text); }
+/* Safari renders its own clear affordance on type=search; ours is the one that
+   matches the rest of the UI and is reachable by keyboard. */
+.cxv-search input[type='search']::-webkit-search-decoration,
+.cxv-search input[type='search']::-webkit-search-cancel-button { -webkit-appearance: none; appearance: none; }
+
+/* Result line for the models filter — one summary for a filter that spans two
+   sections, rather than a changed empty state inside each. */
+.models-filter-summary { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: var(--space-2) var(--space-3); margin: var(--space-3) 0 0; padding: var(--space-2) var(--space-3); border: 1px solid var(--color-border-soft); border-radius: var(--radius-md); background: var(--color-surface); color: var(--color-text-muted); font-size: var(--text-sm); }
+.models-filter-summary strong { color: var(--color-text); font-weight: 650; }
+.models-filter-summary__actions { display: flex; align-items: center; gap: var(--space-2); }
+@media (max-width: 560px) {
+  .models-head-actions { align-items: stretch; }
+  .models-head-actions .cxv-search { width: 100%; }
+}
+
 /* Stat chips (header) */
 .cxv-stats { display: flex; flex-wrap: wrap; gap: var(--space-3); flex: none; }
 .cxv-stat { display: flex; flex-direction: column; gap: 1px; padding: var(--space-3) var(--space-4); min-width: 116px; border-radius: var(--radius-md); background: var(--color-surface); border: 1px solid var(--color-border-soft); }
