@@ -42,8 +42,10 @@ page progressively harder to scan.
 5. **SmolLM3** actually declares `tokenizer.ggml.pre = smaug-bpe`, an exact
    llama3-regex alias in the pinned reference. Its exact-row tokenizer pack now
    passes, including the dialect-specific absent-BOS default. Legacy `smollm`
-   remains a distinct two-pass dialect and must not be used as a shortcut; the
-   real row's dynamic chat renderer remains the next gate.
+   remains a distinct two-pass dialect and must not be used as a shortcut. An
+   exact-template renderer now opens only the default-thinking, text-only,
+   strictly alternating user/assistant envelope; every other dynamic branch
+   remains a typed HOLD, so the template gate is still incomplete.
 6. **Qwen3 MoE** now has an authoritative official 32.48 GB artifact anchor,
    clean-head bounded metadata evidence, and a 13-case exact-row `qwen2`
    tokenizer receipt against pinned llama.cpp b9632. Its embedded Qwen3 template
@@ -67,7 +69,7 @@ promotion; the other five families remain active dispositions:
 | Qwen2.5 | Source, metadata, tokenizer, template, and the exact 512-token context bucket pass; strict greedy parity remains failed on one stable cross-engine numeric frontier. | Layer trace under one fully pinned oracle launch recipe and complete API/WebUI/SSE smoke; do not waive the token mismatch. |
 | Phi-3 | Generic head-dim-96 CPU cache reads are bit-identical; the unproven partial Metal PV tile now falls back. | Repeat the exact-row Metal prefill/decode receipt before changing the HOLD. |
 | Gemma 2 | Source identity, clean-head bounded exact-row metadata, seven-case tokenizer parity, and the exact IT template route pass; substituted templates and invalid shapes fail closed. | Full-artifact identity/load and greedy parity, then API/WebUI/context. |
-| SmolLM3 | Source, clean-head bounded exact-row metadata, and the 10-case `smaug-bpe` tokenizer pack pass. Its absent BOS metadata resolves exactly like pinned llama.cpp, while the dynamic chat template remains under an executable HOLD. | Build a deterministic renderer for its date/reasoning/system/tool contract; load, generation, API/WebUI, and context remain blocked behind that template/runtime work. |
+| SmolLM3 | Source, clean-head bounded exact-row metadata, and the 10-case `smaug-bpe` tokenizer pack pass. The exact 5,493-byte template now renders the bounded default-thinking text envelope with a system-local English date; substituted templates, tools, system/custom overrides, false thinking, nontext inputs, and invalid histories fail typed. | Close the remaining dynamic template branches or retain their explicit exclusions, then produce a full real-artifact HTTP prompt-token receipt. Load, generation, API/WebUI, and context remain blocked or pending. |
 | Qwen3 MoE | Source identity, clean-head bounded metadata, and 13-case exact-row tokenizer parity pass for the official 32.48 GB row. The pack pins absent automatic BOS insertion, exact Qwen2 regex splits, CONTROL ChatML markers, USER_DEFINED tool/reasoning tags, and UNUSED padding behavior. | Qualify the embedded 4,100-byte Qwen3 template, then full-artifact identity/load and MoE parity; tokenizer evidence is not a load, generation, API, context, or support promotion. |
 
 Phase 1 remains active for Qwen2.5, Phi-3, Gemma 2, SmolLM3, and Qwen3 MoE.
@@ -170,7 +172,10 @@ Phase 2 has started without weakening the Phase 1 evidence boundary:
   `--inspect-template` is a separate, mutually exclusive SmolLM3 preparation
   lane. It binds the same immutable 32 MiB prefix to the 5,493-byte template and
   a pinned analyzer/shape pack, but keeps the runtime template stage blocked;
-  nested preparation success is not a renderer or support claim.
+  nested preparation success is not a renderer or support claim. A later,
+  separately locked runtime-envelope fixture opens only the exact
+  default-thinking text shape; it does not rewrite that historical preparation
+  receipt or advance the roster's still-blocked full template gate.
 - `scripts/check-model-qualification-report.mjs` validates the committed report
   contract, fail-closed overall status, and privacy boundary before evidence is
   accepted.

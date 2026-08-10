@@ -512,10 +512,11 @@
           "required": true,
           "status": "blocked",
           "evidence": [
-            "qa/model-qualification/fixtures/smollm3-tokenizer-pre-v1.json",
+            "qa/prompt-packs/smollm3-chat-template-shapes-v1.json",
+            "qa/model-qualification/fixtures/smollm3-default-thinking-runtime-envelope-v1.json",
             "src/api/mod.rs"
           ],
-          "reason": "The pinned 5,493-byte dynamic ChatML template injects current-date metadata, reasoning policy, system overrides, custom instructions, and tool grammars. An executable HOLD prevents it from falling into generic Qwen3 ChatML until a deterministic exact renderer and oracle fixture exist."
+          "reason": "The exact 5,493-byte template now has an architecture-scoped renderer for the bounded default-thinking, text-only user/assistant envelope on /apply-template and chat preparation. The template gate remains blocked because system/custom-instruction/system-override, tools/tool history, explicit no-think, nontext shapes, and full real-artifact HTTP prompt-token parity remain unqualified."
         },
         "load_smoke": {
           "required": true,
