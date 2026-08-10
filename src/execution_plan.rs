@@ -1983,6 +1983,17 @@ fn recognized_row_level(row: &str) -> &'static str {
         // Non-Q8_0 quants of the same name report unknown via `support_level`
         // and are declined by the resident admission (hazard H5).
         "supported_exact_row_smoke_sub512"
+    } else if normalized.contains("lfm2_5_2_6b") {
+        // LFM2.5-2.6B Q8_0 is certified on the runnable lane. Some published
+        // conversions use an opaque hash for `general.name`, so recognizing
+        // the exact model family in the filename lets `exact_model_row` expose
+        // the same supported row as `/api/capabilities`.
+        //
+        // This does not admit LFM2 to the optimized dense Q8 planner:
+        // `is_supported_exact_q8_row` rejects runnable-only architectures
+        // before consulting this table, and `support_level` still gates the
+        // claim to Q8_0.
+        "supported_exact_row_smoke"
     } else if normalized.contains("ornith_1_0_9b") {
         // Ornith-1.0-9B (qwen35 hybrid gated-delta-net), certified on the
         // runnable serve lane. `/api/capabilities` has carried
@@ -2797,6 +2808,36 @@ mod tests {
                 &fixture("Llama 3.2 1B Instruct")
             ),
             "Llama 3.2 1B Instruct"
+        );
+    }
+
+    #[test]
+    fn lfm2_filename_recognition_matches_capabilities_without_dense_q8_admission() {
+        let capabilities_status = crate::api::capabilities_response()
+            .model_compatibility
+            .iter()
+            .find(|target| target.id == "lfm2_5_2_6b_q8_0")
+            .expect("the LFM2.5-2.6B Q8_0 row must be advertised")
+            .status;
+        assert_eq!(capabilities_status, "supported_exact_row_smoke");
+
+        let mut gguf = quant_fixture(
+            "799e37a4e60bdaae",
+            None,
+            &[GgufTensorType::Q8_0, GgufTensorType::F32],
+        );
+        gguf.metadata.insert(
+            "general.architecture".into(),
+            GgufMetadataValue::String("lfm2".into()),
+        );
+        let row = exact_model_row(&PathBuf::from("/models/LFM2.5-2.6B-Q8_0.gguf"), &gguf);
+
+        assert_eq!(row, "LFM2.5-2.6B-Q8_0.gguf");
+        assert_eq!(support_level(&row, "Q8_0"), capabilities_status);
+        assert_eq!(support_level(&row, "Q4_K_M"), "unknown_or_unvalidated");
+        assert!(
+            !is_supported_exact_q8_row(&row, &gguf),
+            "LFM2 is certified on its runnable lane, not the optimized dense Q8 engine"
         );
     }
 
