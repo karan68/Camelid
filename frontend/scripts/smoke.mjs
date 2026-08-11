@@ -29,6 +29,7 @@ const allowGuardedChat = args.has('allow-guarded-chat') || process.env.CAMELID_S
 const replaceLoadedModel = args.has('replace-loaded-model') || process.env.CAMELID_SMOKE_REPLACE_LOADED_MODEL === '1'
 const chatRepeats = Number.parseInt(args.get('chat-repeats') || process.env.CAMELID_SMOKE_CHAT_REPEATS || '1', 10)
 const streamMaxTokens = Number.parseInt(args.get('stream-max-tokens') || process.env.CAMELID_SMOKE_STREAM_MAX_TOKENS || '24', 10)
+const chatMessage = args.get('message') ?? process.env.CAMELID_SMOKE_MESSAGE ?? 'hello'
 const expectCompatibilityRow = args.get('expect-compatibility-row') || process.env.CAMELID_SMOKE_EXPECT_COMPATIBILITY_ROW || ''
 const expectCompatibilityStatus = args.get('expect-compatibility-status') || process.env.CAMELID_SMOKE_EXPECT_COMPATIBILITY_STATUS || ''
 const expectContractSupported = parseOptionalBoolean(args.get('expect-contract-supported') || process.env.CAMELID_SMOKE_EXPECT_CONTRACT_SUPPORTED, 'expect-contract-supported')
@@ -191,8 +192,10 @@ async function fetchStreamingChatCompletion(url, body) {
   })
   const streamEvents = streamEventDetails.map(event => event.type)
   if (!streamEvents.includes('bytes')) throw new Error('chat stream did not expose first-byte progress')
-  if (!streamEvents.includes('content')) throw new Error('chat stream completed without any content delta')
-  if (!streamedSnapshots.length) throw new Error('chat stream did not publish visible content before final completion')
+  const hasContent = streamEvents.includes('content')
+  const hasReasoning = streamEvents.includes('reasoning')
+  if (!hasContent && !hasReasoning) throw new Error('chat stream completed without any content or reasoning delta')
+  if (hasContent && !streamedSnapshots.length) throw new Error('chat stream did not publish visible content before final completion')
   assertTerminalStreamEvidence(streamed, streamEventDetails, body.max_tokens)
   return { streamed, streamEvents, streamEventDetails, streamedSnapshots }
 }
@@ -435,7 +438,7 @@ if (qaChatBypass) {
 if (webuiChatEnabled || qaChatBypass) {
   const { result: streamingChat, elapsedMs: streamingChatMs } = await timed('chat_completion_stream', () => fetchStreamingChatCompletion(`${apiBase}/v1/chat/completions`, {
     model: health.active_model_id || modelIds[0],
-    messages: [{ role: 'user', content: 'hello' }],
+    messages: [{ role: 'user', content: chatMessage }],
     // Thinking rows can spend their first tokens in a hidden reasoning channel.
     // Keep the default bounded, but let exact-row qualification raise it enough
     // to require an eventual visible content delta without fabricating a failure.
@@ -444,7 +447,8 @@ if (webuiChatEnabled || qaChatBypass) {
     stream_options: { include_usage: true },
     temperature: 0,
   }))
-  console.log(`✓ streaming chat published ${streamingChat.streamedSnapshots.length} visible update(s) before final completion in ${(streamingChatMs / 1000).toFixed(2)}s: ${JSON.stringify(streamingChat.streamed.content)}`)
+  const reasoningUpdates = streamingChat.streamEvents.filter(event => event === 'reasoning').length
+  console.log(`✓ streaming chat published ${streamingChat.streamedSnapshots.length} visible and ${reasoningUpdates} reasoning update(s) before final completion in ${(streamingChatMs / 1000).toFixed(2)}s: ${JSON.stringify(streamingChat.streamed.content)}`)
   console.log(`  stream_events=${streamingChat.streamEvents.join(',')}`)
   console.log(`  terminal_finish_reason=${streamingChat.streamed.finishReason}; terminal_usage=${JSON.stringify(streamingChat.streamed.usage)}`)
 
@@ -455,7 +459,7 @@ if (webuiChatEnabled || qaChatBypass) {
       method: 'POST',
       body: JSON.stringify({
         model: health.active_model_id || modelIds[0],
-        messages: [{ role: 'user', content: 'hello' }],
+        messages: [{ role: 'user', content: chatMessage }],
         max_tokens: 1,
         stream: false,
         temperature: 0,

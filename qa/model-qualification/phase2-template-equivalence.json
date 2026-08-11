@@ -1,0 +1,45 @@
+{
+  "schema": "camelid.phase2-template-equivalence/v1",
+  "generated_at": "2026-08-11T17:10:00Z",
+  "oracle": {"engine": "llama.cpp", "build": "b9632", "revision": "acd79d603"},
+  "rows": [
+    {
+      "row_id": "gemma3_270m_it_q8_0",
+      "artifact_sha256": "d156a5159f2f79c1b1d53c7c1cc20f1ff28ab8d00f17a292620aad13399b9698",
+      "chat_template_utf8_bytes": 1654,
+      "chat_template_sha256": "af95fbef33b76a50e5f463ff9766f85ce84f5849d915c4bd6c1619d852ac3231",
+      "reference_pack": "qa/prompt-packs/gemma3-chat-template-shapes-v1.json",
+      "comparison": "The exact row was rendered independently through llama-server --jinja /apply-template. User-only, system-fold, and multi-turn bytes equal the committed Gemma 3 renderer pack exactly; prompt token IDs were captured with the row's own vocabulary in its Phase 2 tokenizer fixture.",
+      "result": "pass_text_only"
+    },
+    {
+      "row_id": "gemma3_4b_it_q8_0",
+      "artifact_sha256": "97b06383df48336e7d2f9b56b6ce545e0fa476407a62c0bd081b53447a58e644",
+      "chat_template_utf8_bytes": 1531,
+      "chat_template_sha256": "8d9e3a3c114fb2053ec500184677af4f7e5f8ec2582443cd535834e68b3ade29",
+      "reference_pack": "qa/prompt-packs/gemma3-chat-template-shapes-v1.json",
+      "comparison": "Pinned llama-server b9632 /apply-template produced byte-identical user-only, system-fold, and multi-turn prompts. /tokenize(add_special=true, parse_special=true) produced the same exact IDs as the 270M row for all three shapes.",
+      "result": "pass_text_only"
+    },
+    {
+      "row_id": "qwen2_5_1_5b_instruct_q8_0",
+      "artifact_sha256": "d7efb072e7724d25048a4fda0a3e10b04bdef5d06b1403a1c93bd9f1240a63c8",
+      "chat_template_utf8_bytes": 2509,
+      "chat_template_sha256": "d5495a1e5db0611132a97e46a65dbb64a642a499421228b9c8b93229097fa9a4",
+      "reference_fixture": "qa/model-qualification/fixtures/qwen2.5-0.5b-q8-llamacpp-b9632.json",
+      "comparison": "The embedded Jinja template is byte-identical to the pinned Qwen2.5 0.5B fixture source, and the fixture's exact rendered prompt tokenizes to the same 36 IDs on this row.",
+      "result": "pass_no_tools"
+    },
+    {
+      "row_id": "qwen2_5_coder_1_5b_instruct_q8_0",
+      "artifact_sha256": "507de59046601282ba768a9789900e6ccf60ed93ddf346730b7c68eb0715bc47",
+      "chat_template_utf8_bytes": 2509,
+      "chat_template_sha256": "d5495a1e5db0611132a97e46a65dbb64a642a499421228b9c8b93229097fa9a4",
+      "reference_fixture": "qa/model-qualification/fixtures/qwen2.5-0.5b-q8-llamacpp-b9632.json",
+      "comparison": "The embedded Jinja template is byte-identical to the pinned Qwen2.5 0.5B fixture source, and the fixture's exact rendered prompt tokenizes to the same 36 IDs on this row.",
+      "result": "pass_no_tools"
+    }
+  ],
+  "scope": "Exact listed rows and bounded ordinary text-chat shapes only.",
+  "does_not_prove": ["tools", "multimodal content", "weight load", "generation parity", "API/WebUI readiness", "context", "support", "neighboring artifacts"]
+}

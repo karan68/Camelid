@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     convert::Infallible,
     env, mem,
     net::SocketAddr,
@@ -5069,6 +5069,283 @@ pub(crate) fn capabilities_response() -> CapabilitiesResponse {
     capabilities_response_with_plan(None)
 }
 
+fn phase2_model_compatibility_target(
+    id: &'static str,
+    family: &'static str,
+    quantization: &'static str,
+    load_pass: bool,
+    parity_pass: bool,
+    template_pass: bool,
+    evidence: &'static str,
+) -> ModelCompatibilityTarget {
+    let status = if !load_pass {
+        "active_validation_blocked_load"
+    } else if !parity_pass {
+        "active_validation_blocked_parity"
+    } else if !template_pass {
+        "active_validation_blocked_template"
+    } else {
+        "active_validation_api_webui_pass_pending_context"
+    };
+    let blocker = if !load_pass {
+        "the exact artifact does not yet complete tensor binding/load; parity, API/WebUI, context, performance, and portability remain blocked"
+    } else if !parity_pass {
+        "the exact artifact loads and generates, but deterministic greedy token parity against the pinned llama.cpp oracle fails; API/WebUI promotion and context remain fail-closed"
+    } else if !template_pass {
+        "raw deterministic parity passes, but the public chat-template envelope is intentionally bounded and has not earned API/WebUI or context promotion"
+    } else {
+        "short deterministic parity and guarded API/WebUI smoke pass; the exact-row bounded 512-context receipt is still required before support promotion"
+    };
+    ModelCompatibilityTarget {
+        id,
+        family,
+        quantization,
+        status,
+        tool_capable: false,
+        support_scope: "phase2_exact_row_validation_only",
+        full_support_status: "blocked_pending_context_performance_and_portability",
+        full_support_blockers: blocker,
+        metadata_parses: "validated_exact_artifact",
+        tokenizer_works: "validated_against_pinned_llama_cpp_b9632",
+        tensors_load: if load_pass {
+            "validated_real_weight_forward"
+        } else {
+            "failed_exact_artifact_tensor_binding"
+        },
+        generation_runs: if load_pass {
+            "validated_deterministic_greedy"
+        } else {
+            "blocked_by_load_failure"
+        },
+        parity_audited: if parity_pass {
+            "pass_exact_greedy_token_ids"
+        } else if load_pass {
+            "failed_exact_greedy_token_ids"
+        } else {
+            "blocked_by_load_failure"
+        },
+        performance_measured: "not_promoted",
+        frontend_load_path_verified: if parity_pass {
+            "validated_guarded_api_webui_smoke"
+        } else {
+            "fail_closed_phase2_validation"
+        },
+        frontend_readiness_gate: "fail-closed; green only after this exact row passes parity, API/WebUI, and the bounded 512-context gate",
+        tested_context: "short_prompt_oracle_pack_only",
+        chat_template_renderer: if template_pass {
+            "validated_exact_row_shape_pack"
+        } else {
+            "bounded_default_envelope_only"
+        },
+        chat_template_shape_pack: if template_pass {
+            "pass"
+        } else {
+            "blocked_partial_envelope"
+        },
+        chat_template_shape_pack_id: "phase2-roster-template-evidence",
+        bounded_context_512_pack: "not_started",
+        bounded_context_512_pack_id: "phase2-context-512-v1",
+        bounded_context_window: 512,
+        bounded_context_1024_pack: "not_promoted",
+        bounded_context_1024_pack_id: "not_selected",
+        bounded_context_1024_window: 1024,
+        bounded_context_2048_pack: "not_promoted",
+        bounded_context_2048_pack_id: "not_selected",
+        bounded_context_2048_window: 2048,
+        bounded_context_4096_pack: "not_promoted",
+        bounded_context_4096_pack_id: "not_selected",
+        bounded_context_4096_window: 4096,
+        bounded_context_8192_pack: "not_promoted",
+        bounded_context_8192_pack_id: "not_selected",
+        bounded_context_8192_window: 8192,
+        latest_checked_bucket: if parity_pass {
+            "phase2_guarded_api_webui_smoke"
+        } else {
+            "phase2_short_greedy_parity"
+        },
+        latest_checked_result: status,
+        latest_checked_output: evidence,
+        evidence,
+        next_step: "close the recorded blocker, then capture exact-row API/WebUI and bounded 512-context evidence before support promotion",
+    }
+}
+
+fn phase2_model_compatibility_targets() -> Vec<ModelCompatibilityTarget> {
+    vec![
+        phase2_model_compatibility_target(
+            "lfm2_5_1_2b_instruct_q8_0",
+            "lfm2",
+            "Q8_0",
+            true,
+            true,
+            true,
+            "qa/model-qualification/phase2-runtime/lfm2_5_1_2b_instruct_q8_0.json",
+        ),
+        phase2_model_compatibility_target(
+            "lfm2_5_1_2b_thinking_q8_0",
+            "lfm2",
+            "Q8_0",
+            true,
+            false,
+            true,
+            "qa/model-qualification/phase2-runtime-matrix.json",
+        ),
+        phase2_model_compatibility_target(
+            "gemma3_270m_it_q8_0",
+            "gemma3",
+            "Q8_0",
+            true,
+            true,
+            true,
+            "qa/model-qualification/phase2-runtime/gemma3_270m_it_q8_0.json",
+        ),
+        phase2_model_compatibility_target(
+            "gemma3_4b_it_q8_0",
+            "gemma3",
+            "Q8_0",
+            true,
+            false,
+            true,
+            "qa/model-qualification/phase2-runtime-matrix.json",
+        ),
+        phase2_model_compatibility_target(
+            "llama3_1_8b_instruct_q8_0",
+            "llama",
+            "Q8_0",
+            true,
+            false,
+            true,
+            "qa/model-qualification/phase2-runtime-matrix.json",
+        ),
+        phase2_model_compatibility_target(
+            "mistral_7b_instruct_v0_2_q8_0",
+            "mistral",
+            "Q8_0",
+            true,
+            true,
+            true,
+            "qa/model-qualification/phase2-runtime/mistral_7b_instruct_v0_2_q8_0.json",
+        ),
+        phase2_model_compatibility_target(
+            "qwen2_5_0_5b_instruct_q8_0",
+            "qwen25",
+            "Q8_0",
+            true,
+            false,
+            true,
+            "qa/model-qualification/phase2-runtime/qwen2_5_0_5b_instruct_q8_0.json",
+        ),
+        phase2_model_compatibility_target(
+            "qwen2_5_1_5b_instruct_q8_0",
+            "qwen25",
+            "Q8_0",
+            true,
+            false,
+            true,
+            "qa/model-qualification/phase2-runtime-matrix.json",
+        ),
+        phase2_model_compatibility_target(
+            "qwen2_5_coder_1_5b_instruct_q8_0",
+            "qwen25",
+            "Q8_0",
+            true,
+            true,
+            true,
+            "qa/model-qualification/phase2-runtime/qwen2_5_coder_1_5b_instruct_q8_0.json",
+        ),
+        phase2_model_compatibility_target(
+            "qwen3_5_0_8b_q8_0",
+            "qwen35",
+            "Q8_0",
+            true,
+            true,
+            true,
+            "qa/model-qualification/phase2-runtime/qwen3_5_0_8b_q8_0.json",
+        ),
+        phase2_model_compatibility_target(
+            "qwen3_5_2b_q8_0",
+            "qwen35",
+            "Q8_0",
+            true,
+            true,
+            true,
+            "qa/model-qualification/phase2-runtime/qwen3_5_2b_q8_0.json",
+        ),
+        phase2_model_compatibility_target(
+            "qwen3_5_4b_q8_0",
+            "qwen35",
+            "Q8_0",
+            true,
+            false,
+            true,
+            "qa/model-qualification/phase2-runtime/qwen3_5_4b_q8_0.json",
+        ),
+        phase2_model_compatibility_target(
+            "qwen3_5_9b_q8_0",
+            "qwen35",
+            "Q8_0",
+            true,
+            false,
+            true,
+            "qa/model-qualification/phase2-runtime-matrix.json",
+        ),
+        phase2_model_compatibility_target(
+            "deepseek_r1_distill_qwen_1_5b_q8_0",
+            "qwen25",
+            "Q8_0",
+            true,
+            false,
+            true,
+            "qa/model-qualification/phase2-runtime-matrix.json",
+        ),
+        phase2_model_compatibility_target(
+            "deepseek_r1_distill_llama_8b_q8_0",
+            "llama",
+            "Q8_0",
+            true,
+            true,
+            true,
+            "qa/model-qualification/phase2-runtime/deepseek_r1_distill_llama_8b_q8_0.json",
+        ),
+        phase2_model_compatibility_target(
+            "phi4_mini_instruct_q8_0",
+            "phi3",
+            "Q8_0",
+            false,
+            false,
+            true,
+            "qa/model-qualification/phase2-runtime-matrix.json",
+        ),
+        phase2_model_compatibility_target(
+            "gemma2_9b_it_q8_0",
+            "gemma2",
+            "Q8_0",
+            true,
+            true,
+            true,
+            "qa/model-qualification/phase2-runtime/gemma2_9b_it_q8_0.json",
+        ),
+        phase2_model_compatibility_target(
+            "smollm3_3b_q8_0",
+            "smollm3",
+            "Q8_0",
+            true,
+            true,
+            false,
+            "qa/model-qualification/phase2-runtime/smollm3_3b_q8_0.json",
+        ),
+        phase2_model_compatibility_target(
+            "aya_expanse_8b_q4_k_m",
+            "command-r",
+            "Q4_K_M",
+            true,
+            false,
+            true,
+            "qa/model-qualification/phase2-runtime/aya_expanse_8b_q4_k_m.json",
+        ),
+    ]
+}
+
 fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> CapabilitiesResponse {
     CapabilitiesResponse {
         engine: "camelid",
@@ -5233,7 +5510,10 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 notes: "tracked as future lanes only, not implied support",
             },
         ],
-        model_compatibility: vec![
+        model_compatibility: {
+            let phase2 = phase2_model_compatibility_targets();
+            let phase2_ids = phase2.iter().map(|row| row.id).collect::<HashSet<_>>();
+            let mut rows = vec![
             ModelCompatibilityTarget {
                 id: "nomic_embed_text_v1_5_q8_0",
                 family: "nomic-bert",
@@ -7331,7 +7611,11 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 evidence: "first Gemma candidate row remains planning only: gemma-2-9b-it-Q8_0.gguf. qa/model-qualification/fixtures/gemma2-it-chat-template-v1.json pins the exact GGUF template identity, renderer shapes, BOS contract, and typed fail-closed system/alternation behavior; it is template evidence only and supplies no model-load or generation support receipt",
                 next_step: "verify the remotely observed artifact identity independently, acquire the row, and run exact token-id, bounded metadata/load, generation, API/WebUI, parity, RSS, and context gates before any runtime-support wording",
             },
-        ],
+            ];
+            rows.retain(|row| !phase2_ids.contains(row.id));
+            rows.extend(phase2);
+            rows
+        },
         runtime_projects: crate::runtime_manifest::runtime_capability_manifest()
             .projects
             .clone(),
@@ -8481,6 +8765,50 @@ mod gemma4_template_tests {
     }
 
     #[test]
+    fn qwen35_text_renderer_matches_exact_0_8b_and_2b_template_pack() {
+        #[derive(serde::Deserialize)]
+        struct WireMsg {
+            role: String,
+            content: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct Shape {
+            id: String,
+            enable_thinking: bool,
+            messages: Vec<WireMsg>,
+            expected_prompt: String,
+            prompt_ids: Vec<u32>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Pack {
+            shapes: Vec<Shape>,
+        }
+        let pack: Pack = serde_json::from_str(include_str!(
+            "../../qa/prompt-packs/qwen3.5-text-chat-template-shapes-v1.json"
+        ))
+        .expect("parse Qwen3.5 text template pack");
+        for shape in pack.shapes {
+            let messages = shape
+                .messages
+                .into_iter()
+                .map(|message| ChatMessage {
+                    role: message.role,
+                    content: message.content,
+                    image_urls: Vec::new(),
+                    unsupported_content_parts: Vec::new(),
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                render_ornith_chatml_prompt(&messages, shape.enable_thinking),
+                shape.expected_prompt,
+                "shape {} diverged from llama.cpp",
+                shape.id,
+            );
+            assert!(!shape.prompt_ids.is_empty());
+        }
+    }
+
+    #[test]
     fn phi3_prompt_renders_end_marked_turns_and_generation_prompt() {
         let messages = [
             ChatMessage {
@@ -8714,6 +9042,12 @@ mod gemma4_template_tests {
         let lfm2 = "{{- bos_token -}}{%- set preserve_thinking = preserve_thinking | \
                     default(false) -%}<|im_start|><|im_end|><|tool_call_start|>";
         assert!(is_lfm2_chatml_template(lfm2));
+        let compact = "{{- bos_token -}}{%- set keep_past_thinking = false -%}\
+                       {%- set ns = namespace(last_assistant_index=-1) -%}\
+                       List of tools: [<|im_start|><|im_end|>";
+        assert!(is_lfm2_chatml_template(compact));
+        assert!(is_lfm2_plain_chatml_template(compact));
+        assert!(!is_lfm2_open_think_chatml_template(compact));
         // A bare ChatML template on an lfm2 file is NOT the evidenced dialect —
         // and note a generic `<|im_start|>`/`<|im_end|>` check WOULD accept it.
         assert!(!is_lfm2_chatml_template("<|im_start|><|im_end|>"));
@@ -8787,6 +9121,50 @@ mod gemma4_template_tests {
                 "case {:?}: reference ids must begin with the LFM2 BOS",
                 case.name
             );
+        }
+    }
+
+    #[test]
+    fn lfm2_plain_renderer_matches_1_2b_thinking_llamacpp_pack() {
+        #[derive(serde::Deserialize)]
+        struct WireMsg {
+            role: String,
+            content: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct Shape {
+            id: String,
+            messages: Vec<WireMsg>,
+            expected_prompt: String,
+            prompt_ids: Vec<u32>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Pack {
+            shapes: Vec<Shape>,
+        }
+        let pack: Pack = serde_json::from_str(include_str!(
+            "../../qa/prompt-packs/lfm2-1.2b-thinking-chat-template-shapes-v1.json"
+        ))
+        .expect("parse LFM2.5 1.2B Thinking template pack");
+        assert!(!pack.shapes.is_empty());
+        for shape in pack.shapes {
+            let messages = shape
+                .messages
+                .into_iter()
+                .map(|message| ChatMessage {
+                    role: message.role,
+                    content: message.content,
+                    image_urls: Vec::new(),
+                    unsupported_content_parts: Vec::new(),
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                render_lfm2_plain_chatml_prompt(&messages),
+                shape.expected_prompt,
+                "shape {} diverged from llama.cpp",
+                shape.id,
+            );
+            assert_eq!(shape.prompt_ids.first().copied(), Some(1));
         }
     }
 
@@ -10845,17 +11223,19 @@ mod bitnet_runnable_api_tests {
     }
 
     #[test]
-    fn command_r_chat_stays_on_the_template_hold_instead_of_using_ornith() {
-        let response = command_r_chat_template_hold_rejection("aya");
-        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
-        let details = response.extensions().get::<ApiErrorDetails>().unwrap();
-        assert_eq!(details.code, "unsupported_chat_template");
-        assert!(details
-            .message
-            .contains("Command-R chat remains fail-closed"));
-        assert!(details
-            .message
-            .contains("incompatible qwen35/Ornith renderer"));
+    fn command_r_chat_rejects_tools_and_foreign_thinking_controls() {
+        let tools = aya_runnable_lane_tools_rejection();
+        assert_eq!(tools.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            tools.extensions().get::<ApiErrorDetails>().unwrap().code,
+            "unsupported_tools"
+        );
+        let thinking = aya_runnable_lane_thinking_rejection();
+        assert_eq!(thinking.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            thinking.extensions().get::<ApiErrorDetails>().unwrap().code,
+            "unsupported_parameter"
+        );
     }
 
     #[test]
@@ -10988,6 +11368,51 @@ fn render_lfm2_chatml_prompt(messages: &[ChatMessage]) -> String {
         prompt.push_str("<|im_start|>assistant\n<think>");
     }
     prompt
+}
+
+/// Render the compact LFM2.5 1.2B Thinking template. Unlike the 2.6B dialect,
+/// this exact template opens only the assistant turn and lets the model emit its
+/// own reasoning marker. It also strips stale reasoning from every assistant
+/// history item except the final assistant item.
+fn render_lfm2_plain_chatml_prompt(messages: &[ChatMessage]) -> String {
+    let mut prompt = String::new();
+    let mut loop_start = 0usize;
+    if messages
+        .first()
+        .is_some_and(|message| message.role.trim() == "system")
+    {
+        prompt.push_str("<|im_start|>system\n");
+        prompt.push_str(&messages[0].content);
+        prompt.push_str("<|im_end|>\n");
+        loop_start = 1;
+    }
+    let loop_messages = &messages[loop_start..];
+    let last_assistant = loop_messages
+        .iter()
+        .rposition(|message| message.role.trim() == "assistant");
+    for (index, message) in loop_messages.iter().enumerate() {
+        let role = message.role.trim();
+        prompt.push_str("<|im_start|>");
+        prompt.push_str(role);
+        prompt.push('\n');
+        match (role, message.content.rsplit_once("</think>")) {
+            ("assistant", Some((_, after))) if Some(index) != last_assistant => {
+                prompt.push_str(after.trim())
+            }
+            _ => prompt.push_str(&message.content),
+        }
+        prompt.push_str("<|im_end|>\n");
+    }
+    prompt.push_str("<|im_start|>assistant\n");
+    prompt
+}
+
+fn render_lfm2_chatml_prompt_for_template(messages: &[ChatMessage], template: &str) -> String {
+    if is_lfm2_plain_chatml_template(template) {
+        render_lfm2_plain_chatml_prompt(messages)
+    } else {
+        render_lfm2_chatml_prompt(messages)
+    }
 }
 
 /// Render an Ornith/qwen35 ChatML prompt with tool definitions, faithful to the GGUF
@@ -11398,7 +11823,14 @@ fn prepare_runnable_prompt(
         // `add_special` supplies the leading BOS for templates that emit
         // `bos_token` outside their returned text. Without it the whole prompt
         // is shifted and the forward diverges from the reference.
-        let add_special = runnable_prompt_add_special(&runtime.architecture);
+        let llama_template_omits_bos = runtime.architecture == "llama"
+            && runtime.tokenizer.config.add_bos
+            && runtime
+                .tokenizer
+                .token_text(runtime.tokenizer.special.bos)
+                .is_some_and(|bos| !prompt_text.starts_with(bos));
+        let add_special =
+            runnable_prompt_add_special(&runtime.architecture) || llama_template_omits_bos;
         let ids = runtime
             .tokenizer
             .encode(prompt_text, add_special, true)
@@ -11494,7 +11926,10 @@ fn prepare_runnable_prompt(
 /// Architectures whose evidenced GGUF chat template supplies its leading BOS
 /// through tokenizer special-token insertion rather than literal renderer text.
 fn runnable_prompt_add_special(architecture: &str) -> bool {
-    matches!(architecture, "gemma2" | "gemma3" | "lfm2" | "bitnet-b1.58")
+    matches!(
+        architecture,
+        "gemma2" | "gemma3" | "lfm2" | "bitnet-b1.58" | "command-r"
+    )
 }
 
 /// OpenAI-compatible runnable completion terminator. Tool calls take
@@ -11666,18 +12101,31 @@ async fn runnable_chat_nonstreaming(
         if !tools.is_empty() {
             return lfm2_runnable_lane_tools_rejection();
         }
-        // Keyed on the FILE's template, not the arch string alone: the
-        // open-`<think>` generation prompt below is an LFM2.5 fact, evidenced by
-        // that row's template fixture. Another `lfm2` GGUF — an LFM2 v1 row, or a
-        // requant whose template was substituted — would be handed a `<think>` it
-        // may never have been trained on. Refuse instead, same contract as
-        // `reject_windowed_arch_with_unrecognized_template`.
+        // Keyed on the FILE's template, not the arch string alone. LFM2.5 ships
+        // both an open-think dialect and a plain assistant-generation dialect;
+        // select only after the exact marker contract is recognized.
         if let Some(rejection) = reject_lfm2_with_unrecognized_template(&runtime, &id) {
             return rejection;
         }
-        render_lfm2_chatml_prompt(&messages)
+        render_lfm2_chatml_prompt_for_template(
+            &messages,
+            runtime
+                .tokenizer
+                .chat_template
+                .as_deref()
+                .unwrap_or_default(),
+        )
     } else if runtime.architecture == "command-r" {
-        return command_r_chat_template_hold_rejection(&id);
+        if !tools.is_empty() {
+            return aya_runnable_lane_tools_rejection();
+        }
+        if enable_thinking {
+            return aya_runnable_lane_thinking_rejection();
+        }
+        match prepare_aya_runnable_chat_prompt(&runtime, &id, &messages) {
+            Ok(prompt) => prompt,
+            Err(rejection) => return rejection,
+        }
     } else if tools.is_empty() {
         render_ornith_chatml_prompt(&messages, enable_thinking)
     } else {
@@ -11890,18 +12338,31 @@ async fn runnable_chat_streaming(
         if !tools.is_empty() {
             return lfm2_runnable_lane_tools_rejection();
         }
-        // Keyed on the FILE's template, not the arch string alone: the
-        // open-`<think>` generation prompt below is an LFM2.5 fact, evidenced by
-        // that row's template fixture. Another `lfm2` GGUF — an LFM2 v1 row, or a
-        // requant whose template was substituted — would be handed a `<think>` it
-        // may never have been trained on. Refuse instead, same contract as
-        // `reject_windowed_arch_with_unrecognized_template`.
+        // Keyed on the FILE's template, not the arch string alone. LFM2.5 ships
+        // both an open-think dialect and a plain assistant-generation dialect;
+        // select only after the exact marker contract is recognized.
         if let Some(rejection) = reject_lfm2_with_unrecognized_template(&runtime, &id) {
             return rejection;
         }
-        render_lfm2_chatml_prompt(&messages)
+        render_lfm2_chatml_prompt_for_template(
+            &messages,
+            runtime
+                .tokenizer
+                .chat_template
+                .as_deref()
+                .unwrap_or_default(),
+        )
     } else if runtime.architecture == "command-r" {
-        return command_r_chat_template_hold_rejection(&id);
+        if !tools.is_empty() {
+            return aya_runnable_lane_tools_rejection();
+        }
+        if enable_thinking {
+            return aya_runnable_lane_thinking_rejection();
+        }
+        match prepare_aya_runnable_chat_prompt(&runtime, &id, &messages) {
+            Ok(prompt) => prompt,
+            Err(rejection) => return rejection,
+        }
     } else if tools.is_empty() {
         render_ornith_chatml_prompt(&messages, enable_thinking)
     } else {
@@ -20947,16 +21408,64 @@ fn render_chat_prompt_for_tokenization_for_model_result(
     let exact_llama32_metadata_jinja_row =
         model_id.and_then(llama32_metadata_jinja_exact_row_label);
     if let Some(template) = tokenizer.chat_template.as_deref() {
-        // DeepSeek-R1-0528-Qwen3 declares qwen3 tensors but embeds its own
-        // full-width marker grammar. Refuse before metadata Jinja, ChatML, or
-        // the generic fallback can silently present a foreign prompt.
+        // The pinned DeepSeek R1 Distill Qwen/Llama rows share this full-width
+        // marker grammar. Render only its no-tools text branch before generic
+        // Jinja or ChatML can borrow a foreign prompt shape.
         if is_deepseek_r1_native_chat_template(template) {
-            return Err(MiniJinjaError::new(
-                MiniJinjaErrorKind::InvalidOperation,
-                "the loaded model uses the native DeepSeek R1 marker template; its no-tools \
-                 renderer is not implemented or fixture-locked, so chat fails closed instead \
-                 of borrowing Qwen3 ChatML or the generic role-colon renderer",
-            ));
+            if !is_exact_deepseek_r1_distill_chat_template(template) {
+                return Err(MiniJinjaError::new(
+                    MiniJinjaErrorKind::InvalidOperation,
+                    "the loaded model uses a native DeepSeek R1 marker template that is not one of the two exact Distill Qwen 1.5B / Distill Llama 8B templates qualified by Camelid",
+                ));
+            }
+            let text = render_deepseek_r1_distill_prompt(
+                messages,
+                tokenizer,
+                deepseek_r1_distill_template_opens_think(template),
+            )
+            .map_err(|reason| MiniJinjaError::new(MiniJinjaErrorKind::InvalidOperation, reason))?;
+            return Ok(RenderedPrompt {
+                text,
+                add_special: true,
+                parse_special: true,
+            });
+        }
+        if is_aya_start_of_turn_template(template) {
+            let text = render_aya_start_of_turn_prompt(messages, tokenizer).map_err(|reason| {
+                MiniJinjaError::new(MiniJinjaErrorKind::InvalidOperation, reason)
+            })?;
+            return Ok(RenderedPrompt {
+                text,
+                add_special: true,
+                parse_special: true,
+            });
+        }
+        if is_exact_mistral_v02_instruct_template(template) {
+            let text =
+                render_mistral_v02_instruct_prompt(messages, tokenizer).map_err(|reason| {
+                    MiniJinjaError::new(MiniJinjaErrorKind::InvalidOperation, reason)
+                })?;
+            return Ok(RenderedPrompt {
+                text,
+                add_special: true,
+                parse_special: true,
+            });
+        }
+        if is_exact_llama31_instruct_template(template) {
+            let today = current_llama31_local_date().ok_or_else(|| {
+                MiniJinjaError::new(
+                    MiniJinjaErrorKind::InvalidOperation,
+                    "the system-local date required by the exact Llama 3.1 template is unavailable",
+                )
+            })?;
+            let text = render_llama31_instruct_prompt(messages, &today).map_err(|reason| {
+                MiniJinjaError::new(MiniJinjaErrorKind::InvalidOperation, reason)
+            })?;
+            return Ok(RenderedPrompt {
+                text,
+                add_special: true,
+                parse_special: true,
+            });
         }
         if metadata_chat_template_enabled() {
             return render_metadata_jinja_chat_template_prompt(messages, tokenizer, template, None);
@@ -21064,6 +21573,18 @@ fn render_chat_prompt_for_tokenization_with_tools(
             return Err(MiniJinjaError::new(
                 MiniJinjaErrorKind::InvalidOperation,
                 "Phi-4 tool-call template rendering is not validated; failing closed",
+            ));
+        }
+        if is_exact_mistral_v02_instruct_template(template) {
+            return Err(MiniJinjaError::new(
+                MiniJinjaErrorKind::InvalidOperation,
+                "Mistral Instruct v0.2 has no tools branch; tool requests fail closed",
+            ));
+        }
+        if is_exact_llama31_instruct_template(template) {
+            return Err(MiniJinjaError::new(
+                MiniJinjaErrorKind::InvalidOperation,
+                "the bounded exact Llama 3.1 template pack does not certify tools; tool requests fail closed",
             ));
         }
         // Mistral Instruct templates (v0.3 GGUF) don't reference the `tools`
@@ -21649,20 +22170,31 @@ fn bitnet_runnable_lane_thinking_rejection() -> Response {
 /// Keyed on markers no other admitted ChatML template carries — LFM2's tool-call
 /// delimiters and its `preserve_thinking` switch — because a check on
 /// `<|im_start|>`/`<|im_end|>` alone would match every ChatML family.
-fn is_lfm2_chatml_template(template: &str) -> bool {
+fn is_lfm2_open_think_chatml_template(template: &str) -> bool {
     template.contains("<|im_start|>")
         && template.contains("<|im_end|>")
         && template.contains("<|tool_call_start|>")
         && template.contains("preserve_thinking")
 }
 
+fn is_lfm2_plain_chatml_template(template: &str) -> bool {
+    template.contains("<|im_start|>")
+        && template.contains("<|im_end|>")
+        && template.contains("keep_past_thinking")
+        && template.contains("last_assistant_index")
+        && template.contains("List of tools: [")
+        && !template.contains("<|tool_call_start|>")
+}
+
+fn is_lfm2_chatml_template(template: &str) -> bool {
+    is_lfm2_open_think_chatml_template(template) || is_lfm2_plain_chatml_template(template)
+}
+
 /// Refuse an `lfm2` model whose embedded chat template is not the LFM2.5 dialect.
 ///
-/// [`render_lfm2_chatml_prompt`] hard-codes an OPEN `<think>` generation prompt and
-/// the `keep_thinking` stripping rule. Both are LFM2.5 facts, evidenced only by
-/// that row's template fixture. Another `lfm2` GGUF would be rendered against them
-/// silently, under an architecture Camelid claims to implement — so name the
-/// missing markers and fail closed, mirroring
+/// Camelid has separate fixture-locked renderers for the open-think and compact
+/// plain-assistant LFM2.5 dialects. Another `lfm2` GGUF must not be routed to
+/// either by architecture alone, so name the missing markers and fail closed, mirroring
 /// [`reject_windowed_arch_with_unrecognized_template`].
 fn reject_lfm2_with_unrecognized_template(
     runtime: &RunnableServeRuntime,
@@ -21680,12 +22212,11 @@ fn reject_lfm2_with_unrecognized_template(
         StatusCode::UNPROCESSABLE_ENTITY,
         "unsupported_chat_template",
         format!(
-            "model '{model_id}' declares architecture 'lfm2', whose only evidenced chat \
-             rendering is the LFM2.5 ChatML dialect (markers <|im_start|>, <|im_end|>, \
-             <|tool_call_start|>, and a preserve_thinking switch), but its embedded \
-             tokenizer.chat_template does not carry those markers. The renderer would \
-             otherwise append LFM2.5's open <think> generation prompt, which this model may \
-             never have been trained on, so chat fails closed."
+            "model '{model_id}' declares architecture 'lfm2', but its embedded \
+             tokenizer.chat_template matches neither evidenced LFM2.5 ChatML dialect: \
+             open-think (<|tool_call_start|> plus preserve_thinking) nor compact \
+             plain-assistant (keep_past_thinking plus last_assistant_index). Chat fails \
+             closed instead of borrowing either renderer."
         ),
         Some("messages"),
     ))
@@ -21700,24 +22231,54 @@ fn lfm2_runnable_lane_tools_rejection() -> Response {
     )
 }
 
-/// Command R is metadata/config/load-attemptable for the exact Aya Expanse 8B
-/// Q4_K_M header shape, but its START_OF_TURN template has no rendered-byte or
-/// prompt-token fixture yet. Falling through would render the unrelated Ornith
-/// ChatML dialect, so both streaming and non-streaming chat stop here until the
-/// template and real-weight parity gates are anchored.
-fn command_r_chat_template_hold_rejection(model_id: &str) -> Response {
+fn aya_runnable_lane_tools_rejection() -> Response {
     api_error(
         StatusCode::UNPROCESSABLE_ENTITY,
-        "unsupported_chat_template",
-        format!(
-            "model '{model_id}' declares architecture 'command-r'. The exact Aya Expanse 8B \
-             Q4_K_M header is attemptable, but its embedded START_OF_TURN/SYSTEM/USER/CHATBOT \
-             template has no rendered-byte or prompt-token parity fixture and the full artifact \
-             has no generation parity receipt. Command-R chat remains fail-closed instead of \
-             borrowing the incompatible qwen35/Ornith renderer."
-        ),
-        Some("messages"),
+        "unsupported_tools",
+        "the qualified Aya Expanse START_OF_TURN envelope is text-only; tool definitions and tool history fail closed"
+            .to_string(),
+        Some("tools"),
     )
+}
+
+fn aya_runnable_lane_thinking_rejection() -> Response {
+    api_error(
+        StatusCode::BAD_REQUEST,
+        "unsupported_parameter",
+        "the Aya Expanse START_OF_TURN template has no thinking-mode switch".to_string(),
+        Some("camelid_enable_thinking"),
+    )
+}
+
+#[allow(clippy::result_large_err)]
+fn prepare_aya_runnable_chat_prompt(
+    runtime: &RunnableServeRuntime,
+    model_id: &str,
+    messages: &[ChatMessage],
+) -> std::result::Result<String, Response> {
+    let template = runtime
+        .tokenizer
+        .chat_template
+        .as_deref()
+        .unwrap_or_default();
+    if !is_aya_start_of_turn_template(template) {
+        return Err(api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "unsupported_chat_template",
+            format!(
+                "model '{model_id}' declares architecture 'command-r', but its embedded template is not the fixture-locked Aya START_OF_TURN dialect"
+            ),
+            Some("messages"),
+        ));
+    }
+    render_aya_start_of_turn_prompt(messages, &runtime.tokenizer).map_err(|reason| {
+        api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "unsupported_chat_template_shape",
+            reason.to_string(),
+            Some("messages"),
+        )
+    })
 }
 
 /// The gemma chat-template shape the gemma-3 GGUFs ship: `<start_of_turn>` /
@@ -21737,10 +22298,22 @@ fn is_llama3_instruct_template(template: &str) -> bool {
         && template.contains("<|eot_id|>")
 }
 
+fn is_exact_llama31_instruct_template(template: &str) -> bool {
+    template.len() == 4613
+        && format!("{:x}", Sha256::digest(template.as_bytes()))
+            == "93c0e9aa3629bbd77e68dbc0f5621f6e6b23aa8d74b932595cdb8d64684526d7"
+}
+
 fn is_mistral_instruct_template(template: &str) -> bool {
     template.contains("[INST]")
         && template.contains("[/INST]")
         && (template.contains("bos_token") || template.contains("</s>"))
+}
+
+fn is_exact_mistral_v02_instruct_template(template: &str) -> bool {
+    template.len() == 470
+        && format!("{:x}", Sha256::digest(template.as_bytes()))
+            == "26a59556925c987317ce5291811ba3b7f32ec4c647c400c6cc7e3a9993007ba7"
 }
 
 /// Signature of the pinned SmolLM3-3B GGUF's dynamic ChatML template.
@@ -21781,6 +22354,35 @@ fn is_deepseek_r1_native_chat_template(template: &str) -> bool {
     template.contains("<｜begin▁of▁sentence｜>")
         && template.contains("<｜User｜>")
         && template.contains("<｜Assistant｜>")
+}
+
+const DEEPSEEK_R1_DISTILL_QWEN_TEMPLATE_SHA256: &str =
+    "56a1447ad31926fdc21fb07e56e5642bd9c850c4f52d8c8af7bbe5f079a84f5f";
+const DEEPSEEK_R1_DISTILL_LLAMA_TEMPLATE_SHA256: &str =
+    "b6835114b7303ddd78919a82e4d9f7d8c26ed0d7dfc36beeb12d524f6144eab1";
+
+fn is_exact_deepseek_r1_distill_chat_template(template: &str) -> bool {
+    matches!(template.len(), 2246 | 2237)
+        && matches!(
+            format!("{:x}", Sha256::digest(template.as_bytes())).as_str(),
+            DEEPSEEK_R1_DISTILL_QWEN_TEMPLATE_SHA256 | DEEPSEEK_R1_DISTILL_LLAMA_TEMPLATE_SHA256
+        )
+}
+
+fn deepseek_r1_distill_template_opens_think(template: &str) -> bool {
+    template.contains("{{'<｜Assistant｜><think>\\n'}}")
+}
+
+fn is_aya_start_of_turn_template(template: &str) -> bool {
+    template.len() == 1318
+        && format!("{:x}", Sha256::digest(template.as_bytes()))
+            == "90c33aee14aa2a226127516d48ee9184c9b90745d4a04c484621ec2e82fb712c"
+        && template.contains("<|START_OF_TURN_TOKEN|>")
+        && template.contains("<|SYSTEM_TOKEN|>")
+        && template.contains("<|USER_TOKEN|>")
+        && template.contains("<|CHATBOT_TOKEN|>")
+        && template.contains("<|END_OF_TURN_TOKEN|>")
+        && template.contains("Conversation roles must alternate user/assistant")
 }
 
 /// Phi-4's compact marker template keeps every role marker adjacent to content:
@@ -22040,6 +22642,58 @@ fn render_llama3_instruct_prompt_with_options(
     prompt
 }
 
+fn render_llama31_instruct_prompt(
+    messages: &[ChatMessage],
+    injected_today: &str,
+) -> std::result::Result<String, &'static str> {
+    if messages.is_empty() {
+        return Err("Llama 3.1 chat requires at least one user message");
+    }
+    if messages.iter().any(|message| {
+        !message.image_urls.is_empty() || !message.unsupported_content_parts.is_empty()
+    }) {
+        return Err("Llama 3.1 bounded chat supports plain text messages only");
+    }
+    let mut index = 0;
+    let system = if messages[0].role.trim() == "system" {
+        index = 1;
+        messages[0].content.trim()
+    } else {
+        ""
+    };
+    if index == messages.len() {
+        return Err("Llama 3.1 chat requires a non-system turn");
+    }
+    let mut prompt = format!(
+        "<|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: {injected_today}\n\n{system}<|eot_id|>"
+    );
+    for message in &messages[index..] {
+        let role = message.role.trim();
+        if !matches!(role, "user" | "assistant") {
+            return Err("Llama 3.1 text chat accepts only system, user, and assistant roles");
+        }
+        prompt.push_str("<|start_header_id|>");
+        prompt.push_str(role);
+        prompt.push_str("<|end_header_id|>\n\n");
+        prompt.push_str(message.content.trim());
+        prompt.push_str("<|eot_id|>");
+    }
+    prompt.push_str("<|start_header_id|>assistant<|end_header_id|>\n\n");
+    Ok(prompt)
+}
+
+fn current_llama31_local_date() -> Option<String> {
+    let full = current_smollm3_local_date()?;
+    let mut parts = full.split_whitespace();
+    let day = parts.next()?.trim_start_matches('0');
+    let month = parts.next()?;
+    let year = parts.next()?;
+    if day.is_empty() || month.len() < 3 || parts.next().is_some() {
+        return None;
+    }
+    Some(format!("{day} {} {year}", &month[..3]))
+}
+
 fn render_mistral_instruct_prompt(messages: &[ChatMessage], tokenizer: &Tokenizer) -> String {
     let bos = tokenizer.token_text(tokenizer.special.bos).unwrap_or("<s>");
     let eos = tokenizer
@@ -22085,6 +22739,53 @@ fn render_mistral_instruct_prompt(messages: &[ChatMessage], tokenizer: &Tokenize
     }
 
     prompt
+}
+
+fn render_mistral_v02_instruct_prompt(
+    messages: &[ChatMessage],
+    tokenizer: &Tokenizer,
+) -> std::result::Result<String, &'static str> {
+    if messages.is_empty() {
+        return Err("Mistral v0.2 chat requires at least one user message");
+    }
+    let eos = tokenizer
+        .token_text(tokenizer.special.eos)
+        .unwrap_or("</s>");
+    let mut prompt = String::new();
+    let mut index = 0;
+    let system = if messages[0].role.trim() == "system" {
+        index = 1;
+        Some(messages[0].content.as_str())
+    } else {
+        None
+    };
+    if index == messages.len() {
+        return Err("Mistral v0.2 chat requires a user turn after the system message");
+    }
+    for (turn, message) in messages[index..].iter().enumerate() {
+        let expected = if turn % 2 == 0 { "user" } else { "assistant" };
+        if message.role.trim() != expected {
+            return Err("Mistral v0.2 conversation roles must alternate user/assistant");
+        }
+        if !message.image_urls.is_empty() || !message.unsupported_content_parts.is_empty() {
+            return Err("Mistral v0.2 supports plain text turns only");
+        }
+        if expected == "user" {
+            prompt.push_str("[INST] ");
+            if turn == 0 {
+                if let Some(system) = system {
+                    prompt.push_str(system);
+                    prompt.push('\n');
+                }
+            }
+            prompt.push_str(&message.content);
+            prompt.push_str(" [/INST]");
+        } else {
+            prompt.push_str(&message.content);
+            prompt.push_str(eos);
+        }
+    }
+    Ok(prompt)
 }
 
 /// Mistral Instruct v0.3+ with native tool calling: injects `[AVAILABLE_TOOLS]`
@@ -22254,6 +22955,224 @@ fn render_phi4_compact_prompt(messages: &[ChatMessage]) -> String {
     }
     prompt.push_str("<|assistant|>");
     prompt
+}
+
+/// Render the ordinary text-only branch shared by the pinned DeepSeek R1
+/// Distill Qwen 1.5B and Llama 8B templates. Both templates use the same
+/// full-width marker grammar; the Qwen row alone opens `<think>\n` in its
+/// generation header. Tool messages remain outside this bounded renderer.
+fn render_deepseek_r1_distill_prompt(
+    messages: &[ChatMessage],
+    _tokenizer: &Tokenizer,
+    open_think: bool,
+) -> std::result::Result<String, &'static str> {
+    if messages.is_empty() {
+        return Err("DeepSeek R1 chat requires at least one message");
+    }
+    if messages.iter().any(|message| {
+        message.role.trim() == "tool"
+            || !message.image_urls.is_empty()
+            || !message.unsupported_content_parts.is_empty()
+    }) {
+        return Err("DeepSeek R1 tool history is outside the qualified text-only envelope");
+    }
+
+    let system_prompt = messages
+        .iter()
+        .filter(|message| message.role.trim() == "system")
+        .map(|message| message.content.as_str())
+        .next_back()
+        .unwrap_or("");
+    let mut prompt = String::new();
+    prompt.push_str(system_prompt);
+
+    for message in messages {
+        match message.role.trim() {
+            "system" => {}
+            "user" => {
+                prompt.push_str("<｜User｜>");
+                prompt.push_str(&message.content);
+            }
+            "assistant" => {
+                let content = message
+                    .content
+                    .rsplit_once("</think>")
+                    .map_or(message.content.as_str(), |(_, answer)| answer);
+                prompt.push_str("<｜Assistant｜>");
+                prompt.push_str(content);
+                prompt.push_str("<｜end▁of▁sentence｜>");
+            }
+            _ => {
+                return Err("DeepSeek R1 text chat accepts only system, user, and assistant roles")
+            }
+        }
+    }
+    prompt.push_str("<｜Assistant｜>");
+    if open_think {
+        prompt.push_str("<think>\n");
+    }
+    Ok(prompt)
+}
+
+/// Render Aya Expanse's exact Command-R START_OF_TURN text envelope. The
+/// `/apply-template` returns no literal BOS; both engines request BOS through
+/// tokenizer special insertion. Turn content is trimmed and user/assistant
+/// history must alternate after an optional leading system message.
+fn render_aya_start_of_turn_prompt(
+    messages: &[ChatMessage],
+    _tokenizer: &Tokenizer,
+) -> std::result::Result<String, &'static str> {
+    if messages.is_empty() {
+        return Err("Aya chat requires at least one user message");
+    }
+    let mut index = 0;
+    let mut prompt = String::new();
+    if messages[0].role.trim() == "system" {
+        prompt.push_str("<|START_OF_TURN_TOKEN|><|SYSTEM_TOKEN|>");
+        prompt.push_str(&messages[0].content);
+        prompt.push_str("<|END_OF_TURN_TOKEN|>");
+        index = 1;
+    }
+    if index == messages.len() {
+        return Err("Aya chat requires a user turn after the system message");
+    }
+
+    for (turn, message) in messages[index..].iter().enumerate() {
+        if !message.image_urls.is_empty() || !message.unsupported_content_parts.is_empty() {
+            return Err(
+                "Aya structured or tool history is outside the qualified text-only envelope",
+            );
+        }
+        let expected = if turn % 2 == 0 { "user" } else { "assistant" };
+        if message.role.trim() != expected {
+            return Err("Aya conversation roles must alternate user/assistant");
+        }
+        prompt.push_str("<|START_OF_TURN_TOKEN|>");
+        prompt.push_str(if expected == "user" {
+            "<|USER_TOKEN|>"
+        } else {
+            "<|CHATBOT_TOKEN|>"
+        });
+        prompt.push_str(message.content.trim());
+        prompt.push_str("<|END_OF_TURN_TOKEN|>");
+    }
+    prompt.push_str("<|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>");
+    Ok(prompt)
+}
+
+#[cfg(test)]
+mod phase2_template_renderer_tests {
+    use super::*;
+    use crate::tokenizer::{
+        BpePreTokenizer, BpeRegistry, SpecialTokens, TokenizerConfig, TokenizerModel,
+    };
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    struct ShapePack {
+        shapes: Vec<Shape>,
+    }
+
+    #[derive(Deserialize)]
+    struct Shape {
+        messages: Vec<ChatMessage>,
+        #[serde(default)]
+        expected_prompt: Option<String>,
+        #[serde(default)]
+        qwen_expected_prompt: Option<String>,
+        #[serde(default)]
+        llama_expected_prompt: Option<String>,
+    }
+
+    fn empty_tokenizer() -> Tokenizer {
+        Tokenizer {
+            model: TokenizerModel::Gpt2Bpe,
+            bpe_pre_tokenizer: BpePreTokenizer::default(),
+            tokens: Vec::new(),
+            token_to_id: HashMap::new(),
+            byte_token_to_id: HashMap::new(),
+            bpe_ranks: HashMap::new(),
+            bpe_registry: BpeRegistry::default(),
+            special: SpecialTokens::default(),
+            config: TokenizerConfig {
+                add_bos: true,
+                add_eos: false,
+                add_sep: false,
+                add_space_prefix: false,
+                remove_extra_whitespaces: false,
+            },
+            chat_template: None,
+            specials_index: OnceLock::new(),
+        }
+    }
+
+    #[test]
+    fn aya_renderer_matches_start_of_turn_pack() {
+        let pack: ShapePack = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/qa/prompt-packs/aya-expanse-start-of-turn-shapes-v1.json"
+        )))
+        .expect("valid Aya shape pack");
+        let tokenizer = empty_tokenizer();
+        for shape in pack.shapes {
+            assert_eq!(
+                render_aya_start_of_turn_prompt(&shape.messages, &tokenizer).unwrap(),
+                shape.expected_prompt.unwrap(),
+            );
+        }
+        assert!(runnable_prompt_add_special("command-r"));
+    }
+
+    #[test]
+    fn deepseek_distill_renderer_matches_both_exact_template_packs() {
+        let pack: ShapePack = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/qa/prompt-packs/deepseek-r1-distill-text-shapes-v1.json"
+        )))
+        .expect("valid DeepSeek R1 Distill shape pack");
+        let tokenizer = empty_tokenizer();
+        for shape in pack.shapes {
+            assert_eq!(
+                render_deepseek_r1_distill_prompt(&shape.messages, &tokenizer, true).unwrap(),
+                shape.qwen_expected_prompt.unwrap(),
+            );
+            assert_eq!(
+                render_deepseek_r1_distill_prompt(&shape.messages, &tokenizer, false).unwrap(),
+                shape.llama_expected_prompt.unwrap(),
+            );
+        }
+    }
+
+    #[test]
+    fn llama31_renderer_matches_dynamic_date_pack() {
+        let pack: ShapePack = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/qa/prompt-packs/llama3.1-8b-instruct-text-shapes-v1.json"
+        )))
+        .expect("valid Llama 3.1 shape pack");
+        for shape in pack.shapes {
+            assert_eq!(
+                render_llama31_instruct_prompt(&shape.messages, "11 Aug 2026").unwrap(),
+                shape.expected_prompt.unwrap(),
+            );
+        }
+    }
+
+    #[test]
+    fn mistral_v02_renderer_matches_exact_row_pack() {
+        let pack: ShapePack = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/qa/prompt-packs/mistral-7b-v0.2-instruct-shapes-v1.json"
+        )))
+        .expect("valid Mistral v0.2 shape pack");
+        let tokenizer = empty_tokenizer();
+        for shape in pack.shapes {
+            assert_eq!(
+                render_mistral_v02_instruct_prompt(&shape.messages, &tokenizer).unwrap(),
+                shape.expected_prompt.unwrap(),
+            );
+        }
+    }
 }
 
 fn render_role_colon_prompt(messages: &[ChatMessage]) -> String {
@@ -25213,9 +26132,7 @@ mod tests {
 
         let planned_rows = [
             "qwen25_7b_instruct_q8_0",
-            "gemma2_9b_it_q8_0",
             "deepseek_r1_distill_qwen_7b_q8_0",
-            "deepseek_r1_distill_llama_8b_q8_0",
             "qwen25_coder_7b_q8_0",
             "llama31_8b_instruct_q8_0",
         ];
@@ -25245,23 +26162,38 @@ mod tests {
             assert!(target.evidence.contains("planning only"));
         }
 
+        let phase2_parity_passes = ["gemma2_9b_it_q8_0", "deepseek_r1_distill_llama_8b_q8_0"];
+        for id in phase2_parity_passes {
+            let target = response
+                .model_compatibility
+                .iter()
+                .find(|target| target.id == id)
+                .unwrap_or_else(|| panic!("{id} Phase 2 row should stay advertised"));
+            assert_eq!(
+                target.status,
+                "active_validation_api_webui_pass_pending_context"
+            );
+            assert_eq!(target.tensors_load, "validated_real_weight_forward");
+            assert_eq!(target.parity_audited, "pass_exact_greedy_token_ids");
+            assert!(target.frontend_readiness_gate.contains("fail-closed"));
+            assert!(!target.status.starts_with("supported"));
+        }
+
         let command_r = response
             .model_compatibility
             .iter()
             .find(|target| target.id == "aya_expanse_8b_q4_k_m")
             .expect("the manageable Aya Command-R candidate must stay advertised");
-        assert_eq!(command_r.status, "planned_exact_row_candidate");
-        assert_eq!(command_r.support_scope, "future_exact_row_planning_only");
-        assert_eq!(
-            command_r.metadata_parses,
-            "immutable_remote_header_validated_attemptable"
-        );
-        assert_eq!(command_r.latest_checked_result, "planning_only");
+        assert_eq!(command_r.status, "active_validation_blocked_parity");
+        assert_eq!(command_r.support_scope, "phase2_exact_row_validation_only");
+        assert_eq!(command_r.metadata_parses, "validated_exact_artifact");
+        assert_eq!(command_r.tensors_load, "validated_real_weight_forward");
+        assert_eq!(command_r.parity_audited, "failed_exact_greedy_token_ids");
         assert!(command_r.frontend_readiness_gate.contains("fail-closed"));
-        assert!(command_r.evidence.contains("header-only HOLD"));
-        assert!(command_r
-            .evidence
-            .contains("9592bad943fe56cf93200286a0a4b00a158cd84a408f227b9978ec5879002fb8"));
+        assert_eq!(
+            command_r.evidence,
+            "qa/model-qualification/phase2-runtime/aya_expanse_8b_q4_k_m.json"
+        );
         assert!(!command_r.status.starts_with("supported"));
 
         let phi3 = response
@@ -25325,6 +26257,74 @@ mod tests {
         assert!(phi4
             .evidence
             .contains("intentionally absent from curated_catalog"));
+    }
+
+    #[test]
+    fn phase2_exact_rows_are_unique_downloadable_and_fail_closed() {
+        let expected = BTreeSet::from([
+            "lfm2_5_1_2b_instruct_q8_0",
+            "lfm2_5_1_2b_thinking_q8_0",
+            "gemma3_270m_it_q8_0",
+            "gemma3_4b_it_q8_0",
+            "llama3_1_8b_instruct_q8_0",
+            "mistral_7b_instruct_v0_2_q8_0",
+            "qwen2_5_0_5b_instruct_q8_0",
+            "qwen2_5_1_5b_instruct_q8_0",
+            "qwen2_5_coder_1_5b_instruct_q8_0",
+            "qwen3_5_0_8b_q8_0",
+            "qwen3_5_2b_q8_0",
+            "qwen3_5_4b_q8_0",
+            "qwen3_5_9b_q8_0",
+            "deepseek_r1_distill_qwen_1_5b_q8_0",
+            "deepseek_r1_distill_llama_8b_q8_0",
+            "phi3_mini_4k_instruct_q8_0",
+            "phi4_mini_instruct_q8_0",
+            "gemma2_9b_it_q8_0",
+            "smollm3_3b_q8_0",
+            "aya_expanse_8b_q4_k_m",
+        ]);
+        let response = capabilities_response();
+        let phase2_rows = response
+            .model_compatibility
+            .iter()
+            .filter(|row| expected.contains(row.id))
+            .collect::<Vec<_>>();
+        assert_eq!(phase2_rows.len(), 20);
+        assert_eq!(
+            phase2_rows
+                .iter()
+                .map(|row| row.id)
+                .collect::<BTreeSet<_>>(),
+            expected
+        );
+        assert_eq!(
+            phase2_rows
+                .iter()
+                .filter(|row| row.parity_audited == "pass_exact_greedy_token_ids")
+                .count(),
+            9
+        );
+        assert_eq!(
+            phase2_rows
+                .iter()
+                .filter(|row| {
+                    row.status == "active_validation_blocked_parity"
+                        || row.status == "active_validation_blocked_load"
+                })
+                .count(),
+            11
+        );
+        assert!(phase2_rows.iter().all(|row| {
+            !row.status.starts_with("supported")
+                && row.frontend_readiness_gate.contains("fail-closed")
+        }));
+
+        let catalog_ids = curated_catalog()
+            .iter()
+            .filter(|item| expected.contains(item.catalog_id))
+            .map(|item| item.catalog_id)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(catalog_ids, expected);
     }
 
     #[test]
@@ -30192,8 +31192,264 @@ impl CatalogItemView {
     }
 }
 
-pub fn curated_catalog() -> Vec<CatalogItem> {
+fn phase2_catalog_item(
+    catalog_id: &'static str,
+    name: &'static str,
+    repo_id: &'static str,
+    filename: &'static str,
+    size_bytes: u64,
+    quant: &'static str,
+    architecture: &'static str,
+    license: &'static str,
+    task_tags: &'static [&'static str],
+) -> CatalogItem {
+    CatalogItem {
+        catalog_id,
+        name,
+        repo_id,
+        filename,
+        size_bytes,
+        downloads: 0,
+        likes: 0,
+        quant,
+        architecture,
+        license,
+        task_tags,
+    }
+}
+
+fn phase2_curated_catalog() -> Vec<CatalogItem> {
     vec![
+        phase2_catalog_item(
+            "lfm2_5_1_2b_instruct_q8_0",
+            "LFM2.5 1.2B Instruct Q8_0",
+            "LiquidAI/LFM2.5-1.2B-Instruct-GGUF",
+            "LFM2.5-1.2B-Instruct-Q8_0.gguf",
+            1_246_253_888,
+            "Q8_0",
+            "lfm2",
+            "LFM Open License v1.0",
+            &["general"],
+        ),
+        phase2_catalog_item(
+            "lfm2_5_1_2b_thinking_q8_0",
+            "LFM2.5 1.2B Thinking Q8_0",
+            "LiquidAI/LFM2.5-1.2B-Thinking-GGUF",
+            "LFM2.5-1.2B-Thinking-Q8_0.gguf",
+            1_246_254_080,
+            "Q8_0",
+            "lfm2",
+            "LFM Open License v1.0",
+            &["reasoning"],
+        ),
+        phase2_catalog_item(
+            "gemma3_270m_it_q8_0",
+            "Gemma 3 270M-It Q8_0",
+            "unsloth/gemma-3-270m-it-GGUF",
+            "gemma-3-270m-it-Q8_0.gguf",
+            291_546_144,
+            "Q8_0",
+            "gemma3",
+            "gemma",
+            &["general"],
+        ),
+        phase2_catalog_item(
+            "gemma3_4b_it_q8_0",
+            "Gemma 3 4B-It Q8_0",
+            "ggml-org/gemma-3-4b-it-GGUF",
+            "gemma-3-4b-it-Q8_0.gguf",
+            4_130_226_336,
+            "Q8_0",
+            "gemma3",
+            "gemma",
+            &["general", "reasoning"],
+        ),
+        phase2_catalog_item(
+            "llama3_1_8b_instruct_q8_0",
+            "Llama 3.1 8B Instruct Q8_0",
+            "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF",
+            "Meta-Llama-3.1-8B-Instruct-Q8_0.gguf",
+            8_540_775_840,
+            "Q8_0",
+            "llama",
+            "llama3.1",
+            &["general", "reasoning"],
+        ),
+        phase2_catalog_item(
+            "mistral_7b_instruct_v0_2_q8_0",
+            "Mistral 7B Instruct v0.2 Q8_0",
+            "TheBloke/Mistral-7B-Instruct-v0.2-GGUF",
+            "mistral-7b-instruct-v0.2.Q8_0.gguf",
+            7_695_857_952,
+            "Q8_0",
+            "llama",
+            "apache-2.0",
+            &["general", "coding"],
+        ),
+        phase2_catalog_item(
+            "qwen2_5_0_5b_instruct_q8_0",
+            "Qwen2.5 0.5B Instruct Q8_0",
+            "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+            "qwen2.5-0.5b-instruct-q8_0.gguf",
+            675_710_816,
+            "Q8_0",
+            "qwen2",
+            "apache-2.0",
+            &["general"],
+        ),
+        phase2_catalog_item(
+            "qwen2_5_1_5b_instruct_q8_0",
+            "Qwen2.5 1.5B Instruct Q8_0",
+            "Qwen/Qwen2.5-1.5B-Instruct-GGUF",
+            "qwen2.5-1.5b-instruct-q8_0.gguf",
+            1_894_532_128,
+            "Q8_0",
+            "qwen2",
+            "apache-2.0",
+            &["general"],
+        ),
+        phase2_catalog_item(
+            "qwen2_5_coder_1_5b_instruct_q8_0",
+            "Qwen2.5 Coder 1.5B Instruct Q8_0",
+            "Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF",
+            "qwen2.5-coder-1.5b-instruct-q8_0.gguf",
+            1_894_532_160,
+            "Q8_0",
+            "qwen2",
+            "apache-2.0",
+            &["coding"],
+        ),
+        phase2_catalog_item(
+            "qwen3_5_0_8b_q8_0",
+            "Qwen3.5 0.8B Q8_0",
+            "unsloth/Qwen3.5-0.8B-GGUF",
+            "Qwen3.5-0.8B-Q8_0.gguf",
+            811_843_840,
+            "Q8_0",
+            "qwen35",
+            "apache-2.0",
+            &["general"],
+        ),
+        phase2_catalog_item(
+            "qwen3_5_2b_q8_0",
+            "Qwen3.5 2B Q8_0",
+            "unsloth/Qwen3.5-2B-GGUF",
+            "Qwen3.5-2B-Q8_0.gguf",
+            2_012_012_800,
+            "Q8_0",
+            "qwen35",
+            "apache-2.0",
+            &["general", "reasoning"],
+        ),
+        phase2_catalog_item(
+            "qwen3_5_4b_q8_0",
+            "Qwen3.5 4B Q8_0",
+            "unsloth/Qwen3.5-4B-GGUF",
+            "Qwen3.5-4B-Q8_0.gguf",
+            4_482_403_488,
+            "Q8_0",
+            "qwen35",
+            "apache-2.0",
+            &["general", "reasoning"],
+        ),
+        phase2_catalog_item(
+            "qwen3_5_9b_q8_0",
+            "Qwen3.5 9B Q8_0",
+            "unsloth/Qwen3.5-9B-GGUF",
+            "Qwen3.5-9B-Q8_0.gguf",
+            9_527_502_048,
+            "Q8_0",
+            "qwen35",
+            "apache-2.0",
+            &["general", "reasoning", "coding"],
+        ),
+        phase2_catalog_item(
+            "deepseek_r1_distill_qwen_1_5b_q8_0",
+            "DeepSeek R1 Distill Qwen 1.5B Q8_0",
+            "unsloth/DeepSeek-R1-Distill-Qwen-1.5B-GGUF",
+            "DeepSeek-R1-Distill-Qwen-1.5B-Q8_0.gguf",
+            1_894_532_416,
+            "Q8_0",
+            "qwen2",
+            "apache-2.0",
+            &["reasoning", "coding"],
+        ),
+        phase2_catalog_item(
+            "deepseek_r1_distill_llama_8b_q8_0",
+            "DeepSeek R1 Distill Llama 8B Q8_0",
+            "unsloth/DeepSeek-R1-Distill-Llama-8B-GGUF",
+            "DeepSeek-R1-Distill-Llama-8B-Q8_0.gguf",
+            8_540_773_088,
+            "Q8_0",
+            "llama",
+            "llama3.1",
+            &["reasoning", "coding"],
+        ),
+        phase2_catalog_item(
+            "phi3_mini_4k_instruct_q8_0",
+            "Phi-3 Mini 4K Instruct Q8_0",
+            "bartowski/Phi-3-mini-4k-instruct-GGUF",
+            "Phi-3-mini-4k-instruct-Q8_0.gguf",
+            4_061_221_376,
+            "Q8_0",
+            "phi3",
+            "mit",
+            &["reasoning", "coding"],
+        ),
+        phase2_catalog_item(
+            "phi4_mini_instruct_q8_0",
+            "Phi-4 Mini Instruct Q8_0",
+            "unsloth/Phi-4-mini-instruct-GGUF",
+            "Phi-4-mini-instruct.Q8_0.gguf",
+            4_084_611_040,
+            "Q8_0",
+            "phi3",
+            "mit",
+            &["reasoning", "coding"],
+        ),
+        phase2_catalog_item(
+            "gemma2_9b_it_q8_0",
+            "Gemma 2 9B-It Q8_0",
+            "BenevolenceMessiah/gemma-2-9b-it-Q8_0-GGUF",
+            "gemma-2-9b-it-q8_0.gguf",
+            9_827_149_312,
+            "Q8_0",
+            "gemma2",
+            "gemma",
+            &["general", "reasoning"],
+        ),
+        phase2_catalog_item(
+            "smollm3_3b_q8_0",
+            "SmolLM3 3B Q8_0",
+            "ggml-org/SmolLM3-3B-GGUF",
+            "SmolLM3-Q8_0.gguf",
+            3_275_574_624,
+            "Q8_0",
+            "smollm3",
+            "apache-2.0",
+            &["general", "reasoning"],
+        ),
+        phase2_catalog_item(
+            "aya_expanse_8b_q4_k_m",
+            "Aya Expanse 8B Q4_K_M",
+            "bartowski/aya-expanse-8b-GGUF",
+            "aya-expanse-8b-Q4_K_M.gguf",
+            5_056_982_720,
+            "Q4_K_M",
+            "command-r",
+            "cc-by-nc-4.0",
+            &["general"],
+        ),
+    ]
+}
+
+pub fn curated_catalog() -> Vec<CatalogItem> {
+    let phase2 = phase2_curated_catalog();
+    let phase2_ids = phase2
+        .iter()
+        .map(|item| item.catalog_id)
+        .collect::<HashSet<_>>();
+    let mut rows = vec![
         CatalogItem {
             catalog_id: "nomic_embed_text_v1_5_q8_0",
             name: "Nomic Embed Text v1.5 Q8_0",
@@ -30786,7 +32042,10 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             license: "apache-2.0",
             task_tags: &["general", "reasoning", "coding", "tools"],
         },
-    ]
+    ];
+    rows.retain(|item| !phase2_ids.contains(item.catalog_id));
+    rows.extend(phase2);
+    rows
 }
 
 #[derive(Debug, serde::Serialize)]

@@ -217,6 +217,7 @@ try {
       '--model-id', modelId,
       '--chat-repeats', '1',
       '--stream-max-tokens', String(streamMaxTokens),
+      '--message', message,
       '--require-local-model',
       '--require-generation',
     ]

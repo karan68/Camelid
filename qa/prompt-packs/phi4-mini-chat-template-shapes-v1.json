@@ -1,35 +1,59 @@
 {
   "schema": "camelid.chat_template_shape_pack/v1",
   "pack_id": "phi4-mini-chat-template-shapes-v1",
-  "purpose": "Locks the ordinary-message branch of the exact Phi-4-mini-instruct GGUF chat template. Tool-bearing requests fail closed until their metadata-Jinja path is independently validated.",
+  "purpose": "Locks the ordinary-message branch of the exact Phi-4-mini-instruct Q8_0 GGUF chat template. Tool-bearing requests fail closed until their metadata-Jinja path is independently validated.",
   "oracle": {
-    "source": "unsloth/Phi-4-mini-instruct-GGUF exact GGUF metadata",
+    "engine": "llama.cpp llama-server /apply-template and /tokenize",
+    "build": "b9632",
     "revision": "78eb92a46fc37e6b524df991ed9aca9bc6aa7b80",
+    "source_repo": "unsloth/Phi-4-mini-instruct-GGUF",
+    "source_file": "Phi-4-mini-instruct.Q8_0.gguf",
+    "size_bytes": 4084611040,
+    "sha256": "26188c6050d525376a88b04514c236c5e28a36730f1e936f2a00314212b7ba42",
+    "chat_template_utf8_bytes": 398,
+    "chat_template_sha256": "46bcd040271c497ee454c7ff577615abf2853ba2971b472e417468ac2bf47f52",
+    "add_generation_prompt": true,
+    "add_special": true,
+    "parse_special": true,
     "template": "{% for message in messages %}{% if message['role'] == 'system' and 'tools' in message and message['tools'] is not none %}{{ '<|' + message['role'] + '|>' + message['content'] + '<|tool|>' + message['tools'] + '<|/tool|>' + '<|end|>' }}{% else %}{{ '<|' + message['role'] + '|>' + message['content'] + '<|end|>' }}{% endif %}{% endfor %}{% if add_generation_prompt %}{{ '<|assistant|>' }}{% endif %}"
   },
   "shapes": [
     {
-      "id": "system_user_generation",
-      "messages": [
-        {"role": "system", "content": "Be concise."},
-        {"role": "user", "content": "Capital of France?"}
-      ],
-      "expected_prompt": "<|system|>Be concise.<|end|><|user|>Capital of France?<|end|><|assistant|>"
+      "id": "single_user",
+      "messages": [{"role": "user", "content": "What is the capital of France?"}],
+      "expected_prompt": "<|user|>What is the capital of France?<|end|><|assistant|>",
+      "prompt_ids": [200021, 4827, 382, 290, 9029, 328, 10128, 30, 200020, 200019]
     },
     {
-      "id": "assistant_history_generation",
+      "id": "system_user",
       "messages": [
-        {"role": "user", "content": "Question"},
-        {"role": "assistant", "content": "Answer"}
+        {"role": "system", "content": "Be concise."},
+        {"role": "user", "content": "Hello"}
       ],
-      "expected_prompt": "<|user|>Question<|end|><|assistant|>Answer<|end|><|assistant|>"
+      "expected_prompt": "<|system|>Be concise.<|end|><|user|>Hello<|end|><|assistant|>",
+      "prompt_ids": [200022, 3238, 82463, 13, 200020, 200021, 13225, 200020, 200019]
+    },
+    {
+      "id": "multi_turn",
+      "messages": [
+        {"role": "user", "content": "Say hello."},
+        {"role": "assistant", "content": "Hello!"},
+        {"role": "user", "content": "Say it again."}
+      ],
+      "expected_prompt": "<|user|>Say hello.<|end|><|assistant|>Hello!<|end|><|user|>Say it again.<|end|><|assistant|>",
+      "prompt_ids": [200021, 62316, 40617, 13, 200020, 200019, 13225, 0, 200020, 200021, 62316, 480, 2418, 13, 200020, 200019]
+    },
+    {
+      "id": "content_whitespace_is_verbatim",
+      "messages": [{"role": "user", "content": "  keep this spacing  "}],
+      "expected_prompt": "<|user|>  keep this spacing  <|end|><|assistant|>",
+      "prompt_ids": [200021, 220, 3357, 495, 47236, 256, 200020, 200019]
     },
     {
       "id": "tool_role_is_ordinary_without_tools_argument",
-      "messages": [
-        {"role": "tool", "content": "result"}
-      ],
-      "expected_prompt": "<|tool|>result<|end|><|assistant|>"
+      "messages": [{"role": "tool", "content": "result"}],
+      "expected_prompt": "<|tool|>result<|end|><|assistant|>",
+      "prompt_ids": [200023, 2521, 200020, 200019]
     }
   ]
 }

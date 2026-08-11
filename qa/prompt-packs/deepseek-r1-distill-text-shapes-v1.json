@@ -1,0 +1,78 @@
+{
+  "schema": "camelid.chat_template_shape_pack/v1",
+  "pack_id": "deepseek-r1-distill-text-shapes-v1",
+  "purpose": "Locks the no-tools text envelope shared by the exact DeepSeek R1 Distill Qwen 1.5B and Llama 8B rows. The Qwen template opens a think block; the Llama template opens a plain assistant turn.",
+  "source_rows": [
+    {
+      "row_id": "deepseek_r1_distill_qwen_1_5b_q8_0",
+      "repo": "unsloth/DeepSeek-R1-Distill-Qwen-1.5B-GGUF",
+      "revision": "3cb4d15544a2a5e07439592b9a0965b6445fbd34",
+      "file": "DeepSeek-R1-Distill-Qwen-1.5B-Q8_0.gguf",
+      "size_bytes": 1894532416,
+      "sha256": "068a721e47419ccfc94b6420118f772478544e1a0d4fad7118212774b3f9ba9e",
+      "chat_template_utf8_bytes": 2246,
+      "chat_template_sha256": "56a1447ad31926fdc21fb07e56e5642bd9c850c4f52d8c8af7bbe5f079a84f5f",
+      "open_think": true
+    },
+    {
+      "row_id": "deepseek_r1_distill_llama_8b_q8_0",
+      "repo": "unsloth/DeepSeek-R1-Distill-Llama-8B-GGUF",
+      "revision": "615f8936e16dfde29dcc00be71145d4d5ce8ed53",
+      "file": "DeepSeek-R1-Distill-Llama-8B-Q8_0.gguf",
+      "size_bytes": 8540773088,
+      "sha256": "8c6e3924d662d3f24a96b228a5c317510c27e91c587e71e78877ed18a875ec82",
+      "chat_template_utf8_bytes": 2237,
+      "chat_template_sha256": "b6835114b7303ddd78919a82e4d9f7d8c26ed0d7dfc36beeb12d524f6144eab1",
+      "open_think": false
+    }
+  ],
+  "oracle": {
+    "engine": "llama.cpp llama-server /apply-template and /tokenize",
+    "build": "b9632",
+    "revision": "acd79d603",
+    "add_generation_prompt": true,
+    "add_special": true,
+    "parse_special": true
+  },
+  "shapes": [
+    {
+      "id": "single_user",
+      "messages": [{"role": "user", "content": "What is the capital of France?"}],
+      "qwen_expected_prompt": "<｜User｜>What is the capital of France?<｜Assistant｜><think>\n",
+      "qwen_prompt_ids": [151646, 151644, 3838, 374, 279, 6722, 315, 9625, 30, 151645, 151648, 198],
+      "llama_expected_prompt": "<｜User｜>What is the capital of France?<｜Assistant｜>",
+      "llama_prompt_ids": [128000, 128011, 3923, 374, 279, 6864, 315, 9822, 30, 128012]
+    },
+    {
+      "id": "system_user",
+      "messages": [
+        {"role": "system", "content": "You are a concise assistant."},
+        {"role": "user", "content": "Name the largest ocean."}
+      ],
+      "qwen_expected_prompt": "You are a concise assistant.<｜User｜>Name the largest ocean.<｜Assistant｜><think>\n",
+      "qwen_prompt_ids": [151646, 2610, 525, 264, 63594, 17847, 13, 151644, 675, 279, 7772, 17951, 13, 151645, 151648, 198],
+      "llama_expected_prompt": "You are a concise assistant.<｜User｜>Name the largest ocean.<｜Assistant｜>",
+      "llama_prompt_ids": [128000, 2675, 527, 264, 64694, 18328, 13, 128011, 678, 279, 7928, 18435, 13, 128012]
+    },
+    {
+      "id": "multi_turn_strips_prior_thinking",
+      "messages": [
+        {"role": "user", "content": "Hi there."},
+        {"role": "assistant", "content": "<think>hidden</think>Hello! How can I help?"},
+        {"role": "user", "content": "Say hello again."}
+      ],
+      "qwen_expected_prompt": "<｜User｜>Hi there.<｜Assistant｜>Hello! How can I help?<｜end▁of▁sentence｜><｜User｜>Say hello again.<｜Assistant｜><think>\n",
+      "qwen_prompt_ids": [151646, 151644, 13048, 1052, 13, 151645, 9707, 0, 2585, 646, 358, 1492, 30, 151643, 151644, 45764, 23811, 1549, 13, 151645, 151648, 198],
+      "llama_expected_prompt": "<｜User｜>Hi there.<｜Assistant｜>Hello! How can I help?<｜end▁of▁sentence｜><｜User｜>Say hello again.<｜Assistant｜>",
+      "llama_prompt_ids": [128000, 128011, 13347, 1070, 13, 128012, 9906, 0, 2650, 649, 358, 1520, 30, 128001, 128011, 46864, 24748, 1578, 13, 128012]
+    }
+  ],
+  "does_not_prove": [
+    "tools or tool history",
+    "structured or multimodal content",
+    "weight load or generation parity",
+    "API/WebUI readiness",
+    "context",
+    "support"
+  ]
+}

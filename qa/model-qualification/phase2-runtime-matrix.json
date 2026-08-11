@@ -1,0 +1,41 @@
+{
+  "schema": "camelid.phase2-runtime-matrix/v1",
+  "generated_utc": "2026-08-11T00:00:00Z",
+  "oracle": {
+    "engine": "llama.cpp",
+    "build": "b9632",
+    "revision": "acd79d603",
+    "decode": "greedy"
+  },
+  "summary": {
+    "rows": 20,
+    "artifact_identity_pass": 20,
+    "tokenizer_pass": 20,
+    "template_pass": 19,
+    "load_and_forward_pass": 19,
+    "full_short_parity_pass": 9,
+    "parity_hold": 11
+  },
+  "rows": [
+    {"id":"lfm2_5_1_2b_instruct_q8_0","load":"pass","parity":"pass","matched_prompts":6,"total_prompts":6,"evidence":"qa/model-qualification/phase2-runtime/lfm2_5_1_2b_instruct_q8_0.json"},
+    {"id":"lfm2_5_1_2b_thinking_q8_0","load":"pass","parity":"fail","matched_prompts":0,"total_prompts":1,"first_divergence_generated_index":3,"reason":"deterministic greedy token divergence on the first probe","evidence":"qa/model-qualification/fixtures/phase2/lfm2_5_1_2b_thinking_q8_0-tokenizer-b9632.json"},
+    {"id":"gemma3_270m_it_q8_0","load":"pass","parity":"pass","matched_prompts":6,"total_prompts":6,"evidence":"qa/model-qualification/phase2-runtime/gemma3_270m_it_q8_0.json"},
+    {"id":"gemma3_4b_it_q8_0","load":"pass","parity":"fail","matched_prompts":0,"total_prompts":1,"first_divergence_generated_index":3,"reason":"linear RoPE metadata now loads, but deterministic greedy output diverges","evidence":"qa/model-qualification/fixtures/phase2/gemma3_4b_it_q8_0-tokenizer-b9632.json"},
+    {"id":"llama3_1_8b_instruct_q8_0","load":"pass","parity":"fail","matched_prompts":0,"total_prompts":1,"first_divergence_generated_index":3,"reason":"deterministic greedy token divergence on the first probe","evidence":"qa/model-qualification/fixtures/phase2/llama3_1_8b_instruct_q8_0-tokenizer-b9632.json"},
+    {"id":"mistral_7b_instruct_v0_2_q8_0","load":"pass","parity":"pass","matched_prompts":6,"total_prompts":6,"evidence":"qa/model-qualification/phase2-runtime/mistral_7b_instruct_v0_2_q8_0.json"},
+    {"id":"qwen2_5_0_5b_instruct_q8_0","load":"pass","parity":"fail","matched_prompts":3,"total_prompts":4,"first_divergence_generated_index":15,"reason":"one probe flips at the final generated token","evidence":"qa/model-qualification/phase2-runtime/qwen2_5_0_5b_instruct_q8_0.json"},
+    {"id":"qwen2_5_1_5b_instruct_q8_0","load":"pass","parity":"fail","matched_prompts":0,"total_prompts":1,"first_divergence_generated_index":4,"reason":"deterministic greedy token divergence on the first probe","evidence":"qa/model-qualification/fixtures/phase2/qwen2_5_1_5b_instruct_q8_0-tokenizer-b9632.json"},
+    {"id":"qwen2_5_coder_1_5b_instruct_q8_0","load":"pass","parity":"pass","matched_prompts":6,"total_prompts":6,"evidence":"qa/model-qualification/phase2-runtime/qwen2_5_coder_1_5b_instruct_q8_0.json"},
+    {"id":"qwen3_5_0_8b_q8_0","load":"pass","parity":"pass","matched_prompts":6,"total_prompts":6,"evidence":"qa/model-qualification/phase2-runtime/qwen3_5_0_8b_q8_0.json"},
+    {"id":"qwen3_5_2b_q8_0","load":"pass","parity":"pass","matched_prompts":6,"total_prompts":6,"evidence":"qa/model-qualification/phase2-runtime/qwen3_5_2b_q8_0.json"},
+    {"id":"qwen3_5_4b_q8_0","load":"pass","parity":"fail","matched_prompts":3,"total_prompts":6,"reason":"three of six greedy probes diverge","evidence":"qa/model-qualification/phase2-runtime/qwen3_5_4b_q8_0.json"},
+    {"id":"qwen3_5_9b_q8_0","load":"pass","parity":"fail","matched_prompts":0,"total_prompts":1,"first_divergence_generated_index":3,"reason":"deterministic greedy token divergence on the first probe","evidence":"qa/model-qualification/fixtures/phase2/qwen3_5_9b_q8_0-tokenizer-b9632.json"},
+    {"id":"deepseek_r1_distill_qwen_1_5b_q8_0","load":"pass","parity":"fail","matched_prompts":0,"total_prompts":1,"first_divergence_generated_index":3,"reason":"deterministic greedy token divergence on the first probe","evidence":"qa/model-qualification/fixtures/phase2/deepseek_r1_distill_qwen_1_5b_q8_0-tokenizer-b9632.json"},
+    {"id":"deepseek_r1_distill_llama_8b_q8_0","load":"pass","parity":"pass","matched_prompts":6,"total_prompts":6,"evidence":"qa/model-qualification/phase2-runtime/deepseek_r1_distill_llama_8b_q8_0.json"},
+    {"id":"phi3_mini_4k_instruct_q8_0","load":"pass","parity":"fail","reason":"prompt parity passes, but incremental decode diverges from a fresh prefill","evidence":"qa/muster/phi3-hold-evidence/generation-divergence-q8-20260727.json"},
+    {"id":"phi4_mini_instruct_q8_0","load":"fail","parity":"blocked","reason":"fused Phi-4 QKV tensor names are not yet bound (blk.0.attn_q.weight missing)","evidence":"qa/model-qualification/fixtures/phase2/phi4_mini_instruct_q8_0-tokenizer-b9632.json"},
+    {"id":"gemma2_9b_it_q8_0","load":"pass","parity":"pass","matched_prompts":6,"total_prompts":6,"evidence":"qa/model-qualification/phase2-runtime/gemma2_9b_it_q8_0.json"},
+    {"id":"smollm3_3b_q8_0","load":"pass","parity":"pass","matched_prompts":6,"total_prompts":6,"reason":"raw greedy parity passes; public promotion remains held on the intentionally bounded template envelope","evidence":"qa/model-qualification/phase2-runtime/smollm3_3b_q8_0.json"},
+    {"id":"aya_expanse_8b_q4_k_m","load":"pass","parity":"fail","matched_prompts":5,"total_prompts":6,"first_divergence_generated_index":3,"reason":"the math probe diverges while five other probes match","evidence":"qa/model-qualification/phase2-runtime/aya_expanse_8b_q4_k_m.json"}
+  ]
+}

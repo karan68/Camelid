@@ -1,0 +1,590 @@
+{
+  "schema": "camelid.model-qualification-report/v1",
+  "generated_at": "2026-08-11T18:18:30.914Z",
+  "row_id": "gemma3_270m_it_q8_0",
+  "source_head": "fcab3e2f1debe4ef1b999b3e7ab193947d978f85",
+  "source_dirty": true,
+  "source_inspection": "observed",
+  "host": {
+    "hostname_redacted": true,
+    "platform": "darwin",
+    "release": "25.5.0",
+    "arch": "arm64",
+    "logical_cpus": 10
+  },
+  "backend": {
+    "serve": "runnable",
+    "env": {}
+  },
+  "artifact": {
+    "path": "<artifact>",
+    "size_bytes": 291546144,
+    "sha256": "d156a5159f2f79c1b1d53c7c1cc20f1ff28ab8d00f17a292620aad13399b9698",
+    "path_redacted": true
+  },
+  "oracle_fixture": {
+    "path": "qa/model-qualification/fixtures/phase2/gemma3_270m_it_q8_0-tokenizer-b9632.json",
+    "status": "pass"
+  },
+  "stages": {
+    "source": {
+      "status": "pass",
+      "repo": "unsloth/gemma-3-270m-it-GGUF",
+      "revision": "c90975dbd40c0c7b275fefaae758c3415c906238",
+      "file": "gemma-3-270m-it-Q8_0.gguf",
+      "license": "gemma"
+    },
+    "artifact": {
+      "status": "pass",
+      "size_bytes": 291546144,
+      "sha256": "d156a5159f2f79c1b1d53c7c1cc20f1ff28ab8d00f17a292620aad13399b9698"
+    },
+    "metadata": {
+      "status": "pass",
+      "command": [
+        "<camelid>",
+        "inspect",
+        "<artifact>"
+      ],
+      "observed": {
+        "architecture": "gemma3",
+        "tokenizer_model": "llama",
+        "tokenizer_pre": "default",
+        "declared_quant": "Q8_0",
+        "headline_quant": "Q8_0",
+        "tensor_count": 236
+      }
+    },
+    "tokenizer": {
+      "status": "pass",
+      "oracle_fixture": "qa/model-qualification/fixtures/phase2/gemma3_270m_it_q8_0-tokenizer-b9632.json",
+      "probes": [
+        {
+          "text": "Hello",
+          "match": true,
+          "first_divergence": null,
+          "actual_length": 2,
+          "expected_length": 2,
+          "actual_ids": [
+            2,
+            9259
+          ],
+          "expected_ids": [
+            2,
+            9259
+          ]
+        },
+        {
+          "text": "The capital of France is",
+          "match": true,
+          "first_divergence": null,
+          "actual_length": 6,
+          "expected_length": 6,
+          "actual_ids": [
+            2,
+            818,
+            5279,
+            529,
+            7001,
+            563
+          ],
+          "expected_ids": [
+            2,
+            818,
+            5279,
+            529,
+            7001,
+            563
+          ]
+        },
+        {
+          "text": "Once upon a time",
+          "match": true,
+          "first_divergence": null,
+          "actual_length": 5,
+          "expected_length": 5,
+          "actual_ids": [
+            2,
+            14946,
+            3324,
+            496,
+            990
+          ],
+          "expected_ids": [
+            2,
+            14946,
+            3324,
+            496,
+            990
+          ]
+        },
+        {
+          "text": "The quick brown fox",
+          "match": true,
+          "first_divergence": null,
+          "actual_length": 5,
+          "expected_length": 5,
+          "actual_ids": [
+            2,
+            818,
+            3823,
+            8864,
+            37423
+          ],
+          "expected_ids": [
+            2,
+            818,
+            3823,
+            8864,
+            37423
+          ]
+        },
+        {
+          "text": "2 + 2 =",
+          "match": true,
+          "first_divergence": null,
+          "actual_length": 6,
+          "expected_length": 6,
+          "actual_ids": [
+            2,
+            236778,
+            900,
+            236743,
+            236778,
+            578
+          ],
+          "expected_ids": [
+            2,
+            236778,
+            900,
+            236743,
+            236778,
+            578
+          ]
+        },
+        {
+          "text": "don't stop 12345\nUnicode café 東京 🙂",
+          "match": true,
+          "first_divergence": null,
+          "actual_length": 16,
+          "expected_length": 16,
+          "actual_ids": [
+            2,
+            13246,
+            236789,
+            236745,
+            4721,
+            236743,
+            236770,
+            236778,
+            236800,
+            236812,
+            236810,
+            107,
+            123540,
+            33443,
+            86459,
+            57235
+          ],
+          "expected_ids": [
+            2,
+            13246,
+            236789,
+            236745,
+            4721,
+            236743,
+            236770,
+            236778,
+            236800,
+            236812,
+            236810,
+            107,
+            123540,
+            33443,
+            86459,
+            57235
+          ]
+        }
+      ],
+      "chat_probes": [
+        {
+          "name": "user-only",
+          "match": true,
+          "first_divergence": null,
+          "actual_length": 15,
+          "expected_length": 15,
+          "actual_ids": [
+            105,
+            2364,
+            107,
+            3689,
+            563,
+            506,
+            5279,
+            529,
+            7001,
+            236881,
+            106,
+            107,
+            105,
+            4368,
+            107
+          ],
+          "expected_ids": [
+            105,
+            2364,
+            107,
+            3689,
+            563,
+            506,
+            5279,
+            529,
+            7001,
+            236881,
+            106,
+            107,
+            105,
+            4368,
+            107
+          ]
+        },
+        {
+          "name": "system-fold",
+          "match": true,
+          "first_divergence": null,
+          "actual_length": 20,
+          "expected_length": 20,
+          "actual_ids": [
+            105,
+            2364,
+            107,
+            3048,
+            659,
+            496,
+            63510,
+            16326,
+            236761,
+            108,
+            1567,
+            506,
+            7488,
+            12461,
+            236761,
+            106,
+            107,
+            105,
+            4368,
+            107
+          ],
+          "expected_ids": [
+            105,
+            2364,
+            107,
+            3048,
+            659,
+            496,
+            63510,
+            16326,
+            236761,
+            108,
+            1567,
+            506,
+            7488,
+            12461,
+            236761,
+            106,
+            107,
+            105,
+            4368,
+            107
+          ]
+        },
+        {
+          "name": "multi-turn",
+          "match": true,
+          "first_divergence": null,
+          "actual_length": 32,
+          "expected_length": 32,
+          "actual_ids": [
+            105,
+            2364,
+            107,
+            10979,
+            993,
+            236761,
+            106,
+            107,
+            105,
+            4368,
+            107,
+            9259,
+            236888,
+            2088,
+            740,
+            564,
+            1601,
+            236881,
+            106,
+            107,
+            105,
+            2364,
+            107,
+            37889,
+            29104,
+            1570,
+            236761,
+            106,
+            107,
+            105,
+            4368,
+            107
+          ],
+          "expected_ids": [
+            105,
+            2364,
+            107,
+            10979,
+            993,
+            236761,
+            106,
+            107,
+            105,
+            4368,
+            107,
+            9259,
+            236888,
+            2088,
+            740,
+            564,
+            1601,
+            236881,
+            106,
+            107,
+            105,
+            2364,
+            107,
+            37889,
+            29104,
+            1570,
+            236761,
+            106,
+            107,
+            105,
+            4368,
+            107
+          ]
+        }
+      ]
+    },
+    "template": {
+      "status": "blocked",
+      "oracle_fixture": "qa/model-qualification/fixtures/phase2/gemma3_270m_it_q8_0-tokenizer-b9632.json",
+      "reason": "the rendered oracle bytes tokenize identically, but the Camelid API renderer has not yet been compared byte-for-byte in this report"
+    },
+    "load_smoke": {
+      "status": "blocked",
+      "reason": "smoke execution was not requested; pass --run-smoke"
+    },
+    "parity": {
+      "status": "pass",
+      "oracle_fixture": "qa/model-qualification/fixtures/phase2/gemma3_270m_it_q8_0-tokenizer-b9632.json",
+      "probes": [
+        {
+          "text": "Hello",
+          "match": true,
+          "first_divergence": null,
+          "actual_length": 5,
+          "expected_length": 5,
+          "actual_ids": [
+            236888,
+            564,
+            236789,
+            236757,
+            9775
+          ],
+          "expected_ids": [
+            236888,
+            564,
+            236789,
+            236757,
+            9775
+          ],
+          "actual_text": "! I'm excited",
+          "expected_text": "! I'm excited",
+          "metrics": {
+            "prompt_tokens": 2,
+            "load_ms": 645.807625,
+            "ttft_ms": 367.748833,
+            "decode_ms": 1074.5871670000001,
+            "tokens_per_second": 3.7223597329633837,
+            "peak_memory_bytes": 412205056
+          }
+        },
+        {
+          "text": "The capital of France is",
+          "match": true,
+          "first_divergence": null,
+          "actual_length": 5,
+          "expected_length": 5,
+          "actual_ids": [
+            9079,
+            236761,
+            108,
+            818,
+            5279
+          ],
+          "expected_ids": [
+            9079,
+            236761,
+            108,
+            818,
+            5279
+          ],
+          "actual_text": " Paris.\n\nThe capital",
+          "expected_text": " Paris.\n\nThe capital",
+          "metrics": {
+            "prompt_tokens": 6,
+            "load_ms": 662.487667,
+            "ttft_ms": 754.5834169999999,
+            "decode_ms": 1084.978291,
+            "tokens_per_second": 3.686709709475653,
+            "peak_memory_bytes": 412762112
+          }
+        },
+        {
+          "text": "Once upon a time",
+          "match": true,
+          "first_divergence": null,
+          "actual_length": 5,
+          "expected_length": 5,
+          "actual_ids": [
+            236764,
+            993,
+            691,
+            496,
+            1944
+          ],
+          "expected_ids": [
+            236764,
+            993,
+            691,
+            496,
+            1944
+          ],
+          "actual_text": ", there was a small",
+          "expected_text": ", there was a small",
+          "metrics": {
+            "prompt_tokens": 5,
+            "load_ms": 659.908042,
+            "ttft_ms": 644.7102500000001,
+            "decode_ms": 1128.4126249999997,
+            "tokens_per_second": 3.5448025938206786,
+            "peak_memory_bytes": 413663232
+          }
+        },
+        {
+          "text": "The quick brown fox",
+          "match": true,
+          "first_divergence": null,
+          "actual_length": 5,
+          "expected_length": 5,
+          "actual_ids": [
+            236764,
+            496,
+            33070,
+            529,
+            8176
+          ],
+          "expected_ids": [
+            236764,
+            496,
+            33070,
+            529,
+            8176
+          ],
+          "actual_text": ", a creature of pure",
+          "expected_text": ", a creature of pure",
+          "metrics": {
+            "prompt_tokens": 5,
+            "load_ms": 713.2383329999999,
+            "ttft_ms": 654.8455,
+            "decode_ms": 1068.6470829999998,
+            "tokens_per_second": 3.7430505015471045,
+            "peak_memory_bytes": 412745728
+          }
+        },
+        {
+          "text": "2 + 2 =",
+          "match": true,
+          "first_divergence": null,
+          "actual_length": 5,
+          "expected_length": 5,
+          "actual_ids": [
+            236743,
+            236812,
+            108,
+            818,
+            3890
+          ],
+          "expected_ids": [
+            236743,
+            236812,
+            108,
+            818,
+            3890
+          ],
+          "actual_text": " 4\n\nThe answer",
+          "expected_text": " 4\n\nThe answer",
+          "metrics": {
+            "prompt_tokens": 6,
+            "load_ms": 643.856958,
+            "ttft_ms": 732.926208,
+            "decode_ms": 1041.874917,
+            "tokens_per_second": 3.839232459418158,
+            "peak_memory_bytes": 414466048
+          }
+        },
+        {
+          "text": "don't stop 12345\nUnicode café 東京 🙂",
+          "match": true,
+          "first_divergence": null,
+          "actual_length": 5,
+          "expected_length": 5,
+          "actual_ids": [
+            107,
+            123540,
+            33443,
+            86459,
+            57235
+          ],
+          "expected_ids": [
+            107,
+            123540,
+            33443,
+            86459,
+            57235
+          ],
+          "actual_text": "\nUnicode café 東京 🙂",
+          "expected_text": "\nUnicode café 東京 🙂",
+          "metrics": {
+            "prompt_tokens": 16,
+            "load_ms": 641.581208,
+            "ttft_ms": 1631.941583,
+            "decode_ms": 1048.0182919999995,
+            "tokens_per_second": 3.8167272752143924,
+            "peak_memory_bytes": 413941760
+          }
+        }
+      ]
+    },
+    "api_webui": {
+      "status": "blocked",
+      "reason": "API/WebUI promotion smoke requires an explicitly started current-head server and frontend; this local file runner does not infer it"
+    },
+    "context": {
+      "status": "blocked",
+      "reason": "no preflighted context receipt captured; required buckets: 512"
+    }
+  },
+  "overall_status": "blocked"
+}

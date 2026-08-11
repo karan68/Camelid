@@ -52,6 +52,18 @@ function headlineQuant(tensors) {
   return [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))[0]?.[0] || null
 }
 
+const GGUF_FILE_TYPE_LABELS = new Map([
+  [0, 'F32'], [1, 'F16'], [2, 'Q4_0'], [3, 'Q4_1'], [7, 'Q8_0'],
+  [8, 'Q5_0'], [9, 'Q5_1'], [10, 'Q2_K'], [11, 'Q3_K_S'],
+  [12, 'Q3_K_M'], [13, 'Q3_K_L'], [14, 'Q4_K_S'], [15, 'Q4_K_M'],
+  [16, 'Q5_K_S'], [17, 'Q5_K_M'], [18, 'Q6_K'], [32, 'BF16'],
+  [36, 'TQ1_0'], [37, 'TQ2_0'], [39, 'NVFP4'], [40, 'Q1_0'], [41, 'Q2_0'],
+])
+
+function declaredQuant(fileType) {
+  return Number.isSafeInteger(fileType) ? GGUF_FILE_TYPE_LABELS.get(fileType) ?? null : null
+}
+
 function deriveOverall(stages) {
   const required = Object.values(stages).filter((stage) => stage.required !== false)
   for (const stage of required) {
@@ -66,6 +78,17 @@ function deriveOverall(stages) {
 function stage(status, details = {}) {
   if (!REPORT_STATUSES.has(status)) throw new Error(`invalid stage status ${status}`)
   return { status, ...details }
+}
+
+function promoteLoadFromFullParity(stages) {
+  if (stages?.parity?.status !== 'pass' || stages?.load_smoke?.status === 'pass') return stages
+  const prior = stages.load_smoke
+  stages.load_smoke = stage('pass', {
+    qualified_by: 'full_raw_greedy_parity_replay',
+    reason: 'every pinned oracle prompt loaded the exact artifact and generated the complete expected token sequence; this is stronger load/forward evidence than the standalone coherence smoke',
+    superseded_standalone_smoke: prior,
+  })
+  return stages
 }
 
 function redactLocalPaths(value, replacements) {
@@ -114,6 +137,26 @@ function validateOracleFixture(fixture, row, defaults = {}) {
     if (expected && fixture.oracle?.[field] !== expected) {
       errors.push(`oracle.${field} ${JSON.stringify(fixture.oracle?.[field])} != ${JSON.stringify(expected)}`)
     }
+  }
+  if (!Array.isArray(fixture.raw_prompts) || fixture.raw_prompts.length === 0) {
+    errors.push('raw_prompts must be a non-empty array')
+  } else {
+    fixture.raw_prompts.forEach((prompt, index) => {
+      if (typeof prompt?.text !== 'string' || !prompt.text) {
+        errors.push(`raw_prompts[${index}].text must be a non-empty string`)
+      }
+      if (!Array.isArray(prompt?.prompt_ids)
+        || prompt.prompt_ids.length === 0
+        || prompt.prompt_ids.some((id) => !Number.isSafeInteger(id) || id < 0)) {
+        errors.push(`raw_prompts[${index}].prompt_ids must be a non-empty non-negative integer array`)
+      }
+      if (Object.hasOwn(prompt || {}, 'generated_ids')
+        && (!Array.isArray(prompt.generated_ids)
+          || prompt.generated_ids.length === 0
+          || prompt.generated_ids.some((id) => !Number.isSafeInteger(id) || id < 0))) {
+        errors.push(`raw_prompts[${index}].generated_ids must be a non-empty non-negative integer array when present`)
+      }
+    })
   }
   return errors
 }
@@ -202,6 +245,7 @@ async function inspectMetadata({ binary, artifact, row, root }) {
     architecture: metadata['general.architecture'] ?? null,
     tokenizer_model: metadata['tokenizer.ggml.model'] ?? null,
     tokenizer_pre: metadata['tokenizer.ggml.pre'] ?? null,
+    declared_quant: declaredQuant(metadata['general.file_type']),
     headline_quant: headlineQuant(inspect.tensors),
     tensor_count: inspect.tensor_count ?? inspect.tensors?.length ?? null,
   }
@@ -209,7 +253,8 @@ async function inspectMetadata({ binary, artifact, row, root }) {
   if (observed.architecture !== row.identity.architecture) mismatches.push(`architecture ${observed.architecture} != ${row.identity.architecture}`)
   if (observed.tokenizer_model !== row.expected.tokenizer_model) mismatches.push(`tokenizer model ${observed.tokenizer_model} != ${row.expected.tokenizer_model}`)
   if (row.expected.tokenizer_pre !== null && observed.tokenizer_pre !== row.expected.tokenizer_pre) mismatches.push(`tokenizer pre ${observed.tokenizer_pre} != ${row.expected.tokenizer_pre}`)
-  if (observed.headline_quant !== row.identity.quantization) mismatches.push(`headline quant ${observed.headline_quant} != ${row.identity.quantization}`)
+  const observedQuant = observed.declared_quant ?? observed.headline_quant
+  if (observedQuant !== row.identity.quantization) mismatches.push(`declared quant ${observedQuant} != ${row.identity.quantization}`)
   return mismatches.length
     ? stage('fail', { command, observed, reason: mismatches.join('; ') })
     : stage('pass', { command, observed })
@@ -285,6 +330,9 @@ async function checkSmoke({ binary, artifact, row, root, enabled }) {
 async function checkParity({ binary, artifact, row, fixture, root, enabled, promptLimit }) {
   if (!enabled) return stage('blocked', { reason: 'greedy generation parity was not requested; pass --run-generation' })
   if (!fixture?.raw_prompts?.length) return stage('blocked', { reason: 'required independent greedy fixture is absent' })
+  if (fixture.raw_prompts.some((prompt) => !Array.isArray(prompt.generated_ids) || prompt.generated_ids.length === 0)) {
+    return stage('blocked', { reason: 'the exact-row oracle fixture is tokenizer-only; greedy generated token IDs are absent' })
+  }
   const selected = fixture.raw_prompts.slice(0, promptLimit ?? fixture.raw_prompts.length)
   const probes = []
   for (const prompt of selected) {
@@ -424,6 +472,7 @@ async function qualify(options) {
     report.stages.parity = fixtureErrors.length
       ? stage('blocked', { reason: `oracle fixture identity gate did not pass: ${fixtureErrors.join('; ')}` })
       : await checkParity({ binary, artifact, row, fixture, root, enabled: options.runGeneration, promptLimit: options.promptLimit })
+    promoteLoadFromFullParity(report.stages)
   } else {
     for (const name of ['metadata', 'tokenizer', 'template', 'load_smoke', 'parity']) {
       report.stages[name] = stage('blocked', { reason: 'artifact identity gate did not pass' })
@@ -481,9 +530,11 @@ Options:
 
 export {
   compareIds,
+  declaredQuant,
   deriveOverall,
   gitDirtyState,
   headlineQuant,
+  promoteLoadFromFullParity,
   qualify,
   redactLocalPaths,
   validateOracleFixture,

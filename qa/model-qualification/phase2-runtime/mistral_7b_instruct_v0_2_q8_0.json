@@ -1,0 +1,434 @@
+{
+  "schema": "camelid.model-qualification-report/v1",
+  "generated_at": "2026-08-11T18:20:40.028Z",
+  "row_id": "mistral_7b_instruct_v0_2_q8_0",
+  "source_head": "fcab3e2f1debe4ef1b999b3e7ab193947d978f85",
+  "source_dirty": true,
+  "source_inspection": "observed",
+  "host": {
+    "hostname_redacted": true,
+    "platform": "darwin",
+    "release": "25.5.0",
+    "arch": "arm64",
+    "logical_cpus": 10
+  },
+  "backend": {
+    "serve": "runnable",
+    "env": {
+      "CAMELID_GPU": "off",
+      "CAMELID_DETERMINISTIC": "1"
+    }
+  },
+  "artifact": {
+    "path": "<artifact>",
+    "size_bytes": 7695857952,
+    "sha256": "f326f5f4f137f3ad30f8c9cc21d4d39e54476583e8306ee2931d5a022cb85b06",
+    "path_redacted": true
+  },
+  "oracle_fixture": {
+    "path": "qa/model-qualification/fixtures/phase2/mistral_7b_instruct_v0_2_q8_0-tokenizer-b9632.json",
+    "status": "pass"
+  },
+  "stages": {
+    "source": {
+      "status": "pass",
+      "repo": "TheBloke/Mistral-7B-Instruct-v0.2-GGUF",
+      "revision": "3a6fbf4a41a1d52e415a4958cde6856d34b2db93",
+      "file": "mistral-7b-instruct-v0.2.Q8_0.gguf",
+      "license": "apache-2.0"
+    },
+    "artifact": {
+      "status": "pass",
+      "size_bytes": 7695857952,
+      "sha256": "f326f5f4f137f3ad30f8c9cc21d4d39e54476583e8306ee2931d5a022cb85b06"
+    },
+    "metadata": {
+      "status": "pass",
+      "command": [
+        "<camelid>",
+        "inspect",
+        "<artifact>"
+      ],
+      "observed": {
+        "architecture": "llama",
+        "tokenizer_model": "llama",
+        "tokenizer_pre": null,
+        "declared_quant": "Q8_0",
+        "headline_quant": "Q8_0",
+        "tensor_count": 291
+      }
+    },
+    "tokenizer": {
+      "status": "pass",
+      "oracle_fixture": "qa/model-qualification/fixtures/phase2/mistral_7b_instruct_v0_2_q8_0-tokenizer-b9632.json",
+      "probes": [
+        {
+          "text": "Hello",
+          "match": true,
+          "first_divergence": null,
+          "actual_length": 2,
+          "expected_length": 2,
+          "actual_ids": [
+            1,
+            22557
+          ],
+          "expected_ids": [
+            1,
+            22557
+          ]
+        },
+        {
+          "text": "The capital of France is",
+          "match": true,
+          "first_divergence": null,
+          "actual_length": 6,
+          "expected_length": 6,
+          "actual_ids": [
+            1,
+            415,
+            5565,
+            302,
+            4843,
+            349
+          ],
+          "expected_ids": [
+            1,
+            415,
+            5565,
+            302,
+            4843,
+            349
+          ]
+        },
+        {
+          "text": "Once upon a time",
+          "match": true,
+          "first_divergence": null,
+          "actual_length": 5,
+          "expected_length": 5,
+          "actual_ids": [
+            1,
+            5713,
+            3714,
+            264,
+            727
+          ],
+          "expected_ids": [
+            1,
+            5713,
+            3714,
+            264,
+            727
+          ]
+        },
+        {
+          "text": "The quick brown fox",
+          "match": true,
+          "first_divergence": null,
+          "actual_length": 6,
+          "expected_length": 6,
+          "actual_ids": [
+            1,
+            415,
+            2936,
+            9060,
+            285,
+            1142
+          ],
+          "expected_ids": [
+            1,
+            415,
+            2936,
+            9060,
+            285,
+            1142
+          ]
+        },
+        {
+          "text": "2 + 2 =",
+          "match": true,
+          "first_divergence": null,
+          "actual_length": 7,
+          "expected_length": 7,
+          "actual_ids": [
+            1,
+            28705,
+            28750,
+            648,
+            28705,
+            28750,
+            327
+          ],
+          "expected_ids": [
+            1,
+            28705,
+            28750,
+            648,
+            28705,
+            28750,
+            327
+          ]
+        },
+        {
+          "text": "don't stop 12345\nUnicode café 東京 🙂",
+          "match": true,
+          "first_divergence": null,
+          "actual_length": 19,
+          "expected_length": 19,
+          "actual_ids": [
+            1,
+            949,
+            28742,
+            28707,
+            2115,
+            28705,
+            28740,
+            28750,
+            28770,
+            28781,
+            28782,
+            13,
+            27977,
+            28345,
+            28705,
+            30366,
+            29936,
+            28705,
+            29340
+          ],
+          "expected_ids": [
+            1,
+            949,
+            28742,
+            28707,
+            2115,
+            28705,
+            28740,
+            28750,
+            28770,
+            28781,
+            28782,
+            13,
+            27977,
+            28345,
+            28705,
+            30366,
+            29936,
+            28705,
+            29340
+          ]
+        }
+      ],
+      "chat_probes": []
+    },
+    "template": {
+      "status": "blocked",
+      "reason": "template rendering is downstream of the tokenizer fixture gate"
+    },
+    "load_smoke": {
+      "status": "blocked",
+      "reason": "smoke execution was not requested; pass --run-smoke"
+    },
+    "parity": {
+      "status": "pass",
+      "oracle_fixture": "qa/model-qualification/fixtures/phase2/mistral_7b_instruct_v0_2_q8_0-tokenizer-b9632.json",
+      "probes": [
+        {
+          "text": "Hello",
+          "match": true,
+          "first_divergence": null,
+          "actual_length": 5,
+          "expected_length": 5,
+          "actual_ids": [
+            28725,
+            13,
+            13,
+            28737,
+            28742
+          ],
+          "expected_ids": [
+            28725,
+            13,
+            13,
+            28737,
+            28742
+          ],
+          "actual_text": ",\n\nI'",
+          "expected_text": ",\n\nI'",
+          "metrics": {
+            "prompt_tokens": 2,
+            "load_ms": 8935.251250000001,
+            "ttft_ms": 2010.1979999999999,
+            "decode_ms": 1327.179208,
+            "tokens_per_second": 3.013910989479576,
+            "peak_memory_bytes": 8153989120
+          }
+        },
+        {
+          "text": "The capital of France is",
+          "match": true,
+          "first_divergence": null,
+          "actual_length": 5,
+          "expected_length": 5,
+          "actual_ids": [
+            5465,
+            28725,
+            304,
+            378,
+            349
+          ],
+          "expected_ids": [
+            5465,
+            28725,
+            304,
+            378,
+            349
+          ],
+          "actual_text": " Paris, and it is",
+          "expected_text": " Paris, and it is",
+          "metrics": {
+            "prompt_tokens": 6,
+            "load_ms": 11247.363625,
+            "ttft_ms": 4895.49725,
+            "decode_ms": 1287.105125,
+            "tokens_per_second": 3.107749260185721,
+            "peak_memory_bytes": 8412151808
+          }
+        },
+        {
+          "text": "Once upon a time",
+          "match": true,
+          "first_divergence": null,
+          "actual_length": 5,
+          "expected_length": 5,
+          "actual_ids": [
+            28725,
+            297,
+            264,
+            2533,
+            2082
+          ],
+          "expected_ids": [
+            28725,
+            297,
+            264,
+            2533,
+            2082
+          ],
+          "actual_text": ", in a land far",
+          "expected_text": ", in a land far",
+          "metrics": {
+            "prompt_tokens": 5,
+            "load_ms": 11252.372041999999,
+            "ttft_ms": 4257.762624999999,
+            "decode_ms": 1283.015333,
+            "tokens_per_second": 3.1176556484691673,
+            "peak_memory_bytes": 8336916480
+          }
+        },
+        {
+          "text": "The quick brown fox",
+          "match": true,
+          "first_divergence": null,
+          "actual_length": 5,
+          "expected_length": 5,
+          "actual_ids": [
+            461,
+            10575,
+            754,
+            272,
+            17898
+          ],
+          "expected_ids": [
+            461,
+            10575,
+            754,
+            272,
+            17898
+          ],
+          "actual_text": " jumps over the lazy",
+          "expected_text": " jumps over the lazy",
+          "metrics": {
+            "prompt_tokens": 6,
+            "load_ms": 11277.170833,
+            "ttft_ms": 4790.303666,
+            "decode_ms": 1264.242375,
+            "tokens_per_second": 3.1639502670522335,
+            "peak_memory_bytes": 8389427200
+          }
+        },
+        {
+          "text": "2 + 2 =",
+          "match": true,
+          "first_divergence": null,
+          "actual_length": 5,
+          "expected_length": 5,
+          "actual_ids": [
+            28705,
+            28781,
+            13,
+            13,
+            28771
+          ],
+          "expected_ids": [
+            28705,
+            28781,
+            13,
+            13,
+            28771
+          ],
+          "actual_text": " 4\n\n#",
+          "expected_text": " 4\n\n#",
+          "metrics": {
+            "prompt_tokens": 7,
+            "load_ms": 11245.573417,
+            "ttft_ms": 5455.824875,
+            "decode_ms": 1308.359125,
+            "tokens_per_second": 3.0572645717589197,
+            "peak_memory_bytes": 8445968384
+          }
+        },
+        {
+          "text": "don't stop 12345\nUnicode café 東京 🙂",
+          "match": true,
+          "first_divergence": null,
+          "actual_length": 5,
+          "expected_length": 5,
+          "actual_ids": [
+            13,
+            13,
+            28771,
+            28705,
+            243
+          ],
+          "expected_ids": [
+            13,
+            13,
+            28771,
+            28705,
+            243
+          ],
+          "actual_text": "\n\n# ",
+          "expected_text": "\n\n# �",
+          "metrics": {
+            "prompt_tokens": 19,
+            "load_ms": 11241.5715,
+            "ttft_ms": 13959.108167,
+            "decode_ms": 1295.586666,
+            "tokens_per_second": 3.0874044206935363,
+            "peak_memory_bytes": 8413478912
+          }
+        }
+      ]
+    },
+    "api_webui": {
+      "status": "blocked",
+      "reason": "API/WebUI promotion smoke requires an explicitly started current-head server and frontend; this local file runner does not infer it"
+    },
+    "context": {
+      "status": "blocked",
+      "reason": "no preflighted context receipt captured; required buckets: 512"
+    }
+  },
+  "overall_status": "blocked"
+}

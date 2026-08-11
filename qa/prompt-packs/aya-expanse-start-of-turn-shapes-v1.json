@@ -1,0 +1,57 @@
+{
+  "schema": "camelid.chat_template_shape_pack/v1",
+  "pack_id": "aya-expanse-start-of-turn-shapes-v1",
+  "purpose": "Locks the exact Aya Expanse 8B text-only START_OF_TURN envelope. Tools, structured content, and thinking controls remain outside this pack.",
+  "source": {
+    "repo": "bartowski/aya-expanse-8b-GGUF",
+    "revision": "f9d62ed0c58e6f2ae17975df990b1b8a4013b596",
+    "file": "aya-expanse-8b-Q4_K_M.gguf",
+    "size_bytes": 5056982720,
+    "sha256": "9592bad943fe56cf93200286a0a4b00a158cd84a408f227b9978ec5879002fb8",
+    "chat_template_utf8_bytes": 1318,
+    "chat_template_sha256": "90c33aee14aa2a226127516d48ee9184c9b90745d4a04c484621ec2e82fb712c"
+  },
+  "oracle": {
+    "engine": "llama.cpp llama-server /apply-template and /tokenize",
+    "build": "b9632",
+    "revision": "acd79d603",
+    "add_generation_prompt": true,
+    "add_special": true,
+    "parse_special": true
+  },
+  "shapes": [
+    {
+      "id": "single_user",
+      "messages": [{"role": "user", "content": "What is the capital of France?"}],
+      "expected_prompt": "<|START_OF_TURN_TOKEN|><|USER_TOKEN|>What is the capital of France?<|END_OF_TURN_TOKEN|><|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>",
+      "prompt_ids": [5, 255000, 255006, 11214, 1801, 1690, 7784, 1719, 5334, 38, 255001, 255000, 255007]
+    },
+    {
+      "id": "system_user",
+      "messages": [
+        {"role": "system", "content": "You are a concise assistant."},
+        {"role": "user", "content": "Name the largest ocean."}
+      ],
+      "expected_prompt": "<|START_OF_TURN_TOKEN|><|SYSTEM_TOKEN|>You are a concise assistant.<|END_OF_TURN_TOKEN|><|START_OF_TURN_TOKEN|><|USER_TOKEN|>Name the largest ocean.<|END_OF_TURN_TOKEN|><|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>",
+      "prompt_ids": [5, 255000, 255008, 5659, 1955, 1671, 82349, 17091, 21, 255001, 255000, 255006, 3020, 1690, 9717, 24301, 21, 255001, 255000, 255007]
+    },
+    {
+      "id": "multi_turn",
+      "messages": [
+        {"role": "user", "content": "Hi there."},
+        {"role": "assistant", "content": "Hello! How can I help?"},
+        {"role": "user", "content": "Say hello again."}
+      ],
+      "expected_prompt": "<|START_OF_TURN_TOKEN|><|USER_TOKEN|>Hi there.<|END_OF_TURN_TOKEN|><|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>Hello! How can I help?<|END_OF_TURN_TOKEN|><|START_OF_TURN_TOKEN|><|USER_TOKEN|>Say hello again.<|END_OF_TURN_TOKEN|><|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>",
+      "prompt_ids": [5, 255000, 255006, 37535, 2782, 21, 255001, 255000, 255007, 28339, 8, 4070, 2063, 1767, 3153, 38, 255001, 255000, 255006, 54818, 65903, 3407, 21, 255001, 255000, 255007]
+    }
+  ],
+  "does_not_prove": [
+    "tools or tool history",
+    "structured or multimodal content",
+    "generation parity",
+    "API/WebUI readiness",
+    "context",
+    "support"
+  ]
+}

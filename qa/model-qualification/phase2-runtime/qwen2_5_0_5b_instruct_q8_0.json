@@ -1,0 +1,470 @@
+{
+  "schema": "camelid.model-qualification-report/v1",
+  "generated_at": "2026-08-11T18:17:21.276Z",
+  "row_id": "qwen2_5_0_5b_instruct_q8_0",
+  "source_head": "fcab3e2f1debe4ef1b999b3e7ab193947d978f85",
+  "source_dirty": true,
+  "source_inspection": "observed",
+  "host": {
+    "hostname_redacted": true,
+    "platform": "darwin",
+    "release": "25.5.0",
+    "arch": "arm64",
+    "logical_cpus": 10
+  },
+  "backend": {
+    "serve": "cpu_reference",
+    "env": {
+      "CAMELID_GPU": "off",
+      "CAMELID_DETERMINISTIC": "1"
+    }
+  },
+  "artifact": {
+    "path": "<artifact>",
+    "size_bytes": 675710816,
+    "sha256": "ca59ca7f13d0e15a8cfa77bd17e65d24f6844b554a7b6c12e07a5f89ff76844e",
+    "path_redacted": true
+  },
+  "oracle_fixture": {
+    "path": "qa/model-qualification/fixtures/qwen2.5-0.5b-q8-llamacpp-b9632.json",
+    "status": "pass"
+  },
+  "stages": {
+    "source": {
+      "status": "pass",
+      "repo": "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+      "revision": "9217f5db79a29953eb74d5343926648285ec7e67",
+      "file": "qwen2.5-0.5b-instruct-q8_0.gguf",
+      "license": "apache-2.0"
+    },
+    "artifact": {
+      "status": "pass",
+      "size_bytes": 675710816,
+      "sha256": "ca59ca7f13d0e15a8cfa77bd17e65d24f6844b554a7b6c12e07a5f89ff76844e"
+    },
+    "metadata": {
+      "status": "pass",
+      "command": [
+        "<camelid>",
+        "inspect",
+        "<artifact>"
+      ],
+      "observed": {
+        "architecture": "qwen2",
+        "tokenizer_model": "gpt2",
+        "tokenizer_pre": "qwen2",
+        "declared_quant": "Q8_0",
+        "headline_quant": "Q8_0",
+        "tensor_count": 291
+      }
+    },
+    "tokenizer": {
+      "status": "pass",
+      "oracle_fixture": "qa/model-qualification/fixtures/qwen2.5-0.5b-q8-llamacpp-b9632.json",
+      "probes": [
+        {
+          "text": "The capital of France is",
+          "match": true,
+          "first_divergence": null,
+          "actual_length": 5,
+          "expected_length": 5,
+          "actual_ids": [
+            785,
+            6722,
+            315,
+            9625,
+            374
+          ],
+          "expected_ids": [
+            785,
+            6722,
+            315,
+            9625,
+            374
+          ]
+        },
+        {
+          "text": "Once upon a time",
+          "match": true,
+          "first_divergence": null,
+          "actual_length": 4,
+          "expected_length": 4,
+          "actual_ids": [
+            12522,
+            5193,
+            264,
+            882
+          ],
+          "expected_ids": [
+            12522,
+            5193,
+            264,
+            882
+          ]
+        },
+        {
+          "text": "The quick brown fox",
+          "match": true,
+          "first_divergence": null,
+          "actual_length": 4,
+          "expected_length": 4,
+          "actual_ids": [
+            785,
+            3974,
+            13876,
+            38835
+          ],
+          "expected_ids": [
+            785,
+            3974,
+            13876,
+            38835
+          ]
+        },
+        {
+          "text": "2 + 2 =",
+          "match": true,
+          "first_divergence": null,
+          "actual_length": 5,
+          "expected_length": 5,
+          "actual_ids": [
+            17,
+            488,
+            220,
+            17,
+            284
+          ],
+          "expected_ids": [
+            17,
+            488,
+            220,
+            17,
+            284
+          ]
+        }
+      ],
+      "chat_probes": [
+        {
+          "name": "one_user_turn_with_default_system",
+          "match": true,
+          "first_divergence": null,
+          "actual_length": 36,
+          "expected_length": 36,
+          "actual_ids": [
+            151644,
+            8948,
+            198,
+            2610,
+            525,
+            1207,
+            16948,
+            11,
+            3465,
+            553,
+            54364,
+            14817,
+            13,
+            1446,
+            525,
+            264,
+            10950,
+            17847,
+            13,
+            151645,
+            198,
+            151644,
+            872,
+            198,
+            3838,
+            374,
+            279,
+            6722,
+            315,
+            9625,
+            30,
+            151645,
+            198,
+            151644,
+            77091,
+            198
+          ],
+          "expected_ids": [
+            151644,
+            8948,
+            198,
+            2610,
+            525,
+            1207,
+            16948,
+            11,
+            3465,
+            553,
+            54364,
+            14817,
+            13,
+            1446,
+            525,
+            264,
+            10950,
+            17847,
+            13,
+            151645,
+            198,
+            151644,
+            872,
+            198,
+            3838,
+            374,
+            279,
+            6722,
+            315,
+            9625,
+            30,
+            151645,
+            198,
+            151644,
+            77091,
+            198
+          ]
+        }
+      ]
+    },
+    "template": {
+      "status": "blocked",
+      "oracle_fixture": "qa/model-qualification/fixtures/qwen2.5-0.5b-q8-llamacpp-b9632.json",
+      "reason": "the rendered oracle bytes tokenize identically, but the Camelid API renderer has not yet been compared byte-for-byte in this report"
+    },
+    "load_smoke": {
+      "status": "blocked",
+      "reason": "smoke execution was not requested; pass --run-smoke"
+    },
+    "parity": {
+      "status": "fail",
+      "oracle_fixture": "qa/model-qualification/fixtures/qwen2.5-0.5b-q8-llamacpp-b9632.json",
+      "probes": [
+        {
+          "text": "The capital of France is",
+          "match": true,
+          "first_divergence": null,
+          "actual_length": 16,
+          "expected_length": 16,
+          "actual_ids": [
+            12095,
+            13,
+            1084,
+            374,
+            279,
+            7772,
+            3283,
+            304,
+            4505,
+            323,
+            279,
+            2086,
+            7772,
+            304,
+            279,
+            1879
+          ],
+          "expected_ids": [
+            12095,
+            13,
+            1084,
+            374,
+            279,
+            7772,
+            3283,
+            304,
+            4505,
+            323,
+            279,
+            2086,
+            7772,
+            304,
+            279,
+            1879
+          ],
+          "actual_text": " Paris. It is the largest city in Europe and the second largest in the world",
+          "expected_text": " Paris. It is the largest city in Europe and the second largest in the world",
+          "metrics": {
+            "prompt_tokens": 5,
+            "load_ms": 426.798417,
+            "ttft_ms": 542.1822080000001,
+            "decode_ms": 842.336875,
+            "tokens_per_second": 17.80760221378175,
+            "peak_memory_bytes": 983580672
+          }
+        },
+        {
+          "text": "Once upon a time",
+          "match": true,
+          "first_divergence": null,
+          "actual_length": 16,
+          "expected_length": 16,
+          "actual_ids": [
+            11,
+            1052,
+            572,
+            264,
+            3908,
+            883,
+            6941,
+            3757,
+            879,
+            12163,
+            304,
+            264,
+            2613,
+            14126,
+            13,
+            3757
+          ],
+          "expected_ids": [
+            11,
+            1052,
+            572,
+            264,
+            3908,
+            883,
+            6941,
+            3757,
+            879,
+            12163,
+            304,
+            264,
+            2613,
+            14126,
+            13,
+            3757
+          ],
+          "actual_text": ", there was a young man named John who lived in a small village. John",
+          "expected_text": ", there was a young man named John who lived in a small village. John",
+          "metrics": {
+            "prompt_tokens": 4,
+            "load_ms": 385.499125,
+            "ttft_ms": 424.429042,
+            "decode_ms": 854.6971249999999,
+            "tokens_per_second": 17.550076584146694,
+            "peak_memory_bytes": 983842816
+          }
+        },
+        {
+          "text": "The quick brown fox",
+          "match": false,
+          "first_divergence": 15,
+          "actual_length": 16,
+          "expected_length": 16,
+          "actual_ids": [
+            34208,
+            916,
+            264,
+            15678,
+            5562,
+            11,
+            374,
+            279,
+            1852,
+            438,
+            279,
+            2701,
+            11652,
+            25,
+            330,
+            32
+          ],
+          "expected_ids": [
+            34208,
+            916,
+            264,
+            15678,
+            5562,
+            11,
+            374,
+            279,
+            1852,
+            438,
+            279,
+            2701,
+            11652,
+            25,
+            330,
+            785
+          ],
+          "actual_text": " jumps over a lazy dog, is the same as the following sentence: \"A",
+          "expected_text": " jumps over a lazy dog, is the same as the following sentence: \"The",
+          "metrics": {
+            "prompt_tokens": 4,
+            "load_ms": 381.003875,
+            "ttft_ms": 401.737042,
+            "decode_ms": 842.333917,
+            "tokens_per_second": 17.807664748230717,
+            "peak_memory_bytes": 984268800
+          }
+        },
+        {
+          "text": "2 + 2 =",
+          "match": true,
+          "first_divergence": null,
+          "actual_length": 16,
+          "expected_length": 16,
+          "actual_ids": [
+            220,
+            19,
+            198,
+            59,
+            2533,
+            54815,
+            11,
+            279,
+            897,
+            315,
+            17767,
+            64,
+            488,
+            293,
+            488,
+            272
+          ],
+          "expected_ids": [
+            220,
+            19,
+            198,
+            59,
+            2533,
+            54815,
+            11,
+            279,
+            897,
+            315,
+            17767,
+            64,
+            488,
+            293,
+            488,
+            272
+          ],
+          "actual_text": " 4\n\\]\n\nTherefore, the value of \\(a + b + c",
+          "expected_text": " 4\n\\]\n\nTherefore, the value of \\(a + b + c",
+          "metrics": {
+            "prompt_tokens": 5,
+            "load_ms": 403.333916,
+            "ttft_ms": 480.515125,
+            "decode_ms": 836.4534590000001,
+            "tokens_per_second": 17.932856680314114,
+            "peak_memory_bytes": 984170496
+          }
+        }
+      ],
+      "reason": "greedy token parity diverged from the pinned oracle"
+    },
+    "api_webui": {
+      "status": "blocked",
+      "reason": "API/WebUI promotion smoke requires an explicitly started current-head server and frontend; this local file runner does not infer it"
+    },
+    "context": {
+      "status": "blocked",
+      "reason": "no preflighted context receipt captured; required buckets: 512"
+    }
+  },
+  "overall_status": "fail"
+}

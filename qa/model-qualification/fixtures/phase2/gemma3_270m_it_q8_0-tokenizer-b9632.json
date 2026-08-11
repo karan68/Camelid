@@ -1,0 +1,276 @@
+{
+  "schema": "camelid.model-qualification-oracle/v1",
+  "generated_at": "2026-08-11T17:04:00.443Z",
+  "row_id": "gemma3_270m_it_q8_0",
+  "scope": "tokenizer_and_raw_greedy_generation",
+  "artifact": {
+    "repo": "unsloth/gemma-3-270m-it-GGUF",
+    "revision": "c90975dbd40c0c7b275fefaae758c3415c906238",
+    "file": "gemma-3-270m-it-Q8_0.gguf",
+    "size_bytes": 291546144,
+    "sha256": "d156a5159f2f79c1b1d53c7c1cc20f1ff28ab8d00f17a292620aad13399b9698"
+  },
+  "oracle": {
+    "engine": "llama.cpp",
+    "build": "b9632",
+    "revision": "acd79d603",
+    "platform": "darwin-arm64",
+    "release": "25.5.0",
+    "llama_tokenize_sha256": "de1b813ddc9ad026d45c4f3f37b1f2052aa4c01b94a66ddcea2e8ac673bcc4ba",
+    "llama_server_sha256": "382096b1dc10da68c2bf0a97e1f0dd36db90531cdea1434760d8c1a70fea1310",
+    "command": [
+      "<llama-tokenize>",
+      "-m",
+      "<artifact>",
+      "-p",
+      "<prompt>",
+      "--ids",
+      "--no-escape",
+      "--log-disable"
+    ]
+  },
+  "raw_prompts": [
+    {
+      "text": "Hello",
+      "prompt_ids": [
+        2,
+        9259
+      ],
+      "generated_ids": [
+        236888,
+        564,
+        236789,
+        236757,
+        9775
+      ],
+      "generated_text": "! I'm excited"
+    },
+    {
+      "text": "The capital of France is",
+      "prompt_ids": [
+        2,
+        818,
+        5279,
+        529,
+        7001,
+        563
+      ],
+      "generated_ids": [
+        9079,
+        236761,
+        108,
+        818,
+        5279
+      ],
+      "generated_text": " Paris.\n\nThe capital"
+    },
+    {
+      "text": "Once upon a time",
+      "prompt_ids": [
+        2,
+        14946,
+        3324,
+        496,
+        990
+      ],
+      "generated_ids": [
+        236764,
+        993,
+        691,
+        496,
+        1944
+      ],
+      "generated_text": ", there was a small"
+    },
+    {
+      "text": "The quick brown fox",
+      "prompt_ids": [
+        2,
+        818,
+        3823,
+        8864,
+        37423
+      ],
+      "generated_ids": [
+        236764,
+        496,
+        33070,
+        529,
+        8176
+      ],
+      "generated_text": ", a creature of pure"
+    },
+    {
+      "text": "2 + 2 =",
+      "prompt_ids": [
+        2,
+        236778,
+        900,
+        236743,
+        236778,
+        578
+      ],
+      "generated_ids": [
+        236743,
+        236812,
+        108,
+        818,
+        3890
+      ],
+      "generated_text": " 4\n\nThe answer"
+    },
+    {
+      "text": "don't stop 12345\nUnicode café 東京 🙂",
+      "prompt_ids": [
+        2,
+        13246,
+        236789,
+        236745,
+        4721,
+        236743,
+        236770,
+        236778,
+        236800,
+        236812,
+        236810,
+        107,
+        123540,
+        33443,
+        86459,
+        57235
+      ],
+      "generated_ids": [
+        107,
+        123540,
+        33443,
+        86459,
+        57235
+      ],
+      "generated_text": "\nUnicode café 東京 🙂"
+    }
+  ],
+  "chat_templates": [
+    {
+      "name": "user-only",
+      "rendered": "<start_of_turn>user\nWhat is the capital of France?<end_of_turn>\n<start_of_turn>model\n",
+      "prompt_ids": [
+        105,
+        2364,
+        107,
+        3689,
+        563,
+        506,
+        5279,
+        529,
+        7001,
+        236881,
+        106,
+        107,
+        105,
+        4368,
+        107
+      ]
+    },
+    {
+      "name": "system-fold",
+      "rendered": "<start_of_turn>user\nYou are a concise assistant.\n\nName the largest ocean.<end_of_turn>\n<start_of_turn>model\n",
+      "prompt_ids": [
+        105,
+        2364,
+        107,
+        3048,
+        659,
+        496,
+        63510,
+        16326,
+        236761,
+        108,
+        1567,
+        506,
+        7488,
+        12461,
+        236761,
+        106,
+        107,
+        105,
+        4368,
+        107
+      ]
+    },
+    {
+      "name": "multi-turn",
+      "rendered": "<start_of_turn>user\nHi there.<end_of_turn>\n<start_of_turn>model\nHello! How can I help?<end_of_turn>\n<start_of_turn>user\nSay hello again.<end_of_turn>\n<start_of_turn>model\n",
+      "prompt_ids": [
+        105,
+        2364,
+        107,
+        10979,
+        993,
+        236761,
+        106,
+        107,
+        105,
+        4368,
+        107,
+        9259,
+        236888,
+        2088,
+        740,
+        564,
+        1601,
+        236881,
+        106,
+        107,
+        105,
+        2364,
+        107,
+        37889,
+        29104,
+        1570,
+        236761,
+        106,
+        107,
+        105,
+        4368,
+        107
+      ]
+    }
+  ],
+  "does_not_prove": [
+    "Camelid weight load, logits, generation, or greedy-token parity until the independent replay phase passes",
+    "chat-template rendering or prompt-token parity unless a separate exact-row shape pack is cited",
+    "API, WebUI, bounded context, performance, GPU execution, portability, neighboring rows, or broad-family support"
+  ],
+  "greedy_capture": {
+    "captured_at": "2026-08-11T17:50:04.452Z",
+    "endpoint": "/completion",
+    "prompt_input": "pinned_prompt_ids",
+    "max_new_tokens": 5,
+    "temperature": 0,
+    "top_k": 1,
+    "seed": 0,
+    "cache_prompt": false,
+    "samplers": [
+      "top_k"
+    ],
+    "backend": "cpu_reference_f32_kv_no_repack",
+    "llama_server_command": [
+      "<llama-server>",
+      "-m",
+      "<artifact>",
+      "-c",
+      "256",
+      "-ngl",
+      "0",
+      "-ctk",
+      "f32",
+      "-ctv",
+      "f32",
+      "-fa",
+      "off",
+      "--no-repack",
+      "--no-warmup",
+      "--log-disable"
+    ]
+  }
+}

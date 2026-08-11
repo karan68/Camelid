@@ -28,7 +28,10 @@
       "type": "string",
       "$comment": "Code-derived from `status:` literals in src/api/mod.rs. check-ledger-schema.mjs asserts this list is a SUPERSET of the live code values (drift guard). Polymorphic by item type: model rows use the supported_*/active_validation_*/planned_* subset; SupportItem lists (quant/family/api_features) add ok/partial/future/downloading/error.",
       "enum": [
+        "active_validation_api_webui_pass_pending_context",
+        "active_validation_blocked_load",
         "active_validation_blocked_parity",
+        "active_validation_blocked_template",
         "active_validation_exact_row_hold",
         "active_validation_exact_row_smoke",
         "active_validation_partial_runtime",
@@ -88,18 +91,19 @@
         "exact_row_single_node_cpu_smoke_only",
         "exact_row_smoke_only",
         "exact_row_validation_only",
-        "future_exact_row_planning_only"
+        "future_exact_row_planning_only",
+        "phase2_exact_row_validation_only"
       ]
     },
     "fullSupportStatusVocabulary": {
       "type": "string",
       "$comment": "Code-derived from `full_support_status:` literals in src/api/mod.rs (checked ⊇ by check-ledger-schema.mjs).",
-      "enum": ["blocked_before_support_promotion", "blocked_generation_parity", "blocked_later_generation_divergence", "blocked_pending_broader_encoder_evidence", "blocked_pending_normalized_full_support", "blocked_pending_portability_and_bounded_context", "blocked_pending_portability_bounded_context_and_multimodal_expansion", "blocked_prompt_and_generation_parity", "current_gate_refresh_under_stricter_bar", "not_applicable_until_certified_row", "not_applicable_until_runtime_support"]
+      "enum": ["blocked_before_support_promotion", "blocked_generation_parity", "blocked_later_generation_divergence", "blocked_pending_broader_encoder_evidence", "blocked_pending_context_performance_and_portability", "blocked_pending_normalized_full_support", "blocked_pending_portability_and_bounded_context", "blocked_pending_portability_bounded_context_and_multimodal_expansion", "blocked_prompt_and_generation_parity", "current_gate_refresh_under_stricter_bar", "not_applicable_until_certified_row", "not_applicable_until_runtime_support"]
     },
     "latestCheckedResultVocabulary": {
       "type": "string",
       "$comment": "Code-derived from `latest_checked_result:` literals in src/api/mod.rs (checked ⊇ by check-ledger-schema.mjs).",
-      "enum": ["blocked_generation_parity", "blocked_later_generation_divergence", "blocked_prompt_and_generation_parity", "not_started", "partial_pass_hold", "pass", "pass_active_validation_only", "planning_only"]
+      "enum": ["active_validation_api_webui_pass_pending_context", "active_validation_blocked_load", "active_validation_blocked_parity", "active_validation_blocked_template", "blocked_generation_parity", "blocked_later_generation_divergence", "blocked_prompt_and_generation_parity", "not_started", "partial_pass_hold", "pass", "pass_active_validation_only", "planning_only"]
     },
     "supportItem": {
       "type": "object",

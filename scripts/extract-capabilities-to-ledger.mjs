@@ -257,6 +257,106 @@ async function extractApiFeatureContract(root) {
   })
 }
 
+function phase2CompatibilityContract({ id, family, quantization, loadPass, parityPass, templatePass, evidence }) {
+  const status = !loadPass
+    ? 'active_validation_blocked_load'
+    : !parityPass
+      ? 'active_validation_blocked_parity'
+      : !templatePass
+        ? 'active_validation_blocked_template'
+        : 'active_validation_api_webui_pass_pending_context'
+  const blocker = !loadPass
+    ? 'the exact artifact does not yet complete tensor binding/load; parity, API/WebUI, context, performance, and portability remain blocked'
+    : !parityPass
+      ? 'the exact artifact loads and generates, but deterministic greedy token parity against the pinned llama.cpp oracle fails; API/WebUI promotion and context remain fail-closed'
+      : !templatePass
+        ? 'raw deterministic parity passes, but the public chat-template envelope is intentionally bounded and has not earned API/WebUI or context promotion'
+        : 'short deterministic parity and guarded API/WebUI smoke pass; the exact-row bounded 512-context receipt is still required before support promotion'
+  return {
+    id,
+    family,
+    quantization,
+    status,
+    tool_capable: false,
+    support_scope: 'phase2_exact_row_validation_only',
+    full_support_status: 'blocked_pending_context_performance_and_portability',
+    full_support_blockers: blocker,
+    metadata_parses: 'validated_exact_artifact',
+    tokenizer_works: 'validated_against_pinned_llama_cpp_b9632',
+    tensors_load: loadPass ? 'validated_real_weight_forward' : 'failed_exact_artifact_tensor_binding',
+    generation_runs: loadPass ? 'validated_deterministic_greedy' : 'blocked_by_load_failure',
+    parity_audited: parityPass ? 'pass_exact_greedy_token_ids' : loadPass ? 'failed_exact_greedy_token_ids' : 'blocked_by_load_failure',
+    performance_measured: 'not_promoted',
+    frontend_load_path_verified: parityPass ? 'validated_guarded_api_webui_smoke' : 'fail_closed_phase2_validation',
+    frontend_readiness_gate: 'fail-closed; green only after this exact row passes parity, API/WebUI, and the bounded 512-context gate',
+    tested_context: 'short_prompt_oracle_pack_only',
+    chat_template_renderer: templatePass ? 'validated_exact_row_shape_pack' : 'bounded_default_envelope_only',
+    chat_template_shape_pack: templatePass ? 'pass' : 'blocked_partial_envelope',
+    chat_template_shape_pack_id: 'phase2-roster-template-evidence',
+    bounded_context_512_pack: 'not_started',
+    bounded_context_512_pack_id: 'phase2-context-512-v1',
+    bounded_context_window: 512,
+    bounded_context_1024_pack: 'not_promoted',
+    bounded_context_1024_pack_id: 'not_selected',
+    bounded_context_1024_window: 1024,
+    bounded_context_2048_pack: 'not_promoted',
+    bounded_context_2048_pack_id: 'not_selected',
+    bounded_context_2048_window: 2048,
+    bounded_context_4096_pack: 'not_promoted',
+    bounded_context_4096_pack_id: 'not_selected',
+    bounded_context_4096_window: 4096,
+    bounded_context_8192_pack: 'not_promoted',
+    bounded_context_8192_pack_id: 'not_selected',
+    bounded_context_8192_window: 8192,
+    latest_checked_bucket: parityPass ? 'phase2_guarded_api_webui_smoke' : 'phase2_short_greedy_parity',
+    latest_checked_result: status,
+    latest_checked_output: evidence,
+    evidence,
+    next_step: 'close the recorded blocker, then capture exact-row API/WebUI and bounded 512-context evidence before support promotion',
+  }
+}
+
+function extractPhase2CompatibilityRows(src) {
+  const marker = 'fn phase2_model_compatibility_targets()'
+  const start = src.indexOf(marker)
+  if (start < 0) return []
+  const block = balancedBlock(src, src.indexOf('{', start))
+  const rows = []
+  const callRe = /phase2_model_compatibility_target\s*\(/g
+  for (const match of block.matchAll(callRe)) {
+    const open = match.index + match[0].lastIndexOf('(')
+    const call = balancedBlock(block, open, '(', ')')
+    const values = [...call.matchAll(/"([^"]*)"|\b(true|false)\b/g)].map((token) => (
+      token[1] === undefined ? token[2] === 'true' : token[1]
+    ))
+    if (values.length !== 7) {
+      throw new Error(`phase2_model_compatibility_target call parsed ${values.length} arguments instead of 7`)
+    }
+    const [id, family, quantization, loadPass, parityPass, templatePass, evidence] = values
+    rows.push(phase2CompatibilityContract({ id, family, quantization, loadPass, parityPass, templatePass, evidence }))
+  }
+  if (rows.length === 0) throw new Error('phase2_model_compatibility_targets() parsed to zero rows')
+  return rows
+}
+
+function extractModelCompatibilityRows(src, capabilitiesBlock, parsedCapabilities) {
+  if (Array.isArray(parsedCapabilities.model_compatibility)) return parsedCapabilities.model_compatibility
+
+  const fieldStart = capabilitiesBlock.indexOf('model_compatibility:')
+  const runtimeStart = capabilitiesBlock.indexOf('runtime_projects:', fieldStart)
+  const composedField = capabilitiesBlock.slice(fieldStart, runtimeStart)
+  const baseMarker = 'let mut rows = vec!['
+  const baseStart = composedField.indexOf(baseMarker)
+  if (baseStart < 0) throw new Error('composed model_compatibility is missing its base vec literal')
+  const baseOpen = composedField.indexOf('[', baseStart)
+  const baseRows = parse(tokenize(balancedBlock(composedField, baseOpen, '[', ']')))
+  if (!Array.isArray(baseRows)) throw new Error('composed model_compatibility base did not parse to an array')
+
+  const phase2 = extractPhase2CompatibilityRows(src)
+  const phase2Ids = new Set(phase2.map((row) => row.id))
+  return baseRows.filter((row) => !phase2Ids.has(row.id)).concat(phase2)
+}
+
 export async function buildLedger(root = ROOT) {
   const src = await readFile(join(root, 'src', 'api', 'mod.rs'), 'utf8')
   const marker = 'CapabilitiesResponse {'
@@ -273,8 +373,7 @@ export async function buildLedger(root = ROOT) {
   // execution_plan is the function param (None) -> null in the static contract
   cr.execution_plan = null
 
-  const rows = cr.model_compatibility
-  if (!Array.isArray(rows)) throw new Error('model_compatibility did not parse to an array')
+  const rows = extractModelCompatibilityRows(src, block, cr)
   const apiFeatures = await extractApiFeatureContract(root)
 
   const pinned = extractHashPinnedArtifacts(src)

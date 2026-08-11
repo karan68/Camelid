@@ -1,0 +1,225 @@
+{
+  "schema": "camelid.model-qualification-report/v1",
+  "generated_at": "2026-08-11T17:22:36.572Z",
+  "row_id": "qwen2_5_1_5b_instruct_q8_0",
+  "source_head": "fcab3e2f1debe4ef1b999b3e7ab193947d978f85",
+  "source_dirty": true,
+  "source_inspection": "observed",
+  "host": {
+    "hostname_redacted": true,
+    "platform": "darwin",
+    "release": "25.5.0",
+    "arch": "arm64",
+    "logical_cpus": 10
+  },
+  "backend": {
+    "serve": "cpu_reference",
+    "env": {
+      "CAMELID_GPU": "off",
+      "CAMELID_DETERMINISTIC": "1"
+    }
+  },
+  "artifact": {
+    "path": "<artifact>",
+    "size_bytes": 1894532128,
+    "sha256": "d7efb072e7724d25048a4fda0a3e10b04bdef5d06b1403a1c93bd9f1240a63c8",
+    "path_redacted": true
+  },
+  "oracle_fixture": {
+    "path": "qa/model-qualification/fixtures/phase2/qwen2_5_1_5b_instruct_q8_0-tokenizer-b9632.json",
+    "status": "pass"
+  },
+  "stages": {
+    "source": {
+      "status": "pass",
+      "repo": "Qwen/Qwen2.5-1.5B-Instruct-GGUF",
+      "revision": "91cad51170dc346986eccefdc2dd33a9da36ead9",
+      "file": "qwen2.5-1.5b-instruct-q8_0.gguf",
+      "license": "apache-2.0"
+    },
+    "artifact": {
+      "status": "pass",
+      "size_bytes": 1894532128,
+      "sha256": "d7efb072e7724d25048a4fda0a3e10b04bdef5d06b1403a1c93bd9f1240a63c8"
+    },
+    "metadata": {
+      "status": "pass",
+      "command": [
+        "<camelid>",
+        "inspect",
+        "<artifact>"
+      ],
+      "observed": {
+        "architecture": "qwen2",
+        "tokenizer_model": "gpt2",
+        "tokenizer_pre": "qwen2",
+        "headline_quant": "Q8_0",
+        "tensor_count": 339
+      }
+    },
+    "tokenizer": {
+      "status": "pass",
+      "oracle_fixture": "qa/model-qualification/fixtures/phase2/qwen2_5_1_5b_instruct_q8_0-tokenizer-b9632.json",
+      "probes": [
+        {
+          "text": "Hello",
+          "match": true,
+          "first_divergence": null,
+          "actual_length": 1,
+          "expected_length": 1,
+          "actual_ids": [
+            9707
+          ],
+          "expected_ids": [
+            9707
+          ]
+        },
+        {
+          "text": "The capital of France is",
+          "match": true,
+          "first_divergence": null,
+          "actual_length": 5,
+          "expected_length": 5,
+          "actual_ids": [
+            785,
+            6722,
+            315,
+            9625,
+            374
+          ],
+          "expected_ids": [
+            785,
+            6722,
+            315,
+            9625,
+            374
+          ]
+        },
+        {
+          "text": "Once upon a time",
+          "match": true,
+          "first_divergence": null,
+          "actual_length": 4,
+          "expected_length": 4,
+          "actual_ids": [
+            12522,
+            5193,
+            264,
+            882
+          ],
+          "expected_ids": [
+            12522,
+            5193,
+            264,
+            882
+          ]
+        },
+        {
+          "text": "The quick brown fox",
+          "match": true,
+          "first_divergence": null,
+          "actual_length": 4,
+          "expected_length": 4,
+          "actual_ids": [
+            785,
+            3974,
+            13876,
+            38835
+          ],
+          "expected_ids": [
+            785,
+            3974,
+            13876,
+            38835
+          ]
+        },
+        {
+          "text": "2 + 2 =",
+          "match": true,
+          "first_divergence": null,
+          "actual_length": 5,
+          "expected_length": 5,
+          "actual_ids": [
+            17,
+            488,
+            220,
+            17,
+            284
+          ],
+          "expected_ids": [
+            17,
+            488,
+            220,
+            17,
+            284
+          ]
+        },
+        {
+          "text": "don't stop 12345\nUnicode café 東京 🙂",
+          "match": true,
+          "first_divergence": null,
+          "actual_length": 16,
+          "expected_length": 16,
+          "actual_ids": [
+            15007,
+            944,
+            2936,
+            220,
+            16,
+            17,
+            18,
+            19,
+            20,
+            198,
+            33920,
+            51950,
+            60596,
+            109,
+            46553,
+            27484
+          ],
+          "expected_ids": [
+            15007,
+            944,
+            2936,
+            220,
+            16,
+            17,
+            18,
+            19,
+            20,
+            198,
+            33920,
+            51950,
+            60596,
+            109,
+            46553,
+            27484
+          ]
+        }
+      ],
+      "chat_probes": []
+    },
+    "template": {
+      "status": "blocked",
+      "reason": "template rendering is downstream of the tokenizer fixture gate"
+    },
+    "load_smoke": {
+      "status": "blocked",
+      "reason": "smoke execution was not requested; pass --run-smoke"
+    },
+    "parity": {
+      "status": "blocked",
+      "reason": "greedy generation parity was not requested; pass --run-generation"
+    },
+    "api_webui": {
+      "status": "blocked",
+      "reason": "API/WebUI promotion smoke requires an explicitly started current-head server and frontend; this local file runner does not infer it"
+    },
+    "context": {
+      "status": "blocked",
+      "reason": "no preflighted context receipt captured; required buckets: 512"
+    }
+  },
+  "overall_status": "blocked"
+}
