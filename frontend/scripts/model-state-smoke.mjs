@@ -46,6 +46,7 @@ import {
 } from '../src/lib/modelState.js'
 
 import { getChatGateState } from '../src/lib/chatGate.js'
+import { isEmbeddingOnlyModel, isGenerationCapableModel, modelTaskKind } from '../src/lib/modelCapabilities.js'
 import { formatDurationMs } from '../src/lib/formatters.js'
 import { SUPPORTED_MODELS } from '../src/lib/supportedModels.js'
 
@@ -75,6 +76,49 @@ assert.equal(isRunnableInCurrentRuntime(localReadyWithRuntimeName, { active_mode
 assert.equal(getChatGateState({ model_compatibility: [] }, localReadyWithRuntimeName, { active_model_id: 'backend-runtime-id', loaded_now: true, generation_ready: true }).runtimeReady, true, 'chat gate runtime readiness should use the same runtime id matcher as the API view')
 assert.equal(getModelStatusLabel(localLoadedReady), 'Loaded + generation-ready')
 assert.match(describeModelState(localLoadedReady), /generation_ready=true/)
+
+const bitnetEmbedding = {
+  ...localLoadedReady,
+  id: 'bitnet-embeddings-270m',
+  name: 'Microsoft BitNet Embedding 270M',
+  model_path: '/tmp/bitnet-embeddings-270m-bf16-i2_s.gguf',
+  embedding_capable: true,
+  generation_capable: false,
+  generation_ready: false,
+}
+const embeddingRuntime = {
+  active_model_id: 'bitnet-embeddings-270m',
+  loaded_now: true,
+  // A stale/incorrect true must never promote an embedding-only row into Chat.
+  generation_ready: true,
+  model_family: 'embedding',
+}
+assert.equal(isEmbeddingOnlyModel(bitnetEmbedding, embeddingRuntime), true)
+assert.equal(modelTaskKind(bitnetEmbedding, embeddingRuntime), 'embedding')
+assert.equal(isRunnableModel(bitnetEmbedding), false)
+assert.equal(isRunnableInCurrentRuntime(bitnetEmbedding, embeddingRuntime), false)
+assert.equal(getChatGateState({ model_compatibility: [] }, bitnetEmbedding, embeddingRuntime).embeddingOnly, true)
+assert.equal(getChatGateState({ model_compatibility: [] }, bitnetEmbedding, embeddingRuntime).chatUnlocked, false)
+assert.equal(getModelStatusLabel(bitnetEmbedding), 'Ready for embeddings')
+assert.match(describeModelState(bitnetEmbedding), /embeddings and reranking/i)
+
+const causalBaseModel = {
+  ...localLoadedReady,
+  id: 'bitnet-causal',
+  chat_capable: false,
+  embedding_capable: false,
+  generation_capable: true,
+}
+assert.equal(isEmbeddingOnlyModel(causalBaseModel), false, 'chat_capable=false must not demote a causal base model to embedding-only')
+assert.equal(isGenerationCapableModel(causalBaseModel), true)
+const companionProjector = {
+  id: 'vision-projector',
+  architecture: 'clip',
+  embedding_capable: false,
+  generation_capable: false,
+}
+assert.equal(isGenerationCapableModel(companionProjector), false)
+assert.equal(modelTaskKind(companionProjector), 'companion')
 assert.equal(formatDurationMs(0.42), '420 μs')
 assert.equal(formatDurationMs(18.7), '19 ms')
 assert.equal(formatDurationMs(328.92), '329 ms')
@@ -291,6 +335,12 @@ for (const [id, filename, quant] of prismCatalogRows) {
     `${filename} must derive the Models-page Supported lane from its exact capability row`,
   )
 }
+
+const lfmCatalogItem = SUPPORTED_MODELS.find((item) => item.catalog_id === 'lfm2_5_2_6b_q8_0')
+assert.ok(lfmCatalogItem, 'LFM2.5 2.6B Q8_0 must be visible in the frontend curated catalog decoration')
+assert.equal(lfmCatalogItem.filename, 'LFM2.5-2.6B-Q8_0.gguf')
+assert.equal(lfmCatalogItem.size_bytes, 2874779456)
+assert.equal(lfmCatalogItem.quant, 'Q8_0')
 assert.equal(
   isCompatibilitySupportedForModel(prismCapabilityFixture, null, {
     catalog_id: 'ternary_bonsai_8b_pq2_0',
@@ -441,6 +491,10 @@ assert.deepEqual(
   getChatGateState(capabilityFixture, { ...localLoadedReady, id: 'llama32-1b', ...llama32OneBExactArtifactModel }, { active_model_id: 'llama32-1b', loaded_now: true, generation_ready: true }),
   {
     hint: llama32OneBHint,
+    taskKind: 'unknown',
+    embeddingOnly: false,
+    embeddingReady: false,
+    generationCapable: true,
     runtimeReady: true,
     runtimeLoaded: true,
     runtimeGenerationReady: true,

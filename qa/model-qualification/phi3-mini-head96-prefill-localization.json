@@ -1,0 +1,62 @@
+{
+  "schema": "camelid.model-parity-localization/v1",
+  "generated_at": "2026-08-10T06:55:17Z",
+  "row_id": "phi3_mini_4k_instruct_q8_0",
+  "artifact": {
+    "file": "Phi-3-mini-4k-instruct-Q8_0.gguf",
+    "sha256": "0ac8ee48aeebf7d1b354691fd1e29e91c32ad88bbad10ad45ac880dcd4372a47"
+  },
+  "evidence_chronology": [
+    {
+      "receipt": "qa/muster/phi3-hold-evidence/generation-divergence-q8-20260727.json",
+      "status": "superseded",
+      "finding": "Its initial prefill/decode conclusion used two samples from a then-nondeterministic engine."
+    },
+    {
+      "receipt": "qa/muster/phi3-hold-evidence/nondeterminism-fixed-q8-20260728.json",
+      "status": "current_blocker",
+      "finding": "After the 96-row Metal PV overhang/race was fixed, three repeated runs became identical, and a fresh eight-token prefill selected reference token 13 while incremental decode selected token 3681."
+    }
+  ],
+  "localization": {
+    "head_dim": 96,
+    "metal_attention_pv_tile_rows": 64,
+    "second_tile_live_rows": 32,
+    "generic_cpu_cache_addressing": {
+      "test": "inference::tests::head_dim_96_cpu_attention_batch_matches_incremental_cache_reads",
+      "layouts": ["position_major", "head_major"],
+      "rows": 7,
+      "attention_heads": 8,
+      "kv_heads": 4,
+      "result": "bit_identical",
+      "conclusion": "The platform-neutral CPU attention batch and incremental readers agree at width 96; the generic cache layout/stride code is not the reproduced fault."
+    },
+    "metal_prefill_path": {
+      "prior_gate": "head_dim % 8 == 0 and head_dim <= 128",
+      "problem": "That gate admitted Phi-3's partial 64-row PV tile even though only complete row tiles carry prefill/decode parity evidence.",
+      "new_gate": "head_dim <= 128 and head_dim % 64 == 0",
+      "phi3_route": "existing f32 attention prefill fallback",
+      "memory_safety_fix_retained": true
+    }
+  },
+  "runtime_change": {
+    "file": "src/metal.rs",
+    "helper": "attention_matmul_prefill_head_dim_supported",
+    "scope": "Metal resident attention-as-matmul prefill only",
+    "support_claim": false
+  },
+  "verification": {
+    "host": "windows-x64",
+    "tests_passed": [
+      "inference::tests::head_dim_96_cpu_attention_batch_matches_incremental_cache_reads",
+      "metal::attention_matmul_prefill_shape_tests::partial_64_row_pv_tiles_fail_closed"
+    ],
+    "real_phi3_metal_rerun_available": false
+  },
+  "proposed_gate_update": {
+    "parity": "fail_pending_exact_row_rerun",
+    "api_webui": "blocked",
+    "context": "blocked",
+    "next_evidence": "On a Metal host with the pinned artifact, rerun the deterministic five-token prefix receipt with default prefill and CAMELID_PREFILL_CHUNK_TOKENS=1 as the control. Promote parity only if both select the pinned oracle sequence."
+  }
+}

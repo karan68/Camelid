@@ -37,7 +37,7 @@ Use these anchors before changing public copy:
 
 ## Claim policy
 
-- Do not promote a row from planned, evidence-only, active validation, or blocked status unless a scrubbed row-specific evidence bundle exists and `COMPATIBILITY.md`, `STATUS.md`, `/api/capabilities`, and WebUI readiness language are updated together.
+- Do not promote a row from planned, evidence-only, active validation, or blocked status unless a scrubbed row-specific evidence bundle exists and `COMPATIBILITY.md`, `docs/reference/STATUS.md`, `/api/capabilities`, and WebUI readiness language are updated together.
 - Do not infer support across neighboring model sizes, base/instruct variants, quantization formats, tokenizer families, context buckets, API surfaces, or frontend states.
 - Do not turn local-only tests, dirty-tree experiments, direction probes, implementation scaffolding, or timing anecdotes into release, benchmark, or readiness claims.
 - Do not publish local/private paths, hostnames, key paths, private IPs, raw operator commands, raw stderr, or model-library locations. Public evidence should use repo-relative paths, hashes, row IDs, timestamps, command names, and summarized pass/fail outcomes.
@@ -61,7 +61,7 @@ Scheduled audits should record sanitized evidence only: repo-relative paths, row
 
 Before landing a support-sensitive docs/API/frontend change:
 
-1. Read the current on-disk `README.md`, `STATUS.md`, `BENCHMARKS.md`, `COMPATIBILITY.md`, `/api/capabilities` implementation, and WebUI readiness docs.
+1. Read the current on-disk `README.md`, `docs/reference/STATUS.md`, `docs/benchmarks/BENCHMARKS.md`, `COMPATIBILITY.md`, `/api/capabilities` implementation, and WebUI readiness docs.
 2. Identify the exact row, API feature, benchmark lane, or WebUI state being changed.
 3. Cite only scrubbed committed evidence or explicitly label the work as local-only, planned, partial, evidence-only, or blocked.
 4. Run the public evidence and scrub guards when the change touches public claims.

@@ -1,3 +1,5 @@
+import { isEmbeddingOnlyModel } from './modelCapabilities.js'
+
 export function isExternalModel(model) {
   return model?.provider_kind === 'external'
 }
@@ -20,6 +22,7 @@ export function isModelGenerationReady(model) {
 
 export function isRunnableModel(model) {
   if (!model || model.status !== 'ready') return false
+  if (isEmbeddingOnlyModel(model)) return false
   if (isExternalModel(model)) return isHostedRoutingAvailable(model)
   return Boolean(hasLocalModelPath(model) && isModelLoadedNow(model) && isModelGenerationReady(model))
 }
@@ -36,6 +39,7 @@ export function getRuntimeRequestModelId(model, runtime, fallback = '') {
 }
 
 export function isRunnableInCurrentRuntime(model, runtime) {
+  if (isEmbeddingOnlyModel(model, runtime)) return false
   if (!isRunnableModel(model)) return false
   if (isExternalModel(model)) return Boolean(runtime?.generation_ready)
   return Boolean(runtime?.generation_ready && modelRuntimeIdMatches(model, runtime))
@@ -47,6 +51,9 @@ export function canLoadIntoRuntime(model) {
 
 export function getModelStatusLabel(model) {
   if (!model) return 'No model selected'
+  if (isEmbeddingOnlyModel(model)) {
+    return isModelLoadedNow(model) ? 'Ready for embeddings' : 'Embedding model'
+  }
   if (isModelLoadedNow(model) && isModelGenerationReady(model)) return 'Loaded + generation-ready'
   if (isModelLoadedNow(model)) return 'Loaded, not generation-ready'
   if (model.load_error || model.install_error) return 'Load needs attention'
@@ -62,6 +69,11 @@ export function getModelStatusLabel(model) {
 
 export function describeModelState(model) {
   if (!model) return 'Choose a model to decide what you want to use for the next chat.'
+  if (isEmbeddingOnlyModel(model)) {
+    return isModelLoadedNow(model)
+      ? 'Loaded for embeddings and reranking. This model is not generation-capable and will not appear as a Chat choice.'
+      : 'This model is for embeddings and reranking, not text generation or Chat.'
+  }
   if (isModelLoadedNow(model) && isModelGenerationReady(model)) return 'Loaded now and Camelid reports generation_ready=true, so chat can run immediately.'
   if (isModelLoadedNow(model)) return 'Loaded now, but Camelid still reports generation_ready=false. Chat remains blocked until tokenizer, config, tensor binding, and the CPU weight materialization budget all line up.'
   if (model.load_error || model.install_error) return 'The last load attempt failed. Check the saved path or retry after fixing the local GGUF file.'

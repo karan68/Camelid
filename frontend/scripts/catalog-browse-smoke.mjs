@@ -18,12 +18,61 @@ import {
   isRefusingFit,
   partitionByArchSupport,
   partitionCuratedByFit,
+  predictedLane,
   quantAdvice,
   repoOwner,
   repoTitle,
 } from '../src/lib/catalogBrowse.js'
 
 const GB = 1024 * 1024 * 1024
+
+/* --- host-scoped support lane --------------------------------------------- */
+{
+  const capabilities = {
+    model_compatibility: [
+      {
+        id: 'lfm2_5_2_6b_q8_0',
+        family: 'lfm2_decoder',
+        quantization: 'Q8_0',
+        status: 'supported_exact_row_smoke',
+      },
+    ],
+  }
+  const lfm = {
+    catalog_id: 'lfm2_5_2_6b_q8_0',
+    group: 'curated',
+    name: 'LFM2.5 2.6B Q8_0',
+    filename: 'LFM2.5-2.6B-Q8_0.gguf',
+    quant: 'Q8_0',
+    oracle_qualified: true,
+  }
+
+  assert.equal(
+    predictedLane(lfm, capabilities),
+    'supported',
+    'legacy/static capabilities still identify the exact supported row',
+  )
+  assert.equal(
+    predictedLane({ ...lfm, host_lane_class: 'experimental_implemented' }, capabilities),
+    'compatible',
+    'an explicit unsupported-host verdict cannot be promoted by the static row',
+  )
+  assert.equal(
+    predictedLane({ ...lfm, host_lane_class: 'supported' }, capabilities),
+    'supported',
+    'an eligible host keeps the exact supported lane',
+  )
+  assert.equal(
+    predictedLane({ ...lfm, host_lane_class: 'unsupported' }, capabilities),
+    'not_anchored',
+    'an explicit backend negative always fails closed',
+  )
+  assert.equal(
+    predictedLane({ ...lfm, group: 'experimental', host_lane_class: 'supported' }, capabilities),
+    'not_anchored',
+    'live filename guesses remain advisory even if a malformed response carries a lane',
+  )
+}
 
 function hfFile({ repo = 'unsloth/Phi-4-mini-instruct-GGUF', quant, size, fit = 'unknown', arch = 'phi3', archSupport = 'implemented' }) {
   return {

@@ -4,6 +4,7 @@ import { TokenizerPlayground } from '../components/models/TokenizerPlayground'
 import { ActiveModelBar } from '../components/models/ActiveModelBar'
 import { CatalogLaneBrowse } from '../components/models/CatalogLaneBrowse'
 import { DownloadsPanel } from '../components/models/DownloadsPanel'
+import { ModelFamilyGroups } from '../components/models/ModelFamilyGroups'
 import { UnsupportedBlocker } from '../components/models/UnsupportedBlocker'
 import { Section, SupportedRow, CompatibleRow, EligibleRow, NotAnchoredRow } from '../components/models/LaneRows'
 import { Button } from '../components/ui/Button'
@@ -12,7 +13,8 @@ import { Notice } from '../components/ui/Notice'
 import { useModelsPageData } from '../hooks/useModelsPageData'
 import { formatBytes } from '../lib/formatters'
 import { bucketByLane } from '../lib/modelLanes'
-import { loadLocalModelForChat, modelFilenameFromPath } from '../lib/modelActivation'
+import { modelSearchText, shouldOpenModelFamily } from '../lib/modelFamilies'
+import { loadLocalModelForChat, modelFilenameFromPath, unloadLocalModel } from '../lib/modelActivation'
 import { modelDeleteBlockedReason } from '../lib/modelDeletion'
 import { IconClose, IconModels, IconRefresh, IconSearch } from '../components/ui/icons'
 
@@ -85,15 +87,13 @@ export default function ModelsView({
     () => new Set((spine.local?.models || []).filter((model) => model.ghost_moe_prepared).map((model) => model.filename)),
     [spine.local],
   )
-  /* Name filter for the models already on this machine. It searches the display
-     name AND the filename, because a GGUF's file name is often the only place
-     the quantization appears — someone looking for "q4" means the file, not the
-     model family. The catalog below keeps its own search: that one reaches the
-     network to find models you do NOT have, which is a different question. */
+  /* Search the same identity the row exposes: display name, filename,
+     architecture, and derived family label. The latter two matter for renamed
+     local files whose scan rows do not carry a display name. */
   const matchesModelQuery = (model) => {
     const needle = modelQuery.trim().toLowerCase()
     if (!needle) return true
-    return `${model?.name || ''} ${model?.filename || ''}`.toLowerCase().includes(needle)
+    return modelSearchText(model).includes(needle)
   }
   const supportedRows = (laneBuckets ? laneBuckets.supported : []).filter(matchesModelQuery)
   /* Keep the experimental sub-lanes separate after filtering. Their row types
@@ -104,11 +104,21 @@ export default function ModelsView({
   const compatibleRows = (laneBuckets ? laneBuckets.compatible : []).filter(matchesModelQuery)
   const eligibleRows = (laneBuckets ? laneBuckets.eligible : []).filter(matchesModelQuery)
   const notAnchoredRows = (laneBuckets ? laneBuckets.not_anchored : []).filter(matchesModelQuery)
-  const experimentalRows = [...compatibleRows, ...eligibleRows, ...notAnchoredRows]
+  const experimentalRows = [
+    ...compatibleRows.map((entry) => ({ ...entry, _familyLane: 'compatible' })),
+    ...eligibleRows.map((entry) => ({ ...entry, _familyLane: 'eligible' })),
+    ...notAnchoredRows.map((entry) => ({ ...entry, _familyLane: 'not_anchored' })),
+  ]
   const filteringModels = Boolean(modelQuery.trim())
   const localMatchCount = supportedRows.length + experimentalRows.length
+  const localFamilyInitiallyOpen = (group) => shouldOpenModelFamily(group, {
+    filtering: filteringModels,
+    activeFilename: spine.activeFilename,
+    loadedModelIds: spine.loadedModelIds,
+  })
   const deleteBlockedReason = modelDeleteBlockedReason({
     activeFilename: spine.activeFilename,
+    residentModelsLoaded: spine.loadedModelIds.size > 0,
     downloads: spine.downloads,
     loading: Boolean(usingFilename || loadingModelId || importing || unloading),
     smoking: Object.values(smokeBusy).some(Boolean) || catalogOperations.size > 0,
@@ -128,7 +138,7 @@ export default function ModelsView({
   // lib/modelActivation so this page and the first-run card cannot drift; what stays
   // here is the page's own state wiring. The spine's `/api/models/current` refresh
   // answers the identity check, so the confirmation costs no extra request.
-  const loadModelForChat = async (filename, { onStage } = {}) => {
+  const loadModelForChat = async (filename, { onStage, model = null } = {}) => {
     if (loadInFlightRef.current) {
       const message = loadInFlightRef.current === filename
         ? `${filename} is already loading.`
@@ -144,6 +154,7 @@ export default function ModelsView({
       const result = await loadLocalModelForChat({
         apiBase: spine.base,
         filename,
+        model: model || spine.local?.models.find((entry) => entry.filename === filename) || null,
         onStage,
         readActiveFilename: async () => modelFilenameFromPath((await spine.refreshCurrent())?.path),
       })
@@ -152,8 +163,33 @@ export default function ModelsView({
         setLaneError(result.message)
         return result
       }
-      await refreshDashboard?.({ silent: true })
+      await Promise.all([
+        spine.refreshLoadedModels(),
+        refreshDashboard?.({ silent: true }),
+      ])
       return result
+    } finally {
+      if (loadInFlightRef.current === filename) loadInFlightRef.current = ''
+      setUsingFilename('')
+    }
+  }
+
+  const unloadEmbeddingModel = async (filename) => {
+    if (loadInFlightRef.current) return
+    loadInFlightRef.current = filename
+    setUsingFilename(filename)
+    setLaneError('')
+    try {
+      const result = await unloadLocalModel({ apiBase: spine.base, modelId: filename })
+      if (!result.ok) {
+        setLaneError(result.message)
+        return
+      }
+      await Promise.all([
+        spine.refreshLoadedModels(),
+        spine.refreshCurrent(),
+        refreshDashboard?.({ silent: true }),
+      ])
     } finally {
       if (loadInFlightRef.current === filename) loadInFlightRef.current = ''
       setUsingFilename('')
@@ -450,21 +486,27 @@ export default function ModelsView({
             {spine.localLoading ? 'Scanning local models…' : runtimeOnline ? 'Local model scan unavailable.' : 'Runtime offline — the local scan resumes when the backend is back.'}
           </p>
         ) : supportedRows.length ? (
-          supportedRows.map((m) => (
-            <SupportedRow
-              key={m.filename}
-              entry={m}
-              active={m.filename === spine.activeFilename}
-              busy={usingFilename === m.filename}
-              deleteBusy={deletingFilename === m.filename}
-              defaultBusy={defaultingFilename === m.filename}
-              isDefault={spine.defaultFilename === m.filename}
-              blockedReason={deleteBlockedReason}
-              onUse={() => loadModelForChat(m.filename)}
-              onDelete={requestDeleteModel}
-              onMakeDefault={makeDefaultModel}
-            />
-          ))
+          <ModelFamilyGroups
+            items={supportedRows}
+            initiallyOpen={localFamilyInitiallyOpen}
+            renderItem={(m) => (
+              <SupportedRow
+                key={m.filename}
+                entry={m}
+                active={m.filename === spine.activeFilename}
+                resident={m.filename === spine.activeFilename || spine.loadedModelIds.has(m.filename)}
+                busy={usingFilename === m.filename}
+                deleteBusy={deletingFilename === m.filename}
+                defaultBusy={defaultingFilename === m.filename}
+                isDefault={spine.defaultFilename === m.filename}
+                blockedReason={deleteBlockedReason}
+                onUse={() => loadModelForChat(m.filename)}
+                onUnload={unloadEmbeddingModel}
+                onDelete={requestDeleteModel}
+                onMakeDefault={makeDefaultModel}
+              />
+            )}
+          />
         ) : (
           <p className="lane-empty">{filteringModels ? 'No verified model matches this search.' : 'No verified models on this machine yet — download one below in “Get models”.'}</p>
         )}
@@ -482,23 +524,27 @@ export default function ModelsView({
             {spine.localLoading ? 'Scanning local models…' : runtimeOnline ? 'Local model scan unavailable.' : 'Runtime offline — the local scan resumes when the backend is back.'}
           </p>
         ) : experimentalRows.length ? (
-          <>
-            {compatibleRows.map((m) => (
+          <ModelFamilyGroups
+            items={experimentalRows}
+            initiallyOpen={localFamilyInitiallyOpen}
+            renderItem={(m) => m._familyLane === 'compatible' ? (
               <CompatibleRow
                 key={m.filename}
                 entry={m}
                 receipt={receipts[m.filename]}
+                active={m.filename === spine.activeFilename}
+                resident={m.filename === spine.activeFilename || spine.loadedModelIds.has(m.filename)}
                 busy={usingFilename === m.filename}
                 deleteBusy={deletingFilename === m.filename}
                 defaultBusy={defaultingFilename === m.filename}
                 isDefault={spine.defaultFilename === m.filename}
                 blockedReason={deleteBlockedReason}
                 onUse={() => loadModelForChat(m.filename)}
+                onUnload={unloadEmbeddingModel}
                 onDelete={requestDeleteModel}
                 onMakeDefault={makeDefaultModel}
               />
-            ))}
-            {eligibleRows.map((m) => (
+            ) : m._familyLane === 'eligible' ? (
               <EligibleRow
                 key={m.filename}
                 entry={m}
@@ -508,22 +554,24 @@ export default function ModelsView({
                 onRun={() => runSmoke(m.filename)}
                 onDelete={requestDeleteModel}
               />
-            ))}
-            {notAnchoredRows.map((m) => (
+            ) : (
               <NotAnchoredRow
                 key={m.filename}
                 entry={m}
+                active={m.filename === spine.activeFilename}
+                resident={m.filename === spine.activeFilename || spine.loadedModelIds.has(m.filename)}
                 busy={usingFilename === m.filename}
                 deleteBusy={deletingFilename === m.filename}
                 defaultBusy={defaultingFilename === m.filename}
                 isDefault={spine.defaultFilename === m.filename}
                 blockedReason={deleteBlockedReason}
                 onUse={() => loadModelForChat(m.filename)}
+                onUnload={unloadEmbeddingModel}
                 onDelete={requestDeleteModel}
                 onMakeDefault={makeDefaultModel}
               />
-            ))}
-          </>
+            )}
+          />
         ) : (
           <p className="lane-empty">{filteringModels ? 'No experimental model matches this search.' : 'Nothing experimental on this machine — every downloaded model is verified.'}</p>
         )}

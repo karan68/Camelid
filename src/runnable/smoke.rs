@@ -180,6 +180,18 @@ pub fn smoke_admit(path: &str) -> Result<SmokeReport> {
 /// The headline quant: the most common quantized (non-F32) tensor type, e.g. `Q8_0`.
 fn headline_quant(gguf: &GgufFile) -> String {
     use std::collections::HashMap;
+    // `general.file_type=40` is the GGUF I2_S file type. Official BitNet files
+    // also contain many small F16 norms (and an F16 embedding/head), so counting
+    // tensor descriptors mislabels their projection format as F16 even though
+    // every transformer matrix uses I2_S.
+    if gguf.metadata_u32("general.file_type") == Some(40)
+        && gguf
+            .tensors
+            .iter()
+            .any(|tensor| tensor.tensor_type == GgufTensorType::I2S)
+    {
+        return "I2_S".to_string();
+    }
     let mut counts: HashMap<GgufTensorType, usize> = HashMap::new();
     for t in &gguf.tensors {
         if t.tensor_type != GgufTensorType::F32 {
@@ -189,7 +201,10 @@ fn headline_quant(gguf: &GgufFile) -> String {
     counts
         .into_iter()
         .max_by_key(|(_, c)| *c)
-        .map(|(tt, _)| format!("{tt:?}"))
+        .map(|(tt, _)| match tt {
+            GgufTensorType::I2S => "I2_S".to_string(),
+            _ => format!("{tt:?}"),
+        })
         .unwrap_or_else(|| "F32".to_string())
 }
 
@@ -361,6 +376,14 @@ mod tests {
         assert!(super::oracle_qualified("nomic-bert", "Q8_0"));
         // Not anchored: a covered architecture we have not HF-anchored.
         assert!(!is_oracle_qualified("gemma2", TokenizerFamily::Spm, "Q8_0"));
+        // Attemptable after the Phase-3 config/admission slice, but deliberately
+        // not supported: no exact-row llama.cpp parity receipt exists yet.
+        assert!(!is_oracle_qualified(
+            "command-r",
+            TokenizerFamily::Bpe,
+            "Q4K"
+        ));
+        assert!(!super::oracle_qualified("command-r", "Q4K"));
         // Not anchored: anchored arch but a quant we did not anchor.
         assert!(!is_oracle_qualified("llama", TokenizerFamily::Spm, "Q4K"));
         // Not anchored: anchored arch but unexpected tokenizer family.
@@ -389,6 +412,17 @@ mod tests {
         assert!(
             !msg.contains("unsupported quant"),
             "refusal must not read as a quant-coverage reject: {msg}"
+        );
+    }
+
+    #[test]
+    fn command_r_q4_k_smoke_refusal_is_not_yet_anchored() {
+        let err = oracle_qualification_gate("command-r", TokenizerFamily::Bpe, "Q4K")
+            .expect_err("command-r must remain smoke-refused until exact-row parity");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("combo not yet anchored: command-r/Q4K/Bpe"),
+            "refusal must be the oracle gate, got: {msg}"
         );
     }
 

@@ -1,0 +1,13 @@
+[hw] GPU: Apple M4 | Metal compute | unified-memory yes | GPU-resident inference available
+[hw] CPU: 10 logical cores | SIMD NEON (avx2=false avx512f=false fma=false neon=true) | RAM 8.1 GiB free / 16.0 GiB total
+  Diagnostics log: $CAMELID_STATE_DIR/logs/camelid.log
+
+  ðŸª Warming up the GPU (building the resident engine, one-time)â€¦
+[lfm2] resident Metal graph active (Q8_0 weights, short-conv + GQA attention, FFN, logits, GPU greedy)
+
+  ðŸª Camelid is ready
+  Open the chat UI:  http://127.0.0.1:8251
+  OpenAI-style API:  http://127.0.0.1:8251/v1/chat/completions
+
+  Workspace CLI: ready
+[lfm2] resident Metal graph active (Q8_0 weights, short-conv + GQA attention, FFN, logits, GPU greedy)

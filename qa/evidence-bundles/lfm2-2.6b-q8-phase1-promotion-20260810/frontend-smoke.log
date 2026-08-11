@@ -1,0 +1,7 @@
+PASS frontend HTTP 200
+PASS exact local identity: filename=LFM2.5-2.6B-Q8_0.gguf size_bytes=2874779456 lane_class=supported sha256=36587fdf27bdfc69caf2637273679a0870ec155162161bde6fd16e8c70bdb757
+PASS compatibility row: lfm2_5_2_6b_q8_0 status=supported_exact_row_smoke contract_supported=true webui_chat=enabled
+PASS streaming visible text: Hello! How can I help you today?
+PASS streaming terminal events: finish, usage, done
+PASS streaming finish_reason=stop usage={"prompt_tokens":11,"completion_tokens":43,"total_tokens":54} requested_max_tokens=128
+PASS non-streaming chat: prompt_tokens=11 completion_tokens=1 total_tokens=12

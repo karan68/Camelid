@@ -1,0 +1,66 @@
+{
+  "schema": "camelid.lfm2_macos_metal_promotion_summary/v1",
+  "generated_utc": "2026-08-10T16:06:13.245Z",
+  "runtime": {
+    "head": "d31e5cb02bd3633407cbd3e6e89aeac5bacde617",
+    "version": "v0.6.1-26-gd31e5cb0",
+    "binary_sha256": "96314b2022606f5f70495f6ed86652a5d001a946395cf1a96f7b26f9fd650de1",
+    "fit_check_override_set": false
+  },
+  "model": {
+    "id": "lfm2_5_2_6b_q8_0",
+    "filename": "LFM2.5-2.6B-Q8_0.gguf",
+    "size_bytes": 2874779456,
+    "sha256": "36587fdf27bdfc69caf2637273679a0870ec155162161bde6fd16e8c70bdb757",
+    "quantization": "Q8_0",
+    "architecture": "lfm2",
+    "local_lane_class": "supported",
+    "v1_models_count": 1
+  },
+  "contract": {
+    "row_id": "lfm2_5_2_6b_q8_0",
+    "status": "supported_exact_row_smoke",
+    "webui_chat": "enabled",
+    "exact_identity_checks_passed": true
+  },
+  "execution_plan": {
+    "exact_model_row": "LFM2.5-2.6B-Q8_0.gguf",
+    "support_level": "supported_exact_row_smoke",
+    "selected_backend": "metal_resident_lfm2_runtime",
+    "prefill_path": "lfm2_metal_resident_prefill",
+    "decode_path": "lfm2_metal_resident_decode",
+    "asserted_after_frontend_smoke": true
+  },
+  "api_nonstreaming_chat": {
+    "passed": true,
+    "max_tokens": 8,
+    "completion_tokens": 8,
+    "finish_reason": "length",
+    "generated_token_ids": [
+      207,
+      597,
+      4695,
+      2997,
+      496,
+      52071,
+      2784,
+      969
+    ]
+  },
+  "frontend": {
+    "passed": true,
+    "http_status": 200,
+    "http_ms": 42,
+    "model_load_ms": 78,
+    "stream_max_tokens": 128,
+    "stream_completion_tokens": 43,
+    "stream_finish_reason": "stop",
+    "terminal_usage_present": true,
+    "done_event_present": true
+  },
+  "intentional_skips": {
+    "legacy_v1_completions": "chat-only runnable qualification",
+    "generation_timing_summary": "runnable response does not emit dense-engine timing diagnostics"
+  },
+  "passed": true
+}

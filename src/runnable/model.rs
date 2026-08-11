@@ -2,20 +2,19 @@
 //!
 //! One configurable transformer (parameterized from GGUF KV via [`LlamaModelConfig`]):
 //! embeddings → N pre-norm blocks (RMSNorm → GQA attention with RoPE → RMSNorm →
-//! SwiGLU FFN) → final RMSNorm → logits. The generic reference graph itself uses no
-//! Metal/CUDA and no fused quantized kernels — weights are dequantized to f32
-//! ([`super::dequant`]) and run through naive f32 math. Speed is the supported lane's
-//! job; this path's job is to be obviously correct and deterministic so it can serve
-//! as the promotion oracle. This module ALSO hosts the arch-specific routing that
+//! SwiGLU FFN) → final RMSNorm → logits. Most weights are dequantized to f32
+//! ([`super::dequant`]) and run through naive f32 math. BitNet I2_S projections are
+//! the deliberate exception: cleanroom CPU and opportunistic Metal/CUDA kernels
+//! consume the canonical packed bytes directly. This module ALSO hosts the
+//! arch-specific routing that
 //! sends qwen35 to its resident Metal (macOS default) or CUDA graph and lfm2 to its
 //! Metal engine — those lanes consume packed quantized weights directly, and the f32
 //! reference below is their fallback and oracle.
 //!
-//! Memory: weights stay resident in their compact **quantized** form; each layer's
-//! matrices are dequantized to f32 once per forward pass and dropped, and the
-//! embedding/output projections are done row-by-row. Peak ≈ raw weights + one layer
-//! of f32, rather than the whole model as f32 — deliberate, so a small model fits a
-//! tight RAM budget without thrashing (`RUNNABLE_LANE_SPEC.md` working-env guard).
+//! Memory: weights stay resident in their compact **quantized** form. The generic
+//! reference graph dequantizes one projection at a time, embedding/output projections
+//! are handled row-by-row, and BitNet projections remain packed throughout. This
+//! avoids expanding a full model to f32.
 //!
 //! Phase 4 brings this up on **llama** (adjacent-pair RoPE, RMSNorm, SwiGLU, GQA).
 //! Architecture-specific switches (qwen3 QK-norm / split-half RoPE, gemma norms +
@@ -63,7 +62,6 @@ impl RawMatBytes {
         Self::Owned(Arc::new(bytes))
     }
 
-    #[cfg(target_os = "macos")]
     fn wire_pages(&self) -> Option<&Arc<crate::wire_mmap::WirePages>> {
         match self {
             Self::WirePages(pages) => Some(pages),
@@ -118,6 +116,17 @@ fn resident_metal_format(tt: GgufTensorType) -> Option<crate::metal::ResidentWei
     }
 }
 
+/// Formats accepted by the small hybrid projection bridge. Dense F16 is not a
+/// general resident-model admission: it is used only for BitNet's explicitly
+/// page-backed tied output head (see `load_raw`).
+#[cfg(target_os = "macos")]
+fn hybrid_metal_format(tt: GgufTensorType) -> Option<crate::metal::ResidentWeightFormat> {
+    match tt {
+        GgufTensorType::F16 => Some(crate::metal::ResidentWeightFormat::DenseF16),
+        _ => resident_metal_format(tt),
+    }
+}
+
 /// Tensor types read into `RawMatBytes::WirePages` rather than an owned `Vec`, so the
 /// allocation can be wrapped in place with `newBufferWithBytesNoCopy`.
 ///
@@ -129,7 +138,89 @@ fn resident_metal_format(tt: GgufTensorType) -> Option<crate::metal::ResidentWei
 /// Page-backing is otherwise unobservable — `as_slice` is identical either way and
 /// `wire_pages` is macOS-only — at the cost of rounding each tensor up to a page.
 fn wants_page_backing(tt: GgufTensorType) -> bool {
-    resident_metal_format(tt).is_some()
+    tt == GgufTensorType::I2S || resident_metal_format(tt).is_some()
+}
+
+/// The ReLU²/SubLN graph below is certified for Microsoft's exact 2B-4T
+/// checkpoint, not for every historical model that reused the
+/// `bitnet-b1.58` architecture label. Fail closed before loading weights so an
+/// older SiLU checkpoint cannot be executed with a plausible-but-wrong graph.
+fn validate_bitnet_b158_2b_4t(gguf: &GgufFile, config: &LlamaModelConfig) -> Result<()> {
+    if config.architecture != "bitnet-b1.58" {
+        return Ok(());
+    }
+
+    let head_dim = config
+        .attention_key_length
+        .or_else(|| {
+            config
+                .embedding_length
+                .checked_div(config.attention_head_count)
+        })
+        .unwrap_or(0);
+    let geometry_matches = gguf.model_name() == Some("bitnet2b")
+        && config.context_length == 4_096
+        && config.embedding_length == 2_560
+        && config.block_count == 30
+        && config.feed_forward_length == 6_912
+        && config.attention_head_count == 20
+        && config.attention_head_count_kv == 5
+        && head_dim == 128
+        && config.rope_dimension_count == Some(128)
+        && config.rope_freq_base == Some(500_000.0)
+        && config.vocab_size == Some(128_256)
+        && config.file_type == Some(40);
+
+    let projection_suffixes = [
+        ".attn_q.weight",
+        ".attn_k.weight",
+        ".attn_v.weight",
+        ".attn_output.weight",
+        ".ffn_gate.weight",
+        ".ffn_up.weight",
+        ".ffn_down.weight",
+    ];
+    let projections: Vec<_> = gguf
+        .tensors
+        .iter()
+        .filter(|tensor| {
+            tensor.name.starts_with("blk.")
+                && projection_suffixes
+                    .iter()
+                    .any(|suffix| tensor.name.ends_with(suffix))
+        })
+        .collect();
+    let tensors_match = projections.len() == 30 * projection_suffixes.len()
+        && projections
+            .iter()
+            .all(|tensor| tensor.tensor_type == GgufTensorType::I2S)
+        && gguf.tensors.iter().any(|tensor| {
+            tensor.name == "token_embd.weight" && tensor.tensor_type == GgufTensorType::F16
+        })
+        && !gguf
+            .tensors
+            .iter()
+            .any(|tensor| tensor.name == "output.weight");
+
+    if !geometry_matches || !tensors_match {
+        return Err(BackendError::InvalidModelMetadata(format!(
+            "bitnet-b1.58 runnable support is pinned to Microsoft's BitNet-b1.58-2B-4T I2_S artifact; got model {:?}, geometry ({}, {}, {}, {}, {}, {}, head_dim {}, rope {:?}/{:?}, vocab {:?}, file_type {:?}) and {} canonical projections",
+            gguf.model_name().unwrap_or("unknown"),
+            config.context_length,
+            config.embedding_length,
+            config.block_count,
+            config.feed_forward_length,
+            config.attention_head_count,
+            config.attention_head_count_kv,
+            head_dim,
+            config.rope_dimension_count,
+            config.rope_freq_base,
+            config.vocab_size,
+            config.file_type,
+            projections.len()
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -137,7 +228,7 @@ fn log_prism_metal_hybrid_once() {
     static LOGGED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     LOGGED.get_or_init(|| {
         eprintln!(
-            "[qwen35] Metal hybrid bring-up: packed Q1/Q2 projections are NoCopy GPU \
+            "[runnable] Metal hybrid bring-up: packed/ternary projections are NoCopy GPU \
              kernels; recurrent/attention state is still CPU-resident"
         );
     });
@@ -158,15 +249,16 @@ struct Mat {
 }
 
 impl Mat {
-    /// y[r] = Σ_i data[r*in + i] * x[i].
     fn matvec(&self, x: &[f32]) -> Vec<f32> {
         debug_assert_eq!(x.len(), self.in_features);
-        let mut y = vec![0.0f32; self.out_features];
-        for (r, yr) in y.iter_mut().enumerate() {
-            let row = &self.data[r * self.in_features..(r + 1) * self.in_features];
-            *yr = dot(row, x);
+        let mut output = vec![0.0_f32; self.out_features];
+        for (row, value) in output.iter_mut().enumerate() {
+            *value = dot(
+                &self.data[row * self.in_features..(row + 1) * self.in_features],
+                x,
+            );
         }
-        y
+        output
     }
 }
 
@@ -230,24 +322,46 @@ impl RawMat {
         })
     }
 
-    /// Dequantize the entire matrix to f32 (used per layer, dropped after the layer).
     fn dequant_all(&self, name: &str) -> Result<Mat> {
-        let data = super::dequant::dequantize(
-            self.tt,
-            self.bytes.as_slice(),
-            self.in_features * self.out_features,
-            name,
-        )?;
         Ok(Mat {
-            data,
+            data: super::dequant::dequantize(
+                self.tt,
+                self.bytes.as_slice(),
+                self.in_features * self.out_features,
+                name,
+            )?,
             in_features: self.in_features,
             out_features: self.out_features,
         })
     }
 
+    /// Preserve the generic graph's f32 reference arithmetic while allowing
+    /// canonical I2_S projections to stay packed and use their cleanroom lane.
+    fn projection_matvec(&self, input: &[f32], name: &str) -> Result<Vec<f32>> {
+        if self.tt == GgufTensorType::I2S {
+            self.par_matvec(input, name)
+        } else {
+            Ok(self.dequant_all(name)?.matvec(input))
+        }
+    }
+
+    fn projection_matmul(&self, inputs: &[Vec<f32>], name: &str) -> Result<Vec<Vec<f32>>> {
+        if self.tt == GgufTensorType::I2S {
+            self.par_matmul(inputs)
+        } else {
+            let matrix = self.dequant_all(name)?;
+            Ok(inputs.iter().map(|input| matrix.matvec(input)).collect())
+        }
+    }
+
     /// Dequantize a single row `r` (length `in_features`) — for embedding lookup and
     /// the output projection, which touch the huge vocab matrix one row at a time.
     fn dequant_row(&self, r: usize, name: &str) -> Result<Vec<f32>> {
+        if self.tt == GgufTensorType::I2S {
+            return Err(BackendError::InvalidTensorData(format!(
+                "I2_S tensor {name} has a tensor-wide scale trailer and cannot be decoded row-wise"
+            )));
+        }
         let rb = self.row_bytes();
         let slice = &self.bytes.as_slice()[r * rb..(r + 1) * rb];
         super::dequant::dequantize(self.tt, slice, self.in_features, name)
@@ -279,9 +393,46 @@ impl RawMat {
     /// corresponding slice of a whole-matrix dequant.
     fn par_matvec(&self, x: &[f32], name: &str) -> Result<Vec<f32>> {
         debug_assert_eq!(x.len(), self.in_features);
+        if self.tt == GgufTensorType::I2S {
+            let mode = crate::bitnet_kernels::BitNetKernelMode::from_env();
+            let mut output = vec![0.0_f32; self.out_features];
+            if crate::bitnet_kernels::gpu_allowed()
+                && crate::cuda::gpu_accel_enabled()
+                && crate::cuda::try_bitnet_i2_s_linear_rows(
+                    x,
+                    self.bytes.as_slice(),
+                    1,
+                    self.out_features,
+                    self.in_features,
+                    mode.gpu_code(),
+                    &mut output,
+                )
+            {
+                return Ok(output);
+            }
+            #[cfg(target_os = "macos")]
+            if crate::bitnet_kernels::gpu_allowed() && crate::cuda::gpu_accel_enabled() {
+                if let Some(pages) = self.bytes.wire_pages() {
+                    if let Some(output) = crate::metal::try_bitnet_i2_s_matvec_f32(
+                        x,
+                        pages,
+                        self.out_features,
+                        mode.gpu_code(),
+                    ) {
+                        return Ok(output);
+                    }
+                }
+            }
+            return crate::bitnet_kernels::i2_s_matvec(
+                self.bytes.as_slice(),
+                x,
+                self.out_features,
+                mode,
+            );
+        }
         #[cfg(target_os = "macos")]
         if let Some(pages) = self.bytes.wire_pages() {
-            if let Some(output) = resident_metal_format(self.tt).and_then(|format| {
+            if let Some(output) = hybrid_metal_format(self.tt).and_then(|format| {
                 crate::metal::try_prism_wire_matvec_f32(x, pages, format, self.out_features)
             }) {
                 log_prism_metal_hybrid_once();
@@ -309,6 +460,14 @@ impl RawMat {
             GgufTensorType::F32 => Ok((0..self.out_features)
                 .into_par_iter()
                 .map(|r| f32_row_dot(&self.bytes.as_slice()[r * rb..(r + 1) * rb], x))
+                .collect()),
+            GgufTensorType::F16 => Ok((0..self.out_features)
+                .into_par_iter()
+                .map(|r| f16_row_dot(&self.bytes.as_slice()[r * rb..(r + 1) * rb], x))
+                .collect()),
+            GgufTensorType::BF16 => Ok((0..self.out_features)
+                .into_par_iter()
+                .map(|r| bf16_row_dot(&self.bytes.as_slice()[r * rb..(r + 1) * rb], x))
                 .collect()),
             _ => (0..self.out_features)
                 .into_par_iter()
@@ -407,6 +566,57 @@ fn f32_row_dot(row: &[u8], x: &[f32]) -> f32 {
         .sum()
 }
 
+/// Fused F16-row · f32 dot (no 2,560-element allocation per vocabulary row).
+/// Element conversion and accumulation order match `dequantize_f16` + `dot`.
+fn f16_row_dot(row: &[u8], x: &[f32]) -> f32 {
+    row.chunks_exact(2)
+        .zip(x.iter())
+        .map(|(c, &xi)| crate::tensor::f16_bits_to_f32(u16::from_le_bytes([c[0], c[1]])) * xi)
+        .sum()
+}
+
+/// Fused BF16-row · f32 dot. BF16 is exactly the high 16 bits of an f32.
+fn bf16_row_dot(row: &[u8], x: &[f32]) -> f32 {
+    row.chunks_exact(2)
+        .zip(x.iter())
+        .map(|(c, &xi)| {
+            let bits = u16::from_le_bytes([c[0], c[1]]) as u32;
+            f32::from_bits(bits << 16) * xi
+        })
+        .sum()
+}
+
+#[cfg(test)]
+mod dense_row_dot_tests {
+    use super::*;
+
+    #[test]
+    fn fused_f16_and_bf16_rows_match_dequantized_dot() {
+        let x = [0.25_f32, -2.0, 3.5, 0.0];
+        let f16_bits = [0x3c00_u16, 0xc000, 0x3800, 0x7bff];
+        let f16_bytes = f16_bits
+            .iter()
+            .flat_map(|bits| bits.to_le_bytes())
+            .collect::<Vec<_>>();
+        let f16_values = f16_bits
+            .iter()
+            .map(|&bits| crate::tensor::f16_bits_to_f32(bits))
+            .collect::<Vec<_>>();
+        assert_eq!(f16_row_dot(&f16_bytes, &x), dot(&f16_values, &x));
+
+        let bf16_bits = [0x3f80_u16, 0xc000, 0x3f00, 0x7f7f];
+        let bf16_bytes = bf16_bits
+            .iter()
+            .flat_map(|bits| bits.to_le_bytes())
+            .collect::<Vec<_>>();
+        let bf16_values = bf16_bits
+            .iter()
+            .map(|&bits| f32::from_bits((bits as u32) << 16))
+            .collect::<Vec<_>>();
+        assert_eq!(bf16_row_dot(&bf16_bytes, &x), dot(&bf16_values, &x));
+    }
+}
+
 impl RawMat {
     /// Batched [`par_matvec`]: one output vector per input in `xs`, reading each
     /// weight row ONCE and dotting it against every input — so the resident weights
@@ -418,9 +628,55 @@ impl RawMat {
     fn par_matmul(&self, xs: &[Vec<f32>]) -> Result<Vec<Vec<f32>>> {
         let m = xs.len();
         let out_f = self.out_features;
+        if self.tt == GgufTensorType::I2S {
+            let mode = crate::bitnet_kernels::BitNetKernelMode::from_env();
+            let input_width = xs.first().map(Vec::len).ok_or_else(|| {
+                BackendError::RuntimeShapeMismatch(
+                    "I2_S matmul requires at least one input row".into(),
+                )
+            })?;
+            if input_width != self.in_features || xs.iter().any(|input| input.len() != input_width)
+            {
+                return Err(BackendError::RuntimeShapeMismatch(format!(
+                    "I2_S matmul expected input rows of width {}, got {:?}",
+                    self.in_features,
+                    xs.iter().map(Vec::len).collect::<Vec<_>>()
+                )));
+            }
+            let flat_input = xs.iter().flatten().copied().collect::<Vec<_>>();
+            let mut flat_output = vec![0.0_f32; m * out_f];
+            if crate::bitnet_kernels::gpu_allowed()
+                && crate::cuda::gpu_accel_enabled()
+                && crate::cuda::try_bitnet_i2_s_linear_rows(
+                    &flat_input,
+                    self.bytes.as_slice(),
+                    m,
+                    out_f,
+                    input_width,
+                    mode.gpu_code(),
+                    &mut flat_output,
+                )
+            {
+                return Ok(flat_output
+                    .chunks_exact(out_f)
+                    .map(<[f32]>::to_vec)
+                    .collect());
+            }
+            #[cfg(target_os = "macos")]
+            if crate::bitnet_kernels::gpu_allowed() && crate::cuda::gpu_accel_enabled() {
+                if let Some(pages) = self.bytes.wire_pages() {
+                    if let Some(output) =
+                        crate::metal::try_bitnet_i2_s_matmul_f32(xs, pages, out_f, mode.gpu_code())
+                    {
+                        return Ok(output);
+                    }
+                }
+            }
+            return crate::bitnet_kernels::i2_s_matmul(self.bytes.as_slice(), xs, out_f, mode);
+        }
         #[cfg(target_os = "macos")]
         if let Some(pages) = self.bytes.wire_pages() {
-            if let Some(output) = resident_metal_format(self.tt).and_then(|format| {
+            if let Some(output) = hybrid_metal_format(self.tt).and_then(|format| {
                 crate::metal::try_prism_wire_matmul_f32(xs, pages, format, self.out_features)
             }) {
                 log_prism_metal_hybrid_once();
@@ -489,6 +745,20 @@ struct Layer {
     /// vector, applied to Q/K after projection and before RoPE. `None` for llama-family.
     q_norm: Option<Vec<f32>>,
     k_norm: Option<Vec<f32>>,
+    /// BitNet embedding checkpoints normalize each projection input separately.
+    /// These seven tensors are an all-or-nothing graph contract for the official
+    /// qwen3/gemma3 embedding GGUFs.
+    q_norm_in: Option<Vec<f32>>,
+    k_norm_in: Option<Vec<f32>>,
+    v_norm_in: Option<Vec<f32>>,
+    output_norm_in: Option<Vec<f32>>,
+    gate_norm_in: Option<Vec<f32>>,
+    up_norm_in: Option<Vec<f32>>,
+    down_norm_in: Option<Vec<f32>>,
+    /// BitNet-b1.58 applies SubLN to the attention value mix and gated FFN
+    /// activation before their output projections.
+    attn_sub_norm: Option<Vec<f32>>,
+    ffn_sub_norm: Option<Vec<f32>>,
     /// gemma 4-norm structure: an extra RMSNorm applied to the attention output and to
     /// the FFN output BEFORE each residual add. `None` for the llama 2-norm structure.
     post_attn_norm: Option<Vec<f32>>,
@@ -579,16 +849,168 @@ pub struct RunnableModel {
     metal_lfm2: std::sync::Mutex<Option<crate::metal::Lfm2MetalDecode>>,
 }
 
+/// Keep the first Command R bring-up deliberately narrower than architecture
+/// admission. The immutable Aya Expanse 8B Q4_K_M row is small enough to qualify
+/// on a normal workstation and has a graph fully described by the pinned
+/// llama.cpp source. Neighboring Command R variants differ structurally (notably
+/// the >=64-layer Q/K-norm layout), so they fail closed until separately proven.
+/// Validate the complete immutable header contract for the only Command-R row
+/// Camelid currently attempts. This is header-only: it deliberately does not
+/// read tensor payload bytes, but it does require every canonical tensor name,
+/// type, and dimension so a lookalike header cannot reach release-mode matvecs
+/// with incompatible widths.
+pub(crate) fn validate_command_r_attemptability_slice(
+    gguf: &GgufFile,
+    cfg: &LlamaModelConfig,
+) -> Result<()> {
+    let exact_metadata = gguf.model_name() == Some("Aya Expanse 8b")
+        && gguf.metadata_string("general.license") == Some("cc-by-nc-4.0")
+        && gguf.metadata_u32("general.file_type") == Some(15)
+        && gguf.metadata_string("tokenizer.ggml.model") == Some("gpt2")
+        && gguf.metadata_string("tokenizer.ggml.pre") == Some("command-r")
+        && cfg.context_length == 8_192
+        && cfg.embedding_length == 4_096
+        && cfg.block_count == 32
+        && cfg.feed_forward_length == 14_336
+        && cfg.attention_head_count == 32
+        && cfg.attention_head_count_kv == 8
+        && cfg.vocab_size == Some(256_000)
+        && cfg.rope_freq_base == Some(10_000.0)
+        && cfg.rope_scaling_type.as_deref() == Some("none")
+        && cfg.rms_norm_epsilon == 1e-5
+        && cfg.logit_scale == Some(0.125);
+    if !exact_metadata {
+        return Err(BackendError::UnsupportedGguf(format!(
+            "command-r runnable attemptability is currently pinned to Aya Expanse 8B \
+             Q4_K_M (name='Aya Expanse 8b', file_type=15, 32x4096, FFN 14336, \
+             GQA 32/8, vocab 256000, context 8192, command-r GPT-2 tokenizer); \
+             observed name={:?}, file_type={:?}, layers={}, embedding={}, ffn={}, \
+             heads={}/{}, vocab={:?}, context={}",
+            gguf.model_name(),
+            gguf.metadata_u32("general.file_type"),
+            cfg.block_count,
+            cfg.embedding_length,
+            cfg.feed_forward_length,
+            cfg.attention_head_count,
+            cfg.attention_head_count_kv,
+            cfg.vocab_size,
+            cfg.context_length
+        )));
+    }
+
+    let mut names = std::collections::HashSet::with_capacity(gguf.tensors.len());
+    for tensor in &gguf.tensors {
+        let Some((expected_type, expected_dimensions)) =
+            command_r_aya_expected_tensor(&tensor.name)
+        else {
+            return Err(BackendError::UnsupportedGguf(format!(
+                "command-r Aya Q4_K_M header contains unexpected tensor {}; the exact \
+                 258-descriptor contract has only token_embd/output_norm and eight tensors \
+                 per layer (shared attn_norm, Q/K/V/output, and SwiGLU gate/up/down)",
+                tensor.name
+            )));
+        };
+        if tensor.tensor_type != expected_type || tensor.dimensions != expected_dimensions {
+            return Err(BackendError::UnsupportedGguf(format!(
+                "command-r Aya Q4_K_M descriptor mismatch for {}: expected {:?} {:?}, \
+                 observed {:?} {:?}",
+                tensor.name,
+                expected_type,
+                expected_dimensions,
+                tensor.tensor_type,
+                tensor.dimensions
+            )));
+        }
+        if !names.insert(tensor.name.as_str()) {
+            return Err(BackendError::UnsupportedGguf(format!(
+                "command-r Aya Q4_K_M header contains duplicate tensor {}; refusing a \
+                 descriptor set whose first-match binding would be ambiguous",
+                tensor.name
+            )));
+        }
+    }
+    // The accepted name universe is exactly 2 globals + 32 * 8 layer tensors.
+    // Requiring 258 unique recognized names therefore also proves none are absent.
+    if names.len() != 258 {
+        return Err(BackendError::UnsupportedGguf(format!(
+            "command-r Aya Q4_K_M canonical descriptor count mismatch: expected 258 \
+             unique tensors, observed {}",
+            names.len()
+        )));
+    }
+
+    Ok(())
+}
+
+fn command_r_aya_expected_tensor(name: &str) -> Option<(GgufTensorType, Vec<u64>)> {
+    match name {
+        "token_embd.weight" => return Some((GgufTensorType::Q6K, vec![4_096, 256_000])),
+        "output_norm.weight" => return Some((GgufTensorType::F32, vec![4_096])),
+        _ => {}
+    }
+
+    let layer_and_tensor = name.strip_prefix("blk.")?;
+    let (layer, tensor) = layer_and_tensor.split_once('.')?;
+    let layer = layer.parse::<usize>().ok()?;
+    if layer >= 32 {
+        return None;
+    }
+
+    const Q6_DOWN_LAYERS: &[usize] = &[0, 1, 2, 3, 8, 10, 13, 16, 18, 21, 24, 27, 28, 29, 30, 31];
+    const Q6_VALUE_LAYERS: &[usize] = &[0, 1, 2, 3, 6, 7, 12, 15, 18, 21, 24, 27, 28, 29, 30, 31];
+
+    Some(match tensor {
+        "attn_norm.weight" => (GgufTensorType::F32, vec![4_096]),
+        "attn_q.weight" | "attn_output.weight" => (GgufTensorType::Q4K, vec![4_096, 4_096]),
+        "attn_k.weight" => (GgufTensorType::Q4K, vec![4_096, 1_024]),
+        "attn_v.weight" => (
+            if Q6_VALUE_LAYERS.contains(&layer) {
+                GgufTensorType::Q6K
+            } else {
+                GgufTensorType::Q4K
+            },
+            vec![4_096, 1_024],
+        ),
+        "ffn_gate.weight" | "ffn_up.weight" => (GgufTensorType::Q4K, vec![4_096, 14_336]),
+        "ffn_down.weight" => (
+            if Q6_DOWN_LAYERS.contains(&layer) {
+                GgufTensorType::Q6K
+            } else {
+                GgufTensorType::Q4K
+            },
+            vec![14_336, 4_096],
+        ),
+        _ => return None,
+    })
+}
+
+/// Reference addition order from llama.cpp `models/command-r.cpp`:
+/// `(ffn_out + residual) + attn_out`. The explicit order matters at f32
+/// cancellation frontiers and is therefore kept in one unit-tested helper.
+fn command_r_parallel_residual(
+    output: &mut [f32],
+    residual: &[f32],
+    ffn_out: &[f32],
+    attn_out: &[f32],
+) {
+    for (((dst, ffn), residual), attn) in output.iter_mut().zip(ffn_out).zip(residual).zip(attn_out)
+    {
+        *dst = (*ffn + *residual) + *attn;
+    }
+}
+
 impl RunnableModel {
     /// Admit, parse config, and read every weight into resident quantized form.
     pub fn load(path: &str) -> Result<Self> {
         let gguf = read_metadata(path)?;
         admit::admit(&gguf).map_err(BackendError::from)?;
         let cfg = LlamaModelConfig::from_gguf(&gguf)?;
+        validate_bitnet_b158_2b_4t(&gguf, &cfg)?;
         let arch = gguf
             .architecture()
             .ok_or_else(|| BackendError::InvalidModelMetadata("missing architecture".into()))?
             .to_string();
+        let bitnet_embedding = crate::model::is_bitnet_embedding_model(&gguf);
 
         let d_model = cfg.embedding_length as usize;
         let n_heads = cfg.attention_head_count as usize;
@@ -603,6 +1025,10 @@ impl RunnableModel {
             .unwrap_or(head_dim);
         let rope_base = cfg.rope_freq_base.unwrap_or(10_000.0);
         let n_layers = cfg.block_count as usize;
+
+        if arch == "command-r" {
+            validate_command_r_attemptability_slice(&gguf, &cfg)?;
+        }
 
         if let Some(kind) = cfg.rope_scaling_type.as_deref() {
             if !kind.is_empty() && kind != "none" {
@@ -622,7 +1048,10 @@ impl RunnableModel {
         let load_raw = |f: &mut File, name: &str| -> Result<RawMat> {
             let d = find_tensor(&gguf, name)?;
             let (inf, outf) = mat_dims(d, name)?;
-            let bytes = if wants_page_backing(d.tensor_type) {
+            let bitnet_tied_head = arch == "bitnet-b1.58"
+                && d.tensor_type == GgufTensorType::F16
+                && matches!(name, "token_embd.weight" | "output.weight");
+            let bytes = if wants_page_backing(d.tensor_type) || bitnet_tied_head {
                 let byte_len = usize::try_from(d.n_bytes).map_err(|_| {
                     BackendError::InvalidTensorData(format!(
                         "tensor {name} packed byte length {} does not fit usize",
@@ -1019,6 +1448,7 @@ impl RunnableModel {
         let q_dim = n_heads * head_dim;
         let kv_dim = n_kv_heads * head_dim;
         let ffn = cfg.feed_forward_length as usize;
+        let is_command_r = arch == "command-r";
 
         let mut layers = Vec::with_capacity(n_layers);
         for l in 0..n_layers {
@@ -1050,9 +1480,17 @@ impl RunnableModel {
                 (gu.split_rows(0, ffn), gu.split_rows(ffn, ffn))
             };
 
-            layers.push(Layer {
-                attn_norm: load_vec(&mut f, &p("attn_norm"))?,
-                ffn_norm: load_vec(&mut f, &p("ffn_norm"))?,
+            let attn_norm = load_vec(&mut f, &p("attn_norm"))?;
+            // Command R's parallel residual feeds both branches from this one
+            // LayerNorm and has no separate `ffn_norm` tensor.
+            let ffn_norm = if is_command_r {
+                attn_norm.clone()
+            } else {
+                load_vec(&mut f, &p("ffn_norm"))?
+            };
+            let layer = Layer {
+                attn_norm,
+                ffn_norm,
                 wq,
                 wk,
                 wv,
@@ -1062,16 +1500,27 @@ impl RunnableModel {
                 down: load_raw(&mut f, &p("ffn_down"))?,
                 q_norm: load_vec_opt(&mut f, &p("attn_q_norm"))?,
                 k_norm: load_vec_opt(&mut f, &p("attn_k_norm"))?,
+                q_norm_in: load_vec_opt(&mut f, &p("attn_q_norm_in"))?,
+                k_norm_in: load_vec_opt(&mut f, &p("attn_k_norm_in"))?,
+                v_norm_in: load_vec_opt(&mut f, &p("attn_v_norm_in"))?,
+                output_norm_in: load_vec_opt(&mut f, &p("attn_output_norm_in"))?,
+                gate_norm_in: load_vec_opt(&mut f, &p("ffn_gate_norm_in"))?,
+                up_norm_in: load_vec_opt(&mut f, &p("ffn_up_norm_in"))?,
+                down_norm_in: load_vec_opt(&mut f, &p("ffn_down_norm_in"))?,
+                attn_sub_norm: load_vec_opt(&mut f, &p("attn_sub_norm"))?,
+                ffn_sub_norm: load_vec_opt(&mut f, &p("ffn_sub_norm"))?,
                 post_attn_norm: load_vec_opt(&mut f, &p("post_attention_norm"))?,
                 post_ffn_norm: load_vec_opt(&mut f, &p("post_ffw_norm"))?,
-            });
+            };
+            validate_extra_norms(&layer, l, &arch, bitnet_embedding, d_model, q_dim, ffn)?;
+            layers.push(layer);
         }
 
         let is_gemma = arch.starts_with("gemma");
-        let is_command_r = arch == "command-r";
-        // RoPE pairing: NEOX (split-half) for qwen3/gemma/phi3/command-r (unpermuted weights);
-        // LLAMA (interleaved) for standard variants.
-        let rope_neox = cfg.rope_neox_pairing || is_gemma || arch == "phi3" || is_command_r;
+        // RoPE pairing: NEOX (split-half) for qwen3/gemma/phi3; adjacent/interleaved
+        // for standard LLaMA conversions AND Command R. The latter is explicit in
+        // pinned llama.cpp's `LLM_ARCH_COMMAND_R` rope-type classification.
+        let rope_neox = cfg.rope_neox_pairing || is_gemma || arch == "phi3";
         // gemma3 dual RoPE: the per-layer global/local schedule and both RoPE bases
         // come from the SAME parsed `Gemma3Metadata` the resident lane consumes
         // (`LlamaModelConfig::from_gguf` -> `cfg.gemma3`) — single source of truth,
@@ -1141,6 +1590,13 @@ impl RunnableModel {
         }
     }
 
+    fn apply_optional_norm(&self, x: &[f32], weight: Option<&Vec<f32>>) -> Vec<f32> {
+        match weight {
+            Some(weight) => self.apply_norm(x, weight),
+            None => x.to_vec(),
+        }
+    }
+
     fn apply_norm_heads(&self, vec: &mut [f32], n_heads: usize, head_dim: usize, weight: &[f32]) {
         if self.architecture == "command-r" {
             layer_norm_heads(vec, n_heads, head_dim, weight, self.eps)
@@ -1175,60 +1631,77 @@ impl RunnableModel {
             }
             return Ok(logits);
         }
-        let seq = tokens.len();
-        let dm = self.d_model;
-
-        // Embedding lookup (one dequantized row per token).
-        let mut hidden = vec![0.0f32; seq * dm];
-        for (pos, &tok) in tokens.iter().enumerate() {
-            let t = tok as usize;
-            if t >= self.vocab {
-                return Err(BackendError::InvalidTensorData(format!(
-                    "token id {t} >= vocab {}",
-                    self.vocab
-                )));
+        // Command R uses a parallel attention/FFN residual, while the generic
+        // batched helpers below implement sequential pre-norm blocks. Run the
+        // same corrected KV-cached step that generation uses so smoke/diagnostic
+        // logits cannot accidentally exercise the wrong graph.
+        if self.architecture == "command-r" {
+            let mut cache = self.new_cache();
+            let mut logits = Vec::new();
+            let last = tokens.len().saturating_sub(1);
+            for (pos, &tok) in tokens.iter().enumerate() {
+                logits = self.forward_step_maybe_logits(tok, pos, &mut cache, pos == last)?;
             }
-            let mut row = self.token_embd.dequant_row(t, "token_embd")?;
-            // gemma scales embeddings by sqrt(d_model).
-            if let Some(scale) = self.embed_scale {
-                for v in row.iter_mut() {
-                    *v *= scale;
+            return Ok(logits);
+        }
+        let hidden = self.forward_hidden_states(tokens)?;
+        let normed = &hidden[hidden.len() - self.d_model..];
+        self.project_output_logits(normed)
+    }
+
+    /// Project one normalized hidden row through the language-model head and
+    /// apply the architecture's final logit transforms.
+    fn project_output_logits(&self, normed: &[f32]) -> Result<Vec<f32>> {
+        let mut logits = if self.architecture == "bitnet-b1.58" {
+            // The official 2B model ties a 128,256 x 2,560 F16 embedding to its
+            // LM head. `par_matvec` keeps that matrix page-backed on Metal and
+            // uses allocation-free row dots on CPU, instead of making 128k
+            // temporary Vecs for every generated token. Windows additionally
+            // keeps the immutable F16 wire bytes resident in CUDA and runs one
+            // 256-thread reduction block per vocabulary row. Every gate below
+            // is intentionally exact: this is not a generic dense-F16 CUDA path.
+            let tied_pages = match (
+                self.token_embd.bytes.wire_pages(),
+                self.output.bytes.wire_pages(),
+            ) {
+                (Some(token), Some(output)) if Arc::ptr_eq(token, output) => Some(output),
+                _ => None,
+            };
+            let exact_cuda_head = self.output.tt == GgufTensorType::F16
+                && self.output.in_features == 2_560
+                && self.d_model == 2_560
+                && self.output.out_features == 128_256
+                && self.vocab == 128_256
+                && crate::bitnet_kernels::gpu_allowed()
+                && crate::cuda::gpu_accel_enabled();
+            if exact_cuda_head {
+                if let Some(pages) = tied_pages {
+                    let mut output = vec![0.0_f32; self.vocab];
+                    if crate::cuda::try_bitnet_f16_head_matvec(
+                        normed,
+                        pages,
+                        self.vocab,
+                        self.d_model,
+                        &mut output,
+                    ) {
+                        output
+                    } else {
+                        self.output.par_matvec(normed, "output")?
+                    }
+                } else {
+                    self.output.par_matvec(normed, "output")?
                 }
+            } else {
+                self.output.par_matvec(normed, "output")?
             }
-            hidden[pos * dm..(pos + 1) * dm].copy_from_slice(&row);
-        }
-
-        // gemma3→CUDA campaign, localization instrument. `CAMELID_LAYER_DUMP=<path>`
-        // appends this lane's LAST-position hidden state after every layer, so the
-        // resident GPU lanes can be diffed against this oracle layer by layer and
-        // the first divergent layer names the defect. Off unless the var is set;
-        // no effect on the forward itself.
-        let dump_path = std::env::var("CAMELID_LAYER_DUMP").ok();
-        let mut dump = String::new();
-        for (li, layer) in self.layers.iter().enumerate() {
-            self.attention_block(layer, li, &mut hidden, seq)?;
-            self.ffn_block(layer, li, &mut hidden, seq)?;
-            if dump_path.is_some() {
-                let last = &hidden[(seq - 1) * dm..seq * dm];
-                let l2 = last.iter().map(|v| v * v).sum::<f32>().sqrt();
-                dump.push_str(&format!(
-                    "{li}\t{l2:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\n",
-                    last[0], last[1], last[2], last[3]
-                ));
+        } else {
+            let mut logits = vec![0.0f32; self.vocab];
+            for (token, logit) in logits.iter_mut().enumerate() {
+                let row = self.output.dequant_row(token, "output")?;
+                *logit = dot(&row, normed);
             }
-        }
-        if let Some(p) = dump_path {
-            let _ = std::fs::write(p, &dump);
-        }
-
-        // Final norm on the last position, then logits (one dequantized row per vocab).
-        let last = &hidden[(seq - 1) * dm..seq * dm];
-        let normed = self.apply_norm(last, &self.output_norm);
-        let mut logits = vec![0.0f32; self.vocab];
-        for (t, lt) in logits.iter_mut().enumerate() {
-            let row = self.output.dequant_row(t, "output")?;
-            *lt = dot(&row, &normed);
-        }
+            logits
+        };
         // gemma2 final logit soft-cap (gemma3: None).
         if let Some(cap) = self.final_logit_softcap {
             for l in logits.iter_mut() {
@@ -1241,6 +1714,83 @@ impl RunnableModel {
             }
         }
         Ok(logits)
+    }
+
+    /// Run the generic causal stack and return final-normalized hidden states for
+    /// every input position. This is also the encoder surface used by the official
+    /// decoder-only BitNet embedding checkpoints before their declared pooling.
+    pub(crate) fn forward_hidden_states(&self, tokens: &[u32]) -> Result<Vec<f32>> {
+        self.forward_hidden_states_with_cache(tokens, None, None)
+    }
+
+    /// Batched generic forward with optional KV capture. BitNet chat uses the
+    /// captured cache for prompt prefill; embedding models use the same graph
+    /// without a cache. `cancelled` is checked between transformer blocks so a
+    /// disconnected streaming request does not continue monopolizing the GPU.
+    fn forward_hidden_states_with_cache(
+        &self,
+        tokens: &[u32],
+        mut cache: Option<&mut KvCache>,
+        cancelled: Option<&dyn Fn() -> bool>,
+    ) -> Result<Vec<f32>> {
+        if tokens.is_empty() {
+            return Err(BackendError::InvalidTensorData(
+                "empty token sequence".into(),
+            ));
+        }
+        if self.qwen35.is_some() || self.lfm2.is_some() || self.architecture == "command-r" {
+            return Err(BackendError::UnsupportedGguf(format!(
+                "{} does not expose full-sequence hidden states",
+                self.architecture
+            )));
+        }
+        let seq = tokens.len();
+        let dm = self.d_model;
+        let mut hidden = vec![0.0f32; seq * dm];
+        for (pos, &tok) in tokens.iter().enumerate() {
+            let t = tok as usize;
+            if t >= self.vocab {
+                return Err(BackendError::InvalidTensorData(format!(
+                    "token id {t} >= vocab {}",
+                    self.vocab
+                )));
+            }
+            let mut row = self.token_embd.dequant_row(t, "token_embd")?;
+            if let Some(scale) = self.embed_scale {
+                for value in &mut row {
+                    *value *= scale;
+                }
+            }
+            hidden[pos * dm..(pos + 1) * dm].copy_from_slice(&row);
+        }
+
+        let dump_path = std::env::var("CAMELID_LAYER_DUMP").ok();
+        let mut dump = String::new();
+        for (li, layer) in self.layers.iter().enumerate() {
+            if cancelled.is_some_and(|is_cancelled| is_cancelled()) {
+                return Err(BackendError::InvalidTensorData(
+                    "generation cancelled".into(),
+                ));
+            }
+            self.attention_block(layer, li, &mut hidden, seq, cache.as_deref_mut())?;
+            self.ffn_block(layer, li, &mut hidden, seq)?;
+            if dump_path.is_some() {
+                let last = &hidden[(seq - 1) * dm..seq * dm];
+                let l2 = last.iter().map(|value| value * value).sum::<f32>().sqrt();
+                dump.push_str(&format!(
+                    "{li}\t{l2:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\n",
+                    last[0], last[1], last[2], last[3]
+                ));
+            }
+        }
+        if let Some(path) = dump_path {
+            let _ = std::fs::write(path, &dump);
+        }
+        for row in hidden.chunks_exact_mut(dm) {
+            let normed = self.apply_norm(row, &self.output_norm);
+            row.copy_from_slice(&normed);
+        }
+        Ok(hidden)
     }
 
     /// Greedy-decode up to `max_new` tokens. Uses an incremental KV cache: the prompt
@@ -1266,14 +1816,7 @@ impl RunnableModel {
             return self.generate_lfm2_metal(prompt, max_new, &[], None, &mut |_| {});
         }
         let mut cache = self.new_cache();
-        let mut last = Vec::new();
-        // Only the LAST prompt position's logits are consumed; the rest exist to
-        // fill the cache and roll the conv ring. Skipping the tied 128k-row head on
-        // those positions removes 9.7% of the bytes each prefill step reads.
-        let last_prompt = prompt.len().saturating_sub(1);
-        for (pos, &tok) in prompt.iter().enumerate() {
-            last = self.forward_step_maybe_logits(tok, pos, &mut cache, pos == last_prompt)?;
-        }
+        let last = self.prefill_generic(prompt, &mut cache, None)?;
         let mut out = Vec::with_capacity(max_new);
         let mut pos = prompt.len();
         let mut next = argmax(&last);
@@ -1386,6 +1929,41 @@ impl RunnableModel {
             }
         }
         cache
+    }
+
+    /// Fill the generic decoder cache and return the final prompt position's
+    /// logits. BitNet uses the existing full-sequence projection path so every
+    /// layer submits one batched I2_S matmul per projection instead of one Metal
+    /// command buffer per prompt token. Other generic architectures retain their
+    /// established incremental prefill order.
+    fn prefill_generic(
+        &self,
+        prompt: &[u32],
+        cache: &mut KvCache,
+        cancelled: Option<&dyn Fn() -> bool>,
+    ) -> Result<Vec<f32>> {
+        if self.architecture == "bitnet-b1.58" {
+            let hidden = self.forward_hidden_states_with_cache(prompt, Some(cache), cancelled)?;
+            if cancelled.is_some_and(|is_cancelled| is_cancelled()) {
+                return Err(BackendError::InvalidTensorData(
+                    "generation cancelled".into(),
+                ));
+            }
+            let normed = &hidden[hidden.len() - self.d_model..];
+            return self.project_output_logits(normed);
+        }
+
+        let mut last = Vec::new();
+        let last_prompt = prompt.len().saturating_sub(1);
+        for (pos, &token) in prompt.iter().enumerate() {
+            if cancelled.is_some_and(|is_cancelled| is_cancelled()) {
+                return Err(BackendError::InvalidTensorData(
+                    "generation cancelled".into(),
+                ));
+            }
+            last = self.forward_step_maybe_logits(token, pos, cache, pos == last_prompt)?;
+        }
+        Ok(last)
     }
 
     /// Incremental forward of one LFM2 token at absolute `pos`. Conv layers
@@ -1591,9 +2169,9 @@ impl RunnableModel {
         self.forward_step_maybe_logits(token, pos, cache, true)
     }
 
-    /// [`forward_step`] with the LM head made optional. Only the lfm2 path honors
-    /// the flag today; every other architecture ignores it and always projects,
-    /// so behaviour there is unchanged.
+    /// [`forward_step`] with the LM head made optional. Prompt positions that only
+    /// populate KV state skip the vocabulary projection; the final prompt position
+    /// and every decode position still return logits.
     ///
     /// [`forward_step`]: RunnableModel::forward_step
     fn forward_step_maybe_logits(
@@ -1628,14 +2206,15 @@ impl RunnableModel {
 
         for (li, layer) in self.layers.iter().enumerate() {
             // --- attention (single query position over cached K/V) ---
+            let is_command_r = self.architecture == "command-r";
+            let command_r_residual = is_command_r.then(|| hidden.clone());
             let xn = self.apply_norm(&hidden, &layer.attn_norm);
-            let wq = layer.wq.dequant_all(&name(li, "attn_q"))?;
-            let wk = layer.wk.dequant_all(&name(li, "attn_k"))?;
-            let wv = layer.wv.dequant_all(&name(li, "attn_v"))?;
-            let wo = layer.wo.dequant_all(&name(li, "attn_output"))?;
-            let mut qp = wq.matvec(&xn);
-            let mut kp = wk.matvec(&xn);
-            let vp = wv.matvec(&xn);
+            let q_input = self.apply_optional_norm(&xn, layer.q_norm_in.as_ref());
+            let k_input = self.apply_optional_norm(&xn, layer.k_norm_in.as_ref());
+            let v_input = self.apply_optional_norm(&xn, layer.v_norm_in.as_ref());
+            let mut qp = layer.wq.projection_matvec(&q_input, &name(li, "attn_q"))?;
+            let mut kp = layer.wk.projection_matvec(&k_input, &name(li, "attn_k"))?;
+            let vp = layer.wv.projection_matvec(&v_input, &name(li, "attn_v"))?;
             if let Some(qn) = &layer.q_norm {
                 self.apply_norm_heads(&mut qp, self.n_heads, hd, qn);
             }
@@ -1682,36 +2261,68 @@ impl RunnableModel {
                     }
                 }
             }
-            let mut proj = wo.matvec(&attn_out);
+            if let Some(norm) = &layer.attn_sub_norm {
+                attn_out = self.apply_norm(&attn_out, norm);
+            }
+            let output_input = self.apply_optional_norm(&attn_out, layer.output_norm_in.as_ref());
+            let mut proj = layer
+                .wo
+                .projection_matvec(&output_input, &name(li, "attn_output"))?;
             if let Some(pn) = &layer.post_attn_norm {
                 proj = self.apply_norm(&proj, pn);
             }
-            for (h, p) in hidden.iter_mut().zip(proj.iter()) {
-                *h += *p;
+            if !is_command_r {
+                for (h, p) in hidden.iter_mut().zip(proj.iter()) {
+                    *h += *p;
+                }
             }
 
             // --- FFN ---
-            let xn2 = self.apply_norm(&hidden, &layer.ffn_norm);
-            let gate = layer.gate.dequant_all(&name(li, "ffn_gate"))?;
-            let up = layer.up.dequant_all(&name(li, "ffn_up"))?;
-            let down = layer.down.dequant_all(&name(li, "ffn_down"))?;
-            let g = gate.matvec(&xn2);
-            let u = up.matvec(&xn2);
+            // Command R's FFN is parallel with attention: both consume the SAME
+            // LayerNorm result. Every other generic architecture keeps the
+            // established sequential second-norm path.
+            let xn2 = if is_command_r {
+                xn
+            } else {
+                self.apply_norm(&hidden, &layer.ffn_norm)
+            };
+            let gate_input = self.apply_optional_norm(&xn2, layer.gate_norm_in.as_ref());
+            let up_input = self.apply_optional_norm(&xn2, layer.up_norm_in.as_ref());
+            let g = layer
+                .gate
+                .projection_matvec(&gate_input, &name(li, "ffn_gate"))?;
+            let u = layer.up.projection_matvec(&up_input, &name(li, "ffn_up"))?;
             let mut act = vec![0.0f32; g.len()];
             for i in 0..g.len() {
-                let gated = if self.ffn_gelu {
+                let gated = if self.architecture == "bitnet-b1.58" {
+                    // BitNet-b1.58-2B-4T is trained with `hidden_act = relu2`:
+                    // ReLU(gate)^2, multiplied by the parallel up projection.
+                    // The older BitNet family used SiLU, but applying that graph
+                    // to Microsoft's 2B-4T row produces repetitive garbage.
+                    g[i].max(0.0).powi(2)
+                } else if self.ffn_gelu {
                     gelu_tanh(g[i])
                 } else {
                     g[i] / (1.0 + (-g[i]).exp())
                 };
                 act[i] = gated * u[i];
             }
-            let mut d = down.matvec(&act);
+            if let Some(norm) = &layer.ffn_sub_norm {
+                act = self.apply_norm(&act, norm);
+            }
+            let down_input = self.apply_optional_norm(&act, layer.down_norm_in.as_ref());
+            let mut d = layer
+                .down
+                .projection_matvec(&down_input, &name(li, "ffn_down"))?;
             if let Some(pn) = &layer.post_ffn_norm {
                 d = self.apply_norm(&d, pn);
             }
-            for (h, dv) in hidden.iter_mut().zip(d.iter()) {
-                *h += *dv;
+            if let Some(residual) = command_r_residual.as_deref() {
+                command_r_parallel_residual(&mut hidden, residual, &d, &proj);
+            } else {
+                for (h, dv) in hidden.iter_mut().zip(d.iter()) {
+                    *h += *dv;
+                }
             }
             // gemma3→CUDA campaign localization instrument (see `forward_logits`).
             // This is the KV-cached step the runnable SERVE lane actually runs, so
@@ -1736,23 +2347,11 @@ impl RunnableModel {
             }
         }
 
+        if !need_logits {
+            return Ok(Vec::new());
+        }
         let normed = self.apply_norm(&hidden, &self.output_norm);
-        let mut logits = vec![0.0f32; self.vocab];
-        for (tk, lt) in logits.iter_mut().enumerate() {
-            let row = self.output.dequant_row(tk, "output")?;
-            *lt = dot(&row, &normed);
-        }
-        if let Some(cap) = self.final_logit_softcap {
-            for l in logits.iter_mut() {
-                *l = cap * (*l / cap).tanh();
-            }
-        }
-        if let Some(scale) = self.logit_scale {
-            for l in logits.iter_mut() {
-                *l *= scale;
-            }
-        }
-        Ok(logits)
+        self.project_output_logits(&normed)
     }
 
     fn attention_block(
@@ -1761,6 +2360,7 @@ impl RunnableModel {
         li: usize,
         hidden: &mut [f32],
         seq: usize,
+        cache: Option<&mut KvCache>,
     ) -> Result<()> {
         let dm = self.d_model;
         let hd = self.head_dim;
@@ -1769,21 +2369,26 @@ impl RunnableModel {
         let q_dim = self.n_heads * hd;
         let kv_dim = self.n_kv_heads * hd;
 
-        // Dequantize this layer's projection weights once (dropped at block end).
-        let wq = layer.wq.dequant_all(&name(li, "attn_q"))?;
-        let wk = layer.wk.dequant_all(&name(li, "attn_k"))?;
-        let wv = layer.wv.dequant_all(&name(li, "attn_v"))?;
-        let wo = layer.wo.dequant_all(&name(li, "attn_output"))?;
-
         let mut q = vec![0.0f32; seq * q_dim];
         let mut k = vec![0.0f32; seq * kv_dim];
         let mut v = vec![0.0f32; seq * kv_dim];
+        let mut q_inputs = Vec::with_capacity(seq);
+        let mut k_inputs = Vec::with_capacity(seq);
+        let mut v_inputs = Vec::with_capacity(seq);
         for pos in 0..seq {
             let x = &hidden[pos * dm..(pos + 1) * dm];
             let xn = self.apply_norm(x, &layer.attn_norm);
-            let mut qp = wq.matvec(&xn);
-            let mut kp = wk.matvec(&xn);
-            let vp = wv.matvec(&xn);
+            q_inputs.push(self.apply_optional_norm(&xn, layer.q_norm_in.as_ref()));
+            k_inputs.push(self.apply_optional_norm(&xn, layer.k_norm_in.as_ref()));
+            v_inputs.push(self.apply_optional_norm(&xn, layer.v_norm_in.as_ref()));
+        }
+        let q_rows = layer.wq.projection_matmul(&q_inputs, &name(li, "attn_q"))?;
+        let k_rows = layer.wk.projection_matmul(&k_inputs, &name(li, "attn_k"))?;
+        let v_rows = layer.wv.projection_matmul(&v_inputs, &name(li, "attn_v"))?;
+        for pos in 0..seq {
+            let mut qp = q_rows[pos].clone();
+            let mut kp = k_rows[pos].clone();
+            let vp = &v_rows[pos];
             // QK-norm (qwen3, gemma3): per-head RMSNorm before RoPE.
             if let Some(qn) = &layer.q_norm {
                 self.apply_norm_heads(&mut qp, self.n_heads, hd, qn);
@@ -1796,9 +2401,10 @@ impl RunnableModel {
             self.apply_rope(&mut kp, self.n_kv_heads, pos, rope_base);
             q[pos * q_dim..(pos + 1) * q_dim].copy_from_slice(&qp);
             k[pos * kv_dim..(pos + 1) * kv_dim].copy_from_slice(&kp);
-            v[pos * kv_dim..(pos + 1) * kv_dim].copy_from_slice(&vp);
+            v[pos * kv_dim..(pos + 1) * kv_dim].copy_from_slice(vp);
         }
 
+        let mut output_inputs = Vec::with_capacity(seq);
         for pos in 0..seq {
             let mut attn_out = vec![0.0f32; q_dim];
             for h in 0..self.n_heads {
@@ -1832,7 +2438,16 @@ impl RunnableModel {
                     }
                 }
             }
-            let mut proj = wo.matvec(&attn_out);
+            if let Some(norm) = &layer.attn_sub_norm {
+                attn_out = self.apply_norm(&attn_out, norm);
+            }
+            output_inputs.push(self.apply_optional_norm(&attn_out, layer.output_norm_in.as_ref()));
+        }
+        let projections = layer
+            .wo
+            .projection_matmul(&output_inputs, &name(li, "attn_output"))?;
+        for (pos, projection) in projections.iter().enumerate() {
+            let mut proj = projection.clone();
             // gemma: post-attention RMSNorm before the residual add.
             if let Some(pn) = &layer.post_attn_norm {
                 proj = self.apply_norm(&proj, pn);
@@ -1842,30 +2457,57 @@ impl RunnableModel {
                 *h += *p;
             }
         }
+        if let Some(cache) = cache {
+            cache.k[li] = k;
+            cache.v[li] = v;
+        }
         Ok(())
     }
 
     fn ffn_block(&self, layer: &Layer, li: usize, hidden: &mut [f32], seq: usize) -> Result<()> {
         let dm = self.d_model;
-        let gate = layer.gate.dequant_all(&name(li, "ffn_gate"))?;
-        let up = layer.up.dequant_all(&name(li, "ffn_up"))?;
-        let down = layer.down.dequant_all(&name(li, "ffn_down"))?;
+        let mut gate_inputs = Vec::with_capacity(seq);
+        let mut up_inputs = Vec::with_capacity(seq);
         for pos in 0..seq {
             let x = &hidden[pos * dm..(pos + 1) * dm];
             let xn = self.apply_norm(x, &layer.ffn_norm);
-            let g = gate.matvec(&xn);
-            let u = up.matvec(&xn);
+            gate_inputs.push(self.apply_optional_norm(&xn, layer.gate_norm_in.as_ref()));
+            up_inputs.push(self.apply_optional_norm(&xn, layer.up_norm_in.as_ref()));
+        }
+        let gate_rows = layer
+            .gate
+            .projection_matmul(&gate_inputs, &name(li, "ffn_gate"))?;
+        let up_rows = layer
+            .up
+            .projection_matmul(&up_inputs, &name(li, "ffn_up"))?;
+        let mut down_inputs = Vec::with_capacity(seq);
+        for pos in 0..seq {
+            let g = &gate_rows[pos];
+            let u = &up_rows[pos];
             // Gated FFN: gemma uses GeGLU (gelu-tanh), llama uses SwiGLU (silu).
             let mut act = vec![0.0f32; g.len()];
             for i in 0..g.len() {
-                let gated = if self.ffn_gelu {
+                let gated = if self.architecture == "bitnet-b1.58" {
+                    // Exact Microsoft BitNet 2B-4T FFN activation. Keep this
+                    // identical to the incremental path above.
+                    g[i].max(0.0).powi(2)
+                } else if self.ffn_gelu {
                     gelu_tanh(g[i])
                 } else {
                     g[i] / (1.0 + (-g[i]).exp())
                 };
                 act[i] = gated * u[i];
             }
-            let mut d = down.matvec(&act);
+            if let Some(norm) = &layer.ffn_sub_norm {
+                act = self.apply_norm(&act, norm);
+            }
+            down_inputs.push(self.apply_optional_norm(&act, layer.down_norm_in.as_ref()));
+        }
+        let down_rows = layer
+            .down
+            .projection_matmul(&down_inputs, &name(li, "ffn_down"))?;
+        for (pos, down_row) in down_rows.iter().enumerate() {
+            let mut d = down_row.clone();
             // gemma: post-FFN RMSNorm before the residual add.
             if let Some(pn) = &layer.post_ffn_norm {
                 d = self.apply_norm(&d, pn);
@@ -3410,7 +4052,14 @@ impl RunnableModel {
                 &mut |_| {},
             );
         }
-        self.generate_stopping(prompt, max_new, stop)
+        self.generate_stopping_streaming_with_sampling_cancelled(
+            prompt,
+            max_new,
+            stop,
+            sampling,
+            &|| false,
+            &mut |_| {},
+        )
     }
 
     /// [`generate_stopping`](Self::generate_stopping) with a per-token callback
@@ -3424,49 +4073,29 @@ impl RunnableModel {
         stop: &[u32],
         on_token: &mut dyn FnMut(u32),
     ) -> Result<Vec<u32>> {
-        if prompt.is_empty() {
-            return Err(BackendError::InvalidTensorData("empty prompt".into()));
-        }
-        if self.qwen35.is_some() {
-            return self.generate_qwen35_streaming(prompt, max_new, stop, None, true, on_token);
-        }
-        // LFM2 resident Metal graph (opt-in via CAMELID_LFM2_METAL while it is
-        // being proven). No silent CPU fallback: the conv ring is order-dependent
-        // and a mid-stream replay would restart from the prompt, so a Metal failure
-        // surfaces as an error rather than a quietly different lane.
-        #[cfg(target_os = "macos")]
-        if self.lfm2.is_some() && lfm2_metal_enabled() {
-            return self.generate_lfm2_metal(prompt, max_new, stop, None, on_token);
-        }
-        // Dense/generic path (MUSTER M-A1): the same incremental loop as `generate`
-        // (byte-identical forward sequence when no stop token fires) plus stop-token
-        // handling and true per-token streaming. A stop token ends the turn and is
-        // NOT appended — matching the qwen35 lane and llama.cpp's served output.
-        let mut cache = self.new_cache();
-        let mut last = Vec::new();
-        // Only the LAST prompt position's logits are consumed; the rest exist to
-        // fill the cache and roll the conv ring. Skipping the tied 128k-row head on
-        // those positions removes 9.7% of the bytes each prefill step reads.
-        let last_prompt = prompt.len().saturating_sub(1);
-        for (pos, &tok) in prompt.iter().enumerate() {
-            last = self.forward_step_maybe_logits(tok, pos, &mut cache, pos == last_prompt)?;
-        }
-        let mut out = Vec::with_capacity(max_new);
-        let mut pos = prompt.len();
-        let mut next = argmax(&last);
-        while out.len() < max_new {
-            if stop.contains(&next) {
-                break;
-            }
-            out.push(next);
-            on_token(next);
-            if out.len() < max_new {
-                let logits = self.forward_step(next, pos, &mut cache)?;
-                pos += 1;
-                next = argmax(&logits);
-            }
-        }
-        Ok(out)
+        self.generate_stopping_streaming_cancelled(prompt, max_new, stop, &|| false, on_token)
+    }
+
+    /// Greedy streaming with cooperative cancellation. The predicate is checked
+    /// between prompt blocks and decode tokens, allowing an SSE disconnect to
+    /// release the runnable lane instead of finishing an abandoned long reply.
+    pub fn generate_stopping_streaming_cancelled(
+        &self,
+        prompt: &[u32],
+        max_new: usize,
+        stop: &[u32],
+        is_cancelled: &dyn Fn() -> bool,
+        on_token: &mut dyn FnMut(u32),
+    ) -> Result<Vec<u32>> {
+        let greedy = SamplingConfig::default();
+        self.generate_stopping_streaming_with_sampling_cancelled(
+            prompt,
+            max_new,
+            stop,
+            &greedy,
+            is_cancelled,
+            on_token,
+        )
     }
 
     /// Qwen3.5 served sampling path. Greedy/no-op configurations retain the
@@ -3480,17 +4109,88 @@ impl RunnableModel {
         sampling: &SamplingConfig,
         on_token: &mut dyn FnMut(u32),
     ) -> Result<Vec<u32>> {
-        if self.qwen35.is_some() && qwen35_sampling_requires_logits(sampling) {
-            return self.generate_qwen35_streaming(
-                prompt,
-                max_new,
-                stop,
-                Some(sampling),
-                true,
-                on_token,
-            );
+        self.generate_stopping_streaming_with_sampling_cancelled(
+            prompt,
+            max_new,
+            stop,
+            sampling,
+            &|| false,
+            on_token,
+        )
+    }
+
+    /// Sampling-capable runnable generation with cooperative cancellation. Unlike
+    /// the previous generic bridge, BitNet now honors non-greedy sampling instead
+    /// of silently ignoring the OpenAI request parameters.
+    pub fn generate_stopping_streaming_with_sampling_cancelled(
+        &self,
+        prompt: &[u32],
+        max_new: usize,
+        stop: &[u32],
+        sampling: &SamplingConfig,
+        is_cancelled: &dyn Fn() -> bool,
+        on_token: &mut dyn FnMut(u32),
+    ) -> Result<Vec<u32>> {
+        if prompt.is_empty() {
+            return Err(BackendError::InvalidTensorData("empty prompt".into()));
         }
-        self.generate_stopping_streaming(prompt, max_new, stop, on_token)
+        if is_cancelled() {
+            return Err(BackendError::InvalidTensorData(
+                "generation cancelled".into(),
+            ));
+        }
+        if self.qwen35.is_some() {
+            let sampling = qwen35_sampling_requires_logits(sampling).then_some(sampling);
+            return self.generate_qwen35_streaming(prompt, max_new, stop, sampling, true, on_token);
+        }
+        #[cfg(target_os = "macos")]
+        if self.lfm2.is_some() && lfm2_metal_enabled() {
+            let sampling = qwen35_sampling_requires_logits(sampling).then_some(sampling);
+            return self.generate_lfm2_metal(prompt, max_new, stop, sampling, on_token);
+        }
+
+        let mut cache = self.new_cache();
+        let logits = self.prefill_generic(prompt, &mut cache, Some(is_cancelled))?;
+        let sampler = qwen35_sampling_requires_logits(sampling)
+            .then(|| LlamaSampler::Sampling(sampling.clone()));
+        let mut token_history = prompt.to_vec();
+        let choose = |logits: Vec<f32>, history: &[u32]| -> Result<u32> {
+            match &sampler {
+                Some(sampler) => qwen35_sample_logits(logits, sampler, history),
+                None => Ok(argmax(&logits)),
+            }
+        };
+        let mut next = choose(logits, &token_history)?;
+        let mut out = Vec::with_capacity(max_new);
+        let mut pos = prompt.len();
+        while out.len() < max_new {
+            if is_cancelled() {
+                return Err(BackendError::InvalidTensorData(
+                    "generation cancelled".into(),
+                ));
+            }
+            if stop.contains(&next) {
+                break;
+            }
+            out.push(next);
+            token_history.push(next);
+            on_token(next);
+            // The generic path serves architectures beyond Qwen 3.5 (including
+            // BitNet).  Qwen's defensive repetition heuristic is model-specific
+            // and can terminate perfectly valid repeated text from those models.
+            if out.len() >= max_new {
+                break;
+            }
+            if is_cancelled() {
+                return Err(BackendError::InvalidTensorData(
+                    "generation cancelled".into(),
+                ));
+            }
+            let logits = self.forward_step(next, pos, &mut cache)?;
+            pos += 1;
+            next = choose(logits, &token_history)?;
+        }
+        Ok(out)
     }
 
     /// One token through the full qwen35 stack at absolute `pos`, mutating `cache`.
@@ -3957,6 +4657,74 @@ mod prism_vision_cuda_tests {
     }
 }
 
+fn validate_extra_norms(
+    layer: &Layer,
+    layer_index: usize,
+    architecture: &str,
+    require_projection_norms: bool,
+    d_model: usize,
+    q_dim: usize,
+    ffn_dim: usize,
+) -> Result<()> {
+    let projection_norms = [
+        ("attn_q_norm_in", layer.q_norm_in.as_ref(), d_model),
+        ("attn_k_norm_in", layer.k_norm_in.as_ref(), d_model),
+        ("attn_v_norm_in", layer.v_norm_in.as_ref(), d_model),
+        ("attn_output_norm_in", layer.output_norm_in.as_ref(), q_dim),
+        ("ffn_gate_norm_in", layer.gate_norm_in.as_ref(), d_model),
+        ("ffn_up_norm_in", layer.up_norm_in.as_ref(), d_model),
+        ("ffn_down_norm_in", layer.down_norm_in.as_ref(), ffn_dim),
+    ];
+    let projection_norm_count = projection_norms
+        .iter()
+        .filter(|(_, value, _)| value.is_some())
+        .count();
+    if (require_projection_norms && projection_norm_count != projection_norms.len())
+        || (!require_projection_norms
+            && projection_norm_count != 0
+            && projection_norm_count != projection_norms.len())
+    {
+        return Err(BackendError::InvalidModelMetadata(format!(
+            "layer {layer_index}: BitNet projection-input norm set is incomplete ({projection_norm_count}/{} tensors)",
+            projection_norms.len()
+        )));
+    }
+    for (name, value, expected) in projection_norms {
+        if let Some(value) = value {
+            if value.len() != expected {
+                return Err(BackendError::InvalidTensorData(format!(
+                    "layer {layer_index} {name} has {} elements, expected {expected}",
+                    value.len()
+                )));
+            }
+        }
+    }
+
+    match (&layer.attn_sub_norm, &layer.ffn_sub_norm) {
+        (Some(attn), Some(ffn)) => {
+            if attn.len() != q_dim || ffn.len() != ffn_dim {
+                return Err(BackendError::InvalidTensorData(format!(
+                    "layer {layer_index}: BitNet SubLN widths are attention={} and ffn={}, expected {q_dim} and {ffn_dim}",
+                    attn.len(),
+                    ffn.len()
+                )));
+            }
+        }
+        (None, None) if architecture != "bitnet-b1.58" => {}
+        (None, None) => {
+            return Err(BackendError::InvalidModelMetadata(format!(
+                "layer {layer_index}: bitnet-b1.58 requires attn_sub_norm and ffn_sub_norm"
+            )));
+        }
+        _ => {
+            return Err(BackendError::InvalidModelMetadata(format!(
+                "layer {layer_index}: BitNet SubLN requires both attn_sub_norm and ffn_sub_norm"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn name(layer: usize, tensor: &str) -> String {
     format!("blk.{layer}.{tensor}")
 }
@@ -4031,21 +4799,16 @@ fn lfm2_metal_prefill_chunk() -> usize {
         .unwrap_or(64)
 }
 
-/// Whether the LFM2 resident Metal lane may be used. DEFAULT-ON; opt out with
-/// `CAMELID_LFM2_METAL=0` (also `off`/`false`/`no`/`disabled`, the documented
-/// opt-out convention).
+/// Whether the LFM2 resident Metal lane may be used. DEFAULT-ON; the Safe
+/// profile or `CAMELID_LFM2_METAL=0` (also `off`/`false`/`no`/`disabled`)
+/// selects the CPU path.
 ///
 /// This predicate MUST stay in lockstep with the execution-plan gate in
 /// `execution_plan.rs`. They answer the same question, and when they disagree
 /// `/v1/health` describes a lane other than the one that ran.
 #[cfg(target_os = "macos")]
 pub(crate) fn lfm2_metal_enabled() -> bool {
-    // Reuses the planner's own opt-out predicate rather than restating the value
-    // list. Restating it is how the two drift: an independently written list here
-    // already differed from the planner's on `no` and `cpu`, which would have let
-    // routing and disclosure disagree for those two values.
-    !std::env::var("CAMELID_LFM2_METAL")
-        .is_ok_and(|v| crate::execution_plan::flag_value_disabled(&v))
+    crate::execution_plan::lfm2_metal_plan_selectable()
 }
 
 /// Whether qwen35 decode routes to the resident Metal graph (default on; `=0`
@@ -4888,6 +5651,11 @@ mod resident_format_admission_tests {
             assert_eq!(resident_metal_format(tt), Some(want), "{tt:?} must map");
             assert!(wants_page_backing(tt), "{tt:?} must load into WirePages");
         }
+
+        // I2_S has its own cleanroom Metal kernel and canonical tensor-wide
+        // trailer, so it is page-backed without pretending to be a Prism format.
+        assert_eq!(resident_metal_format(GgufTensorType::I2S), None);
+        assert!(wants_page_backing(GgufTensorType::I2S));
     }
 
     #[test]
@@ -5943,5 +6711,227 @@ mod gemma3_schedule_tests {
             "gemma3 runnable forward fingerprint: len={} sum_bits={sum_bits:#018x} head={head:?}",
             logits.len()
         );
+    }
+}
+
+#[cfg(test)]
+mod command_r_attemptability_tests {
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    use super::{command_r_parallel_residual, validate_command_r_attemptability_slice};
+    use crate::gguf::{GgufFile, GgufMetadataValue, GgufTensorDescriptor, GgufTensorType};
+    use crate::model::LlamaModelConfig;
+
+    fn descriptor(
+        name: impl Into<String>,
+        tensor_type: GgufTensorType,
+        dimensions: Vec<u64>,
+    ) -> GgufTensorDescriptor {
+        GgufTensorDescriptor {
+            name: name.into(),
+            dimensions,
+            tensor_type,
+            relative_offset: 0,
+            absolute_offset: 0,
+            n_bytes: 0,
+        }
+    }
+
+    fn exact_aya_header_shape() -> (GgufFile, LlamaModelConfig) {
+        let mut metadata = BTreeMap::new();
+        let mut put = |key: &str, value| {
+            metadata.insert(key.to_string(), value);
+        };
+        put(
+            "general.architecture",
+            GgufMetadataValue::String("command-r".into()),
+        );
+        put(
+            "general.name",
+            GgufMetadataValue::String("Aya Expanse 8b".into()),
+        );
+        put(
+            "general.license",
+            GgufMetadataValue::String("cc-by-nc-4.0".into()),
+        );
+        put("general.file_type", GgufMetadataValue::U32(15));
+        put(
+            "tokenizer.ggml.model",
+            GgufMetadataValue::String("gpt2".into()),
+        );
+        put(
+            "tokenizer.ggml.pre",
+            GgufMetadataValue::String("command-r".into()),
+        );
+        put("command-r.context_length", GgufMetadataValue::U32(8_192));
+        put("command-r.embedding_length", GgufMetadataValue::U32(4_096));
+        put("command-r.block_count", GgufMetadataValue::U32(32));
+        put(
+            "command-r.feed_forward_length",
+            GgufMetadataValue::U32(14_336),
+        );
+        put("command-r.attention.head_count", GgufMetadataValue::U32(32));
+        put(
+            "command-r.attention.head_count_kv",
+            GgufMetadataValue::U32(8),
+        );
+        put(
+            "command-r.attention.layer_norm_epsilon",
+            GgufMetadataValue::F32(1e-5),
+        );
+        put("command-r.rope.freq_base", GgufMetadataValue::F32(10_000.0));
+        put(
+            "command-r.rope.scaling.type",
+            GgufMetadataValue::String("none".into()),
+        );
+        put("command-r.logit_scale", GgufMetadataValue::F32(0.125));
+
+        const Q6_DOWN_LAYERS: &[usize] =
+            &[0, 1, 2, 3, 8, 10, 13, 16, 18, 21, 24, 27, 28, 29, 30, 31];
+        const Q6_VALUE_LAYERS: &[usize] =
+            &[0, 1, 2, 3, 6, 7, 12, 15, 18, 21, 24, 27, 28, 29, 30, 31];
+        let mut tensors = vec![
+            descriptor(
+                "token_embd.weight",
+                GgufTensorType::Q6K,
+                vec![4_096, 256_000],
+            ),
+            descriptor("output_norm.weight", GgufTensorType::F32, vec![4_096]),
+        ];
+        for layer in 0..32 {
+            tensors.extend([
+                descriptor(
+                    format!("blk.{layer}.attn_norm.weight"),
+                    GgufTensorType::F32,
+                    vec![4_096],
+                ),
+                descriptor(
+                    format!("blk.{layer}.attn_q.weight"),
+                    GgufTensorType::Q4K,
+                    vec![4_096, 4_096],
+                ),
+                descriptor(
+                    format!("blk.{layer}.attn_k.weight"),
+                    GgufTensorType::Q4K,
+                    vec![4_096, 1_024],
+                ),
+                descriptor(
+                    format!("blk.{layer}.attn_v.weight"),
+                    if Q6_VALUE_LAYERS.contains(&layer) {
+                        GgufTensorType::Q6K
+                    } else {
+                        GgufTensorType::Q4K
+                    },
+                    vec![4_096, 1_024],
+                ),
+                descriptor(
+                    format!("blk.{layer}.attn_output.weight"),
+                    GgufTensorType::Q4K,
+                    vec![4_096, 4_096],
+                ),
+                descriptor(
+                    format!("blk.{layer}.ffn_gate.weight"),
+                    GgufTensorType::Q4K,
+                    vec![4_096, 14_336],
+                ),
+                descriptor(
+                    format!("blk.{layer}.ffn_up.weight"),
+                    GgufTensorType::Q4K,
+                    vec![4_096, 14_336],
+                ),
+                descriptor(
+                    format!("blk.{layer}.ffn_down.weight"),
+                    if Q6_DOWN_LAYERS.contains(&layer) {
+                        GgufTensorType::Q6K
+                    } else {
+                        GgufTensorType::Q4K
+                    },
+                    vec![14_336, 4_096],
+                ),
+            ]);
+        }
+        assert_eq!(
+            tensors
+                .iter()
+                .filter(|tensor| tensor.tensor_type == GgufTensorType::F32)
+                .count(),
+            33
+        );
+        assert_eq!(
+            tensors
+                .iter()
+                .filter(|tensor| tensor.tensor_type == GgufTensorType::Q4K)
+                .count(),
+            192
+        );
+        assert_eq!(
+            tensors
+                .iter()
+                .filter(|tensor| tensor.tensor_type == GgufTensorType::Q6K)
+                .count(),
+            33
+        );
+        let gguf = GgufFile {
+            path: PathBuf::new(),
+            version: 3,
+            tensor_count: tensors.len() as i64,
+            metadata_count: metadata.len() as i64,
+            alignment: 32,
+            data_start_offset: 0,
+            metadata,
+            tensors,
+        };
+        let config = LlamaModelConfig::from_gguf(&gguf).expect("exact Aya config");
+        (gguf, config)
+    }
+
+    #[test]
+    fn exact_aya_q4_k_m_header_shape_is_the_only_command_r_load_slice() {
+        let (mut gguf, config) = exact_aya_header_shape();
+        validate_command_r_attemptability_slice(&gguf, &config)
+            .expect("pinned Aya header shape must be attemptable");
+
+        gguf.tensors[2].name = "blk.0.attn_q_norm.weight".into();
+        let err = validate_command_r_attemptability_slice(&gguf, &config)
+            .expect_err("a QK-normalized neighboring Command R graph must fail closed");
+        assert!(err.to_string().contains("unexpected tensor"));
+    }
+
+    #[test]
+    fn aya_attemptability_rejects_wrong_canonical_dimensions_and_types() {
+        let (mut wrong_dimensions, config) = exact_aya_header_shape();
+        let q = wrong_dimensions
+            .tensors
+            .iter_mut()
+            .find(|tensor| tensor.name == "blk.0.attn_q.weight")
+            .expect("q descriptor");
+        q.dimensions = vec![2_048, 4_096];
+        let err = validate_command_r_attemptability_slice(&wrong_dimensions, &config)
+            .expect_err("a truncated projection width must fail at header admission");
+        assert!(err.to_string().contains("descriptor mismatch"));
+
+        let (mut wrong_type, config) = exact_aya_header_shape();
+        let v = wrong_type
+            .tensors
+            .iter_mut()
+            .find(|tensor| tensor.name == "blk.0.attn_v.weight")
+            .expect("value descriptor");
+        v.tensor_type = GgufTensorType::Q4K;
+        let err = validate_command_r_attemptability_slice(&wrong_type, &config)
+            .expect_err("the immutable row's per-tensor quant assignment must be exact");
+        assert!(err.to_string().contains("descriptor mismatch"));
+    }
+
+    #[test]
+    fn command_r_parallel_residual_preserves_reference_addition_order() {
+        let mut output = [0.0f32];
+        command_r_parallel_residual(&mut output, &[1e20], &[-1e20], &[3.0]);
+        assert_eq!(output, [3.0]);
+
+        let residual = 1e20f32;
+        let attention = 3.0f32;
+        let ffn = -1e20f32;
+        assert_eq!((residual + attention) + ffn, 0.0);
     }
 }

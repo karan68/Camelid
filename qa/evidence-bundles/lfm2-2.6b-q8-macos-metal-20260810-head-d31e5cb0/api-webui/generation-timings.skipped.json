@@ -1,0 +1,4 @@
+{
+  "skipped": true,
+  "reason": "the selected generation lane did not emit camelid.timings_ms; timing diagnostics are not a support gate"
+}

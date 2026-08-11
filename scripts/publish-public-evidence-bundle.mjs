@@ -59,6 +59,17 @@ function sanitizeValue(value) {
 
 function sanitizeText(input) {
   return String(input)
+    .replace(/\/Users\/[^/]+\/Documents\/Camelid\/frontend\/scripts\/smoke\.mjs/g, 'frontend/scripts/smoke.mjs')
+    .replace(/\/Users\/[^/]+\/Documents\/Camelid\/scripts\/summarize-generation-timings\.mjs/g, 'scripts/summarize-generation-timings.mjs')
+    .replace(/\/Users\/[^/]+\/Documents\/Camelid(?=\/|[\s)"']|$)/g, '$CAMELID_WORKTREE')
+    .replace(/\/Users\/[^/]+\/\.local\/state\/Camelid(?=\/|$)/g, '$CAMELID_STATE_DIR')
+    .replace(/\/Volumes\/[^/]+\/models\//g, '$CAMELID_MODEL_ROOT/')
+    .replace(/\/Volumes\/[^/]+\/cargo-targets\/global\/release\/camelid/g, '$CAMELID_BIN')
+    .replace(/\/Volumes\/[^/]+\/llama\.cpp-metal-parity\/build-metal\/bin\//g, '$CAMELID_LLAMA_CPP_BIN/')
+    .replace(/\/private\/tmp\/camelid-[A-Za-z0-9._-]+/g, '$CAMELID_EVIDENCE_TMP')
+    .replace(/\/opt\/homebrew\/Cellar\/node(?:@[^/]+)?\/[^/]+\/bin\/node/g, 'node')
+    .replace(/\/Volumes\/[^/\s"']+/g, '$CAMELID_EXTERNAL_VOLUME')
+    .replace(/\/Users\/[^/\s"']+/g, '$HOME')
     .replace(/\/home\/[^/]+\/work\/Camelid[^/]*\/target\//g, 'target/')
     .replace(/\/home\/[^/]+\/work\/Camelid[^/]*\/frontend\/scripts\/smoke\.mjs/g, 'frontend/scripts/smoke.mjs')
     .replace(/\/home\/[^/]+\/work\/Camelid[^/]*\/scripts\/summarize-generation-timings\.mjs/g, 'scripts/summarize-generation-timings.mjs')
@@ -66,7 +77,9 @@ function sanitizeText(input) {
     .replace(/\/home\/[^/]+\/work\/Camelid[^\s"]*/g, '$CAMELID_WORKTREE')
     .replace(/\/home\/[^/]+\/\.nvm\/versions\/node\/[^/]+\/bin\/node/g, 'node')
     .replace(/\/home\/[^/]+\/models\//g, '$CAMELID_MODEL_DIR/')
-    .replace(/\b(?:\d{1,3}\.){3}\d{1,3}\b/g, 'canonical-private-ubuntu-validation-host')
+    .replace(/\b(?:\d{1,3}\.){3}\d{1,3}\b/g, address => (
+      address === '127.0.0.1' ? address : 'canonical-private-ubuntu-validation-host'
+    ))
     .replace(/\bip-(?:\d+-){3}\d+\b/g, 'canonical-private-ubuntu-validation-host')
     .replace(/[ \t]+$/gm, '')
 }

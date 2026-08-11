@@ -129,6 +129,7 @@ const read = (path) => readFileSync(new URL(path, import.meta.url), 'utf8')
 const readmeSource = read('../../README.md')
 const chatWorkspaceSource = read('../src/views/ChatWorkspace.jsx')
 const messageTurnSource = read('../src/components/chat/MessageTurn.jsx')
+const streamingIndicatorSource = read('../src/components/chat/render/StreamingIndicator.jsx')
 const diagnosticsSource = read('../src/components/chat/render/Diagnostics.jsx')
 const markdownSource = read('../src/lib/markdown.jsx')
 const dashboardHookSource = read('../src/hooks/useDashboardData.js')
@@ -216,14 +217,21 @@ assert.match(markdownSource, /data-code-streaming-state=\{stillGenerating \? 'op
 assert.match(markdownSource, /message-code-card-status[^>]*aria-live="polite"[^>]*data-live-status="active"[^>]*>\{CODE_CARD_STREAMING_LABEL\}</, 'incomplete streaming code blocks should show a live active still-generating badge')
 assert.doesNotMatch(markdownSource, /dangerouslySetInnerHTML/, 'model output must never reach the DOM through dangerouslySetInnerHTML')
 assert.doesNotMatch(messageTurnSource, /dangerouslySetInnerHTML/, 'message rows must never use dangerouslySetInnerHTML')
+assert.match(streamingIndicatorSource, /className="streaming-loader-label">\{label\}<\/span>/, 'pre-token status text must be visible next to the animated dots, not aria-only')
 
 /* ---- Dashboard data hook ---- */
 assert.match(dashboardHookSource, /Include inline <style> and inline <script>/, 'HTML code prompts should ask for inline CSS and JS, not an unfinished fragment')
 assert.match(
   dashboardHookSource,
-  /max_tokens:\s*applyGemma4GhostChatTokenCap\(\s*applyGemma4ChatTokenFloor\(\s*localChatMaxTokens\(history, requestModelId\),\s*sendGate\.hint\?\.target\?\.family,\s*\),\s*runtime\?\.gemma4_serve_lane,\s*\)/,
-  'local chat sends should apply the Gemma 4 visible-output floor and then the Ghost-only Metal-context ceiling',
+  /const requestMaxTokens = applyGemma4GhostChatTokenCap\([\s\S]*applyGemma4ChatTokenFloor\([\s\S]*applyBitNetFreshChatTokenCap\([\s\S]*localChatMaxTokens\(history, responseLimitModelId\)/,
+  'local chat sends should apply the fresh-BitNet cap before the Gemma 4 floor and Ghost-only Metal-context ceiling',
 )
+assert.match(dashboardHookSource, /max_tokens:\s*requestMaxTokens/, 'the computed lane-aware response budget must be sent to the backend')
+assert.match(dashboardHookSource, /const useExperimentalSampling = selectedModelExperimental && !bitNetB158Chat/, 'experimental BitNet chat must stay on its honest greedy lane')
+assert.match(dashboardHookSource, /temperature:\s*useExperimentalSampling \? 0\.7 : 0/, 'BitNet and supported rows must send greedy temperature zero')
+assert.match(dashboardHookSource, /\.\.\.\(useExperimentalSampling \? \{ top_p: 0\.95, top_k: 20, min_p: 0 \} : \{\}\)/, 'unsupported experimental sampling fields must be omitted from BitNet requests')
+assert.match(dashboardHookSource, /thinkingMode && !bitNetB158Chat \? \{ camelid_enable_thinking: true \}/, 'a stale thinking toggle must not make a BitNet request fail before the UI effect clears it')
+assert.match(chatWorkspaceSource, /isBitNetB158ChatModel\(selectedModel, runtime, selectedModelId\)/, 'BitNet controls must use the exact causal-model detector rather than architecture display metadata alone')
 assert.match(dashboardHookSource, /const outputElapsedMs = liveElapsedMs[\s\S]*tokensPerSecond\(realTokens, outputElapsedMs\)/, 'live output rate must use wall time from request start, matching its end-to-end label')
 assert.match(dashboardHookSource, /getRuntimeRequestModelId\(selectedModel, runtime, selectedModelId\)/, 'chat sends should use the backend active runtime model id when a browser alias is selected')
 assert.doesNotMatch(dashboardHookSource, /Camelid streamed the local reply\./, 'successful streams should not show a noisy demo-breaking toast')
@@ -333,6 +341,7 @@ assert.match(compatibilityViewSource, /data-row-id=\{feature\.id\} tabIndex=\{-1
 const modelLanesSource = read('../src/lib/modelLanes.js')
 const laneRowsSource = read('../src/components/models/LaneRows.jsx')
 const catalogBrowseSource = read('../src/components/models/CatalogLaneBrowse.jsx')
+const catalogLaneSource = read('../src/lib/catalogBrowse.js')
 const downloadsPanelSource = read('../src/components/models/DownloadsPanel.jsx')
 const downloadedModelsViewSource = read('../src/views/DownloadedModelsView.jsx')
 const modelActivationSource = read('../src/lib/modelActivation.js')
@@ -349,12 +358,16 @@ assert.match(modelsViewSource, /supportedRows\s*=\s*\(laneBuckets \? laneBuckets
 assert.match(modelsViewSource, /compatibleRows\s*=\s*\(laneBuckets \? laneBuckets\.compatible : \[\]\)\.filter\(matchesModelQuery\)/, 'the Compatible sub-lane must be filtered before rendering')
 assert.match(modelsViewSource, /eligibleRows\s*=\s*\(laneBuckets \? laneBuckets\.eligible : \[\]\)\.filter\(matchesModelQuery\)/, 'the Eligible sub-lane must be filtered before rendering')
 assert.match(modelsViewSource, /notAnchoredRows\s*=\s*\(laneBuckets \? laneBuckets\.not_anchored : \[\]\)\.filter\(matchesModelQuery\)/, 'the Not anchored sub-lane must be filtered before rendering')
-assert.match(modelsViewSource, /\{compatibleRows\.map\(\(m\) => \(/, 'the Experimental section must render filtered Compatible rows, not the raw bucket')
-assert.match(modelsViewSource, /\{eligibleRows\.map\(\(m\) => \(/, 'the Experimental section must render filtered Eligible rows, not the raw bucket')
-assert.match(modelsViewSource, /\{notAnchoredRows\.map\(\(m\) => \(/, 'the Experimental section must render filtered Not anchored rows, not the raw bucket')
+assert.match(modelsViewSource, /\.\.\.compatibleRows\.map\(\(entry\) => \(\{ \.\.\.entry, _familyLane: 'compatible' \}\)\)/, 'the grouped Experimental section must derive Compatible rows from the filtered list')
+assert.match(modelsViewSource, /\.\.\.eligibleRows\.map\(\(entry\) => \(\{ \.\.\.entry, _familyLane: 'eligible' \}\)\)/, 'the grouped Experimental section must derive Eligible rows from the filtered list')
+assert.match(modelsViewSource, /\.\.\.notAnchoredRows\.map\(\(entry\) => \(\{ \.\.\.entry, _familyLane: 'not_anchored' \}\)\)/, 'the grouped Experimental section must derive Not anchored rows from the filtered list')
+assert.match(modelsViewSource, /items=\{supportedRows\}/, 'the Supported family groups must render the filtered list')
+assert.match(modelsViewSource, /items=\{experimentalRows\}/, 'the Experimental family groups must render the filtered tagged list')
+assert.match(modelsViewSource, /filtering:\s*filteringModels[\s\S]*activeFilename:\s*spine\.activeFilename[\s\S]*loadedModelIds:\s*spine\.loadedModelIds/, 'local family disclosures must open for search, the active model, and resident sidecars')
+assert.equal((modelsViewSource.match(/initiallyOpen=\{localFamilyInitiallyOpen\}/g) || []).length, 2, 'both local lanes must use the shared disclosure-open policy')
 // A GGUF's filename is often the only place the quantization appears, so a
 // search for "q4" has to reach it.
-assert.match(modelsViewSource, /model\?\.name \|\| ''\} \$\{model\?\.filename \|\| ''/, 'the model search must match filename as well as display name')
+assert.match(modelsViewSource, /modelSearchText\(model\)\.includes\(needle\)/, 'the model search must match filename, display name, architecture, and visible family')
 // One search drives the whole page. Scoping it to installed models only meant
 // searching "qwen" on a machine without one reported failure while seven
 // downloadable Qwen builds sat further down the same page.
@@ -363,6 +376,8 @@ assert.match(catalogLaneBrowseSource, /setQuery\(String\(externalQuery \|\| ''\)
 // Two search boxes on one page is the thing this replaced, so the catalog's own
 // input must not render while the page is driving it.
 assert.match(catalogLaneBrowseSource, /\{!pageControlled && \(/, "the catalog's own search box must be hidden when the page drives the query")
+assert.match(catalogLaneBrowseSource, /initiallyOpen=\{\(\) => openFamilies\}/, 'catalog family disclosures must accept an explicit open-on-search policy')
+assert.equal((catalogLaneBrowseSource.match(/openFamilies=\{searching\}/g) || []).length, 3, 'curated, runnable live, and nested unsupported search families must not remain hidden in closed disclosures')
 // The result line has to say whether scrolling down is worth it.
 assert.match(modelsViewSource, /to download in Get models/, 'the result line must report how many catalog rows match')
 // Empty states must not keep claiming the machine has nothing while a filter is
@@ -384,7 +399,9 @@ assert.match(modelsViewSource, /UnsupportedBlocker/, 'typed fail-closed blockers
 assert.doesNotMatch(modelsViewSource, /supported_quantization|planned_quantization|supported_model_families|planned_model_families|getQuantCapability|quantCapabilityLabel|quantCapabilityCopy/, 'Models view should not render broad quant/family capability lists as support evidence')
 assert.match(laneRowsSource, /<EvidenceChip/, 'Models lane rows must render their status claims through the Evidence Chip')
 assert.match(laneRowsSource, /never copper/, 'runnable rows must document that they never take the reserved supported (copper) styling')
-assert.match(catalogBrowseSource, /if \(item\.group === 'experimental'\) return 'not_anchored'/, 'live Hugging Face rows must never anchor a lane or imply support')
+assert.match(catalogBrowseSource, /predictedLane\(item, capabilities\)/, 'catalog rows must delegate lane placement to the shared prediction helper')
+assert.match(catalogLaneSource, /if \(item\?\.group === 'experimental'\) return 'not_anchored'/, 'live Hugging Face rows must never anchor a lane or imply support')
+assert.match(catalogLaneSource, /if \(item\?\.host_lane_class != null\)[\s\S]*return 'not_anchored'/, 'an explicit unrecognized or unsupported host lane must fail closed')
 assert.match(catalogBrowseSource, /Confirm download/, 'catalog downloads must go through an explicit confirmation phase')
 assert.match(catalogBrowseSource, /Download and start/, 'curated catalog rows should offer the complete activation workflow')
 assert.match(catalogBrowseSource, /settlementInFlightRef\.current/, 'catalog settlement must be single-flight across polling ticks')
@@ -398,7 +415,7 @@ assert.match(catalogBrowseSource, /refusedByFit[\s\S]*item\.oracle_qualified/, '
 assert.match(catalogBrowseSource, /const refusedByFit = isRefusingFit\(item\.fit\)/, 'auto-start must gate on every load-refusing verdict, not just wont_fit')
 assert.match(modelActivationSource, /if \(!inspectRes\.ok\)[\s\S]*return \{ ok: false, stage: CHECKING, message, code, blocker/, 'automatic activation must fail closed on an HTTP-level inspect failure')
 assert.match(modelActivationSource, /activeFilename !== filename[\s\S]*did not confirm/, 'automatic navigation must wait for current-model confirmation')
-assert.match(modelActivationSource, /v1\/health[\s\S]*health\.loaded_now[\s\S]*health\.generation_ready[\s\S]*health\.active_model_id !== filename/, 'automatic navigation must wait for live generation readiness and active-model identity')
+assert.match(modelActivationSource, /v1\/health[\s\S]*health\.loaded_now[\s\S]*health\.generation_ready[\s\S]*health\.active_model_id !== requestModelId/, 'automatic navigation must wait for live generation readiness and the requested active-model identity')
 assert.match(modelsViewSource, /readActiveFilename: async \(\) => modelFilenameFromPath\(\(await spine\.refreshCurrent\(\)\)\?\.path\)/, 'the Models page must answer the identity check from its own current-model refresh')
 assert.match(appSource, /modelsVisited[\s\S]*hidden=\{tab !== 'library'\}/, 'Models must remain mounted after first visit so active downloads retain their activation coordinator')
 /* First-run activation, same rule for the same reason: an in-flight install must keep
@@ -459,9 +476,13 @@ assert.match(appSource, /ensureInferenceTelemetryConnected/, 'the app shell must
 const responseLimitsSource = read('../src/lib/responseLimits.js')
 const rlcSource = read('../src/components/settings/ResponseLengthControl.jsx')
 const {
+  applyBitNetFreshChatTokenCap,
   applyGemma4ChatTokenFloor,
   applyGemma4GhostChatTokenCap,
+  BITNET_B1_58_DEFAULT_CHAT_MAX_TOKENS,
   GEMMA4_GHOST_WEBUI_MAX_TOKENS,
+  hasExplicitMaxTokensSetting,
+  isBitNetB158ChatModel,
   validateResponseLength,
   validateSendBudget,
   verifiedContextBound,
@@ -477,6 +498,50 @@ const {
   assert.equal(applyGemma4GhostChatTokenCap(8192, 'distributed'), 8192, 'the Ghost cap must not shrink distributed Gemma 4')
   assert.equal(applyGemma4GhostChatTokenCap(8192, 'local'), 8192, 'the Ghost cap must not shrink another local Gemma lane')
   assert.equal(applyGemma4GhostChatTokenCap(8192, ''), 8192, 'the global default must remain unchanged without an explicit Ghost lane')
+  assert.equal(
+    isBitNetB158ChatModel(
+      { id: 'downloaded-model' },
+      { current_model: { gguf: { metadata: { 'general.architecture': 'bitnet-b1.58' } } } },
+      'downloaded-model',
+    ),
+    true,
+    'the inspected causal BitNet architecture should select its chat policy even when the runtime id is generic',
+  )
+  assert.equal(
+    isBitNetB158ChatModel({ id: 'bitnet_b1_58_2b_4t_i2_s' }, null, 'bitnet_b1_58_2b_4t_i2_s'),
+    true,
+    'the exact catalog id should select the causal BitNet chat policy before current-model metadata arrives',
+  )
+  assert.equal(
+    isBitNetB158ChatModel({ id: 'bitnet-embeddings-0.6b-bf16-i2_s.gguf', architecture: 'qwen3' }, null, 'bitnet-embeddings-0.6b-bf16-i2_s.gguf'),
+    false,
+    'the Microsoft embedding sidecars must not inherit the causal BitNet chat cap or sampler policy',
+  )
+  assert.equal(
+    applyBitNetFreshChatTokenCap(8192, { bitNetB158: true }),
+    BITNET_B1_58_DEFAULT_CHAT_MAX_TOKENS,
+    'a fresh BitNet setup should replace the legacy 8K default with a fast bounded turn',
+  )
+  assert.equal(applyBitNetFreshChatTokenCap(64, { bitNetB158: true }), 64, 'a smaller fresh BitNet budget should be preserved')
+  assert.equal(
+    applyBitNetFreshChatTokenCap(512, { bitNetB158: true, hasExplicitSetting: true }),
+    512,
+    'an explicit per-model BitNet response setting must remain authoritative',
+  )
+  assert.equal(applyBitNetFreshChatTokenCap(8192, { bitNetB158: false }), 8192, 'the BitNet cap must not shrink another model')
+  const previousWindow = globalThis.window
+  globalThis.window = {
+    localStorage: {
+      getItem: (key) => key === 'camelid.maxTokens.bitnet_b1_58_2b_4t_i2_s' ? '512' : null,
+    },
+  }
+  try {
+    assert.equal(hasExplicitMaxTokensSetting('bitnet_b1_58_2b_4t_i2_s'), true, 'a valid per-model storage value should disable only the fresh-default cap')
+    assert.equal(hasExplicitMaxTokensSetting('another-model'), false, 'a missing per-model setting should retain lane defaults')
+  } finally {
+    if (previousWindow === undefined) delete globalThis.window
+    else globalThis.window = previousWindow
+  }
   const overCtx = validateResponseLength({ value: 8192, contextLength: 64, verifiedBound: null, modelName: 'fixture' })
   assert.equal(overCtx.level, 'caution', 'above the model context is a non-blocking caution now (backend auto-limits, does not reject)')
   assert.match(overCtx.message, /auto-limit|room left|shorter/, 'over-context copy must explain the auto-limit, not claim rejection')
@@ -705,8 +770,9 @@ for (const [path, source] of visibleUiSources) {
 
 /* ---- Streaming visuals (current chat.css/ui.css truth) ---- */
 assert.match(chatCss, /\.streaming-loader\s*\{[^}]*display:\s*inline-flex/s, 'streaming assistant rows should keep a dedicated loader')
+assert.match(chatCss, /\.streaming-loader-label\s*\{[^}]*color:\s*var\(--color-text-muted\)[^}]*font-size:\s*var\(--text-xs\)/s, 'the visible pre-token status should use readable secondary text styling')
 assert.match(chatCss, /\.streaming-loader-dot\s*\{[^}]*border-radius:\s*50%[^}]*animation:\s*camelidDotBounce/s, 'streaming loader dots should animate only while the loader is rendered')
-assert.match(chatCss, /\.streaming-loader-compact\s*\{[^}]*padding:\s*0 0 8px/s, 'compact streaming loader should sit above pre-token assistant content without extra copy')
+assert.match(chatCss, /\.streaming-loader-compact\s*\{[^}]*padding:\s*0 0 8px/s, 'compact streaming loader should sit above pre-token assistant content with its visible phase label')
 assert.match(chatCss, /\.message-code-card\.is-generating\s*\{/, 'incomplete streaming code cards should have an active visual treatment')
 assert.match(chatCss, /\.message-live-generation-badge\s*\{/, 'streaming assistant content should keep a visible active badge while the backend is generating')
 assert.match(chatCss, /\.message-live-dot\s*\{[^}]*animation:\s*cxPulse/s, 'live generation badges should visibly pulse only while the badge is rendered')

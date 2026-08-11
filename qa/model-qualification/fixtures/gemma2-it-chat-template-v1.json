@@ -1,0 +1,98 @@
+{
+  "schema": "camelid.chat-template-fixture/v1",
+  "pack_id": "gemma2-it-chat-template-v1",
+  "support_scope": "template_and_routing_only_no_real_row_support",
+  "artifact": {
+    "repo": "BenevolenceMessiah/gemma-2-9b-it-Q8_0-GGUF",
+    "revision": "eb4741d7b2aece6d8519db62dc31d89029a40af8",
+    "file": "gemma-2-9b-it-q8_0.gguf",
+    "size_bytes": 9827149312,
+    "hf_lfs_sha256": "59f2e1125fc3af738c256336fb11095da855050305b3705c6c779730a3a8d84e",
+    "architecture": "gemma2",
+    "tokenizer_model": "llama",
+    "tokenizer_pre": "default",
+    "add_bos_token": true,
+    "add_eos_token": false,
+    "bos_token_id": 2,
+    "eos_token_id": 1
+  },
+  "oracle": {
+    "kind": "exact_gguf_metadata_plus_template_semantics",
+    "gguf_metadata_parser": "@huggingface/gguf remote range parser",
+    "upstream_model_card": "https://huggingface.co/google/gemma-2-9b-it#chat-template",
+    "note": "The source template is copied byte-for-byte from tokenizer.chat_template in the pinned GGUF. Google documents the same <bos><start_of_turn>user... shape. Camelid leaves BOS out of renderer text and requests tokenizer-level BOS insertion exactly once."
+  },
+  "source_template": "{{ bos_token }}{% if messages[0]['role'] == 'system' %}{{ raise_exception('System role not supported') }}{% endif %}{% for message in messages %}{% if (message['role'] == 'user') != (loop.index0 % 2 == 0) %}{{ raise_exception('Conversation roles must alternate user/assistant/user/assistant/...') }}{% endif %}{% if (message['role'] == 'assistant') %}{% set role = 'model' %}{% else %}{% set role = message['role'] %}{% endif %}{{ '<start_of_turn>' + role + '\n' + message['content'] | trim + '<end_of_turn>\n' }}{% endfor %}{% if add_generation_prompt %}{{'<start_of_turn>model\n'}}{% endif %}",
+  "encode_contract": {
+    "renderer_includes_bos_text": false,
+    "add_special": true,
+    "parse_special": true,
+    "reason": "The GGUF declares add_bos_token=true. Keeping BOS at token level avoids a literal-BOS plus inserted-BOS duplicate."
+  },
+  "shapes": [
+    {
+      "id": "single_user",
+      "messages": [
+        { "role": "user", "content": "Hello" }
+      ],
+      "expected_prompt_without_bos": "<start_of_turn>user\nHello<end_of_turn>\n<start_of_turn>model\n"
+    },
+    {
+      "id": "multi_turn",
+      "messages": [
+        { "role": "user", "content": "First" },
+        { "role": "assistant", "content": "One" },
+        { "role": "user", "content": "Second" }
+      ],
+      "expected_prompt_without_bos": "<start_of_turn>user\nFirst<end_of_turn>\n<start_of_turn>model\nOne<end_of_turn>\n<start_of_turn>user\nSecond<end_of_turn>\n<start_of_turn>model\n"
+    },
+    {
+      "id": "content_trim_and_final_assistant",
+      "messages": [
+        { "role": "user", "content": "  keep inside\nline  " },
+        { "role": "assistant", "content": "  answer  " }
+      ],
+      "expected_prompt_without_bos": "<start_of_turn>user\nkeep inside\nline<end_of_turn>\n<start_of_turn>model\nanswer<end_of_turn>\n<start_of_turn>model\n"
+    }
+  ],
+  "rejections": [
+    {
+      "id": "system_role",
+      "messages": [
+        { "role": "system", "content": "Be terse" },
+        { "role": "user", "content": "Hello" }
+      ],
+      "reason": "System role not supported"
+    },
+    {
+      "id": "assistant_first",
+      "messages": [
+        { "role": "assistant", "content": "Hello" }
+      ],
+      "reason": "Conversation roles must alternate user/assistant/user/assistant/..."
+    },
+    {
+      "id": "whitespace_padded_role",
+      "messages": [
+        { "role": " user ", "content": "Hello" }
+      ],
+      "reason": "Conversation roles must alternate user/assistant/user/assistant/..."
+    },
+    {
+      "id": "two_users",
+      "messages": [
+        { "role": "user", "content": "One" },
+        { "role": "user", "content": "Two" }
+      ],
+      "reason": "Conversation roles must alternate user/assistant/user/assistant/..."
+    }
+  ],
+  "not_claimed": [
+    "model load",
+    "generation parity",
+    "API or WebUI smoke",
+    "context",
+    "performance",
+    "real-row support"
+  ]
+}

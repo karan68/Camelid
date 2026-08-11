@@ -29,6 +29,8 @@
       "$comment": "Code-derived from `status:` literals in src/api/mod.rs. check-ledger-schema.mjs asserts this list is a SUPERSET of the live code values (drift guard). Polymorphic by item type: model rows use the supported_*/active_validation_*/planned_* subset; SupportItem lists (quant/family/api_features) add ok/partial/future/downloading/error.",
       "enum": [
         "active_validation_blocked_parity",
+        "active_validation_exact_row_hold",
+        "active_validation_exact_row_smoke",
         "active_validation_partial_runtime",
         "blocked_later_generation_divergence",
         "blocked_pending_normalized_full_support",
@@ -64,6 +66,9 @@
       "$comment": "Code-derived from `support_scope:` literals in src/api/mod.rs (checked ⊇ by check-ledger-schema.mjs).",
       "enum": [
         "current_full_gate_exact_row",
+        "catalog_download_and_bounded_cross_backend_raw_decode_smoke_only",
+        "catalog_download_and_bounded_raw_runtime_validation_only",
+        "catalog_download_and_bounded_runtime_validation_only",
         "exact_row_bounded_moe_runtime_only",
         "exact_row_chatml_thinking_disabled_gpu_resident_smoke_only",
         "exact_row_chatml_thinking_disabled_smoke_only",
@@ -72,6 +77,8 @@
         "exact_row_embeddings_rerank_and_workspace_semantic_retrieval_only",
         "exact_row_gpu_resident_raw_decode_parity_smoke_only",
         "exact_row_gpu_resident_windowed_chat_smoke_only_metal_or_cuda",
+        "exact_hash_pinned_row_on_windows_x86_64_runnable_cpu_or_mac16_10_apple_m4_macos_26_5_arm64_resident_metal_greedy_chat_and_512_context_smoke_only",
+        "exact_row_greedy_runnable_chat_and_512_context_smoke_only",
         "exact_row_macos_apple_silicon_metal_chat_smoke_only",
         "exact_row_macos_apple_silicon_metal_text_and_single_image_chat_smoke_only",
         "exact_row_macos_apple_silicon_metal_text_and_single_image_cli_smoke_only",
@@ -87,12 +94,12 @@
     "fullSupportStatusVocabulary": {
       "type": "string",
       "$comment": "Code-derived from `full_support_status:` literals in src/api/mod.rs (checked ⊇ by check-ledger-schema.mjs).",
-      "enum": ["blocked_generation_parity", "blocked_later_generation_divergence", "blocked_pending_broader_encoder_evidence", "blocked_pending_normalized_full_support", "blocked_pending_portability_and_bounded_context", "blocked_pending_portability_bounded_context_and_multimodal_expansion", "blocked_prompt_and_generation_parity", "current_gate_refresh_under_stricter_bar", "not_applicable_until_certified_row", "not_applicable_until_runtime_support"]
+      "enum": ["blocked_before_support_promotion", "blocked_generation_parity", "blocked_later_generation_divergence", "blocked_pending_broader_encoder_evidence", "blocked_pending_normalized_full_support", "blocked_pending_portability_and_bounded_context", "blocked_pending_portability_bounded_context_and_multimodal_expansion", "blocked_prompt_and_generation_parity", "current_gate_refresh_under_stricter_bar", "not_applicable_until_certified_row", "not_applicable_until_runtime_support"]
     },
     "latestCheckedResultVocabulary": {
       "type": "string",
       "$comment": "Code-derived from `latest_checked_result:` literals in src/api/mod.rs (checked ⊇ by check-ledger-schema.mjs).",
-      "enum": ["blocked_generation_parity", "blocked_later_generation_divergence", "blocked_prompt_and_generation_parity", "not_started", "pass", "planning_only"]
+      "enum": ["blocked_generation_parity", "blocked_later_generation_divergence", "blocked_prompt_and_generation_parity", "not_started", "partial_pass_hold", "pass", "pass_active_validation_only", "planning_only"]
     },
     "supportItem": {
       "type": "object",

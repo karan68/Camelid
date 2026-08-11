@@ -257,4 +257,4 @@ The next benchmark slice worth publishing is:
 
 This file is a benchmark snapshot, not a support matrix.
 
-It does not widen any support claim beyond `COMPATIBILITY.md`, `STATUS.md`, and the cited evidence bundles.
+It does not widen any support claim beyond `COMPATIBILITY.md`, `docs/reference/STATUS.md`, and the cited evidence bundles.

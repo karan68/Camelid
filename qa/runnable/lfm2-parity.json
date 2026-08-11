@@ -10,7 +10,7 @@
   "max_new": 24,
   "decode": "greedy/argmax",
   "proves": "lfm2 forward graph (short-conv + rolling conv state + QK-normed GQA + per-layer schedule)",
-  "does_not_prove": "tokenizer parity (both sides are fed the same prompt ids by construction) — gated separately by lfm2_tokenizer_matches_llamacpp; chat-template fidelity — gated by api::tests::lfm2_renderer_matches_llamacpp_applied_template; and end-to-end serve, long context, sampling, tools, other quants, GPU lanes, other LFM2 variants — none of which are gated anywhere yet",
+  "does_not_prove": "tokenizer parity (both sides are fed the same prompt ids by construction) — gated separately by lfm2_tokenizer_matches_llamacpp; chat-template fidelity — gated by api::tests::lfm2_renderer_matches_llamacpp_applied_template; or, by itself, end-to-end serve, long context, sampling, tools, other quants, a particular CPU/GPU execution backend, or other LFM2 variants — backend and context claims require independent lane-specific receipts",
   "result": "pass",
   "all_greedy_match": true,
   "prompts": [

@@ -19,7 +19,8 @@ import {
    (Evidence-Chip treatment — the one marker allowed evidence styling), the
    model context length (metadata, explicitly not a support claim), and a
    memory ceiling that is ABSENT until the backend reports system memory and
-   KV cost (BACKEND_ASKS.md #3) — no client-side guessing, no fake gauge. */
+   KV cost (frontend/design-evidence/BACKEND_ASKS.md #3) — no client-side
+   guessing, no fake gauge. */
 
 const fmt = (n) => n.toLocaleString()
 

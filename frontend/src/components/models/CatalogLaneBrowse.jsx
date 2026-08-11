@@ -1,5 +1,4 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { isCompatibilitySupportedForModel } from '../../lib/capabilities'
 import { beginCatalogSettlement, catalogDownloadSettlement, completeCatalogAcquisition, reserveCatalogAcquisition } from '../../lib/catalogActivation'
 import {
   catalogBundleInstalled,
@@ -17,14 +16,17 @@ import {
   isRefusingFit,
   partitionByArchSupport,
   partitionCuratedByFit,
+  predictedLane,
   quantAdvice,
 } from '../../lib/catalogBrowse'
 import { SUPPORTED_MODELS } from '../../lib/supportedModels'
 import { formatBytes } from '../../lib/formatters'
+import { isEmbeddingOnlyModel } from '../../lib/modelCapabilities.js'
 import { Button } from '../ui/Button'
 import { EvidenceChip } from '../ui/EvidenceChip'
 import { IconCheck } from '../ui/icons'
 import { Notice } from '../ui/Notice'
+import { ModelFamilyGroups } from './ModelFamilyGroups'
 
 /* Zone 5 — Get models. Curated picks first, then live Hugging Face GGUF search
    (>= 2 chars). Each row shows which lane it WOULD land in (derived: supported
@@ -50,17 +52,6 @@ const CURATED_DECORATION = new Map(SUPPORTED_MODELS.map((item) => [item.catalog_
    in a tooltip on the guessed value, rather than as a paragraph on all 150 rows. */
 const HF_GUESS_EXPLANATION =
   'Architecture and quantization are read from the filename, not the model. The real lane is only known after the file loads.'
-
-/* Predicted lane for a catalog entry — derived, never a hand-authored label. */
-function predictedLane(item, capabilities) {
-  // Experimental (live Hugging Face) rows are advisory only: their architecture/quant
-  // are filename guesses, so they can never anchor a lane or imply support — even when
-  // the filename happens to coincide with a supported contract row. Always not-anchored.
-  if (item.group === 'experimental') return 'not_anchored'
-  if (isCompatibilitySupportedForModel(capabilities, null, item)) return 'supported'
-  if (item.oracle_qualified) return 'compatible'
-  return 'not_anchored'
-}
 
 function laneChip(lane) {
   if (lane === 'supported') return <EvidenceChip state="supported" asText>Supported</EvidenceChip>
@@ -292,6 +283,7 @@ function CatalogRow({
   const acquisitionItemRef = useRef(item)
   const settlementInFlightRef = useRef(false)
   const lane = predictedLane(item, capabilities)
+  const embeddingOnly = isEmbeddingOnlyModel(item)
   const decoration = item.group === 'experimental' ? null : CURATED_DECORATION.get(item.catalog_id)
   // ANY load-refusing verdict must stop the auto-start chain, not just `wont_fit`:
   // the load-time guard refuses both, so chaining into it would end in a 422.
@@ -544,7 +536,9 @@ function CatalogRow({
             {phase === 'checking'
               ? 'Download complete — checking the model…'
               : phase === 'loading'
-                ? 'Check passed — loading the model for Chat…'
+                ? embeddingOnly
+                  ? 'Check passed — loading the embedding sidecar…'
+                  : 'Check passed — loading the model for Chat…'
                 : preparingGhost
                   ? 'Preparing Ghost MoE — repacking routed experts and reclaiming the full download…'
                 : downloading
@@ -765,6 +759,17 @@ function CatalogGroup({ title, marker, count, emptyText, children }) {
         {count === 0 ? <p className="lane-empty">{emptyText}</p> : children}
       </div>
     </section>
+  )
+}
+
+function CatalogFamilyGroups({ items, renderItem, openFamilies = false }) {
+  return (
+    <ModelFamilyGroups
+      items={items}
+      renderItem={renderItem}
+      className="model-family-group--catalog"
+      initiallyOpen={() => openFamilies}
+    />
   )
 }
 
@@ -1063,7 +1068,11 @@ export function CatalogLaneBrowse({
           count={curated.length}
           emptyText="No curated entries match."
         >
-          {curated.map((item) => renderRow(item))}
+          <CatalogFamilyGroups
+            items={curated}
+            renderItem={(item) => renderRow(item)}
+            openFamilies={searching}
+          />
         </CatalogGroup>
       ) : (
         <>
@@ -1077,7 +1086,10 @@ export function CatalogLaneBrowse({
             count={curatedRunnable.length}
             emptyText="No curated model matches."
           >
-            {curatedRunnable.map((item) => renderRow(item))}
+            <CatalogFamilyGroups
+              items={curatedRunnable}
+              renderItem={(item) => renderRow(item)}
+            />
           </CatalogGroup>
           {curatedBlocked.length ? (
             <details className="catalog-collapsed">
@@ -1085,7 +1097,12 @@ export function CatalogLaneBrowse({
                 {curatedBlocked.length} model{curatedBlocked.length === 1 ? '' : 's'} too big for this
                 machine
               </summary>
-              <div className="catalog-list">{curatedBlocked.map((item) => renderRow(item))}</div>
+              <div className="catalog-list">
+                <CatalogFamilyGroups
+                  items={curatedBlocked}
+                  renderItem={(item) => renderRow(item)}
+                />
+              </div>
             </details>
           ) : null}
         </>
@@ -1110,7 +1127,13 @@ export function CatalogLaneBrowse({
                 : 'No live Hugging Face GGUFs match (or the Hub is unreachable).'
             }
           >
-            {loading ? <SearchSkeleton /> : loadable.map(renderHfCard)}
+            {loading ? <SearchSkeleton /> : (
+              <CatalogFamilyGroups
+                items={loadable}
+                renderItem={renderHfCard}
+                openFamilies={searching}
+              />
+            )}
           </CatalogGroup>
           {!loading && unimplemented.length ? (
             <details className="catalog-collapsed">
@@ -1119,7 +1142,13 @@ export function CatalogLaneBrowse({
                 Camelid can&rsquo;t run
               </summary>
               <p className="catalog-row-faint">{HF_GUESS_EXPLANATION}</p>
-              <div className="catalog-list">{unimplemented.map(renderHfCard)}</div>
+              <div className="catalog-list">
+                <CatalogFamilyGroups
+                  items={unimplemented}
+                  renderItem={renderHfCard}
+                  openFamilies={searching}
+                />
+              </div>
             </details>
           ) : null}
           {nextCursor && !loading ? (

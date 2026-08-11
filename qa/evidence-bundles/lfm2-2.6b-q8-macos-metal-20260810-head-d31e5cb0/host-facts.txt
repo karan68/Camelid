@@ -1,0 +1,10 @@
+model_identifier=Mac16,10
+cpu=Apple M4
+memory_bytes=17179869184
+logical_cpus=10
+operating_system=macOS
+operating_system_version=26.5
+operating_system_build=25F5058e
+architecture=arm64
+runtime_gpu=Apple M4 Metal compute
+unified_memory=true

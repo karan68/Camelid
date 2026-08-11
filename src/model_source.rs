@@ -8,6 +8,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::hf_tokenizer_json::{inspect_hf_tokenizer_json, HfTokenizerJsonSummary};
 use crate::{BackendError, Result};
 
 /// Source-level model formats that Camelid can reason about before runtime loading.
@@ -27,6 +28,8 @@ pub struct ModelSourceManifest {
     pub kind: ModelSourceKind,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hf_config: Option<HfLlamaConfigSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hf_tokenizer: Option<HfTokenizerJsonSummary>,
     #[serde(skip_serializing)]
     pub root: PathBuf,
     #[serde(skip_serializing)]
@@ -411,6 +414,7 @@ fn inspect_gguf_file(path: &Path) -> ModelSourceInspection {
             id: source_id(path),
             kind: ModelSourceKind::Gguf,
             hf_config: None,
+            hf_tokenizer: None,
             root: path.to_path_buf(),
             weight_files: vec![path.to_path_buf()],
             tensor_descriptors: Vec::new(),
@@ -455,19 +459,31 @@ fn inspect_hugging_face_safetensors_dir(path: &Path) -> Result<ModelSourceInspec
             (false, None)
         });
 
-    let tokenizer_ready = tokenizer_path.is_some();
-    if !tokenizer_ready {
-        blockers.push(blocker(
-            "missing_tokenizer_json",
-            "Hugging Face SafeTensors directories must include tokenizer.json before tokenizer readiness can be reported",
-        ));
-    }
+    let (tokenizer_ready, hf_tokenizer) = match tokenizer_path.as_deref() {
+        Some(tokenizer_path) => match inspect_hf_tokenizer_json(tokenizer_path) {
+            Ok(summary) => (true, Some(summary)),
+            Err(tokenizer_blocker) => {
+                blockers.push(blocker(
+                    tokenizer_blocker.code.as_str(),
+                    tokenizer_blocker.message,
+                ));
+                (false, None)
+            }
+        },
+        None => {
+            blockers.push(blocker(
+                "missing_tokenizer_json",
+                "Hugging Face SafeTensors directories must include tokenizer.json before tokenizer readiness can be reported",
+            ));
+            (false, None)
+        }
+    };
 
     let (weights_ready, tensor_descriptors) =
         hf_weights_ready(&weight_files, shard_index_path.as_deref(), &mut blockers)?;
     blockers.push(blocker(
         "generation_disabled",
-        "SafeTensors generation remains disabled until tokenizer parity, tensor orientation, dtype decode, and one-token dense execution fixtures pass",
+        "SafeTensors generation remains disabled until tokenizer special-token/chat-template parity, tensor orientation, and one-token dense execution fixtures pass",
     ));
 
     Ok(ModelSourceInspection {
@@ -475,6 +491,7 @@ fn inspect_hugging_face_safetensors_dir(path: &Path) -> Result<ModelSourceInspec
             id: source_id(path),
             kind: ModelSourceKind::HuggingFaceSafeTensors,
             hf_config,
+            hf_tokenizer,
             root: path.to_path_buf(),
             weight_files,
             tensor_descriptors,
@@ -1231,13 +1248,15 @@ fn blocker(code: &'static str, message: impl Into<String>) -> ModelSourceBlocker
 mod tests {
     use std::{fs, path::Path};
 
+    use crate::hf_tokenizer_json::TEST_WORDLEVEL_TOKENIZER_JSON;
+
     use super::*;
 
     #[test]
     fn complete_hf_safetensors_directory_reports_readiness_but_not_generation() {
         let dir = tempfile::tempdir().unwrap();
         write_llama_config(dir.path());
-        fs::write(dir.path().join("tokenizer.json"), "{}").unwrap();
+        write_test_tokenizer(dir.path());
         fs::write(dir.path().join("tokenizer_config.json"), "{}").unwrap();
         fs::write(dir.path().join("special_tokens_map.json"), "{}").unwrap();
         fs::write(dir.path().join("generation_config.json"), "{}").unwrap();
@@ -1275,6 +1294,10 @@ mod tests {
         assert_eq!(hf_config.vocab_size, 32000);
         assert!(!hf_config.tie_word_embeddings);
         assert!(inspection.manifest.tokenizer_path.is_some());
+        let hf_tokenizer = inspection.manifest.hf_tokenizer.as_ref().unwrap();
+        assert_eq!(hf_tokenizer.model_type, "WordLevel");
+        assert_eq!(hf_tokenizer.vocab_size, 11);
+        assert_eq!(hf_tokenizer.probes[0].token_ids, [1, 2, 3, 4]);
         assert!(inspection.manifest.shard_index_path.is_some());
         assert_eq!(inspection.manifest.tensor_descriptors.len(), 2);
         assert_eq!(
@@ -1320,10 +1343,37 @@ mod tests {
     }
 
     #[test]
+    fn invalid_tokenizer_json_blocks_tokenizer_readiness_with_a_precise_code() {
+        let dir = tempfile::tempdir().unwrap();
+        write_llama_config(dir.path());
+        fs::write(dir.path().join("tokenizer.json"), "not json").unwrap();
+        write_safetensors_file(
+            dir.path(),
+            "model.safetensors",
+            &[("model.embed_tokens.weight", "F16", &[1, 1])],
+        );
+
+        let inspection = inspect_model_source(dir.path()).unwrap();
+
+        assert!(inspection.readiness.metadata_ready);
+        assert!(!inspection.readiness.tokenizer_ready);
+        assert!(inspection.manifest.hf_tokenizer.is_none());
+        assert!(inspection.readiness.weights_ready);
+        assert_blocker_codes(
+            &inspection,
+            &["invalid_tokenizer_json", "generation_disabled"],
+        );
+        assert_public_blocker_message_without_local_path(
+            &inspection.readiness.blockers[0].message,
+            dir.path(),
+        );
+    }
+
+    #[test]
     fn sharded_weights_without_index_have_precise_blocker() {
         let dir = tempfile::tempdir().unwrap();
         write_llama_config(dir.path());
-        fs::write(dir.path().join("tokenizer.json"), "{}").unwrap();
+        write_test_tokenizer(dir.path());
         write_safetensors_file(
             dir.path(),
             "model-00001-of-00002.safetensors",
@@ -1347,7 +1397,7 @@ mod tests {
     fn invalid_shard_index_has_precise_blocker() {
         let dir = tempfile::tempdir().unwrap();
         write_llama_config(dir.path());
-        fs::write(dir.path().join("tokenizer.json"), "{}").unwrap();
+        write_test_tokenizer(dir.path());
         write_safetensors_file(
             dir.path(),
             "model-00001-of-00002.safetensors",
@@ -1380,7 +1430,7 @@ mod tests {
     fn shard_index_without_weight_map_has_precise_blocker() {
         let dir = tempfile::tempdir().unwrap();
         write_llama_config(dir.path());
-        fs::write(dir.path().join("tokenizer.json"), "{}").unwrap();
+        write_test_tokenizer(dir.path());
         write_safetensors_file(
             dir.path(),
             "model-00001-of-00002.safetensors",
@@ -1406,7 +1456,7 @@ mod tests {
     fn shard_index_referencing_missing_weight_file_has_precise_blocker() {
         let dir = tempfile::tempdir().unwrap();
         write_llama_config(dir.path());
-        fs::write(dir.path().join("tokenizer.json"), "{}").unwrap();
+        write_test_tokenizer(dir.path());
         write_safetensors_file(
             dir.path(),
             "model-00001-of-00002.safetensors",
@@ -1439,7 +1489,7 @@ mod tests {
     fn invalid_config_json_has_sanitized_precise_blocker() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("config.json"), "not json").unwrap();
-        fs::write(dir.path().join("tokenizer.json"), "{}").unwrap();
+        write_test_tokenizer(dir.path());
         write_safetensors_file(
             dir.path(),
             "model.safetensors",
@@ -1469,7 +1519,7 @@ mod tests {
             r#"{"model_type":"mistral","architectures":["MistralForCausalLM"]}"#,
         )
         .unwrap();
-        fs::write(dir.path().join("tokenizer.json"), "{}").unwrap();
+        write_test_tokenizer(dir.path());
         write_safetensors_file(
             dir.path(),
             "model.safetensors",
@@ -1495,7 +1545,7 @@ mod tests {
             r#"{"model_type":"llama","architectures":["LlamaForCausalLM"],"hidden_size":16}"#,
         )
         .unwrap();
-        fs::write(dir.path().join("tokenizer.json"), "{}").unwrap();
+        write_test_tokenizer(dir.path());
         write_safetensors_file(
             dir.path(),
             "model.safetensors",
@@ -1525,7 +1575,7 @@ mod tests {
                 ("num_attention_heads", serde_json::json!(4)),
             ],
         );
-        fs::write(dir.path().join("tokenizer.json"), "{}").unwrap();
+        write_test_tokenizer(dir.path());
         write_safetensors_file(
             dir.path(),
             "model.safetensors",
@@ -1551,7 +1601,7 @@ mod tests {
                 serde_json::json!({"type":"linear","factor":2.0}),
             )],
         );
-        fs::write(dir.path().join("tokenizer.json"), "{}").unwrap();
+        write_test_tokenizer(dir.path());
         write_safetensors_file(
             dir.path(),
             "model.safetensors",
@@ -1571,7 +1621,7 @@ mod tests {
     fn shard_index_path_values_have_sanitized_precise_blocker() {
         let dir = tempfile::tempdir().unwrap();
         write_llama_config(dir.path());
-        fs::write(dir.path().join("tokenizer.json"), "{}").unwrap();
+        write_test_tokenizer(dir.path());
         write_safetensors_file(
             dir.path(),
             "model-00001-of-00002.safetensors",
@@ -1608,7 +1658,7 @@ mod tests {
     fn shard_index_invalid_entries_are_reported_in_stable_tensor_order() {
         let dir = tempfile::tempdir().unwrap();
         write_llama_config(dir.path());
-        fs::write(dir.path().join("tokenizer.json"), "{}").unwrap();
+        write_test_tokenizer(dir.path());
         write_safetensors_file(
             dir.path(),
             "model-00001-of-00002.safetensors",
@@ -1642,7 +1692,7 @@ mod tests {
         let model_dir = root.path().join("Meta-Llama-3.1-8B-Instruct");
         fs::create_dir(&model_dir).unwrap();
         write_llama_config(&model_dir);
-        fs::write(model_dir.join("tokenizer.json"), "{}").unwrap();
+        write_test_tokenizer(&model_dir);
         write_safetensors_file(
             &model_dir,
             "model.safetensors",
@@ -1658,7 +1708,7 @@ mod tests {
     fn invalid_safetensors_header_blocks_weight_readiness() {
         let dir = tempfile::tempdir().unwrap();
         write_llama_config(dir.path());
-        fs::write(dir.path().join("tokenizer.json"), "{}").unwrap();
+        write_test_tokenizer(dir.path());
         fs::write(dir.path().join("model.safetensors"), b"too short").unwrap();
 
         let inspection = inspect_model_source(dir.path()).unwrap();
@@ -1678,7 +1728,7 @@ mod tests {
     fn unsupported_safetensors_dtype_blocks_weight_readiness() {
         let dir = tempfile::tempdir().unwrap();
         write_llama_config(dir.path());
-        fs::write(dir.path().join("tokenizer.json"), "{}").unwrap();
+        write_test_tokenizer(dir.path());
         write_safetensors_file(
             dir.path(),
             "model.safetensors",
@@ -1702,7 +1752,7 @@ mod tests {
     fn shard_index_tensor_missing_from_header_blocks_weight_readiness() {
         let dir = tempfile::tempdir().unwrap();
         write_llama_config(dir.path());
-        fs::write(dir.path().join("tokenizer.json"), "{}").unwrap();
+        write_test_tokenizer(dir.path());
         write_safetensors_file(
             dir.path(),
             "model-00001-of-00001.safetensors",
@@ -1730,7 +1780,7 @@ mod tests {
     fn serialized_hf_inspection_does_not_expose_local_paths() {
         let dir = tempfile::tempdir().unwrap();
         write_llama_config(dir.path());
-        fs::write(dir.path().join("tokenizer.json"), "{}").unwrap();
+        write_test_tokenizer(dir.path());
         write_safetensors_file(
             dir.path(),
             "model.safetensors",
@@ -1754,7 +1804,7 @@ mod tests {
     fn safetensors_shape_dtype_offset_mismatch_blocks_weight_readiness() {
         let dir = tempfile::tempdir().unwrap();
         write_llama_config(dir.path());
-        fs::write(dir.path().join("tokenizer.json"), "{}").unwrap();
+        write_test_tokenizer(dir.path());
         let header = serde_json::json!({
             "model.embed_tokens.weight": {
                 "dtype": "F32",
@@ -1801,6 +1851,10 @@ mod tests {
 
     fn write_llama_config(root: &Path) {
         write_llama_config_with_overrides(root, &[]);
+    }
+
+    fn write_test_tokenizer(root: &Path) {
+        fs::write(root.join("tokenizer.json"), TEST_WORDLEVEL_TOKENIZER_JSON).unwrap();
     }
 
     fn write_llama_config_with_overrides(root: &Path, overrides: &[(&str, Value)]) {

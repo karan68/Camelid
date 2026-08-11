@@ -1,0 +1,8 @@
+PASS self-digest: receipt_id matches the canonical body (4c5ab20e898fa6c2fed49e9079aed4b7248b2502ca0b006ba9b42acdbda2133c)
+PASS lane-identity: --gguf sha256 matches lane.gguf_sha256 (36587fdf27bdfc69caf2637273679a0870ec155162161bde6fd16e8c70bdb757)
+PASS reproducibility: receipt records a deterministic (greedy) run
+SKIP camelid-rerun: --reference-only
+INFO reference-rerun: llama-server version "version: 9632 (acd79d603)"
+INFO reference-rerun: prompt fed as the receipt's exact 512 token ids
+PASS reference-rerun: generated tokens (8) and text match llama.cpp (first_divergent_token_index=-1)
+RECEIPT PARTIALLY VERIFIED (reference checks only: digest, lane identity, and the llama.cpp re-run; the Camelid re-run was skipped)

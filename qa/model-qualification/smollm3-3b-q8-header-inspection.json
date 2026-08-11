@@ -1,0 +1,77 @@
+{
+  "schema": "camelid.remote-gguf-header-inspection/v1",
+  "row_id": "smollm3_3b_q8_0",
+  "generated_at": "2026-08-10T17:03:19.278Z",
+  "host": {
+    "hostname_redacted": true,
+    "platform": "win32",
+    "release": "10.0.26220",
+    "arch": "x64"
+  },
+  "inspector": {
+    "version": "camelid v0.6.1-28-gfcb3e022",
+    "binary_sha256": "17c60bcad794934416a1ae29de99ce0316d77b68207ac1e5d1e7d90189f5b9c3",
+    "source_head": "fcb3e022e24efecdd0a554ff7fd218a6ee106dfc",
+    "binary_commit_abbrev": "fcb3e022",
+    "binary_reports_dirty": false,
+    "binary_matches_source_head": true,
+    "clean_current_head": true,
+    "binary_path_redacted": true,
+    "command": [
+      "<camelid>",
+      "inspect-prefix",
+      "<remote-gguf-prefix>",
+      "--declared-len",
+      "3275574624"
+    ]
+  },
+  "source": {
+    "repo": "ggml-org/SmolLM3-3B-GGUF",
+    "file": "SmolLM3-Q8_0.gguf",
+    "revision": "4965cb60b150737b68a0408c36aeefb65078f894",
+    "size_bytes": 3275574624,
+    "sha256": "8aa8cc74656137174a1988d993b00828e65a86fd68773412b632a75aa1373248"
+  },
+  "range": {
+    "requested_bytes": 33554432,
+    "received_bytes": 33554432,
+    "content_range": {
+      "start": 0,
+      "end": 33554431,
+      "total": 3275574624
+    },
+    "prefix_sha256": "2d043b2114b89100c7ba464e57375a6f32c06c04729542d54ed684b5e8c5016e"
+  },
+  "inspection": {
+    "version": 3,
+    "tensor_count": 326,
+    "metadata_count": 26,
+    "alignment": 32,
+    "data_start_offset": 7843168,
+    "observed": {
+      "architecture": "smollm3",
+      "general_file_type": 7,
+      "tokenizer_model": "gpt2",
+      "tokenizer_pre": "smaug-bpe",
+      "headline_quant": "Q8_0"
+    },
+    "tensor_inventory": {
+      "sha256": "df12dc5af5709d5a7411ca9916c7f628f55d65102b96bf3b974d18ab503d98fb",
+      "total_n_bytes": 3267731456,
+      "types": {
+        "F32": 73,
+        "Q8_0": 253
+      }
+    }
+  },
+  "scope": {
+    "prefix_sha256": "all_received_prefix_bytes",
+    "tensor_payload": "partially_range_fetched_opaque",
+    "full_artifact_sha256": "not_run",
+    "tensor_payload_interpretation": "not_run",
+    "load": "not_run",
+    "generation": "not_run"
+  },
+  "support_claim": false,
+  "note": "Remote header inspection validates metadata and tensor descriptors against the pinned full length. The prefix SHA-256 covers every received byte, including any opaque initial tensor payload after data_start_offset; the remaining payload is not fetched, and no tensor payload is interpreted, loaded as model weights, or used for inference or generation."
+}

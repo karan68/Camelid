@@ -1,0 +1,4 @@
+{
+  "skipped": true,
+  "reason": "chat-only qualification requested; this model does not claim legacy /v1/completions support"
+}

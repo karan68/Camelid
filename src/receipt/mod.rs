@@ -6,7 +6,7 @@
 //!
 //! 1. A receipt proves one request matched the reference — it is NOT a support
 //!    promotion. A green receipt does not move any row in the release ledger
-//!    (`README.md` / `COMPATIBILITY.md` / `STATUS.md`), and no copy, field
+//!    (`README.md` / `COMPATIBILITY.md` / `docs/reference/STATUS.md`), and no copy, field
 //!    name, or log line may imply otherwise.
 //! 2. Receipts are only meaningful for deterministic runs. A receipt for a
 //!    sampled (non-greedy) run must be stamped `reproducible: false` and is
@@ -204,6 +204,16 @@ impl LaneIdentity {
 /// Human label for the GGUF's quantization: `general.file_type` when present
 /// (llama.cpp ftype naming), else the dominant tensor type by count.
 pub fn quantization_label(gguf: &GgufFile) -> String {
+    // Microsoft's BitNet fork reuses general.file_type=40, which Prism already
+    // uses for Q1_0. The tensor directory is unambiguous (GGML type 36), so it
+    // must outrank the colliding file-level enum.
+    if gguf
+        .tensors
+        .iter()
+        .any(|tensor| tensor.tensor_type == GgufTensorType::I2S)
+    {
+        return "I2_S".to_string();
+    }
     if gguf
         .tensors
         .iter()
@@ -1258,6 +1268,25 @@ mod tests {
             "Q2_0_G128"
         );
         assert_eq!(quantization_label(&gguf(GgufTensorType::Pq2_0)), "PQ2_0");
+    }
+
+    #[test]
+    fn bitnet_i2_s_tensor_directory_outranks_colliding_file_type_40() {
+        use crate::gguf::{GgufTensorDescriptor, GgufTensorType};
+        let mut metadata = BTreeMap::new();
+        metadata.insert("general.file_type".into(), GgufMetadataValue::U32(40));
+        let gguf = gguf_for_lane_tests(
+            metadata,
+            vec![GgufTensorDescriptor {
+                name: "blk.0.attn_q.weight".into(),
+                dimensions: vec![128, 128],
+                tensor_type: GgufTensorType::I2S,
+                relative_offset: 0,
+                absolute_offset: 0,
+                n_bytes: 0,
+            }],
+        );
+        assert_eq!(quantization_label(&gguf), "I2_S");
     }
 
     #[test]

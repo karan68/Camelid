@@ -80,6 +80,7 @@ assert.deepEqual(streamed.usage, { prompt_tokens: 3, completion_tokens: 7, total
 assert.ok(streamEvents.includes('bytes'), 'stream parser should expose first-byte progress before content')
 assert.ok(streamEvents.includes('role'), 'stream parser should expose role-only chunks while waiting for first content token')
 assert.ok(streamEvents.includes('usage'), 'stream parser should expose backend usage chunks before finalizing the assistant row')
+assert.deepEqual(streamEvents.slice(-3), ['finish', 'usage', 'done'], 'terminal stream evidence should preserve finish, usage, then [DONE] ordering')
 
 const multilinePayload = await readStreamingChatCompletion(new Response(streamFromChunks([
   'data: {"choices":[{"delta":{"content":"multi"}}],\n',

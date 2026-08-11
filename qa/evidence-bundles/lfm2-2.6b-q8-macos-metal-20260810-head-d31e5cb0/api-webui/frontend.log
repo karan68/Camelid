@@ -1,0 +1,9 @@
+
+> camelid-frontend@0.1.0 dev
+> vite --host 127.0.0.1 --port 4175
+
+
+  VITE v8.0.10  ready in 183 ms
+
+  ➜  Local:   http://127.0.0.1:4175/
+  ➜  press h + enter to show help

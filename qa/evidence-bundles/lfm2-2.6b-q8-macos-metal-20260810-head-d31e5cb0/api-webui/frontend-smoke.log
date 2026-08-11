@@ -1,0 +1,26 @@
+Smoke target API: http://127.0.0.1:8251
+Smoke target frontend: http://127.0.0.1:4175
+  frontend_http_200_ms=42
+✓ frontend returned HTTP 200
+  model_load_ms=78
+✓ loaded requested GGUF: $CAMELID_MODEL_ROOT/lfm2/LFM2.5-2.6B-Q8_0.gguf
+  model_id=lfm2_5_2_6b_q8_0; tokenizer=available; dense tensors not bound
+  chat_template=metadata_unparsed; source=tokenizer.chat_template; length=5443
+  health_ms=2
+✓ health ok; generation_ready=true; active_model_id=lfm2_5_2_6b_q8_0
+  models_ms=0
+✓ /v1/models returned 1 model(s): lfm2_5_2_6b_q8_0
+  current_model_ms=46
+  local_models_ms=9
+✓ exact local identity filename=LFM2.5-2.6B-Q8_0.gguf; size_bytes=2874779456; lane_class=supported; gguf_sha256=36587fdf27bdfc69caf2637273679a0870ec155162161bde6fd16e8c70bdb757
+  capabilities_ms=7
+✓ WebUI chat gate model=lfm2_5_2_6b_q8_0; quant=Q8_0; backend_lane=supported; lfm2_5_2_6b_q8_0: supported exact row smoke; artifact_supported=true
+  WebUI contract note=native runnable chat emits sealed prompt/generated-token receipts; exact 512-token rendered chat matches the same oracle for 8/8 generated tokens and text on both lanes; Match source: exact /api/capabilities row id match; runtime generation still requires loaded_now=true and generation_ready=true.
+  chat_completion_stream_ms=1387
+✓ streaming chat published 9 visible update(s) before final completion in 1.39s: "Hello! How can I help you today?"
+  stream_events=bytes,role,content,content,content,content,content,content,content,content,content,finish,usage,done
+  terminal_finish_reason=stop; terminal_usage={"prompt_tokens":11,"completion_tokens":43,"total_tokens":54}
+  chat_completion_ms=142
+  backend_prompt_token_ids=[124894,124899,5922,207,52071,124900,207,124899,63514,207,124901]
+  backend_generated_token_ids=[207]
+✓ chat completion 1/1 returned in 0.14s: "\n"

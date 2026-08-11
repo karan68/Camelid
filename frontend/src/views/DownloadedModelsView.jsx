@@ -19,6 +19,7 @@ import {
   unloadLocalModel,
 } from '../lib/modelActivation'
 import { modelDeleteBlockedReason } from '../lib/modelDeletion'
+import { isEmbeddingOnlyModel, isGenerationCapableModel } from '../lib/modelCapabilities.js'
 import {
   describeModel,
   metaLine,
@@ -93,7 +94,8 @@ export default function DownloadedModelsView({
     }
   }
 
-  const load = async (filename) => {
+  const load = async (entry) => {
+    const filename = entry.filename
     if (modelActionInFlightRef.current) return
     modelActionInFlightRef.current = filename
     clearMessages()
@@ -102,6 +104,7 @@ export default function DownloadedModelsView({
       const result = await loadLocalModelForChat({
         apiBase: spine.base,
         filename,
+        model: entry,
         readActiveFilename: async () => modelFilenameFromPath((await spine.refreshCurrent())?.path),
       })
       if (!result.ok) throw new Error(result.message)
@@ -328,6 +331,9 @@ export default function DownloadedModelsView({
             const isDefault = entry.filename === spine.defaultFilename
             const deleteAvailable = Boolean(entry.delete_token)
             const canLoad = entry.lane_class !== 'unsupported'
+            const embeddingOnly = isEmbeddingOnlyModel(entry, runtime)
+            const generationCapable = isGenerationCapableModel(entry, runtime)
+            const standaloneRuntime = embeddingOnly || generationCapable
             const actionBusy = Boolean(modelAction.filename)
             return (
               <article
@@ -349,10 +355,10 @@ export default function DownloadedModelsView({
                   <div className="cxv-card__meta">
                     <strong>{entry.size_bytes ? formatBytes(entry.size_bytes) : 'Unknown size'}</strong>
                     <span className="cxv-dot">·</span>
-                    <span>{entry.chat_capable ? 'Chat model' : 'Text model'}</span>
+                    <span>{embeddingOnly ? 'Embedding model' : generationCapable ? (entry.chat_capable ? 'Chat model' : 'Text model') : 'Companion asset'}</span>
                   </div>
                   <div className="cxv-card__actions">
-                    {!isDefault && canLoad ? (
+                    {!isDefault && canLoad && generationCapable ? (
                       <Button
                         variant="ghost"
                         size="sm"
@@ -379,12 +385,12 @@ export default function DownloadedModelsView({
                       >
                         Unload
                       </Button>
-                    ) : (
+                    ) : standaloneRuntime ? (
                       <Button
                         variant="tonal"
                         size="sm"
                         icon={<IconPlay size={16} />}
-                        onClick={() => load(entry.filename)}
+                        onClick={() => load(entry)}
                         loading={modelAction.filename === entry.filename && modelAction.type === 'load'}
                         disabled={!canLoad || actionBusy || Boolean(deletingFilename)}
                         aria-label={`Load ${entry.filename}`}
@@ -392,7 +398,7 @@ export default function DownloadedModelsView({
                       >
                         Load
                       </Button>
-                    )}
+                    ) : null}
                     <Button
                       variant="ghost"
                       size="sm"

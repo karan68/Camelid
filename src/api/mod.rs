@@ -43,7 +43,9 @@ pub use server::ServeOptions;
 pub(crate) use server::DEFAULT_MAX_REQUEST_BODY_BYTES;
 
 use crate::{
-    embedding::{cosine_similarity, EncoderConfig, NomicBertRuntime},
+    embedding::{
+        cosine_similarity, validate_bitnet_embedding_metadata, EmbeddingRuntime, EncoderConfig,
+    },
     execution_plan::{plan_for_model_with_env, ExecutionPlan, PlannerEnv},
     gguf::{read_metadata, GgufFile, GgufTensorDescriptor, GgufTensorType},
     inference::{
@@ -65,13 +67,13 @@ use crate::{
     },
     model::{
         DenseLlamaDims, LlamaAttentionTensors, LlamaFfnTensors, LlamaModelConfig,
-        LlamaTensorBinding,
+        LlamaMoeExpertTensors, LlamaTensorBinding,
     },
     model_default,
     model_source::{inspect_model_source, ModelSourceInspection, ModelSourceKind},
     receipt::{
-        self, LaneIdentity, ParityBlock, ParityReceipt, ReceiptResult, ReferenceIdentity,
-        RECEIPT_SCHEMA_V1,
+        self, ExecutionLane, LaneIdentity, ParityBlock, ParityReceipt, ReceiptResult,
+        ReferenceIdentity, RECEIPT_SCHEMA_V1,
     },
     telemetry,
     tensor::{parse_byte_count_env, CpuTensor, Q8_0Block, TensorStore},
@@ -139,7 +141,7 @@ pub struct AppState {
     dg_runtimes: Arc<RwLock<HashMap<String, Arc<DgServeRuntime>>>>,
     /// Bidirectional encoder runtimes, loaded lazily on the first embeddings or
     /// reranking request and released with the owning model.
-    embedding_runtimes: Arc<RwLock<HashMap<String, Arc<NomicBertRuntime>>>>,
+    embedding_runtimes: Arc<RwLock<HashMap<String, Arc<EmbeddingRuntime>>>>,
     /// Prevent concurrent first-use requests from loading the same encoder
     /// weights more than once and temporarily doubling resident memory.
     embedding_runtime_load: Arc<tokio::sync::Mutex<()>>,
@@ -847,6 +849,7 @@ pub struct ChatCompletionRequest {
     /// Opt-in: attach a parity receipt to the (non-streaming) response. The
     /// receipt is a claim of output for the verifier to check â€” no reference
     /// runs here, so its parity block is emitted as not-compared.
+    #[serde(alias = "include_receipt")]
     pub camelid_receipt: Option<bool>,
     /// Opt-in gemma4 thinking mode: renders the reference's enable_thinking
     /// template (system turn opens with the `<|think|>` token). Thinking
@@ -961,6 +964,8 @@ pub struct ChatMessage {
     pub unsupported_content_parts: Vec<String>,
 }
 
+const INTERNAL_TOOL_CALL_HISTORY_MARKER: &str = "__camelid_internal_tool_calls";
+
 /// Wire shape for `ChatMessage` deserialization: accepts the OpenAI plain
 /// string form and the content-parts array form. `text` parts are concatenated
 /// in order; every non-text part records its `type` so the handler can reject
@@ -1073,7 +1078,7 @@ impl<'de> Deserialize<'de> for ChatMessage {
         D: serde::Deserializer<'de>,
     {
         let mut wire = ChatMessageWire::deserialize(deserializer)?;
-        let (mut content, image_urls, unsupported_content_parts) = match wire.content {
+        let (mut content, image_urls, mut unsupported_content_parts) = match wire.content {
             Some(ChatContentWire::Text(text)) => (text, Vec::new(), Vec::new()),
             Some(ChatContentWire::Parts(parts)) => {
                 let mut text = String::new();
@@ -1111,6 +1116,10 @@ impl<'de> Deserialize<'de> for ChatMessage {
                 content.push('\n');
                 content.push_str(&canonical);
             }
+            // Preserve the fact that this assistant content came from structured
+            // tool_calls. Tool-capable templates still consume the canonicalized
+            // text, while no-tools dialects such as BitNet can fail closed.
+            unsupported_content_parts.push(INTERNAL_TOOL_CALL_HISTORY_MARKER.to_string());
         }
         if wire.tool_call_id.is_some() && wire.role != "tool" {
             return Err(serde::de::Error::custom(
@@ -1136,7 +1145,12 @@ impl<'de> Deserialize<'de> for ChatMessage {
 fn reject_unsupported_multimodal_content(messages: &[ChatMessage]) -> Option<Response> {
     let mut part_types: Vec<&str> = messages
         .iter()
-        .flat_map(|m| m.unsupported_content_parts.iter().map(String::as_str))
+        .flat_map(|m| {
+            m.unsupported_content_parts
+                .iter()
+                .map(String::as_str)
+                .filter(|part| *part != INTERNAL_TOOL_CALL_HISTORY_MARKER)
+        })
         .collect();
     if part_types.is_empty() {
         return None;
@@ -4033,6 +4047,120 @@ async fn llama_server_props(
 }
 
 fn llama_server_chat_template_caps(model: Option<&LoadedModel>) -> serde_json::Value {
+    if let Some(model) = model.filter(|model| model.gguf.architecture() == Some("smollm3")) {
+        let template = model
+            .tokenizer_runtime
+            .as_deref()
+            .and_then(|tokenizer| tokenizer.chat_template.as_deref());
+        return match template {
+            Some(template) if is_exact_smollm3_chat_template(template) => serde_json::json!({
+                "available": true,
+                "requires_loaded_model": true,
+                "source": "tokenizer.chat_template",
+                "detected_format": "smollm3_exact_default_thinking_text_qualified",
+                "length": template.len(),
+                "supported_operations": ["render_prompt"],
+                "render_prompt_envelope": {
+                    "public_surfaces": {
+                        "/apply-template": {
+                            "thinking": ["omitted_effective_true"]
+                        },
+                        "/v1/chat/completions": {
+                            "thinking": ["omitted_defaults_true", "explicit_true"],
+                            "streaming": [false, true]
+                        }
+                    },
+                    "content": "text_only",
+                    "roles": ["user", "assistant"],
+                    "history": "strict_alternation_ending_user",
+                    "add_generation_prompt": true,
+                    "today_date": "system_local_english_dd_month_yyyy"
+                },
+                "unsupported": [
+                    "system_messages",
+                    "custom_instructions",
+                    "system_override",
+                    "tools",
+                    "tool_messages",
+                    "thinking_disabled",
+                    "invalid_roles",
+                    "non_alternating_history",
+                    "history_not_ending_user",
+                    "multimodal_content",
+                    "non_text_content",
+                    "arbitrary_template_kwargs",
+                    "full_llama_server_template_parity"
+                ],
+            }),
+            Some(template) => serde_json::json!({
+                "available": true,
+                "requires_loaded_model": true,
+                "source": "tokenizer.chat_template",
+                "detected_format": detect_chat_template_format(template),
+                "length": template.len(),
+                "supported_operations": [],
+                "render_prompt_envelope": null,
+                "unsupported": [
+                    "smollm3_exact_template_required",
+                    "render_prompt",
+                    "arbitrary_template_kwargs",
+                    "tool_call_templates",
+                    "multimodal_templates",
+                    "full_llama_server_template_parity"
+                ],
+            }),
+            None => serde_json::json!({
+                "available": false,
+                "requires_loaded_model": true,
+                "source": null,
+                "detected_format": null,
+                "length": null,
+                "supported_operations": [],
+                "render_prompt_envelope": null,
+                "unsupported": [
+                    "smollm3_chat_template_missing",
+                    "render_prompt",
+                    "arbitrary_template_kwargs",
+                    "tool_call_templates",
+                    "multimodal_templates",
+                    "full_llama_server_template_parity"
+                ],
+            }),
+        };
+    }
+
+    if let Some((model, template)) = model.and_then(|model| {
+        (model.gguf.architecture() != Some("smollm3"))
+            .then_some(model)
+            .and_then(|model| {
+                model
+                    .tokenizer_runtime
+                    .as_deref()
+                    .and_then(|tokenizer| tokenizer.chat_template.as_deref())
+                    .filter(|template| is_exact_smollm3_chat_template(template))
+                    .map(|template| (model, template))
+            })
+    }) {
+        return serde_json::json!({
+            "available": true,
+            "requires_loaded_model": true,
+            "source": "tokenizer.chat_template",
+            "detected_format": "smollm3_exact_template_architecture_mismatch",
+            "length": template.len(),
+            "declared_architecture": model.gguf.architecture(),
+            "supported_operations": [],
+            "render_prompt_envelope": null,
+            "unsupported": [
+                "smollm3_architecture_template_mismatch",
+                "render_prompt",
+                "arbitrary_template_kwargs",
+                "tool_call_templates",
+                "multimodal_templates",
+                "full_llama_server_template_parity"
+            ],
+        });
+    }
+
     let template = model.and_then(|model| match &model.tokenizer {
         TokenizerLoadState::Available(summary) => summary.chat_template.as_ref(),
         TokenizerLoadState::Unavailable { .. } => None,
@@ -4474,7 +4602,7 @@ struct RerankResponse<'a> {
 async fn resolve_embedding_runtime(
     state: &AppState,
     requested_model: Option<&str>,
-) -> std::result::Result<(String, Arc<NomicBertRuntime>), Response> {
+) -> std::result::Result<(String, Arc<EmbeddingRuntime>), Response> {
     let model_id = match requested_model
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -4486,13 +4614,13 @@ async fn resolve_embedding_runtime(
             let active_embedding = active.filter(|id| {
                 loaded
                     .get(id)
-                    .is_some_and(|model| model.gguf.architecture() == Some("nomic-bert"))
+                    .is_some_and(|model| is_embedding_model(&model.gguf))
             });
             active_embedding
                 .or_else(|| {
                     let mut candidates = loaded
                         .values()
-                        .filter(|model| model.gguf.architecture() == Some("nomic-bert"))
+                        .filter(|model| is_embedding_model(&model.gguf))
                         .map(|model| model.id.clone())
                         .collect::<Vec<_>>();
                     candidates.sort();
@@ -4542,13 +4670,14 @@ async fn resolve_embedding_runtime(
                 Some("model"),
             )
         })?;
-    if model.gguf.architecture() != Some("nomic-bert") {
+    if !is_embedding_model(&model.gguf) {
         return Err(api_error(
             StatusCode::UNPROCESSABLE_ENTITY,
             "model_not_embedding_capable",
             format!(
-                "model {model_id:?} uses architecture {:?}; the current embedding runtime requires \"nomic-bert\"",
-                model.gguf.architecture().unwrap_or("unknown")
+                "model {model_id:?} uses architecture {:?} and name {:?}; it is not an admitted embedding artifact",
+                model.gguf.architecture().unwrap_or("unknown"),
+                model.gguf.model_name().unwrap_or("unknown")
             ),
             Some("model"),
         ));
@@ -4556,7 +4685,7 @@ async fn resolve_embedding_runtime(
 
     let path = model.path.clone();
     let _reader = state.model_file_lifecycle.read().await;
-    let loaded = tokio::task::spawn_blocking(move || NomicBertRuntime::load(path)).await;
+    let loaded = tokio::task::spawn_blocking(move || EmbeddingRuntime::load(path)).await;
     let runtime = match loaded {
         Ok(Ok(runtime)) => Arc::new(runtime),
         Ok(Err(error)) => {
@@ -4620,6 +4749,14 @@ async fn embeddings(
             Err(response) => return response,
         };
     let dimensions = request.dimensions;
+    if let Err(error) = runtime.validate_dimensions(dimensions) {
+        return api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            backend_error_code(&error),
+            error.to_string(),
+            Some("dimensions"),
+        );
+    }
     let result = tokio::task::spawn_blocking(move || {
         let embeddings = runtime.embed_batch(&inputs, dimensions)?;
         let prompt_tokens = inputs
@@ -4678,19 +4815,6 @@ async fn embeddings(
         .into_response()
 }
 
-fn with_embedding_prefix(text: &str, prefix: &str) -> String {
-    let trimmed = text.trim();
-    if trimmed.starts_with("search_query:")
-        || trimmed.starts_with("search_document:")
-        || trimmed.starts_with("clustering:")
-        || trimmed.starts_with("classification:")
-    {
-        trimmed.to_string()
-    } else {
-        format!("{prefix}{trimmed}")
-    }
-}
-
 async fn rerank(
     State(state): State<AppState>,
     payload: std::result::Result<Json<RerankRequest>, JsonRejection>,
@@ -4734,12 +4858,12 @@ async fn rerank(
         };
 
     let mut inputs = Vec::with_capacity(request.documents.len() + 1);
-    inputs.push(with_embedding_prefix(&request.query, "search_query: "));
+    inputs.push(runtime.prepare_retrieval_query(&request.query));
     inputs.extend(
         request
             .documents
             .iter()
-            .map(|document| with_embedding_prefix(document.text(), "search_document: ")),
+            .map(|document| runtime.prepare_retrieval_document(document.text())),
     );
     let result = tokio::task::spawn_blocking(move || {
         let embeddings = runtime.embed_batch(&inputs, None)?;
@@ -4839,9 +4963,16 @@ fn loaded_model_generation_ready(model: &LoadedModel) -> bool {
     let Some(binding) = model.llama_tensors.as_ref() else {
         return false;
     };
+    let (layer_range, load_embedding, load_output) = api_weight_load_ownership();
     model.llama_config.is_some()
         && matches!(model.tokenizer, TokenizerLoadState::Available(_))
-        && guard_cpu_weight_materialization_budget(binding).is_ok()
+        && guard_cpu_weight_materialization_budget_with_ownership(
+            binding,
+            layer_range.as_ref(),
+            load_embedding,
+            load_output,
+        )
+        .is_ok()
 }
 
 /// Runtime GPU state for the UI toggle. `available` covers either a usable CUDA
@@ -4950,7 +5081,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
         hf_catalog_install: true,
         execution_plan,
         support_contract: SupportContract {
-            current_gate: "Current exact-row support: TinyLlama Q8_0 current gate; Llama 3.2 1B Instruct Q8_0 has checked bounded 512/1024/2048/4096/8192 packs; Llama 3.2 3B Instruct Q8_0 is supported_exact_row_smoke with the anchored checked bounded 512/1024/2048/4096/8192 raw-decode context ladder on the current canonical GGUF (prior-upload Ubuntu API/WebUI refresh at source head e9f926ed1a65 retained as historical evidence); and Llama 3 8B Instruct Q8_0 has checked bounded 512/1024/2048 packs where row-specific PASS artifacts exist. Mistral 7B Instruct v0.3 Q8_0 is supported_exact_row_smoke: checked tokenizer/template, parity (including GPU-vs-CPU greedy continuations on the exact row), bounded 512/1024/2048/4096/8192 context artifacts, and a support-promotion API/WebUI smoke bundle. Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf has bounded one-token backend MoE runtime evidence only; later 5-token/API/WebUI/RSS promotion-candidate artifacts are superseded by Gate 9A 50-token divergence and a longer-continuation hang, so broad/API/WebUI/frontend readiness remains unsupported. The dense Qwen3 Q8_0 ChatML rows (0.6B/1.7B/4B/8B Instruct, thinking disabled) are supported_exact_row_smoke: qwen2 BPE pre-tokenizer + ChatML renderer, per-head QK-norm + NEOX RoPE, and token+text parity vs llama.cpp at 1/5/50 on macOS/Ubuntu and on Windows x86_64 CPU (cpu_reference + the x86_q8 AVX2 runtime-repack path, bit-identical), and additionally on Windows CUDA: the 0.6B/1.7B/4B rows fully VRAM-resident and the 8B row via the VRAM+host-RAM offload split (RTX 3060 Laptop 6 GB, driver 576.83, CUDA 12.9; GPU decode+single-shot prefill token+text identical to cpu_reference/llama.cpp at 1/5/50); 1.7B additionally has GPU-resident decode+prefill and a 15,373-token single-shot prefill lane on macOS, and thinking-mode is opt-in (leading-trace parity only). The 4B row additionally carries checked bounded-context packs 512/1024/2048/4096/8192, the 1.7B row 512/1024/2048/4096, and the 0.6B row 512/2048/4096/8192 (fully-GPU-resident raw-decode greedy parity vs llama.cpp acd79d603 at 50 tokens; the 1.7B 8192 and 0.6B 1024 buckets are held as documented benign near-ties). These are exact bounded lanes only; no model-native/larger context beyond the checked packs, arbitrary-template behavior, production throughput, portability, neighboring-row, or broad-family support is implied. Seven hash-pinned Prism ML Bonsai Q1_0, Prism Q2_0, and PQ2_0 artifacts are supported_exact_row_smoke on macOS Apple Silicon Metal and Windows x86_64 CUDA after paired text and vision validation; the claim is exact-file and limited to those two GPU platforms, with broader qwen3/qwen35 or quant support, bounded/model-native context, and production throughput still unclaimed. The seven files are mixed-arch: the 4B and 8B rows declare general.architecture=qwen3 (dense), only the 27B rows declare qwen35 (hybrid).",
+            current_gate: "Current exact-row support: TinyLlama Q8_0 current gate; Llama 3.2 1B Instruct Q8_0 has checked bounded 512/1024/2048/4096/8192 packs; Llama 3.2 3B Instruct Q8_0 is supported_exact_row_smoke with the anchored checked bounded 512/1024/2048/4096/8192 raw-decode context ladder on the current canonical GGUF (prior-upload Ubuntu API/WebUI refresh at source head e9f926ed1a65 retained as historical evidence); and Llama 3 8B Instruct Q8_0 has checked bounded 512/1024/2048 packs where row-specific PASS artifacts exist. Mistral 7B Instruct v0.3 Q8_0 is supported_exact_row_smoke: checked tokenizer/template, parity (including GPU-vs-CPU greedy continuations on the exact row), bounded 512/1024/2048/4096/8192 context artifacts, and a support-promotion API/WebUI smoke bundle. LFM2.5-2.6B Q8_0 is hash-pinned supported_exact_row_smoke only on the Windows x86_64 runnable-CPU lane and one Mac16,10 / Apple M4 / macOS 26.5 arm64 resident-Metal lane after tokenizer/template and 96/96 short greedy parity, native runnable-chat receipts, a checked exact 512-token chat bucket, and the clean d31e5cb0 API/WebUI/SSE smoke; tools, sampling beyond greedy, adjacent files, broader context, CUDA, Linux, other Apple hardware or macOS revisions, and broad portability remain unclaimed. Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf has bounded one-token backend MoE runtime evidence only; later 5-token/API/WebUI/RSS promotion-candidate artifacts are superseded by Gate 9A 50-token divergence and a longer-continuation hang, so broad/API/WebUI/frontend readiness remains unsupported. The dense Qwen3 Q8_0 ChatML rows (0.6B/1.7B/4B/8B Instruct, thinking disabled) are supported_exact_row_smoke: qwen2 BPE pre-tokenizer + ChatML renderer, per-head QK-norm + NEOX RoPE, and token+text parity vs llama.cpp at 1/5/50 on macOS/Ubuntu and on Windows x86_64 CPU (cpu_reference + the x86_q8 AVX2 runtime-repack path, bit-identical), and additionally on Windows CUDA: the 0.6B/1.7B/4B rows fully VRAM-resident and the 8B row via the VRAM+host-RAM offload split (RTX 3060 Laptop 6 GB, driver 576.83, CUDA 12.9; GPU decode+single-shot prefill token+text identical to cpu_reference/llama.cpp at 1/5/50); 1.7B additionally has GPU-resident decode+prefill and a 15,373-token single-shot prefill lane on macOS, and thinking-mode is opt-in (leading-trace parity only). The 4B row additionally carries checked bounded-context packs 512/1024/2048/4096/8192, the 1.7B row 512/1024/2048/4096, and the 0.6B row 512/2048/4096/8192 (fully-GPU-resident raw-decode greedy parity vs llama.cpp acd79d603 at 50 tokens; the 1.7B 8192 and 0.6B 1024 buckets are held as documented benign near-ties). These are exact bounded lanes only; no model-native/larger context beyond the checked packs, arbitrary-template behavior, production throughput, portability, neighboring-row, or broad-family support is implied. Seven hash-pinned Prism ML Bonsai Q1_0, Prism Q2_0, and PQ2_0 artifacts are supported_exact_row_smoke on macOS Apple Silicon Metal and Windows x86_64 CUDA after paired text and vision validation; the claim is exact-file and limited to those two GPU platforms, with broader qwen3/qwen35 or quant support, bounded/model-native context, and production throughput still unclaimed. The seven files are mixed-arch: the 4B and 8B rows declare general.architecture=qwen3 (dense), only the 27B rows declare qwen35 (hybrid).",
             support_policy: "A model, tokenizer, quantization, API feature, or context length is supported only after tests, docs, and real-model evidence exist for that lane.",
             unsupported_policy: "Unsupported combinations should return typed errors instead of silently falling back to best-effort behavior.",
         },
@@ -4973,7 +5104,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             SupportItem {
                 id: "Q8_0",
                 status: "supported_current_gate",
-                notes: "TinyLlama remains the current support gate; exact Llama 3.2 1B Instruct Q8_0 now has checked bounded 512/1024/2048/4096/8192-context packs; exact Llama 3.2 3B Instruct Q8_0 is supported_exact_row_smoke with the anchored checked bounded 512/1024/2048/4096/8192-context raw-decode ladder on the current canonical GGUF (prior-upload Ubuntu API/WebUI refresh at source head e9f926ed1a65 retained as historical evidence); and exact Llama 3 8B Instruct Q8_0 has checked bounded 512/1024/2048-context packs where row-specific PASS artifacts exist. These are exact bounded-pack lanes only; no model-native/larger-context beyond the checked packs, arbitrary-template, production-throughput, portability, neighboring-row, or broad-family support is implied.",
+                notes: "TinyLlama remains the current support gate; exact Llama 3.2 1B Instruct Q8_0 now has checked bounded 512/1024/2048/4096/8192-context packs; exact Llama 3.2 3B Instruct Q8_0 is supported_exact_row_smoke with the anchored checked bounded 512/1024/2048/4096/8192-context raw-decode ladder on the current canonical GGUF (prior-upload Ubuntu API/WebUI refresh at source head e9f926ed1a65 retained as historical evidence); and exact Llama 3 8B Instruct Q8_0 has checked bounded 512/1024/2048-context packs where row-specific PASS artifacts exist; exact LFM2.5-2.6B Q8_0 adds tokenizer/template and 96/96 short greedy parity, native runnable-chat receipts, checked 512-token chat parity, and API/WebUI/SSE smoke. These are exact bounded-pack or checked-smoke lanes only; no model-native/larger-context beyond the checked packs, arbitrary-template, production-throughput, portability, neighboring-row, or broad-family support is implied.",
             },
             SupportItem {
                 id: "Q4_K_M/Q5_K_M/Q3_K_M",
@@ -5045,6 +5176,11 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 notes: "exact Mistral-7B-Instruct-v0.3 Q8_0 has row-specific smoke support: tokenizer/template, deterministic and broader 50-token parity, checked bounded 512/1024/2048/4096/8192-context packs, GPU-vs-CPU greedy parity on the exact row, and a support-promotion API/WebUI smoke bundle. Exact row only; broader Mistral-family, other quants, model-native context, and full support are not implied.",
             },
             SupportItem {
+                id: "lfm2_5_exact_2_6b_q8_0",
+                status: "supported_exact_row_smoke_lane",
+                notes: "exact LFM2.5-2.6B-Q8_0.gguf only (sha256 36587fdf27bdfc69caf2637273679a0870ec155162161bde6fd16e8c70bdb757), scoped to Windows x86_64 runnable CPU and one Mac16,10 / Apple M4 / macOS 26.5 arm64 resident-Metal lane: tokenizer/template and 96/96 short greedy parity against pinned llama.cpp, native runnable-chat receipts, exact 512-token chat parity, 128-token SSE with terminal usage, and Models-page exact-identity smoke. Tools fail closed; sampling beyond greedy, context above 512, neighboring LFM2 files/quants, CUDA, Linux, other Apple hardware or macOS revisions, broad portability, and broad-family support are not implied.",
+            },
+            SupportItem {
                 id: "llama_bpe_decoder_exact_1b_3b_8b_q8_0",
                 status: "supported_exact_row_smoke_lanes",
                 notes: "exact Llama 3.2 1B Instruct Q8_0 has row-specific smoke support with checked bounded 512/1024/2048/4096/8192-context packs; exact Llama 3.2 3B Instruct Q8_0 has supported_exact_row_smoke standing on the anchored checked bounded 512/1024/2048/4096/8192-context raw-decode ladder for the current canonical GGUF (prior-upload Ubuntu main-lane API/WebUI evidence at source head e9f926ed1a65 retained as historical); exact Llama 3 8B Instruct Q8_0 has row-specific smoke support with checked bounded 512/1024/2048-context packs, including the published source/runtime-head 8B 1024/2048 PASS bundle at 8e26be0a73c0. Broader 50-token, compact chat-template-shapes, and retained-block lazy-Q8 hot-path evidence remain exact-row bounded pack/measurement evidence only, and broad/full support still needs separate proof.",
@@ -5079,7 +5215,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             SupportItem {
                 id: "command_r",
                 status: "experimental_scaffolding",
-                notes: "Command-R tensor, normalization, tokenizer, and logit-scale scaffolding exists, but the runnable parser/admission path still rejects command-r and no exact-row load, generation, parity, or frontend evidence exists.",
+                notes: "Aya Expanse 8B Q4_K_M is the first immutable Command-R candidate: its public 5.056 GB artifact identity and license are pinned, and the complete remote header validates the 32-layer parallel-residual graph, config, admission, binding, adjacent RoPE, and tensor mix. The full artifact is not local, so load, tokenizer/template parity, generation parity, API/WebUI, and context remain blocked; neighboring Command-R/cohere2 rows fail closed.",
             },
             SupportItem {
                 id: "qwen25",
@@ -5089,7 +5225,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             SupportItem {
                 id: "gemma2",
                 status: "planned_exact_row_candidate",
-                notes: "public readiness: planned first Gemma row only for gemma-2-9b-it-Q8_0.gguf; not supported yet. Gemma2 architecture, tokenizer/control-token behavior, template formatting, bounded load, parity, API/WebUI, RSS, and bundle evidence are missing",
+                notes: "public readiness: planned first Gemma row only for gemma-2-9b-it-Q8_0.gguf; not supported yet. The exact embedded Gemma 2 IT template now has a fixture-locked renderer and fail-closed route, but real-row token-id parity, bounded load/generation, parity, API/WebUI, RSS, context, and bundle evidence are still missing",
             },
             SupportItem {
                 id: "phi_falcon_mamba_others",
@@ -5386,7 +5522,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 latest_checked_bucket: "direct_chat_smoke",
                 latest_checked_result: "pass",
                 latest_checked_output: "Certainly! Here",
-                evidence: "five-prompt TinyLlama Q8_0 parity gate plus current template-shape, bounded 512-context, API/WebUI, and RSS/perf artifacts recorded in STATUS.md",
+                evidence: "five-prompt TinyLlama Q8_0 parity gate plus current template-shape, bounded 512-context, API/WebUI, and RSS/perf artifacts recorded in docs/reference/STATUS.md",
                 next_step: "extend to larger contexts and additional LLaMA-family/quant targets before broadening support claims",
             },
             ModelCompatibilityTarget {
@@ -6389,6 +6525,174 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 next_step: "repeat the current-head promotion smoke on contract-affecting changes; broader/full support still needs separate proof",
             },
             ModelCompatibilityTarget {
+                id: "mistral_nemo_instruct_2407_q4_k_m",
+                tool_capable: false,
+                family: "mistral",
+                quantization: "Q4_K_M",
+                status: "active_validation_exact_row_hold",
+                support_scope: "catalog_download_and_bounded_runtime_validation_only",
+                full_support_status: "blocked_before_support_promotion",
+                full_support_blockers: "the Metal and deterministic CPU K-quant lanes diverge after a five-token common prefix, the installed llama.cpp comparator exits 139 while loading this 12B artifact, and row-specific chat-template/API/WebUI/context/portability evidence is missing",
+                metadata_parses: "validated",
+                tokenizer_works: "validated_39_case_tekken_oracle",
+                tensors_load: "validated_q4_k_q6_k_f32",
+                generation_runs: "validated_bounded_on_metal_and_cpu",
+                parity_audited: "hold_cross_backend_divergence_at_generated_index_5_external_oracle_unavailable",
+                performance_measured: "bounded_measurement_only_not_promoted",
+                frontend_load_path_verified: "not_started",
+                frontend_readiness_gate: "fail-closed: catalog availability is not support; chat remains experimental until row-specific template and generation parity plus API/WebUI evidence pass",
+                tested_context: "six_token_raw_prompt_plus_eight_generated_tokens_only",
+                chat_template_renderer: "mistral_instruct_candidate_not_row_fixture_locked",
+                chat_template_shape_pack: "not_started",
+                chat_template_shape_pack_id: "not_selected",
+                bounded_context_512_pack: "not_started",
+                bounded_context_512_pack_id: "not_selected",
+                bounded_context_window: 512,
+                bounded_context_1024_pack: "not_started",
+                bounded_context_1024_pack_id: "not_selected",
+                bounded_context_1024_window: 1024,
+                bounded_context_2048_pack: "not_started",
+                bounded_context_2048_pack_id: "not_selected",
+                bounded_context_2048_window: 2048,
+                bounded_context_4096_pack: "not_promoted",
+                bounded_context_4096_pack_id: "not_selected",
+                bounded_context_4096_window: 4096,
+                bounded_context_8192_pack: "not_promoted",
+                bounded_context_8192_pack_id: "not_selected",
+                bounded_context_8192_window: 8192,
+                latest_checked_bucket: "exact_artifact_admission_tokenizer_and_cross_backend_runtime_smoke",
+                latest_checked_result: "partial_pass_hold",
+                latest_checked_output: "qa/evidence-bundles/catalog-expansion-20260809-head-4efe4920/manifest.json",
+                evidence: "exact public file Mistral-Nemo-Instruct-2407.Q4_K_M.gguf at immutable revision eba4e7492de28b8ab2ff44b0bb819004181b3db4 (sha256 5964f3e6d9c17b99e3d2174022048f3ec58b12ee8fefa987888e0562d070d52e, 7477204928 B) passes whole-file admission and all committed Tekken tokenizer oracle cases. Camelid Metal and deterministic CPU both generate, but match only the first five greedy tokens before index-5 divergence; installed llama.cpp exits 139 on both attempted load configurations. The cited bundle records the observed summary and explicit hold",
+                next_step: "capture a working pinned llama.cpp oracle, attribute or fix the index-5 backend frontier, fixture-lock the Nemo template, and run chat/API/WebUI smoke before support promotion",
+            },
+            ModelCompatibilityTarget {
+                id: "qwen3_14b_q4_k_m",
+                tool_capable: false,
+                family: "qwen3",
+                quantization: "Q4_K_M",
+                status: "active_validation_exact_row_smoke",
+                support_scope: "catalog_download_and_bounded_cross_backend_raw_decode_smoke_only",
+                full_support_status: "blocked_before_support_promotion",
+                full_support_blockers: "external llama.cpp generated-token parity, row-specific ChatML/API/WebUI smoke, tool evaluation, bounded context, portability, and normalized performance evidence remain missing",
+                metadata_parses: "validated",
+                tokenizer_works: "qwen2_pre_tokenizer_admits_row_specific_oracle_not_run",
+                tensors_load: "validated_q4_k_q6_k_f32",
+                generation_runs: "validated_bounded_on_metal_and_cpu",
+                parity_audited: "metal_equals_deterministic_cpu_for_8_of_8_raw_greedy_tokens_external_oracle_not_run",
+                performance_measured: "bounded_measurement_only_not_promoted",
+                frontend_load_path_verified: "not_started",
+                frontend_readiness_gate: "fail-closed: catalog availability and internal cross-backend smoke do not satisfy the supported-row frontend gate",
+                tested_context: "five_token_raw_prompt_plus_eight_generated_tokens_only",
+                chat_template_renderer: "qwen3_chatml_thinking_disabled_candidate",
+                chat_template_shape_pack: "not_started",
+                chat_template_shape_pack_id: "qwen3-chatml-chat-template-pack-v1",
+                bounded_context_512_pack: "not_started",
+                bounded_context_512_pack_id: "not_selected",
+                bounded_context_window: 512,
+                bounded_context_1024_pack: "not_started",
+                bounded_context_1024_pack_id: "not_selected",
+                bounded_context_1024_window: 1024,
+                bounded_context_2048_pack: "not_started",
+                bounded_context_2048_pack_id: "not_selected",
+                bounded_context_2048_window: 2048,
+                bounded_context_4096_pack: "not_promoted",
+                bounded_context_4096_pack_id: "not_selected",
+                bounded_context_4096_window: 4096,
+                bounded_context_8192_pack: "not_promoted",
+                bounded_context_8192_pack_id: "not_selected",
+                bounded_context_8192_window: 8192,
+                latest_checked_bucket: "exact_artifact_cross_backend_raw_decode_smoke",
+                latest_checked_result: "pass_active_validation_only",
+                latest_checked_output: "qa/evidence-bundles/catalog-expansion-20260809-head-4efe4920/manifest.json",
+                evidence: "exact official Qwen3-14B-Q4_K_M.gguf at immutable revision 530227a7d994db8eca5ab5ced2fb692b614357fd (sha256 500a8806e85ee9c83f3ae08420295592451379b4f8cf2d0f41c15dffeb6b81f0, 9001752960 B) parses as qwen3/qwen2-pre with the standard Qwen3 ChatML template and loads its Q4_K/Q6_K/F32 mix. Metal and deterministic CPU emitted identical text and all 8/8 greedy token ids on the bounded raw prompt; no external-oracle or chat/API claim is made",
+                next_step: "run the existing Qwen3 ChatML 1/5/50 harness against pinned llama.cpp, then add API/WebUI, tool, and bounded-context evidence before support promotion",
+            },
+            ModelCompatibilityTarget {
+                id: "deepseek_r1_0528_qwen3_8b_q4_k_m",
+                tool_capable: false,
+                family: "qwen3_deepseek_r1",
+                quantization: "Q4_K_M",
+                status: "active_validation_exact_row_hold",
+                support_scope: "catalog_download_and_bounded_raw_runtime_validation_only",
+                full_support_status: "blocked_before_support_promotion",
+                full_support_blockers: "the native DeepSeek R1 <｜User｜>/<｜Assistant｜> renderer and tool envelope are not implemented, Metal and CPU raw decode diverge at generated index 2, and external-oracle/chat/API/WebUI/context/portability evidence is missing",
+                metadata_parses: "validated",
+                tokenizer_works: "qwen2_pre_tokenizer_admits_row_specific_oracle_not_run",
+                tensors_load: "validated_q4_k_q6_k_f32",
+                generation_runs: "validated_bounded_raw_on_metal_and_cpu",
+                parity_audited: "hold_cross_backend_divergence_at_generated_index_2_external_oracle_not_run",
+                performance_measured: "bounded_measurement_only_not_promoted",
+                frontend_load_path_verified: "fail_closed_native_template_unimplemented",
+                frontend_readiness_gate: "fail-closed: never borrow Qwen3 ChatML for this file; catalog availability is not chat support",
+                tested_context: "five_token_raw_prompt_plus_eight_generated_tokens_only",
+                chat_template_renderer: "not_implemented_deepseek_r1_markers",
+                chat_template_shape_pack: "not_started",
+                chat_template_shape_pack_id: "not_selected",
+                bounded_context_512_pack: "not_started",
+                bounded_context_512_pack_id: "not_selected",
+                bounded_context_window: 512,
+                bounded_context_1024_pack: "not_started",
+                bounded_context_1024_pack_id: "not_selected",
+                bounded_context_1024_window: 1024,
+                bounded_context_2048_pack: "not_started",
+                bounded_context_2048_pack_id: "not_selected",
+                bounded_context_2048_window: 2048,
+                bounded_context_4096_pack: "not_promoted",
+                bounded_context_4096_pack_id: "not_selected",
+                bounded_context_4096_window: 4096,
+                bounded_context_8192_pack: "not_promoted",
+                bounded_context_8192_pack_id: "not_selected",
+                bounded_context_8192_window: 8192,
+                latest_checked_bucket: "exact_artifact_metadata_and_cross_backend_raw_decode_smoke",
+                latest_checked_result: "partial_pass_hold",
+                latest_checked_output: "qa/evidence-bundles/catalog-expansion-20260809-head-4efe4920/manifest.json",
+                evidence: "exact unsloth DeepSeek-R1-0528-Qwen3-8B-Q4_K_M.gguf at immutable revision eb48357c179d34dbf515983f798dfb8752a0f261 (sha256 a86349a4180c4e6bb43f874c29c404fa2be3f90b15509bd6d86f697dba724ec1, 5027785216 B) parses as qwen3 with 131072 context/YaRN and loads its Q4_K/Q6_K/F32 mix. Both Camelid lanes execute bounded raw generation, but diverge at generated index 2. Its embedded template is the original R1 marker/tool grammar, not ChatML, so chat remains refused until a dedicated renderer is fixture-locked",
+                next_step: "implement and fixture-lock the native R1 no-tools renderer first, keep tools refused, then resolve the index-2 backend frontier and run external-oracle plus API/WebUI gates",
+            },
+            ModelCompatibilityTarget {
+                id: "lfm2_5_2_6b_q8_0",
+                tool_capable: false,
+                family: "lfm2",
+                quantization: "Q8_0",
+                status: "supported_exact_row_smoke",
+                support_scope: "exact_hash_pinned_row_on_windows_x86_64_runnable_cpu_or_mac16_10_apple_m4_macos_26_5_arm64_resident_metal_greedy_chat_and_512_context_smoke_only",
+                full_support_status: "blocked_pending_normalized_full_support",
+                full_support_blockers: "tool calling, sampling semantics beyond greedy, context beyond the checked 512-token chat bucket, Linux portability, CUDA and non-Apple-Silicon GPU execution, other Apple hardware or macOS revisions, broad platform portability, production throughput, neighboring LFM2 variants/quants, and broader normalized support bundles remain missing",
+                metadata_parses: "validated",
+                tokenizer_works: "validated_against_pinned_llamacpp",
+                tensors_load: "validated",
+                generation_runs: "raw_greedy_plus_non_streaming_and_streaming_runnable_chat_smoke",
+                parity_audited: "windows_cpu_and_one_apple_m4_macos_26_5_arm64_resident_metal_96_of_96_short_greedy_tokens_plus_tokenizer_template_and_512_chat_context_parity_pass",
+                performance_measured: "macos_m4_measurement_only_not_promoted_as_sla",
+                frontend_load_path_verified: "validated_windows_bundle_and_clean_d31e5cb0_single_apple_m4_macos_26_5_arm64_models_page_smoke",
+                frontend_readiness_gate: "green only when this exact hash-pinned GGUF row plus Q8_0 quant match /api/capabilities, /api/models/local reports lane_class=supported for the loaded exact bytes and current host, and the live execution plan reports host-scoped support_level=supported_exact_row_smoke plus either Windows x86_64 runnable CPU or the Mac resident labels metal_resident_lfm2_runtime, lfm2_metal_resident_prefill, and lfm2_metal_resident_decode; that Mac support level itself requires Mac16,10 / Apple M4 / macOS 26.5 arm64",
+                tested_context: "short_raw_and_chat_prompts_plus_exact_512_token_rendered_chat_prompt",
+                chat_template_renderer: "lfm2_5_chatml_open_think",
+                chat_template_shape_pack: "validated_three_shapes",
+                chat_template_shape_pack_id: "lfm2-chat-template-fixture-v1",
+                bounded_context_512_pack: "validated_bounded_pack",
+                bounded_context_512_pack_id: "lfm2-2.6b-q8-phase1-promotion-20260810",
+                bounded_context_window: 512,
+                bounded_context_1024_pack: "not_started",
+                bounded_context_1024_pack_id: "not_selected",
+                bounded_context_1024_window: 1024,
+                bounded_context_2048_pack: "not_started",
+                bounded_context_2048_pack_id: "not_selected",
+                bounded_context_2048_window: 2048,
+                bounded_context_4096_pack: "not_promoted",
+                bounded_context_4096_pack_id: "not_selected",
+                bounded_context_4096_window: 4096,
+                bounded_context_8192_pack: "not_promoted",
+                bounded_context_8192_pack_id: "not_selected",
+                bounded_context_8192_window: 8192,
+                latest_checked_bucket: "windows_cpu_bundle_and_clean_d31e5cb0_single_apple_m4_macos_26_5_arm64_resident_metal_api_webui_sse_and_exact_512_chat_context",
+                latest_checked_result: "pass",
+                latest_checked_output: "qa/evidence-bundles/lfm2-2.6b-q8-macos-metal-20260810-head-d31e5cb0/manifest.json",
+                evidence: "exact LFM2.5-2.6B-Q8_0.gguf bytes (sha256 36587fdf27bdfc69caf2637273679a0870ec155162161bde6fd16e8c70bdb757, 2874779456 B): tokenizer/template fixtures and 4 prompts x 24 greedy tokens match pinned llama.cpp b9632/acd79d603 on the Windows CPU bundle and one Apple M4/macOS 26.5/arm64 resident-Metal host; native runnable chat emits sealed prompt/generated-token receipts; exact 512-token rendered chat matches the same oracle for 8/8 generated tokens and text on both lanes; the Windows bundle and clean d31e5cb0 single-host Mac API/WebUI smokes cover non-streaming chat, 128-token SSE with terminal usage, exact local identity, and supported Models-page state; the Mac receipt asserts selected_backend=metal_resident_lfm2_runtime, prefill_path=lfm2_metal_resident_prefill, and decode_path=lfm2_metal_resident_decode",
+                next_step: "add 1024+ chat context buckets before widening the checked context envelope; qualify Linux CPU, CUDA, other Apple hardware and macOS revisions, broad platform portability, sampling, tools, neighboring artifacts, and throughput independently",
+            },
+            ModelCompatibilityTarget {
                 id: "qwen3_0_6b_instruct_q8_0",
                 tool_capable: false,
                 family: "qwen3",
@@ -6818,46 +7122,46 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 next_step: "acquire and SHA-anchor the exact artifact, then run prompt-token, generation, API/WebUI, memory, and bounded-context gates",
             },
             ModelCompatibilityTarget {
-                id: "c4ai_command_r_v01_q8_0",
+                id: "aya_expanse_8b_q4_k_m",
                 tool_capable: false,
                 family: "command_r",
-                quantization: "Q8_0",
+                quantization: "Q4_K_M",
                 status: "planned_exact_row_candidate",
                 support_scope: "future_exact_row_planning_only",
                 full_support_status: "not_applicable_until_runtime_support",
-                full_support_blockers: "command-r is still rejected by runnable architecture admission; the new tensor/tokenizer scaffolding is unreachable and has no exact-row load or parity evidence",
-                metadata_parses: "header_only_not_runnable",
-                tokenizer_works: "scaffolding_unvalidated",
-                tensors_load: "not_started",
-                generation_runs: "not_started",
-                parity_audited: "not_started",
-                performance_measured: "not_started",
-                frontend_load_path_verified: "fail_closed_planned",
-                frontend_readiness_gate: "fail-closed while command-r runtime admission rejects the architecture",
-                tested_context: "not_started",
-                chat_template_renderer: "command_r_planned",
-                chat_template_shape_pack: "not_started",
+                full_support_blockers: "the exact 5.056 GB artifact is not local; no full-file hash/load, prompt-token or Aya template fixture, real-weight generation parity, API/WebUI/SSE, context, RSS, performance, or portability evidence exists",
+                metadata_parses: "immutable_remote_header_validated_attemptable",
+                tokenizer_works: "command_r_dialect_identified_exact_row_parity_blocked",
+                tensors_load: "blocked_exact_artifact_not_local",
+                generation_runs: "blocked_exact_artifact_not_local",
+                parity_audited: "blocked_no_real_weight_oracle_run",
+                performance_measured: "blocked_no_real_weight_run",
+                frontend_load_path_verified: "fail_closed_header_only_hold",
+                frontend_readiness_gate: "fail-closed: Command-R chat returns a typed template HOLD until the exact Aya template and real-weight parity gates pass",
+                tested_context: "blocked_metadata_declaration_only",
+                chat_template_renderer: "fail_closed_pending_aya_template_fixture",
+                chat_template_shape_pack: "blocked_not_captured",
                 chat_template_shape_pack_id: "command-r-chat-template-pack-v1",
-                bounded_context_512_pack: "not_started",
+                bounded_context_512_pack: "blocked_exact_artifact_not_local",
                 bounded_context_512_pack_id: "command-r-context-512-smoke-v1",
                 bounded_context_window: 512,
-                bounded_context_1024_pack: "not_started",
+                bounded_context_1024_pack: "blocked_exact_artifact_not_local",
                 bounded_context_1024_pack_id: "command-r-context-1024-smoke-v1",
                 bounded_context_1024_window: 1024,
-                bounded_context_2048_pack: "not_started",
+                bounded_context_2048_pack: "blocked_exact_artifact_not_local",
                 bounded_context_2048_pack_id: "command-r-context-2048-smoke-v1",
                 bounded_context_2048_window: 2048,
-                bounded_context_4096_pack: "not_started",
+                bounded_context_4096_pack: "blocked_exact_artifact_not_local",
                 bounded_context_4096_pack_id: "command-r-context-4096-smoke-v1",
                 bounded_context_4096_window: 4096,
-                bounded_context_8192_pack: "not_promoted",
-                bounded_context_8192_pack_id: "not_selected",
+                bounded_context_8192_pack: "blocked_exact_artifact_not_local",
+                bounded_context_8192_pack_id: "command-r-context-8192-smoke-v1",
                 bounded_context_8192_window: 8192,
-                latest_checked_bucket: "candidate_selected",
+                latest_checked_bucket: "immutable_header_shape",
                 latest_checked_result: "planning_only",
-                latest_checked_output: "not_applicable",
-                evidence: "planning only: logit-scale, normalization, and tokenizer scaffolding do not make command-r runnable or supported",
-                next_step: "implement and validate command-r admission/binding, then run exact-artifact tokenizer, generation, parity, API/WebUI, memory, and context gates",
+                latest_checked_output: "qa/model-qualification/phase3-command-r-aya-attemptability-report.json",
+                evidence: "planning only / header-only HOLD: bartowski/aya-expanse-8b-GGUF@f9d62ed0c58e6f2ae17975df990b1b8a4013b596, aya-expanse-8b-Q4_K_M.gguf, 5,056,982,720 bytes, LFS SHA-256 9592bad943fe56cf93200286a0a4b00a158cd84a408f227b9978ec5879002fb8, CC-BY-NC-4.0. The complete immutable remote header proves command-r, GPT-2/command-r tokenizer metadata, 32x4096 geometry, FFN 14336, GQA 32/8, adjacent RoPE, one shared LayerNorm parallel residual, tied output, and F32/Q4_K/Q6_K tensor distribution. Only the first 16 MiB header range was fetched; no weight payload, load, generation, parity, frontend, or context result is claimed.",
+                next_step: "provide and full-hash the exact artifact, capture prompt-token and Aya template fixtures, then run pinned llama.cpp greedy parity before any smoke/API/SSE/Models-page or 512-token context gate",
             },
             ModelCompatibilityTarget {
                 id: "deepseek_r1_distill_llama_8b_q8_0",
@@ -6993,9 +7297,9 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 status: "planned_exact_row_candidate",
                 support_scope: "future_exact_row_planning_only",
                 full_support_status: "not_applicable_until_runtime_support",
-                full_support_blockers: "gemma2 runtime, control-token/template fixtures, bounded load/readiness, API/WebUI, RSS/timing, context, and durable bundle evidence are missing",
+                full_support_blockers: "the exact template renderer is fixture-locked only; real-row tokenizer/control-token parity, bounded load/readiness, generation parity, API/WebUI, RSS/timing, context, and durable bundle evidence are missing",
                 metadata_parses: "acquisition_planned",
-                tokenizer_works: "not_started",
+                tokenizer_works: "construction_path_exists_real_row_token_ids_unverified",
                 tensors_load: "not_started",
                 generation_runs: "not_started",
                 parity_audited: "not_started",
@@ -7003,9 +7307,9 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 frontend_load_path_verified: "fail_closed_planned",
                 frontend_readiness_gate: "fail-closed until an exact supported row plus runtime readiness exist",
                 tested_context: "not_started",
-                chat_template_renderer: "gemma2_it_planned",
-                chat_template_shape_pack: "not_started",
-                chat_template_shape_pack_id: "gemma2-it-chat-template-pack-v1",
+                chat_template_renderer: "gemma2_it_exact_fixture_only",
+                chat_template_shape_pack: "validated_fixture_only_no_real_row_runtime_claim",
+                chat_template_shape_pack_id: "gemma2-it-chat-template-v1",
                 bounded_context_512_pack: "not_started",
                 bounded_context_512_pack_id: "gemma2-context-512-smoke-v1",
                 bounded_context_window: 512,
@@ -7024,8 +7328,8 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 latest_checked_bucket: "candidate_selected",
                 latest_checked_result: "planning_only",
                 latest_checked_output: "not_applicable",
-                evidence: "first Gemma candidate row selected for planning only: gemma-2-9b-it-Q8_0.gguf; Gemma2 architecture details, tokenizer/control-token behavior, template formatting, bounded load, parity, API/WebUI, RSS, and bundle evidence are all still required",
-                next_step: "capture acquisition path, model SHA and license/access notes, then add tokenizer/chat-template fixtures and bounded metadata/load checks before any runtime-support wording",
+                evidence: "first Gemma candidate row remains planning only: gemma-2-9b-it-Q8_0.gguf. qa/model-qualification/fixtures/gemma2-it-chat-template-v1.json pins the exact GGUF template identity, renderer shapes, BOS contract, and typed fail-closed system/alternation behavior; it is template evidence only and supplies no model-load or generation support receipt",
+                next_step: "verify the remotely observed artifact identity independently, acquire the row, and run exact token-id, bounded metadata/load, generation, API/WebUI, parity, RSS, and context gates before any runtime-support wording",
             },
         ],
         runtime_projects: crate::runtime_manifest::runtime_capability_manifest()
@@ -7074,6 +7378,18 @@ impl ResidentReclaim {
     fn is_empty(&self) -> bool {
         self.ids.is_empty() || self.bytes == 0
     }
+}
+
+fn resident_load_is_idempotent(
+    resident_id: &str,
+    resident_path: &std::path::Path,
+    requested_id: Option<&str>,
+    requested_path: &std::path::Path,
+) -> bool {
+    if resident_path != requested_path {
+        return false;
+    }
+    requested_id.is_none_or(|id| id == resident_id)
 }
 
 /// The refusal for a load-blocking verdict: a stable error code plus its message.
@@ -7313,12 +7629,27 @@ async fn load_model(State(state): State<AppState>, Json(req): Json<LoadModelRequ
             Some("path"),
         );
     }
-    // What is resident BESIDES the model being requested. A second copy of the
-    // same file is not reclaimable room (the load would be idempotent), so it is
-    // excluded — otherwise a repeat load would offer to release itself.
+    // A repeated explicit id + identical resolved path is a true no-op. The
+    // load pipeline's idempotent fast path will reuse (and, where needed, heal)
+    // the existing runtime, so the live-memory fit preflight must not reject it
+    // as though a second copy were about to be allocated.
+    let idempotent_resident = match req.id.as_deref() {
+        Some(requested_id) => state
+            .loaded_models
+            .read()
+            .await
+            .get(requested_id)
+            .is_some_and(|loaded| loaded.path == path),
+        None => false,
+    };
+    // What is resident BESIDES the model identity being requested. The same
+    // path is idempotent only when the request also keeps the same explicit id
+    // (or omits an id). A UI promotion smoke may intentionally replace the
+    // startup hash id with the catalog row id for the same GGUF; that is a real
+    // switch and must release the old resident runtime before the fit check.
     let mut reclaim = ResidentReclaim::default();
     for (id, loaded) in state.loaded_models.read().await.iter() {
-        if loaded.path == path {
+        if resident_load_is_idempotent(id, &loaded.path, req.id.as_deref(), &path) {
             continue;
         }
         reclaim.bytes += std::fs::metadata(&loaded.path)
@@ -7369,14 +7700,16 @@ async fn load_model(State(state): State<AppState>, Json(req): Json<LoadModelRequ
     // it on a blocking thread rather than stalling the async worker — consistent with
     // how the header fetches use spawn_blocking. A panic in the probe is non-fatal: we
     // fall through to the load, where VramShortfall/KvCache remain the hard net.
-    let guard_path = path.clone();
-    {
-        let _reader = state.model_file_lifecycle.read().await;
-        if let Ok(Some(resp)) =
-            tokio::task::spawn_blocking(move || fit_preload_guard(&guard_path, Some(&reclaim)))
-                .await
+    if !idempotent_resident {
+        let guard_path = path.clone();
         {
-            return resp;
+            let _reader = state.model_file_lifecycle.read().await;
+            if let Ok(Some(resp)) =
+                tokio::task::spawn_blocking(move || fit_preload_guard(&guard_path, Some(&reclaim)))
+                    .await
+            {
+                return resp;
+            }
         }
     }
     match load_model_from_path(&state, path, req.id, req.set_active.unwrap_or(true)).await {
@@ -7468,15 +7801,38 @@ struct InspectBlocker {
 struct InspectModelResponse {
     architecture: Option<String>,
     quant: Option<String>,
+    /// True when the artifact is an encoder sidecar and must not replace the
+    /// active chat model.
+    embedding_only: bool,
+    /// Fixed native vector width for embedding-only artifacts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    native_embedding_dimensions: Option<usize>,
+    /// The file exposes an embedding/reranking runtime rather than a token-
+    /// generation head. This is metadata-derived and independent of whether the
+    /// current host can admit the model.
+    embedding_capable: bool,
+    /// The file can produce completion tokens. Keep this separate from
+    /// `chat_capable`: base completion models may not ship a chat template.
+    generation_capable: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     source: Option<ModelSourceInspection>,
     /// Predicted lane (`supported` / `experimental_implemented` / `unsupported`).
     lane_class: ModelLaneClass,
-    /// The exact typed blocker the load would hit â€” predicted WITHOUT binding
-    /// tensors or loading weights. `None` when the architecture is implemented
-    /// (it would load and run, supported or experimental).
+    /// A typed blocker found by header-level inspection without reading weight
+    /// payloads. `None` means the architecture config and any exact-row header
+    /// admission checks passed; it does NOT promise that tensor bytes will load,
+    /// execute, or satisfy parity gates.
     #[serde(skip_serializing_if = "Option::is_none")]
     blocker: Option<InspectBlocker>,
+}
+
+fn inspect_decoder_header_attemptability(gguf: &GgufFile) -> Result<(), BackendError> {
+    let config = LlamaModelConfig::from_gguf(gguf)?;
+    if gguf.architecture() == Some("command-r") {
+        crate::runnable::model::validate_command_r_attemptability_slice(gguf, &config)?;
+        Tokenizer::from_gguf(gguf)?;
+    }
+    Ok(())
 }
 
 /// `POST /api/models/inspect` â€” source-level readiness inspection. GGUF files keep
@@ -7507,6 +7863,10 @@ async fn inspect_model(
                 Json(InspectModelResponse {
                     architecture: None,
                     quant: None,
+                    embedding_only: false,
+                    native_embedding_dimensions: None,
+                    embedding_capable: false,
+                    generation_capable: false,
                     source: Some(source),
                     lane_class: ModelLaneClass::Unsupported,
                     blocker: Some(InspectBlocker {
@@ -7551,6 +7911,8 @@ async fn inspect_model(
     };
 
     let architecture = gguf.architecture().map(ToOwned::to_owned);
+    let embedding_capable = is_embedding_model(&gguf);
+    let generation_capable = is_generation_model(&gguf);
     let filename = req
         .path
         .file_name()
@@ -7558,13 +7920,30 @@ async fn inspect_model(
         .unwrap_or_default()
         .to_string();
     let quant = Some(crate::runnable::headline_quant_of(&gguf)).filter(|q| !q.is_empty());
+    let bitnet_embedding = crate::model::is_bitnet_embedding_model(&gguf);
+    let embedding_only = embedding_capable && !generation_capable;
+    let bitnet_embedding_config =
+        bitnet_embedding.then(|| validate_bitnet_embedding_metadata(&gguf));
+    let native_embedding_dimensions = if let Some(config) = bitnet_embedding_config.as_ref() {
+        config.as_ref().ok().map(|config| config.embedding_length)
+    } else if architecture.as_deref() == Some("nomic-bert") {
+        EncoderConfig::from_gguf(&gguf)
+            .ok()
+            .map(|config| config.embedding_length)
+    } else {
+        None
+    };
 
-    // Parse the config header (no tensor bind, no weight load). Ok â‡’ it would load;
-    // Err â‡’ it would fail closed with this exact typed reason.
-    let config_result = if architecture.as_deref() == Some("nomic-bert") {
+    // Parse the config header without reading tensor payloads. Exact-row runnable
+    // slices add canonical descriptor and tokenizer checks here so inspect agrees
+    // with their load door. Passing remains a header-level attemptability result,
+    // not a promise that weight bytes load or run.
+    let config_result = if let Some(result) = bitnet_embedding_config {
+        result.map(|_| ())
+    } else if architecture.as_deref() == Some("nomic-bert") {
         EncoderConfig::from_gguf(&gguf).map(|_| ())
     } else {
-        LlamaModelConfig::from_gguf(&gguf).map(|_| ())
+        inspect_decoder_header_attemptability(&gguf)
     };
     let (lane_class, blocker) = match config_result {
         Ok(_) => (
@@ -7585,12 +7964,115 @@ async fn inspect_model(
         Json(InspectModelResponse {
             architecture,
             quant,
+            embedding_only,
+            native_embedding_dimensions,
+            embedding_capable,
+            generation_capable,
             source: None,
             lane_class,
             blocker,
         }),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod inspect_header_attemptability_tests {
+    use std::{collections::BTreeMap, path::PathBuf};
+
+    use super::inspect_decoder_header_attemptability;
+    use crate::gguf::{GgufFile, GgufMetadataValue, GgufTensorDescriptor, GgufTensorType};
+
+    #[test]
+    fn command_r_inspect_runs_exact_descriptor_admission() {
+        let metadata = BTreeMap::from([
+            (
+                "general.architecture".into(),
+                GgufMetadataValue::String("command-r".into()),
+            ),
+            (
+                "general.name".into(),
+                GgufMetadataValue::String("Aya Expanse 8b".into()),
+            ),
+            (
+                "general.license".into(),
+                GgufMetadataValue::String("cc-by-nc-4.0".into()),
+            ),
+            ("general.file_type".into(), GgufMetadataValue::U32(15)),
+            (
+                "tokenizer.ggml.model".into(),
+                GgufMetadataValue::String("gpt2".into()),
+            ),
+            (
+                "tokenizer.ggml.pre".into(),
+                GgufMetadataValue::String("command-r".into()),
+            ),
+            (
+                "command-r.context_length".into(),
+                GgufMetadataValue::U32(8_192),
+            ),
+            (
+                "command-r.embedding_length".into(),
+                GgufMetadataValue::U32(4_096),
+            ),
+            ("command-r.block_count".into(), GgufMetadataValue::U32(32)),
+            (
+                "command-r.feed_forward_length".into(),
+                GgufMetadataValue::U32(14_336),
+            ),
+            (
+                "command-r.attention.head_count".into(),
+                GgufMetadataValue::U32(32),
+            ),
+            (
+                "command-r.attention.head_count_kv".into(),
+                GgufMetadataValue::U32(8),
+            ),
+            (
+                "command-r.attention.layer_norm_epsilon".into(),
+                GgufMetadataValue::F32(1e-5),
+            ),
+            (
+                "command-r.rope.freq_base".into(),
+                GgufMetadataValue::F32(10_000.0),
+            ),
+            (
+                "command-r.rope.scaling.type".into(),
+                GgufMetadataValue::String("none".into()),
+            ),
+            (
+                "command-r.logit_scale".into(),
+                GgufMetadataValue::F32(0.125),
+            ),
+        ]);
+        let tensors = vec![GgufTensorDescriptor {
+            name: "token_embd.weight".into(),
+            dimensions: vec![4_096, 256_000],
+            tensor_type: GgufTensorType::Q6K,
+            relative_offset: 0,
+            absolute_offset: 0,
+            n_bytes: 0,
+        }];
+        let gguf = GgufFile {
+            path: PathBuf::new(),
+            version: 3,
+            tensor_count: tensors.len() as i64,
+            metadata_count: metadata.len() as i64,
+            alignment: 32,
+            data_start_offset: 0,
+            metadata,
+            tensors,
+        };
+
+        let error = inspect_decoder_header_attemptability(&gguf)
+            .expect_err("inspect must reject a lookalike Command-R header before tokenizer/load");
+        assert!(
+            error
+                .to_string()
+                .contains("canonical descriptor count mismatch"),
+            "{error}"
+        );
+    }
 }
 
 /// The Gemma 4 serve path is ON by default: gemma4 chat never falls through to
@@ -7790,15 +8272,96 @@ fn gemma4_cuda_fit_check(model_path: &std::path::Path) -> std::result::Result<()
 
 /// Model family from the GGUF `general.architecture`.
 fn model_family(gguf: &GgufFile) -> &'static str {
+    if is_embedding_model(gguf) {
+        return "embedding";
+    }
     match gguf.architecture() {
         Some("gemma4") => "gemma4",
-        Some("nomic-bert") => "embedding",
         Some(
             "llama" | "mistral" | "qwen2" | "qwen3" | "qwen3moe" | "smollm3" | "gemma3" | "phi3"
-            | "lfm2",
+            | "lfm2" | "bitnet-b1.58",
         ) => "llama-family",
         Some(_) => "other",
         None => "unknown",
+    }
+}
+
+fn is_embedding_model(gguf: &GgufFile) -> bool {
+    gguf.architecture() == Some("nomic-bert") || crate::model::is_bitnet_embedding_model(gguf)
+}
+
+/// Whether the GGUF carries the decoder-side token embedding table required by
+/// a text-generation graph. This deliberately leaves companion projectors (for
+/// example CLIP/mmproj GGUFs) in the third, neither-generation-nor-embedding
+/// state instead of treating every non-encoder file as generative.
+fn is_generation_model(gguf: &GgufFile) -> bool {
+    !is_embedding_model(gguf)
+        && gguf
+            .tensors
+            .iter()
+            .any(|tensor| tensor.name == "token_embd.weight")
+}
+
+#[cfg(test)]
+mod model_capability_tests {
+    use std::{collections::BTreeMap, path::PathBuf};
+
+    use super::{is_embedding_model, is_generation_model};
+    use crate::gguf::{GgufFile, GgufMetadataValue, GgufTensorDescriptor, GgufTensorType};
+
+    fn fixture(architecture: &str, name: &str, tensor_names: &[&str]) -> GgufFile {
+        GgufFile {
+            path: PathBuf::from("capability.gguf"),
+            version: 3,
+            tensor_count: tensor_names.len() as i64,
+            metadata_count: 2,
+            alignment: 32,
+            data_start_offset: 0,
+            metadata: BTreeMap::from([
+                (
+                    "general.architecture".to_string(),
+                    GgufMetadataValue::String(architecture.to_string()),
+                ),
+                (
+                    "general.name".to_string(),
+                    GgufMetadataValue::String(name.to_string()),
+                ),
+            ]),
+            tensors: tensor_names
+                .iter()
+                .map(|tensor_name| GgufTensorDescriptor {
+                    name: (*tensor_name).to_string(),
+                    dimensions: vec![8, 8],
+                    tensor_type: GgufTensorType::F32,
+                    relative_offset: 0,
+                    absolute_offset: 0,
+                    n_bytes: 256,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn decoder_encoder_and_projector_capabilities_are_distinct() {
+        let decoder = fixture(
+            "bitnet-b1.58",
+            "bitnet2b",
+            &["token_embd.weight", "output.weight"],
+        );
+        assert!(is_generation_model(&decoder));
+        assert!(!is_embedding_model(&decoder));
+
+        let encoder = fixture(
+            "gemma3",
+            "bitnet-embeddings-270m",
+            &["token_embd.weight", "output_norm.weight"],
+        );
+        assert!(is_embedding_model(&encoder));
+        assert!(!is_generation_model(&encoder));
+
+        let projector = fixture("clip", "vision-projector", &["mm.0.weight"]);
+        assert!(!is_embedding_model(&projector));
+        assert!(!is_generation_model(&projector));
     }
 }
 
@@ -7893,14 +8456,21 @@ mod gemma4_template_tests {
             image_urls: Vec::new(),
             unsupported_content_parts: Vec::new(),
             role: "user".to_string(),
-            content: "Reply with exactly: hello".to_string(),
+            content: "What is the capital of France?".to_string(),
         }];
+
+        let oracle: serde_json::Value = serde_json::from_str(include_str!(
+            "../../qa/model-qualification/fixtures/qwen2.5-0.5b-q8-llamacpp-b9632.json"
+        ))
+        .expect("Qwen2.5 qualification oracle fixture parses");
+        let oracle_rendered = oracle["chat_templates"][0]["rendered"]
+            .as_str()
+            .expect("oracle fixture carries rendered chat bytes");
 
         assert_eq!(
             render_qwen2_chatml_prompt(&messages),
-            "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n\
-             <|im_start|>user\nReply with exactly: hello<|im_end|>\n\
-             <|im_start|>assistant\n"
+            oracle_rendered,
+            "Camelid's Qwen2.5 renderer must stay byte-identical to llama.cpp b9632 /apply-template"
         );
         let qwen2_template = "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. \
                               You are a helpful assistant.<|im_end|>";
@@ -8221,6 +8791,153 @@ mod gemma4_template_tests {
     }
 
     #[test]
+    fn lfm2_runnable_receipt_opt_in_uses_chat_contract_and_streams_fail_closed() {
+        for field in ["camelid_receipt", "include_receipt"] {
+            let mut wire = serde_json::json!({
+                "model": "lfm2_5_2_6b_q8_0",
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": 8,
+                "temperature": 0,
+            });
+            wire[field] = serde_json::json!(true);
+            let req: ChatCompletionRequest =
+                serde_json::from_value(wire).expect("receipt opt-in parses");
+            assert_eq!(req.camelid_receipt, Some(true), "alias {field}");
+            let stamp = runnable_receipt_request_stamp(&req)
+                .expect("non-streaming receipt request is valid")
+                .expect("receipt was requested");
+            assert_eq!(stamp.endpoint, "/v1/chat/completions");
+            assert!(stamp.reproducible);
+        }
+
+        let streaming: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "lfm2_5_2_6b_q8_0",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": true,
+            "camelid_receipt": true,
+        }))
+        .expect("streaming receipt request parses");
+        let response = match runnable_receipt_request_stamp(&streaming) {
+            Err(response) => response,
+            Ok(_) => panic!("streaming runnable receipt must fail closed"),
+        };
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response
+                .extensions()
+                .get::<ApiErrorDetails>()
+                .expect("typed API error")
+                .code,
+            "invalid_request_error"
+        );
+    }
+
+    #[test]
+    fn lfm2_runnable_stream_finish_exposes_ids_and_terminal_usage_is_exact() {
+        let prompt = [124_894, 10, 11, 12];
+        let generated = [20, 124_902, 21, 22];
+        let diagnostics = runnable_generation_diagnostics("lfm2", Some(&prompt), &generated);
+        let finish = runnable_stream_chunk(
+            "lfm2_5_2_6b_q8_0",
+            123,
+            serde_json::json!({}),
+            Some("stop"),
+            Some(diagnostics),
+        );
+        assert_eq!(finish["choices"][0]["finish_reason"], "stop");
+        assert_eq!(finish["camelid"]["architecture"], "lfm2");
+        assert_eq!(finish["camelid"]["lane"], "runnable");
+        assert_eq!(
+            finish["camelid"]["prompt_token_ids"],
+            serde_json::json!(prompt)
+        );
+        assert_eq!(
+            finish["camelid"]["generated_token_ids"],
+            serde_json::json!(generated)
+        );
+        assert!(finish.get("usage").is_none());
+
+        let usage =
+            runnable_stream_usage_chunk("lfm2_5_2_6b_q8_0", 123, prompt.len(), generated.len());
+        assert_eq!(usage["choices"], serde_json::json!([]));
+        assert_eq!(usage["usage"]["prompt_tokens"], prompt.len());
+        assert_eq!(usage["usage"]["completion_tokens"], generated.len());
+        assert_eq!(
+            usage["usage"]["total_tokens"],
+            prompt.len() + generated.len()
+        );
+        assert!(usage.get("camelid").is_none());
+    }
+
+    #[test]
+    fn lfm2_runnable_chat_receipt_seals_exact_rendered_execution() {
+        let req: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "lfm2_5_2_6b_q8_0",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 4,
+            "temperature": 0,
+            "camelid_receipt": true,
+        }))
+        .expect("receipt request parses");
+        let stamp = runnable_receipt_request_stamp(&req)
+            .expect("receipt request valid")
+            .expect("receipt requested");
+        let prompt = [124_894, 1, 2, 3];
+        let generated = [4, 5, 6, 7];
+        let receipt = seal_server_receipt(
+            LaneIdentity {
+                model_id: "lfm2_5_2_6b_q8_0".to_string(),
+                gguf_sha256: "36587fdf27bdfc69caf2637273679a0870ec155162161bde6fd16e8c70bdb757"
+                    .to_string(),
+                gguf_filename: "LFM2.5-2.6B-Q8_0.gguf".to_string(),
+                quantization: "Q8_0".to_string(),
+                architecture: "lfm2".to_string(),
+                tokenizer_kind: "gpt2_bpe".to_string(),
+                tokenizer_sha256: None,
+                camelid_version: "test".to_string(),
+                camelid_commit: "test".to_string(),
+            },
+            stamp,
+            4,
+            ServerReceiptResult {
+                prompt_token_ids: &prompt,
+                generated_token_ids: &generated,
+                generated_text: "reasoninganswer",
+                completion_tokens: generated.len(),
+                finish_reason: "length",
+            },
+            Some(ExecutionLane::Runnable),
+            None,
+        )
+        .expect("runnable chat receipt seals");
+
+        receipt
+            .verify_self_digest()
+            .expect("sealed digest verifies");
+        assert!(receipt.is_runnable());
+        assert_eq!(receipt.request.endpoint, "/v1/chat/completions");
+        assert_eq!(receipt.result.prompt_token_ids, prompt);
+        assert_eq!(receipt.result.generated_token_ids, generated);
+        assert_eq!(receipt.result.generated_text, "reasoninganswer");
+        assert!(!receipt.parity.compared_against_reference);
+        assert_eq!(receipt.reference.tool, "llama.cpp");
+    }
+
+    #[test]
+    fn lfm2_tools_stay_typed_fail_closed_after_receipt_support() {
+        let response = lfm2_runnable_lane_tools_rejection();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            response
+                .extensions()
+                .get::<ApiErrorDetails>()
+                .expect("typed API error")
+                .code,
+            "unsupported_tools"
+        );
+    }
+
+    #[test]
     fn completions_fail_closed_for_runnable_serve_archs() {
         // Runnable-served archs have no raw-completions bridge: the gate must
         // reject them, and must NOT touch the optimized-lane archs. qwen35 and
@@ -8245,6 +8962,7 @@ mod gemma4_template_tests {
                 // bring-up: its conv layers carry no attn_q/k/v, so no
                 // optimized lane can run it on any host.
                 assert!(bridge("lfm2", capable, q8));
+                assert!(bridge("bitnet-b1.58", capable, q8));
                 for arch in ["llama", "qwen3", "mistral", "gemma4", ""] {
                     assert!(!bridge(arch, capable, q8), "{arch:?} must stay open");
                 }
@@ -9388,7 +10106,8 @@ fn gemma4_telemetry_error(message: String) -> telemetry::RequestFinish {
 //
 // Architectures implemented only in the runnable lane (`model::is_runnable_only_arch`
 // is the authoritative list; "runnable" names the bridge, not a CPU claim — within it
-// qwen35 decodes on resident Metal/CUDA graphs where available, lfm2 on Metal) are
+// qwen35 decodes on resident Metal/CUDA graphs where available, lfm2 on Metal, and
+// bitnet-b1.58 through cleanroom CPU/Metal/CUDA I2_S projections) are
 // not in the optimized inference engine, so the Llama serve path fails closed on them. This bridge mirrors the gemma4 serve pattern: a parallel
 // per-model-id runtime map, a short-circuit at the top of `chat_completions`, and a
 // dedicated chat handler. The optimized lane is untouched. Generation is greedy
@@ -9443,7 +10162,7 @@ fn runnable_serve_flag(value: Option<&str>) -> bool {
 /// single source of truth shared with the CLI direct-session guard — so the
 /// serve router and the direct lanes can never disagree about routing.
 fn is_runnable_serve_file(gguf: &GgufFile) -> bool {
-    crate::model::file_requires_runnable_bridge(gguf)
+    !is_embedding_model(gguf) && crate::model::file_requires_runnable_bridge(gguf)
 }
 
 /// A runnable-lane model wrapped for the serve path: greedy generation + the GGUF
@@ -9453,6 +10172,20 @@ pub struct RunnableServeRuntime {
     tokenizer: std::sync::Arc<Tokenizer>,
     architecture: String,
     vision: Option<crate::runnable::PrismVisionProjector>,
+}
+
+/// Lives inside the SSE body. Dropping the response (for example when the UI
+/// aborts a request) flips the flag even if BitNet is still in prompt prefill
+/// and has not emitted a first token yet.
+struct RunnableStreamDisconnectGuard {
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for RunnableStreamDisconnectGuard {
+    fn drop(&mut self) {
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
 }
 
 impl RunnableServeRuntime {
@@ -9520,24 +10253,29 @@ impl RunnableServeRuntime {
         Ok((text, ids))
     }
 
-    /// [`generate_greedy`](Self::generate_greedy) with a per-token-id callback —
-    /// the runnable lane's SSE source. Returns the same (text, ids) as the
-    /// non-streaming path (identical generation by construction).
-    fn generate_greedy_streaming<F: FnMut(u32)>(
+    /// Streaming generation with a cooperative disconnect check. The generic
+    /// runnable decoder polls `is_cancelled` during prefill and between decode
+    /// steps, so a dropped BitNet SSE response does not leave a long-running
+    /// Metal/CPU generation monopolizing the model in the background.
+    fn generate_greedy_streaming_cancelled<F: FnMut(u32)>(
         &self,
         prompt_ids: &[u32],
         max_new: usize,
         sampling: &SamplingConfig,
+        is_cancelled: &dyn Fn() -> bool,
         mut on_token: F,
     ) -> std::result::Result<(String, Vec<u32>), BackendError> {
         let stop: Vec<u32> = self.tokenizer.special.eog.iter().copied().collect();
-        let ids = self.model.generate_stopping_streaming_with_sampling(
-            prompt_ids,
-            max_new,
-            &stop,
-            sampling,
-            &mut on_token,
-        )?;
+        let ids = self
+            .model
+            .generate_stopping_streaming_with_sampling_cancelled(
+                prompt_ids,
+                max_new,
+                &stop,
+                sampling,
+                is_cancelled,
+                &mut on_token,
+            )?;
         let text = self.tokenizer.decode(&ids, true).unwrap_or_default();
         Ok((text, ids))
     }
@@ -9812,6 +10550,63 @@ mod prism_mmproj_discovery_tests {
     }
 }
 
+/// The exact `tokenizer.chat_template` carried by the pinned Gemma 2 9B IT
+/// candidate in `qa/model-qualification/fixtures/gemma2-it-chat-template-v1.json`.
+///
+/// This is deliberately an equality pin, not a marker detector. Gemma 2 and
+/// Gemma 3 share `<start_of_turn>` / `<end_of_turn>`, but their system-message
+/// semantics differ: Gemma 2 rejects system messages while Gemma 3 folds one
+/// into the first user turn. A loose marker check silently routed Gemma 2
+/// through the Gemma 3 renderer and changed the prompt contract.
+const GEMMA2_IT_CHAT_TEMPLATE: &str = "{{ bos_token }}{% if messages[0]['role'] == 'system' %}{{ raise_exception('System role not supported') }}{% endif %}{% for message in messages %}{% if (message['role'] == 'user') != (loop.index0 % 2 == 0) %}{{ raise_exception('Conversation roles must alternate user/assistant/user/assistant/...') }}{% endif %}{% if (message['role'] == 'assistant') %}{% set role = 'model' %}{% else %}{% set role = message['role'] %}{% endif %}{{ '<start_of_turn>' + role + '\n' + message['content'] | trim + '<end_of_turn>\n' }}{% endfor %}{% if add_generation_prompt %}{{'<start_of_turn>model\n'}}{% endif %}";
+
+const GEMMA2_SYSTEM_ROLE_ERROR: &str = "System role not supported";
+const GEMMA2_ALTERNATION_ERROR: &str =
+    "Conversation roles must alternate user/assistant/user/assistant/...";
+const GEMMA2_EMPTY_MESSAGES_ERROR: &str = "Gemma 2 chat requires at least one user message";
+
+fn is_gemma2_it_chat_template(template: &str) -> bool {
+    template == GEMMA2_IT_CHAT_TEMPLATE
+}
+
+/// Render the pinned Gemma 2 IT template without literal BOS text.
+///
+/// The file declares `tokenizer.ggml.add_bos_token=true`, and the runnable
+/// bridge calls the tokenizer with `add_special=true`; BOS therefore lands at
+/// token level exactly once. The source Jinja always appends the model
+/// generation header when `add_generation_prompt=true`, including after a
+/// completed assistant turn. Invalid system/alternation shapes are errors in
+/// the source template and remain errors here rather than being coerced into a
+/// Gemma 3-shaped conversation.
+fn render_gemma2_it_prompt(messages: &[ChatMessage]) -> std::result::Result<String, &'static str> {
+    if messages.is_empty() {
+        return Err(GEMMA2_EMPTY_MESSAGES_ERROR);
+    }
+    if messages[0].role == "system" {
+        return Err(GEMMA2_SYSTEM_ROLE_ERROR);
+    }
+
+    let mut prompt = String::new();
+    for (index, message) in messages.iter().enumerate() {
+        // The pinned Jinja compares the role string directly. Whitespace is
+        // not normalized there, so accepting ` user ` here would render a
+        // shape the source template rejects.
+        let role = message.role.as_str();
+        let expected = if index % 2 == 0 { "user" } else { "assistant" };
+        if role != expected {
+            return Err(GEMMA2_ALTERNATION_ERROR);
+        }
+        let rendered_role = if role == "assistant" { "model" } else { role };
+        prompt.push_str("<start_of_turn>");
+        prompt.push_str(rendered_role);
+        prompt.push('\n');
+        prompt.push_str(message.content.trim());
+        prompt.push_str("<end_of_turn>\n");
+    }
+    prompt.push_str("<start_of_turn>model\n");
+    Ok(prompt)
+}
+
 /// Render a gemma3 chat prompt byte-faithful to the GGUF `tokenizer.chat_template`
 /// (MUSTER M-A1): `<bos>` + per-turn `<start_of_turn>{role}\n{content|trim}<end_of_turn>\n`
 /// with assistant renamed to "model"; a leading system message is folded into the FIRST
@@ -9885,6 +10680,261 @@ fn render_ornith_chatml_prompt(messages: &[ChatMessage], enable_thinking: bool) 
         });
     }
     prompt
+}
+
+const STALE_MICROSOFT_GGUF_TEMPLATE: &str = "{% for message in messages %}{% if loop.first %}{{ bos_token }}{% endif %}{% if message['role'] == 'user' %}{{ 'Human: ' + message['content'] + '\\n\\nBITNETAssistant: ' + eos_token }}{% elif message['role'] == 'assistant' %}{{ message['content'] + eos_token }}{% endif %}{% endfor %}";
+const CANONICAL_MICROSOFT_TEMPLATE: &str = "{% set loop_messages = messages %}{% for message in loop_messages %}{% set content = message['role'] | capitalize + ': '+ message['content'] | trim + '<|eot_id|>' %}{{ content }}{% endfor %}{% if add_generation_prompt %}{{ 'Assistant: ' }}{% endif %}";
+
+/// Render the canonical Microsoft BitNet-b1.58-2B-4T chat dialect.
+///
+/// The published GGUF accidentally embeds an older BitNet
+/// `Human:/BITNETAssistant:` template. The 2B-4T tokenizer configuration and
+/// the model's training/runtime implementation instead use:
+///
+/// ```text
+/// System: {system content}<|eot_id|>User: {user content}<|eot_id|>Assistant:
+/// ```
+///
+/// BOS deliberately does not appear in the returned text: the runnable
+/// tokenizer supplies it through `add_special=true`. Message content is
+/// trimmed exactly like the canonical Jinja template's `| trim` expression.
+fn render_bitnet_b158_prompt(messages: &[ChatMessage]) -> String {
+    let mut prompt = String::new();
+    for message in messages {
+        let role = match message.role.trim() {
+            "system" => "System",
+            "user" => "User",
+            "assistant" => "Assistant",
+            other => other,
+        };
+        prompt.push_str(role);
+        prompt.push_str(": ");
+        prompt.push_str(message.content.trim());
+        prompt.push_str("<|eot_id|>");
+    }
+    prompt.push_str("Assistant: ");
+    prompt
+}
+
+/// Validate the request features that Microsoft's BitNet chat template can
+/// actually represent. Its GGUF template has neither a tools branch nor a
+/// thinking-mode switch, so silently accepting either would discard caller
+/// intent while presenting the request as supported.
+fn bitnet_b158_request_rejection(
+    tools: &[serde_json::Value],
+    enable_thinking: bool,
+) -> Option<Response> {
+    if !tools.is_empty() {
+        return Some(bitnet_runnable_lane_tools_rejection());
+    }
+    enable_thinking.then(bitnet_runnable_lane_thinking_rejection)
+}
+
+fn bitnet_b158_message_rejection(messages: &[ChatMessage]) -> Option<Response> {
+    for message in messages {
+        if message
+            .unsupported_content_parts
+            .iter()
+            .any(|part| part == INTERNAL_TOOL_CALL_HISTORY_MARKER)
+        {
+            return Some(bitnet_runnable_lane_tools_rejection());
+        }
+        let role = message.role.trim();
+        if !matches!(role, "system" | "user" | "assistant") {
+            return Some(api_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "unsupported_message_role",
+                format!(
+                    "the BitNet-b1.58-2B-4T chat dialect accepts only system, user, and assistant messages; role {role:?} requires an unsupported tool/function protocol"
+                ),
+                Some("messages"),
+            ));
+        }
+    }
+    None
+}
+
+/// Gate the hand-written renderer on either the known-stale official GGUF
+/// template or the corrected canonical template. Also require the canonical
+/// end-of-turn marker to exist as one tokenizer token; treating it as ordinary
+/// text would shift every trained turn boundary.
+#[allow(clippy::result_large_err)]
+fn prepare_bitnet_b158_chat_prompt(
+    runtime: &RunnableServeRuntime,
+    model_id: &str,
+    messages: &[ChatMessage],
+) -> std::result::Result<String, Response> {
+    if let Some(rejection) = bitnet_b158_message_rejection(messages) {
+        return Err(rejection);
+    }
+    if let Some(rejection) = reject_bitnet_with_unrecognized_template(runtime, model_id) {
+        return Err(rejection);
+    }
+    let eot_id = runtime.tokenizer.token_to_id.get("<|eot_id|>").copied();
+    let eot_is_one_special = eot_id.is_some_and(|expected| {
+        runtime
+            .tokenizer
+            .encode("<|eot_id|>", false, true)
+            .is_ok_and(|ids| ids.as_slice() == [expected])
+    });
+    if !eot_is_one_special {
+        return Err(api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "unsupported_chat_template",
+            format!(
+                "model '{model_id}' declares architecture 'bitnet-b1.58', but its tokenizer has no single <|eot_id|> token required by the canonical Microsoft chat template"
+            ),
+            Some("messages"),
+        ));
+    }
+    Ok(render_bitnet_b158_prompt(messages))
+}
+
+#[cfg(test)]
+mod bitnet_runnable_api_tests {
+    use super::*;
+
+    fn message(role: &str, content: &str) -> ChatMessage {
+        ChatMessage {
+            role: role.to_string(),
+            content: content.to_string(),
+            image_urls: Vec::new(),
+            unsupported_content_parts: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn bitnet_renderer_corrects_the_stale_gguf_template_to_the_trained_dialect() {
+        let messages = [
+            message("system", " Be helpful. "),
+            message("user", " Hello "),
+            message("assistant", "Hi"),
+            message("user", "Again"),
+        ];
+        let prompt = render_bitnet_b158_prompt(&messages);
+        assert_eq!(
+            prompt,
+            "System: Be helpful.<|eot_id|>User: Hello<|eot_id|>Assistant: Hi<|eot_id|>User: Again<|eot_id|>Assistant: "
+        );
+        assert!(
+            !prompt.contains("<|begin_of_text|>"),
+            "BOS belongs to tokenizer add_special, not renderer text"
+        );
+    }
+
+    #[test]
+    fn bitnet_template_gate_is_specific_to_the_evidenced_dialect() {
+        assert!(is_bitnet_b158_chat_template(STALE_MICROSOFT_GGUF_TEMPLATE));
+        assert!(is_bitnet_b158_chat_template(CANONICAL_MICROSOFT_TEMPLATE));
+        assert!(!is_bitnet_b158_chat_template(
+            "{{ bos_token }}<|im_start|>user<|im_end|>{{ eos_token }}"
+        ));
+        assert!(!is_bitnet_b158_chat_template(
+            "Human: {{ content }} BITNETAssistant:"
+        ));
+        assert!(!is_bitnet_b158_chat_template(&format!(
+            "{STALE_MICROSOFT_GGUF_TEMPLATE}{{{{ forged_extra }}}}"
+        )));
+    }
+
+    #[test]
+    fn bitnet_prompt_requests_bos_special_token_insertion() {
+        assert!(runnable_prompt_add_special("bitnet-b1.58"));
+        assert!(runnable_prompt_add_special("lfm2"));
+        assert!(!runnable_prompt_add_special("qwen35"));
+    }
+
+    #[test]
+    fn command_r_chat_stays_on_the_template_hold_instead_of_using_ornith() {
+        let response = command_r_chat_template_hold_rejection("aya");
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let details = response.extensions().get::<ApiErrorDetails>().unwrap();
+        assert_eq!(details.code, "unsupported_chat_template");
+        assert!(details
+            .message
+            .contains("Command-R chat remains fail-closed"));
+        assert!(details
+            .message
+            .contains("incompatible qwen35/Ornith renderer"));
+    }
+
+    #[test]
+    fn runnable_finish_reason_reports_a_capped_bitnet_reply_as_length() {
+        assert_eq!(runnable_finish_reason(false, 64, 64), "length");
+        assert_eq!(runnable_finish_reason(false, 12, 64), "stop");
+        assert_eq!(runnable_finish_reason(true, 64, 64), "tool_calls");
+    }
+
+    #[test]
+    fn bitnet_rejects_uncertified_tools_and_thinking() {
+        assert!(bitnet_b158_request_rejection(&[], false).is_none());
+
+        let tools = [serde_json::json!({"name": "weather"})];
+        let tools_response = bitnet_b158_request_rejection(&tools, false).unwrap();
+        assert_eq!(tools_response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            tools_response
+                .extensions()
+                .get::<ApiErrorDetails>()
+                .unwrap()
+                .code,
+            "unsupported_tools"
+        );
+
+        let thinking_response = bitnet_b158_request_rejection(&[], true).unwrap();
+        assert_eq!(thinking_response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            thinking_response
+                .extensions()
+                .get::<ApiErrorDetails>()
+                .unwrap()
+                .code,
+            "unsupported_parameter"
+        );
+
+        assert!(bitnet_b158_message_rejection(&[message("user", "hello")]).is_none());
+        let tool_history = bitnet_b158_message_rejection(&[message("tool", "result")]).unwrap();
+        assert_eq!(tool_history.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            tool_history
+                .extensions()
+                .get::<ApiErrorDetails>()
+                .unwrap()
+                .code,
+            "unsupported_message_role"
+        );
+
+        let assistant_tool_call: ChatMessage = serde_json::from_value(serde_json::json!({
+            "role": "assistant",
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "weather", "arguments": "{}"}
+            }]
+        }))
+        .unwrap();
+        let structured_history = bitnet_b158_message_rejection(&[assistant_tool_call]).unwrap();
+        assert_eq!(
+            structured_history
+                .extensions()
+                .get::<ApiErrorDetails>()
+                .unwrap()
+                .code,
+            "unsupported_tools"
+        );
+    }
+
+    #[test]
+    fn runnable_disconnect_guard_sets_cancellation_flag() {
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let _guard = RunnableStreamDisconnectGuard {
+                cancelled: cancelled.clone(),
+            };
+            assert!(!cancelled.load(std::sync::atomic::Ordering::Acquire));
+        }
+        assert!(cancelled.load(std::sync::atomic::Ordering::Acquire));
+    }
 }
 
 /// Render an LFM2 / LFM2.5 chat prompt, faithful to the GGUF's own template.
@@ -10345,13 +11395,10 @@ fn prepare_runnable_prompt(
         .flat_map(|message| message.image_urls.iter().map(String::as_str))
         .collect();
     if image_urls.is_empty() {
-        // `add_special` is what supplies the leading BOS. gemma needs it; so
-        // does lfm2 — LFM2.5's chat template opens with `{{- bos_token -}}`
-        // (`<|startoftext|>`, id 124894), and the GGUF omits
-        // `tokenizer.ggml.add_bos_token` so the tokenizer's default `true`
-        // applies. Without this the whole prompt is shifted by a missing BOS
-        // and the forward diverges from the reference.
-        let add_special = matches!(runtime.architecture.as_str(), "gemma2" | "gemma3" | "lfm2");
+        // `add_special` supplies the leading BOS for templates that emit
+        // `bos_token` outside their returned text. Without it the whole prompt
+        // is shifted and the forward diverges from the reference.
+        let add_special = runnable_prompt_add_special(&runtime.architecture);
         let ids = runtime
             .tokenizer
             .encode(prompt_text, add_special, true)
@@ -10444,23 +11491,174 @@ fn prepare_runnable_prompt(
     })
 }
 
+/// Architectures whose evidenced GGUF chat template supplies its leading BOS
+/// through tokenizer special-token insertion rather than literal renderer text.
+fn runnable_prompt_add_special(architecture: &str) -> bool {
+    matches!(architecture, "gemma2" | "gemma3" | "lfm2" | "bitnet-b1.58")
+}
+
+/// OpenAI-compatible runnable completion terminator. Tool calls take
+/// precedence; otherwise exhausting the caller's token budget is `length`,
+/// while an earlier EOG is `stop`.
+fn runnable_finish_reason(
+    has_tool_calls: bool,
+    completion_tokens: usize,
+    max_tokens: usize,
+) -> &'static str {
+    if has_tool_calls {
+        "tool_calls"
+    } else if completion_tokens >= max_tokens {
+        "length"
+    } else {
+        "stop"
+    }
+}
+
+/// One completed runnable-serve generation. Text prompts retain their exact
+/// token ids so chat diagnostics and opt-in receipts can be replayed against an
+/// oracle. Vision prompts contain projected image embeddings that have no token
+/// id representation, so `prompt_token_ids` is deliberately absent there while
+/// `prompt_token_count` still drives OpenAI usage accounting.
+struct RunnableGenerationResult {
+    text: String,
+    generated_token_ids: Vec<u32>,
+    prompt_token_ids: Option<Vec<u32>>,
+    prompt_token_count: usize,
+}
+
+fn runnable_generation_diagnostics(
+    architecture: &str,
+    prompt_token_ids: Option<&[u32]>,
+    generated_token_ids: &[u32],
+) -> serde_json::Value {
+    let mut diagnostics = serde_json::json!({
+        "generated_token_ids": generated_token_ids,
+        "lane": "runnable",
+        "architecture": architecture,
+    });
+    if let Some(prompt_token_ids) = prompt_token_ids {
+        diagnostics["prompt_token_ids"] = serde_json::json!(prompt_token_ids);
+    }
+    diagnostics
+}
+
+fn runnable_stream_chunk(
+    model_id: &str,
+    created: u64,
+    delta: serde_json::Value,
+    finish_reason: Option<&str>,
+    camelid: Option<serde_json::Value>,
+) -> serde_json::Value {
+    let mut chunk = serde_json::json!({
+        "id": "chatcmpl-runnable",
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model_id,
+        "choices": [{ "index": 0, "delta": delta, "finish_reason": finish_reason }],
+    });
+    if let Some(camelid) = camelid {
+        chunk["camelid"] = camelid;
+    }
+    chunk
+}
+
+fn runnable_stream_usage_chunk(
+    model_id: &str,
+    created: u64,
+    prompt_tokens: usize,
+    completion_tokens: usize,
+) -> serde_json::Value {
+    serde_json::json!({
+        "id": "chatcmpl-runnable",
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model_id,
+        "choices": [],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        },
+    })
+}
+
+/// Apply the same receipt request contract as dense chat before the runnable
+/// bridge short-circuits the common handler. Receipts describe one completed,
+/// non-streaming choice; asking for one on an SSE or multi-choice request must
+/// fail explicitly rather than being silently ignored.
+fn runnable_receipt_request_stamp(
+    req: &ChatCompletionRequest,
+) -> std::result::Result<Option<ReceiptRequestStamp>, Box<Response>> {
+    if !req.camelid_receipt.unwrap_or(false) {
+        return Ok(None);
+    }
+    if req.stream.unwrap_or(false) {
+        return Err(Box::new(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "camelid_receipt is not supported with stream:true; receipts record one complete non-streaming generation".to_string(),
+            Some("camelid_receipt"),
+        )));
+    }
+    if req.n.unwrap_or(1) > 1 {
+        return Err(Box::new(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "camelid_receipt is not supported with n greater than 1; a receipt records one complete generation".to_string(),
+            Some("camelid_receipt"),
+        )));
+    }
+    receipt_request_stamp(req).map(Some)
+}
+
+fn runnable_vision_receipt_rejection() -> Response {
+    api_error(
+        StatusCode::BAD_REQUEST,
+        "invalid_request_error",
+        "camelid_receipt is not supported with image input because projected image embeddings have no replayable prompt token ids"
+            .to_string(),
+        Some("camelid_receipt"),
+    )
+}
+
 /// Non-streaming chat for a runnable-served model (qwen35/Ornith): render the Ornith
 /// ChatML prompt (with tools when present), greedy-generate to EOG, split the
 /// `<think>` reasoning, and lift `<function=â€¦>` tool calls into structured `tool_calls`
 /// (the content keeps the tool-call text so the agent's client-side parser also lifts).
 async fn runnable_chat_nonstreaming(
+    state: &AppState,
     id: String,
     runtime: Arc<RunnableServeRuntime>,
     req: &ChatCompletionRequest,
 ) -> Response {
+    let receipt_stamp = match runnable_receipt_request_stamp(req) {
+        Ok(stamp) => stamp,
+        Err(response) => return *response,
+    };
     let messages = req.messages.clone().unwrap_or_default();
     let enable_thinking = req.camelid_enable_thinking.unwrap_or(false);
     let tools = runnable_request_tools(req);
-    let prompt_text = if runtime.architecture == "gemma2" || runtime.architecture == "gemma3" {
+    let prompt_text = if runtime.architecture == "gemma2" {
+        if !tools.is_empty() {
+            return gemma_runnable_lane_tools_rejection();
+        }
+        match prepare_gemma2_runnable_chat_prompt(&runtime, &id, &messages) {
+            Ok(prompt) => prompt,
+            Err(rejection) => return *rejection,
+        }
+    } else if runtime.architecture == "gemma3" {
         if !tools.is_empty() {
             return gemma_runnable_lane_tools_rejection();
         }
         render_gemma3_prompt(&messages)
+    } else if runtime.architecture == "bitnet-b1.58" {
+        if let Some(rejection) = bitnet_b158_request_rejection(&tools, enable_thinking) {
+            return rejection;
+        }
+        match prepare_bitnet_b158_chat_prompt(&runtime, &id, &messages) {
+            Ok(prompt) => prompt,
+            Err(rejection) => return rejection,
+        }
     } else if runtime.architecture == "lfm2" {
         // LFM2 has its own template AND its own tool-call envelope; borrowing
         // the qwen35 tools renderer would emit a format these weights were
@@ -10478,6 +11676,8 @@ async fn runnable_chat_nonstreaming(
             return rejection;
         }
         render_lfm2_chatml_prompt(&messages)
+    } else if runtime.architecture == "command-r" {
+        return command_r_chat_template_hold_rejection(&id);
     } else if tools.is_empty() {
         render_ornith_chatml_prompt(&messages, enable_thinking)
     } else {
@@ -10488,6 +11688,9 @@ async fn runnable_chat_nonstreaming(
             Ok(prepared) => prepared,
             Err(response) => return response,
         };
+    if receipt_stamp.is_some() && matches!(&prepared, RunnablePreparedPrompt::Vision { .. }) {
+        return runnable_vision_receipt_rejection();
+    }
     let sampling = match runnable_sampling_config(req) {
         Ok(config) => config,
         Err(response) => return response,
@@ -10497,8 +11700,14 @@ async fn runnable_chat_nonstreaming(
     let result = tokio::task::spawn_blocking(move || match prepared {
         RunnablePreparedPrompt::Text(prompt_ids) => {
             let prompt_token_count = prompt_ids.len();
-            rt.generate_greedy(&prompt_ids, max_tokens, &sampling)
-                .map(|(text, ids)| (text, ids, prompt_token_count))
+            rt.generate_greedy(&prompt_ids, max_tokens, &sampling).map(
+                |(text, generated_token_ids)| RunnableGenerationResult {
+                    text,
+                    generated_token_ids,
+                    prompt_token_ids: Some(prompt_ids),
+                    prompt_token_count,
+                },
+            )
         }
         RunnablePreparedPrompt::Vision {
             prefix,
@@ -10506,18 +11715,32 @@ async fn runnable_chat_nonstreaming(
             suffix,
             min_image_tokens,
             max_image_tokens,
-        } => rt.generate_vision_greedy(
-            &prefix,
-            &image_bytes,
-            &suffix,
-            min_image_tokens,
-            max_image_tokens,
-            max_tokens,
-            &sampling,
-        ),
+        } => rt
+            .generate_vision_greedy(
+                &prefix,
+                &image_bytes,
+                &suffix,
+                min_image_tokens,
+                max_image_tokens,
+                max_tokens,
+                &sampling,
+            )
+            .map(
+                |(text, generated_token_ids, prompt_token_count)| RunnableGenerationResult {
+                    text,
+                    generated_token_ids,
+                    prompt_token_ids: None,
+                    prompt_token_count,
+                },
+            ),
     })
     .await;
-    let (text, ids, prompt_token_count) = match result {
+    let RunnableGenerationResult {
+        text,
+        generated_token_ids: ids,
+        prompt_token_ids,
+        prompt_token_count,
+    } = match result {
         Ok(Ok(out)) => out,
         Ok(Err(e)) => {
             return api_error(
@@ -10540,8 +11763,11 @@ async fn runnable_chat_nonstreaming(
     // Prefer the token-level split: on lfm2 `</think>` is a control token that
     // detokenization strips, so the text search below can never find it and the
     // whole think block would land in `content`.
-    let (reasoning, content) =
-        split_think_by_token(&ids, &runtime.tokenizer).unwrap_or_else(|| split_ornith_think(&text));
+    let (reasoning, content) = if runtime.architecture == "bitnet-b1.58" {
+        (None, text.clone())
+    } else {
+        split_think_by_token(&ids, &runtime.tokenizer).unwrap_or_else(|| split_ornith_think(&text))
+    };
     // Structured tool_calls (OpenAI shape) lifted from the Ornith `<function=â€¦>` XML.
     // The agent loop ALSO re-parses the content text client-side (chat-lane
     // `parse_ornith`), so the content keeps the tool-call text below.
@@ -10555,16 +11781,29 @@ async fn runnable_chat_nonstreaming(
     // covers). Without this a request that was REFUSED a tools array could still
     // come back with `finish_reason: "tool_calls"` if the model echoed Ornith
     // syntax from its history.
-    let tool_calls =
-        if runtime.architecture != "lfm2" && tool_choice_allows_calls(req.tool_choice.as_ref()) {
-            parse_ornith_tool_calls_json(&content)
-        } else {
-            Vec::new()
-        };
-    let finish_reason = if tool_calls.is_empty() {
-        "stop"
+    let tool_calls = if !matches!(runtime.architecture.as_str(), "lfm2" | "bitnet-b1.58")
+        && tool_choice_allows_calls(req.tool_choice.as_ref())
+    {
+        parse_ornith_tool_calls_json(&content)
     } else {
-        "tool_calls"
+        Vec::new()
+    };
+    let finish_reason = runnable_finish_reason(!tool_calls.is_empty(), ids.len(), max_tokens);
+    let camelid_receipt = match (receipt_stamp, prompt_token_ids.as_deref()) {
+        (Some(stamp), Some(prompt_token_ids)) => {
+            build_runnable_server_receipt(
+                state,
+                &id,
+                stamp,
+                max_tokens as u32,
+                prompt_token_ids,
+                &ids,
+                &text,
+                finish_reason,
+            )
+            .await
+        }
+        _ => None,
     };
 
     let mut message = serde_json::json!({ "role": "assistant", "content": content });
@@ -10574,7 +11813,12 @@ async fn runnable_chat_nonstreaming(
     if !tool_calls.is_empty() {
         message["tool_calls"] = serde_json::Value::Array(tool_calls);
     }
-    let body = serde_json::json!({
+    let diagnostics = runnable_generation_diagnostics(
+        runtime.architecture.as_str(),
+        prompt_token_ids.as_deref(),
+        &ids,
+    );
+    let mut body = serde_json::json!({
         "id": "chatcmpl-runnable",
         "object": "chat.completion",
         "created": unix_secs(),
@@ -10585,16 +11829,14 @@ async fn runnable_chat_nonstreaming(
             "completion_tokens": ids.len(),
             "total_tokens": prompt_token_count + ids.len(),
         },
-        // Lane is the neutral "runnable" (the bridge serves qwen35, gemma2, and
-        // gemma3); the actual model architecture is disclosed separately so the
-        // label never misreports one arch as another (matches the parity-artifact
-        // shape in tests/runnable_parity.rs).
-        "camelid": {
-            "generated_token_ids": ids,
-            "lane": "runnable",
-            "architecture": runtime.architecture.as_str(),
-        },
+        // Lane is the neutral "runnable" (the bridge serves several
+        // architectures); prompt and generated ids make this exact run
+        // independently replayable without pretending it is a support claim.
+        "camelid": diagnostics,
     });
+    if let Some(receipt) = camelid_receipt {
+        body["camelid_receipt"] = serde_json::json!(receipt);
+    }
     (StatusCode::OK, Json(body)).into_response()
 }
 
@@ -10614,14 +11856,33 @@ async fn runnable_chat_streaming(
     runtime: Arc<RunnableServeRuntime>,
     req: &ChatCompletionRequest,
 ) -> Response {
+    if let Err(response) = runnable_receipt_request_stamp(req) {
+        return *response;
+    }
     let messages = req.messages.clone().unwrap_or_default();
     let enable_thinking = req.camelid_enable_thinking.unwrap_or(false);
     let tools = runnable_request_tools(req);
-    let prompt_text = if runtime.architecture == "gemma2" || runtime.architecture == "gemma3" {
+    let prompt_text = if runtime.architecture == "gemma2" {
+        if !tools.is_empty() {
+            return gemma_runnable_lane_tools_rejection();
+        }
+        match prepare_gemma2_runnable_chat_prompt(&runtime, &id, &messages) {
+            Ok(prompt) => prompt,
+            Err(rejection) => return *rejection,
+        }
+    } else if runtime.architecture == "gemma3" {
         if !tools.is_empty() {
             return gemma_runnable_lane_tools_rejection();
         }
         render_gemma3_prompt(&messages)
+    } else if runtime.architecture == "bitnet-b1.58" {
+        if let Some(rejection) = bitnet_b158_request_rejection(&tools, enable_thinking) {
+            return rejection;
+        }
+        match prepare_bitnet_b158_chat_prompt(&runtime, &id, &messages) {
+            Ok(prompt) => prompt,
+            Err(rejection) => return rejection,
+        }
     } else if runtime.architecture == "lfm2" {
         // LFM2 has its own template AND its own tool-call envelope; borrowing
         // the qwen35 tools renderer would emit a format these weights were
@@ -10639,6 +11900,8 @@ async fn runnable_chat_streaming(
             return rejection;
         }
         render_lfm2_chatml_prompt(&messages)
+    } else if runtime.architecture == "command-r" {
+        return command_r_chat_template_hold_rejection(&id);
     } else if tools.is_empty() {
         render_ornith_chatml_prompt(&messages, enable_thinking)
     } else {
@@ -10662,28 +11925,45 @@ async fn runnable_chat_streaming(
     // (hold-back off), so lifting here would BOTH violate OpenAI semantics and
     // duplicate the streamed text as a structured tool_calls delta.
     // Arch-gated for the same reason as the non-streaming path above.
-    let lift_tool_calls =
-        runtime.architecture != "lfm2" && tool_choice_allows_calls(req.tool_choice.as_ref());
+    let lift_tool_calls = !matches!(runtime.architecture.as_str(), "lfm2" | "bitnet-b1.58")
+        && tool_choice_allows_calls(req.tool_choice.as_ref());
     let think_close = runtime.tokenizer.token_to_id.get("</think>").copied();
     let opens_think_unconditionally = runtime.architecture == "lfm2";
+    let bitnet_stream = runtime.architecture == "bitnet-b1.58";
     let created = unix_secs();
 
     enum StreamItem {
         Token(u32),
-        Done(String, Vec<u32>, usize),
+        Done(RunnableGenerationResult),
         Fail(String),
     }
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<StreamItem>();
+    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let worker_cancelled = cancelled.clone();
     let rt = runtime.clone();
     tokio::task::spawn_blocking(move || {
         let send_tx = tx.clone();
+        let is_cancelled = || worker_cancelled.load(std::sync::atomic::Ordering::Acquire);
         let result = match prepared {
             RunnablePreparedPrompt::Text(prompt_ids) => {
                 let prompt_token_count = prompt_ids.len();
-                rt.generate_greedy_streaming(&prompt_ids, max_tokens, &sampling, |tok| {
-                    let _ = send_tx.send(StreamItem::Token(tok));
+                rt.generate_greedy_streaming_cancelled(
+                    &prompt_ids,
+                    max_tokens,
+                    &sampling,
+                    &is_cancelled,
+                    |tok| {
+                        if send_tx.send(StreamItem::Token(tok)).is_err() {
+                            worker_cancelled.store(true, std::sync::atomic::Ordering::Release);
+                        }
+                    },
+                )
+                .map(|(text, generated_token_ids)| RunnableGenerationResult {
+                    text,
+                    generated_token_ids,
+                    prompt_token_ids: Some(prompt_ids),
+                    prompt_token_count,
                 })
-                .map(|(text, ids)| (text, ids, prompt_token_count))
             }
             RunnablePreparedPrompt::Vision {
                 prefix,
@@ -10691,22 +11971,33 @@ async fn runnable_chat_streaming(
                 suffix,
                 min_image_tokens,
                 max_image_tokens,
-            } => rt.generate_vision_greedy_streaming(
-                &prefix,
-                &image_bytes,
-                &suffix,
-                min_image_tokens,
-                max_image_tokens,
-                max_tokens,
-                &sampling,
-                |tok| {
-                    let _ = send_tx.send(StreamItem::Token(tok));
-                },
-            ),
+            } => rt
+                .generate_vision_greedy_streaming(
+                    &prefix,
+                    &image_bytes,
+                    &suffix,
+                    min_image_tokens,
+                    max_image_tokens,
+                    max_tokens,
+                    &sampling,
+                    |tok| {
+                        if send_tx.send(StreamItem::Token(tok)).is_err() {
+                            worker_cancelled.store(true, std::sync::atomic::Ordering::Release);
+                        }
+                    },
+                )
+                .map(
+                    |(text, generated_token_ids, prompt_token_count)| RunnableGenerationResult {
+                        text,
+                        generated_token_ids,
+                        prompt_token_ids: None,
+                        prompt_token_count,
+                    },
+                ),
         };
         match result {
-            Ok((text, ids, prompt_token_count)) => {
-                let _ = tx.send(StreamItem::Done(text, ids, prompt_token_count));
+            Ok(result) => {
+                let _ = tx.send(StreamItem::Done(result));
             }
             Err(e) => {
                 let _ = tx.send(StreamItem::Fail(e.to_string()));
@@ -10715,18 +12006,21 @@ async fn runnable_chat_streaming(
     });
 
     let tokenizer = runtime.tokenizer.clone();
+    let disconnect_guard = RunnableStreamDisconnectGuard { cancelled };
     let events = async_stream::stream! {
-        let chunk = |delta: serde_json::Value, finish: Option<&str>| {
-            serde_json::json!({
-                "id": "chatcmpl-runnable",
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": id,
-                "choices": [{ "index": 0, "delta": delta, "finish_reason": finish }],
-            })
-        };
+        // Keep the guard owned by the response body for its full lifetime.
+        let _disconnect_guard = disconnect_guard;
         yield Ok::<Event, std::convert::Infallible>(
-            Event::default().data(chunk(serde_json::json!({ "role": "assistant" }), None).to_string()),
+            Event::default().data(
+                runnable_stream_chunk(
+                    &id,
+                    created,
+                    serde_json::json!({ "role": "assistant" }),
+                    None,
+                    None,
+                )
+                .to_string(),
+            ),
         );
 
         // Per-phase incremental decode state. `emitted` counts bytes of the phase's
@@ -10743,7 +12037,7 @@ async fn runnable_chat_streaming(
         let mut phase_ids: Vec<u32> = Vec::new();
         let mut emitted = 0usize;
         let mut seen_visible = false;
-        type RunnableStreamResult = std::result::Result<(String, Vec<u32>, usize), String>;
+        type RunnableStreamResult = std::result::Result<RunnableGenerationResult, String>;
         let mut final_state: Option<RunnableStreamResult> = None;
 
         while let Some(item) = rx.recv().await {
@@ -10794,10 +12088,12 @@ async fn runnable_chat_streaming(
                         }
                         serde_json::json!({ "content": delta_text })
                     };
-                    yield Ok(Event::default().data(chunk(delta, None).to_string()));
+                    yield Ok(Event::default().data(
+                        runnable_stream_chunk(&id, created, delta, None, None).to_string(),
+                    ));
                 }
-                StreamItem::Done(text, ids, prompt_token_count) => {
-                    final_state = Some(Ok((text, ids, prompt_token_count)));
+                StreamItem::Done(result) => {
+                    final_state = Some(Ok(result));
                     break;
                 }
                 StreamItem::Fail(e) => {
@@ -10808,14 +12104,24 @@ async fn runnable_chat_streaming(
         }
 
         match final_state {
-            Some(Ok((text, ids, prompt_token_count))) => {
-                let (_reasoning, content) = split_ornith_think(&text);
+            Some(Ok(RunnableGenerationResult {
+                text,
+                generated_token_ids: ids,
+                prompt_token_ids,
+                prompt_token_count,
+            })) => {
+                let content = if bitnet_stream {
+                    text
+                } else {
+                    split_ornith_think(&text).1
+                };
                 let tool_calls = if lift_tool_calls {
                     parse_ornith_tool_calls_json(&content)
                 } else {
                     Vec::new()
                 };
-                let finish = if tool_calls.is_empty() { "stop" } else { "tool_calls" };
+                let finish =
+                    runnable_finish_reason(!tool_calls.is_empty(), ids.len(), max_tokens);
                 if !tool_calls.is_empty() {
                     let deltas: Vec<serde_json::Value> = tool_calls
                         .iter()
@@ -10827,27 +12133,49 @@ async fn runnable_chat_streaming(
                         })
                         .collect();
                     yield Ok(Event::default().data(
-                        chunk(serde_json::json!({ "tool_calls": deltas }), None).to_string(),
+                        runnable_stream_chunk(
+                            &id,
+                            created,
+                            serde_json::json!({ "tool_calls": deltas }),
+                            None,
+                            None,
+                        )
+                        .to_string(),
                     ));
                 } else if parse_stream_tool_calls && !content.is_empty() {
                     yield Ok(Event::default().data(
-                        chunk(serde_json::json!({ "content": content }), None).to_string(),
+                        runnable_stream_chunk(
+                            &id,
+                            created,
+                            serde_json::json!({ "content": content }),
+                            None,
+                            None,
+                        )
+                        .to_string(),
                     ));
                 }
-                yield Ok(Event::default().data(chunk(serde_json::json!({}), Some(finish)).to_string()));
+                let diagnostics = runnable_generation_diagnostics(
+                    runtime.architecture.as_str(),
+                    prompt_token_ids.as_deref(),
+                    &ids,
+                );
+                yield Ok(Event::default().data(
+                    runnable_stream_chunk(
+                        &id,
+                        created,
+                        serde_json::json!({}),
+                        Some(finish),
+                        Some(diagnostics),
+                    )
+                    .to_string(),
+                ));
                 if include_usage {
-                    let usage = serde_json::json!({
-                        "id": "chatcmpl-runnable",
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": id,
-                        "choices": [],
-                        "usage": {
-                            "prompt_tokens": prompt_token_count,
-                            "completion_tokens": ids.len(),
-                            "total_tokens": prompt_token_count + ids.len(),
-                        },
-                    });
+                    let usage = runnable_stream_usage_chunk(
+                        &id,
+                        created,
+                        prompt_token_count,
+                        ids.len(),
+                    );
                     yield Ok(Event::default().data(usage.to_string()));
                 }
             }
@@ -11470,9 +12798,6 @@ async fn load_model_from_path_with_activation(
             if existing.path == path {
                 let existing = existing.clone();
                 drop(loaded);
-                if set_active {
-                    *state.active_model_id.write().await = Some(requested_id.to_string());
-                }
                 // Heal a missing gemma4 serve runtime: a client that
                 // disconnects mid-load cancels the handler future AFTER the
                 // loaded_models insert but BEFORE the runtime insert, and the
@@ -11487,6 +12812,29 @@ async fn load_model_from_path_with_activation(
                         .contains_key(requested_id)
                 {
                     load_gemma4_serve_runtime(state, requested_id, &existing.path).await?;
+                }
+                // Apply the same healing rule to runnable-only rows. A prior
+                // runtime construction failure or cancelled load must not turn
+                // the idempotent fast path into a false success followed by a
+                // generic model_not_ready response.
+                if runnable_serve_enabled()
+                    && is_runnable_serve_file(&existing.gguf)
+                    && !state
+                        .runnable_runtimes
+                        .read()
+                        .await
+                        .contains_key(requested_id)
+                {
+                    load_runnable_serve_runtime(
+                        state,
+                        requested_id,
+                        &existing.path,
+                        &existing.lane.gguf_sha256,
+                    )
+                    .await?;
+                }
+                if set_active {
+                    *state.active_model_id.write().await = Some(requested_id.to_string());
                 }
                 return Ok(existing);
             }
@@ -11517,7 +12865,7 @@ async fn load_model_from_path_with_activation(
     let metadata_path = path.clone();
     let configured_threads = state.configured_threads;
     let planner_env = state.planner_env.clone();
-    let (gguf, outcome) = tokio::task::spawn_blocking(move || {
+    let (gguf, mut outcome) = tokio::task::spawn_blocking(move || {
         let gguf = read_metadata(&metadata_path)?;
         let outcome =
             plan_for_model_with_env(&metadata_path, &gguf, configured_threads, &planner_env);
@@ -11528,7 +12876,6 @@ async fn load_model_from_path_with_activation(
         BackendError::InvalidModelMetadata(format!("model metadata task panicked: {join_error}"))
     })??;
     state.planner_env.apply(&outcome.env_updates);
-    log_selected_execution_plan(&outcome.plan);
     let id = id
         .or_else(|| gguf.model_name().map(ToOwned::to_owned))
         .or_else(|| path.file_stem().map(|s| s.to_string_lossy().to_string()))
@@ -11541,6 +12888,20 @@ async fn load_model_from_path_with_activation(
         .map_err(|join_error| {
             BackendError::InvalidModelMetadata(format!("model load task panicked: {join_error}"))
         })??;
+    finalize_execution_plan_support_for_loaded_artifact(
+        &mut outcome.plan,
+        &loaded.path,
+        &loaded.lane.gguf_sha256,
+    );
+    log_selected_execution_plan(&outcome.plan);
+
+    // Runnable-only models are published atomically with their runtime. Build
+    // the bridge before inserting LoadedModel/active state so a tokenizer or
+    // graph refusal cannot leave a partial id that the idempotent fast path
+    // later mistakes for a successful load.
+    if runnable_serve_enabled() && is_runnable_serve_file(&loaded.gguf) {
+        load_runnable_serve_runtime(state, &id, &loaded.path, &loaded.lane.gguf_sha256).await?;
+    }
 
     state
         .loaded_models
@@ -11569,12 +12930,6 @@ async fn load_model_from_path_with_activation(
         load_gemma4_serve_runtime(state, &id, &loaded.path).await?;
     }
 
-    // Runnable serve path (additive, on by default; opt-out CAMELID_RUNNABLE_SERVE=0):
-    // load a runnable-lane runtime (qwen35/Ornith, gemma3) so /v1/chat can route to it.
-    if runnable_serve_enabled() && is_runnable_serve_file(&loaded.gguf) {
-        load_runnable_serve_runtime(state, &id, &loaded.path, &loaded.lane.gguf_sha256).await?;
-    }
-
     // DiffusionGemma serve path (additive, on by default; opt-out CAMELID_DG_SERVE=0):
     // the AR engine keeps failing closed for this arch (`unsupported_runtime` carries
     // the dedicated-lane redirect); the bridge loads the Phase 6 DgChat runtime
@@ -11595,6 +12950,7 @@ fn build_loaded_model(
     id: String,
     mut gguf: GgufFile,
 ) -> Result<LoadedModel, BackendError> {
+    let embedding_only = crate::model::is_bitnet_embedding_model(&gguf);
     let llama_config_result = LlamaModelConfig::from_gguf(&gguf);
     // Some dense decoders (e.g. phi3) ship fused attn_qkv / gate-up tensors. Synthesize
     // the split tensors the binder + forward path expect (no-op for already-split rows),
@@ -11607,20 +12963,39 @@ fn build_loaded_model(
     // Capture the exact typed blocker so a loaded-but-non-runnable model surfaces
     // WHY it fails closed (architecture not implemented, missing/invalid metadata,
     // DiffusionGemma redirect, â€¦) instead of silently sitting non-generative.
-    let unsupported_runtime = match &llama_config_result {
-        Err(
-            err @ (BackendError::UnsupportedModelArchitecture(_)
-            | BackendError::InvalidModelMetadata(_)
-            | BackendError::UnsupportedGguf(_)),
-        ) => Some(UnsupportedRuntimeSummary {
-            code: backend_error_code(err),
-            message: err.to_string(),
-        }),
-        _ => None,
+    let unsupported_runtime = if embedding_only {
+        Some(UnsupportedRuntimeSummary {
+            code: "model_not_generation_capable",
+            message:
+                "this Microsoft BitNet artifact is embedding-only; use /v1/embeddings or /v1/rerank"
+                    .to_string(),
+        })
+    } else {
+        match &llama_config_result {
+            Err(
+                err @ (BackendError::UnsupportedModelArchitecture(_)
+                | BackendError::InvalidModelMetadata(_)
+                | BackendError::UnsupportedGguf(_)),
+            ) => Some(UnsupportedRuntimeSummary {
+                code: backend_error_code(err),
+                message: err.to_string(),
+            }),
+            _ => None,
+        }
     };
-    let llama_config = llama_config_result.ok();
+    let llama_config = if embedding_only {
+        None
+    } else {
+        llama_config_result.ok()
+    };
+    // Runnable-only architectures parse the shared config for inspection and
+    // routing, but their correct tensor graph lives in `runnable::model`. Never
+    // publish a dense binding for them: Gemma 2, in particular, is Llama-shaped
+    // enough for the dense binder to appear successful while silently dropping
+    // its sandwich norms and logit soft-cap.
     let llama_tensors = llama_config
         .as_ref()
+        .filter(|config| !crate::model::is_runnable_only_arch(&config.architecture))
         .and_then(|config| LlamaTensorBinding::bind(&gguf, config).ok());
     let tokenizer_result = Tokenizer::from_gguf(&gguf);
     let tokenizer = tokenizer_state_from_result(tokenizer_result.as_ref());
@@ -12311,7 +13686,14 @@ async fn load_weights_lru(
         }
     }
 
-    let estimated_bytes = guard_cpu_weight_materialization_budget(binding).map_err(|err| {
+    let (layer_range, load_embedding, load_output) = api_weight_load_ownership();
+    let estimated_bytes = guard_cpu_weight_materialization_budget_with_ownership(
+        binding,
+        layer_range.as_ref(),
+        load_embedding,
+        load_output,
+    )
+    .map_err(|err| {
         api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "cpu_weight_materialization_exceeds_budget",
@@ -12331,7 +13713,12 @@ async fn load_weights_lru(
             if id != &model.id {
                 if let Some(m) = loaded.get(id) {
                     if let Some(b) = m.llama_tensors.as_ref() {
-                        if let Ok(bytes) = estimate_cpu_weight_materialization_bytes(b) {
+                        if let Ok(bytes) = estimate_cpu_weight_materialization_bytes_with_ownership(
+                            b,
+                            layer_range.as_ref(),
+                            load_embedding,
+                            load_output,
+                        ) {
                             current_sum += bytes;
                         }
                     }
@@ -12376,20 +13763,18 @@ async fn load_weights_lru(
     let store = TensorStore::open(&model.path, &model.gguf);
     // Only the coordinator reaches the API loader; a worker runs `run_worker_loop` instead.
     // Its ownership is role-derived, not positional -- see `distributed::PipelineRole`.
-    let loaded = match crate::distributed::DISTRIBUTED_RANGE.get() {
-        Some(&(layer_start, layer_end)) => {
-            let (load_embedding, load_output) =
-                crate::distributed::PipelineRole::Coordinator.tensor_ownership();
+    let loaded = match layer_range {
+        Some(layer_range) => {
             tracing::info!(
                 "API loader running in distributed coordinator mode; loading layers {}..{}",
-                layer_start,
-                layer_end
+                layer_range.start,
+                layer_range.end
             );
             LlamaLoadedWeights::load_distributed(
                 &store,
                 binding,
-                layer_start,
-                layer_end,
+                layer_range.start,
+                layer_range.end,
                 load_embedding,
                 load_output,
             )
@@ -12754,6 +14139,33 @@ async fn llama_server_apply_template(
             }
         },
     };
+    if let Some(rendered) = render_smollm3_production_chat_prompt(
+        model.gguf.architecture().unwrap_or_default(),
+        &tokenizer,
+        &model.id,
+        &messages,
+        None,
+        None,
+    ) {
+        return match rendered {
+            Ok(rendered) => (
+                StatusCode::OK,
+                Json(LlamaServerApplyTemplateResponse {
+                    prompt: rendered.text,
+                }),
+            )
+                .into_response(),
+            Err(response) => response,
+        };
+    }
+    if let Some(rejection) = reject_qwen3_moe_chat_until_template_qualified(
+        model.gguf.architecture().unwrap_or_default(),
+        &tokenizer,
+        &model.id,
+        None,
+    ) {
+        return rejection;
+    }
     let rendered = match render_chat_prompt_for_tokenization_for_model_result(
         &messages,
         &tokenizer,
@@ -12763,17 +14175,7 @@ async fn llama_server_apply_template(
         false,
     ) {
         Ok(rendered) => rendered,
-        Err(err) => {
-            return api_error(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "unsupported_chat_template",
-                format!(
-                    "chat template rendering failed for loaded model {:?}: {err}",
-                    model.id
-                ),
-                Some("messages"),
-            )
-        }
+        Err(err) => return unsupported_chat_template_response(&model.id, &err),
     };
 
     (
@@ -13443,7 +14845,7 @@ async fn chat_completions(
             if req.stream.unwrap_or(false) {
                 return runnable_chat_streaming(id, runtime, &req).await;
             }
-            return runnable_chat_nonstreaming(id, runtime, &req).await;
+            return runnable_chat_nonstreaming(&state, id, runtime, &req).await;
         }
         Ok(None) => {}
         Err(resp) => return resp,
@@ -13872,6 +15274,80 @@ fn stop_spec_to_vec(stop: Option<&StopSpec>) -> Vec<String> {
 /// reference engine runs here, so the parity block is emitted not-compared:
 /// the receipt is a claim of output that `camelid verify-receipt` checks
 /// independently. It is not a support promotion for the lane.
+struct ServerReceiptResult<'a> {
+    prompt_token_ids: &'a [u32],
+    generated_token_ids: &'a [u32],
+    generated_text: &'a str,
+    completion_tokens: usize,
+    finish_reason: &'a str,
+}
+
+fn seal_server_receipt(
+    lane: LaneIdentity,
+    stamp: ReceiptRequestStamp,
+    effective_max_tokens: u32,
+    generated: ServerReceiptResult<'_>,
+    execution_lane: Option<ExecutionLane>,
+    execution_trace: Option<receipt::ExecutionTraceBlock>,
+) -> std::result::Result<ParityReceipt, receipt::ReceiptError> {
+    let mut receipt = ParityReceipt {
+        schema: RECEIPT_SCHEMA_V1.to_string(),
+        receipt_id: String::new(),
+        created_utc: receipt::rfc3339_utc_now(),
+        lane,
+        reference: ReferenceIdentity {
+            tool: "llama.cpp".to_string(),
+            binary: "llama-server".to_string(),
+            version: None,
+            commit: None,
+        },
+        request: receipt::ReceiptRequest {
+            endpoint: stamp.endpoint.to_string(),
+            messages_or_prompt: stamp.messages_or_prompt,
+            max_tokens: effective_max_tokens,
+            temperature: stamp.temperature,
+            top_p: stamp.top_p,
+            top_k: stamp.top_k,
+            seed: stamp.seed,
+            stop: stamp.stop,
+            response_format: stamp.response_format,
+        },
+        reproducible: stamp.reproducible,
+        result: ReceiptResult {
+            prompt_token_ids: generated.prompt_token_ids.to_vec(),
+            generated_token_ids: generated.generated_token_ids.to_vec(),
+            generated_text: generated.generated_text.to_string(),
+            completion_tokens: generated.completion_tokens as u32,
+            finish_reason: generated.finish_reason.to_string(),
+        },
+        parity: ParityBlock::not_compared(),
+        execution_lane,
+        execution_trace,
+        quality_tier: None,
+        signature: None,
+    };
+    receipt.seal()?;
+    Ok(receipt)
+}
+
+fn publish_server_receipt(
+    sealed: std::result::Result<ParityReceipt, receipt::ReceiptError>,
+) -> Option<ParityReceipt> {
+    let receipt = match sealed {
+        Ok(receipt) => receipt,
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to seal camelid_receipt; omitting receipt");
+            return None;
+        }
+    };
+    telemetry::emit(telemetry::Event::ReceiptWritten {
+        receipt_id: receipt.receipt_id.clone(),
+        reproducible: receipt.reproducible,
+        gguf_sha256: Some(receipt.lane.gguf_sha256.clone()),
+    });
+    Some(receipt)
+}
+
 async fn build_server_receipt(
     state: &AppState,
     model_id: &str,
@@ -13897,54 +15373,58 @@ async fn build_server_receipt(
                 generated.generated_token_ids.len(),
             )
         });
-    let mut receipt = ParityReceipt {
-        schema: RECEIPT_SCHEMA_V1.to_string(),
-        receipt_id: String::new(),
-        created_utc: receipt::rfc3339_utc_now(),
+    publish_server_receipt(seal_server_receipt(
         lane,
-        reference: ReferenceIdentity {
-            tool: "llama.cpp".to_string(),
-            binary: "llama-server".to_string(),
-            version: None,
-            commit: None,
+        stamp,
+        effective_max_tokens,
+        ServerReceiptResult {
+            prompt_token_ids: &generated.prompt_token_ids,
+            generated_token_ids: &generated.generated_token_ids,
+            generated_text: &generated.text,
+            completion_tokens: generated.completion_tokens,
+            finish_reason: generated.finish_reason,
         },
-        request: receipt::ReceiptRequest {
-            endpoint: stamp.endpoint.to_string(),
-            messages_or_prompt: stamp.messages_or_prompt,
-            max_tokens: effective_max_tokens,
-            temperature: stamp.temperature,
-            top_p: stamp.top_p,
-            top_k: stamp.top_k,
-            seed: stamp.seed,
-            stop: stamp.stop,
-            response_format: stamp.response_format,
-        },
-        reproducible: stamp.reproducible,
-        result: ReceiptResult {
-            prompt_token_ids: generated.prompt_token_ids.clone(),
-            generated_token_ids: generated.generated_token_ids.clone(),
-            generated_text: generated.text.clone(),
-            completion_tokens: generated.completion_tokens as u32,
-            finish_reason: generated.finish_reason.to_string(),
-        },
-        parity: ParityBlock::not_compared(),
-        // This is the supported-lane serving path; leave the lane absent (= supported,
-        // the legacy default) so existing receipts keep their exact digests.
-        execution_lane: None,
+        // This is the supported-lane serving path; leave the lane absent (=
+        // supported, the legacy default) so existing receipts keep their exact
+        // digests.
+        None,
         execution_trace,
-        quality_tier: None,
-        signature: None,
+    ))
+}
+
+/// Runnable chat uses the same sealed receipt body as dense chat, but binds the
+/// runnable execution marker into the digest. That marker is required even for
+/// an exact supported catalog row: it describes HOW this request executed and
+/// never widens the support contract on its own.
+#[allow(clippy::too_many_arguments)]
+async fn build_runnable_server_receipt(
+    state: &AppState,
+    model_id: &str,
+    stamp: ReceiptRequestStamp,
+    effective_max_tokens: u32,
+    prompt_token_ids: &[u32],
+    generated_token_ids: &[u32],
+    generated_text: &str,
+    finish_reason: &str,
+) -> Option<ParityReceipt> {
+    let lane = {
+        let models = state.loaded_models.read().await;
+        models.get(model_id)?.lane.clone()
     };
-    if let Err(err) = receipt.seal() {
-        tracing::warn!(error = %err, "failed to seal camelid_receipt; omitting receipt");
-        return None;
-    }
-    telemetry::emit(telemetry::Event::ReceiptWritten {
-        receipt_id: receipt.receipt_id.clone(),
-        reproducible: receipt.reproducible,
-        gguf_sha256: Some(receipt.lane.gguf_sha256.clone()),
-    });
-    Some(receipt)
+    publish_server_receipt(seal_server_receipt(
+        lane,
+        stamp,
+        effective_max_tokens,
+        ServerReceiptResult {
+            prompt_token_ids,
+            generated_token_ids,
+            generated_text,
+            completion_tokens: generated_token_ids.len(),
+            finish_reason,
+        },
+        Some(ExecutionLane::Runnable),
+        None,
+    ))
 }
 
 /// Outcome of an in-process deterministic replay for `verify-receipt`.
@@ -14126,57 +15606,40 @@ fn cpu_weight_materialization_retains_q8_blocks() -> bool {
     )
 }
 
-fn lazy_q8_linear_materialization_enabled() -> bool {
-    match env::var(LAZY_Q8_LINEAR_ENV) {
-        Ok(value)
-            if value.eq_ignore_ascii_case("0")
-                || value.eq_ignore_ascii_case("false")
-                || value.eq_ignore_ascii_case("off")
-                || value.eq_ignore_ascii_case("disabled") =>
-        {
-            false
-        }
-        Ok(_) | Err(env::VarError::NotPresent) => true,
-        Err(_) => true,
-    }
-}
-
 fn q8_file_cache_bytes_for_health() -> Option<u64> {
     parse_byte_count_env("CAMELID_Q8_0_FILE_CACHE_BYTES").map(|value| value as u64)
 }
 
-fn q8_lazy_env_value_disabled(value: &str) -> bool {
-    value.eq_ignore_ascii_case("0")
-        || value.eq_ignore_ascii_case("false")
-        || value.eq_ignore_ascii_case("off")
-        || value.eq_ignore_ascii_case("disabled")
-}
-
-fn q8_lazy_env_present_and_enabled() -> bool {
-    matches!(env::var(LAZY_Q8_LINEAR_ENV), Ok(value) if !q8_lazy_env_value_disabled(&value))
-}
-
 fn q8_runtime_health() -> Q8RuntimeHealth {
-    let lazy_q8_linear = lazy_q8_linear_materialization_enabled();
+    let dense_storage = crate::inference::q8_dense_linear_storage_policy();
+    let lazy_q8_linear = matches!(
+        dense_storage,
+        crate::inference::Q8DenseLinearStorage::FileBacked
+    );
     let retain_q8_blocks = cpu_weight_materialization_retains_q8_blocks();
-    let forced_lazy = q8_lazy_env_present_and_enabled();
-    let policy = if forced_lazy {
+    let policy = if lazy_q8_linear {
         "forced_lazy_file_backed_q8"
-    } else if lazy_q8_linear {
-        "lazy_q8_linear_default_or_auto_retain"
+    } else if matches!(
+        dense_storage,
+        crate::inference::Q8DenseLinearStorage::WirePages
+    ) {
+        "resident_q8_wire_pages"
     } else if retain_q8_blocks {
-        "eager_f32_with_retained_q8_blocks"
+        "resident_q8_default_with_generic_retention"
     } else {
-        "eager_cpu_materialization"
+        "resident_q8_default"
     };
-    let note = if forced_lazy {
+    let note = if lazy_q8_linear {
         "Q8_0 linears are explicitly forced to file-backed lazy reads; retained-block settings do not override that loader path."
-    } else if lazy_q8_linear {
-        "Q8_0 linears are lazy by policy unless the loader auto-retains a fitting compact Q8 model."
+    } else if matches!(
+        dense_storage,
+        crate::inference::Q8DenseLinearStorage::WirePages
+    ) {
+        "Dense Q8_0 linears use page-aligned 34-byte GGUF wire allocations for Metal no-copy; this effective loader path outranks CAMELID_LAZY_Q8_0_LINEAR."
     } else if retain_q8_blocks {
-        "Lazy Q8_0 linears are disabled and Q8_0 source blocks are retained alongside eager f32 CPU weights."
+        "Dense Q8_0 linears use expanded RAM-resident blocks by default. CAMELID_RETAIN_Q8_0_BLOCKS also retains Q8_0 source blocks for tensors routed through the generic f32 loader."
     } else {
-        "Lazy Q8_0 linears are disabled; CPU weights may be eagerly materialized within the configured budget."
+        "Dense Q8_0 linears use expanded RAM-resident blocks by default; set CAMELID_LAZY_Q8_0_LINEAR=1 only to force the slower file-backed path."
     };
 
     Q8RuntimeHealth {
@@ -14188,11 +15651,78 @@ fn q8_runtime_health() -> Q8RuntimeHealth {
     }
 }
 
+#[cfg(test)]
 fn estimate_cpu_weight_materialization_bytes(binding: &LlamaTensorBinding) -> crate::Result<u64> {
+    estimate_cpu_weight_materialization_bytes_with_ownership(binding, None, true, true)
+}
+
+fn estimate_cpu_weight_materialization_bytes_with_ownership(
+    binding: &LlamaTensorBinding,
+    layer_range: Option<&std::ops::Range<usize>>,
+    load_embedding: bool,
+    load_output: bool,
+) -> crate::Result<u64> {
+    estimate_cpu_weight_materialization_bytes_with_q8_storage_and_ownership(
+        binding,
+        crate::inference::q8_dense_linear_storage_policy(),
+        layer_range,
+        load_embedding,
+        load_output,
+    )
+}
+
+#[cfg(test)]
+fn estimate_cpu_weight_materialization_bytes_with_q8_storage(
+    binding: &LlamaTensorBinding,
+    dense_q8_storage: crate::inference::Q8DenseLinearStorage,
+) -> crate::Result<u64> {
+    estimate_cpu_weight_materialization_bytes_with_q8_storage_and_ownership(
+        binding,
+        dense_q8_storage,
+        None,
+        true,
+        true,
+    )
+}
+
+fn estimate_cpu_weight_materialization_bytes_with_q8_storage_and_ownership(
+    binding: &LlamaTensorBinding,
+    dense_q8_storage: crate::inference::Q8DenseLinearStorage,
+    layer_range: Option<&std::ops::Range<usize>>,
+    load_embedding: bool,
+    load_output: bool,
+) -> crate::Result<u64> {
+    #[derive(Clone, Copy)]
+    enum TensorLoadKind {
+        GenericF32,
+        DenseLinear,
+        MoeExpertMerged,
+        MoeExpertSplit,
+    }
+
+    fn page_rounded_wire_bytes(
+        desc: &GgufTensorDescriptor,
+        wire_bytes: u64,
+        storage_label: &str,
+    ) -> crate::Result<u64> {
+        let page_bytes = crate::wire_mmap::page_size() as u64;
+        wire_bytes
+            .div_ceil(page_bytes)
+            .checked_mul(page_bytes)
+            .ok_or_else(|| {
+                BackendError::InvalidTensorData(format!(
+                    "tensor {} {storage_label} page-rounded byte estimate overflow",
+                    desc.name
+                ))
+            })
+    }
+
     fn tensor_estimate(
         desc: &GgufTensorDescriptor,
         retain_q8_blocks: bool,
-        lazy_q8_linear: bool,
+        dense_q8_storage: crate::inference::Q8DenseLinearStorage,
+        resident_q8_experts: bool,
+        load_kind: TensorLoadKind,
     ) -> crate::Result<u64> {
         let element_count = desc.dimensions.iter().try_fold(1u64, |acc, dim| {
             acc.checked_mul(*dim).ok_or_else(|| {
@@ -14202,42 +15732,93 @@ fn estimate_cpu_weight_materialization_bytes(binding: &LlamaTensorBinding) -> cr
                 ))
             })
         })?;
-        let file_backed_q8_linear = lazy_q8_linear
-            && desc.tensor_type == GgufTensorType::Q8_0
-            && matches!(desc.dimensions.len(), 2 | 3);
-        // K-quant 2-D/3-D linears (Q4_K/Q5_K/Q6_K/Q2_K/Q3_K) load via the wire path
-        // (`load_kquant_wire_linear`), retaining only the compact super-block wire
-        // bytes â€” they never materialize an f32 copy, so they must not be counted
-        // against the f32 budget (otherwise a 4B Q2_K/Q4_K model's ~16 GB f32 estimate
-        // wrongly trips the safety limit even though the resident GPU path uses wire).
-        let wire_resident_kquant = matches!(
+        let q8_dense_linear = desc.tensor_type == GgufTensorType::Q8_0
+            && desc.dimensions.len() == 2
+            && matches!(load_kind, TensorLoadKind::DenseLinear);
+        let q8_expert_pack = desc.tensor_type == GgufTensorType::Q8_0
+            && matches!(
+                load_kind,
+                TensorLoadKind::MoeExpertMerged | TensorLoadKind::MoeExpertSplit
+            );
+        let q4_expert_pack = matches!(
             desc.tensor_type,
-            GgufTensorType::Q4K
-                | GgufTensorType::Q5K
-                | GgufTensorType::Q6K
-                | GgufTensorType::Q2K
-                | GgufTensorType::Q3K
-        ) && matches!(desc.dimensions.len(), 2 | 3);
+            GgufTensorType::Q4_0 | GgufTensorType::Q4_1
+        );
+        if matches!(load_kind, TensorLoadKind::MoeExpertSplit) && !q8_expert_pack {
+            return Err(BackendError::UnsupportedTensorType(format!(
+                "split MoE expert tensor {} has storage type {:?}; split expert loaders require Q8_0",
+                desc.name, desc.tensor_type
+            )));
+        }
+        if matches!(load_kind, TensorLoadKind::MoeExpertMerged)
+            && resident_q8_experts
+            && !q8_expert_pack
+            && !q4_expert_pack
+        {
+            return Err(BackendError::UnsupportedTensorType(format!(
+                "resident MoE expert tensor {} has storage type {:?}; resident_q8 requires Q8_0 (merged Q4_0/Q4_1 packs remain file-backed)",
+                desc.name, desc.tensor_type
+            )));
+        }
+        // Mirror `LlamaLoadedWeights::load_with_ownership`: dense Q8 linears
+        // retain expanded Q8_0Block storage unless the explicit lazy opt-out is
+        // on; rank-3 expert packs follow the separate MoE storage policy.
+        let file_backed_q8 = (q8_dense_linear
+            && matches!(
+                dense_q8_storage,
+                crate::inference::Q8DenseLinearStorage::FileBacked
+            ))
+            || (q8_expert_pack && !resident_q8_experts);
+        let resident_q8_wire = q8_dense_linear
+            && matches!(
+                dense_q8_storage,
+                crate::inference::Q8DenseLinearStorage::WirePages
+            );
+        let resident_q8_dense_expanded = q8_dense_linear
+            && matches!(
+                dense_q8_storage,
+                crate::inference::Q8DenseLinearStorage::ExpandedBlocks
+            );
+        let resident_q8_expert_expanded = q8_expert_pack && resident_q8_experts;
+        // K-quant rank-2 linears (Q4_K/Q5_K/Q6_K/Q2_K/Q3_K) load via the wire path
+        // (`load_kquant_wire_linear`), retaining only the compact super-block wire
+        // bytes. They never materialize an f32 copy, but the retained compact bytes
+        // still count against the admission/LRU memory budget. Under Metal no-copy,
+        // Q4_K/Q6_K use page-rounded WirePages; the other K-quants keep Arc<Vec<u8>>.
+        let wire_resident_kquant = matches!(load_kind, TensorLoadKind::DenseLinear)
+            && matches!(
+                desc.tensor_type,
+                GgufTensorType::Q4K
+                    | GgufTensorType::Q5K
+                    | GgufTensorType::Q6K
+                    | GgufTensorType::Q2K
+                    | GgufTensorType::Q3K
+            )
+            && desc.dimensions.len() == 2;
         // Prism Q1_0/Q2_0 2-D tensors remain in their native packed wire layout
         // for the Metal resident lane. They carry neither an f32 copy nor the
-        // historical Q1->Q8 expansion, so budget the exact descriptor bytes.
-        let wire_resident_prism = matches!(
-            desc.tensor_type,
-            GgufTensorType::Q1_0
-                | GgufTensorType::Q2_0G64
-                | GgufTensorType::Q2_0G128
-                | GgufTensorType::Pq2_0
-        ) && desc.dimensions.len() == 2;
+        // historical Q1->Q8 expansion. The loader uses WirePages on every platform,
+        // so budget the page-rounded allocation rather than only descriptor bytes.
+        let wire_resident_prism = matches!(load_kind, TensorLoadKind::DenseLinear)
+            && matches!(
+                desc.tensor_type,
+                GgufTensorType::Q1_0
+                    | GgufTensorType::Q2_0G64
+                    | GgufTensorType::Q2_0G128
+                    | GgufTensorType::Pq2_0
+            )
+            && desc.dimensions.len() == 2;
         // Rank-3 Q4_0 MoE expert packs stream file-backed unconditionally
         // (`load_q4_0_file_backed_expert_tensor`): only per-expert slices are
         // ever dequantized, transiently, at matvec time. Counting them at f32
         // bytes would refuse every fine-grained Q4_0 MoE (e.g. ~116 GB for a
         // 30B-A3B pack) that the engine actually runs in a ~2 GB footprint.
-        let file_backed_q4_experts = matches!(
-            desc.tensor_type,
-            GgufTensorType::Q4_0 | GgufTensorType::Q4_1
-        ) && desc.dimensions.len() == 3;
-        let f32_bytes = if file_backed_q8_linear
+        let file_backed_q4_experts =
+            matches!(load_kind, TensorLoadKind::MoeExpertMerged) && q4_expert_pack;
+        let f32_bytes = if file_backed_q8
+            || resident_q8_wire
+            || resident_q8_dense_expanded
+            || resident_q8_expert_expanded
             || wire_resident_kquant
             || wire_resident_prism
             || file_backed_q4_experts
@@ -14252,11 +15833,35 @@ fn estimate_cpu_weight_materialization_bytes(binding: &LlamaTensorBinding) -> cr
             })?
         };
         let retained_source_bytes = if wire_resident_prism {
-            desc.n_bytes
-        } else if retain_q8_blocks
-            && !file_backed_q8_linear
-            && desc.tensor_type == GgufTensorType::Q8_0
-        {
+            page_rounded_wire_bytes(desc, desc.n_bytes, "Prism wire")?
+        } else if wire_resident_kquant {
+            if matches!(desc.tensor_type, GgufTensorType::Q4K | GgufTensorType::Q6K)
+                && matches!(
+                    dense_q8_storage,
+                    crate::inference::Q8DenseLinearStorage::WirePages
+                )
+            {
+                page_rounded_wire_bytes(desc, desc.n_bytes, "K-quant wire")?
+            } else {
+                desc.n_bytes
+            }
+        } else if resident_q8_wire {
+            let q8_block_count = element_count.checked_add(31).ok_or_else(|| {
+                BackendError::InvalidTensorData(format!(
+                    "tensor {} q8 block-count estimate overflow",
+                    desc.name
+                ))
+            })? / 32;
+            let wire_bytes = q8_block_count.checked_mul(34).ok_or_else(|| {
+                BackendError::InvalidTensorData(format!(
+                    "tensor {} q8 wire materialization byte estimate overflow",
+                    desc.name
+                ))
+            })?;
+            page_rounded_wire_bytes(desc, wire_bytes, "q8 wire")?
+        } else if resident_q8_dense_expanded {
+            crate::tensor::q8_0_block_backed_linear_retained_bytes(&desc.name, &desc.dimensions)?
+        } else if resident_q8_expert_expanded {
             let q8_block_count = element_count.checked_add(31).ok_or_else(|| {
                 BackendError::InvalidTensorData(format!(
                     "tensor {} q8 block-count estimate overflow",
@@ -14271,6 +15876,21 @@ fn estimate_cpu_weight_materialization_bytes(binding: &LlamaTensorBinding) -> cr
                         desc.name
                     ))
                 })?
+        } else if f32_bytes > 0
+            && matches!(
+                desc.tensor_type,
+                GgufTensorType::Q2K
+                    | GgufTensorType::Q3K
+                    | GgufTensorType::Q4K
+                    | GgufTensorType::Q6K
+            )
+        {
+            // `load_cpu_f32` preserves these wire bytes beside the decoded f32
+            // tensor for resident/CPU block-dot consumers. Q5_K is deliberately
+            // absent: its generic f32 loader does not retain a wire sidecar.
+            desc.n_bytes
+        } else if retain_q8_blocks && !file_backed_q8 && desc.tensor_type == GgufTensorType::Q8_0 {
+            crate::tensor::q8_0_retained_blocks_with_sidecars_bytes(&desc.name, &desc.dimensions)?
         } else {
             0
         };
@@ -14282,54 +15902,212 @@ fn estimate_cpu_weight_materialization_bytes(binding: &LlamaTensorBinding) -> cr
         })
     }
 
+    fn checked_f32_tensor_bytes(role: &str, dimensions: &[u64]) -> crate::Result<u64> {
+        let elements = dimensions.iter().try_fold(1u64, |count, dim| {
+            count.checked_mul(*dim).ok_or_else(|| {
+                BackendError::InvalidTensorData(format!(
+                    "{role} element count overflow while estimating CPU materialization"
+                ))
+            })
+        })?;
+        elements.checked_mul(4).ok_or_else(|| {
+            BackendError::InvalidTensorData(format!(
+                "{role} f32 materialization byte estimate overflow"
+            ))
+        })
+    }
+
     let retain_q8_blocks = cpu_weight_materialization_retains_q8_blocks();
-    let lazy_q8_linear = lazy_q8_linear_materialization_enabled();
-    let mut total = tensor_estimate(&binding.token_embedding, retain_q8_blocks, lazy_q8_linear)?
-        .checked_add(tensor_estimate(
-            &binding.output_norm,
+    let resident_q8_experts = matches!(
+        crate::runtime_config::moe_expert_storage(),
+        crate::runtime_config::MoeExpertStorage::ResidentQ8
+    );
+    let estimate_tensor = |desc, load_kind| {
+        tensor_estimate(
+            desc,
             retain_q8_blocks,
-            lazy_q8_linear,
-        )?)
-        .ok_or_else(|| {
+            dense_q8_storage,
+            resident_q8_experts,
+            load_kind,
+        )
+    };
+    let estimate_expert_set = |experts: &LlamaMoeExpertTensors| -> crate::Result<u64> {
+        let (descriptors, load_kind) = match experts {
+            LlamaMoeExpertTensors::Merged(desc) => {
+                (std::slice::from_ref(desc), TensorLoadKind::MoeExpertMerged)
+            }
+            LlamaMoeExpertTensors::Split(descs) => {
+                if descs.is_empty() {
+                    return Err(BackendError::InvalidModelMetadata(
+                        "split MoE expert binding has no descriptors (expert_count must be greater than zero)"
+                            .to_string(),
+                    ));
+                }
+                (descs.as_slice(), TensorLoadKind::MoeExpertSplit)
+            }
+        };
+        descriptors.iter().try_fold(0u64, |total, desc| {
+            total
+                .checked_add(tensor_estimate(
+                    desc,
+                    retain_q8_blocks,
+                    dense_q8_storage,
+                    resident_q8_experts,
+                    load_kind,
+                )?)
+                .ok_or_else(|| {
+                    BackendError::InvalidTensorData(
+                        "CPU materialization byte estimate overflow".to_string(),
+                    )
+                })
+        })
+    };
+    let estimate_tied_output_clone = |desc: &GgufTensorDescriptor| -> crate::Result<u64> {
+        let shared_q8_storage = desc.tensor_type == GgufTensorType::Q8_0
+            && desc.dimensions.len() == 2
+            && matches!(
+                dense_q8_storage,
+                crate::inference::Q8DenseLinearStorage::FileBacked
+                    | crate::inference::Q8DenseLinearStorage::WirePages
+            );
+        let shared_wire_storage = desc.dimensions.len() == 2
+            && matches!(
+                desc.tensor_type,
+                GgufTensorType::Q4K
+                    | GgufTensorType::Q5K
+                    | GgufTensorType::Q6K
+                    | GgufTensorType::Q2K
+                    | GgufTensorType::Q3K
+                    | GgufTensorType::Q1_0
+                    | GgufTensorType::Q2_0G64
+                    | GgufTensorType::Q2_0G128
+                    | GgufTensorType::Pq2_0
+            );
+        if shared_q8_storage || shared_wire_storage {
+            Ok(0)
+        } else {
+            tensor_estimate(
+                desc,
+                retain_q8_blocks,
+                dense_q8_storage,
+                resident_q8_experts,
+                TensorLoadKind::DenseLinear,
+            )
+        }
+    };
+    // Empty split sets must fail before admission even when they belong to an
+    // unowned pipeline layer: the loader's name-only placeholder path still
+    // indexes the first descriptor for those layers.
+    for layer in &binding.layers {
+        let expert_sets = match &layer.ffn {
+            LlamaFfnTensors::Dense { .. } => continue,
+            LlamaFfnTensors::MoE {
+                gate_experts,
+                up_experts,
+                down_experts,
+                ..
+            }
+            | LlamaFfnTensors::DeepSeekMoE {
+                gate_experts,
+                up_experts,
+                down_experts,
+                ..
+            } => [gate_experts, up_experts, down_experts],
+        };
+        if expert_sets.iter().any(
+            |experts| matches!(experts, LlamaMoeExpertTensors::Split(descs) if descs.is_empty()),
+        ) {
+            return Err(BackendError::InvalidModelMetadata(
+                "split MoE expert binding has no descriptors (expert_count must be greater than zero)"
+                    .to_string(),
+            ));
+        }
+    }
+
+    let mut total = 0u64;
+    if load_embedding {
+        total = total
+            .checked_add(estimate_tensor(
+                &binding.token_embedding,
+                TensorLoadKind::DenseLinear,
+            )?)
+            .ok_or_else(|| {
+                BackendError::InvalidTensorData(
+                    "CPU materialization byte estimate overflow".to_string(),
+                )
+            })?;
+    }
+    if load_output {
+        total = total
+            .checked_add(estimate_tensor(
+                &binding.output_norm,
+                TensorLoadKind::GenericF32,
+            )?)
+            .ok_or_else(|| {
+                BackendError::InvalidTensorData(
+                    "CPU materialization byte estimate overflow".to_string(),
+                )
+            })?;
+        let output_estimate = if binding.output_is_tied_embedding {
+            if load_embedding {
+                // `CpuTensor::clone` shares file/wire Arc backings, but deep-clones
+                // expanded Q8 blocks and eager f32 data for the tied output alias.
+                estimate_tied_output_clone(&binding.token_embedding)?
+            } else {
+                // A last-only shard loads the tied embedding descriptor afresh as
+                // its output projection because this node does not own embeddings.
+                estimate_tensor(&binding.token_embedding, TensorLoadKind::DenseLinear)?
+            }
+        } else {
+            estimate_tensor(&binding.output, TensorLoadKind::DenseLinear)?
+        };
+        total = total.checked_add(output_estimate).ok_or_else(|| {
             BackendError::InvalidTensorData(
                 "CPU materialization byte estimate overflow".to_string(),
             )
         })?;
-    if !binding.output_is_tied_embedding {
-        total = total
-            .checked_add(tensor_estimate(
-                &binding.output,
-                retain_q8_blocks,
-                lazy_q8_linear,
-            )?)
-            .ok_or_else(|| {
-                BackendError::InvalidTensorData(
-                    "CPU materialization byte estimate overflow".to_string(),
-                )
-            })?;
     }
     if let Some(rope_freqs) = &binding.rope_freqs {
         total = total
-            .checked_add(tensor_estimate(
-                rope_freqs,
-                retain_q8_blocks,
-                lazy_q8_linear,
-            )?)
+            .checked_add(estimate_tensor(rope_freqs, TensorLoadKind::GenericF32)?)
             .ok_or_else(|| {
                 BackendError::InvalidTensorData(
                     "CPU materialization byte estimate overflow".to_string(),
                 )
             })?;
     }
-    for layer in &binding.layers {
-        let mut attention_tensors = vec![&layer.attention_norm, &layer.attention_output];
+    for (layer_idx, layer) in binding.layers.iter().enumerate() {
+        if layer_range.is_some_and(|range| !range.contains(&layer_idx)) {
+            continue;
+        }
+        let mut attention_tensors = vec![(&layer.attention_norm, TensorLoadKind::GenericF32)];
         match &layer.attention {
             LlamaAttentionTensors::Standard {
-                q, k, v, biases, ..
+                q,
+                k,
+                v,
+                q_norm,
+                k_norm,
+                biases,
             } => {
-                attention_tensors.extend([q, k, v]);
+                attention_tensors.extend([
+                    (&layer.attention_output, TensorLoadKind::DenseLinear),
+                    (q, TensorLoadKind::DenseLinear),
+                    (k, TensorLoadKind::DenseLinear),
+                    (v, TensorLoadKind::DenseLinear),
+                ]);
+                if let Some(q_norm) = q_norm {
+                    attention_tensors.push((q_norm, TensorLoadKind::GenericF32));
+                }
+                if let Some(k_norm) = k_norm {
+                    attention_tensors.push((k_norm, TensorLoadKind::GenericF32));
+                }
                 if let Some(biases) = biases {
-                    attention_tensors.extend([&biases.q, &biases.k, &biases.v]);
+                    attention_tensors.extend([
+                        (&biases.q, TensorLoadKind::GenericF32),
+                        (&biases.k, TensorLoadKind::GenericF32),
+                        (&biases.v, TensorLoadKind::GenericF32),
+                    ]);
                 }
             }
             LlamaAttentionTensors::Mla {
@@ -14340,19 +16118,77 @@ fn estimate_cpu_weight_materialization_bytes(binding: &LlamaTensorBinding) -> cr
                 kv_a_layernorm,
                 kv_b_proj,
             } => {
-                attention_tensors.extend([
-                    q_a_proj,
-                    q_a_layernorm,
-                    q_b_proj,
-                    kv_a_proj_with_mqa,
-                    kv_a_layernorm,
-                    kv_b_proj,
-                ]);
+                if let Some(mla) = binding.mla_metadata.as_ref() {
+                    attention_tensors.extend([
+                        (q_a_proj, TensorLoadKind::DenseLinear),
+                        (q_a_layernorm, TensorLoadKind::GenericF32),
+                        (kv_a_proj_with_mqa, TensorLoadKind::DenseLinear),
+                        (kv_a_layernorm, TensorLoadKind::GenericF32),
+                    ]);
+
+                    // The loader initially reads q_b, kv_b, and attention_output,
+                    // then absorbs them and drops all three source tensors. The
+                    // retained weights are two newly allocated f32 matrices whose
+                    // shapes come from the MLA metadata, independent of the source
+                    // quantization and dense-Q8 storage policy.
+                    let num_heads = u64::try_from(binding.attention_head_count).map_err(|_| {
+                        BackendError::InvalidTensorData(
+                            "MLA attention head count does not fit u64".to_string(),
+                        )
+                    })?;
+                    let hidden_size = u64::try_from(binding.hidden_size).map_err(|_| {
+                        BackendError::InvalidTensorData(
+                            "MLA hidden size does not fit u64".to_string(),
+                        )
+                    })?;
+                    let q_lora = u64::from(mla.q_lora_rank);
+                    let kv_lora = u64::from(mla.kv_lora_rank);
+                    let rope_dim = u64::from(mla.rope_head_dim);
+                    let absorbed_q_width = kv_lora.checked_add(rope_dim).ok_or_else(|| {
+                        BackendError::InvalidTensorData(
+                            "MLA absorbed q_b width overflow".to_string(),
+                        )
+                    })?;
+                    let absorbed_q_b = checked_f32_tensor_bytes(
+                        "MLA absorbed q_b",
+                        &[num_heads, absorbed_q_width, q_lora],
+                    )?;
+                    let absorbed_output = checked_f32_tensor_bytes(
+                        "MLA absorbed attention output",
+                        &[hidden_size, num_heads, kv_lora],
+                    )?;
+                    total = total
+                        .checked_add(absorbed_q_b)
+                        .and_then(|value| value.checked_add(absorbed_output))
+                        .ok_or_else(|| {
+                            BackendError::InvalidTensorData(
+                                "CPU materialization byte estimate overflow".to_string(),
+                            )
+                        })?;
+                } else {
+                    // Defensive mirror of the loader's no-metadata branch: no
+                    // absorption occurs, so all original linears remain resident.
+                    attention_tensors.extend([
+                        (&layer.attention_output, TensorLoadKind::DenseLinear),
+                        (q_a_proj, TensorLoadKind::DenseLinear),
+                        (q_a_layernorm, TensorLoadKind::GenericF32),
+                        (q_b_proj, TensorLoadKind::DenseLinear),
+                        (kv_a_proj_with_mqa, TensorLoadKind::DenseLinear),
+                        (kv_a_layernorm, TensorLoadKind::GenericF32),
+                        (kv_b_proj, TensorLoadKind::DenseLinear),
+                    ]);
+                }
             }
         }
-        for desc in attention_tensors {
+        if let Some(post_attention_norm) = &layer.post_attention_norm {
+            attention_tensors.push((post_attention_norm, TensorLoadKind::GenericF32));
+        }
+        if let Some(post_ffw_norm) = &layer.post_ffw_norm {
+            attention_tensors.push((post_ffw_norm, TensorLoadKind::GenericF32));
+        }
+        for (desc, load_kind) in attention_tensors {
             total = total
-                .checked_add(tensor_estimate(desc, retain_q8_blocks, lazy_q8_linear)?)
+                .checked_add(estimate_tensor(desc, load_kind)?)
                 .ok_or_else(|| {
                     BackendError::InvalidTensorData(
                         "CPU materialization byte estimate overflow".to_string(),
@@ -14360,10 +16196,9 @@ fn estimate_cpu_weight_materialization_bytes(binding: &LlamaTensorBinding) -> cr
                 })?;
         }
         total = total
-            .checked_add(tensor_estimate(
+            .checked_add(estimate_tensor(
                 &layer.ffn_norm,
-                retain_q8_blocks,
-                lazy_q8_linear,
+                TensorLoadKind::GenericF32,
             )?)
             .ok_or_else(|| {
                 BackendError::InvalidTensorData(
@@ -14374,7 +16209,7 @@ fn estimate_cpu_weight_materialization_bytes(binding: &LlamaTensorBinding) -> cr
             LlamaFfnTensors::Dense { gate, up, down } => {
                 for desc in [gate, up, down] {
                     total = total
-                        .checked_add(tensor_estimate(desc, retain_q8_blocks, lazy_q8_linear)?)
+                        .checked_add(estimate_tensor(desc, TensorLoadKind::DenseLinear)?)
                         .ok_or_else(|| {
                             BackendError::InvalidTensorData(
                                 "CPU materialization byte estimate overflow".to_string(),
@@ -14388,13 +16223,16 @@ fn estimate_cpu_weight_materialization_bytes(binding: &LlamaTensorBinding) -> cr
                 up_experts,
                 down_experts,
             } => {
-                for desc in std::iter::once(router)
-                    .chain(gate_experts.descriptors())
-                    .chain(up_experts.descriptors())
-                    .chain(down_experts.descriptors())
-                {
+                total = total
+                    .checked_add(estimate_tensor(router, TensorLoadKind::GenericF32)?)
+                    .ok_or_else(|| {
+                        BackendError::InvalidTensorData(
+                            "CPU materialization byte estimate overflow".to_string(),
+                        )
+                    })?;
+                for experts in [gate_experts, up_experts, down_experts] {
                     total = total
-                        .checked_add(tensor_estimate(desc, retain_q8_blocks, lazy_q8_linear)?)
+                        .checked_add(estimate_expert_set(experts)?)
                         .ok_or_else(|| {
                             BackendError::InvalidTensorData(
                                 "CPU materialization byte estimate overflow".to_string(),
@@ -14411,14 +16249,25 @@ fn estimate_cpu_weight_materialization_bytes(binding: &LlamaTensorBinding) -> cr
                 up_experts,
                 down_experts,
             } => {
-                for desc in [shared_gate, shared_up, shared_down, router]
-                    .into_iter()
-                    .chain(gate_experts.descriptors())
-                    .chain(up_experts.descriptors())
-                    .chain(down_experts.descriptors())
-                {
+                for desc in [shared_gate, shared_up, shared_down] {
                     total = total
-                        .checked_add(tensor_estimate(desc, retain_q8_blocks, lazy_q8_linear)?)
+                        .checked_add(estimate_tensor(desc, TensorLoadKind::DenseLinear)?)
+                        .ok_or_else(|| {
+                            BackendError::InvalidTensorData(
+                                "CPU materialization byte estimate overflow".to_string(),
+                            )
+                        })?;
+                }
+                total = total
+                    .checked_add(estimate_tensor(router, TensorLoadKind::GenericF32)?)
+                    .ok_or_else(|| {
+                        BackendError::InvalidTensorData(
+                            "CPU materialization byte estimate overflow".to_string(),
+                        )
+                    })?;
+                for experts in [gate_experts, up_experts, down_experts] {
+                    total = total
+                        .checked_add(estimate_expert_set(experts)?)
                         .ok_or_else(|| {
                             BackendError::InvalidTensorData(
                                 "CPU materialization byte estimate overflow".to_string(),
@@ -14435,7 +16284,8 @@ fn estimate_cpu_weight_materialization_bytes(binding: &LlamaTensorBinding) -> cr
 /// Q6_K) in a dense (non-MoE) layout. Such a model is loaded WIRE-ONLY: K-quant 2-D
 /// linears keep only their packed super-block wire bytes (see `load_kquant_wire_linear`
 /// in `LlamaLoadedWeights::load_with_ownership`) and Q8_0 linears keep their 36-byte
-/// blocks/pages â€” neither materializes the f32 the CPU-budget guard estimates. The CUDA
+/// blocks/pages â€” neither materializes an f32 copy. The memory guard still counts the
+/// retained compact/page-backed representation. The CUDA
 /// resident decode engine reads those packed bytes in place (q8_gemv / q4k_gemv /
 /// q6k_gemv), so the f32 quantity the guard sizes is never produced for this model.
 ///
@@ -14443,12 +16293,17 @@ fn estimate_cpu_weight_materialization_bytes(binding: &LlamaTensorBinding) -> cr
 /// (which needs a built session); it intentionally checks only what the guard needs â€”
 /// the per-tensor quant types and the dense layout. Anything else (an f16/f32 linear, a
 /// MoE router/expert stack) keeps the eager-f32 CPU path and stays under the guard.
+#[cfg(test)]
 fn binding_all_resident_quant_linears(binding: &LlamaTensorBinding) -> bool {
     let is_resident_quant = |desc: &GgufTensorDescriptor| {
-        matches!(
-            desc.tensor_type,
-            GgufTensorType::Q8_0 | GgufTensorType::Q4K | GgufTensorType::Q5K | GgufTensorType::Q6K
-        )
+        desc.dimensions.len() == 2
+            && matches!(
+                desc.tensor_type,
+                GgufTensorType::Q8_0
+                    | GgufTensorType::Q4K
+                    | GgufTensorType::Q5K
+                    | GgufTensorType::Q6K
+            )
     };
     if !is_resident_quant(&binding.token_embedding) {
         return false;
@@ -14480,17 +16335,9 @@ fn binding_all_resident_quant_linears(binding: &LlamaTensorBinding) -> bool {
     })
 }
 
-/// Whether the GPU-resident decode engine will run this model â€” and therefore the
-/// CPU f32 weight materialization the budget guard estimates is never produced. True
-/// only when CUDA resident decode is active for this process AND every linear is a
-/// resident-eligible quant (`binding_all_resident_quant_linears`). On non-CUDA builds
-/// `resident_decode_cuda_active()` is `false`, so the guard always applies there.
-fn binding_runs_on_resident_gpu(binding: &LlamaTensorBinding) -> bool {
-    crate::inference::resident_decode_cuda_active() && binding_all_resident_quant_linears(binding)
-}
-
 /// Whether the CPU decode path consumes every linear WIRE-ONLY â€” and so, like the
-/// resident-GPU case, never materializes the f32 weights the budget guard sizes. True
+/// resident-GPU case, never materializes f32 weights. The compact wire backing remains
+/// part of the memory estimate. True
 /// when the K-quant CPU block-dot is enabled (Q4_K/Q6_K linears stream their wire bytes
 /// via `q4_k`/`q6_k_block_dot`, Q8_0 linears stream their packed blocks) AND every linear
 /// is a resident-eligible quant. Without this, serve CPU mode FALSE-POSITIVES the guard
@@ -14498,8 +16345,24 @@ fn binding_runs_on_resident_gpu(binding: &LlamaTensorBinding) -> bool {
 /// because `binding_runs_on_resident_gpu` is false on CPU. K-quant super-blocks are
 /// 256-wide so the block-dot always engages (the 7130 dispatch requires that), matching
 /// the wire-only invariant documented on `binding_all_resident_quant_linears`.
+#[cfg(test)]
 fn binding_runs_on_cpu_wire_only(binding: &LlamaTensorBinding) -> bool {
     crate::inference::q4_k_cpu_block_dot_enabled() && binding_all_resident_quant_linears(binding)
+}
+
+/// Exact tensor ownership used by the API-side weight loader. The distributed
+/// coordinator owns its configured prefix layers plus both model ends; a normal
+/// single-node server owns the complete binding. This immutable process context
+/// is shared by readiness, admission, LRU accounting, and execution.
+fn api_weight_load_ownership() -> (Option<std::ops::Range<usize>>, bool, bool) {
+    match crate::distributed::DISTRIBUTED_RANGE.get() {
+        Some(&(layer_start, layer_end)) => {
+            let (load_embedding, load_output) =
+                crate::distributed::PipelineRole::Coordinator.tensor_ownership();
+            (Some(layer_start..layer_end), load_embedding, load_output)
+        }
+        None => (None, true, true),
+    }
 }
 
 fn enforce_context_budget(
@@ -14524,25 +16387,30 @@ pub(super) fn model_resident_cache_key(model_id: &str) -> u64 {
     hasher.finish()
 }
 
+#[cfg(test)]
 fn guard_cpu_weight_materialization_budget(binding: &LlamaTensorBinding) -> crate::Result<u64> {
-    // Resident-GPU models load wire-only (packed Q8_0/Q4_K/Q6_K bytes the CUDA engine
-    // reads in place) and never materialize the f32 weights this guard sizes. Bypass the
-    // CPU budget for them â€” but ONLY them; genuinely CPU-bound large models (or any
-    // build/host without the resident GPU path) still hit the guard below.
-    if binding_runs_on_resident_gpu(binding) {
-        return Ok(0);
-    }
-    // CPU K-quant block-dot decode is also wire-only (no f32 materialization), so the
-    // same bypass applies on the CPU lane â€” otherwise a K-quant model that runs fine via
-    // the block-dot is wrongly rejected here. (K-quant conductor Phase 2 follow-up.)
-    if binding_runs_on_cpu_wire_only(binding) {
-        return Ok(0);
-    }
-    let estimated_bytes = estimate_cpu_weight_materialization_bytes(binding)?;
+    guard_cpu_weight_materialization_budget_with_ownership(binding, None, true, true)
+}
+
+fn guard_cpu_weight_materialization_budget_with_ownership(
+    binding: &LlamaTensorBinding,
+    layer_range: Option<&std::ops::Range<usize>>,
+    load_embedding: bool,
+    load_output: bool,
+) -> crate::Result<u64> {
+    // Always run the ownership-aware estimator so eager norms, biases, rope
+    // tensors, retained wire storage, malformed-rank fallbacks, and MLA
+    // absorption cannot be hidden by an all-quant shortcut.
+    let estimated_bytes = estimate_cpu_weight_materialization_bytes_with_ownership(
+        binding,
+        layer_range,
+        load_embedding,
+        load_output,
+    )?;
     let limit_bytes = cpu_weight_materialization_limit_bytes()?;
     if estimated_bytes > limit_bytes {
         return Err(BackendError::UnsupportedTensorType(format!(
-            "estimated CPU f32 weight materialization is {estimated_bytes} bytes, above safety limit {limit_bytes} bytes; current CPU path eagerly decodes dense weights and may trigger host memory pressure. Lower model size/quant target, add lazy/mmap weight materialization, or raise {CPU_WEIGHT_MATERIALIZATION_LIMIT_ENV} deliberately for a controlled run"
+            "estimated CPU weight materialization/retention is {estimated_bytes} bytes, above safety limit {limit_bytes} bytes; dense Q8_0 linears retain expanded in-memory blocks by default and other CPU tensors may decode eagerly. Lower model size/quant target, set {LAZY_Q8_LINEAR_ENV}=1 only if deliberately accepting the slower file-backed Q8 path, or raise {CPU_WEIGHT_MATERIALIZATION_LIMIT_ENV} deliberately for a controlled run"
         )));
     }
     Ok(estimated_bytes)
@@ -14745,6 +16613,33 @@ async fn prepare_generation(
             token_ids
         }
         PromptInput::Chat(messages) => {
+            let smollm3_rendered_prompt = render_smollm3_production_chat_prompt(
+                model.gguf.architecture().unwrap_or_default(),
+                &tokenizer,
+                &model.id,
+                &messages,
+                req.camelid_enable_thinking,
+                request_tools.as_deref(),
+            )
+            .transpose()?;
+            if let Some(rejection) = reject_qwen3_moe_chat_until_template_qualified(
+                model.gguf.architecture().unwrap_or_default(),
+                &tokenizer,
+                &model.id,
+                request_tools.as_deref(),
+            ) {
+                return Err(rejection);
+            }
+            // Gemma 2 is normally bridge-only, but keep the dense chokepoint
+            // fail-closed too: tests, future routing changes, or a partially
+            // constructed model must not revive the old Gemma 3 fallback.
+            if model.gguf.architecture() == Some("gemma2") {
+                if let Some(rejection) =
+                    reject_gemma2_with_unrecognized_template(&tokenizer, &model.id)
+                {
+                    return Err(rejection);
+                }
+            }
             // Phase 3c triage: the dense-lane gemma3 renderer is keyed on
             // TEMPLATE SHAPE (`is_gemma3_chat_template`) while routing admits
             // by ARCH. A gemma3 GGUF whose embedded template does not carry
@@ -14761,28 +16656,22 @@ async fn prepare_generation(
             ) {
                 return Err(rejection);
             }
-            let rendered_prompt = match request_tools.as_deref() {
-                Some(tools) if !tools.is_empty() => {
-                    render_chat_prompt_for_tokenization_with_tools(&messages, &tokenizer, tools)
-                }
-                _ => render_chat_prompt_for_tokenization_for_model_result(
-                    &messages,
-                    &tokenizer,
-                    Some(&model.id),
-                    req.camelid_enable_thinking.unwrap_or(false),
-                ),
-            }
-            .map_err(|err| {
-                api_error(
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    "unsupported_chat_template",
-                    format!(
-                        "chat template rendering failed for loaded model {:?}: {err}",
-                        model.id
+            let rendered_prompt = if let Some(rendered_prompt) = smollm3_rendered_prompt {
+                rendered_prompt
+            } else {
+                match request_tools.as_deref() {
+                    Some(tools) if !tools.is_empty() => {
+                        render_chat_prompt_for_tokenization_with_tools(&messages, &tokenizer, tools)
+                    }
+                    _ => render_chat_prompt_for_tokenization_for_model_result(
+                        &messages,
+                        &tokenizer,
+                        Some(&model.id),
+                        req.camelid_enable_thinking.unwrap_or(false),
                     ),
-                    Some("messages"),
-                )
-            })?;
+                }
+                .map_err(|err| unsupported_chat_template_response(&model.id, &err))?
+            };
             let mut token_ids = tokenizer
                 .encode(
                     &rendered_prompt.text,
@@ -18705,6 +20594,302 @@ struct RenderedPrompt {
     parse_special: bool,
 }
 
+const SMOLLM3_EXACT_CHAT_TEMPLATE_UTF8_BYTES: usize = 5_493;
+const SMOLLM3_EXACT_CHAT_TEMPLATE_SHA256: &str =
+    "b9b66f04c64fbb8695cf5b35c37780efd0b8e0829fbfe3e30fafb9f469b7d30e";
+const SMOLLM3_DEFAULT_THINKING_INSTRUCTION: &str = "You are a helpful AI assistant named SmolLM, trained by Hugging Face. Your role as an assistant involves thoroughly exploring questions through a systematic thinking process before providing the final precise and accurate solutions. This requires engaging in a comprehensive cycle of analysis, summarizing, exploration, reassessment, reflection, backtracking, and iteration to develop well-considered thinking process. Please structure your response into two main sections: Thought and Solution using the specified format: <think> Thought section </think> Solution section. In the Thought section, detail your reasoning process in steps. Each step should include detailed considerations such as analysing questions, summarizing relevant findings, brainstorming new ideas, verifying the accuracy of the current steps, refining any errors, and revisiting previous steps. In the Solution section, based on various attempts, explorations, and reflections from the Thought section, systematically present the final solution that you deem correct. The Solution section should be logical, accurate, and concise and detail necessary steps needed to reach the conclusion.";
+
+/// Typed boundary for the fixture-locked SmolLM3 production envelope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SmolLm3TemplatePreparationError {
+    TemplateIdentityMismatch,
+    EmptyMessages,
+    EmptyContent,
+    ExplicitFalseThinkingUnsupported,
+    AddGenerationPromptRequired,
+    InvalidInjectedDate,
+    SystemRoleUnsupported,
+    SystemOverrideUnsupported,
+    ToolRoleUnsupported,
+    UnsupportedRole,
+    NonAlternatingHistory,
+    HistoryMustEndWithUser,
+    MultimodalUnsupported,
+    StructuredContentUnsupported,
+}
+
+impl SmolLm3TemplatePreparationError {
+    fn code(self) -> &'static str {
+        match self {
+            Self::TemplateIdentityMismatch => "smollm3_template_identity_mismatch",
+            Self::EmptyMessages => "smollm3_template_empty_messages",
+            Self::EmptyContent => "smollm3_template_empty_content",
+            Self::ExplicitFalseThinkingUnsupported => "smollm3_template_false_thinking_unsupported",
+            Self::AddGenerationPromptRequired => "smollm3_template_add_generation_prompt_required",
+            Self::InvalidInjectedDate => "smollm3_template_injected_date_invalid",
+            Self::SystemRoleUnsupported => "smollm3_template_system_role_unsupported",
+            Self::SystemOverrideUnsupported => "smollm3_template_system_override_unsupported",
+            Self::ToolRoleUnsupported => "smollm3_template_tool_role_unsupported",
+            Self::UnsupportedRole => "smollm3_template_role_unsupported",
+            Self::NonAlternatingHistory => "smollm3_template_history_non_alternating",
+            Self::HistoryMustEndWithUser => "smollm3_template_history_must_end_with_user",
+            Self::MultimodalUnsupported => "smollm3_template_multimodal_unsupported",
+            Self::StructuredContentUnsupported => "smollm3_template_structured_content_unsupported",
+        }
+    }
+}
+
+fn valid_smollm3_injected_date(value: &str) -> bool {
+    let mut parts = value.split(' ');
+    let (Some(day), Some(month), Some(year), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    if day.len() != 2
+        || !day.bytes().all(|byte| byte.is_ascii_digit())
+        || year.len() != 4
+        || !year.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return false;
+    }
+    let Ok(day) = day.parse::<u8>() else {
+        return false;
+    };
+    let Ok(year) = year.parse::<u16>() else {
+        return false;
+    };
+    let max_day = match month {
+        "January" | "March" | "May" | "July" | "August" | "October" | "December" => 31,
+        "April" | "June" | "September" | "November" => 30,
+        "February" if year % 400 == 0 || (year % 4 == 0 && year % 100 != 0) => 29,
+        "February" => 28,
+        _ => return false,
+    };
+    year > 0 && (1..=max_day).contains(&day)
+}
+
+fn format_smollm3_local_date(day: u16, month: u16, year: u16) -> Option<String> {
+    let month = [
+        "January",
+        "February",
+        "March",
+        "April",
+        "May",
+        "June",
+        "July",
+        "August",
+        "September",
+        "October",
+        "November",
+        "December",
+    ]
+    .get(usize::from(month.checked_sub(1)?))?;
+    let rendered = format!("{day:02} {month} {year:04}");
+    valid_smollm3_injected_date(&rendered).then_some(rendered)
+}
+
+/// Match the pinned llama.cpp b9632 `strftime_now` clock contract: one system-
+/// local calendar reading per render. Month names are fixed to English because
+/// that is the exact prompt grammar captured by the Windows oracle pack; they
+/// must not drift with the process locale.
+#[cfg(windows)]
+fn current_smollm3_local_date() -> Option<String> {
+    use windows_sys::Win32::{Foundation::SYSTEMTIME, System::SystemInformation::GetLocalTime};
+
+    let mut local: SYSTEMTIME = unsafe { std::mem::zeroed() };
+    unsafe { GetLocalTime(&mut local) };
+    format_smollm3_local_date(local.wDay, local.wMonth, local.wYear)
+}
+
+#[cfg(unix)]
+fn current_smollm3_local_date() -> Option<String> {
+    let mut timestamp: libc::time_t = 0;
+    if unsafe { libc::time(&mut timestamp) } == -1 {
+        return None;
+    }
+    let mut local: libc::tm = unsafe { std::mem::zeroed() };
+    if unsafe { libc::localtime_r(&timestamp, &mut local) }.is_null() {
+        return None;
+    }
+    let day = u16::try_from(local.tm_mday).ok()?;
+    let month = u16::try_from(local.tm_mon.checked_add(1)?).ok()?;
+    let year = u16::try_from(local.tm_year.checked_add(1900)?).ok()?;
+    format_smollm3_local_date(day, month, year)
+}
+
+#[cfg(not(any(windows, unix)))]
+fn current_smollm3_local_date() -> Option<String> {
+    None
+}
+
+fn is_exact_smollm3_chat_template(template: &str) -> bool {
+    template.len() == SMOLLM3_EXACT_CHAT_TEMPLATE_UTF8_BYTES
+        && format!("{:x}", Sha256::digest(template.as_bytes()))
+            == SMOLLM3_EXACT_CHAT_TEMPLATE_SHA256
+}
+
+/// Render the deliberately narrow, fixture-locked subset of the pinned
+/// SmolLM3 template from Camelid's post-canonicalization [`ChatMessage`] shape.
+/// A text-only content-parts array is already the same string as plain text at
+/// this boundary; images and every remaining structured shape fail closed.
+fn render_smollm3_exact_chat_prompt(
+    messages: &[ChatMessage],
+    source_template: &str,
+    enable_thinking: Option<bool>,
+    add_generation_prompt: bool,
+    injected_today: &str,
+) -> std::result::Result<RenderedPrompt, SmolLm3TemplatePreparationError> {
+    if !is_exact_smollm3_chat_template(source_template) {
+        return Err(SmolLm3TemplatePreparationError::TemplateIdentityMismatch);
+    }
+    if matches!(enable_thinking, Some(false)) {
+        return Err(SmolLm3TemplatePreparationError::ExplicitFalseThinkingUnsupported);
+    }
+    if !add_generation_prompt {
+        return Err(SmolLm3TemplatePreparationError::AddGenerationPromptRequired);
+    }
+    if !valid_smollm3_injected_date(injected_today) {
+        return Err(SmolLm3TemplatePreparationError::InvalidInjectedDate);
+    }
+    if messages.is_empty() {
+        return Err(SmolLm3TemplatePreparationError::EmptyMessages);
+    }
+
+    for (index, message) in messages.iter().enumerate() {
+        let role = message.role.as_str();
+        if message.content.is_empty() {
+            return Err(SmolLm3TemplatePreparationError::EmptyContent);
+        }
+        if !message.image_urls.is_empty() {
+            return Err(SmolLm3TemplatePreparationError::MultimodalUnsupported);
+        }
+        if !message.unsupported_content_parts.is_empty() {
+            return Err(SmolLm3TemplatePreparationError::StructuredContentUnsupported);
+        }
+        match role {
+            "system" if message.content.contains("/system_override") => {
+                return Err(SmolLm3TemplatePreparationError::SystemOverrideUnsupported)
+            }
+            "system" => return Err(SmolLm3TemplatePreparationError::SystemRoleUnsupported),
+            "tool" => return Err(SmolLm3TemplatePreparationError::ToolRoleUnsupported),
+            "user" if index % 2 == 0 => {}
+            "assistant" if index % 2 == 1 => {}
+            "user" | "assistant" => {
+                return Err(SmolLm3TemplatePreparationError::NonAlternatingHistory)
+            }
+            _ => return Err(SmolLm3TemplatePreparationError::UnsupportedRole),
+        }
+    }
+    if messages.last().map(|message| message.role.as_str()) != Some("user") {
+        return Err(SmolLm3TemplatePreparationError::HistoryMustEndWithUser);
+    }
+
+    let mut text = format!(
+        "<|im_start|>system\n## Metadata\n\nKnowledge Cutoff Date: June 2025\nToday Date: \
+         {injected_today}\nReasoning Mode: /think\n\n## Custom Instructions\n\n\
+         {SMOLLM3_DEFAULT_THINKING_INSTRUCTION}\n\n"
+    );
+    // Exact source behavior: the ordinary no-tools synthetic system branch
+    // has no `<|im_end|>` before the first user turn.
+    for message in messages {
+        match message.role.as_str() {
+            "user" => text.push_str(&format!(
+                "<|im_start|>user\n{}<|im_end|>\n",
+                message.content
+            )),
+            "assistant" => text.push_str(&format!(
+                "<|im_start|>assistant\n{}<|im_end|>\n",
+                message.content.trim_start_matches('\n')
+            )),
+            _ => unreachable!("roles were validated above"),
+        }
+    }
+    text.push_str("<|im_start|>assistant\n");
+    Ok(RenderedPrompt {
+        text,
+        add_special: false,
+        parse_special: true,
+    })
+}
+
+fn smollm3_template_error_response(
+    model_id: &str,
+    error: SmolLm3TemplatePreparationError,
+) -> Response {
+    match error {
+        SmolLm3TemplatePreparationError::ExplicitFalseThinkingUnsupported => api_error(
+            StatusCode::BAD_REQUEST,
+            "unsupported_parameter",
+            format!(
+                "model '{model_id}' uses the exact SmolLM3 template, whose thinking-disabled \
+                 branch is not oracle-qualified; omit camelid_enable_thinking or set it to true"
+            ),
+            Some("camelid_enable_thinking"),
+        ),
+        _ => api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "unsupported_chat_template",
+            format!(
+                "SmolLM3 chat template rendering failed for model '{model_id}': {}",
+                error.code()
+            ),
+            Some("messages"),
+        ),
+    }
+}
+
+/// Architecture-scoped production entry for the exact SmolLM3 template.
+///
+/// Only the oracle-locked default-thinking text envelope is open. In
+/// particular, OpenAI `tools` must not be reinterpreted as the source
+/// template's unrelated `xml_tools` or `python_tools` variables.
+fn render_smollm3_production_chat_prompt(
+    architecture: &str,
+    tokenizer: &Tokenizer,
+    model_id: &str,
+    messages: &[ChatMessage],
+    enable_thinking: Option<bool>,
+    tools: Option<&[serde_json::Value]>,
+) -> Option<std::result::Result<RenderedPrompt, Response>> {
+    if architecture != "smollm3" {
+        return None;
+    }
+    if tools.is_some_and(|tools| !tools.is_empty()) {
+        return Some(Err(api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "unsupported_tools",
+            format!(
+                "model '{model_id}' declares architecture 'smollm3'; SmolLM3's xml_tools, \
+                 python_tools, and tool-result-history semantics are not oracle-qualified, so \
+                 OpenAI tools fail closed regardless of embedded-template identity instead of \
+                 being dropped or translated"
+            ),
+            Some("tools"),
+        )));
+    }
+
+    let template = tokenizer.chat_template.as_deref().unwrap_or_default();
+    if !is_exact_smollm3_chat_template(template) {
+        return Some(Err(smollm3_template_error_response(
+            model_id,
+            SmolLm3TemplatePreparationError::TemplateIdentityMismatch,
+        )));
+    }
+    let Some(today) = current_smollm3_local_date() else {
+        return Some(Err(api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "template_clock_unavailable",
+            format!("could not read the system-local calendar date required by model '{model_id}'"),
+            None,
+        )));
+    };
+    Some(
+        render_smollm3_exact_chat_prompt(messages, template, enable_thinking, true, &today)
+            .map_err(|error| smollm3_template_error_response(model_id, error)),
+    )
+}
+
 #[derive(Debug, Serialize)]
 struct ChatTemplateMessage<'a> {
     role: &'a str,
@@ -18744,6 +20929,15 @@ fn render_chat_prompt_for_tokenization(
     render_chat_prompt_for_tokenization_for_model(messages, tokenizer, None)
 }
 
+fn unsupported_chat_template_response(model_id: &str, err: &MiniJinjaError) -> Response {
+    api_error(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "unsupported_chat_template",
+        format!("chat template rendering failed for loaded model {model_id:?}: {err}"),
+        Some("messages"),
+    )
+}
+
 fn render_chat_prompt_for_tokenization_for_model_result(
     messages: &[ChatMessage],
     tokenizer: &Tokenizer,
@@ -18753,6 +20947,17 @@ fn render_chat_prompt_for_tokenization_for_model_result(
     let exact_llama32_metadata_jinja_row =
         model_id.and_then(llama32_metadata_jinja_exact_row_label);
     if let Some(template) = tokenizer.chat_template.as_deref() {
+        // DeepSeek-R1-0528-Qwen3 declares qwen3 tensors but embeds its own
+        // full-width marker grammar. Refuse before metadata Jinja, ChatML, or
+        // the generic fallback can silently present a foreign prompt.
+        if is_deepseek_r1_native_chat_template(template) {
+            return Err(MiniJinjaError::new(
+                MiniJinjaErrorKind::InvalidOperation,
+                "the loaded model uses the native DeepSeek R1 marker template; its no-tools \
+                 renderer is not implemented or fixture-locked, so chat fails closed instead \
+                 of borrowing Qwen3 ChatML or the generic role-colon renderer",
+            ));
+        }
         if metadata_chat_template_enabled() {
             return render_metadata_jinja_chat_template_prompt(messages, tokenizer, template, None);
         }
@@ -18767,6 +20972,22 @@ fn render_chat_prompt_for_tokenization_for_model_result(
                     "{row_label} requires a recognized Llama 3 metadata chat_template containing <|start_header_id|>, <|end_header_id|>, and <|eot_id|>"
                 ),
             ));
+        }
+        if is_smollm3_dynamic_chat_template(template) {
+            return Err(MiniJinjaError::new(
+                MiniJinjaErrorKind::InvalidOperation,
+                "SmolLM3 dynamic ChatML must pass through its architecture-scoped exact-template renderer; this generic entry cannot establish the template identity, system-local date, or qualified reasoning shape and must not borrow Camelid's Qwen3 renderer",
+            ));
+        }
+        if is_gemma2_it_chat_template(template) {
+            let text = render_gemma2_it_prompt(messages).map_err(|reason| {
+                MiniJinjaError::new(MiniJinjaErrorKind::InvalidOperation, reason)
+            })?;
+            return Ok(RenderedPrompt {
+                text,
+                add_special: true,
+                parse_special: true,
+            });
         }
     } else if let Some(row_label) = exact_llama32_metadata_jinja_row {
         return Err(exact_llama32_metadata_jinja_chat_template_error(&format!(
@@ -18805,6 +21026,25 @@ fn render_chat_prompt_for_tokenization_with_tools(
         })
         .collect();
     if let Some(template) = tokenizer.chat_template.as_deref() {
+        if is_deepseek_r1_native_chat_template(template) {
+            return Err(MiniJinjaError::new(
+                MiniJinjaErrorKind::InvalidOperation,
+                "the native DeepSeek R1 tool envelope is not implemented or certified; tool \
+                 requests fail closed",
+            ));
+        }
+        if is_smollm3_dynamic_chat_template(template) {
+            return Err(MiniJinjaError::new(
+                MiniJinjaErrorKind::InvalidOperation,
+                "SmolLM3 xml_tools/python_tools and tool-result history are not oracle-qualified; OpenAI tools fail closed at the architecture-scoped entry",
+            ));
+        }
+        if is_gemma2_it_chat_template(template) {
+            return Err(MiniJinjaError::new(
+                MiniJinjaErrorKind::InvalidOperation,
+                "the pinned Gemma 2 IT chat template has no tools branch; tool requests fail closed",
+            ));
+        }
         // gemma3: the template has no tools branch and no tool-call grammar is
         // certified for this row, so tool requests fail closed on the dense
         // lane with the SAME contract the runnable bridge enforces (its typed
@@ -19227,6 +21467,176 @@ fn gemma_runnable_lane_tools_rejection() -> Response {
     )
 }
 
+/// Build the only Gemma 2 chat prompt this bridge is allowed to serve.
+///
+/// Architecture admission alone is insufficient: a community requant can
+/// carry a substituted or missing template, and Gemma 2's markers overlap
+/// Gemma 3's despite incompatible system-message rules. Both streaming and
+/// non-streaming runnable routes call this one gate so neither can fall back
+/// to the Gemma 3 renderer.
+fn prepare_gemma2_runnable_chat_prompt(
+    runtime: &RunnableServeRuntime,
+    model_id: &str,
+    messages: &[ChatMessage],
+) -> std::result::Result<String, Box<Response>> {
+    if let Some(rejection) = reject_gemma2_with_unrecognized_template(&runtime.tokenizer, model_id)
+    {
+        return Err(Box::new(rejection));
+    }
+
+    render_gemma2_it_prompt(messages).map_err(|reason| {
+        Box::new(api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "unsupported_chat_template_shape",
+            format!(
+                "messages cannot be rendered by the pinned Gemma 2 IT template for \
+                 model '{model_id}': {reason}"
+            ),
+            Some("messages"),
+        ))
+    })
+}
+
+fn reject_gemma2_with_unrecognized_template(
+    tokenizer: &Tokenizer,
+    model_id: &str,
+) -> Option<Response> {
+    if tokenizer
+        .chat_template
+        .as_deref()
+        .is_some_and(is_gemma2_it_chat_template)
+    {
+        return None;
+    }
+    Some(api_error(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "unsupported_chat_template",
+        format!(
+            "model '{model_id}' declares architecture 'gemma2', but its embedded \
+             tokenizer.chat_template is not the exact pinned Gemma 2 IT template. \
+             Gemma 2 and Gemma 3 share turn markers but disagree on system-message \
+             handling, so substituting the Gemma 3 renderer is unsafe and chat fails \
+             closed. Re-convert the GGUF with the model's own template."
+        ),
+        Some("messages"),
+    ))
+}
+
+const QWEN3_MOE_EXACT_CHAT_TEMPLATE_UTF8_BYTES: usize = 4_100;
+const QWEN3_MOE_EXACT_CHAT_TEMPLATE_SHA256: &str =
+    "57f1fd00f0013a2be96aa79b857391f27e23df5b5f847072b524c897e24d0361";
+
+/// Exact identity of the embedded template in the pinned
+/// Qwen3-30B-A3B-Q8_0 artifact. This template is also used by dense Qwen3
+/// rows, so it is evidence about the selected artifact, never an architecture
+/// classifier. The production HOLD below is keyed on `qwen3moe` metadata.
+fn is_exact_qwen3_moe_chat_template(template: &str) -> bool {
+    template.len() == QWEN3_MOE_EXACT_CHAT_TEMPLATE_UTF8_BYTES
+        && format!("{:x}", Sha256::digest(template.as_bytes()))
+            == QWEN3_MOE_EXACT_CHAT_TEMPLATE_SHA256
+}
+
+/// Executable HOLD for Qwen3-MoE chat and `/apply-template`.
+///
+/// Header/tokenizer qualification may proceed from a bounded prefix, but the
+/// exact 4,100-byte template has reasoning-content, tool-call, and grouped
+/// tool-response branches that Camelid's generic Qwen3 renderer does not
+/// implement. Keep every qwen3moe chat shape closed until a pinned shape pack
+/// proves a deliberately narrow envelope. Raw completion remains a separate
+/// qualification lane.
+fn reject_qwen3_moe_chat_until_template_qualified(
+    architecture: &str,
+    tokenizer: &Tokenizer,
+    model_id: &str,
+    tools: Option<&[serde_json::Value]>,
+) -> Option<Response> {
+    if architecture != "qwen3moe" {
+        return None;
+    }
+    if tools.is_some_and(|tools| !tools.is_empty()) {
+        return Some(api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "unsupported_tools",
+            format!(
+                "model '{model_id}' declares architecture 'qwen3moe'; Qwen3-MoE tool-definition, tool-call-history, and grouped tool-response semantics are not shape-pack qualified, so tools fail closed instead of borrowing Camelid's generic Qwen3 tool renderer"
+            ),
+            Some("tools"),
+        ));
+    }
+
+    let template_state = match tokenizer.chat_template.as_deref() {
+        Some(template) if is_exact_qwen3_moe_chat_template(template) => {
+            "matches the pinned exact 4,100-byte identity"
+        }
+        Some(_) => "is present but does not match the pinned exact 4,100-byte identity",
+        None => "is missing",
+    };
+    Some(api_error(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "unsupported_chat_template",
+        format!(
+            "model '{model_id}' declares architecture 'qwen3moe'; its embedded chat template \
+             {template_state}. Qwen3-MoE reasoning-content, trailing-assistant, tool-call, and \
+             grouped tool-response branches do not match Camelid's generic Qwen3 renderer, so \
+             chat and /apply-template fail closed until an exact-row shape pack is committed. \
+             Raw completion remains a separate qualification lane."
+        ),
+        Some("messages"),
+    ))
+}
+
+/// Recognize either Microsoft's known-stale 2B GGUF template or the canonical
+/// 2B-4T tokenizer template. The stale branch is admitted only so Camelid can
+/// apply the documented corrective renderer above; it is never rendered as-is.
+fn is_bitnet_b158_chat_template(template: &str) -> bool {
+    let template = template.trim();
+    template == STALE_MICROSOFT_GGUF_TEMPLATE || template == CANONICAL_MICROSOFT_TEMPLATE
+}
+
+/// Refuse a `bitnet-b1.58` file whose template is neither of the two exact
+/// evidenced forms. Falling through to generic ChatML remains forbidden.
+fn reject_bitnet_with_unrecognized_template(
+    runtime: &RunnableServeRuntime,
+    model_id: &str,
+) -> Option<Response> {
+    if runtime
+        .tokenizer
+        .chat_template
+        .as_deref()
+        .is_some_and(is_bitnet_b158_chat_template)
+    {
+        return None;
+    }
+    Some(api_error(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "unsupported_chat_template",
+        format!(
+            "model '{model_id}' declares architecture 'bitnet-b1.58', but its embedded tokenizer.chat_template is neither the known Microsoft GGUF form nor the canonical User:/Assistant:<|eot_id|> form. Generic ChatML would be a foreign prompt, so chat fails closed."
+        ),
+        Some("messages"),
+    ))
+}
+
+fn bitnet_runnable_lane_tools_rejection() -> Response {
+    api_error(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "unsupported_tools",
+        "the bitnet-b1.58 runnable serve lane does not support tools: the model's chat template has no tools branch and no BitNet tool-call grammar is certified"
+            .to_string(),
+        None,
+    )
+}
+
+fn bitnet_runnable_lane_thinking_rejection() -> Response {
+    api_error(
+        StatusCode::BAD_REQUEST,
+        "unsupported_parameter",
+        "the bitnet-b1.58 runnable serve lane does not support camelid_enable_thinking: the model's chat template has no thinking branch"
+            .to_string(),
+        Some("camelid_enable_thinking"),
+    )
+}
+
 /// The single construction of the LFM2 runnable tool refusal, shared by the
 /// non-streaming and streaming bridges so the two cannot drift.
 ///
@@ -19290,6 +21700,26 @@ fn lfm2_runnable_lane_tools_rejection() -> Response {
     )
 }
 
+/// Command R is metadata/config/load-attemptable for the exact Aya Expanse 8B
+/// Q4_K_M header shape, but its START_OF_TURN template has no rendered-byte or
+/// prompt-token fixture yet. Falling through would render the unrelated Ornith
+/// ChatML dialect, so both streaming and non-streaming chat stop here until the
+/// template and real-weight parity gates are anchored.
+fn command_r_chat_template_hold_rejection(model_id: &str) -> Response {
+    api_error(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "unsupported_chat_template",
+        format!(
+            "model '{model_id}' declares architecture 'command-r'. The exact Aya Expanse 8B \
+             Q4_K_M header is attemptable, but its embedded START_OF_TURN/SYSTEM/USER/CHATBOT \
+             template has no rendered-byte or prompt-token parity fixture and the full artifact \
+             has no generation parity receipt. Command-R chat remains fail-closed instead of \
+             borrowing the incompatible qwen35/Ornith renderer."
+        ),
+        Some("messages"),
+    )
+}
+
 /// The gemma chat-template shape the gemma-3 GGUFs ship: `<start_of_turn>` /
 /// `<end_of_turn>` turn markers plus the `first_user_prefix` system-folding
 /// variable (which distinguishes it from other turn-marker templates). Chat
@@ -19313,6 +21743,21 @@ fn is_mistral_instruct_template(template: &str) -> bool {
         && (template.contains("bos_token") || template.contains("</s>"))
 }
 
+/// Signature of the pinned SmolLM3-3B GGUF's dynamic ChatML template.
+///
+/// It shares the ordinary `<|im_start|>` markers with Qwen, but its prompt
+/// contract additionally injects current-date metadata, a reasoning-mode
+/// policy, system overrides, custom instructions, and tool grammars. Those
+/// unique markers are fixture-pinned so this template can be refused before
+/// the generic Qwen3 detector silently renders a foreign prompt.
+fn is_smollm3_dynamic_chat_template(template: &str) -> bool {
+    template.contains("<|im_start|>")
+        && template.contains("Knowledge Cutoff Date: June 2025")
+        && template.contains("strftime_now")
+        && template.contains("Reasoning Mode:")
+        && template.contains("/system_override")
+}
+
 fn is_qwen2_chatml_template(template: &str) -> bool {
     template.contains("<|im_start|>")
         && template.contains("<|im_end|>")
@@ -19327,6 +21772,15 @@ fn is_qwen2_chatml_template(template: &str) -> bool {
 /// rendered by [`render_qwen3_chatml_prompt`] instead.
 fn is_qwen3_chatml_template(template: &str) -> bool {
     template.contains("<|im_start|>") && template.contains("<|im_end|>")
+}
+
+/// DeepSeek-R1-0528-Qwen3's native marker grammar. These full-width markers
+/// distinguish the row from Qwen3 ChatML even though both use the qwen3 tensor
+/// architecture and qwen2 BPE pre-tokenizer.
+fn is_deepseek_r1_native_chat_template(template: &str) -> bool {
+    template.contains("<｜begin▁of▁sentence｜>")
+        && template.contains("<｜User｜>")
+        && template.contains("<｜Assistant｜>")
 }
 
 /// Phi-4's compact marker template keeps every role marker adjacent to content:
@@ -19957,7 +22411,15 @@ fn tokenizer_summary(tokenizer: &Tokenizer) -> TokenizerSummary {
 }
 
 fn detect_chat_template_format(template: &str) -> &'static str {
-    if is_llama3_instruct_template(template) {
+    if is_exact_smollm3_chat_template(template) {
+        "smollm3_exact_template_identity"
+    } else if is_smollm3_dynamic_chat_template(template) {
+        "smollm3_dynamic_chatml_unqualified"
+    } else if is_gemma2_it_chat_template(template) {
+        "gemma2_it_exact"
+    } else if is_gemma3_chat_template(template) {
+        "gemma3_turn_markers"
+    } else if is_llama3_instruct_template(template) {
         "llama3_instruct"
     } else if is_mistral_instruct_template(template) {
         "mistral_instruct"
@@ -21719,6 +24181,43 @@ mod tests {
     }
 
     #[test]
+    fn catalog_exposes_bitnet_rows_as_experimental_bring_up_targets() {
+        let catalog = curated_catalog();
+        for (id, filename, size, architecture) in [
+            (
+                "bitnet_b1_58_2b_4t_i2_s",
+                "ggml-model-i2_s.gguf",
+                1_187_801_280,
+                "bitnet-b1.58",
+            ),
+            (
+                "bitnet_embedding_0_6b_i2_s",
+                "bitnet-embeddings-0.6b-bf16-i2_s.gguf",
+                427_935_008,
+                "qwen3",
+            ),
+            (
+                "bitnet_embedding_270m_i2_s",
+                "bitnet-embeddings-270m-bf16-i2_s.gguf",
+                367_487_040,
+                "gemma3",
+            ),
+        ] {
+            let item = catalog
+                .iter()
+                .find(|item| item.catalog_id == id)
+                .unwrap_or_else(|| panic!("missing BitNet catalog row {id}"));
+            assert_eq!(item.filename, filename);
+            assert_eq!(item.size_bytes, size);
+            assert_eq!(item.quant, "I2_S");
+            assert_eq!(
+                classify_model_lane(Some(architecture), filename),
+                ModelLaneClass::ExperimentalImplemented
+            );
+        }
+    }
+
+    #[test]
     fn every_supported_row_is_reachable_on_the_models_page() {
         // REGRESSION: a row can be promoted to `supported_*` in the contract and
         // still be invisible to every user. The Models page has exactly two ways
@@ -21785,6 +24284,14 @@ mod tests {
         assert_eq!(
             classify_model_lane(Some("qwen3"), "Qwen3-0.6B-Q8_0.gguf"),
             ModelLaneClass::Supported,
+        );
+        assert_eq!(
+            classify_model_lane(Some("lfm2"), "LFM2.5-2.6B-Q8_0.gguf"),
+            if lfm2_supported_on_current_host() {
+                ModelLaneClass::Supported
+            } else {
+                ModelLaneClass::ExperimentalImplemented
+            },
         );
         // Non-catalog allowlisted artifact of a supported row (in-house requant
         // with no HF catalog source) â†’ Supported.
@@ -21864,6 +24371,11 @@ mod tests {
             classify_model_lane(Some("mistral"), "some-random-mistral-finetune-Q8_0.gguf"),
             ModelLaneClass::ExperimentalImplemented,
         );
+        assert_eq!(
+            classify_model_lane(Some("gemma2"), "community-gemma-2-9b-Q4_K_M.gguf"),
+            ModelLaneClass::ExperimentalImplemented,
+            "Gemma 2 reaches the runnable bridge but gains no exact-row support claim",
+        );
         // Architecture not in the implemented set â†’ Unsupported (fails closed at load).
         assert_eq!(
             classify_model_lane(Some("falcon"), "falcon-7b-Q8_0.gguf"),
@@ -21873,6 +24385,115 @@ mod tests {
             classify_model_lane(None, "headerless.gguf"),
             ModelLaneClass::Unsupported,
         );
+    }
+
+    #[test]
+    fn lfm2_support_scope_fails_closed_outside_the_two_receipted_lanes() {
+        assert!(lfm2_support_scope_matches(
+            "windows", "x86_64", None, None, None, false, true,
+        ));
+        assert!(lfm2_support_scope_matches(
+            "macos",
+            "aarch64",
+            Some("Mac16,10"),
+            Some("Apple M4"),
+            Some("26.5"),
+            true,
+            true,
+        ));
+        assert!(!lfm2_support_scope_matches(
+            "windows", "x86_64", None, None, None, false, false,
+        ));
+
+        for (os, arch, model, cpu, version, metal) in [
+            ("linux", "x86_64", None, None, None, false),
+            ("windows", "aarch64", None, None, None, false),
+            (
+                "macos",
+                "aarch64",
+                Some("Mac15,3"),
+                Some("Apple M3"),
+                Some("26.5"),
+                true,
+            ),
+            (
+                "macos",
+                "aarch64",
+                Some("Mac16,10"),
+                Some("Apple M4"),
+                Some("26.6"),
+                true,
+            ),
+            (
+                "macos",
+                "aarch64",
+                Some("Mac16,10"),
+                Some("Apple M4"),
+                Some("26.5"),
+                false,
+            ),
+        ] {
+            assert!(
+                !lfm2_support_scope_matches(os, arch, model, cpu, version, metal, true),
+                "unreceipted LFM2 scope must stay experimental: {os}/{arch}/{model:?}/{cpu:?}/{version:?}/metal={metal}"
+            );
+        }
+    }
+
+    fn provisional_lfm2_supported_plan() -> ExecutionPlan {
+        ExecutionPlan {
+            profile: ExecutionProfile::Auto,
+            operating_system: "macos".into(),
+            architecture: "aarch64".into(),
+            platform_label: "macOS arm64 Apple Silicon".into(),
+            cpu_model: "Apple M4".into(),
+            cpu_features: vec!["i8mm".into()],
+            model_family: "lfm2".into(),
+            quant_type: "Q8_0".into(),
+            exact_model_row: LFM2_5_2_6B_Q8_0_FILENAME.into(),
+            support_level: "supported_exact_row_smoke".into(),
+            selected_backend: "metal_resident_lfm2_runtime".into(),
+            selected_q8_path: "metal_resident_q8_wire".into(),
+            prefill_path: "lfm2_metal_resident_prefill".into(),
+            prefill_runtime_policy: "resident_tiled_mm_prefill".into(),
+            decode_path: "lfm2_metal_resident_decode".into(),
+            thread_count: 8,
+            diagnostics_status: "standard diagnostics".into(),
+            fallback_path: "runnable_cpu_decode_fallback".into(),
+            cuda_resident_active: false,
+            reasons: vec!["support_level=supported_exact_row_smoke".into()],
+        }
+    }
+
+    #[test]
+    fn stored_lfm2_plan_requires_the_exact_certified_artifact() {
+        let expected_sha = supported_artifact_expected_sha256(LFM2_5_2_6B_Q8_0_FILENAME)
+            .expect("promoted LFM row must carry a digest");
+
+        let mut exact = provisional_lfm2_supported_plan();
+        finalize_execution_plan_support_for_loaded_artifact(
+            &mut exact,
+            std::path::Path::new("/models/LFM2.5-2.6B-Q8_0.gguf"),
+            expected_sha,
+        );
+        assert_eq!(exact.support_level, "supported_exact_row_smoke");
+
+        for (path, sha) in [
+            ("/models/LFM2.5-2.6B-Q8_0.gguf", "00"),
+            ("/models/renamed-lfm2.gguf", expected_sha),
+        ] {
+            let mut plan = provisional_lfm2_supported_plan();
+            finalize_execution_plan_support_for_loaded_artifact(
+                &mut plan,
+                std::path::Path::new(path),
+                sha,
+            );
+            assert_eq!(plan.support_level, "unknown_or_unvalidated");
+            assert!(plan
+                .reasons
+                .iter()
+                .any(|reason| reason == "support_level=unknown_or_unvalidated"));
+        }
     }
 
     /// Every artifact whose supported-row identity is pinned to exact bytes:
@@ -21908,10 +24529,16 @@ mod tests {
                 filename,
                 &"00".repeat(32)
             ));
+            let expected_lane =
+                if filename == LFM2_5_2_6B_Q8_0_FILENAME && !lfm2_supported_on_current_host() {
+                    ModelLaneClass::ExperimentalImplemented
+                } else {
+                    ModelLaneClass::Supported
+                };
             assert_eq!(
                 classify_loaded_model_identity(Some("qwen35"), filename, expected_sha256),
-                ModelLaneClass::Supported,
-                "{filename} with its evidence digest must remain supported"
+                expected_lane,
+                "{filename} with its evidence digest must retain its exact identity while obeying any narrower host lane"
             );
             assert_eq!(
                 classify_loaded_model_identity(Some("qwen35"), filename, &"00".repeat(32)),
@@ -21919,13 +24546,12 @@ mod tests {
                 "{filename} with replaced bytes must not inherit support by name"
             );
             // With no digest in hand, a pin says nothing: the row keeps its
-            // ordinary filename/header class. Asserting ExperimentalImplemented
-            // here for every pinned artifact is what locked the v0.6.0 library
-            // regression in behind a green test.
+            // ordinary filename/header class, further narrowed only by an
+            // explicitly host-scoped receipt such as LFM2's.
             assert_eq!(
                 classify_model_lane_with_verified_sha256(Some("qwen35"), filename, None),
-                ModelLaneClass::Supported,
-                "{filename} must not be demoted before anyone has hashed it"
+                expected_lane,
+                "{filename} must retain its artifact class while obeying any narrower host lane"
             );
         }
         // A curated row with NO recorded digest keeps its filename-only gating.
@@ -21964,6 +24590,7 @@ mod tests {
             "Llama-3.2-1B-Instruct-IQ4_XS.gguf",
             "gemma-3-1b-it-Q8_0.gguf",
             "Qwen3-4B-Q4_K_M.gguf",
+            "LFM2.5-2.6B-Q8_0.gguf",
             "ornith-1.0-9b-Q8_0.gguf",
             "ornith-1.0-9b-Q4_K_M.gguf",
             "ornith-1.0-9b-Q3_K_M.gguf",
@@ -21983,10 +24610,16 @@ mod tests {
                 supported_artifact_expected_sha256(filename).is_some(),
                 "precondition: {filename} is hash-pinned"
             );
+            let expected_preload_class =
+                if filename == LFM2_5_2_6B_Q8_0_FILENAME && !lfm2_supported_on_current_host() {
+                    ModelLaneClass::ExperimentalImplemented
+                } else {
+                    ModelLaneClass::Supported
+                };
             assert_eq!(
                 classify_model_lane_with_verified_sha256(Some("llama"), filename, None),
-                ModelLaneClass::Supported,
-                "{filename} must read Supported in the models library, not Experimental"
+                expected_preload_class,
+                "{filename} must retain its artifact class unless a narrower host receipt applies"
             );
             // The pin still does its real job: certified NAME + uncertified BYTES
             // loses the row's evidence at load, which is where it always mattered.
@@ -22050,10 +24683,20 @@ mod tests {
                 supported_compatibility_row_ids().contains(catalog_id),
                 "{filename} pins {catalog_id}, which is not a supported row"
             );
+            assert!(
+                supported_artifact_identity_matches(filename, sha256),
+                "{filename} must retain its certified byte identity independently of host scope"
+            );
+            let expected_lane =
+                if *filename == LFM2_5_2_6B_Q8_0_FILENAME && !lfm2_supported_on_current_host() {
+                    ModelLaneClass::ExperimentalImplemented
+                } else {
+                    ModelLaneClass::Supported
+                };
             assert_eq!(
                 classify_loaded_model_identity(Some("llama"), filename, sha256),
-                ModelLaneClass::Supported,
-                "{filename} with its certified bytes keeps the row"
+                expected_lane,
+                "{filename} with its certified bytes keeps its identity while obeying any narrower host lane"
             );
             assert_eq!(
                 classify_loaded_model_identity(Some("llama"), filename, &"00".repeat(32)),
@@ -22416,6 +25059,7 @@ mod tests {
                 // within 1e-4. Raw-completion smoke only. See qa/iquant/ receipt.
                 "llama3_2_1b_instruct_iq4_xs",
                 "llama3_8b_instruct_q8_0",
+                "lfm2_5_2_6b_q8_0",
                 "mistral_7b_instruct_v0_3_q8_0",
                 // Nomic v1.5 Q8_0 bidirectional encoder: exact-row embeddings,
                 // embedding-similarity reranking, and Workspace semantic retrieval.
@@ -22461,6 +25105,7 @@ mod tests {
             BTreeSet::from([
                 "llama_bpe_decoder_exact_1b_3b_8b_q8_0",
                 "llama_spm_decoder",
+                "lfm2_5_exact_2_6b_q8_0",
                 "mistral_instruct_exact_7b_v0_3_q8_0",
                 "nomic_bert_encoder_exact_v1_5_q8_0",
                 "prism_bonsai_qwen35_exact_4b_8b_27b_gpu",
@@ -22472,7 +25117,7 @@ mod tests {
             "qwen25_7b_instruct_q8_0",
             "gemma2_9b_it_q8_0",
             "deepseek_r1_distill_qwen_7b_q8_0",
-            "c4ai_command_r_v01_q8_0",
+            "aya_expanse_8b_q4_k_m",
             "deepseek_r1_distill_llama_8b_q8_0",
             "qwen25_coder_7b_q8_0",
             "llama31_8b_instruct_q8_0",
@@ -22570,7 +25215,6 @@ mod tests {
             "qwen25_7b_instruct_q8_0",
             "gemma2_9b_it_q8_0",
             "deepseek_r1_distill_qwen_7b_q8_0",
-            "c4ai_command_r_v01_q8_0",
             "deepseek_r1_distill_llama_8b_q8_0",
             "qwen25_coder_7b_q8_0",
             "llama31_8b_instruct_q8_0",
@@ -22600,6 +25244,25 @@ mod tests {
             assert!(target.frontend_readiness_gate.contains("fail-closed"));
             assert!(target.evidence.contains("planning only"));
         }
+
+        let command_r = response
+            .model_compatibility
+            .iter()
+            .find(|target| target.id == "aya_expanse_8b_q4_k_m")
+            .expect("the manageable Aya Command-R candidate must stay advertised");
+        assert_eq!(command_r.status, "planned_exact_row_candidate");
+        assert_eq!(command_r.support_scope, "future_exact_row_planning_only");
+        assert_eq!(
+            command_r.metadata_parses,
+            "immutable_remote_header_validated_attemptable"
+        );
+        assert_eq!(command_r.latest_checked_result, "planning_only");
+        assert!(command_r.frontend_readiness_gate.contains("fail-closed"));
+        assert!(command_r.evidence.contains("header-only HOLD"));
+        assert!(command_r
+            .evidence
+            .contains("9592bad943fe56cf93200286a0a4b00a158cd84a408f227b9978ec5879002fb8"));
+        assert!(!command_r.status.starts_with("supported"));
 
         let phi3 = response
             .model_compatibility
@@ -22949,15 +25612,417 @@ mod tests {
     }
 
     #[test]
-    fn cpu_weight_materialization_estimate_defaults_q8_linears_to_file_backed() {
+    fn q8_estimate_matches_loader_for_unset_disabled_and_enabled_lazy_env() {
         let _env_guard = crate::test_support::env_lock();
         std::env::remove_var(RETAIN_Q8_BLOCKS_ENV);
         std::env::remove_var(LAZY_Q8_LINEAR_ENV);
-        let binding = materialization_binding(false, GgufTensorType::Q8_0, vec![32, 2]);
+        let binding = dense_q8_materialization_binding(false, vec![32, 2]);
+        let expected_per_tensor = 2 * mem::size_of::<Q8_0Block>() as u64;
+        let expected_dense_tensor_count = 2 + 4 + 3;
+
+        let unset = estimate_cpu_weight_materialization_bytes(&binding).unwrap();
+        assert_eq!(unset, expected_per_tensor * expected_dense_tensor_count);
+
+        std::env::set_var(LAZY_Q8_LINEAR_ENV, "0");
+        let explicitly_disabled = estimate_cpu_weight_materialization_bytes(&binding).unwrap();
+        assert_eq!(explicitly_disabled, unset);
+
+        std::env::set_var(LAZY_Q8_LINEAR_ENV, "1");
+        let explicitly_enabled = estimate_cpu_weight_materialization_bytes(&binding).unwrap();
+        assert_eq!(explicitly_enabled, 0);
+        std::env::remove_var(LAZY_Q8_LINEAR_ENV);
+    }
+
+    #[test]
+    fn forced_lazy_still_budgets_eager_generic_f32_tensors() {
+        let _env_guard = crate::test_support::env_lock();
+        std::env::remove_var(RETAIN_Q8_BLOCKS_ENV);
+        std::env::set_var(LAZY_Q8_LINEAR_ENV, "1");
+        std::env::set_var("CAMELID_X86_Q4K_DECODE", "1");
+        let mut binding = dense_q8_materialization_binding(false, vec![32, 2]);
+        binding.output_norm =
+            materialization_desc("output_norm.weight", GgufTensorType::F32, vec![8]);
+        binding.layers[0].attention_norm =
+            materialization_desc("blk.0.attn_norm.weight", GgufTensorType::F32, vec![8]);
+        binding.layers[0].ffn_norm =
+            materialization_desc("blk.0.ffn_norm.weight", GgufTensorType::F32, vec![8]);
 
         let estimated = estimate_cpu_weight_materialization_bytes(&binding).unwrap();
+        assert_eq!(estimated, 3 * 8 * 4);
+        std::env::set_var(
+            CPU_WEIGHT_MATERIALIZATION_LIMIT_ENV,
+            (estimated - 1).to_string(),
+        );
+        assert!(guard_cpu_weight_materialization_budget(&binding).is_err());
 
-        assert_eq!(estimated, 0);
+        std::env::remove_var(CPU_WEIGHT_MATERIALIZATION_LIMIT_ENV);
+        std::env::remove_var("CAMELID_X86_Q4K_DECODE");
+        std::env::remove_var(LAZY_Q8_LINEAR_ENV);
+    }
+
+    #[test]
+    fn malformed_rank_q8_linear_falls_back_to_eager_f32_estimate() {
+        let _env_guard = crate::test_support::env_lock();
+        std::env::remove_var(RETAIN_Q8_BLOCKS_ENV);
+        std::env::set_var(LAZY_Q8_LINEAR_ENV, "1");
+        let mut binding = dense_q8_materialization_binding(false, vec![32, 2]);
+        let LlamaAttentionTensors::Standard { q, .. } = &mut binding.layers[0].attention else {
+            unreachable!();
+        };
+        *q = materialization_desc("blk.0.attn_q.weight", GgufTensorType::Q8_0, vec![32]);
+
+        assert_eq!(
+            estimate_cpu_weight_materialization_bytes(&binding).unwrap(),
+            32 * 4
+        );
+        assert!(!binding_all_resident_quant_linears(&binding));
+
+        std::env::remove_var(LAZY_Q8_LINEAR_ENV);
+    }
+
+    #[test]
+    fn mla_absorption_budgets_final_f32_weights_for_every_q8_storage_policy() {
+        use crate::inference::Q8DenseLinearStorage;
+
+        let _env_guard = crate::test_support::env_lock();
+        std::env::remove_var(RETAIN_Q8_BLOCKS_ENV);
+        let binding = mla_q8_materialization_binding();
+        // heads=2, q_lora=3, kv_lora=5, rope=2, hidden=7:
+        // absorbed q_b = 2*(5+2)*3, absorbed output = 7*2*5.
+        let expected = (2 * (5 + 2) * 3 + 7 * 2 * 5) * 4;
+
+        for storage in [
+            Q8DenseLinearStorage::ExpandedBlocks,
+            Q8DenseLinearStorage::FileBacked,
+            Q8DenseLinearStorage::WirePages,
+        ] {
+            assert_eq!(
+                estimate_cpu_weight_materialization_bytes_with_q8_storage(&binding, storage)
+                    .unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn merged_q4_moe_stays_file_backed_but_split_q4_fails_closed() {
+        let _env_guard = crate::test_support::env_lock();
+        std::env::set_var(crate::runtime_config::MOE_EXPERT_STORAGE_ENV, "resident_q8");
+        let merged = q4_moe_materialization_binding(false);
+        assert_eq!(
+            estimate_cpu_weight_materialization_bytes(&merged).unwrap(),
+            0
+        );
+
+        let split = q4_moe_materialization_binding(true);
+        let err = estimate_cpu_weight_materialization_bytes(&split)
+            .expect_err("split Q4 experts have no matching loader")
+            .to_string();
+        assert!(err.contains("split expert loaders require Q8_0"), "{err}");
+
+        std::env::remove_var(crate::runtime_config::MOE_EXPERT_STORAGE_ENV);
+    }
+
+    #[test]
+    fn metal_nocopy_outranks_lazy_and_budgets_page_rounded_q8_wire() {
+        use crate::inference::Q8DenseLinearStorage;
+
+        let policy = crate::inference::q8_dense_linear_storage_policy_given(true, true);
+        assert_eq!(policy, Q8DenseLinearStorage::WirePages);
+        assert_eq!(
+            crate::inference::q8_dense_linear_storage_policy_given(false, true),
+            Q8DenseLinearStorage::FileBacked
+        );
+        assert_eq!(
+            crate::inference::q8_dense_linear_storage_policy_given(false, false),
+            Q8DenseLinearStorage::ExpandedBlocks
+        );
+
+        let _env_guard = crate::test_support::env_lock();
+        std::env::remove_var(RETAIN_Q8_BLOCKS_ENV);
+        let binding = dense_q8_materialization_binding(false, vec![32, 2]);
+        let estimated = estimate_cpu_weight_materialization_bytes_with_q8_storage(
+            &binding,
+            Q8DenseLinearStorage::WirePages,
+        )
+        .unwrap();
+        let page_bytes = crate::wire_mmap::page_size() as u64;
+        let expected_per_tensor = 68_u64.div_ceil(page_bytes) * page_bytes;
+        let expected_dense_tensor_count = 2 + 4 + 3;
+        assert_eq!(estimated, expected_per_tensor * expected_dense_tensor_count);
+        assert!(estimated > 68 * expected_dense_tensor_count);
+    }
+
+    #[test]
+    fn kquant_estimate_counts_compact_or_page_rounded_retained_storage() {
+        use crate::inference::Q8DenseLinearStorage;
+
+        const DENSE_TENSOR_COUNT: u64 = 2 + 4 + 3;
+        const TIED_DENSE_TENSOR_COUNT: u64 = 1 + 4 + 3;
+        let page_bytes = crate::wire_mmap::page_size() as u64;
+
+        for (tensor_type, wire_bytes) in [
+            (GgufTensorType::Q2K, 84_u64),
+            (GgufTensorType::Q4K, 144_u64),
+            (GgufTensorType::Q5K, 176_u64),
+            (GgufTensorType::Q6K, 210_u64),
+        ] {
+            let binding = dense_quant_materialization_binding(false, tensor_type, vec![256, 1]);
+            assert_eq!(
+                estimate_cpu_weight_materialization_bytes_with_q8_storage(
+                    &binding,
+                    Q8DenseLinearStorage::ExpandedBlocks,
+                )
+                .unwrap(),
+                wire_bytes * DENSE_TENSOR_COUNT,
+                "{tensor_type:?} Vec-backed dense linears retain compact wire bytes"
+            );
+
+            let nocopy_per_tensor =
+                if matches!(tensor_type, GgufTensorType::Q4K | GgufTensorType::Q6K) {
+                    wire_bytes.div_ceil(page_bytes) * page_bytes
+                } else {
+                    wire_bytes
+                };
+            assert_eq!(
+                estimate_cpu_weight_materialization_bytes_with_q8_storage(
+                    &binding,
+                    Q8DenseLinearStorage::WirePages,
+                )
+                .unwrap(),
+                nocopy_per_tensor * DENSE_TENSOR_COUNT,
+                "{tensor_type:?} no-copy estimate must match its actual loader backing"
+            );
+
+            let tied = dense_quant_materialization_binding(true, tensor_type, vec![256, 1]);
+            assert_eq!(
+                estimate_cpu_weight_materialization_bytes_with_q8_storage(
+                    &tied,
+                    Q8DenseLinearStorage::WirePages,
+                )
+                .unwrap(),
+                nocopy_per_tensor * TIED_DENSE_TENSOR_COUNT,
+                "the tied output clone shares {tensor_type:?} Arc storage"
+            );
+        }
+    }
+
+    #[test]
+    fn generic_kquant_f32_load_counts_retained_wire_sidecar() {
+        use crate::inference::Q8DenseLinearStorage;
+
+        let mut binding = dense_q8_materialization_binding(false, vec![32, 2]);
+        for (tensor_type, wire_bytes) in [
+            (GgufTensorType::Q2K, 84_u64),
+            (GgufTensorType::Q3K, 110_u64),
+            (GgufTensorType::Q4K, 144_u64),
+            (GgufTensorType::Q6K, 210_u64),
+        ] {
+            binding.output_norm =
+                materialization_desc("output_norm.weight", tensor_type, vec![256]);
+            assert_eq!(
+                estimate_cpu_weight_materialization_bytes_with_q8_storage(
+                    &binding,
+                    Q8DenseLinearStorage::FileBacked,
+                )
+                .unwrap(),
+                256 * 4 + wire_bytes,
+                "generic {tensor_type:?} retains its wire Arc beside decoded f32 data"
+            );
+        }
+
+        binding.output_norm =
+            materialization_desc("output_norm.weight", GgufTensorType::Q5K, vec![256]);
+        assert_eq!(
+            estimate_cpu_weight_materialization_bytes_with_q8_storage(
+                &binding,
+                Q8DenseLinearStorage::FileBacked,
+            )
+            .unwrap(),
+            256 * 4,
+            "the generic Q5_K loader decodes f32 without retaining a wire sidecar"
+        );
+    }
+
+    #[test]
+    fn kquant_retained_storage_is_enforced_by_the_materialization_guard() {
+        let _env_guard = crate::test_support::env_lock();
+        std::env::remove_var("CAMELID_METAL_NOCOPY");
+        let binding = dense_quant_materialization_binding(false, GgufTensorType::Q4K, vec![256, 1]);
+        let estimated = estimate_cpu_weight_materialization_bytes(&binding).unwrap();
+        assert_eq!(estimated, 144 * (2 + 4 + 3));
+        std::env::set_var(
+            CPU_WEIGHT_MATERIALIZATION_LIMIT_ENV,
+            (estimated - 1).to_string(),
+        );
+
+        let err = guard_cpu_weight_materialization_budget(&binding)
+            .expect_err("the guard must enforce retained compact K-quant storage")
+            .to_string();
+        assert!(err.contains(&estimated.to_string()), "{err}");
+
+        std::env::remove_var(CPU_WEIGHT_MATERIALIZATION_LIMIT_ENV);
+    }
+
+    #[test]
+    fn distributed_coordinator_budget_counts_only_owned_prefix_plus_both_ends() {
+        use crate::inference::Q8DenseLinearStorage;
+
+        let _env_guard = crate::test_support::env_lock();
+        std::env::remove_var("CAMELID_METAL_NOCOPY");
+        std::env::remove_var(LAZY_Q8_LINEAR_ENV);
+        std::env::remove_var(RETAIN_Q8_BLOCKS_ENV);
+        let mut binding = dense_q8_materialization_binding(false, vec![32, 2]);
+        let layer = binding.layers[0].clone();
+        binding.layers = vec![layer; 4];
+        let coordinator_range = 0..1;
+
+        let full = estimate_cpu_weight_materialization_bytes_with_q8_storage_and_ownership(
+            &binding,
+            Q8DenseLinearStorage::ExpandedBlocks,
+            None,
+            true,
+            true,
+        )
+        .unwrap();
+        let coordinator = estimate_cpu_weight_materialization_bytes_with_q8_storage_and_ownership(
+            &binding,
+            Q8DenseLinearStorage::ExpandedBlocks,
+            Some(&coordinator_range),
+            true,
+            true,
+        )
+        .unwrap();
+        assert!(
+            coordinator < full,
+            "prefix shard {coordinator} < full {full}"
+        );
+
+        std::env::set_var(
+            CPU_WEIGHT_MATERIALIZATION_LIMIT_ENV,
+            coordinator.to_string(),
+        );
+        assert_eq!(
+            guard_cpu_weight_materialization_budget_with_ownership(
+                &binding,
+                Some(&coordinator_range),
+                true,
+                true,
+            )
+            .unwrap(),
+            coordinator,
+            "the coordinator shard must be admitted at its exact retained size"
+        );
+        let err = guard_cpu_weight_materialization_budget(&binding)
+            .expect_err("the same limit must reject the full model")
+            .to_string();
+        assert!(err.contains(&full.to_string()), "{err}");
+
+        std::env::remove_var(CPU_WEIGHT_MATERIALIZATION_LIMIT_ENV);
+    }
+
+    #[test]
+    fn ownership_estimate_models_embedding_output_and_tied_arc_sharing() {
+        use crate::inference::Q8DenseLinearStorage;
+
+        const KQUANT_WIRE_BYTES: u64 = 144;
+        const OUTPUT_NORM_BYTES: u64 = 8 * 4;
+        let mut tied = dense_quant_materialization_binding(true, GgufTensorType::Q4K, vec![256, 1]);
+        tied.layers.clear();
+        tied.output_norm = materialization_desc("output_norm.weight", GgufTensorType::F32, vec![8]);
+
+        for (load_embedding, load_output, expected) in [
+            (false, false, 0),
+            (true, false, KQUANT_WIRE_BYTES),
+            (false, true, KQUANT_WIRE_BYTES + OUTPUT_NORM_BYTES),
+            (true, true, KQUANT_WIRE_BYTES + OUTPUT_NORM_BYTES),
+        ] {
+            assert_eq!(
+                estimate_cpu_weight_materialization_bytes_with_q8_storage_and_ownership(
+                    &tied,
+                    Q8DenseLinearStorage::ExpandedBlocks,
+                    Some(&(0..0)),
+                    load_embedding,
+                    load_output,
+                )
+                .unwrap(),
+                expected,
+                "tied ownership ({load_embedding}, {load_output})"
+            );
+        }
+
+        let mut untied = tied.clone();
+        untied.output_is_tied_embedding = false;
+        assert_eq!(
+            estimate_cpu_weight_materialization_bytes_with_q8_storage_and_ownership(
+                &untied,
+                Q8DenseLinearStorage::ExpandedBlocks,
+                Some(&(0..0)),
+                true,
+                true,
+            )
+            .unwrap(),
+            2 * KQUANT_WIRE_BYTES + OUTPUT_NORM_BYTES,
+            "an untied output owns a second compact allocation"
+        );
+    }
+
+    #[test]
+    fn prism_estimate_counts_page_rounded_wire_pages_and_shared_tied_clone() {
+        use crate::inference::Q8DenseLinearStorage;
+
+        const DENSE_TENSOR_COUNT: u64 = 2 + 4 + 3;
+        const TIED_DENSE_TENSOR_COUNT: u64 = 1 + 4 + 3;
+        let page_bytes = crate::wire_mmap::page_size() as u64;
+        let wire_pages = 18_u64.div_ceil(page_bytes) * page_bytes;
+        let binding =
+            dense_quant_materialization_binding(false, GgufTensorType::Q1_0, vec![128, 1]);
+        assert_eq!(
+            estimate_cpu_weight_materialization_bytes_with_q8_storage(
+                &binding,
+                Q8DenseLinearStorage::ExpandedBlocks,
+            )
+            .unwrap(),
+            wire_pages * DENSE_TENSOR_COUNT
+        );
+
+        let tied = dense_quant_materialization_binding(true, GgufTensorType::Q1_0, vec![128, 1]);
+        assert_eq!(
+            estimate_cpu_weight_materialization_bytes_with_q8_storage(
+                &tied,
+                Q8DenseLinearStorage::ExpandedBlocks,
+            )
+            .unwrap(),
+            wire_pages * TIED_DENSE_TENSOR_COUNT,
+            "the tied Prism output clone shares its WirePages allocation"
+        );
+    }
+
+    #[test]
+    fn empty_split_moe_experts_fail_admission_before_zero_byte_estimate() {
+        let _env_guard = crate::test_support::env_lock();
+        std::env::remove_var(crate::runtime_config::MOE_EXPERT_STORAGE_ENV);
+        let mut binding = q4_moe_materialization_binding(true);
+        let LlamaFfnTensors::MoE {
+            gate_experts,
+            up_experts,
+            down_experts,
+            ..
+        } = &mut binding.layers[0].ffn
+        else {
+            unreachable!("MoE materialization fixture must contain expert sets");
+        };
+        *gate_experts = LlamaMoeExpertTensors::Split(Vec::new());
+        *up_experts = LlamaMoeExpertTensors::Split(Vec::new());
+        *down_experts = LlamaMoeExpertTensors::Split(Vec::new());
+
+        let err = estimate_cpu_weight_materialization_bytes(&binding)
+            .expect_err("zero-expert split bindings must fail before admission")
+            .to_string();
+        assert!(
+            err.contains("expert_count must be greater than zero"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -22977,7 +26042,7 @@ mod tests {
     }
 
     #[test]
-    fn q8_runtime_health_reports_default_auto_retain_candidate_policy() {
+    fn q8_runtime_health_reports_default_resident_policy() {
         let _env_guard = crate::test_support::env_lock();
         std::env::remove_var(RETAIN_Q8_BLOCKS_ENV);
         std::env::remove_var(LAZY_Q8_LINEAR_ENV);
@@ -22985,22 +26050,25 @@ mod tests {
 
         let health = q8_runtime_health();
 
-        assert_eq!(health.policy, "lazy_q8_linear_default_or_auto_retain");
-        assert!(health.lazy_q8_linear);
+        assert_eq!(health.policy, "resident_q8_default");
+        assert!(!health.lazy_q8_linear);
         assert!(!health.retain_q8_blocks);
+        assert!(health
+            .note
+            .contains("expanded RAM-resident blocks by default"));
         assert_eq!(health.file_cache_bytes, Some(64 * 1024 * 1024));
         std::env::remove_var("CAMELID_Q8_0_FILE_CACHE_BYTES");
     }
 
     #[test]
-    fn q8_runtime_health_reports_eager_retained_duplicate_policy() {
+    fn q8_runtime_health_reports_default_resident_with_generic_retention() {
         let _env_guard = crate::test_support::env_lock();
         std::env::set_var(LAZY_Q8_LINEAR_ENV, "0");
         std::env::set_var(RETAIN_Q8_BLOCKS_ENV, "1");
 
         let health = q8_runtime_health();
 
-        assert_eq!(health.policy, "eager_f32_with_retained_q8_blocks");
+        assert_eq!(health.policy, "resident_q8_default_with_generic_retention");
         assert!(!health.lazy_q8_linear);
         assert!(health.retain_q8_blocks);
         std::env::remove_var(RETAIN_Q8_BLOCKS_ENV);
@@ -23008,30 +26076,30 @@ mod tests {
     }
 
     #[test]
-    fn cpu_weight_materialization_estimate_can_count_q8_f32_when_lazy_disabled() {
+    fn cpu_weight_materialization_estimate_counts_expanded_q8_when_lazy_is_zero() {
         let _env_guard = crate::test_support::env_lock();
         std::env::remove_var(RETAIN_Q8_BLOCKS_ENV);
         std::env::set_var(LAZY_Q8_LINEAR_ENV, "0");
-        let binding = materialization_binding(false, GgufTensorType::Q8_0, vec![32, 2]);
+        let binding = dense_q8_materialization_binding(false, vec![32, 2]);
 
         let estimated = estimate_cpu_weight_materialization_bytes(&binding).unwrap();
-        let expected_per_tensor = 32 * 2 * 4;
-        let expected_tensor_count = 3 + 9;
+        let expected_per_tensor = 2 * mem::size_of::<Q8_0Block>() as u64;
+        let expected_tensor_count = 2 + 4 + 3;
 
         assert_eq!(estimated, expected_per_tensor * expected_tensor_count);
         std::env::remove_var(LAZY_Q8_LINEAR_ENV);
     }
 
     #[test]
-    fn cpu_weight_materialization_estimate_counts_opt_in_q8_retained_blocks() {
+    fn generic_retain_env_does_not_double_count_default_dense_q8_blocks() {
         let _env_guard = crate::test_support::env_lock();
         std::env::set_var(LAZY_Q8_LINEAR_ENV, "0");
         std::env::set_var(RETAIN_Q8_BLOCKS_ENV, "1");
-        let binding = materialization_binding(false, GgufTensorType::Q8_0, vec![32, 2]);
+        let binding = dense_q8_materialization_binding(false, vec![32, 2]);
 
         let estimated = estimate_cpu_weight_materialization_bytes(&binding).unwrap();
-        let expected_per_tensor = (32 * 2 * 4) + (2 * mem::size_of::<Q8_0Block>() as u64);
-        let expected_tensor_count = 3 + 9;
+        let expected_per_tensor = 2 * mem::size_of::<Q8_0Block>() as u64;
+        let expected_tensor_count = 2 + 4 + 3;
 
         assert_eq!(estimated, expected_per_tensor * expected_tensor_count);
         std::env::remove_var(RETAIN_Q8_BLOCKS_ENV);
@@ -23039,11 +26107,34 @@ mod tests {
     }
 
     #[test]
-    fn cpu_weight_materialization_estimate_counts_lazy_q8_linears_as_file_backed() {
+    fn q8_estimator_budgets_opt_in_packed_sidecars() {
+        let _env_guard = crate::test_support::env_lock();
+        std::env::remove_var(RETAIN_Q8_BLOCKS_ENV);
+        std::env::set_var(LAZY_Q8_LINEAR_ENV, "0");
+        std::env::remove_var("CAMELID_MAC_Q8_REPACK");
+        std::env::remove_var("CAMELID_X86_Q8_REPACK");
+        std::env::set_var("CAMELID_Q8_0_PACKED_4X4_DOT", "on");
+        std::env::set_var("CAMELID_Q8_0_PACKED_4X8_DOT", "on");
+        let binding = dense_q8_materialization_binding(false, vec![4, 32]);
+
+        let base_per_tensor = 4 * mem::size_of::<Q8_0Block>() as u64;
+        let expected_tensor_count = 2 + 4 + 3;
+        assert_eq!(
+            estimate_cpu_weight_materialization_bytes(&binding).unwrap(),
+            base_per_tensor * 3 * expected_tensor_count
+        );
+
+        std::env::remove_var("CAMELID_Q8_0_PACKED_4X4_DOT");
+        std::env::remove_var("CAMELID_Q8_0_PACKED_4X8_DOT");
+        std::env::remove_var(LAZY_Q8_LINEAR_ENV);
+    }
+
+    #[test]
+    fn cpu_weight_materialization_estimate_counts_forced_lazy_q8_linears_as_file_backed() {
         let _env_guard = crate::test_support::env_lock();
         std::env::remove_var(RETAIN_Q8_BLOCKS_ENV);
         std::env::set_var(LAZY_Q8_LINEAR_ENV, "1");
-        let binding = materialization_binding(false, GgufTensorType::Q8_0, vec![32, 2]);
+        let binding = dense_q8_materialization_binding(false, vec![32, 2]);
 
         let estimated = estimate_cpu_weight_materialization_bytes(&binding).unwrap();
 
@@ -23052,17 +26143,36 @@ mod tests {
     }
 
     #[test]
-    fn cpu_weight_materialization_estimate_skips_tied_output_tensor() {
+    fn cpu_weight_materialization_estimate_models_tied_output_clone_storage() {
         let _env_guard = crate::test_support::env_lock();
         std::env::remove_var(RETAIN_Q8_BLOCKS_ENV);
         std::env::set_var(LAZY_Q8_LINEAR_ENV, "0");
-        let binding = materialization_binding(true, GgufTensorType::Q8_0, vec![32, 2]);
+        let binding = dense_q8_materialization_binding(true, vec![32, 2]);
 
         let estimated = estimate_cpu_weight_materialization_bytes(&binding).unwrap();
-        let expected_per_tensor = 32 * 2 * 4;
-        let expected_tensor_count = 2 + 9;
+        let expected_per_tensor = 2 * mem::size_of::<Q8_0Block>() as u64;
+        let expected_tensor_count = 2 + 4 + 3;
 
         assert_eq!(estimated, expected_per_tensor * expected_tensor_count);
+
+        let page_bytes = crate::wire_mmap::page_size() as u64;
+        let wire_per_tensor = 68_u64.div_ceil(page_bytes) * page_bytes;
+        assert_eq!(
+            estimate_cpu_weight_materialization_bytes_with_q8_storage(
+                &binding,
+                crate::inference::Q8DenseLinearStorage::WirePages,
+            )
+            .unwrap(),
+            wire_per_tensor * (1 + 4 + 3)
+        );
+        assert_eq!(
+            estimate_cpu_weight_materialization_bytes_with_q8_storage(
+                &binding,
+                crate::inference::Q8DenseLinearStorage::FileBacked,
+            )
+            .unwrap(),
+            0
+        );
         std::env::remove_var(LAZY_Q8_LINEAR_ENV);
     }
 
@@ -23078,6 +26188,52 @@ mod tests {
             estimated
         );
         std::env::remove_var(CPU_WEIGHT_MATERIALIZATION_LIMIT_ENV);
+    }
+
+    #[test]
+    fn smollm3_sized_q8_budget_uses_expanded_blocks_and_forced_lazy_stays_zero() {
+        const SMOLLM3_Q8_GGUF_BYTES: u64 = 3_275_574_624;
+        const DENSE_TENSOR_COUNT: u64 = 2 + 4 + 3;
+
+        let _env_guard = crate::test_support::env_lock();
+        std::env::remove_var(RETAIN_Q8_BLOCKS_ENV);
+        std::env::remove_var(LAZY_Q8_LINEAR_ENV);
+        // Shape nine synthetic dense linears so their aggregate 34-byte GGUF wire
+        // footprint is the exact SmolLM3 row's size (rounded up by <9 blocks).
+        let blocks_per_tensor = SMOLLM3_Q8_GGUF_BYTES
+            .div_ceil(34)
+            .div_ceil(DENSE_TENSOR_COUNT);
+        let binding = dense_q8_materialization_binding(false, vec![32, blocks_per_tensor]);
+
+        let retained = estimate_cpu_weight_materialization_bytes(&binding).unwrap();
+        let expected = blocks_per_tensor * DENSE_TENSOR_COUNT * mem::size_of::<Q8_0Block>() as u64;
+        assert_eq!(retained, expected);
+        assert!(
+            retained > SMOLLM3_Q8_GGUF_BYTES,
+            "expanded 36-byte Q8 blocks must not be budgeted as 34-byte GGUF wire"
+        );
+
+        std::env::set_var(
+            CPU_WEIGHT_MATERIALIZATION_LIMIT_ENV,
+            SMOLLM3_Q8_GGUF_BYTES.to_string(),
+        );
+        let err = guard_cpu_weight_materialization_budget(&binding)
+            .expect_err("wire-sized budget must reject the larger retained layout")
+            .to_string();
+        assert!(err.contains("weight materialization/retention"), "{err}");
+
+        std::env::set_var(LAZY_Q8_LINEAR_ENV, "1");
+        assert_eq!(
+            estimate_cpu_weight_materialization_bytes(&binding).unwrap(),
+            0
+        );
+        assert_eq!(
+            guard_cpu_weight_materialization_budget(&binding).unwrap(),
+            0
+        );
+
+        std::env::remove_var(CPU_WEIGHT_MATERIALIZATION_LIMIT_ENV);
+        std::env::remove_var(LAZY_Q8_LINEAR_ENV);
     }
 
     #[test]
@@ -23164,18 +26320,17 @@ mod tests {
             .expect_err("oversized materialization should fail before eager decode")
             .to_string();
 
-        assert!(err.contains("estimated CPU f32 weight materialization"));
+        assert!(err.contains("estimated CPU weight materialization/retention"));
         assert!(err.contains(CPU_WEIGHT_MATERIALIZATION_LIMIT_ENV));
         std::env::remove_var(CPU_WEIGHT_MATERIALIZATION_LIMIT_ENV);
     }
 
     #[test]
-    fn cpu_weight_materialization_budget_bypassed_for_kquant_block_dot() {
-        // The budget guard must treat a K-quant block-dot model as wire-only (no f32
-        // materialization) on the CPU lane â€” otherwise serve CPU mode false-positives
-        // on the f32 size it never produces (Phase 2 follow-up). Tested directly on
-        // `binding_runs_on_cpu_wire_only` to avoid the `resident_decode_cuda_active`
-        // GPU-bypass confound on CUDA builds.
+    fn cpu_wire_only_classification_accepts_kquant_block_dot() {
+        // The execution classifier must treat a K-quant block-dot model as wire-only
+        // (no f32 materialization) on the CPU lane. Admission separately budgets the
+        // retained compact bytes. Test the classifier directly so CUDA availability
+        // cannot confound this CPU-path assertion.
         let _env_guard = crate::test_support::env_lock();
         let kquant = materialization_binding(false, GgufTensorType::Q4K, vec![256, 256]);
         let dense_f32 = materialization_binding(false, GgufTensorType::F32, vec![256, 256]);
@@ -23995,6 +27150,544 @@ mod tests {
             err.to_string().contains("no tools branch"),
             "the refusal must state the reason: {err}"
         );
+    }
+
+    #[test]
+    fn gemma2_exact_template_fixture_locks_detector_renderer_and_rejections() {
+        #[derive(serde::Deserialize)]
+        struct Pack {
+            pack_id: String,
+            support_scope: String,
+            source_template: String,
+            encode_contract: EncodeContract,
+            shapes: Vec<Shape>,
+            rejections: Vec<RejectedShape>,
+            not_claimed: Vec<String>,
+        }
+        #[derive(serde::Deserialize)]
+        struct EncodeContract {
+            renderer_includes_bos_text: bool,
+            add_special: bool,
+            parse_special: bool,
+        }
+        #[derive(serde::Deserialize)]
+        struct Shape {
+            id: String,
+            messages: Vec<PackMessage>,
+            expected_prompt_without_bos: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct RejectedShape {
+            id: String,
+            messages: Vec<PackMessage>,
+            reason: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct PackMessage {
+            role: String,
+            content: String,
+        }
+
+        let raw =
+            include_str!("../../qa/model-qualification/fixtures/gemma2-it-chat-template-v1.json");
+        let pack: Pack = serde_json::from_str(raw).expect("parse Gemma 2 template fixture");
+        assert_eq!(pack.pack_id, "gemma2-it-chat-template-v1");
+        assert_eq!(
+            pack.support_scope,
+            "template_and_routing_only_no_real_row_support"
+        );
+        assert!(pack
+            .not_claimed
+            .iter()
+            .any(|claim| claim == "real-row support"));
+        assert_eq!(pack.source_template, GEMMA2_IT_CHAT_TEMPLATE);
+        assert!(is_gemma2_it_chat_template(&pack.source_template));
+
+        // Equality is load-bearing. A semantically similar template or even
+        // one appended byte is outside the pinned contract.
+        let mut substituted = pack.source_template.clone();
+        substituted.push(' ');
+        assert!(!is_gemma2_it_chat_template(&substituted));
+        assert!(!is_gemma2_it_chat_template(
+            "{{ '<start_of_turn>' + role }}{{ '<end_of_turn>' }}"
+        ));
+
+        for shape in &pack.shapes {
+            let messages = shape
+                .messages
+                .iter()
+                .map(|message| ChatMessage {
+                    image_urls: Vec::new(),
+                    unsupported_content_parts: Vec::new(),
+                    role: message.role.clone(),
+                    content: message.content.clone(),
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                render_gemma2_it_prompt(&messages).expect("fixture shape must render"),
+                shape.expected_prompt_without_bos,
+                "Gemma 2 fixture shape {} diverged",
+                shape.id
+            );
+
+            let mut tokenizer = test_tokenizer();
+            tokenizer.chat_template = Some(pack.source_template.clone());
+            let routed = render_chat_prompt_for_tokenization_for_model_result(
+                &messages, &tokenizer, None, false,
+            )
+            .expect("exact Gemma 2 template must take the dedicated route");
+            assert_eq!(routed.text, shape.expected_prompt_without_bos);
+            assert_eq!(routed.add_special, pack.encode_contract.add_special);
+            assert_eq!(routed.parse_special, pack.encode_contract.parse_special);
+            assert!(!pack.encode_contract.renderer_includes_bos_text);
+            assert!(!routed.text.starts_with("<bos>"));
+        }
+
+        for rejected in &pack.rejections {
+            let messages = rejected
+                .messages
+                .iter()
+                .map(|message| ChatMessage {
+                    image_urls: Vec::new(),
+                    unsupported_content_parts: Vec::new(),
+                    role: message.role.clone(),
+                    content: message.content.clone(),
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                render_gemma2_it_prompt(&messages).expect_err("shape must fail closed"),
+                rejected.reason,
+                "Gemma 2 rejection shape {} drifted",
+                rejected.id
+            );
+        }
+        assert_eq!(
+            render_gemma2_it_prompt(&[]).expect_err("empty chat must fail closed"),
+            GEMMA2_EMPTY_MESSAGES_ERROR
+        );
+    }
+
+    #[test]
+    fn gemma2_architecture_rejects_missing_or_substituted_templates() {
+        let mut tokenizer = test_tokenizer();
+        tokenizer.chat_template = Some(GEMMA2_IT_CHAT_TEMPLATE.to_string());
+        assert!(reject_gemma2_with_unrecognized_template(&tokenizer, "gemma2-row").is_none());
+        assert_eq!(
+            detect_chat_template_format(tokenizer.chat_template.as_deref().unwrap()),
+            "gemma2_it_exact"
+        );
+
+        for template in [
+            None,
+            Some("{{ '<start_of_turn>' + role }}{{ '<end_of_turn>' }}".to_string()),
+            Some(format!("{GEMMA2_IT_CHAT_TEMPLATE} ")),
+        ] {
+            tokenizer.chat_template = template;
+            let rejection = reject_gemma2_with_unrecognized_template(&tokenizer, "gemma2-row")
+                .expect("non-exact Gemma 2 template must fail closed");
+            assert_eq!(rejection.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            let details = rejection
+                .extensions()
+                .get::<ApiErrorDetails>()
+                .expect("typed error details");
+            assert_eq!(details.code, "unsupported_chat_template");
+        }
+    }
+
+    #[test]
+    fn smollm3_exact_renderer_is_architecture_scoped_and_not_generic_qwen3() {
+        #[derive(serde::Deserialize)]
+        struct Pack {
+            chat_template_blocker: Blocker,
+        }
+        #[derive(serde::Deserialize)]
+        struct Blocker {
+            source_template_utf8_bytes: usize,
+            source_template_sha256: String,
+            required_signature_markers: Vec<String>,
+            reason: String,
+        }
+
+        let raw =
+            include_str!("../../qa/model-qualification/fixtures/smollm3-tokenizer-pre-v1.json");
+        let pack: Pack = serde_json::from_str(raw).expect("parse SmolLM3 blocker fixture");
+        assert_eq!(pack.chat_template_blocker.source_template_utf8_bytes, 5_493);
+        assert_eq!(
+            pack.chat_template_blocker.source_template_sha256,
+            "b9b66f04c64fbb8695cf5b35c37780efd0b8e0829fbfe3e30fafb9f469b7d30e"
+        );
+        assert!(pack
+            .chat_template_blocker
+            .reason
+            .contains("not generic Qwen3 ChatML"));
+
+        // A compact stand-in carrying every signature marker must still fail
+        // exact identity. Marker-only routing is the bug this gate prevents.
+        let signature = pack
+            .chat_template_blocker
+            .required_signature_markers
+            .join(" :: ");
+        assert!(is_smollm3_dynamic_chat_template(&signature));
+        assert!(!is_exact_smollm3_chat_template(&signature));
+        assert!(!is_qwen2_chatml_template(&signature));
+
+        let mut tokenizer = test_tokenizer();
+        tokenizer.chat_template = Some(signature.clone());
+        assert_eq!(
+            detect_chat_template_format(tokenizer.chat_template.as_deref().unwrap()),
+            "smollm3_dynamic_chatml_unqualified"
+        );
+        let messages = vec![ChatMessage {
+            image_urls: Vec::new(),
+            unsupported_content_parts: Vec::new(),
+            role: "user".to_string(),
+            content: "hello".to_string(),
+        }];
+        let rejection = render_smollm3_production_chat_prompt(
+            "smollm3",
+            &tokenizer,
+            "SmolLM3-Q8_0.gguf",
+            &messages,
+            None,
+            None,
+        )
+        .expect("the architecture owns the exact-template decision")
+        .expect_err("marker-only substitution must fail closed");
+        assert_eq!(rejection.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            rejection
+                .extensions()
+                .get::<ApiErrorDetails>()
+                .expect("typed error details")
+                .code,
+            "unsupported_chat_template"
+        );
+        assert!(render_smollm3_production_chat_prompt(
+            "qwen3", &tokenizer, "qwen", &messages, None, None,
+        )
+        .is_none());
+
+        let err = render_chat_prompt_for_tokenization_for_model_result(
+            &messages, &tokenizer, None, false,
+        )
+        .expect_err("template dispatch must fail before generic Qwen3 rendering");
+        assert!(err
+            .to_string()
+            .contains("architecture-scoped exact-template renderer"));
+
+        let shape_pack: serde_json::Value = serde_json::from_str(include_str!(
+            "../../qa/prompt-packs/smollm3-chat-template-shapes-v1.json"
+        ))
+        .expect("parse exact SmolLM3 shape pack");
+        let exact = shape_pack["source_template"]["text"]
+            .as_str()
+            .expect("shape pack carries exact source template");
+        assert!(is_smollm3_dynamic_chat_template(exact));
+        assert!(is_exact_smollm3_chat_template(exact));
+        assert_eq!(
+            detect_chat_template_format(exact),
+            "smollm3_exact_template_identity"
+        );
+        tokenizer.chat_template = Some(exact.to_string());
+        let rendered = render_smollm3_production_chat_prompt(
+            "smollm3",
+            &tokenizer,
+            "SmolLM3-Q8_0.gguf",
+            &messages,
+            None,
+            None,
+        )
+        .expect("the architecture owns the exact-template decision")
+        .expect("exact default-thinking text chat is open");
+        assert!(rendered.text.contains("Reasoning Mode: /think"));
+        assert!(rendered.text.ends_with("<|im_start|>assistant\n"));
+    }
+
+    #[test]
+    fn smollm3_exact_renderer_matches_bounded_oracle_shapes() {
+        let pack: serde_json::Value = serde_json::from_str(include_str!(
+            "../../qa/prompt-packs/smollm3-chat-template-shapes-v1.json"
+        ))
+        .expect("parse SmolLM3 prompt-shape pack");
+        let template = pack["source_template"]["text"]
+            .as_str()
+            .expect("exact source template");
+        assert_eq!(template.len(), SMOLLM3_EXACT_CHAT_TEMPLATE_UTF8_BYTES);
+        assert_eq!(
+            format!("{:x}", Sha256::digest(template.as_bytes())),
+            SMOLLM3_EXACT_CHAT_TEMPLATE_SHA256
+        );
+        assert_eq!(
+            format_smollm3_local_date(10, 8, 2026).as_deref(),
+            Some("10 August 2026")
+        );
+        assert_eq!(
+            format_smollm3_local_date(29, 2, 2024).as_deref(),
+            Some("29 February 2024")
+        );
+        assert!(format_smollm3_local_date(29, 2, 2025).is_none());
+        assert!(format_smollm3_local_date(1, 13, 2026).is_none());
+        assert!(current_smollm3_local_date()
+            .as_deref()
+            .is_some_and(valid_smollm3_injected_date));
+
+        let message = |role: &str, content: &str| ChatMessage {
+            role: role.to_string(),
+            content: content.to_string(),
+            image_urls: Vec::new(),
+            unsupported_content_parts: Vec::new(),
+        };
+        let text_parts_message: ChatMessage = serde_json::from_value(serde_json::json!({
+            "role": "user",
+            "content": [
+                { "type": "text", "text": "Hello, " },
+                { "type": "text", "text": "please help me." }
+            ]
+        }))
+        .expect("text-only content parts canonicalize to a string");
+        assert_eq!(text_parts_message.content, "Hello, please help me.");
+        assert!(text_parts_message.image_urls.is_empty());
+        assert!(text_parts_message.unsupported_content_parts.is_empty());
+        assert_eq!(
+            render_smollm3_exact_chat_prompt(
+                std::slice::from_ref(&text_parts_message),
+                template,
+                None,
+                true,
+                "10 August 2026",
+            )
+            .expect("post-canonicalization text parts are the plain-text shape"),
+            render_smollm3_exact_chat_prompt(
+                &[message("user", "Hello, please help me.")],
+                template,
+                None,
+                true,
+                "10 August 2026",
+            )
+            .expect("plain-text shape"),
+        );
+        let cases = pack["cases"].as_array().expect("shape cases");
+        for (case, messages) in [
+            (&cases[0], vec![message("user", "Hello, please help me.")]),
+            (
+                &cases[1],
+                vec![
+                    message("user", "Hello, please help me."),
+                    message("assistant", "I can help you with that."),
+                    message("user", "Thank you."),
+                ],
+            ),
+        ] {
+            let expected = case["normalized_prompt"]
+                .as_str()
+                .expect("normalized prompt")
+                .replace("{{CURRENT_DATE_DD_MONTH_YYYY}}", "10 August 2026");
+            let omitted =
+                render_smollm3_exact_chat_prompt(&messages, template, None, true, "10 August 2026")
+                    .expect("omitted thinking defaults to true");
+            let explicit = render_smollm3_exact_chat_prompt(
+                &messages,
+                template,
+                Some(true),
+                true,
+                "10 August 2026",
+            )
+            .expect("explicit true thinking is in the bounded envelope");
+            assert_eq!(omitted, explicit);
+            assert_eq!(omitted.text, expected);
+            assert!(!omitted.add_special);
+            assert!(omitted.parse_special);
+            assert!(omitted.text.contains(
+                "detail necessary steps needed to reach the conclusion.\n\n<|im_start|>user"
+            ));
+            assert!(!omitted
+                .text
+                .contains("detail necessary steps needed to reach the conclusion.\n\n<|im_end|>"));
+        }
+
+        let leading_newline_history = vec![
+            message("user", "First"),
+            message("assistant", "\n\nAnswer"),
+            message("user", "Second"),
+        ];
+        let rendered = render_smollm3_exact_chat_prompt(
+            &leading_newline_history,
+            template,
+            Some(true),
+            true,
+            "29 February 2024",
+        )
+        .expect("valid leap-day injection and assistant history");
+        assert!(rendered
+            .text
+            .contains("<|im_start|>assistant\nAnswer<|im_end|>\n"));
+        assert!(rendered.text.contains("Today Date: 29 February 2024\n"));
+    }
+
+    #[test]
+    fn smollm3_exact_renderer_typed_blocks_every_unqualified_branch() {
+        let pack: serde_json::Value = serde_json::from_str(include_str!(
+            "../../qa/prompt-packs/smollm3-chat-template-shapes-v1.json"
+        ))
+        .expect("parse SmolLM3 prompt-shape pack");
+        let template = pack["source_template"]["text"]
+            .as_str()
+            .expect("exact source template");
+        let message = |role: &str, content: &str| ChatMessage {
+            role: role.to_string(),
+            content: content.to_string(),
+            image_urls: Vec::new(),
+            unsupported_content_parts: Vec::new(),
+        };
+        let render = |messages: &[ChatMessage],
+                      source_template: &str,
+                      thinking: Option<bool>,
+                      add_generation_prompt: bool,
+                      today: &str| {
+            render_smollm3_exact_chat_prompt(
+                messages,
+                source_template,
+                thinking,
+                add_generation_prompt,
+                today,
+            )
+        };
+        let user = message("user", "Hello");
+
+        for (messages, expected) in [
+            (Vec::new(), SmolLm3TemplatePreparationError::EmptyMessages),
+            (
+                vec![message("user", "")],
+                SmolLm3TemplatePreparationError::EmptyContent,
+            ),
+            (
+                vec![message("system", "custom instructions")],
+                SmolLm3TemplatePreparationError::SystemRoleUnsupported,
+            ),
+            (
+                vec![message("system", "/system_override custom")],
+                SmolLm3TemplatePreparationError::SystemOverrideUnsupported,
+            ),
+            (
+                vec![message("tool", "result")],
+                SmolLm3TemplatePreparationError::ToolRoleUnsupported,
+            ),
+            (
+                vec![message("developer", "policy")],
+                SmolLm3TemplatePreparationError::UnsupportedRole,
+            ),
+            (
+                vec![message(" user ", "Hello")],
+                SmolLm3TemplatePreparationError::UnsupportedRole,
+            ),
+            (
+                vec![message("User", "Hello")],
+                SmolLm3TemplatePreparationError::UnsupportedRole,
+            ),
+            (
+                vec![message("user", "First"), message("user", "Second")],
+                SmolLm3TemplatePreparationError::NonAlternatingHistory,
+            ),
+            (
+                vec![message("user", "First"), message("assistant", "Answer")],
+                SmolLm3TemplatePreparationError::HistoryMustEndWithUser,
+            ),
+        ] {
+            let error = render(&messages, template, None, true, "10 August 2026")
+                .expect_err("shape must remain outside the bounded envelope");
+            assert_eq!(error, expected);
+            assert!(error.code().starts_with("smollm3_template_"));
+        }
+
+        assert_eq!(
+            render(
+                std::slice::from_ref(&user),
+                template,
+                Some(false),
+                true,
+                "10 August 2026"
+            )
+            .expect_err("false thinking remains blocked"),
+            SmolLm3TemplatePreparationError::ExplicitFalseThinkingUnsupported
+        );
+        assert_eq!(
+            render(
+                std::slice::from_ref(&user),
+                template,
+                None,
+                false,
+                "10 August 2026"
+            )
+            .expect_err("generation prompt is mandatory in this slice"),
+            SmolLm3TemplatePreparationError::AddGenerationPromptRequired
+        );
+        for invalid_date in [
+            "10 Aug 2026",
+            "10 august 2026",
+            "0 August 2026",
+            "00 August 2026",
+            "31 February 2026",
+            "29 February 2025",
+            "10 August 26",
+            "10 August 0000",
+            "2026-08-10",
+        ] {
+            assert_eq!(
+                render(
+                    std::slice::from_ref(&user),
+                    template,
+                    None,
+                    true,
+                    invalid_date
+                )
+                .expect_err("date must be exact locale-independent DD Month YYYY"),
+                SmolLm3TemplatePreparationError::InvalidInjectedDate
+            );
+        }
+
+        let mut multimodal = user.clone();
+        multimodal
+            .image_urls
+            .push("data:image/png;base64,AQID".to_string());
+        assert_eq!(
+            render(&[multimodal], template, None, true, "10 August 2026")
+                .expect_err("multimodal input remains blocked"),
+            SmolLm3TemplatePreparationError::MultimodalUnsupported
+        );
+        let mut structured = user.clone();
+        structured
+            .unsupported_content_parts
+            .push("input_audio".to_string());
+        assert_eq!(
+            render(&[structured], template, None, true, "10 August 2026")
+                .expect_err("structured input remains blocked"),
+            SmolLm3TemplatePreparationError::StructuredContentUnsupported
+        );
+
+        let same_length_hash_mutation = template.replacen("defaults", "Defaults", 1);
+        assert_eq!(same_length_hash_mutation.len(), template.len());
+        assert_ne!(same_length_hash_mutation, template);
+        for mutated_template in [
+            format!("{template} "),
+            same_length_hash_mutation,
+            template.replacen(
+                "{# ───── main loop ───── #}",
+                "{{- \"<|im_end|>\\n\" -}}\n{# ───── main loop ───── #}",
+                1,
+            ),
+        ] {
+            assert_eq!(
+                render(
+                    std::slice::from_ref(&user),
+                    &mutated_template,
+                    None,
+                    true,
+                    "10 August 2026",
+                )
+                .expect_err("any source-template mutation must fail before rendering"),
+                SmolLm3TemplatePreparationError::TemplateIdentityMismatch
+            );
+        }
     }
 
     /// Phase 3c triage: routing admits gemma3 by ARCH while the dense renderer
@@ -25246,6 +28939,68 @@ mod tests {
     }
 
     #[test]
+    fn deepseek_r1_native_template_is_a_typed_422_for_chat_and_tools() {
+        let _guard = crate::test_support::env_lock();
+        let template = "{{ bos_token }}<｜begin▁of▁sentence｜>{% for message in messages %}{% if message['role'] == 'user' %}<｜User｜>{{ message['content'] }}{% else %}<｜Assistant｜>{{ message['content'] }}{% endif %}{% endfor %}";
+        assert!(is_deepseek_r1_native_chat_template(template));
+        assert!(!is_qwen3_chatml_template(template));
+        let tokenizer = llama3_tokenizer_with_template(template);
+        let messages = [ChatMessage {
+            image_urls: Vec::new(),
+            unsupported_content_parts: Vec::new(),
+            role: "user".to_string(),
+            content: "hello".to_string(),
+        }];
+
+        for metadata_renderer in [false, true] {
+            if metadata_renderer {
+                std::env::set_var(METADATA_CHAT_TEMPLATE_ENV, "metadata");
+            } else {
+                std::env::remove_var(METADATA_CHAT_TEMPLATE_ENV);
+            }
+            let err = render_chat_prompt_for_tokenization_for_model_result(
+                &messages,
+                &tokenizer,
+                Some("DeepSeek-R1-0528-Qwen3-8B-Q4_K_M"),
+                false,
+            )
+            .expect_err("native DeepSeek R1 chat must fail closed");
+            assert_eq!(err.kind(), MiniJinjaErrorKind::InvalidOperation);
+            assert!(err
+                .to_string()
+                .contains("native DeepSeek R1 marker template"));
+            let response =
+                unsupported_chat_template_response("DeepSeek-R1-0528-Qwen3-8B-Q4_K_M", &err);
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            let details = response
+                .extensions()
+                .get::<ApiErrorDetails>()
+                .expect("typed API error details");
+            assert_eq!(details.code, "unsupported_chat_template");
+        }
+        std::env::remove_var(METADATA_CHAT_TEMPLATE_ENV);
+
+        let tools = [serde_json::json!({
+            "name": "read_file",
+            "description": "Read a file",
+            "parameters": {"type": "object", "properties": {}}
+        })];
+        let err = render_chat_prompt_for_tokenization_with_tools(&messages, &tokenizer, &tools)
+            .expect_err("native DeepSeek R1 tools must fail closed");
+        assert!(err.to_string().contains("native DeepSeek R1 tool envelope"));
+        let response = unsupported_chat_template_response("DeepSeek-R1-0528-Qwen3-8B-Q4_K_M", &err);
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            response
+                .extensions()
+                .get::<ApiErrorDetails>()
+                .expect("typed API error details")
+                .code,
+            "unsupported_chat_template"
+        );
+    }
+
+    #[test]
     fn metadata_jinja_renderer_reports_undefined_variables_as_unsupported() {
         let _guard = crate::test_support::env_lock();
         std::env::set_var(METADATA_CHAT_TEMPLATE_ENV, "metadata");
@@ -25533,6 +29288,86 @@ mod tests {
         }
     }
 
+    /// Synthetic dense-Q8 binding whose non-linear tensors have zero-sized f32
+    /// storage. This isolates the storage policy under test: every byte in its
+    /// estimate belongs to a tensor routed through the loader's `load_linear`
+    /// closure, so forced lazy is genuinely materialization-free.
+    fn dense_quant_materialization_binding(
+        tied_output: bool,
+        tensor_type: GgufTensorType,
+        dimensions: Vec<u64>,
+    ) -> LlamaTensorBinding {
+        let mut binding = materialization_binding(tied_output, tensor_type, dimensions);
+        let empty_f32 = |name: &str| materialization_desc(name, GgufTensorType::F32, vec![0]);
+        binding.output_norm = empty_f32("output_norm.weight");
+        for layer in &mut binding.layers {
+            layer.attention_norm = empty_f32("blk.0.attn_norm.weight");
+            layer.ffn_norm = empty_f32("blk.0.ffn_norm.weight");
+        }
+        binding
+    }
+
+    fn dense_q8_materialization_binding(
+        tied_output: bool,
+        dimensions: Vec<u64>,
+    ) -> LlamaTensorBinding {
+        dense_quant_materialization_binding(tied_output, GgufTensorType::Q8_0, dimensions)
+    }
+
+    fn mla_q8_materialization_binding() -> LlamaTensorBinding {
+        let mut binding = dense_q8_materialization_binding(true, vec![0]);
+        let q8 = |name: &str, dimensions: Vec<u64>| {
+            materialization_desc(name, GgufTensorType::Q8_0, dimensions)
+        };
+        let f32 = |name: &str| materialization_desc(name, GgufTensorType::F32, vec![0]);
+        binding.mla_metadata = Some(crate::model::MlaMetadata {
+            q_lora_rank: 3,
+            kv_lora_rank: 5,
+            nope_head_dim: 4,
+            rope_head_dim: 2,
+        });
+        binding.attention_head_count = 2;
+        binding.hidden_size = 7;
+        binding.layers[0].attention = LlamaAttentionTensors::Mla {
+            q_a_proj: q8("blk.0.attn_q_a_proj.weight", vec![0]),
+            q_a_layernorm: f32("blk.0.attn_q_a_norm.weight"),
+            q_b_proj: q8("blk.0.attn_q_b_proj.weight", vec![3, 12]),
+            kv_a_proj_with_mqa: q8("blk.0.attn_kv_a_mqa.weight", vec![0]),
+            kv_a_layernorm: f32("blk.0.attn_kv_a_norm.weight"),
+            kv_b_proj: q8("blk.0.attn_kv_b.weight", vec![5, 16]),
+        };
+        binding.layers[0].attention_output = q8(
+            "blk.0.attn_output.weight",
+            vec![8, binding.hidden_size as u64],
+        );
+        binding
+    }
+
+    fn q4_moe_materialization_binding(split: bool) -> LlamaTensorBinding {
+        let mut binding = dense_q8_materialization_binding(true, vec![0]);
+        let expert = materialization_desc(
+            "blk.0.ffn_gate_exps.weight",
+            GgufTensorType::Q4_0,
+            vec![32, 1, 1],
+        );
+        let expert_set = |suffix: &str| {
+            let mut desc = expert.clone();
+            desc.name = format!("blk.0.ffn_{suffix}_exps.weight");
+            if split {
+                LlamaMoeExpertTensors::Split(vec![desc])
+            } else {
+                LlamaMoeExpertTensors::Merged(desc)
+            }
+        };
+        binding.layers[0].ffn = LlamaFfnTensors::MoE {
+            router: materialization_desc("blk.0.ffn_gate_inp.weight", GgufTensorType::F32, vec![0]),
+            gate_experts: expert_set("gate"),
+            up_experts: expert_set("up"),
+            down_experts: expert_set("down"),
+        };
+        binding
+    }
+
     fn materialization_desc(
         name: &str,
         tensor_type: GgufTensorType,
@@ -25541,6 +29376,14 @@ mod tests {
         let element_count = dimensions.iter().product::<u64>();
         let n_bytes = match tensor_type {
             GgufTensorType::Q8_0 => element_count.div_ceil(32) * 34,
+            GgufTensorType::Q2K => element_count.div_ceil(256) * 84,
+            GgufTensorType::Q3K => element_count.div_ceil(256) * 110,
+            GgufTensorType::Q4K => element_count.div_ceil(256) * 144,
+            GgufTensorType::Q5K => element_count.div_ceil(256) * 176,
+            GgufTensorType::Q6K => element_count.div_ceil(256) * 210,
+            GgufTensorType::Q1_0 => element_count.div_ceil(128) * 18,
+            GgufTensorType::Q2_0G64 => element_count.div_ceil(64) * 18,
+            GgufTensorType::Q2_0G128 | GgufTensorType::Pq2_0 => element_count.div_ceil(128) * 34,
             GgufTensorType::F32 => element_count * 4,
             GgufTensorType::F16 | GgufTensorType::BF16 => element_count * 2,
             _ => element_count,
@@ -26124,6 +29967,15 @@ pub struct CatalogItemView {
     pub architecture: String,
     pub license: String,
     pub oracle_qualified: bool,
+    /// Current-host verdict for a curated row whose support evidence is narrower
+    /// than the static catalog contract. `None` keeps the ordinary existing
+    /// compatibility/oracle path for rows without an explicit host predicate.
+    ///
+    /// An explicit non-supported value is authoritative: it prevents a static
+    /// `/api/capabilities` row from promoting platform-scoped evidence onto an
+    /// unreceipted host. Live Hugging Face rows never carry this field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_lane_class: Option<ModelLaneClass>,
     /// `"curated"` (pinned, known-good, authoritative metadata) or `"experimental"`
     /// (live from Hugging Face; metadata is advisory and must never read as support).
     pub group: &'static str,
@@ -26282,6 +30134,7 @@ impl CatalogItemView {
             architecture: item.architecture.to_string(),
             license: item.license.to_string(),
             oracle_qualified: crate::runnable::oracle_qualified(item.architecture, item.quant),
+            host_lane_class: catalog_host_lane_class(item),
             group: "curated",
             arch_detected: true,
             fit,
@@ -26327,6 +30180,7 @@ impl CatalogItemView {
             architecture: file.architecture,
             license: String::new(),
             oracle_qualified: false,
+            host_lane_class: None,
             group: "experimental",
             arch_detected: false,
             fit,
@@ -26351,6 +30205,45 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             quant: "Q8_0",
             architecture: "nomic-bert",
             license: "apache-2.0",
+            task_tags: &["embeddings", "retrieval"],
+        },
+        CatalogItem {
+            catalog_id: "bitnet_b1_58_2b_4t_i2_s",
+            name: "Microsoft BitNet b1.58 2B 4T I2_S",
+            repo_id: "microsoft/BitNet-b1.58-2B-4T-gguf",
+            filename: "ggml-model-i2_s.gguf",
+            size_bytes: 1_187_801_280,
+            downloads: 0,
+            likes: 0,
+            quant: "I2_S",
+            architecture: "bitnet-b1.58",
+            license: "mit",
+            task_tags: &["general"],
+        },
+        CatalogItem {
+            catalog_id: "bitnet_embedding_0_6b_i2_s",
+            name: "Microsoft BitNet Embedding 0.6B I2_S",
+            repo_id: "microsoft/BitNet-embedding-0.6B",
+            filename: "bitnet-embeddings-0.6b-bf16-i2_s.gguf",
+            size_bytes: 427_935_008,
+            downloads: 0,
+            likes: 0,
+            quant: "I2_S",
+            architecture: "qwen3",
+            license: "mit",
+            task_tags: &["embeddings", "retrieval"],
+        },
+        CatalogItem {
+            catalog_id: "bitnet_embedding_270m_i2_s",
+            name: "Microsoft BitNet Embedding 270M I2_S",
+            repo_id: "microsoft/BitNet-embedding-270M",
+            filename: "bitnet-embeddings-270m-bf16-i2_s.gguf",
+            size_bytes: 367_487_040,
+            downloads: 0,
+            likes: 0,
+            quant: "I2_S",
+            architecture: "gemma3",
+            license: "mit",
             task_tags: &["embeddings", "retrieval"],
         },
         CatalogItem {
@@ -26484,6 +30377,32 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             task_tags: &["general", "coding"],
         },
         CatalogItem {
+            catalog_id: "mistral_nemo_instruct_2407_q4_k_m",
+            name: "Mistral Nemo Instruct 2407 Q4_K_M (validation hold)",
+            repo_id: "MaziyarPanahi/Mistral-Nemo-Instruct-2407-GGUF",
+            filename: "Mistral-Nemo-Instruct-2407.Q4_K_M.gguf",
+            size_bytes: 7_477_204_928,
+            downloads: 0,
+            likes: 0,
+            quant: "Q4_K_M",
+            architecture: "llama",
+            license: "apache-2.0",
+            task_tags: &["general", "coding"],
+        },
+        CatalogItem {
+            catalog_id: "lfm2_5_2_6b_q8_0",
+            name: "LFM2.5 2.6B Q8_0",
+            repo_id: "LiquidAI/LFM2.5-2.6B-GGUF",
+            filename: "LFM2.5-2.6B-Q8_0.gguf",
+            size_bytes: 2_874_779_456,
+            downloads: 0,
+            likes: 0,
+            quant: "Q8_0",
+            architecture: "lfm2",
+            license: "LFM Open License v1.0",
+            task_tags: &["general", "reasoning"],
+        },
+        CatalogItem {
             catalog_id: "qwen3_0_6b_instruct_q8_0",
             name: "Qwen3 0.6B Q8_0",
             repo_id: "Qwen/Qwen3-0.6B-GGUF",
@@ -26556,6 +30475,19 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             downloads: 0,
             likes: 0,
             quant: "Q8_0",
+            architecture: "qwen3",
+            license: "apache-2.0",
+            task_tags: &["reasoning", "coding"],
+        },
+        CatalogItem {
+            catalog_id: "qwen3_14b_q4_k_m",
+            name: "Qwen3 14B Q4_K_M (active validation)",
+            repo_id: "Qwen/Qwen3-14B-GGUF",
+            filename: "Qwen3-14B-Q4_K_M.gguf",
+            size_bytes: 9_001_752_960,
+            downloads: 0,
+            likes: 0,
+            quant: "Q4_K_M",
             architecture: "qwen3",
             license: "apache-2.0",
             task_tags: &["reasoning", "coding"],
@@ -26664,17 +30596,17 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             task_tags: &["reasoning", "coding"],
         },
         CatalogItem {
-            catalog_id: "c4ai_command_r_v01_q8_0",
-            name: "Cohere Command R v01 Q8_0",
-            repo_id: "second-state/C4AI-Command-R-v01-GGUF",
-            filename: "c4ai-command-r-v01-Q8_0.gguf",
-            size_bytes: 37179013760,
+            catalog_id: "deepseek_r1_0528_qwen3_8b_q4_k_m",
+            name: "DeepSeek R1 0528 Qwen3 8B Q4_K_M (validation hold)",
+            repo_id: "unsloth/DeepSeek-R1-0528-Qwen3-8B-GGUF",
+            filename: "DeepSeek-R1-0528-Qwen3-8B-Q4_K_M.gguf",
+            size_bytes: 5_027_785_216,
             downloads: 0,
             likes: 0,
-            quant: "Q8_0",
-            architecture: "command-r",
-            license: "cc-by-nc-4.0",
-            task_tags: &["general"],
+            quant: "Q4_K_M",
+            architecture: "qwen3",
+            license: "mit",
+            task_tags: &["reasoning", "coding"],
         },
         CatalogItem {
             catalog_id: "deepseek_r1_distill_llama_8b_q8_0",
@@ -26938,6 +30870,11 @@ pub struct LocalModelEntry {
     /// The GGUF ships a chat template â€” i.e. it is an instruction-tuned chat model
     /// (vs a base text-completion model). A model capability, not a system fact.
     pub chat_capable: bool,
+    /// The file exposes an embedding/reranking runtime.
+    pub embedding_capable: bool,
+    /// The file exposes a token-generation head. This intentionally differs from
+    /// `chat_capable`, because base completion models need no chat template.
+    pub generation_capable: bool,
     /// Trained context window (tokens) from the GGUF â€” a model capability.
     pub context_length: Option<u32>,
     /// A validated catalog-managed marker and sibling `.cghost` are present, so
@@ -27405,10 +31342,16 @@ mod default_model_api_tests {
 /// error. One regression test per surface, over the real router.
 #[cfg(test)]
 mod runnable_completions_gate_api_tests {
-    use std::collections::BTreeMap;
+    use std::{
+        collections::{BTreeMap, HashMap},
+        sync::OnceLock,
+    };
 
     use super::*;
     use crate::gguf::{GgufMetadataValue, GgufTensorDescriptor};
+    use crate::tokenizer::{
+        BpePreTokenizer, BpeRegistry, SpecialTokens, TokenizerConfig, TokenizerModel,
+    };
     use axum::{
         body::{to_bytes, Body},
         http::Request,
@@ -27501,12 +31444,182 @@ mod runnable_completions_gate_api_tests {
         state
     }
 
+    fn exact_qwen3_moe_template_from_fixture() -> String {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../qa/model-qualification/fixtures/qwen3-moe-chat-template-v1.json"
+        ))
+        .expect("committed Qwen3-MoE exact-template fixture parses");
+        fn assert_exact_keys(value: &Value, expected: &[&str]) {
+            let object = value.as_object().expect("fixture section is an object");
+            let mut actual = object.keys().map(String::as_str).collect::<Vec<_>>();
+            let mut expected = expected.to_vec();
+            actual.sort_unstable();
+            expected.sort_unstable();
+            assert_eq!(actual, expected, "fixture object has an unexpected field");
+        }
+
+        assert_exact_keys(&fixture, &["grounding", "schema", "source", "template"]);
+        assert_exact_keys(
+            &fixture["source"],
+            &["file", "repo", "revision", "sha256", "size_bytes"],
+        );
+        assert_exact_keys(
+            &fixture["grounding"],
+            &[
+                "extraction_prefix_sha256",
+                "extraction_range",
+                "header_receipt",
+                "header_receipt_sha256",
+                "receipt_prefix_bytes",
+                "receipt_prefix_sha256",
+            ],
+        );
+        assert_exact_keys(&fixture["template"], &["jinja", "sha256", "utf8_bytes"]);
+        assert_eq!(
+            fixture["schema"],
+            "camelid.qwen3_moe_chat_template_fixture.v1"
+        );
+        assert_eq!(fixture["source"]["repo"], "Qwen/Qwen3-30B-A3B-GGUF");
+        assert_eq!(fixture["source"]["file"], "Qwen3-30B-A3B-Q8_0.gguf");
+        assert_eq!(
+            fixture["source"]["revision"],
+            "e4d4bafdfb96a411a163846265362aceb0b9c63a"
+        );
+        assert_eq!(fixture["source"]["size_bytes"], 32_483_931_648_u64);
+        assert_eq!(
+            fixture["source"]["sha256"],
+            "4ad960d180b16f56024f5b704697e5dd5b0837167c2e515ef0569abfc599743c"
+        );
+        assert_eq!(
+            fixture["grounding"]["header_receipt"],
+            "qa/model-qualification/qwen3-30b-a3b-q8-header-inspection.json"
+        );
+        assert_eq!(
+            fixture["grounding"]["header_receipt_sha256"],
+            format!(
+                "{:x}",
+                Sha256::digest(include_bytes!(
+                    "../../qa/model-qualification/qwen3-30b-a3b-q8-header-inspection.json"
+                ))
+            )
+        );
+        assert_eq!(fixture["grounding"]["receipt_prefix_bytes"], 33_554_432_u64);
+        assert_eq!(
+            fixture["grounding"]["receipt_prefix_sha256"],
+            "55c565264523c5862247d983f857b9034c04d762ee14fecfd68a827cdbb2d566"
+        );
+        assert_eq!(
+            fixture["grounding"]["extraction_range"],
+            "bytes 0-5969407/32483931648"
+        );
+        assert_eq!(
+            fixture["grounding"]["extraction_prefix_sha256"],
+            "90cffffb68f602aadb8d3d8fbe3f4224d4bb3db869ebdb494478d64528ad832e"
+        );
+        assert_eq!(
+            fixture["template"]["utf8_bytes"],
+            QWEN3_MOE_EXACT_CHAT_TEMPLATE_UTF8_BYTES
+        );
+        assert_eq!(
+            fixture["template"]["sha256"],
+            QWEN3_MOE_EXACT_CHAT_TEMPLATE_SHA256
+        );
+        fixture["template"]["jinja"]
+            .as_str()
+            .expect("fixture carries the exact tokenizer.chat_template")
+            .to_string()
+    }
+
+    fn qwen3_moe_test_tokenizer() -> Tokenizer {
+        Tokenizer {
+            model: TokenizerModel::Gpt2Bpe,
+            bpe_pre_tokenizer: BpePreTokenizer::default(),
+            tokens: Vec::new(),
+            token_to_id: HashMap::new(),
+            byte_token_to_id: HashMap::new(),
+            bpe_ranks: HashMap::new(),
+            bpe_registry: BpeRegistry::default(),
+            special: SpecialTokens::default(),
+            config: TokenizerConfig {
+                add_bos: false,
+                add_eos: false,
+                add_sep: false,
+                add_space_prefix: false,
+                remove_extra_whitespaces: false,
+            },
+            chat_template: None,
+            specials_index: OnceLock::new(),
+        }
+    }
+
+    async fn state_with_loaded_qwen3_moe_template(template: Option<&str>) -> AppState {
+        let state = state_with_loaded_arch("qwen3moe").await;
+        let mut tokenizer = qwen3_moe_test_tokenizer();
+        tokenizer.chat_template = template.map(str::to_string);
+        state
+            .loaded_models
+            .write()
+            .await
+            .get_mut("gate-test")
+            .expect("synthetic qwen3moe model is loaded")
+            .tokenizer_runtime = Some(Arc::new(tokenizer));
+        state
+    }
+
+    fn exact_smollm3_template_from_pack() -> String {
+        let pack: Value = serde_json::from_str(include_str!(
+            "../../qa/prompt-packs/smollm3-chat-template-shapes-v1.json"
+        ))
+        .expect("committed SmolLM3 template pack parses");
+        let template = pack["source_template"]["text"]
+            .as_str()
+            .expect("pack carries the exact tokenizer.chat_template");
+        assert_eq!(template.len(), SMOLLM3_EXACT_CHAT_TEMPLATE_UTF8_BYTES);
+        assert!(is_exact_smollm3_chat_template(template));
+        template.to_string()
+    }
+
+    async fn state_with_loaded_arch_and_template(
+        architecture: &str,
+        template: Option<&str>,
+    ) -> AppState {
+        let state = state_with_loaded_arch(architecture).await;
+        let mut tokenizer = qwen3_moe_test_tokenizer();
+        tokenizer.chat_template = template.map(str::to_string);
+        let tokenizer_summary = tokenizer_summary(&tokenizer);
+        let mut loaded_models = state.loaded_models.write().await;
+        let model = loaded_models
+            .get_mut("gate-test")
+            .expect("synthetic smollm3 model is loaded");
+        model.tokenizer = TokenizerLoadState::Available(tokenizer_summary);
+        model.tokenizer_runtime = Some(Arc::new(tokenizer));
+        drop(loaded_models);
+        state
+    }
+
+    async fn state_with_loaded_smollm3_template(template: Option<&str>) -> AppState {
+        state_with_loaded_arch_and_template("smollm3", template).await
+    }
+
     async fn post_json(app: axum::Router, uri: &str, body: Value) -> (StatusCode, Value) {
         let request = Request::builder()
             .method("POST")
             .uri(uri)
             .header("content-type", "application/json")
             .body(Body::from(body.to_string()))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        (status, body)
+    }
+
+    async fn get_json(app: axum::Router, uri: &str) -> (StatusCode, Value) {
+        let request = Request::builder()
+            .method("GET")
+            .uri(uri)
+            .body(Body::empty())
             .unwrap();
         let response = app.oneshot(request).await.unwrap();
         let status = response.status();
@@ -27525,6 +31638,557 @@ mod runnable_completions_gate_api_tests {
                 .contains("/v1/chat/completions"),
             "rejection must point callers at the served chat surface: {body}"
         );
+    }
+
+    #[tokio::test]
+    async fn smollm3_props_caps_are_exact_template_and_envelope_aware() {
+        let exact = exact_smollm3_template_from_pack();
+        for (label, template, expected_available, expected_format, expected_blocker) in [
+            (
+                "exact",
+                Some(exact.as_str()),
+                true,
+                Some("smollm3_exact_default_thinking_text_qualified"),
+                None,
+            ),
+            (
+                "substituted",
+                Some("<|im_start|>system\nKnowledge Cutoff Date: June 2025\n{{ strftime_now('%d %B %Y') }}\nReasoning Mode:\n/system_override\n<|im_end|>\n"),
+                true,
+                Some("smollm3_dynamic_chatml_unqualified"),
+                Some("smollm3_exact_template_required"),
+            ),
+            (
+                "missing",
+                None,
+                false,
+                None,
+                Some("smollm3_chat_template_missing"),
+            ),
+        ] {
+            let app =
+                router_with_state(state_with_loaded_smollm3_template(template).await);
+            let (status, body) = get_json(app, "/props").await;
+            assert_eq!(status, StatusCode::OK, "{label}: {body}");
+            let caps = &body["chat_template_caps"];
+            assert_eq!(caps["available"], expected_available, "{label}: {caps}");
+            match expected_format {
+                Some(format) => assert_eq!(caps["detected_format"], format, "{label}: {caps}"),
+                None => assert!(caps["detected_format"].is_null(), "{label}: {caps}"),
+            }
+
+            let operations = caps["supported_operations"]
+                .as_array()
+                .expect("caps carry supported_operations");
+            let unsupported = caps["unsupported"]
+                .as_array()
+                .expect("caps carry unsupported exclusions");
+            if label == "exact" {
+                assert_eq!(operations, &[json!("render_prompt")]);
+                assert_eq!(caps["length"], SMOLLM3_EXACT_CHAT_TEMPLATE_UTF8_BYTES);
+                assert_eq!(caps["render_prompt_envelope"]["content"], "text_only");
+                assert_eq!(
+                    caps["render_prompt_envelope"]["history"],
+                    "strict_alternation_ending_user"
+                );
+                assert_eq!(
+                    caps["render_prompt_envelope"]["public_surfaces"]["/apply-template"]
+                        ["thinking"],
+                    json!(["omitted_effective_true"])
+                );
+                assert_eq!(
+                    caps["render_prompt_envelope"]["public_surfaces"]
+                        ["/v1/chat/completions"]["thinking"],
+                    json!(["omitted_defaults_true", "explicit_true"])
+                );
+                assert_eq!(
+                    caps["render_prompt_envelope"]["public_surfaces"]
+                        ["/v1/chat/completions"]["streaming"],
+                    json!([false, true])
+                );
+                assert!(caps["render_prompt_envelope"]["surfaces"].is_null());
+                assert!(caps["render_prompt_envelope"]["thinking"].is_null());
+                for exclusion in [
+                    "system_messages",
+                    "custom_instructions",
+                    "system_override",
+                    "tools",
+                    "tool_messages",
+                    "thinking_disabled",
+                    "multimodal_content",
+                    "non_text_content",
+                ] {
+                    assert!(unsupported.contains(&json!(exclusion)), "{exclusion}: {caps}");
+                }
+            } else {
+                assert!(
+                    operations.is_empty(),
+                    "{label} SmolLM3 template must never advertise render_prompt: {caps}"
+                );
+                assert!(caps["render_prompt_envelope"].is_null(), "{label}: {caps}");
+                assert!(
+                    unsupported.contains(&json!(expected_blocker.unwrap())),
+                    "{label}: {caps}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn smollm3_props_caps_refuse_exact_template_on_foreign_architecture() {
+        let exact = exact_smollm3_template_from_pack();
+        let app = router_with_state(
+            state_with_loaded_arch_and_template("qwen3", Some(exact.as_str())).await,
+        );
+        let (tokenizer_status, tokenizer_body) =
+            get_json(app.clone(), "/api/models/tokenizer").await;
+        assert_eq!(tokenizer_status, StatusCode::OK, "{tokenizer_body}");
+        assert_eq!(
+            tokenizer_body["chat_template"]["detected_format"], "smollm3_exact_template_identity",
+            "template-only diagnostics must report identity, not architecture-aware qualification"
+        );
+
+        let (status, body) = get_json(app, "/props").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let caps = &body["chat_template_caps"];
+        assert_eq!(caps["available"], true);
+        assert_eq!(caps["source"], "tokenizer.chat_template");
+        assert_eq!(
+            caps["detected_format"],
+            "smollm3_exact_template_architecture_mismatch"
+        );
+        assert_eq!(caps["declared_architecture"], "qwen3");
+        assert_eq!(caps["length"], SMOLLM3_EXACT_CHAT_TEMPLATE_UTF8_BYTES);
+        assert!(caps["supported_operations"].as_array().unwrap().is_empty());
+        assert!(caps["render_prompt_envelope"].is_null());
+        assert!(caps["unsupported"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("smollm3_architecture_template_mismatch")));
+        assert!(caps["unsupported"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("render_prompt")));
+        assert_eq!(body["chat_template"], exact);
+    }
+
+    #[tokio::test]
+    async fn smollm3_apply_template_renders_the_exact_default_thinking_shape() {
+        let exact = exact_smollm3_template_from_pack();
+        let before = current_smollm3_local_date().expect("system-local date is available");
+        let app = router_with_state(state_with_loaded_smollm3_template(Some(exact.as_str())).await);
+        let (status, body) = post_json(
+            app,
+            "/apply-template",
+            json!({"messages": [{"role": "user", "content": "Hello, please help me."}]}),
+        )
+        .await;
+        let after = current_smollm3_local_date().expect("system-local date is available");
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let messages = [ChatMessage {
+            role: "user".to_string(),
+            content: "Hello, please help me.".to_string(),
+            image_urls: Vec::new(),
+            unsupported_content_parts: Vec::new(),
+        }];
+        let prompt = body["prompt"].as_str().expect("prompt response");
+        assert!(
+            [before, after].iter().any(|today| {
+                render_smollm3_exact_chat_prompt(&messages, &exact, None, true, today)
+                    .is_ok_and(|expected| expected.text == prompt)
+            }),
+            "endpoint prompt must use one system-local date reading"
+        );
+        assert!(prompt.contains("Reasoning Mode: /think"));
+        assert!(prompt.ends_with("<|im_start|>assistant\n"));
+    }
+
+    #[tokio::test]
+    async fn smollm3_apply_template_rejects_substituted_and_missing_templates() {
+        for (label, template) in [
+            (
+                "substituted",
+                Some("<|im_start|>user\n{{ content }}<|im_end|>\n"),
+            ),
+            ("missing", None),
+        ] {
+            let app = router_with_state(state_with_loaded_smollm3_template(template).await);
+            let (status, body) = post_json(
+                app,
+                "/apply-template",
+                json!({"messages": [{"role": "user", "content": "hello"}]}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{label}: {body}");
+            assert_eq!(body["error"]["code"], "unsupported_chat_template");
+            assert_eq!(body["error"]["param"], "messages");
+        }
+    }
+
+    #[tokio::test]
+    async fn smollm3_exact_chat_opens_before_tokenization_for_stream_and_nonstream() {
+        let exact = exact_smollm3_template_from_pack();
+        for stream in [false, true] {
+            for thinking in [None, Some(true)] {
+                let app = router_with_state(
+                    state_with_loaded_smollm3_template(Some(exact.as_str())).await,
+                );
+                let mut request = json!({
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "stream": stream
+                });
+                if let Some(thinking) = thinking {
+                    request["camelid_enable_thinking"] = Value::Bool(thinking);
+                }
+                let (status, body) = post_json(app, "/v1/chat/completions", request).await;
+                assert_eq!(
+                    status,
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "stream={stream}, thinking={thinking:?}: {body}"
+                );
+                assert_eq!(
+                    body["error"]["code"], "tokenization_failed",
+                    "omitted and explicit-true thinking must both pass template rendering: {body}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn smollm3_unqualified_chat_branches_fail_typed_for_stream_and_nonstream() {
+        let exact = exact_smollm3_template_from_pack();
+        for stream in [false, true] {
+            for (label, request, expected_status, expected_code, expected_param) in [
+                (
+                    "system",
+                    json!({
+                        "messages": [
+                            {"role": "system", "content": "custom instructions"},
+                            {"role": "user", "content": "hello"}
+                        ],
+                        "stream": stream
+                    }),
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "unsupported_chat_template",
+                    "messages",
+                ),
+                (
+                    "system-override",
+                    json!({
+                        "messages": [
+                            {"role": "system", "content": "/system_override custom"},
+                            {"role": "user", "content": "hello"}
+                        ],
+                        "stream": stream
+                    }),
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "unsupported_chat_template",
+                    "messages",
+                ),
+                (
+                    "false-thinking",
+                    json!({
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "camelid_enable_thinking": false,
+                        "stream": stream
+                    }),
+                    StatusCode::BAD_REQUEST,
+                    "unsupported_parameter",
+                    "camelid_enable_thinking",
+                ),
+                (
+                    "tools",
+                    json!({
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "tools": [{
+                            "type": "function",
+                            "function": {
+                                "name": "read_file",
+                                "parameters": {"type": "object", "properties": {}}
+                            }
+                        }],
+                        "stream": stream
+                    }),
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "unsupported_tools",
+                    "tools",
+                ),
+                (
+                    "tool-history",
+                    json!({
+                        "messages": [
+                            {"role": "user", "content": "hello"},
+                            {"role": "assistant", "content": "calling"},
+                            {"role": "tool", "content": "result"}
+                        ],
+                        "stream": stream
+                    }),
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "unsupported_chat_template",
+                    "messages",
+                ),
+            ] {
+                let app = router_with_state(
+                    state_with_loaded_smollm3_template(Some(exact.as_str())).await,
+                );
+                let (status, body) = post_json(app, "/v1/chat/completions", request).await;
+                assert_eq!(status, expected_status, "{label}, stream={stream}: {body}");
+                assert_eq!(body["error"]["code"], expected_code, "{label}: {body}");
+                assert_eq!(body["error"]["param"], expected_param, "{label}: {body}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn smollm3_tools_fail_closed_independent_of_template_identity_and_stream_mode() {
+        let exact = exact_smollm3_template_from_pack();
+        for stream in [false, true] {
+            for (label, template) in [
+                ("exact", Some(exact.as_str())),
+                (
+                    "substituted",
+                    Some("<|im_start|>user\n{{ content }}<|im_end|>\n"),
+                ),
+                ("missing", None),
+            ] {
+                let app = router_with_state(state_with_loaded_smollm3_template(template).await);
+                let (status, body) = post_json(
+                    app,
+                    "/v1/chat/completions",
+                    json!({
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "tools": [{
+                            "type": "function",
+                            "function": {
+                                "name": "read_file",
+                                "parameters": {"type": "object", "properties": {}}
+                            }
+                        }],
+                        "stream": stream
+                    }),
+                )
+                .await;
+                assert_eq!(
+                    status,
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "{label}, stream={stream}: {body}"
+                );
+                assert_eq!(
+                    body["error"]["code"], "unsupported_tools",
+                    "{label}, stream={stream}: {body}"
+                );
+                assert_eq!(body["error"]["param"], "tools", "{label}: {body}");
+                let message = body["error"]["message"]
+                    .as_str()
+                    .expect("typed tools error includes a message");
+                assert!(
+                    message.contains("declares architecture 'smollm3'")
+                        && message.contains("regardless of embedded-template identity"),
+                    "diagnostic must describe the architecture-scoped refusal: {body}"
+                );
+                assert!(
+                    !message.contains("uses the exact SmolLM3 template"),
+                    "diagnostic must not claim substituted or missing templates are exact: {body}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn smollm3_chat_rejects_nonexact_templates_for_stream_and_nonstream() {
+        for stream in [false, true] {
+            for (label, template) in [
+                (
+                    "substituted",
+                    Some("<|im_start|>user\n{{ content }}<|im_end|>\n"),
+                ),
+                ("missing", None),
+            ] {
+                let app = router_with_state(state_with_loaded_smollm3_template(template).await);
+                let (status, body) = post_json(
+                    app,
+                    "/v1/chat/completions",
+                    json!({
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "stream": stream
+                    }),
+                )
+                .await;
+                assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{label}: {body}");
+                assert_eq!(body["error"]["code"], "unsupported_chat_template");
+                assert_eq!(body["error"]["param"], "messages");
+            }
+        }
+    }
+
+    #[test]
+    fn qwen3_moe_template_identity_is_exact_not_marker_based() {
+        let exact = exact_qwen3_moe_template_from_fixture();
+        assert_eq!(exact.len(), QWEN3_MOE_EXACT_CHAT_TEMPLATE_UTF8_BYTES);
+        assert!(is_exact_qwen3_moe_chat_template(&exact));
+
+        let mut substituted = exact.clone();
+        substituted.push(' ');
+        assert!(!is_exact_qwen3_moe_chat_template(&substituted));
+
+        let mut same_length_bytes = exact.clone().into_bytes();
+        same_length_bytes[0] = if same_length_bytes[0] == b'{' {
+            b'['
+        } else {
+            b'X'
+        };
+        let same_length = String::from_utf8(same_length_bytes).expect("ASCII mutation stays UTF-8");
+        assert_eq!(same_length.len(), exact.len());
+        assert!(!is_exact_qwen3_moe_chat_template(&same_length));
+        assert!(!is_exact_qwen3_moe_chat_template(
+            "<|im_start|>user\n{{ content }}<|im_end|>\n"
+        ));
+    }
+
+    #[test]
+    fn qwen3_moe_hold_is_architecture_scoped_when_template_is_shared() {
+        let mut tokenizer = qwen3_moe_test_tokenizer();
+        tokenizer.chat_template = Some(exact_qwen3_moe_template_from_fixture());
+        let messages = [ChatMessage {
+            image_urls: Vec::new(),
+            unsupported_content_parts: Vec::new(),
+            role: "user".to_string(),
+            content: "hello".to_string(),
+        }];
+        let tools = [json!({
+            "name": "read_file",
+            "description": "Read a file",
+            "parameters": {"type": "object", "properties": {}}
+        })];
+
+        assert!(
+            render_chat_prompt_for_tokenization_with_tools(&messages, &tokenizer, &tools).is_ok(),
+            "the shared exact template must remain available to dense Qwen3 rows"
+        );
+        assert!(reject_qwen3_moe_chat_until_template_qualified(
+            "qwen3",
+            &tokenizer,
+            "dense-qwen3",
+            Some(&tools),
+        )
+        .is_none());
+        let rejection = reject_qwen3_moe_chat_until_template_qualified(
+            "qwen3moe",
+            &tokenizer,
+            "held-qwen3-moe",
+            Some(&tools),
+        )
+        .expect("qwen3moe must fail closed before the shared renderer");
+        assert_eq!(rejection.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn qwen3_moe_apply_template_holds_exact_substituted_and_missing_templates() {
+        let exact = exact_qwen3_moe_template_from_fixture();
+        let variants = [
+            ("exact", Some(exact.as_str())),
+            (
+                "substituted",
+                Some("<|im_start|>user\n{{ content }}<|im_end|>\n"),
+            ),
+            ("missing", None),
+        ];
+
+        for (label, template) in variants {
+            let app = router_with_state(state_with_loaded_qwen3_moe_template(template).await);
+            let (status, body) = post_json(
+                app,
+                "/apply-template",
+                json!({"messages": [{"role": "user", "content": "hello"}]}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{label}: {body}");
+            assert_eq!(
+                body["error"]["code"], "unsupported_chat_template",
+                "{label}: {body}"
+            );
+            assert_eq!(body["error"]["param"], "messages", "{label}: {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn qwen3_moe_dense_chat_hold_is_stream_independent() {
+        let exact = exact_qwen3_moe_template_from_fixture();
+        for stream in [false, true] {
+            let app =
+                router_with_state(state_with_loaded_qwen3_moe_template(Some(exact.as_str())).await);
+            let (status, body) = post_json(
+                app,
+                "/v1/chat/completions",
+                json!({
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "stream": stream
+                }),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "stream={stream}: {body}"
+            );
+            assert_eq!(
+                body["error"]["code"], "unsupported_chat_template",
+                "stream={stream}: {body}"
+            );
+            assert_eq!(
+                body["error"]["param"], "messages",
+                "stream={stream}: {body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn qwen3_moe_explicit_tools_hold_is_template_and_stream_independent() {
+        let exact = exact_qwen3_moe_template_from_fixture();
+        let variants = [
+            ("exact", Some(exact.as_str())),
+            (
+                "substituted",
+                Some("<|im_start|>user\n{{ content }}<|im_end|>\n"),
+            ),
+            ("missing", None),
+        ];
+        for (label, template) in variants {
+            for stream in [false, true] {
+                let app = router_with_state(state_with_loaded_qwen3_moe_template(template).await);
+                let (status, body) = post_json(
+                    app,
+                    "/v1/chat/completions",
+                    json!({
+                        "messages": [{"role": "user", "content": "read notes.txt"}],
+                        "stream": stream,
+                        "tools": [{
+                            "type": "function",
+                            "function": {
+                                "name": "read_file",
+                                "parameters": {"type": "object", "properties": {}}
+                            }
+                        }]
+                    }),
+                )
+                .await;
+                assert_eq!(
+                    status,
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "{label}, stream={stream}: {body}"
+                );
+                assert_eq!(
+                    body["error"]["code"], "unsupported_tools",
+                    "{label}, stream={stream}: {body}"
+                );
+                assert_eq!(
+                    body["error"]["param"], "tools",
+                    "{label}, stream={stream}: {body}"
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -28100,6 +32764,8 @@ struct CachedLocalMeta {
     admission_reason: Option<String>,
     oracle_qualified: bool,
     chat_capable: bool,
+    embedding_capable: bool,
+    generation_capable: bool,
     context_length: Option<u32>,
 }
 
@@ -28247,10 +32913,14 @@ async fn local_models(
                         admission_reason: None,
                         oracle_qualified: false,
                         chat_capable: false,
+                        embedding_capable: false,
+                        generation_capable: false,
                         context_length: None,
                     };
                     match read_metadata(&path) {
                         Ok(gguf) => {
+                            c.embedding_capable = is_embedding_model(&gguf);
+                            c.generation_capable = is_generation_model(&gguf);
                             let quant = crate::runnable::headline_quant_of(&gguf);
                             c.quantization = Some(quant.clone());
                             // Model capabilities (system-independent): a chat template
@@ -28313,6 +32983,8 @@ async fn local_models(
                 admission_reason: meta.admission_reason,
                 oracle_qualified: meta.oracle_qualified,
                 chat_capable: meta.chat_capable,
+                embedding_capable: meta.embedding_capable,
+                generation_capable: meta.generation_capable,
                 context_length: meta.context_length,
                 ghost_moe_prepared: crate::ghost_install::is_prepared(&path),
                 lane_class,
@@ -28521,7 +33193,7 @@ const NON_CATALOG_SUPPORTED_ARTIFACTS: &[(&str, &str, &str)] = &[
     ),
     // Local requantization (BASALT/GABBRO pilot artifact, 6,058,607,776 B).
     // There is no upstream upload to pull, so the row can only reach the
-    // Supported lane through this allowlist -- SUPPORT_MATRIX_v0.1.md already
+    // Supported lane through this allowlist -- docs/reference/SUPPORT_MATRIX_v0.1.md already
     // records "no frontend pull-catalog entry" for it.
     (
         "gemma-4-E4B-it-NVFP4-mm.gguf",
@@ -28605,6 +33277,10 @@ const CURATED_SUPPORTED_ARTIFACT_SHA256: &[(&str, &str)] = &[
     (
         "Qwen3-4B-Q4_K_M.gguf",
         "7485fe6f11af29433bc51cab58009521f205840f5b4ae3a32fa7f92e8534fdf5",
+    ),
+    (
+        "LFM2.5-2.6B-Q8_0.gguf",
+        "36587fdf27bdfc69caf2637273679a0870ec155162161bde6fd16e8c70bdb757",
     ),
 ];
 
@@ -28709,13 +33385,169 @@ fn filename_is_supported_exact_row(filename: &str) -> bool {
             .any(|(artifact, row_id, _)| *artifact == filename && supported.contains(row_id))
 }
 
+const LFM2_5_2_6B_Q8_0_FILENAME: &str = "LFM2.5-2.6B-Q8_0.gguf";
+
+/// The exact platform envelope carried by the LFM2 promotion receipts.
+///
+/// Windows x86_64 owns the original runnable-CPU receipt. The independent Mac
+/// receipt is deliberately narrower: one Mac16,10 / base Apple M4 shape on
+/// macOS 26.5, with the resident-Metal lane enabled. Linux, CUDA, other Apple
+/// hardware, later macOS revisions, and a Mac CPU fallback remain runnable but
+/// experimental until they earn their own receipts.
+fn lfm2_support_scope_matches(
+    operating_system: &str,
+    architecture: &str,
+    mac_model_identifier: Option<&str>,
+    cpu_model: Option<&str>,
+    operating_system_version: Option<&str>,
+    resident_metal_enabled: bool,
+    supported_profile_selected: bool,
+) -> bool {
+    if !supported_profile_selected {
+        return false;
+    }
+    if operating_system == "windows" && architecture == "x86_64" {
+        return true;
+    }
+    operating_system == "macos"
+        && architecture == "aarch64"
+        && mac_model_identifier == Some("Mac16,10")
+        && cpu_model == Some("Apple M4")
+        && operating_system_version == Some("26.5")
+        && resident_metal_enabled
+}
+
+#[cfg(target_os = "macos")]
+fn lfm2_support_command_output(program: &str, args: &[&str]) -> Option<String> {
+    std::process::Command::new(program)
+        .args(args)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn lfm2_supported_on_current_host() -> bool {
+    let supported_profile_selected = crate::execution_plan::lfm2_supported_profile_selected();
+    if lfm2_support_scope_matches(
+        env::consts::OS,
+        env::consts::ARCH,
+        None,
+        None,
+        None,
+        false,
+        supported_profile_selected,
+    ) {
+        return true;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        static HOST_FACTS: OnceLock<(String, String, String)> = OnceLock::new();
+        static METAL_AVAILABLE: OnceLock<bool> = OnceLock::new();
+        let (model_identifier, cpu_model, operating_system_version) =
+            HOST_FACTS.get_or_init(|| {
+                (
+                    lfm2_support_command_output("sysctl", &["-n", "hw.model"])
+                        .unwrap_or_else(|| "unknown".into()),
+                    lfm2_support_command_output("sysctl", &["-n", "machdep.cpu.brand_string"])
+                        .unwrap_or_else(|| "unknown".into()),
+                    lfm2_support_command_output("sw_vers", &["-productVersion"])
+                        .unwrap_or_else(|| "unknown".into()),
+                )
+            });
+        lfm2_support_scope_matches(
+            env::consts::OS,
+            env::consts::ARCH,
+            Some(model_identifier),
+            Some(cpu_model),
+            Some(operating_system_version),
+            crate::runnable::model::lfm2_metal_enabled()
+                && *METAL_AVAILABLE.get_or_init(|| crate::metal::detect_metal_device().available),
+            supported_profile_selected,
+        )
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
+fn supported_exact_row_host_eligible(filename: &str) -> bool {
+    filename != LFM2_5_2_6B_Q8_0_FILENAME || lfm2_supported_on_current_host()
+}
+
+/// Finalize the provisional LFM plan only after the load pipeline has hashed
+/// the actual bytes. Planning can prove a host/backend shape but cannot prove
+/// artifact identity from GGUF metadata: `general.name` is user-controlled and
+/// a same-named replacement may carry different bytes. Every stored/health plan
+/// therefore loses the supported label unless filename and certified digest
+/// both match the promoted artifact.
+fn finalize_execution_plan_support_for_loaded_artifact(
+    plan: &mut ExecutionPlan,
+    model_path: &std::path::Path,
+    gguf_sha256: &str,
+) {
+    if plan.model_family != "lfm2" || plan.support_level != "supported_exact_row_smoke" {
+        return;
+    }
+    let filename = model_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    if filename == LFM2_5_2_6B_Q8_0_FILENAME
+        && supported_artifact_identity_matches(filename, gguf_sha256)
+    {
+        return;
+    }
+
+    plan.support_level = "unknown_or_unvalidated".into();
+    if let Some(reason) = plan
+        .reasons
+        .iter_mut()
+        .find(|reason| reason.starts_with("support_level="))
+    {
+        *reason = "support_level=unknown_or_unvalidated".into();
+    }
+    plan.reasons
+        .push("support withheld: LFM filename or certified sha256 did not match".into());
+}
+
+/// Add a current-host answer only for the explicitly platform-scoped LFM row.
+/// Other curated rows retain their existing compatibility/oracle prediction;
+/// live Hugging Face rows never call this helper.
+///
+/// Keeping the negative explicit is important for platform-scoped promotions:
+/// the capabilities ledger remains a description of all certified lanes, while
+/// this value answers whether the host serving the catalog owns one of them.
+fn catalog_host_lane_class_with_eligibility(
+    item: &CatalogItem,
+    host_eligible: bool,
+) -> Option<ModelLaneClass> {
+    (item.filename == LFM2_5_2_6B_Q8_0_FILENAME
+        && supported_compatibility_row_ids().contains(item.catalog_id))
+    .then_some(if host_eligible {
+        ModelLaneClass::Supported
+    } else {
+        ModelLaneClass::ExperimentalImplemented
+    })
+}
+
+fn catalog_host_lane_class(item: &CatalogItem) -> Option<ModelLaneClass> {
+    catalog_host_lane_class_with_eligibility(item, supported_exact_row_host_eligible(item.filename))
+}
+
 /// Classify a model from real header metadata. `architecture` is the parsed
 /// `general.architecture` (NOT a filename guess); `filename` identifies the exact
-/// artifact for the supported-row check.
+/// artifact for the supported-row check. Rows whose evidence is platform-scoped
+/// must also match the current host; otherwise an implemented artifact remains
+/// runnable under the explicit experimental label.
 fn classify_model_lane(architecture: Option<&str>, filename: &str) -> ModelLaneClass {
     match architecture {
         Some(arch) if crate::model::is_implemented_architecture(arch) || arch == "nomic-bert" => {
-            if filename_is_supported_exact_row(filename) {
+            if filename_is_supported_exact_row(filename)
+                && supported_exact_row_host_eligible(filename)
+            {
                 ModelLaneClass::Supported
             } else {
                 ModelLaneClass::ExperimentalImplemented
@@ -30315,6 +35147,47 @@ mod catalog_fit_tests {
     }
 
     #[test]
+    fn curated_supported_lane_is_explicitly_scoped_to_the_current_host() {
+        let hw = host(false, 0, 64 * GIB, 48 * GIB);
+        let item = row("lfm2_5_2_6b_q8_0");
+
+        // Exercise both sides without depending on the CI host. The static
+        // supported row remains the same; only the host receipt changes.
+        assert_eq!(
+            super::catalog_host_lane_class_with_eligibility(&item, true),
+            Some(super::ModelLaneClass::Supported)
+        );
+        assert_eq!(
+            super::catalog_host_lane_class_with_eligibility(&item, false),
+            Some(super::ModelLaneClass::ExperimentalImplemented)
+        );
+
+        let view = CatalogItemView::from_curated(&item, &hw);
+        let expected = if super::lfm2_supported_on_current_host() {
+            super::ModelLaneClass::Supported
+        } else {
+            super::ModelLaneClass::ExperimentalImplemented
+        };
+        assert_eq!(view.host_lane_class, Some(expected));
+        assert_eq!(
+            serde_json::to_value(&view).unwrap()["host_lane_class"],
+            serde_json::json!(match expected {
+                super::ModelLaneClass::Supported => "supported",
+                super::ModelLaneClass::ExperimentalImplemented => "experimental_implemented",
+                super::ModelLaneClass::Unsupported => "unsupported",
+            }),
+            "the frontend must receive the host-scoped verdict"
+        );
+
+        let unpromoted = row("qwen3_14b_q4_k_m");
+        assert_eq!(
+            super::catalog_host_lane_class_with_eligibility(&unpromoted, true),
+            None,
+            "a host verdict must not manufacture support for an unpromoted row"
+        );
+    }
+
+    #[test]
     fn both_bonsai_27b_rows_publish_the_same_checked_vision_projector() {
         let hw = host(true, 6 * GIB, 32 * GIB, 24 * GIB);
         for id in ["bonsai_27b_q1_0", "ternary_bonsai_27b_q2_0"] {
@@ -30369,6 +35242,14 @@ mod catalog_fit_tests {
         assert!(view.task_tags.is_empty());
         assert_eq!(view.group, "experimental");
         assert_eq!(view.fit_confidence, "unknown");
+        assert_eq!(view.host_lane_class, None);
+        assert!(
+            serde_json::to_value(&view)
+                .unwrap()
+                .get("host_lane_class")
+                .is_none(),
+            "live filename guesses must not carry an authoritative host lane"
+        );
     }
 
     #[test]
@@ -30488,6 +35369,123 @@ mod catalog_fit_tests {
             assert!(super::supported_compatibility_row_ids().contains(id));
             assert!(super::filename_is_supported_exact_row(filename));
         }
+    }
+
+    #[test]
+    fn catchup_catalog_rows_keep_their_exact_evidence_boundaries() {
+        let capabilities = super::capabilities_response();
+        let expected = [
+            (
+                "mistral_nemo_instruct_2407_q4_k_m",
+                "MaziyarPanahi/Mistral-Nemo-Instruct-2407-GGUF",
+                "Mistral-Nemo-Instruct-2407.Q4_K_M.gguf",
+                7_477_204_928,
+                "llama",
+                false,
+            ),
+            (
+                "qwen3_14b_q4_k_m",
+                "Qwen/Qwen3-14B-GGUF",
+                "Qwen3-14B-Q4_K_M.gguf",
+                9_001_752_960,
+                "qwen3",
+                false,
+            ),
+            (
+                "deepseek_r1_0528_qwen3_8b_q4_k_m",
+                "unsloth/DeepSeek-R1-0528-Qwen3-8B-GGUF",
+                "DeepSeek-R1-0528-Qwen3-8B-Q4_K_M.gguf",
+                5_027_785_216,
+                "qwen3",
+                false,
+            ),
+            (
+                "lfm2_5_2_6b_q8_0",
+                "LiquidAI/LFM2.5-2.6B-GGUF",
+                "LFM2.5-2.6B-Q8_0.gguf",
+                2_874_779_456,
+                "lfm2",
+                true,
+            ),
+        ];
+
+        for (id, repo, filename, size, architecture, supported) in expected {
+            let item = row(id);
+            assert_eq!(item.repo_id, repo, "{id} repo");
+            assert_eq!(item.filename, filename, "{id} filename");
+            assert_eq!(item.size_bytes, size, "{id} size");
+            let contract = capabilities
+                .model_compatibility
+                .iter()
+                .find(|candidate| candidate.id == id)
+                .unwrap_or_else(|| panic!("{id} compatibility row"));
+            assert_eq!(
+                contract.status.starts_with("supported"),
+                supported,
+                "{id} support boundary"
+            );
+            assert_eq!(
+                super::classify_model_lane(Some(architecture), filename),
+                if supported
+                    && (id != "lfm2_5_2_6b_q8_0" || super::lfm2_supported_on_current_host())
+                {
+                    super::ModelLaneClass::Supported
+                } else {
+                    super::ModelLaneClass::ExperimentalImplemented
+                },
+                "{id} models-page lane"
+            );
+        }
+
+        assert_eq!(
+            super::classify_loaded_model_identity(
+                Some("lfm2"),
+                "LFM2.5-2.6B-Q8_0.gguf",
+                "36587fdf27bdfc69caf2637273679a0870ec155162161bde6fd16e8c70bdb757",
+            ),
+            if super::lfm2_supported_on_current_host() {
+                super::ModelLaneClass::Supported
+            } else {
+                super::ModelLaneClass::ExperimentalImplemented
+            }
+        );
+        assert_eq!(
+            super::classify_loaded_model_identity(
+                Some("lfm2"),
+                "LFM2.5-2.6B-Q8_0.gguf",
+                &"00".repeat(32),
+            ),
+            super::ModelLaneClass::ExperimentalImplemented
+        );
+    }
+
+    #[test]
+    fn replace_treats_the_same_path_with_a_different_explicit_id_as_reclaimable() {
+        let path = std::path::Path::new("models/LFM2.5-2.6B-Q8_0.gguf");
+        assert!(super::resident_load_is_idempotent(
+            "startup-hash",
+            path,
+            None,
+            path,
+        ));
+        assert!(super::resident_load_is_idempotent(
+            "lfm2_5_2_6b_q8_0",
+            path,
+            Some("lfm2_5_2_6b_q8_0"),
+            path,
+        ));
+        assert!(!super::resident_load_is_idempotent(
+            "startup-hash",
+            path,
+            Some("lfm2_5_2_6b_q8_0"),
+            path,
+        ));
+        assert!(!super::resident_load_is_idempotent(
+            "lfm2_5_2_6b_q8_0",
+            std::path::Path::new("models/other.gguf"),
+            Some("lfm2_5_2_6b_q8_0"),
+            path,
+        ));
     }
 
     #[test]

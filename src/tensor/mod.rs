@@ -824,28 +824,46 @@ fn q8_0_packed_rows4_enabled_for_tensor(name: &str, interleave: Q8_0PackedRows4I
     }
 }
 
+fn q8_0_packed_rows4_shape(shape: &TensorShape) -> Option<(usize, usize)> {
+    if shape.dims.len() != 2 {
+        return None;
+    }
+    let rows = shape.dims[0];
+    let cols = shape.dims[1];
+    (rows.is_multiple_of(4) && cols.is_multiple_of(Q8_0_BLOCK_VALUES))
+        .then_some((rows, cols / Q8_0_BLOCK_VALUES))
+}
+
+fn q8_0_runtime_packed_rows4_shape_for_tensor(
+    name: &str,
+    shape: &TensorShape,
+) -> Option<(usize, usize)> {
+    if env_flag_disabled("CAMELID_Q8_0_BLOCK_DOT") {
+        return None;
+    }
+    let (rows, cols) = q8_repack_linear_shape(name, shape)?;
+    (rows.is_multiple_of(4) && cols.is_multiple_of(Q8_0_BLOCK_VALUES))
+        .then_some((rows, cols / Q8_0_BLOCK_VALUES))
+}
+
 fn q8_0_runtime_packed_rows4_for_tensor(
     name: &str,
     shape: &TensorShape,
     q8_0_bytes: &[u8],
 ) -> Result<Option<Q8_0RuntimeStorage>> {
-    if env_flag_disabled("CAMELID_Q8_0_BLOCK_DOT") {
-        return Ok(None);
-    }
-    let Some((rows, cols)) = q8_repack_linear_shape(name, shape) else {
+    let Some((rows, blocks_per_row)) = q8_0_runtime_packed_rows4_shape_for_tensor(name, shape)
+    else {
         return Ok(None);
     };
-    if !rows.is_multiple_of(4) || !cols.is_multiple_of(Q8_0_BLOCK_VALUES) {
-        return Ok(None);
-    }
     let started = Instant::now();
     let packed = Q8_0PackedRows4::from_q8_0_bytes(
         rows,
-        cols / Q8_0_BLOCK_VALUES,
+        blocks_per_row,
         Q8_0PackedRows4Interleave::I8,
         q8_0_bytes,
     )?;
     if q8_0_pack_trace_enabled() {
+        let cols = blocks_per_row * Q8_0_BLOCK_VALUES;
         eprintln!(
             "camelid_q8_pack tensor={name} owner=runtime layout={} rows={rows} cols={cols} blocks={} bytes={} micros={}",
             Q8_0PackedRows4Interleave::I8.label(),
@@ -869,17 +887,13 @@ fn q8_0_packed_rows4_for_shape(
     let Some(blocks) = q8_0_blocks else {
         return Ok(None);
     };
-    if shape.dims.len() != 2 {
+    let Some((rows, blocks_per_row)) = q8_0_packed_rows4_shape(shape) else {
         return Ok(None);
-    }
-    let rows = shape.dims[0];
-    let cols = shape.dims[1];
-    if !rows.is_multiple_of(4) || !cols.is_multiple_of(32) {
-        return Ok(None);
-    }
+    };
     let started = Instant::now();
-    let packed = Q8_0PackedRows4::from_rows(rows, cols / 32, interleave, blocks)?;
+    let packed = Q8_0PackedRows4::from_rows(rows, blocks_per_row, interleave, blocks)?;
     if q8_0_pack_trace_enabled() {
+        let cols = blocks_per_row * Q8_0_BLOCK_VALUES;
         eprintln!(
             "camelid_q8_pack tensor={name} layout={} rows={rows} cols={cols} blocks={} bytes={} micros={}",
             interleave.label(),
@@ -889,6 +903,147 @@ fn q8_0_packed_rows4_for_shape(
         );
     }
     Ok(Some(packed))
+}
+
+fn q8_0_payload_bytes(
+    name: &str,
+    block_count: usize,
+    blocks_per_payload: usize,
+    payload_size: usize,
+    role: &str,
+) -> Result<u64> {
+    let payload_count = block_count / blocks_per_payload;
+    u64::try_from(payload_count)
+        .ok()
+        .and_then(|count| count.checked_mul(payload_size as u64))
+        .ok_or_else(|| {
+            BackendError::InvalidTensorData(format!(
+                "tensor {name} {role} resident-byte estimate overflow"
+            ))
+        })
+}
+
+fn q8_0_shape_and_block_count(name: &str, gguf_dimensions: &[u64]) -> Result<(TensorShape, usize)> {
+    let shape = TensorShape::from_gguf_dims(gguf_dimensions)?;
+    let elements = shape.element_count()?;
+    if !elements.is_multiple_of(Q8_0_BLOCK_VALUES) {
+        return Err(BackendError::InvalidTensorData(format!(
+            "tensor {name} Q8_0 element count {elements} is not block aligned"
+        )));
+    }
+    Ok((shape, elements / Q8_0_BLOCK_VALUES))
+}
+
+/// Exact heap payload retained by `load_q8_0_block_backed_linear_as` for a
+/// rank-2 Q8_0 tensor under the current repack/sidecar flags.
+pub(crate) fn q8_0_block_backed_linear_retained_bytes(
+    name: &str,
+    gguf_dimensions: &[u64],
+) -> Result<u64> {
+    let (shape, block_count) = q8_0_shape_and_block_count(name, gguf_dimensions)?;
+    if let Some((rows, _)) = q8_0_runtime_packed_rows4_shape_for_tensor(name, &shape) {
+        let mut total = q8_0_payload_bytes(
+            name,
+            block_count,
+            4,
+            std::mem::size_of::<Q8_0PackedRows4Block>(),
+            "runtime PackedRows4",
+        )?;
+        if rows.is_multiple_of(16) && x86_q8_amx_repack_enabled() {
+            total = total
+                .checked_add(q8_0_payload_bytes(
+                    name,
+                    block_count,
+                    16,
+                    std::mem::size_of::<Q8_0AmxPackedBlock>(),
+                    "AMX repack",
+                )?)
+                .ok_or_else(|| {
+                    BackendError::InvalidTensorData(format!(
+                        "tensor {name} Q8_0 resident-byte estimate overflow"
+                    ))
+                })?;
+        }
+        if rows.is_multiple_of(16) && x86_q8_vnni_decode_repack_enabled() {
+            total = total
+                .checked_add(q8_0_payload_bytes(
+                    name,
+                    block_count,
+                    16,
+                    std::mem::size_of::<Q8_0VnniTile16>(),
+                    "VNNI repack",
+                )?)
+                .ok_or_else(|| {
+                    BackendError::InvalidTensorData(format!(
+                        "tensor {name} Q8_0 resident-byte estimate overflow"
+                    ))
+                })?;
+        }
+        return Ok(total);
+    }
+    q8_0_retained_blocks_with_sidecars_bytes_for_shape(name, &shape, block_count)
+}
+
+fn q8_0_retained_blocks_with_sidecars_bytes_for_shape(
+    name: &str,
+    shape: &TensorShape,
+    block_count: usize,
+) -> Result<u64> {
+    let mut total = q8_0_payload_bytes(
+        name,
+        block_count,
+        1,
+        std::mem::size_of::<Q8_0Block>(),
+        "expanded blocks",
+    )?;
+    let rows4_eligible = q8_0_packed_rows4_shape(shape).is_some();
+    for interleave in [Q8_0PackedRows4Interleave::I4, Q8_0PackedRows4Interleave::I8] {
+        if !rows4_eligible || !q8_0_packed_rows4_enabled_for_tensor(name, interleave) {
+            continue;
+        }
+        total = total
+            .checked_add(q8_0_payload_bytes(
+                name,
+                block_count,
+                4,
+                std::mem::size_of::<Q8_0PackedRows4Block>(),
+                "PackedRows4 sidecar",
+            )?)
+            .ok_or_else(|| {
+                BackendError::InvalidTensorData(format!(
+                    "tensor {name} Q8_0 resident-byte estimate overflow"
+                ))
+            })?;
+        if interleave == Q8_0PackedRows4Interleave::I8
+            && shape.dims[0].is_multiple_of(16)
+            && x86_q8_amx_repack_enabled()
+        {
+            total = total
+                .checked_add(q8_0_payload_bytes(
+                    name,
+                    block_count,
+                    16,
+                    std::mem::size_of::<Q8_0AmxPackedBlock>(),
+                    "AMX sidecar repack",
+                )?)
+                .ok_or_else(|| {
+                    BackendError::InvalidTensorData(format!(
+                        "tensor {name} Q8_0 resident-byte estimate overflow"
+                    ))
+                })?;
+        }
+    }
+    Ok(total)
+}
+
+/// Exact retained Q8 block/sidecar payload attached by the generic f32 loader
+/// when CAMELID_RETAIN_Q8_0_BLOCKS is enabled.
+pub(crate) fn q8_0_retained_blocks_with_sidecars_bytes(
+    name: &str,
+    gguf_dimensions: &[u64],
+) -> Result<u64> {
+    let (shape, block_count) = q8_0_shape_and_block_count(name, gguf_dimensions)?;
+    q8_0_retained_blocks_with_sidecars_bytes_for_shape(name, &shape, block_count)
 }
 
 #[derive(Debug, Clone)]
@@ -4604,6 +4759,10 @@ impl TensorStore {
         ))
     }
 
+    /// Load Q8_0 as descriptor-only file backing, even when runtime repack
+    /// flags are enabled. Callers select this path specifically to bound host
+    /// residency (the dense lazy policy and the Metal wire-pages loader), so
+    /// silently attaching PackedRows4 sidecars would violate that contract.
     pub fn load_q8_0_file_backed_tensor_as(
         &self,
         source_name: &str,
@@ -4622,46 +4781,15 @@ impl TensorStore {
                 "tensor {source_name} Q8_0 element count {expected_elements} is not block aligned"
             )));
         }
-        if q8_repack_tensor_enabled(tensor_name) {
-            let bytes = self.tensor_bytes(source_name)?;
-            if let Some(Q8_0RuntimeStorage::PackedRows4(packed)) =
-                q8_0_runtime_packed_rows4_for_tensor(tensor_name, &shape, &bytes)?
-            {
-                return Ok(CpuTensor::q8_0_runtime_packed_rows4_linear(
-                    tensor_name,
-                    shape,
-                    packed,
-                ));
-            }
-        }
-        let mut tensor = CpuTensor::q8_0_file_backed_linear(
+        Ok(CpuTensor::q8_0_file_backed_linear(
             tensor_name,
-            shape.clone(),
+            shape,
             Q8_0FileBacking::new(
                 self.path.clone(),
                 desc.absolute_offset,
                 expected_elements / 32,
             ),
-        );
-        if q8_0_packed_rows4_enabled_for_tensor(tensor_name, Q8_0PackedRows4Interleave::I4)
-            || q8_0_packed_rows4_enabled_for_tensor(tensor_name, Q8_0PackedRows4Interleave::I8)
-        {
-            let bytes = self.tensor_bytes(source_name)?;
-            let blocks = decode_q8_0_blocks(source_name, &bytes, expected_elements)?;
-            tensor.q8_0_packed_rows4_4x4 = q8_0_packed_rows4_for_shape(
-                tensor_name,
-                &shape,
-                Some(&blocks),
-                Q8_0PackedRows4Interleave::I4,
-            )?;
-            tensor.q8_0_packed_rows4_4x8 = q8_0_packed_rows4_for_shape(
-                tensor_name,
-                &shape,
-                Some(&blocks),
-                Q8_0PackedRows4Interleave::I8,
-            )?;
-        }
-        Ok(tensor)
+        ))
     }
 
     pub fn load_cpu_f32(&self, name: &str) -> Result<CpuTensor> {
@@ -4738,6 +4866,7 @@ impl TensorStore {
             GgufTensorType::IQ4XS => decode_iq4_xs_tensor(name, &bytes, expected_elements)?,
             GgufTensorType::Tq1_0 => decode_tq1_0_tensor(name, &bytes, expected_elements)?,
             GgufTensorType::Tq2_0 => decode_tq2_0_tensor(name, &bytes, expected_elements)?,
+            GgufTensorType::I2S => decode_i2_s_tensor(name, &bytes, expected_elements)?,
             GgufTensorType::Q1_0 => decode_q1_0_tensor(name, &bytes, expected_elements)?,
             GgufTensorType::Q2_0G64
             | GgufTensorType::Q2_0G128
@@ -4746,7 +4875,7 @@ impl TensorStore {
             }
             other => {
                 return Err(BackendError::UnsupportedTensorType(format!(
-                    "tensor {name} has unsupported storage type {other:?}; supported for CPU f32 load: F32, F16, BF16, Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K, IQ4_NL, IQ4_XS, TQ1_0, TQ2_0, Q1_0, Q2_0G64, Q2_0G128, PQ2_0"
+                    "tensor {name} has unsupported storage type {other:?}; supported for CPU f32 load: F32, F16, BF16, Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K, IQ4_NL, IQ4_XS, TQ1_0, TQ2_0, I2_S, Q1_0, Q2_0G64, Q2_0G128, PQ2_0"
                 )))
             }
         };
@@ -5947,6 +6076,58 @@ pub(crate) fn decode_q4_0_tensor(
         let scale = block.scale_f32();
         for val in block.unpack_values() {
             out.push(val as f32 * scale);
+        }
+    }
+    Ok(out)
+}
+
+/// Decode BitNet's tensor-wide I2_S representation.
+///
+/// Packed bytes are grouped in 128-value tiles. Byte `gp` in each 32-byte tile
+/// stores values `gp`, `32 + gp`, `64 + gp`, and `96 + gp` from most- to
+/// least-significant two-bit field. Codes 0/1/2 map to -1/0/+1; code 3 is the
+/// second zero spelling used by the reference decoder. One f32 scale follows
+/// all packed bytes at the start of a 32-byte tensor trailer.
+pub(crate) fn decode_i2_s_tensor(
+    name: &str,
+    bytes: &[u8],
+    expected_elements: usize,
+) -> Result<Vec<f32>> {
+    if !expected_elements.is_multiple_of(128) {
+        return Err(BackendError::InvalidTensorData(format!(
+            "{name}: I2_S element count {expected_elements} is not aligned to 128-value packing groups"
+        )));
+    }
+    let packed_len = expected_elements / 4;
+    let expected_bytes = packed_len.checked_add(32).ok_or_else(|| {
+        BackendError::InvalidTensorData(format!("{name}: I2_S byte length overflow"))
+    })?;
+    if bytes.len() != expected_bytes {
+        return Err(BackendError::InvalidTensorData(format!(
+            "{name}: I2_S byte length {} does not match packed payload {packed_len} + 32-byte trailer",
+            bytes.len()
+        )));
+    }
+    let scale = f32::from_le_bytes(
+        bytes[packed_len..packed_len + 4]
+            .try_into()
+            .expect("four-byte I2_S scale"),
+    );
+    if !scale.is_finite() {
+        return Err(BackendError::InvalidTensorData(format!(
+            "{name}: I2_S tensor scale must be finite, got {scale}"
+        )));
+    }
+
+    const CODE: [f32; 4] = [-1.0, 0.0, 1.0, 0.0];
+    let mut out = vec![0.0_f32; expected_elements];
+    for (tile, packed) in bytes[..packed_len].chunks_exact(32).enumerate() {
+        let base = tile * 128;
+        for (gp, byte) in packed.iter().copied().enumerate() {
+            out[base + gp] = CODE[((byte >> 6) & 3) as usize] * scale;
+            out[base + 32 + gp] = CODE[((byte >> 4) & 3) as usize] * scale;
+            out[base + 64 + gp] = CODE[((byte >> 2) & 3) as usize] * scale;
+            out[base + 96 + gp] = CODE[(byte & 3) as usize] * scale;
         }
     }
     Ok(out)
@@ -8248,12 +8429,14 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     #[test]
-    fn q8_x86_repack_materializes_tied_embedding_as_output_runtime_storage() {
+    fn q8_file_backed_alias_stays_strict_when_repack_and_sidecars_are_enabled() {
         let _env_guard = env_lock();
         std::env::remove_var("CAMELID_Q8_0_BLOCK_DOT");
+        std::env::set_var("CAMELID_MAC_Q8_REPACK", "on");
         std::env::set_var("CAMELID_X86_Q8_REPACK", "on");
+        std::env::set_var("CAMELID_Q8_0_PACKED_4X4_DOT", "on");
+        std::env::set_var("CAMELID_Q8_0_PACKED_4X8_DOT", "on");
 
         let source_shape = TensorShape { dims: vec![32, 64] };
         let rows = 64;
@@ -8305,17 +8488,18 @@ mod tests {
             .unwrap();
         assert_eq!(output.name, "output.weight");
         assert_eq!(output.shape, source_shape);
-        assert!(output.q8_0_file_backing.is_none());
-        let Some(super::Q8_0RuntimeStorage::PackedRows4(packed)) = output.q8_0_runtime_storage
-        else {
-            panic!("expected tied output alias to materialize output-compatible rows4 storage");
-        };
-        assert_eq!(packed.rows, rows);
-        assert_eq!(packed.blocks_per_row, blocks_per_row);
-        assert_eq!(packed.interleave, Q8_0PackedRows4Interleave::I8);
+        assert!(output.q8_0_file_backing.is_some());
+        assert!(output.q8_0_runtime_storage.is_none());
+        assert!(output.q8_0_packed_rows4_4x4.is_none());
+        assert!(output.q8_0_packed_rows4_4x8.is_none());
+        assert!(output.q8_0_blocks.is_none());
+        assert!(output.data.is_empty());
 
         std::fs::remove_file(path).unwrap();
+        std::env::remove_var("CAMELID_MAC_Q8_REPACK");
         std::env::remove_var("CAMELID_X86_Q8_REPACK");
+        std::env::remove_var("CAMELID_Q8_0_PACKED_4X4_DOT");
+        std::env::remove_var("CAMELID_Q8_0_PACKED_4X8_DOT");
     }
 
     #[test]

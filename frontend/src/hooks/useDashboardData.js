@@ -2,6 +2,8 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { isCompatibilitySupportedForModel, quantLabelFromGgufFileType } from '../lib/capabilities'
 import { getChatGateState } from '../lib/chatGate'
 import { resolveLoadedModelDisplayName } from '../lib/loadedModelDisplay'
+import { isEmbeddingOnlyModel, isGenerationCapableModel, matchResidentItemsToLocalRecords, modelCapabilityFields } from '../lib/modelCapabilities.js'
+import { loadLocalModelForChat, modelFilenameFromPath } from '../lib/modelActivation.js'
 import { readStreamingChatCompletion } from '../lib/chatCompletionStream'
 import { NEW_CHAT_SENTINEL, resolveSelectedConversation, shouldCreateConversationForSend } from '../lib/chatState'
 import { normalizeStoredConversations } from '../lib/conversationStorage.js'
@@ -9,7 +11,14 @@ import { getRuntimeRequestModelId, isExternalModel, modelRuntimeIdMatches } from
 import { contractSamplingOverrides } from '../lib/samplingContract'
 import { executionRuntimeFields } from '../lib/executionPlan'
 import { createPacerState, paceDrain, paceStep } from '../lib/streamPacing'
-import { applyGemma4ChatTokenFloor, applyGemma4GhostChatTokenCap, getConfiguredMaxTokens as getModelMaxTokens } from '../lib/responseLimits'
+import {
+  applyBitNetFreshChatTokenCap,
+  applyGemma4ChatTokenFloor,
+  applyGemma4GhostChatTokenCap,
+  getConfiguredMaxTokens as getModelMaxTokens,
+  hasExplicitMaxTokensSetting,
+  isBitNetB158ChatModel,
+} from '../lib/responseLimits'
 import { beginRequest, emitFirstContent, emitProgress, getTelemetrySnapshot, recordChatGeneration, recordHealthPoll } from '../lib/telemetryLog'
 
 const TAB_STORAGE_KEY = 'camelid.activeTab'
@@ -189,6 +198,10 @@ function optionalString(value) {
   return trimmed || null
 }
 
+function optionalBoolean(value) {
+  return typeof value === 'boolean' ? value : null
+}
+
 function normalizeEngineName(value) {
   const engine = optionalString(value)?.toLowerCase()
   if (!engine || engine === 'backendinference' || engine === 'backend inference') return 'camelid'
@@ -210,6 +223,7 @@ function normalizeLocalModelRecord(record) {
   const modelPath = String(record.model_path || record.path || '').trim()
   const id = String(record.id || record.runtime_model_name || fallbackModelName('', modelPath)).trim()
   if (!id || !modelPath) return null
+  const capabilityFields = modelCapabilityFields(record)
   return {
     id,
     name: String(record.name || fallbackModelName(id, modelPath)).trim(),
@@ -220,6 +234,13 @@ function normalizeLocalModelRecord(record) {
     source: record.source || 'Local GGUF file',
     engine: normalizeEngineName(record.engine),
     quant: record.quant || null,
+    architecture: optionalString(record.architecture),
+    model_family: optionalString(record.model_family),
+    chat_capable: optionalBoolean(record.chat_capable),
+    embedding_capable: optionalBoolean(record.embedding_capable) ?? capabilityFields.embedding_capable,
+    generation_capable: optionalBoolean(record.generation_capable) ?? capabilityFields.generation_capable,
+    task_kind: capabilityFields.task_kind,
+    task_tags: Array.isArray(record.task_tags) ? record.task_tags.map(String) : [],
     size_gb: record.size_gb || null,
     api_base: record.api_base || null,
     api_key_configured: false,
@@ -305,10 +326,10 @@ function localRecordMatchesBackendId(record, backendModelId) {
    gated" plus an "unverified, no parity guarantee" banner when the app loaded it
    (the id is the filename, which does not) — one file, two contradictory claims,
    decided by nothing more than which code path issued the load. */
-function laneClassByFilename(localList) {
+function localFactsByFilename(localList) {
   const byFilename = new Map()
   for (const entry of localList?.models || []) {
-    if (entry?.filename && entry?.lane_class) byFilename.set(entry.filename, entry.lane_class)
+    if (entry?.filename) byFilename.set(entry.filename, entry)
   }
   return byFilename
 }
@@ -352,6 +373,18 @@ function modelFromBackend(item, health, currentModel, localRecord, apiBase) {
   const quantLabel = active ? getLoadedModelQuantLabel(currentModel) : null
   const modelPath = active ? getModelPath(currentModel) || localRecord?.model_path || '' : localRecord?.model_path || ''
   const fallbackName = localRecord?.name || item.name || item.id
+  const capabilitySource = {
+    ...item,
+    ...(localRecord || {}),
+    model_family: active ? health?.model_family : localRecord?.model_family,
+    unsupported_runtime: active ? currentModel?.unsupported_runtime : localRecord?.unsupported_runtime,
+  }
+  const capabilityFields = modelCapabilityFields(capabilitySource, {
+    active_model_id: health?.active_model_id,
+    model_family: health?.model_family,
+    current_model: currentModel,
+  })
+  const embeddingOnly = capabilityFields.task_kind === 'embedding'
 
   return {
     id,
@@ -360,12 +393,19 @@ function modelFromBackend(item, health, currentModel, localRecord, apiBase) {
        display/limits only, never a support signal (I2) */
     meta: item.meta || localRecord?.meta || null,
     provider_kind: 'local',
-    status: generationReady ? 'ready' : localRecord?.status || 'registered',
+    status: generationReady || embeddingOnly ? 'ready' : localRecord?.status || 'registered',
     model_path: modelPath,
     runtime_model_name: runtimeModelName,
     source: localRecord?.source || 'Camelid local runtime',
     engine: 'camelid',
     quant: quantLabel || localRecord?.quant || null,
+    architecture: localRecord?.architecture || item?.meta?.architecture || null,
+    chat_capable: optionalBoolean(localRecord?.chat_capable),
+    embedding_capable: capabilityFields.embedding_capable,
+    generation_capable: capabilityFields.generation_capable,
+    task_kind: capabilityFields.task_kind,
+    task_tags: localRecord?.task_tags || [],
+    unsupported_runtime: active ? currentModel?.unsupported_runtime || null : null,
     size_gb: localRecord?.size_gb || null,
     api_base: apiBase,
     api_key_configured: false,
@@ -373,29 +413,55 @@ function modelFromBackend(item, health, currentModel, localRecord, apiBase) {
     load_error: active ? null : localRecord?.load_error || null,
     last_load_attempt_at: localRecord?.last_load_attempt_at || null,
     last_loaded_at: localRecord?.last_loaded_at || null,
-    loaded_now: active,
+    // Presence in /v1/models means resident, including a non-active embedding
+    // sidecar. `camelid.active` remains the separate Chat routing identity.
+    loaded_now: true,
     generation_ready: generationReady,
     camelid: modelReadinessFromCurrent(currentModel, active, generationReady),
   }
 }
 
-function mergeModelLists({ modelItems, health, currentModel, localModels, apiBase, laneClasses }) {
+export function mergeModelLists({ modelItems, health, currentModel, localModels, apiBase, localFacts }) {
   const localRecords = localModels.map(normalizeLocalModelRecord).filter(Boolean)
+  const activeFilename = modelFilename({ model_path: getModelPath(currentModel) })
+  const residentMatches = matchResidentItemsToLocalRecords({
+    items: modelItems,
+    records: localRecords,
+    activeModelId: health?.active_model_id,
+    activeFilename,
+  })
   const byId = new Map()
   localRecords.forEach((record) => {
     byId.set(record.id, modelFromLocalRecord(record, health, currentModel, apiBase))
   })
-  modelItems.forEach((item) => {
-    const localRecord = localRecords.find((record) => localRecordMatchesBackendId(record, item.id)) || null
+  modelItems.forEach((item, index) => {
+    const localRecord = residentMatches[index]
     const mergedModel = modelFromBackend(item, health, currentModel, localRecord, apiBase)
     byId.set(mergedModel.id, mergedModel)
   })
-  // Stamp the backend's lane verdict onto whichever record resolves to that file.
-  const lanes = laneClasses || new Map()
+  // Stamp the backend's authoritative per-file capability + lane facts onto
+  // whichever saved/runtime identity resolves to that file.
+  const factsByFilename = localFacts || new Map()
+  const runtimeProjection = {
+    active_model_id: health?.active_model_id,
+    model_family: health?.model_family,
+    current_model: currentModel,
+  }
   return [...byId.values()]
     .map((model) => {
-      const laneClass = lanes.get(modelFilename(model))
-      return laneClass ? { ...model, lane_class: laneClass } : model
+      const facts = factsByFilename.get(modelFilename(model))
+      const enriched = facts
+        ? {
+            ...model,
+            architecture: facts.architecture || model.architecture || null,
+            chat_capable: optionalBoolean(facts.chat_capable),
+            embedding_capable: optionalBoolean(facts.embedding_capable),
+            generation_capable: optionalBoolean(facts.generation_capable),
+            task_tags: Array.isArray(facts.task_tags) ? facts.task_tags : model.task_tags || [],
+            lane_class: facts.lane_class || model.lane_class,
+          }
+        : model
+      return { ...enriched, ...modelCapabilityFields(enriched, runtimeProjection) }
     })
     .sort(compareModelsByName)
 }
@@ -484,6 +550,7 @@ function makeDashboard({ health, models, currentModel, capabilities, conversatio
       loaded_now: Boolean(health?.loaded_now ?? health?.active_model_id),
       active_model_id: health?.active_model_id || null,
       generation_ready: Boolean(health?.generation_ready),
+      model_family: optionalString(health?.model_family),
       vision_ready: Boolean(health?.vision_ready),
       q8_runtime: health?.q8_runtime || null,
       // Required for lane-scoped support truth. All Gemma 4 serve variants use
@@ -710,6 +777,11 @@ export function useDashboardData({ showNotice, clearNotice }) {
             model_path: `models/${entry.filename}`,
             status: 'registered',
             quant: entry.quantization,
+            architecture: entry.architecture,
+            chat_capable: entry.chat_capable,
+            embedding_capable: entry.embedding_capable,
+            generation_capable: entry.generation_capable,
+            task_tags: entry.task_tags,
           })
           if (rec) additions.push(rec)
         }
@@ -734,7 +806,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
         currentModel,
         localModels: activeLocalModels,
         apiBase: normalizedApiBase,
-        laneClasses: laneClassByFilename(localList),
+        localFacts: localFactsByFilename(localList),
       })
       const nextDashboard = makeDashboard({
         health,
@@ -760,15 +832,16 @@ export function useDashboardData({ showNotice, clearNotice }) {
         const activeModelChatGate = activeModel ? getChatGateState(capabilities, activeModel, nextDashboard.runtime) : null
         const currentModelChatGate = currentModel ? getChatGateState(capabilities, currentModel, nextDashboard.runtime) : null
         const chatUnlockedModel = nextModels.find((model) => getChatGateState(capabilities, model, nextDashboard.runtime).chatUnlocked) || null
+        const firstChatModel = nextModels.find((model) => isGenerationCapableModel(model, nextDashboard.runtime)) || null
 
         // The chat API can only use the backend's active model. If a previous browser
         // selection points at an inactive saved model, snap back to the runtime model
         // instead of leaving the composer looking ready for the wrong row.
         if (activeModelChatGate?.chatUnlocked && current !== activeModel.id) return activeModel.id
         if (currentModelChatGate?.chatUnlocked) return current
-        if (activeModel) return activeModel.id
-        if (currentModel) return current
-        return chatUnlockedModel?.id || nextModels[0]?.id || ''
+        if (activeModel && !activeModelChatGate?.embeddingOnly) return activeModel.id
+        if (currentModel && !currentModelChatGate?.embeddingOnly) return current
+        return chatUnlockedModel?.id || firstChatModel?.id || ''
       })
     } catch (error) {
       const fallbackDashboard = makeDashboard({
@@ -838,7 +911,12 @@ export function useDashboardData({ showNotice, clearNotice }) {
     [conversations, selectedConversationId],
   )
 
-  const selectedModel = useMemo(() => models.find((model) => model.id === selectedModelId) || models[0], [models, selectedModelId])
+  const selectedModel = useMemo(
+    () => models.find((model) => model.id === selectedModelId)
+      || models.find((model) => isGenerationCapableModel(model, runtime))
+      || models[0],
+    [models, runtime, selectedModelId],
+  )
   const selectedModelChatGate = getChatGateState(dashboard?.capabilities, selectedModel, runtime)
   const selectedModelRunnable = selectedModelChatGate.chatUnlocked
   // Experimental lane: loaded + generation-ready implemented model that is NOT a
@@ -1098,6 +1176,31 @@ export function useDashboardData({ showNotice, clearNotice }) {
       setPendingChat(null)
 
       const requestModelId = getRuntimeRequestModelId(selectedModel, runtime, selectedModelId)
+      const bitNetB158Chat = isBitNetB158ChatModel(selectedModel, runtime, requestModelId)
+      const responseLimitModelIds = [...new Set([
+        requestModelId,
+        selectedModel?.id,
+        selectedModelId,
+      ].filter(Boolean))]
+      const explicitResponseLimitModelId = responseLimitModelIds.find(hasExplicitMaxTokensSetting) || ''
+      const responseLimitModelId = explicitResponseLimitModelId || requestModelId
+      const requestMaxTokens = applyGemma4GhostChatTokenCap(
+        applyGemma4ChatTokenFloor(
+          applyBitNetFreshChatTokenCap(
+            localChatMaxTokens(history, responseLimitModelId),
+            {
+              bitNetB158: bitNetB158Chat,
+              hasExplicitSetting: Boolean(explicitResponseLimitModelId),
+            },
+          ),
+          sendGate.hint?.target?.family,
+        ),
+        runtime?.gemma4_serve_lane,
+      )
+      // The generic BitNet runnable is a greedy lane. Its experimental status
+      // must not cause the browser to advertise Prism's sampling controls that
+      // this model does not use.
+      const useExperimentalSampling = selectedModelExperimental && !bitNetB158Chat
       const requestController = new AbortController()
       activeChatRequestRef.current = requestController
       const response = await fetch(`${normalizedApiBase}/v1/chat/completions`, {
@@ -1109,30 +1212,25 @@ export function useDashboardData({ showNotice, clearNotice }) {
           messages: requestMessages,
           // Supported rows stay greedy (temperature 0) — their behavior is parity-
           // locked. Experimental rows have no parity contract and small models loop
-          // badly under greedy decoding, so they sample for usable output.
-          temperature: selectedModelExperimental ? 0.7 : 0,
+          // badly under greedy decoding, so they sample for usable output. BitNet's
+          // runnable lane is explicitly greedy even while its row is experimental.
+          temperature: useExperimentalSampling ? 0.7 : 0,
           // Prism's checked 27B demo sampler: keep the experimental lane aligned
           // with the model authors instead of letting low-bit greedy decode fall
           // into exact repetition loops.
-          ...(selectedModelExperimental ? { top_p: 0.95, top_k: 20, min_p: 0 } : {}),
+          ...(useExperimentalSampling ? { top_p: 0.95, top_k: 20, min_p: 0 } : {}),
           // Gemma 4 may spend its first four tokens on a hidden channel
           // envelope before the first visible token. Keep at least that visible
           // floor, then apply the Ghost-only WebUI ceiling so the global 8,192
           // default does not pre-admit normal chats to CPU common execution.
-          max_tokens: applyGemma4GhostChatTokenCap(
-            applyGemma4ChatTokenFloor(
-              localChatMaxTokens(history, requestModelId),
-              sendGate.hint?.target?.family,
-            ),
-            runtime?.gemma4_serve_lane,
-          ),
+          max_tokens: requestMaxTokens,
           /* Empty today: a sampling override is sent only when /api/capabilities
              advertises a supported row for that exact parameter. */
           ...contractSamplingOverrides(dashboard?.capabilities?.api_features, requestModelId),
           // Opt-in thinking mode (experimental — not parity-locked). Only sent
           // when the user turns it on; silence keeps the thinking-DISABLED
           // parity-locked rendering.
-          ...(thinkingMode ? { camelid_enable_thinking: true } : {}),
+          ...(thinkingMode && !bitNetB158Chat ? { camelid_enable_thinking: true } : {}),
           // Receipts only attach to non-streaming responses; the JSON
           // fallback in readStreamingChatCompletion handles that shape.
           stream: !receiptMode,
@@ -1537,12 +1635,23 @@ export function useDashboardData({ showNotice, clearNotice }) {
 
   const activateModel = async (id) => {
     const model = models.find((item) => item.id === id) || localModels.find((item) => item.id === id)
-    setSelectedModelId(id)
 
     if (!model) {
       showNotice('Choose a saved local model before loading it.', 'error')
       return
     }
+    if (isEmbeddingOnlyModel(model, runtime)) {
+      showNotice(
+        `${model.name || id} is an embedding-only model. Load it from Models for embeddings or reranking; it cannot replace the Chat model.`,
+        'info',
+      )
+      return false
+    }
+    if (!isGenerationCapableModel(model, runtime)) {
+      showNotice(`${model.name || id} is a companion model asset, not a standalone Chat model.`, 'info')
+      return false
+    }
+    setSelectedModelId(id)
     if (isExternalModel(model)) {
       showNotice('Hosted API chat routing is planned but not wired yet. Keep using local GGUF loading for now.', 'info')
       return
@@ -1649,22 +1758,32 @@ export function useDashboardData({ showNotice, clearNotice }) {
     setLoadingModelId(derivedId)
     showNotice(`Loading ${name || derivedId} from the local GGUF path…`, 'info')
     try {
-      const loaded = await fetchJson(`${normalizedApiBase}/api/models/load`, {
-        method: 'POST',
-        body: JSON.stringify({ id: derivedId, path: modelPath, replace: true }),
+      const filename = modelFilenameFromPath(modelPath)
+      const candidate = {
+        id: derivedId,
+        name: name || derivedId,
+        model_path: modelPath,
+        runtime_model_name: registerForm.runtime_model_name.trim() || derivedId,
+      }
+      const loaded = await loadLocalModelForChat({
+        apiBase: normalizedApiBase,
+        filename,
+        path: modelPath,
+        modelId: derivedId,
+        model: candidate,
       })
-      const loadedId = loaded?.id || derivedId
-      const loadedPath = getModelPath(loaded) || modelPath
-      const ready = isLoadedModelGenerationReady(loaded)
-      const fileType = getLoadedModelFileType(loaded)
-      const quantLabel = getLoadedModelQuantLabel(loaded) || (fileType !== null && fileType !== undefined ? `file_type ${fileType}` : null)
+      if (!loaded.ok) throw new Error(loaded.message)
+      const embeddingOnly = Boolean(loaded.embedding)
+      const loadedId = loaded.id || derivedId
       const loadedRecord = {
+        ...candidate,
         id: loadedId,
         name: name || loadedId,
-        model_path: loadedPath,
         runtime_model_name: registerForm.runtime_model_name.trim() || loadedId,
-        status: ready ? 'ready' : 'registered',
-        quant: quantLabel,
+        status: 'ready',
+        embedding_capable: embeddingOnly,
+        generation_capable: !embeddingOnly,
+        task_kind: embeddingOnly ? 'embedding' : 'generation',
         install_error: null,
         load_error: null,
         last_load_attempt_at: nowIso(),
@@ -1673,16 +1792,16 @@ export function useDashboardData({ showNotice, clearNotice }) {
       }
       const supportedByContract = isCompatibilitySupportedForModel(dashboard?.capabilities, loadedRecord)
       const nextLocalModels = persistLocalModels((current) => upsertLocalModelRecord(current, loadedRecord))
-      setSelectedModelId(loadedId)
+      if (!embeddingOnly) setSelectedModelId(loadedId)
       setRegisterForm({ id: '', name: '', model_path: '', runtime_model_name: '' })
       await loadDashboard({ silent: true, localModelsOverride: nextLocalModels })
       showNotice(
-        ready
-          ? supportedByContract
+        embeddingOnly
+          ? 'Embedding model loaded as a sidecar. The current Chat model was left active.'
+          : supportedByContract
             ? 'Model saved, loaded, and verified — you can start chatting.'
-            : 'Model saved and running, but this build isn’t verified, so chat stays locked. The Compatibility page lists the verified builds.'
-          : 'Model saved and loaded, but it isn’t ready to generate yet.',
-        ready && supportedByContract ? 'success' : 'info',
+            : 'Model saved and running, but this build isn’t verified, so chat stays locked. The Compatibility page lists the verified builds.',
+        embeddingOnly || supportedByContract ? 'success' : 'info',
       )
     } catch (error) {
       const message = getGuardrailErrorMessage(error, 'Could not load that local GGUF.')

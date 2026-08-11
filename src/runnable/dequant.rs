@@ -23,10 +23,10 @@
 use crate::error::{BackendError, Result};
 use crate::gguf::GgufTensorType;
 use crate::tensor::{
-    decode_bf16_tensor, decode_iq4_xs_tensor, decode_nvfp4_tensor, decode_q1_0_tensor,
-    decode_q2_0_tensor, decode_q2_k_tensor, decode_q3_k_tensor, decode_q4_0_tensor,
-    decode_q4_k_tensor, decode_q5_k_tensor, decode_q6_k_tensor, decode_q8_0_tensor,
-    f16_bits_to_f32,
+    decode_bf16_tensor, decode_i2_s_tensor, decode_iq4_xs_tensor, decode_nvfp4_tensor,
+    decode_q1_0_tensor, decode_q2_0_tensor, decode_q2_k_tensor, decode_q3_k_tensor,
+    decode_q4_0_tensor, decode_q4_k_tensor, decode_q5_k_tensor, decode_q6_k_tensor,
+    decode_q8_0_tensor, f16_bits_to_f32,
 };
 
 /// Dequantize one tensor's wire bytes to a flat row-major `Vec<f32>` of
@@ -53,6 +53,7 @@ pub fn dequantize(
         // and bit-deterministic — definitionally identical to the pin's
         // ggml_bf16_to_fp32. Reuses the crate's existing decoder; no new numeric code.
         GgufTensorType::BF16 => decode_bf16_tensor(tensor_name, bytes, n_elements),
+        GgufTensorType::I2S => decode_i2_s_tensor(tensor_name, bytes, n_elements),
         // Pin-bitwise NVFP4 decode; refuses NaN-sentinel UE4M3 scale bytes
         // (0x7F/0xFF) per DECISIONS.md D17/T5 — the byte-level half of the
         // admission seam split documented in `super::admit::check_quants`.
@@ -68,7 +69,7 @@ pub fn dequantize(
         }
         other => Err(BackendError::UnsupportedTensorType(format!(
             "tensor {tensor_name} is {other:?}; runnable dequant covers \
-             F32, F16, Q8_0, Q4_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_XS, BF16, NVFP4, Q1_0, Q2_0, PQ2_0"
+             F32, F16, Q8_0, Q4_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_XS, BF16, I2_S, NVFP4, Q1_0, Q2_0, PQ2_0"
         ))),
     }
 }
@@ -124,6 +125,20 @@ mod tests {
     fn wrong_length_fails_closed() {
         let err = dequantize(GgufTensorType::F32, &[0u8; 6], 2, "t").unwrap_err();
         assert!(matches!(err, BackendError::InvalidTensorData(_)));
+    }
+
+    #[test]
+    fn i2_s_dispatch_matches_reference_interleave_and_scale() {
+        // 0x1b = codes 0,1,2,3, so each 128-value tile decodes into
+        // 32 negative, 32 zero, 32 positive, and 32 zero values.
+        let mut bytes = vec![0x1b; 32];
+        bytes.extend_from_slice(&2.0_f32.to_le_bytes());
+        bytes.extend_from_slice(&[0; 28]);
+        let out = dequantize(GgufTensorType::I2S, &bytes, 128, "blk.0").unwrap();
+        assert!(out[0..32].iter().all(|value| *value == -2.0));
+        assert!(out[32..64].iter().all(|value| *value == 0.0));
+        assert!(out[64..96].iter().all(|value| *value == 2.0));
+        assert!(out[96..128].iter().all(|value| *value == 0.0));
     }
 
     #[test]

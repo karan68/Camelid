@@ -88,6 +88,207 @@ mod ghost_moe_cli_tests {
     }
 
     #[test]
+    fn inspect_source_accepts_a_hugging_face_directory() {
+        on_cli_test_stack(|| {
+            let cli = Cli::try_parse_from(["camelid", "inspect-source", "hf-model"])
+                .expect("parse source inspection command");
+            match cli.command {
+                Some(Command::InspectSource { path }) => {
+                    assert_eq!(path, PathBuf::from("hf-model"));
+                }
+                other => panic!("expected InspectSource, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn inspect_prefix_requires_the_declared_artifact_length() {
+        on_cli_test_stack(|| {
+            let cli = Cli::try_parse_from([
+                "camelid",
+                "inspect-prefix",
+                "header.gguf",
+                "--declared-len",
+                "32483931648",
+            ])
+            .expect("parse ranged GGUF inspection command");
+            match cli.command {
+                Some(Command::InspectPrefix { path, declared_len }) => {
+                    assert_eq!(path, PathBuf::from("header.gguf"));
+                    assert_eq!(declared_len, 32_483_931_648);
+                }
+                other => panic!("expected InspectPrefix, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn tokenize_prefix_requires_the_declared_artifact_length() {
+        on_cli_test_stack(|| {
+            let cli = Cli::try_parse_from([
+                "camelid",
+                "tokenize",
+                "--model",
+                "header.gguf",
+                "--declared-len",
+                "9827149312",
+                "--prompt",
+                "Hello",
+            ])
+            .expect("parse ranged GGUF tokenizer command");
+            match cli.command {
+                Some(Command::Tokenize {
+                    model,
+                    declared_len,
+                    prompt,
+                    ..
+                }) => {
+                    assert_eq!(model, PathBuf::from("header.gguf"));
+                    assert_eq!(declared_len, Some(9_827_149_312));
+                    assert_eq!(prompt.as_deref(), Some("Hello"));
+                }
+                other => panic!("expected Tokenize, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn tokenizer_prefix_matches_ordinary_file_and_fails_closed() {
+        fn push_u32(bytes: &mut Vec<u8>, value: u32) {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        fn push_i32(bytes: &mut Vec<u8>, value: i32) {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        fn push_u64(bytes: &mut Vec<u8>, value: u64) {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        fn push_i64(bytes: &mut Vec<u8>, value: i64) {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        fn push_string(bytes: &mut Vec<u8>, value: &str) {
+            push_u64(bytes, value.len() as u64);
+            bytes.extend_from_slice(value.as_bytes());
+        }
+        fn kv_string(bytes: &mut Vec<u8>, key: &str, value: &str) {
+            push_string(bytes, key);
+            push_u32(bytes, 8); // GGUF_TYPE_STRING
+            push_string(bytes, value);
+        }
+        fn kv_u32(bytes: &mut Vec<u8>, key: &str, value: u32) {
+            push_string(bytes, key);
+            push_u32(bytes, 4); // GGUF_TYPE_UINT32
+            push_u32(bytes, value);
+        }
+        fn kv_bool(bytes: &mut Vec<u8>, key: &str, value: bool) {
+            push_string(bytes, key);
+            push_u32(bytes, 7); // GGUF_TYPE_BOOL
+            bytes.push(u8::from(value));
+        }
+        fn kv_strings(bytes: &mut Vec<u8>, key: &str, values: &[&str]) {
+            push_string(bytes, key);
+            push_u32(bytes, 9); // GGUF_TYPE_ARRAY
+            push_u32(bytes, 8); // element GGUF_TYPE_STRING
+            push_u64(bytes, values.len() as u64);
+            for value in values {
+                push_string(bytes, value);
+            }
+        }
+
+        // A tiny Gemma-shaped tokenizer plus one F32 tensor. The prefix contains
+        // every metadata value and descriptor but deliberately omits the tensor
+        // payload, matching the immutable HTTP Range qualification path.
+        let mut prefix = Vec::new();
+        prefix.extend_from_slice(b"GGUF");
+        push_u32(&mut prefix, 3);
+        push_i64(&mut prefix, 1); // tensor_count
+        push_i64(&mut prefix, 9); // metadata_count
+        kv_string(&mut prefix, "general.architecture", "gemma2");
+        kv_string(&mut prefix, "tokenizer.ggml.model", "llama");
+        kv_strings(
+            &mut prefix,
+            "tokenizer.ggml.tokens",
+            &["<unk>", "</s>", "<s>", "h"],
+        );
+        kv_u32(&mut prefix, "tokenizer.ggml.bos_token_id", 2);
+        kv_u32(&mut prefix, "tokenizer.ggml.eos_token_id", 1);
+        kv_u32(&mut prefix, "tokenizer.ggml.unknown_token_id", 0);
+        kv_bool(&mut prefix, "tokenizer.ggml.add_bos_token", true);
+        kv_bool(&mut prefix, "tokenizer.ggml.add_eos_token", false);
+        kv_bool(&mut prefix, "tokenizer.ggml.add_space_prefix", false);
+        push_string(&mut prefix, "token_embd.weight");
+        push_u32(&mut prefix, 2); // dimensions
+        push_i64(&mut prefix, 1);
+        push_i64(&mut prefix, 1);
+        push_i32(&mut prefix, 0); // F32
+        push_u64(&mut prefix, 0); // relative data offset
+        while !prefix.len().is_multiple_of(32) {
+            prefix.push(0);
+        }
+        let full_len = prefix.len() as u64 + 4;
+        let mut full = prefix.clone();
+        full.extend_from_slice(&0_f32.to_le_bytes());
+
+        let dir = std::env::temp_dir().join(format!(
+            "camelid-tokenize-prefix-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let full_path = dir.join("full.gguf");
+        let prefix_path = dir.join("prefix.gguf");
+        std::fs::write(&full_path, &full).unwrap();
+        std::fs::write(&prefix_path, &prefix).unwrap();
+
+        let ordinary = read_tokenizer_gguf(&full_path, None).expect("ordinary full GGUF");
+        let ranged = read_tokenizer_gguf(&prefix_path, Some(full_len))
+            .expect("complete tokenizer header prefix");
+        let ordinary_ids = Tokenizer::from_gguf(&ordinary)
+            .unwrap()
+            .encode("h", true, false)
+            .unwrap();
+        let ranged_ids = Tokenizer::from_gguf(&ranged)
+            .unwrap()
+            .encode("h", true, false)
+            .unwrap();
+        assert_eq!(ordinary_ids, vec![2, 3]);
+        assert_eq!(ranged_ids, ordinary_ids);
+
+        // The legacy path remains stat-based and must reject a truncated body.
+        assert!(read_tokenizer_gguf(&prefix_path, None).is_err());
+
+        let short_path = dir.join("short.gguf");
+        std::fs::write(&short_path, &prefix[..prefix.len() - 24]).unwrap();
+        let short_err = read_tokenizer_gguf(&short_path, Some(full_len))
+            .expect_err("an incomplete descriptor/header must fail closed")
+            .to_string();
+        assert!(
+            short_err.contains("unexpected EOF")
+                || short_err.contains("unexpected end of file")
+                || short_err.contains("prefix ends before aligned tensor data start"),
+            "unexpected truncated-prefix error: {short_err}"
+        );
+
+        let malformed_path = dir.join("malformed.gguf");
+        let mut malformed = prefix.clone();
+        malformed[0] = b'X';
+        std::fs::write(&malformed_path, malformed).unwrap();
+        assert!(read_tokenizer_gguf(&malformed_path, Some(full_len))
+            .expect_err("bad magic must fail closed")
+            .to_string()
+            .contains("bad magic"));
+
+        assert!(
+            read_tokenizer_gguf(&prefix_path, Some(prefix.len() as u64 - 1))
+                .expect_err("declared length below physical prefix must fail closed")
+                .to_string()
+                .contains("larger than declared artifact length")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn serve_parses_ghost_moe_artifact_and_cache_budget() {
         on_cli_test_stack(|| {
             let cli = Cli::try_parse_from([
@@ -150,7 +351,7 @@ use camelid::{
     cluster::{
         recv_activation_packet, recv_token_feedback, send_activation_packet, send_token_feedback,
     },
-    gguf::{read_metadata, GgufTensorType},
+    gguf::{read_metadata, read_metadata_with_len, GgufTensorType},
     ghost::{GhostFile, GhostPipelinePrefetcher, GhostPrefetcher},
     inference::{
         speculative::{
@@ -162,6 +363,7 @@ use camelid::{
     },
     metal::detect_metal_device,
     model::{KvCacheQuantization, LlamaModelConfig, LlamaTensorBinding},
+    model_source::inspect_model_source,
     tensor::{CpuTensor, Q8_0TensorBlocks, TensorStore},
     tokenizer::Tokenizer,
 };
@@ -814,6 +1016,37 @@ fn resolved_gpu_switch(gpu: GpuMode, deterministic: bool) -> Option<bool> {
     }
 }
 
+/// Read the metadata source used by the tokenizer parity CLI.
+///
+/// The ordinary path deliberately remains `read_metadata`, whose bounds checks
+/// use the physical file length. `--declared-len` is the explicit, narrow escape
+/// hatch for an immutable HTTP Range prefix: the shared GGUF prefix parser still
+/// reads every metadata value and tensor descriptor and checks tensor ranges
+/// against the source artifact's pinned full length. Requiring the physical
+/// prefix to cover the aligned data-start boundary makes partial metadata or a
+/// truncated descriptor block fail closed before tokenizer construction.
+fn read_tokenizer_gguf(
+    model: &std::path::Path,
+    declared_len: Option<u64>,
+) -> anyhow::Result<camelid::gguf::GgufFile> {
+    let Some(declared_len) = declared_len else {
+        return Ok(read_metadata(model)?);
+    };
+
+    let prefix_len = std::fs::metadata(model)?.len();
+    anyhow::ensure!(
+        prefix_len <= declared_len,
+        "GGUF prefix is {prefix_len} bytes, larger than declared artifact length {declared_len}"
+    );
+    let gguf = read_metadata_with_len(model, declared_len)?;
+    anyhow::ensure!(
+        prefix_len >= gguf.data_start_offset,
+        "GGUF prefix ends before aligned tensor data start: prefix has {prefix_len} bytes, header requires {}",
+        gguf.data_start_offset
+    );
+    Ok(gguf)
+}
+
 /// Parse the `--mode` flag shared by `fabric route` and `fabric run`.
 fn route_mode(raw: &str) -> anyhow::Result<camelid::fabric::RouteMode> {
     match raw {
@@ -1391,6 +1624,17 @@ enum Command {
     },
     /// Inspect GGUF metadata and tensor descriptors.
     Inspect { path: PathBuf },
+    /// Inspect a ranged GGUF header prefix while validating tensor bounds against
+    /// the source artifact's declared full length. The emitted path is redacted.
+    InspectPrefix {
+        path: PathBuf,
+        #[arg(long)]
+        declared_len: u64,
+    },
+    /// Inspect a GGUF file or local Hugging Face SafeTensors directory as a
+    /// model source. This reports sidecar/header readiness only; SafeTensors
+    /// generation stays disabled until its independent runtime gates pass.
+    InspectSource { path: PathBuf },
     /// Runnable-lane smoke-admission for a single GGUF: admit -> load -> greedy
     /// forward sanity -> coherence, on oracle-qualified combos only. Prints a
     /// RUNNABLE receipt (lane=runnable, never copper; attests deterministic
@@ -1405,6 +1649,11 @@ enum Command {
         /// GGUF model (tokenizer metadata source).
         #[arg(long)]
         model: PathBuf,
+        /// True full artifact length when `--model` is an immutable ranged GGUF
+        /// header prefix. Without this flag, tokenization remains stat-based and
+        /// truncated files fail closed exactly as before.
+        #[arg(long)]
+        declared_len: Option<u64>,
         /// Single prompt to tokenize.
         #[arg(long, short = 'p', conflicts_with = "file")]
         prompt: Option<String>,
@@ -2083,6 +2332,27 @@ enum Command {
         /// Port for the temporary llama-server instance.
         #[arg(long, default_value_t = 8189)]
         llama_port: u16,
+        /// KV cache type passed to llama-server for K (-ctk). Omit to use
+        /// llama.cpp's default.
+        #[arg(
+            long,
+            value_parser = ["f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1"]
+        )]
+        llama_cache_type_k: Option<String>,
+        /// KV cache type passed to llama-server for V (-ctv). Omit to use
+        /// llama.cpp's default.
+        #[arg(
+            long,
+            value_parser = ["f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1"]
+        )]
+        llama_cache_type_v: Option<String>,
+        /// Flash-attention mode passed to llama-server (-fa). Omit to use
+        /// llama.cpp's default.
+        #[arg(long, value_parser = ["on", "off", "auto"])]
+        llama_flash_attn: Option<String>,
+        /// Disable llama.cpp tensor repacking for the reference re-run.
+        #[arg(long)]
+        llama_no_repack: bool,
         /// Override Rayon worker threads for the Camelid re-run.
         #[arg(long)]
         threads: Option<usize>,
@@ -2722,8 +2992,23 @@ async fn main() -> anyhow::Result<()> {
             let gguf = read_metadata(path)?;
             println!("{}", serde_json::to_string_pretty(&gguf)?);
         }
+        Command::InspectPrefix { path, declared_len } => {
+            let prefix_len = std::fs::metadata(&path)?.len();
+            anyhow::ensure!(
+                prefix_len <= declared_len,
+                "GGUF prefix is {prefix_len} bytes, larger than declared artifact length {declared_len}"
+            );
+            let mut gguf = read_metadata_with_len(&path, declared_len)?;
+            gguf.path = PathBuf::from("<remote-gguf-prefix>");
+            println!("{}", serde_json::to_string_pretty(&gguf)?);
+        }
+        Command::InspectSource { path } => {
+            let inspection = inspect_model_source(path)?;
+            println!("{}", serde_json::to_string_pretty(&inspection)?);
+        }
         Command::Tokenize {
             model,
+            declared_len,
             prompt,
             file,
             parse_special,
@@ -2734,7 +3019,7 @@ async fn main() -> anyhow::Result<()> {
             std::thread::Builder::new()
                 .stack_size(64 * 1024 * 1024)
                 .spawn(move || -> anyhow::Result<()> {
-                    let gguf = read_metadata(model)?;
+                    let gguf = read_tokenizer_gguf(&model, declared_len)?;
                     let tokenizer = Tokenizer::from_gguf(&gguf)?;
                     let inputs: Vec<String> = if let Some(p) = prompt {
                         vec![p]
@@ -3808,6 +4093,10 @@ async fn main() -> anyhow::Result<()> {
             reference_only,
             llama_ctx,
             llama_port,
+            llama_cache_type_k,
+            llama_cache_type_v,
+            llama_flash_attn,
+            llama_no_repack,
             threads,
         } => {
             // Route a sealed agent-family receipt to its self-contained verifier
@@ -3849,6 +4138,10 @@ async fn main() -> anyhow::Result<()> {
                 mode,
                 llama_ctx,
                 llama_port,
+                llama_cache_type_k,
+                llama_cache_type_v,
+                llama_flash_attn,
+                llama_no_repack,
                 threads,
             })
             .await;
@@ -9246,11 +9539,11 @@ mod windowed_arch_cli_lane_tests {
         );
     }
 
-    /// qwen35 / gemma2 stay refused on every lane class — the flip did not
+    /// qwen35 / gemma2 / bitnet-b1.58 stay refused on every lane class — the flip did not
     /// touch them, and this is the causality control for the lane split.
     #[test]
     fn runnable_only_archs_stay_refused_on_both_lane_classes() {
-        for arch in ["qwen35", "gemma2"] {
+        for arch in ["qwen35", "gemma2", "bitnet-b1.58"] {
             for lane in [
                 DenseLaneWindowedForward::CpuDenseOnly,
                 DenseLaneWindowedForward::ViaSessionDecode,

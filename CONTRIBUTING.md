@@ -18,7 +18,7 @@ Camelid is intentionally evidence-gated. Optimize for correctness, explicit supp
 
 1. Read `README.md` for the current public support contract.
 2. Check `COMPATIBILITY.md` for the evidence-based support matrix.
-3. Review `ROADMAP.md` and `STATUS.md` for current priorities and open work.
+3. Review `ROADMAP.md` and `docs/reference/STATUS.md` for current priorities and open work.
 4. Read `docs/CONTRIBUTOR_QUICKSTART.md` for the shortest safe local setup path.
 5. If your change affects claims, docs, or readiness wording, update every relevant source of truth in the same PR.
 

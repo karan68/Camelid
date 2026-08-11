@@ -1,0 +1,162 @@
+{
+  "schema": "camelid.model-qualification-report/v1",
+  "generated_at": "2026-08-10T05:16:40.578Z",
+  "phase": 1,
+  "row_id": "qwen2_5_0_5b_instruct_q8_0",
+  "source_head": "4efe4920a2c191a4b906ef5513e048cff8b12ca6",
+  "source_dirty": true,
+  "host": {
+    "platform": "windows-x64",
+    "backend": "cpu_reference",
+    "logical_cpus": 16,
+    "hostname_redacted": true
+  },
+  "artifact": {
+    "repo": "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+    "revision": "9217f5db79a29953eb74d5343926648285ec7e67",
+    "file": "qwen2.5-0.5b-instruct-q8_0.gguf",
+    "size_bytes": 675710816,
+    "sha256": "ca59ca7f13d0e15a8cfa77bd17e65d24f6844b554a7b6c12e07a5f89ff76844e",
+    "license": "apache-2.0",
+    "local_path_redacted": true
+  },
+  "oracle": {
+    "engine": "llama.cpp",
+    "build": "b9632",
+    "revision": "acd79d603",
+    "archive": "llama-b9632-bin-win-cpu-x64.zip",
+    "archive_sha256": "b835d5c5155dd2a5ed748a0351debf2ede0dc9f808757e0429f8700a11832dcd",
+    "engines_never_co_resident": true
+  },
+  "stages": {
+    "source": {
+      "status": "pass",
+      "evidence": [
+        "official immutable HF revision",
+        "downloaded byte count and full SHA-256 match the remote pointer"
+      ]
+    },
+    "artifact": {
+      "status": "pass",
+      "observed_size_bytes": 675710816,
+      "observed_sha256": "ca59ca7f13d0e15a8cfa77bd17e65d24f6844b554a7b6c12e07a5f89ff76844e"
+    },
+    "metadata": {
+      "status": "pass",
+      "binary_profile": "current-head debug",
+      "observed": {
+        "architecture": "qwen2",
+        "tokenizer_model": "gpt2",
+        "tokenizer_pre": "qwen2",
+        "headline_quant": "Q8_0",
+        "tensor_count": 291
+      }
+    },
+    "tokenizer": {
+      "status": "pass",
+      "fixture": "qa/model-qualification/fixtures/qwen2.5-0.5b-q8-llamacpp-b9632.json",
+      "raw_prompt_sequences_matched": 4,
+      "raw_prompt_sequences_total": 4,
+      "chat_prompt_sequences_matched": 1,
+      "chat_prompt_sequences_total": 1
+    },
+    "template": {
+      "status": "pass",
+      "fixture": "qa/model-qualification/fixtures/qwen2.5-0.5b-q8-llamacpp-b9632.json",
+      "shape": "one user turn with Qwen2.5 default system preamble and assistant generation header",
+      "rendered_bytes_match": true,
+      "prompt_token_ids_match": true,
+      "guard": "api::tests::qwen2_chatml_prompt_matches_default_system_template_shape"
+    },
+    "load_smoke": {
+      "status": "blocked",
+      "load_and_generation_ready": true,
+      "selected_backend": "cpu_reference",
+      "runnable_smoke_refusal": "combo not yet anchored: qwen2/Q8_0/Bpe",
+      "reason": "The exact file loads and serves, but runnable-smoke correctly refuses until the architecture/tokenizer/quant tuple earns oracle qualification."
+    },
+    "parity": {
+      "status": "fail",
+      "mode": "raw greedy, temperature=0, top_k=1, cache_prompt=false, 16 generated tokens",
+      "matched_prompts": 3,
+      "total_prompts": 4,
+      "prompts": [
+        {
+          "text": "The capital of France is",
+          "match": true
+        },
+        {
+          "text": "Once upon a time",
+          "match": true
+        },
+        {
+          "text": "The quick brown fox",
+          "match": false,
+          "first_divergence": 6,
+          "reference_token_id": 374,
+          "reference_token_text": " is",
+          "camelid_token_id": 323,
+          "camelid_token_text": " and",
+          "reference_top_two": [
+            {
+              "token_id": 374,
+              "logprob": -1.9951506853103638,
+              "rank": 1
+            },
+            {
+              "token_id": 323,
+              "logprob": -2.002303123474121,
+              "rank": 2
+            }
+          ],
+          "reference_top_two_gap": 0.007152438163757324,
+          "camelid_top_two": [
+            {
+              "token_id": 323,
+              "logit": 18.372192,
+              "rank": 1
+            },
+            {
+              "token_id": 374,
+              "logit": 18.324024,
+              "rank": 2
+            }
+          ],
+          "camelid_top_two_gap": 0.048168,
+          "classification": "opposite immediate-top-two near-tie; still a hard parity failure"
+        },
+        {
+          "text": "2 + 2 =",
+          "match": true
+        }
+      ]
+    },
+    "api_webui": {
+      "status": "blocked",
+      "api_observations": {
+        "health_loaded_now": true,
+        "health_generation_ready": true,
+        "completion_generated_token_ids_present": true,
+        "chat_generated": true,
+        "chat_prompt_ids_match_oracle_template": true,
+        "lane_disclosure": "experimental"
+      },
+      "reason": "The bounded current-head API probe passed, but SSE, repeated requests, Models-page/WebUI load-and-chat behavior, and promotion-contract assertions were not run."
+    },
+    "context": {
+      "status": "blocked",
+      "reason": "No preflighted 512-token parity receipt was captured."
+    }
+  },
+  "overall_status": "fail",
+  "support_decision": "remain_experimental_unverified",
+  "does_not_prove": [
+    "broad Qwen2 or Qwen2.5 family support",
+    "support for neighboring sizes, variants, or quantizations",
+    "strict all-prompt greedy parity",
+    "multi-turn or system-message template coverage beyond the pinned shape",
+    "streaming SSE or WebUI readiness",
+    "512-token or model-native context",
+    "GPU execution or throughput"
+  ]
+}

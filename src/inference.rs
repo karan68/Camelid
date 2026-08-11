@@ -400,6 +400,54 @@ fn q8_0_descriptor_resident_bytes(desc: &crate::gguf::GgufTensorDescriptor) -> R
         })
 }
 
+fn merged_moe_expert_set_streams_q4(experts: &LlamaMoeExpertTensors) -> bool {
+    matches!(
+        experts,
+        LlamaMoeExpertTensors::Merged(desc)
+            if matches!(desc.tensor_type, GgufTensorType::Q4_0 | GgufTensorType::Q4_1)
+    )
+}
+
+fn validate_moe_expert_set_nonempty(experts: &LlamaMoeExpertTensors, context: &str) -> Result<()> {
+    if matches!(experts, LlamaMoeExpertTensors::Split(descs) if descs.is_empty()) {
+        return Err(BackendError::InvalidModelMetadata(format!(
+            "{context} split MoE expert binding has no descriptors (expert_count must be greater than zero)"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_moe_expert_bindings_nonempty(binding: &LlamaTensorBinding) -> Result<()> {
+    for (layer_idx, layer) in binding.layers.iter().enumerate() {
+        let expert_sets = match &layer.ffn {
+            LlamaFfnTensors::Dense { .. } => continue,
+            LlamaFfnTensors::MoE {
+                gate_experts,
+                up_experts,
+                down_experts,
+                ..
+            }
+            | LlamaFfnTensors::DeepSeekMoE {
+                gate_experts,
+                up_experts,
+                down_experts,
+                ..
+            } => [
+                ("gate", gate_experts),
+                ("up", up_experts),
+                ("down", down_experts),
+            ],
+        };
+        for (role, experts) in expert_sets {
+            validate_moe_expert_set_nonempty(
+                experts,
+                &format!("layer {layer_idx} {role} experts"),
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn selected_moe_expert_storage_bytes(
     binding: &LlamaTensorBinding,
     layer_range: Option<&std::ops::Range<usize>>,
@@ -426,6 +474,12 @@ fn selected_moe_expert_storage_bytes(
             } => [gate_experts, up_experts, down_experts],
         };
         for expert_set in expert_sets {
+            // Merged Q4_0/Q4_1 packs always use the streamed nibble loader,
+            // even when resident_q8 is selected. They allocate no resident Q8
+            // blocks and must not be rejected by the resident-Q8 preflight.
+            if merged_moe_expert_set_streams_q4(expert_set) {
+                continue;
+            }
             let mut split_transient = 0u64;
             for desc in expert_set.descriptors() {
                 let resident_bytes = q8_0_descriptor_resident_bytes(desc)?;
@@ -644,6 +698,10 @@ impl LlamaLoadedWeights {
         load_embedding: bool,
         load_output: bool,
     ) -> Result<Self> {
+        // Validate every layer, including pipeline-unowned layers whose name-only
+        // placeholder path indexes the first split descriptor below. A zero expert
+        // count otherwise reaches `descs[0]` and panics instead of failing closed.
+        validate_moe_expert_bindings_nonempty(binding)?;
         // Q8_0 linears are ALWAYS retained as plain RAM-resident blocks. The old policy
         // estimated a retention budget over the WHOLE binding ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â even on a pipeline-sharded
         // node that loads only its layer range ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â and silently fell back to per-token file
@@ -653,14 +711,15 @@ impl LlamaLoadedWeights {
         // Fast-load (CAMELID_METAL_NOCOPY): Q8_0/Q4_K/Q6_K linears read wire bytes once
         // into page-aligned allocations the GPU wraps in place ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â no 36-byte decode, no
         // upload copy, and the page cache stays warm so reloading a model is fast.
-        let nocopy_fast_load = metal_nocopy_fast_load_enabled();
+        let q8_dense_storage = q8_dense_linear_storage_policy();
+        let nocopy_fast_load = matches!(q8_dense_storage, Q8DenseLinearStorage::WirePages);
         if nocopy_fast_load {
             eprintln!(
                 "[camelid] CAMELID_METAL_NOCOPY: loading Q8_0/K-quant/Prism Q1_0/Q2_0 weights as page-aligned wire \
                  pages (GPU reads them in place; requires the wire kernel stack)"
             );
         }
-        let force_lazy_q8_0 = lazy_q8_0_linear_forced();
+        let force_lazy_q8_0 = matches!(q8_dense_storage, Q8DenseLinearStorage::FileBacked);
         if force_lazy_q8_0 {
             eprintln!(
                 "[camelid] WARNING: CAMELID_LAZY_Q8_0_LINEAR is set; Q8_0 weights will stream \
@@ -753,10 +812,7 @@ impl LlamaLoadedWeights {
                 // Q4_0 expert packs stream as raw wire regardless of the
                 // storage mode: they have no resident-Q8 representation, and
                 // the Q8 loader's f32 fallback would materialize tens of GiB.
-                _ if store.descriptor(&desc.name).is_ok_and(|d| {
-                    matches!(d.tensor_type, GgufTensorType::Q4_0 | GgufTensorType::Q4_1)
-                }) =>
-                {
+                _ if merged_moe_expert_set_streams_q4(experts) => {
                     store.load_q4_0_file_backed_expert_tensor(&desc.name)
                 }
                 crate::runtime_config::MoeExpertStorage::FileBacked => {
@@ -13770,7 +13826,8 @@ fn q8_0_hybrid_retained_gpu_rows(output_rows: usize) -> usize {
 /// Explicit (and loud) opt-out from RAM-resident Q8_0 blocks: only an affirmatively set
 /// `CAMELID_LAZY_Q8_0_LINEAR` forces the per-token file-streaming path. Absence ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â and any
 /// disabled spelling ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â means weights are retained in RAM. There is no auto/budget fallback.
-fn lazy_q8_0_linear_forced() -> bool {
+/// Shared with API admission so the estimated storage policy cannot drift from the loader.
+pub(crate) fn lazy_q8_0_linear_forced() -> bool {
     matches!(
         env::var("CAMELID_LAZY_Q8_0_LINEAR"),
         Ok(value)
@@ -13778,6 +13835,39 @@ fn lazy_q8_0_linear_forced() -> bool {
                 || value.eq_ignore_ascii_case("false")
                 || value.eq_ignore_ascii_case("off")
                 || value.eq_ignore_ascii_case("disabled"))
+    )
+}
+
+/// Effective storage selected for ordinary dense Q8_0 linears.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Q8DenseLinearStorage {
+    /// Page-aligned 34-byte GGUF wire allocations consumed in place by Metal.
+    WirePages,
+    /// Per-token file reads; selected only by an explicit lazy opt-out.
+    FileBacked,
+    /// Expanded 36-byte (`f32` scale + 32 quants) in-memory blocks.
+    ExpandedBlocks,
+}
+
+/// Pure precedence rule shared by production resolution and cfg-independent tests.
+pub(crate) fn q8_dense_linear_storage_policy_given(
+    metal_nocopy: bool,
+    lazy_forced: bool,
+) -> Q8DenseLinearStorage {
+    if metal_nocopy {
+        Q8DenseLinearStorage::WirePages
+    } else if lazy_forced {
+        Q8DenseLinearStorage::FileBacked
+    } else {
+        Q8DenseLinearStorage::ExpandedBlocks
+    }
+}
+
+/// Resolve the exact policy used by `LlamaLoadedWeights::load_with_ownership`.
+pub(crate) fn q8_dense_linear_storage_policy() -> Q8DenseLinearStorage {
+    q8_dense_linear_storage_policy_given(
+        metal_nocopy_fast_load_enabled(),
+        lazy_q8_0_linear_forced(),
     )
 }
 

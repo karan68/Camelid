@@ -1,0 +1,160 @@
+{
+  "schema": "camelid.smollm3-runtime-envelope/v1",
+  "fixture_id": "smollm3-default-thinking-runtime-envelope-v1",
+  "row_id": "smollm3_3b_q8_0",
+  "status": "partial_renderer_qualified_template_gate_blocked",
+  "grounding": {
+    "preparation_pack": "qa/prompt-packs/smollm3-chat-template-shapes-v1.json",
+    "preparation_pack_sha256": "d46794448b7c2585d0aa83dfd7bb17d4904c2dcbc048ade1ef68cd3863166de6",
+    "header_receipt": "qa/model-qualification/smollm3-3b-q8-header-inspection.json",
+    "header_receipt_sha256": "6faa8cee4a70b5821f485e2debc8a9263d02ebbf5c346138221e9f78a46c9dae",
+    "tokenizer_receipt": "qa/model-qualification/smollm3-3b-q8-header-tokenizer-parity.json",
+    "tokenizer_receipt_sha256": "4e3f3b74346b4b005a462ab888a50d9bacdd01cc5a20d05e57682d70eff9afe4"
+  },
+  "source": {
+    "repo": "ggml-org/SmolLM3-3B-GGUF",
+    "file": "SmolLM3-Q8_0.gguf",
+    "revision": "4965cb60b150737b68a0408c36aeefb65078f894",
+    "size_bytes": 3275574624,
+    "sha256": "8aa8cc74656137174a1988d993b00828e65a86fd68773412b632a75aa1373248",
+    "license": "apache-2.0"
+  },
+  "template": {
+    "utf8_bytes": 5493,
+    "sha256": "b9b66f04c64fbb8695cf5b35c37780efd0b8e0829fbfe3e30fafb9f469b7d30e",
+    "identity_required": true,
+    "substituted_or_missing_template": "typed_refusal"
+  },
+  "implementation": {
+    "source_file": "src/api/mod.rs",
+    "source_git_blob_sha1": "cb370d9d567d572a4feaf32ac4f3300dd34ef790",
+    "architecture": "smollm3",
+    "renderer": "render_smollm3_production_chat_prompt",
+    "public_chokepoints": [
+      "/apply-template",
+      "/v1/chat/completions"
+    ],
+    "tests": [
+      "smollm3_exact_renderer_is_architecture_scoped_and_not_generic_qwen3",
+      "smollm3_exact_renderer_matches_bounded_oracle_shapes",
+      "smollm3_exact_renderer_typed_blocks_every_unqualified_branch",
+      "smollm3_props_caps_are_exact_template_and_envelope_aware",
+      "smollm3_props_caps_refuse_exact_template_on_foreign_architecture",
+      "smollm3_apply_template_renders_the_exact_default_thinking_shape",
+      "smollm3_apply_template_rejects_substituted_and_missing_templates",
+      "smollm3_exact_chat_opens_before_tokenization_for_stream_and_nonstream",
+      "smollm3_unqualified_chat_branches_fail_typed_for_stream_and_nonstream",
+      "smollm3_tools_fail_closed_independent_of_template_identity_and_stream_mode",
+      "smollm3_chat_rejects_nonexact_templates_for_stream_and_nonstream"
+    ]
+  },
+  "qualified_envelope": {
+    "message_input_stage": "post_canonicalized_chat_messages",
+    "content": "text_only",
+    "messages_nonempty": true,
+    "content_nonempty": true,
+    "exact_role_bytes_required": true,
+    "roles": [
+      "user",
+      "assistant"
+    ],
+    "history": "strict_alternation_starting_and_ending_user",
+    "thinking": [
+      "omitted_defaults_true",
+      "explicit_true"
+    ],
+    "add_generation_prompt": true,
+    "today_date": "one_system_local_calendar_read_formatted_dd_english_month_yyyy",
+    "public_surfaces": {
+      "/apply-template": {
+        "thinking": "omitted_effective_true",
+        "result": "exact_rendered_prompt"
+      },
+      "/v1/chat/completions": {
+        "thinking": [
+          "omitted_defaults_true",
+          "explicit_true"
+        ],
+        "streaming": [
+          false,
+          true
+        ],
+        "result": "renderer_opens_before_tokenization"
+      }
+    }
+  },
+  "typed_refusals": {
+    "renderer_entry": {
+      "unsupported_chat_template": [
+        "substituted_template",
+        "missing_template",
+        "empty_messages",
+        "empty_content",
+        "non_exact_role_bytes",
+        "system_message",
+        "custom_instructions",
+        "system_override",
+        "tool_role_history",
+        "invalid_roles",
+        "non_alternating_history",
+        "history_not_ending_user",
+        "multimodal_content",
+        "non_text_content"
+      ],
+      "unsupported_tools": [
+        "openai_tools_with_exact_template",
+        "openai_tools_with_substituted_template",
+        "openai_tools_with_missing_template"
+      ],
+      "unsupported_parameter": [
+        "camelid_enable_thinking_false"
+      ]
+    },
+    "public_surface_preflight": {
+      "/apply-template": {
+        "empty_chat_messages": [
+          "empty_messages"
+        ],
+        "invalid_message_content": [
+          "empty_content"
+        ],
+        "unsupported_parameter": [
+          "arbitrary_template_kwargs_including_explicit_thinking"
+        ]
+      },
+      "/v1/chat/completions": {
+        "missing_generation_input": [
+          "empty_messages"
+        ],
+        "invalid_message_content": [
+          "empty_content"
+        ],
+        "unsupported_multimodal_content": [
+          "unsupported_nontext_content"
+        ],
+        "vision_model_required": [
+          "image_content"
+        ]
+      }
+    }
+  },
+  "gate_decision": {
+    "template_gate": "blocked",
+    "api_webui_gate": "pending",
+    "support_claim": false,
+    "disposition": "hold",
+    "reason": "Only the exact default-thinking text envelope is qualified. The source template's system/custom-instruction/system-override, tool, tool-history, no-think, and nontext branches remain unqualified, and no full real-artifact HTTP prompt-token or generation receipt exists."
+  },
+  "does_not_prove": [
+    "full_template_contract",
+    "full_artifact_download_or_hash",
+    "model_load",
+    "real_artifact_http_prompt_token_parity",
+    "generation",
+    "api_webui_readiness",
+    "context_parity",
+    "tools_or_system_branches",
+    "thinking_disabled_branch",
+    "support"
+  ]
+}

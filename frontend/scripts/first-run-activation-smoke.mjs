@@ -10,6 +10,7 @@ import {
   recommendFirstRunModel,
 } from '../src/lib/firstRunActivation.js'
 import {
+  inspectDeclaresEmbeddingSidecar,
   loadLocalModelForChat,
   modelFilenameFromPath,
   unloadLocalModel,
@@ -363,10 +364,10 @@ assert.equal(modelFilenameFromPath(null), '')
     filename: 'nomic-embed-text-v1.5.Q8_0.gguf',
     fetchImpl: async (url, options) => {
       calls.push({ url, body: options?.body ? JSON.parse(options.body) : null })
-      if (url.endsWith('/api/models/inspect')) return response({ body: { architecture: 'nomic-bert' } })
+      if (url.endsWith('/api/models/inspect')) return response({ body: { architecture: 'nomic-bert', embedding_only: true, native_embedding_dimensions: 768 } })
       if (url.endsWith('/api/models/load')) return response({ body: {} })
       if (url.endsWith('/v1/embeddings')) {
-        return response({ body: { data: [{ embedding: Array(256).fill(0) }] } })
+        return response({ body: { data: [{ embedding: Array(768).fill(0) }] } })
       }
       throw new Error(`unexpected request ${url}`)
     },
@@ -384,6 +385,127 @@ assert.equal(modelFilenameFromPath(null), '')
   )
   assert.equal(calls[1].body.replace, false)
   assert.equal(calls[1].body.set_active, false)
+  assert.equal('dimensions' in calls[2].body, false, 'readiness must request the encoder native dimension instead of unsupported truncation')
+}
+
+{
+  // Both Microsoft BitNet embedding checkpoints are inspected embedding sidecars,
+  // despite their underlying qwen3/gemma3 architectures. They must remain usable
+  // next to the active causal Chat model and return their native-sized vectors.
+  const fixtures = [
+    {
+      filename: 'bitnet-embeddings-0.6b-bf16-i2_s.gguf',
+      inspect: { architecture: 'qwen3', embedding_only: true, native_embedding_dimensions: 1024 },
+      dimensions: 1024,
+    },
+    {
+      filename: 'bitnet-embeddings-270m-bf16-i2_s.gguf',
+      inspect: { architecture: 'gemma3', embedding_only: true, native_embedding_dimensions: 640 },
+      dimensions: 640,
+    },
+  ]
+
+  for (const fixture of fixtures) {
+    const calls = []
+    const result = await loadLocalModelForChat({
+      apiBase: 'http://camelid.test',
+      filename: fixture.filename,
+      fetchImpl: async (url, options) => {
+        calls.push({ url, body: options?.body ? JSON.parse(options.body) : null })
+        if (url.endsWith('/api/models/inspect')) return response({ body: fixture.inspect })
+        if (url.endsWith('/api/models/load')) return response({ body: {} })
+        if (url.endsWith('/v1/embeddings')) {
+          return response({ body: { data: [{ embedding: Array(fixture.dimensions).fill(0.125) }] } })
+        }
+        throw new Error(`unexpected request ${url}`)
+      },
+    })
+    assert.equal(result.ok, true, `${fixture.filename} should pass native embedding readiness`)
+    assert.equal(result.embedding, true)
+    assert.equal(calls[1].body.replace, false, 'an embedding checkpoint must not evict active Chat')
+    assert.equal(calls[1].body.set_active, false, 'an embedding checkpoint must not become active Chat')
+    assert.equal('dimensions' in calls[2].body, false, 'BitNet readiness must not ask the backend to truncate its native vector')
+  }
+
+  assert.equal(
+    inspectDeclaresEmbeddingSidecar({ architecture: 'gemma3' }),
+    false,
+    'an embedding-like architecture must not override the backend task verdict',
+  )
+  assert.equal(
+    inspectDeclaresEmbeddingSidecar({ architecture: 'nomic-bert' }),
+    true,
+    'older inspect payloads should retain the exact Nomic architecture fallback',
+  )
+  assert.equal(
+    inspectDeclaresEmbeddingSidecar({ architecture: 'bitnet-b1.58' }),
+    false,
+    'the causal Microsoft BitNet model must never be mistaken for an embedding sidecar',
+  )
+  assert.equal(
+    inspectDeclaresEmbeddingSidecar({ embedding_only: true, embedding_capable: true, generation_capable: true }),
+    false,
+    'an explicit generation capability must win over stale embedding metadata',
+  )
+}
+
+{
+  // A populated array is not sufficient readiness: every native coordinate must
+  // be finite so a half-loaded/broken encoder cannot be presented as ready.
+  const result = await loadLocalModelForChat({
+    apiBase: 'http://camelid.test',
+    filename: 'bitnet-embeddings-270m-bf16-i2_s.gguf',
+    fetchImpl: async (url) => {
+      if (url.endsWith('/api/models/inspect')) return response({ body: { embedding_only: true, native_embedding_dimensions: 3 } })
+      if (url.endsWith('/api/models/load')) return response({ body: {} })
+      if (url.endsWith('/v1/embeddings')) return response({ body: { data: [{ embedding: [0, Number.POSITIVE_INFINITY, 1] }] } })
+      throw new Error(`unexpected request ${url}`)
+    },
+  })
+  assert.equal(result.ok, false, 'non-finite embedding output must fail sidecar readiness')
+  assert.match(result.message, /did not pass readiness/)
+}
+
+for (const fixture of [
+  { filename: 'bitnet-embeddings-0.6b-bf16-i2_s.gguf', architecture: 'qwen3', dimensions: 1024 },
+  { filename: 'bitnet-embeddings-270m-bf16-i2_s.gguf', architecture: 'gemma3', dimensions: 640 },
+]) {
+  const calls = []
+  const result = await loadLocalModelForChat({
+    apiBase: 'http://camelid.test',
+    filename: fixture.filename,
+    fetchImpl: async (url, options) => {
+      calls.push({ url, body: options?.body ? JSON.parse(options.body) : null })
+      if (url.endsWith('/api/models/inspect')) {
+        return response({
+          body: {
+            architecture: fixture.architecture,
+            embedding_capable: true,
+            generation_capable: false,
+            native_embedding_dimensions: fixture.dimensions,
+          },
+        })
+      }
+      if (url.endsWith('/api/models/load')) return response({ body: {} })
+      if (url.endsWith('/v1/embeddings')) {
+        return response({ body: { data: [{ embedding: Array(fixture.dimensions).fill(0) }] } })
+      }
+      throw new Error(`unexpected request ${url}`)
+    },
+  })
+  assert.equal(result.ok, true)
+  assert.equal(result.embedding, true)
+  assert.deepEqual(
+    calls.map((call) => call.url),
+    [
+      'http://camelid.test/api/models/inspect',
+      'http://camelid.test/api/models/load',
+      'http://camelid.test/v1/embeddings',
+    ],
+    `${fixture.filename} must use embedding readiness instead of waiting on generation_ready`,
+  )
+  assert.equal(calls[1].body.replace, false, 'BitNet embeddings must not release the current Chat model')
+  assert.equal(calls[1].body.set_active, false, 'BitNet embeddings must remain non-active sidecars')
 }
 
 {

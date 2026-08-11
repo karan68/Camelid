@@ -1,0 +1,6 @@
+# Preserve the checksummed command transcript byte-for-byte; its source command
+# emits one intentional blank line after the final cargo test summary.
+qa/evidence-bundles/lfm2-2.6b-q8-macos-metal-20260810-head-d31e5cb0/short-parity.log whitespace=-blank-at-eof
+
+# Keep the exact header receipt byte-stable when Rust hashes it at compile time.
+qa/model-qualification/qwen3-30b-a3b-q8-header-inspection.json text eol=lf

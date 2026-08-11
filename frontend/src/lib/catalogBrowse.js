@@ -1,3 +1,5 @@
+import { isCompatibilitySupportedForModel } from './capabilities.js'
+
 /* Pure presentation logic for the "Get models" catalog browse.
 
    It lives outside the component so the three rules that actually decide what the
@@ -10,9 +12,35 @@
       `IQ3_M`, `IQ4_XS`, ... of the same weights). Grouping happens here.
    2. Quantization is a quality/size tradeoff the user is currently given no help
       with. The ordering and the plain-language note come from one table.
-   3. Fit is never guessed. Every helper here distinguishes "does not fit",
+   3. A backend-provided current-host lane outranks the static support ledger.
+      This keeps platform-scoped evidence on the host that actually earned it.
+   4. Fit is never guessed. Every helper here distinguishes "does not fit",
       "does not fit right now", and "we do not know" — collapsing them is what made
       the advisory read as "nothing works on this machine". */
+
+/* --- predicted support lane ---------------------------------------------- */
+
+/* The backend's current-host verdict wins whenever it is present. The static
+   capabilities ledger describes every certified platform lane, so consulting it
+   first would let a platform-scoped row read Supported on a host with no receipt.
+   Absence preserves the existing behavior for ordinary curated rows and older
+   servers; any explicit unknown/unsupported value fails closed. */
+export function predictedLane(item, capabilities) {
+  // Live Hugging Face metadata is filename-guessed and can never imply support.
+  if (item?.group === 'experimental') return 'not_anchored'
+
+  if (item?.host_lane_class != null) {
+    if (item.host_lane_class === 'supported') return 'supported'
+    if (item.host_lane_class === 'experimental_implemented' && item.oracle_qualified) {
+      return 'compatible'
+    }
+    return 'not_anchored'
+  }
+
+  if (isCompatibilitySupportedForModel(capabilities, null, item)) return 'supported'
+  if (item?.oracle_qualified) return 'compatible'
+  return 'not_anchored'
+}
 
 /* --- fit ------------------------------------------------------------------ */
 

@@ -1,9 +1,10 @@
 import { Button } from '../ui/Button'
 import { EvidenceChip } from '../ui/EvidenceChip'
-import { IconPlay, IconTrash } from '../ui/icons'
+import { IconPlay, IconStop, IconTrash } from '../ui/icons'
 import { ParityReceiptCard } from '../chat/render/ParityReceipt'
 import { quantAdvice } from '../../lib/catalogBrowse'
 import { formatBytes } from '../../lib/formatters'
+import { isEmbeddingOnlyModel, isGenerationCapableModel } from '../../lib/modelCapabilities.js'
 
 /* Lane row components for the Models page — moved verbatim from
    LocalLaneSections when the page was consolidated into zones. Copper is
@@ -38,6 +39,8 @@ export function metaLine(entry) {
 /* What the MODEL is GOOD AT — its strengths/use-cases, by family. Independent of any
    system, hardware, or lane: this describes the model, not where it runs. */
 export function describeModel(entry) {
+  if (isEmbeddingOnlyModel(entry)) return 'Creates vector embeddings for search, retrieval, and reranking. It is not a Chat model.'
+  if (!isGenerationCapableModel(entry)) return 'A companion model asset used by another runtime; it is not a standalone Chat model.'
   const name = (entry.filename || '').toLowerCase()
   if (name.includes('mistral')) return 'Good at reasoning, coding, and following detailed instructions.'
   if (name.includes('tinyllama')) return 'A tiny model for quick, simple chat and experiments.'
@@ -92,6 +95,40 @@ function DeleteModelButton({ entry, busy, blockedReason, onDelete }) {
   )
 }
 
+function RuntimeModelControl({ entry, resident, busy, deleteBusy, onUse, onUnload }) {
+  if (!isEmbeddingOnlyModel(entry) && !isGenerationCapableModel(entry)) return null
+  if (resident) {
+    if (!isEmbeddingOnlyModel(entry) || !onUnload) return null
+    return (
+      <Button
+        variant="outline"
+        size="sm"
+        icon={<IconStop size={16} />}
+        onClick={() => onUnload(entry.filename)}
+        loading={busy}
+        disabled={busy || deleteBusy}
+        aria-label={`Unload ${entry.filename}`}
+      >
+        Unload
+      </Button>
+    )
+  }
+  return (
+    <Button
+      variant="tonal"
+      size="sm"
+      icon={<IconPlay size={16} />}
+      onClick={onUse}
+      loading={busy}
+      disabled={busy || deleteBusy}
+      aria-label={`Load ${entry.filename}`}
+      title="Load this model into Camelid"
+    >
+      Load
+    </Button>
+  )
+}
+
 function DefaultModelControl({ entry, isDefault, busy, saving, onMakeDefault }) {
   if (isDefault) {
     return (
@@ -99,6 +136,16 @@ function DefaultModelControl({ entry, isDefault, busy, saving, onMakeDefault }) 
         ★ Starts automatically
       </span>
     )
+  }
+  if (isEmbeddingOnlyModel(entry)) {
+    return (
+      <span className="lane-row-default" title="Embedding models load as sidecars and do not replace the startup Chat model">
+        Embedding sidecar
+      </span>
+    )
+  }
+  if (!isGenerationCapableModel(entry)) {
+    return <span className="lane-row-default">Companion asset</span>
   }
   return (
     <Button
@@ -117,18 +164,20 @@ function DefaultModelControl({ entry, isDefault, busy, saving, onMakeDefault }) 
 export function SupportedRow({
   entry,
   active,
+  resident = active,
   busy,
   deleteBusy,
   defaultBusy,
   isDefault,
   blockedReason,
   onUse,
+  onUnload,
   onDelete,
   onMakeDefault,
 }) {
   return (
     <article
-      className={`lane-row lane-row--supported${active ? ' lane-row--active' : ''}`}
+      className={`lane-row lane-row--supported${resident ? ' lane-row--active' : ''}`}
       aria-label={`Supported model ${entry.filename}`}
     >
       <div className="lane-row-head">
@@ -139,22 +188,13 @@ export function SupportedRow({
         <EvidenceChip state="supported" asText>Supported</EvidenceChip>
       </div>
       <p className="lane-row-note">{describeModel(entry)}</p>
-      {active ? <p className="lane-row-loaded">● Loaded — this is the active chat model.</p> : null}
+      {resident ? (
+        <p className="lane-row-loaded">
+          ● {isEmbeddingOnlyModel(entry) ? 'Ready for embeddings — not available in Chat.' : active ? 'Loaded — this is the active chat model.' : 'Loaded in Camelid.'}
+        </p>
+      ) : null}
       <div className="lane-row-actions">
-        {!active ? (
-          <Button
-            variant="tonal"
-            size="sm"
-            icon={<IconPlay size={16} />}
-            onClick={onUse}
-            loading={busy}
-            disabled={busy || deleteBusy}
-            aria-label={`Load ${entry.filename}`}
-            title="Load this model into Camelid"
-          >
-            Load
-          </Button>
-        ) : null}
+        <RuntimeModelControl entry={entry} resident={resident} busy={busy} deleteBusy={deleteBusy} onUse={onUse} onUnload={onUnload} />
         <DefaultModelControl
           entry={entry}
           isDefault={isDefault}
@@ -162,7 +202,7 @@ export function SupportedRow({
           saving={defaultBusy}
           onMakeDefault={onMakeDefault}
         />
-        {!active ? (
+        {!resident ? (
           <DeleteModelButton entry={entry} busy={busy || deleteBusy || defaultBusy} blockedReason={blockedReason} onDelete={onDelete} />
         ) : null}
       </div>
@@ -173,17 +213,20 @@ export function SupportedRow({
 export function CompatibleRow({
   entry,
   receipt,
+  active = false,
+  resident = active,
   busy,
   deleteBusy,
   defaultBusy,
   isDefault,
   blockedReason,
   onUse,
+  onUnload,
   onDelete,
   onMakeDefault,
 }) {
   return (
-    <article className="lane-row lane-row--runnable" aria-label={`Compatible model ${entry.filename}`}>
+    <article className={`lane-row lane-row--runnable${resident ? ' lane-row--active' : ''}`} aria-label={`Compatible model ${entry.filename}`}>
       <div className="lane-row-head">
         <div className="lane-row-id">
           <span className="lane-row-name">{entry.filename}</span>
@@ -198,21 +241,17 @@ export function CompatibleRow({
         <p className="lane-row-faint">Loading test results…</p>
       )}
       <p className="lane-row-faint">
-        This model passed a quick local test, but its chat output isn&rsquo;t verified for correctness.
+        {isEmbeddingOnlyModel(entry)
+          ? 'This model passed a quick local embedding test, but its vectors are not verified for broad use.'
+          : <>This model passed a quick local test, but its chat output isn&rsquo;t verified for correctness.</>}
       </p>
+      {resident ? (
+        <p className="lane-row-loaded">
+          ● {isEmbeddingOnlyModel(entry) ? 'Ready for embeddings — not available in Chat.' : active ? 'Loaded — this is the active chat model.' : 'Loaded in Camelid.'}
+        </p>
+      ) : null}
       <div className="lane-row-actions">
-        <Button
-          variant="tonal"
-          size="sm"
-          icon={<IconPlay size={16} />}
-          onClick={onUse}
-          loading={busy}
-          disabled={busy || deleteBusy}
-          aria-label={`Load ${entry.filename}`}
-          title="Load this model into Camelid"
-        >
-          Load
-        </Button>
+        <RuntimeModelControl entry={entry} resident={resident} busy={busy} deleteBusy={deleteBusy} onUse={onUse} onUnload={onUnload} />
         <DefaultModelControl
           entry={entry}
           isDefault={isDefault}
@@ -220,7 +259,7 @@ export function CompatibleRow({
           saving={defaultBusy}
           onMakeDefault={onMakeDefault}
         />
-        <DeleteModelButton entry={entry} busy={busy || deleteBusy || defaultBusy} blockedReason={blockedReason} onDelete={onDelete} />
+        {!resident ? <DeleteModelButton entry={entry} busy={busy || deleteBusy || defaultBusy} blockedReason={blockedReason} onDelete={onDelete} /> : null}
       </div>
     </article>
   )
@@ -256,17 +295,20 @@ export function EligibleRow({ entry, busy, deleteBusy, blockedReason, onRun, onD
 
 export function NotAnchoredRow({
   entry,
+  active = false,
+  resident = active,
   busy,
   deleteBusy,
   defaultBusy,
   isDefault,
   blockedReason,
   onUse,
+  onUnload,
   onDelete,
   onMakeDefault,
 }) {
   return (
-    <article className="lane-row lane-row--blocked" aria-label={`Experimental model ${entry.filename}`}>
+    <article className={`lane-row lane-row--blocked${resident ? ' lane-row--active' : ''}`} aria-label={`Experimental model ${entry.filename}`}>
       <div className="lane-row-head">
         <div className="lane-row-id">
           <span className="lane-row-name">{entry.filename}</span>
@@ -276,22 +318,18 @@ export function NotAnchoredRow({
       </div>
       <p className="lane-row-note">{describeModel(entry)}</p>
       <p className="lane-row-note">
-        This model loads and runs, but its output isn&rsquo;t verified for correctness.
-        For experimentation only.
+        {isEmbeddingOnlyModel(entry)
+          ? 'This embedding runtime loads and runs, but its vectors are experimental.'
+          : 'This model loads and runs, but its output isn’t verified for correctness.'}
+        {' '}For experimentation only.
       </p>
+      {resident ? (
+        <p className="lane-row-loaded">
+          ● {isEmbeddingOnlyModel(entry) ? 'Ready for embeddings — not available in Chat.' : active ? 'Loaded — this is the active chat model.' : 'Loaded in Camelid.'}
+        </p>
+      ) : null}
       <div className="lane-row-actions">
-        <Button
-          variant="tonal"
-          size="sm"
-          icon={<IconPlay size={16} />}
-          onClick={onUse}
-          loading={busy}
-          disabled={busy || deleteBusy}
-          aria-label={`Load ${entry.filename}`}
-          title="Load this model into Camelid"
-        >
-          Load
-        </Button>
+        <RuntimeModelControl entry={entry} resident={resident} busy={busy} deleteBusy={deleteBusy} onUse={onUse} onUnload={onUnload} />
         <DefaultModelControl
           entry={entry}
           isDefault={isDefault}
@@ -299,7 +337,7 @@ export function NotAnchoredRow({
           saving={defaultBusy}
           onMakeDefault={onMakeDefault}
         />
-        <DeleteModelButton entry={entry} busy={busy || deleteBusy || defaultBusy} blockedReason={blockedReason} onDelete={onDelete} />
+        {!resident ? <DeleteModelButton entry={entry} busy={busy || deleteBusy || defaultBusy} blockedReason={blockedReason} onDelete={onDelete} /> : null}
       </div>
     </article>
   )

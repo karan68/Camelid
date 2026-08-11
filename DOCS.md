@@ -6,8 +6,8 @@ This index helps readers navigate the public Markdown set.
 
 ## Fast reader paths
 
-- **Product/reviewer path:** start with `README.md`, then `COMPATIBILITY.md`, then the milestone snapshot in `STATUS.md`, then `BENCHMARKS.md`.
-- **Evidence auditor path:** start with `PARITY.md`, then `qa/evidence-bundles/README.md`, then follow the row-specific manifests linked from `STATUS.md`.
+- **Product/reviewer path:** start with `README.md`, then `COMPATIBILITY.md`, then the milestone snapshot in `docs/reference/STATUS.md`, then `docs/benchmarks/BENCHMARKS.md`.
+- **Evidence auditor path:** start with `docs/benchmarks/PARITY.md`, then `qa/evidence-bundles/README.md`, then follow the row-specific manifests linked from `docs/reference/STATUS.md`.
 - **Contributor path:** start with `docs/CONTRIBUTOR_QUICKSTART.md`, then use `docs/VALIDATION_MATRIX.md` to choose the smallest safe check lane.
 
 ## Public sources of truth
@@ -43,7 +43,7 @@ Read these first:
 ## Architecture, recon, and planning notes
 
 These documents are working notes, not support ledgers. When a note and a public source differ,
-`COMPATIBILITY.md` and `STATUS.md` win.
+`COMPATIBILITY.md` and `docs/reference/STATUS.md` win.
 
 - [`ARCHITECTURE.md`](docs/architecture/ARCHITECTURE.md)
 - [`STRUCTURED_OUTPUTS.md`](docs/architecture/STRUCTURED_OUTPUTS.md) — LLGuidance JSON Schema and CFG constrained decoding contract

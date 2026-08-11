@@ -24,6 +24,7 @@ try {
   const { default: SystemView } = await server.ssrLoadModule('/src/views/SystemView.jsx')
   const { default: ModelsView } = await server.ssrLoadModule('/src/views/ModelsView.jsx')
   const { default: TopBar } = await server.ssrLoadModule('/src/components/TopBar.jsx')
+  const { StreamingLoader, streamingStatusLabel } = await server.ssrLoadModule('/src/components/chat/render/StreamingIndicator.jsx')
   const { getChatGateState } = await server.ssrLoadModule('/src/lib/chatGate.js')
   const {
     capabilityRowMatchesSearch,
@@ -32,7 +33,7 @@ try {
     rowSupportNextStepCopy,
     statusContainsSupportedEvidence,
   } = await server.ssrLoadModule('/src/lib/capabilities.js')
-  const { resolveLoadedModelDisplayName } = await server.ssrLoadModule('/src/hooks/useDashboardData.js')
+  const { mergeModelLists, resolveLoadedModelDisplayName } = await server.ssrLoadModule('/src/hooks/useDashboardData.js')
   const { LLAMA32_3B_ACCEPTANCE_TARGET } = await server.ssrLoadModule('/src/lib/acceptanceTargets.js')
 
   const noop = () => {}
@@ -168,6 +169,116 @@ try {
     setTab: noop,
   }))
   assert.doesNotMatch(textOnlyRendered, /accept="image\/png,image\/jpeg"/, 'text-only runtime must not advertise an image control it cannot serve')
+
+  const embeddingModel = {
+    id: 'bitnet-embeddings-270m',
+    name: 'Microsoft BitNet Embedding 270M',
+    provider_kind: 'local',
+    status: 'ready',
+    model_path: 'models/bitnet-embeddings-270m-bf16-i2_s.gguf',
+    embedding_capable: true,
+    generation_capable: false,
+    loaded_now: true,
+    generation_ready: false,
+  }
+  const embeddingRuntime = {
+    ...readyRuntime,
+    active_model_id: embeddingModel.id,
+    generation_ready: false,
+    model_family: 'embedding',
+  }
+  const mergedSidecars = mergeModelLists({
+    modelItems: [
+      { id: 'bitnet-embeddings-0.6b-bf16-i2_s.gguf' },
+      { id: 'bitnet-embeddings-270m-bf16-i2_s.gguf' },
+    ],
+    health: readyRuntime,
+    currentModel: { path: selectedModel.model_path },
+    localModels: [
+      {
+        id: 'microsoft-bitnet-embedding-0.6b',
+        name: 'Microsoft BitNet Embedding 0.6B',
+        model_path: 'models/bitnet-embeddings-0.6b-bf16-i2_s.gguf',
+        embedding_capable: true,
+        generation_capable: false,
+      },
+      embeddingModel,
+    ],
+    apiBase: readyRuntime.api_base,
+    localFacts: new Map(),
+  })
+  assert.equal(mergedSidecars.length, 2, 'non-active embedding sidecars should merge into their saved catalog rows without duplicate runtime entries')
+  assert.deepEqual(
+    mergedSidecars.map((model) => model.id).sort(),
+    ['bitnet-embeddings-270m', 'microsoft-bitnet-embedding-0.6b'],
+    'resident filename ids should preserve the saved catalog identities',
+  )
+  assert.ok(mergedSidecars.every((model) => model.loaded_now), 'merged sidecar rows should be marked resident even though neither is the active Chat model')
+  const duplicateFilenameAliases = mergeModelLists({
+    modelItems: [
+      { id: 'runtime-a' },
+      { id: 'shared.gguf' },
+    ],
+    health: readyRuntime,
+    currentModel: { path: 'models/shared.gguf' },
+    localModels: [
+      { id: 'saved-a', runtime_model_name: 'runtime-a', model_path: 'models/shared.gguf' },
+      { id: 'saved-b', runtime_model_name: 'runtime-b', model_path: 'models/shared.gguf' },
+    ],
+    apiBase: readyRuntime.api_base,
+    localFacts: new Map(),
+  })
+  assert.deepEqual(
+    duplicateFilenameAliases.map((model) => model.id).sort(),
+    ['saved-a', 'saved-b'],
+    'resident aliases must claim saved rows one-to-one instead of collapsing onto the first filename match',
+  )
+  const embeddingMarkup = renderToStaticMarkup(React.createElement(ChatWorkspace, {
+    selectedConversation: { id: 'embedding-chat', title: 'Embedding', messages: [] },
+    selectedModel: embeddingModel,
+    selectedModelId: embeddingModel.id,
+    setSelectedModelId: noop,
+    models: [embeddingModel],
+    runtime: embeddingRuntime,
+    capabilities,
+    pendingConversation: null,
+    composer: 'Draft only',
+    setComposer: noop,
+    saveToMemory: noop,
+    sendMessage: noop,
+    sending: false,
+    selectedModelRunnable: false,
+    selectedModelExperimental: false,
+    setTab: noop,
+  }))
+  assert.match(embeddingMarkup, /ready for embeddings and reranking, not Chat/i, 'embedding runtime must render a terminal task-ready state')
+  assert.match(embeddingMarkup, /<optgroup label="Embedding only">/, 'embedding rows remain visible but disabled outside Chat choices')
+  assert.doesNotMatch(embeddingMarkup, /BitNet Embedding 270M · Loading/, 'embedding-only generation_ready=false must never be described as an in-progress Chat load')
+
+  const unloadedEmbedding = { ...embeddingModel, status: 'registered', loaded_now: false }
+  const unloadedEmbeddingGate = getChatGateState(capabilities, unloadedEmbedding, readyRuntime)
+  assert.equal(unloadedEmbeddingGate.embeddingOnly, true)
+  assert.equal(unloadedEmbeddingGate.embeddingReady, false, 'embedding capability alone must not claim runtime readiness')
+  const unloadedEmbeddingMarkup = renderToStaticMarkup(React.createElement(ChatWorkspace, {
+    selectedConversation: { id: 'unloaded-embedding-chat', title: 'Embedding', messages: [] },
+    selectedModel: unloadedEmbedding,
+    selectedModelId: unloadedEmbedding.id,
+    setSelectedModelId: noop,
+    models: [selectedModel, unloadedEmbedding],
+    runtime: readyRuntime,
+    capabilities,
+    pendingConversation: null,
+    composer: 'Draft only',
+    setComposer: noop,
+    saveToMemory: noop,
+    sendMessage: noop,
+    sending: false,
+    selectedModelRunnable: false,
+    selectedModelExperimental: false,
+    setTab: noop,
+  }))
+  assert.match(unloadedEmbeddingMarkup, /embedding model — load it from Models/i)
+  assert.doesNotMatch(unloadedEmbeddingMarkup, /is ready for embeddings and reranking/i)
 
   const wrongArtifactModel = {
     ...selectedModel,
@@ -334,7 +445,19 @@ try {
   // The pre-token phase label is now the reader-facing "Generating response"
   // (StreamingIndicator.FIRST_TOKEN_STREAMING_LABEL); same live status, plain wording.
   assert.match(preTokenMarkup, /Generating response/, 'pre-token streaming should render the active backend-generation live status')
+  assert.match(preTokenMarkup, /streaming-loader-label">Generating response<\/span>/, 'the pre-token status must be visible beside the dots rather than carried only by aria-label')
   assert.match(preTokenMarkup, /streaming-loader-dot-3/, 'pre-token streaming should render the active loader, not a static placeholder')
+
+  const delayedPreTokenLabel = streamingStatusLabel('generating', 20)
+  const delayedPreTokenMarkup = renderToStaticMarkup(React.createElement(StreamingLoader, {
+    label: delayedPreTokenLabel,
+    compact: true,
+  }))
+  assert.match(
+    delayedPreTokenMarkup,
+    /streaming-loader-label">Local response is taking a while<\/span>/,
+    'the delayed-first-token explanation must be visible instead of leaving the user with unexplained dots',
+  )
 
   const completedUnclosedFenceMarkup = renderToStaticMarkup(React.createElement(ChatWorkspace, {
     selectedConversation: {
