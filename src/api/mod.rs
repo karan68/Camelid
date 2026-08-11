@@ -2246,9 +2246,11 @@ fn resolve_models_dir(configured: Option<PathBuf>) -> PathBuf {
 ///    against the process CWD.
 /// 3. Otherwise `<models_dir>/<path>` — the fallback that makes relative loads
 ///    work when the server's CWD is arbitrary (the desktop sidecar case).
-/// 4. Otherwise, when the request already leads with the models dir's own
-///    folder name (e.g. `models/foo.gguf` against a configured `...\models`),
-///    the duplicated leading component is stripped: `<models_dir>/foo.gguf`.
+/// 4. Otherwise, when the request already leads with either the legacy API
+///    prefix `models/` or the configured models dir's own folder name, that
+///    leading component is stripped: `<models_dir>/foo.gguf`. The literal
+///    prefix matters for custom stores such as `<external-root>/phase2`,
+///    because the frontend intentionally persists `models/foo.gguf` paths.
 ///
 /// When nothing exists the typed I/O error names every attempted location, so
 /// the 400 tells the caller exactly where the server looked.
@@ -2271,8 +2273,12 @@ fn resolve_request_model_path(
         "'{}' (under the configured models directory)",
         joined.display()
     ));
-    if let (Some(first), Some(dir_name)) = (requested.components().next(), models_dir.file_name()) {
-        if first.as_os_str() == dir_name {
+    if let Some(first) = requested.components().next() {
+        let is_legacy_models_prefix = first.as_os_str() == std::ffi::OsStr::new("models");
+        let is_models_dir_name = models_dir
+            .file_name()
+            .is_some_and(|dir_name| first.as_os_str() == dir_name);
+        if is_legacy_models_prefix || is_models_dir_name {
             let stripped: PathBuf = requested.components().skip(1).collect();
             if !stripped.as_os_str().is_empty() {
                 let candidate = models_dir.join(&stripped);
@@ -2353,6 +2359,20 @@ mod models_dir_resolution_tests {
         let (_tmp, models_dir) = models_dir_with(name);
         let resolved = resolve_request_model_path(&models_dir, PathBuf::from("models").join(name))
             .expect("models/-prefixed request resolves into the models dir");
+        assert_eq!(resolved, models_dir.join(name));
+    }
+
+    #[test]
+    fn legacy_models_prefix_is_stripped_for_a_custom_named_models_dir() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let models_dir = tmp.path().join("phase2");
+        std::fs::create_dir(&models_dir).expect("create custom models dir");
+        let name = "camelid-custom-models-dir-resolution-test.gguf";
+        std::fs::write(models_dir.join(name), b"gguf-stub").expect("write stub");
+
+        let resolved = resolve_request_model_path(&models_dir, PathBuf::from("models").join(name))
+            .expect("legacy models/ prefix resolves inside a custom-named models dir");
+
         assert_eq!(resolved, models_dir.join(name));
     }
 

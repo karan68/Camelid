@@ -230,6 +230,9 @@ export default function ChatWorkspace({
     return null
   })()
   const selectedRuntimeMatchesLoadedModel = Boolean(selectedChatGate.runtimeLoaded)
+  const selectedRuntimeLoadedButNotReady = Boolean(
+    selectedRuntimeMatchesLoadedModel && !selectedChatGate.runtimeGenerationReady,
+  )
   const selectedModelName = selectedModel?.name || selectedModelId || 'No model selected'
   const selectedModelIssue = selectedModel?.load_error || selectedModel?.install_error || ''
 
@@ -247,6 +250,8 @@ export default function ChatWorkspace({
         ? `${selectedModelName} is ready — replies are not verified.`
       : selectedModelIssue
         ? selectedModelIssue
+        : selectedRuntimeLoadedButNotReady
+          ? `${selectedModelName} is loaded, but this build cannot run it for Chat.`
         : supportBlocked
           ? `${selectedModelName} isn't verified for chat yet.`
           : selectedRuntimeMatchesLoadedModel
@@ -272,6 +277,8 @@ export default function ChatWorkspace({
         ? selectedEmbeddingReady
           ? 'This model is loaded for embeddings and reranking. Choose a generation model to chat.'
           : 'This model creates embeddings for search and reranking. Load it from Models, or choose a generation model to chat.'
+        : selectedRuntimeLoadedButNotReady
+          ? 'This model is loaded but not runnable for Chat in this build. Choose another model to continue.'
         : supportBlocked
           /* When the blocker is a near miss — wrong file, or the right model at an
              unverified quantization — naming it is far more actionable than "pick a
@@ -288,7 +295,7 @@ export default function ChatWorkspace({
             ? 'Camelid answers with a model running on this machine. Set one up above and this becomes a chat.'
             : 'Pick a local GGUF model first. Camelid will show the readiness path here.'
 
-  const readinessState = canChat ? 'ready' : apiUnavailable ? 'offline' : selectedEmbeddingOnly ? 'blocked' : supportBlocked ? 'blocked' : selectedModel ? 'waiting' : 'idle'
+  const readinessState = canChat ? 'ready' : apiUnavailable ? 'offline' : selectedEmbeddingOnly ? 'blocked' : selectedRuntimeLoadedButNotReady || supportBlocked ? 'blocked' : selectedModel ? 'waiting' : 'idle'
   const statusTone = selectedModelRunnable ? 'ready' : experimentalChatReady ? 'warn' : apiUnavailable ? 'offline' : selectedEmbeddingReady ? 'ready' : selectedEmbeddingOnly ? 'neutral' : supportBlocked ? 'warn' : runtime?.loaded_now ? 'warn' : 'neutral'
 
   const canSubmit = Boolean(composer.trim()) && canChat && !generationActive
@@ -302,6 +309,8 @@ export default function ChatWorkspace({
           ? 'Choose a generation model to send this chat.'
           : supportBlocked
           ? 'Choose a verified model to send.'
+          : selectedRuntimeLoadedButNotReady
+            ? 'Choose a runnable model to send.'
           : selectedModel
             ? 'Sending unlocks once this model is ready.'
             : 'Choose a model before sending.'
@@ -314,6 +323,8 @@ export default function ChatWorkspace({
       ? 'Draft a prompt while the Camelid API comes back'
       : selectedEmbeddingOnly
         ? 'Choose a generation model to send a chat'
+        : selectedRuntimeLoadedButNotReady
+          ? 'Choose a runnable model; this loaded model is blocked'
         : composerDraftUnlocked
         ? 'Draft a prompt while Camelid finishes getting ready'
         : firstRunActive
@@ -476,7 +487,7 @@ export default function ChatWorkspace({
     if (gate.chatMode === 'experimental') return `${name} · Experimental ready`
     if (apiUnavailable) return `${name} · Not connected`
     if (gate.runtimeReady) return `${name} · Not verified`
-    if (gate.runtimeLoaded) return `${name} · Loading`
+    if (gate.runtimeLoaded) return `${name} · Not runnable`
     return `${name} · Not loaded`
   }
 

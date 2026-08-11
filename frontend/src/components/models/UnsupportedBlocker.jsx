@@ -9,6 +9,19 @@ import { EvidenceChip } from '../ui/EvidenceChip'
 
 const DEDICATED_LANE_COMMAND = /(camelid\s+diffusion-gemma-chat[^\n.]*)/i
 
+export function blockerNoteFor(blocker) {
+  if (blocker?.code === 'model_io_error') {
+    return 'Camelid could not open this model from the configured storage location, so chat stays disabled until the path is corrected.'
+  }
+  if (blocker?.code === 'model_too_large_for_host') {
+    return 'This model does not fit the current host safety budget, so chat stays disabled instead of risking an unstable load.'
+  }
+  if (blocker?.code === 'unsupported_model_architecture') {
+    return 'This architecture is not implemented, so chat stays disabled — Camelid fails closed rather than emit plausible-but-wrong tokens on a different code path.'
+  }
+  return 'This model did not pass Camelid’s runtime admission checks, so chat stays disabled rather than using an unverified fallback path.'
+}
+
 export function UnsupportedBlocker({ blocker, className = '' }) {
   if (!blocker?.message) return null
   const redirect = blocker.message.match(DEDICATED_LANE_COMMAND)?.[1]?.trim() || null
@@ -27,10 +40,7 @@ export function UnsupportedBlocker({ blocker, className = '' }) {
         {blocker.code ? <code className="unsupported-blocker__code">{blocker.code}</code> : null}
       </div>
       <p className="unsupported-blocker__message">{blocker.message}</p>
-      <p className="unsupported-blocker__note">
-        This architecture is not implemented, so chat stays disabled — Camelid fails closed
-        rather than emit plausible-but-wrong tokens on a different code path.
-      </p>
+      <p className="unsupported-blocker__note">{blockerNoteFor(blocker)}</p>
       {redirect ? (
         <p className="unsupported-blocker__redirect">
           Dedicated lane: <code>{redirect}</code>
