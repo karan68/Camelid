@@ -122,14 +122,14 @@ assert.deepEqual(receiptCommand(), [
 assert.deepEqual([...parseArgs(['--help']).entries()], [['help', true]])
 assert.deepEqual([...parseArgs([
   '--root=.', '--binary', 'camelid.exe', '--artifact=model.gguf', '--cwd', 'run',
-  '--models-dir=models', '--binary-profile', 'dev-opt3', '--out=receipt.json',
+  '--models-dir=models', '--binary-profile', 'release-fat-lto', '--out=receipt.json',
 ]).entries()], [
   ['root', '.'],
   ['binary', 'camelid.exe'],
   ['artifact', 'model.gguf'],
   ['cwd', 'run'],
   ['models-dir', 'models'],
-  ['binary-profile', 'dev-opt3'],
+  ['binary-profile', 'release-fat-lto'],
   ['out', 'receipt.json'],
 ])
 for (const argv of [
@@ -171,7 +171,7 @@ function provenanceExec({ describe = sourceDescribe, version = binaryVersion } =
 assert.deepEqual(await inspectProvenance({
   root,
   binary: frozenBinary,
-  binaryProfile: 'dev-opt3',
+  binaryProfile: 'release-fat-lto',
 }, {
   execFileImpl: provenanceExec(),
   sha256FileImpl: async () => binarySha256,
@@ -180,7 +180,7 @@ assert.deepEqual(await inspectProvenance({
   source_describe: sourceDescribe,
   tracked_files_clean: true,
   untracked_files_excluded: true,
-  binary_profile: 'dev-opt3',
+  binary_profile: 'release-fat-lto',
   binary_sha256: binarySha256,
   binary_version: binaryVersion,
 })
@@ -712,7 +712,7 @@ function preflight() {
       source_describe: sourceDescribe,
       tracked_files_clean: true,
       untracked_files_excluded: true,
-      binary_profile: 'dev-opt3',
+      binary_profile: 'release-fat-lto',
       binary_sha256: binarySha256,
       binary_version: binaryVersion,
     },
@@ -951,7 +951,7 @@ const runOptions = {
   artifact: resolve('C:\\qualification\\artifact.gguf'),
   cwd: resolve('C:\\qualification\\run'),
   modelsDir: resolve('C:\\qualification\\empty-models'),
-  binaryProfile: 'dev-opt3',
+  binaryProfile: 'release-fat-lto',
 }
 
 const success = makeHarness()

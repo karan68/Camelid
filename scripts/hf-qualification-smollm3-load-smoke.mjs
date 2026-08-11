@@ -25,7 +25,7 @@ const execFileAsync = promisify(execFile)
 
 const RECEIPT_SCHEMA = 'camelid.model-qualification.load-smoke/v1'
 const ROW_ID = 'smollm3_3b_q8_0'
-const BINARY_PROFILE = 'dev-opt3'
+const BINARY_PROFILE = 'release-fat-lto'
 const EXECUTION_PLAN_EXACT_MODEL_ROW = 'SmolLM3-Q8_0.gguf'
 const SERVER_ADDR = '127.0.0.1:8297'
 const SERVER_ORIGIN = `http://${SERVER_ADDR}`
@@ -2600,7 +2600,7 @@ async function main(argv = process.argv.slice(2)) {
       + '  --cwd <path>          Dedicated candidate-free run directory\n'
       + '  --models-dir <path>   Dedicated candidate-free models directory\n'
       + '  --root <path>         Clean tracked Camelid source root (default: .)\n'
-      + '  --binary-profile <id> Provenance label (default: dev-opt3)\n'
+      + '  --binary-profile <id> Provenance label (default: release-fat-lto)\n'
       + '  --out <path>          Atomically write the privacy-safe sealed receipt\n')
     return
   }
