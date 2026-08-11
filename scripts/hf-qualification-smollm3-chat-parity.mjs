@@ -43,6 +43,7 @@ const execFileAsync = promisify(execFile)
 const RECEIPT_SCHEMA = 'camelid.model-qualification.chat-parity-preparation/v1'
 const ROW_ID = 'smollm3_3b_q8_0'
 const BINARY_PROFILE = 'release-fat-lto'
+const CAMELID_RELEASE_VERSION = '0.6.1'
 const CAMELID_ADDR = '127.0.0.1:8297'
 const LLAMA_ADDR = '127.0.0.1:8299'
 const CAMELID_ORIGIN = `http://${CAMELID_ADDR}`
@@ -786,7 +787,7 @@ async function httpJson({ origin, allowedEndpoints, method, endpoint, body, time
 function normalizeHealth(body, { loaded, final = false, build }) {
   const code = 'chat_parity_camelid_contract_invalid'
   expect(body?.ok === true && body?.engine === 'camelid'
-    && body?.version === `camelid ${build}` && body?.build === build
+    && body?.version === CAMELID_RELEASE_VERSION && body?.build === build
     && body?.loaded_now === loaded && body?.generation_ready === loaded
     && body?.vision_ready === false && body?.active_model_id === (loaded ? ROW_ID : null)
     && body?.backend === (loaded ? 'llama' : 'none')
@@ -817,6 +818,7 @@ function normalizeHealth(body, { loaded, final = false, build }) {
     loaded_now: loaded,
     generation_ready: loaded,
     active_model_id: body.active_model_id,
+    version: CAMELID_RELEASE_VERSION,
     build,
     backend: body.backend,
     selected_backend: loaded ? body.execution_plan.selected_backend : null,
@@ -1805,11 +1807,12 @@ function validateReceiptUnsafe(receipt) {
     for (const name of ['camelid_baseline_health', 'camelid_loaded_health',
       'camelid_final_health']) {
       close(byName[name], ['loaded_now', 'generation_ready', 'active_model_id', 'build',
-        'backend', 'selected_backend', 'cuda_resident_active', 'queue_idle', 'q8_policy',
+        'version', 'backend', 'selected_backend', 'cuda_resident_active', 'queue_idle', 'q8_policy',
         'listen_addr'], `steps.${name}.evidence`)
       const loaded = name !== 'camelid_baseline_health'
       check(byName[name]?.loaded_now === loaded && byName[name]?.generation_ready === loaded
         && byName[name]?.active_model_id === (loaded ? ROW_ID : null)
+        && byName[name]?.version === CAMELID_RELEASE_VERSION
         && byName[name]?.build === receipt?.provenance?.source_describe
         && byName[name]?.backend === (loaded ? 'llama' : 'none')
         && byName[name]?.selected_backend === (loaded ? 'cpu_reference' : null)
@@ -2279,6 +2282,7 @@ export {
   APPLY_TEMPLATE_REQUEST,
   BINARY_PROFILE,
   CAMELID_ADDR,
+  CAMELID_RELEASE_VERSION,
   CHAT_REQUEST,
   DOES_NOT_PROVE,
   EOG_TOKEN_IDS,

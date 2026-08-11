@@ -9,6 +9,7 @@ import {
   APPLY_TEMPLATE_REQUEST,
   BINARY_PROFILE,
   CAMELID_ADDR,
+  CAMELID_RELEASE_VERSION,
   CHAT_REQUEST,
   DOES_NOT_PROVE,
   EOG_TOKEN_IDS,
@@ -90,6 +91,7 @@ assert.equal(RECEIPT_SCHEMA, 'camelid.model-qualification.chat-parity-preparatio
 assert.equal(ROW_ID, 'smollm3_3b_q8_0')
 assert.equal(BINARY_PROFILE, 'release-fat-lto')
 assert.equal(CAMELID_ADDR, '127.0.0.1:8297')
+assert.equal(CAMELID_RELEASE_VERSION, '0.6.1')
 assert.equal(LLAMA_ADDR, '127.0.0.1:8299')
 assert.deepEqual(EXACT_ROW.source, {
   repo: 'ggml-org/SmolLM3-3B-GGUF',
@@ -242,12 +244,13 @@ assert.deepEqual(normalizedCamelidDetokenize.evidence.trimmed_content,
   { redacted: true, utf8_bytes: Buffer.byteLength(detokenized.trim(), 'utf8'),
     sha256: createHash('sha256').update(detokenized.trim()).digest('hex') })
 
-function health(loaded, final = false) {
+function health(loaded, final = false, version = CAMELID_RELEASE_VERSION,
+  build = sourceDescribe) {
   const body = {
     ok: true,
     engine: 'camelid',
-    version: `camelid ${sourceDescribe}`,
-    build: sourceDescribe,
+    version,
+    build,
     loaded_now: loaded,
     generation_ready: loaded,
     vision_ready: false,
@@ -477,15 +480,17 @@ function fakeGuard(engine, abortAt = null) {
   }
 }
 
-function responses({ llamaTokens = generatedTokens, llamaText = detokenized } = {}) {
+function responses({ llamaTokens = generatedTokens, llamaText = detokenized,
+  camelidVersion = CAMELID_RELEASE_VERSION, camelidBuild = sourceDescribe } = {}) {
   return [
-    health(false), gpu, load, verify, health(true), props,
+    health(false, false, camelidVersion, camelidBuild), gpu, load, verify,
+    health(true, false, camelidVersion, camelidBuild), props,
     { prompt: renderedPrompt },
     { tokens: promptTokens },
     chatBody(),
     { content: detokenized },
     { prompt: renderedPrompt },
-    health(true, true), gpu,
+    health(true, true, camelidVersion, camelidBuild), gpu,
     { status: 'ok' },
     { tokens: promptTokens },
     { tokens: llamaTokens, content: llamaText, tokens_predicted: 4 },
@@ -574,6 +579,12 @@ assert.equal(receipt.gate_decision.bounded_evidence_publishable, true)
 assert.equal(receipt.gate_decision.roster_parity_gate, 'blocked_unchanged')
 assert.deepEqual(receipt.gate_decision.authorized_roster_scope, [])
 assert.equal(receipt.gate_decision.support_claim, false)
+for (const name of ['camelid_baseline_health', 'camelid_loaded_health',
+  'camelid_final_health']) {
+  const evidence = receipt.steps.find((step) => step.name === name).evidence
+  assert.equal(evidence.version, CAMELID_RELEASE_VERSION)
+  assert.equal(evidence.build, sourceDescribe)
+}
 assert.deepEqual(receipt.isolation.lifecycle_events,
   ['camelid_started', 'camelid_closed', 'llama_cpp_started', 'llama_cpp_closed'])
 assert.equal(receipt.isolation.max_concurrent_engine_children, 1)
@@ -602,6 +613,20 @@ assert.equal(httpCalls.filter((call) => call.endpoint === '/v1/chat/completions'
 assert.equal(httpCalls.filter((call) => call.endpoint === '/completion').length, 1)
 assert.deepEqual(happySynthetic.calls.filter((call) => call.kind !== 'http').map((call) => call.kind),
   ['prehash', 'posthash'])
+
+for (const [label, options] of [
+  ['composite version', { camelidVersion: `camelid ${sourceDescribe}` }],
+  ['wrong release scalar', { camelidVersion: '0.6.0' }],
+  ['wrong build identity', { camelidBuild: `${sourceDescribe}-drift` }],
+]) {
+  const invalidHealth = syntheticDeps(options)
+  await expectCode(runSmolLM3ChatParity(runOptions, invalidHealth.deps),
+    'chat_parity_camelid_contract_invalid')
+  assert.deepEqual(invalidHealth.starts.map((entry) => entry.engine), ['camelid'], label)
+  assert.deepEqual(invalidHealth.terminated, ['camelid'], label)
+  assert.deepEqual(invalidHealth.calls.filter((call) => call.kind === 'http')
+    .map((call) => call.endpoint), ['/v1/health'], label)
+}
 
 const mismatchSynthetic = syntheticDeps({
   llamaTokens: [128002, 220, 9999, 5678],
@@ -712,6 +737,8 @@ const tamperCases = [
   ['engine order', (value) => { value.isolation.lifecycle_events.reverse() }, 'lifetimes'],
   ['warmup', (value) => { value.isolation.startup_warmup_markers.llama_cpp.warming_up_seen = true },
     'lifetimes'],
+  ['health release version', (value) => { value.steps[0].evidence.version = '0.6.0' },
+    'health'],
   ['unknown warmup container field', (value) => {
     value.isolation.startup_warmup_markers.extra = true
   }, 'keys must be exact'],
