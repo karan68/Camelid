@@ -5,7 +5,12 @@ import { readFile } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { summarizeRoster, validateRoster } from './check-model-qualification-roster.mjs'
-import { validateLoadSmokeReceipt } from './hf-qualification-smollm3-load-smoke.mjs'
+import {
+  validateLoadSmokeReceipt as validateQwenLoadSmokeReceipt,
+} from './hf-qualification-qwen2_5-load-smoke.mjs'
+import {
+  validateLoadSmokeReceipt as validateSmolLoadSmokeReceipt,
+} from './hf-qualification-smollm3-load-smoke.mjs'
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const path = join(root, 'qa', 'model-qualification', 'phase1-roster.json')
@@ -26,6 +31,14 @@ const qwenVerifyBytes = await readFile(join(qwenContextBundle, 'verify.log'))
 const qwenVerifyLog = qwenVerifyBytes.toString('utf8')
 const qwenContextManifest = JSON.parse(await readFile(join(qwenContextBundle, 'manifest.json'), 'utf8'))
 const qwenContextSums = await readFile(join(qwenContextBundle, 'SHA256SUMS'), 'utf8')
+const qwenLoadReceiptPath = join(
+  root,
+  'qa',
+  'model-qualification',
+  'qwen2.5-0.5b-q8-windows-cpu-load-smoke.json',
+)
+const qwenLoadReceiptBytes = await readFile(qwenLoadReceiptPath)
+const qwenLoadReceipt = JSON.parse(qwenLoadReceiptBytes)
 const fileSha256 = bytes => createHash('sha256').update(bytes).digest('hex')
 const gitBlobSha1 = bytes => createHash('sha1')
   .update(Buffer.from(`blob ${bytes.length}\0`))
@@ -82,8 +95,93 @@ assert.deepEqual(validateRoster(roster, 'phase1'), [], 'the committed Phase 1 ro
 assert.equal(summarizeRoster(roster).length, 6, 'all six Phase 1 graph families must remain visible')
 assert.equal(summarizeRoster(roster)[0].next_gate, null, 'LFM2 closes every Phase 1 gate on the exact promoted row')
 assert.equal(roster.rows[0].disposition, 'promotion_candidate', 'all-green LFM2 is ready for exact-row promotion')
-assert.equal(summarizeRoster(roster)[1].next_gate, 'load_smoke', 'Qwen2.5 preserves its first post-bootstrap blocker')
-assert.equal(roster.rows[1].gates.context.status, 'pass', 'Qwen2.5 closes the independent exact-512 context gate without weakening strict short-prompt parity')
+const qwenRow = roster.rows[1]
+const qwenSummary = summarizeRoster(roster)[1]
+assert.equal(qwenSummary.next_gate, 'parity', 'Qwen2.5 advances only through bounded load-smoke evidence')
+assert.deepEqual(qwenSummary.gates, { pass: 6, fail: 1, blocked: 1, pending: 0 })
+assert.equal(qwenRow.gates.load_smoke.status, 'pass')
+assert.deepEqual(qwenRow.gates.load_smoke.evidence, [
+  'qa/model-qualification/qwen2.5-0.5b-q8-windows-cpu-load-smoke.json',
+])
+assert.equal(Object.hasOwn(qwenRow.gates.load_smoke, 'reason'), false)
+assert.equal(qwenRow.gates.parity.status, 'fail')
+assert.equal(qwenRow.gates.api_webui.status, 'blocked')
+assert.equal(qwenRow.gates.context.status, 'pass')
+assert.equal(qwenRow.disposition, 'active_validation')
+assert.equal(qwenRow.target_tier, 'experimental_exact_row')
+assert.equal(fileSha256(qwenLoadReceiptBytes),
+  'f74bde1366aabce927ab808a9a8d229e0221cbdb20cd6a9eedd78d3319fa3870')
+assert.equal(qwenLoadReceipt.receipt_id,
+  'af388a3ef19951dab0da657e59963ad2d725136518a4aac28a1e23451ffa864b')
+assert.deepEqual(validateQwenLoadSmokeReceipt(qwenLoadReceipt), [])
+assert.equal(qwenLoadReceipt.row.id, qwenRow.id)
+assert.equal(qwenLoadReceipt.row.family, qwenRow.identity.family)
+assert.equal(qwenLoadReceipt.row.architecture, qwenRow.identity.architecture)
+assert.equal(qwenLoadReceipt.row.quantization, qwenRow.identity.quantization)
+assert.equal(qwenLoadReceipt.row.target_tier, qwenRow.target_tier)
+assert.equal(qwenLoadReceipt.row.disposition, qwenRow.disposition)
+assert.deepEqual(qwenLoadReceipt.row.source, {
+  repo: qwenRow.source.repo,
+  file: qwenRow.source.file,
+  revision: qwenRow.source.revision,
+  size_bytes: qwenRow.identity.size_bytes,
+  sha256: qwenRow.identity.sha256,
+  license: qwenRow.source.license,
+})
+assert.equal(qwenLoadReceipt.provenance.runtime_head,
+  '188631159b07f76ca3b081fd1b401090edfa1e21')
+assert.equal(qwenLoadReceipt.provenance.source_describe, 'v0.6.1-51-g18863115')
+assert.equal(qwenLoadReceipt.provenance.tracked_files_clean, true)
+assert.equal(qwenLoadReceipt.provenance.untracked_files_excluded, true)
+assert.equal(qwenLoadReceipt.provenance.binary.sha256,
+  '5c4584186fded5fcbb7e848a938afc006f597b3302ed31942562faa908ca3346')
+assert.equal(qwenLoadReceipt.provenance.binary.built_from_clean_tracked_head, true)
+assert.equal(qwenLoadReceipt.provenance.artifact.sha256, qwenRow.identity.sha256)
+assert.equal(qwenLoadReceipt.provenance.artifact.size_bytes, qwenRow.identity.size_bytes)
+assert.equal(qwenLoadReceipt.provenance.artifact.verified_after_lock_acquisition, true)
+assert.equal(qwenLoadReceipt.provenance.artifact.verified_after_generation, true)
+assert.equal(qwenLoadReceipt.provenance.platform, 'windows-x86_64')
+assert.equal(qwenLoadReceipt.provenance.paths_redacted, true)
+assert.equal(qwenLoadReceipt.provenance.hostname_redacted, true)
+const qwenLoadedEvidence = qwenLoadReceipt.steps
+  .find((step) => step.name === 'loaded_health').evidence
+const qwenRawEvidence = qwenLoadReceipt.steps
+  .find((step) => step.name === 'raw_first_forward').evidence
+assert.equal(qwenRawEvidence.generated_token_ids.length, 1)
+assert.equal(qwenRawEvidence.timings.weight_cache_hit, false)
+assert.equal(qwenRawEvidence.timings.prompt_cache_hit, false)
+assert.equal(qwenRawEvidence.timings.first_token_evaluated, true)
+for (const phase of qwenRawEvidence.memory_phases) {
+  assert.equal(phase.materialization.has_lazy_q8_0_file_backing, true)
+  assert.ok(phase.materialization.q8_0_file_backed_tensor_count > 0)
+  assert.equal(phase.materialization.has_q8_0_f32_materialization, false)
+  assert.equal(phase.materialization.q8_0_f32_materialized_tensor_count, 0)
+  assert.equal(phase.materialization.q8_0_f32_materialized_bytes, 0)
+  assert.ok(phase.q8_file_reads.read_calls > 0)
+  assert.ok(phase.q8_file_reads.read_bytes > 0)
+}
+assert.equal(qwenLoadedEvidence.execution_plan.selected_backend, 'cpu_reference')
+assert.equal(qwenLoadedEvidence.execution_plan.cuda_resident_active, false)
+for (const gpuStep of qwenLoadReceipt.steps
+  .filter((step) => step.name === 'baseline_gpu' || step.name === 'final_gpu')) {
+  assert.equal(gpuStep.evidence.enabled, false)
+  assert.equal(gpuStep.evidence.run_count, 0)
+}
+assert.equal(qwenLoadReceipt.resource_observations.thresholds_tripped, false)
+assert.ok(qwenLoadReceipt.resource_observations.monitor_samples > 0)
+assert.ok(qwenLoadReceipt.resource_observations.minimum_available_physical_bytes >= 1024 ** 3)
+assert.ok(qwenLoadReceipt.resource_observations.peak_child_working_set_bytes < 2 * 1024 ** 3)
+assert.equal(qwenLoadReceipt.isolation.startup_warmup_markers.raw_output_persisted, false)
+assert.equal(qwenRawEvidence.generated_text.redacted, true)
+assert.doesNotMatch(qwenLoadReceiptBytes.toString('utf8'), /[A-Za-z]:[\\/]/)
+assert.deepEqual(qwenLoadReceipt.gate_decision.authorized_roster_scope, ['gates.load_smoke'])
+assert.equal(qwenLoadReceipt.gate_decision.load_smoke, 'pass')
+assert.equal(qwenLoadReceipt.gate_decision.support_claim, false)
+assert.equal(qwenLoadReceipt.gate_decision.existing_parity_gate, 'fail_unchanged')
+assert.equal(qwenLoadReceipt.gate_decision.other_gates_unchanged, true)
+assert.equal(qwenLoadReceipt.gate_decision.disposition, qwenRow.disposition)
+assert.equal(qwenLoadReceipt.gate_decision.target_tier, qwenRow.target_tier)
+assert.equal(qwenRow.gates.context.status, 'pass', 'Qwen2.5 closes the independent exact-512 context gate without weakening strict short-prompt parity')
 assert.equal(qwenContext.schema, 'camelid.context-qualification-summary/v1')
 assert.equal(qwenContext.row_id, roster.rows[1].id)
 assert.equal(qwenContext.artifact.sha256, roster.rows[1].identity.sha256)
@@ -142,7 +240,7 @@ assert.equal(smolRow.gates.context.status, 'pending')
 assert.equal(smolRow.disposition, 'hold')
 assert.equal(fileSha256(smolLoadReceiptBytes), '4c156199ef4395188aa64210401bb3bfa40e8ef8acdb58c4e4908cc583257b17')
 assert.equal(smolLoadReceipt.receipt_id, '7d5a31a30609db49847790d69fd809612d579000f9fa7f4857f0b753dd4a5aa4')
-assert.deepEqual(validateLoadSmokeReceipt(smolLoadReceipt), [])
+assert.deepEqual(validateSmolLoadSmokeReceipt(smolLoadReceipt), [])
 assert.equal(smolLoadReceipt.row.id, smolRow.id)
 assert.equal(smolLoadReceipt.row.source.size_bytes, smolRow.identity.size_bytes)
 assert.equal(smolLoadReceipt.row.source.sha256, smolRow.identity.sha256)

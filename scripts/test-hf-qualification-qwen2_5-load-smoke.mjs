@@ -2,6 +2,7 @@
 
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
+import { readFile } from 'node:fs/promises'
 import { resolve } from 'node:path'
 
 import {
@@ -43,6 +44,11 @@ const binary = resolve('qualification-bin', 'camelid.exe')
 const artifact = resolve('qualification-artifacts', EXACT_ROW.source.file)
 const cwd = resolve('qualification-run', 'work')
 const modelsDir = resolve('qualification-run', 'empty-models')
+const durableReceiptBytes = await readFile(resolve(
+  'qa/model-qualification/qwen2.5-0.5b-q8-windows-cpu-load-smoke.json',
+))
+const durableReceipt = JSON.parse(durableReceiptBytes)
+const fileSha256 = bytes => createHash('sha256').update(bytes).digest('hex')
 
 function deepClone(value) {
   return structuredClone(value)
@@ -85,6 +91,97 @@ assert.equal(LIMITS.preflight_disk_bytes, 4 * 1024 ** 3)
 assert.equal(LIMITS.low_memory_abort_bytes, 1024 ** 3)
 assert.equal(LIMITS.child_working_set_abort_bytes, 2 * 1024 ** 3)
 assert.equal(LIMITS.consecutive_abort_samples, 2)
+assert.equal(
+  fileSha256(durableReceiptBytes),
+  'f74bde1366aabce927ab808a9a8d229e0221cbdb20cd6a9eedd78d3319fa3870',
+)
+assert.equal(
+  durableReceipt.receipt_id,
+  'af388a3ef19951dab0da657e59963ad2d725136518a4aac28a1e23451ffa864b',
+)
+assert.deepEqual(validateLoadSmokeReceipt(durableReceipt), [])
+assert.deepEqual(durableReceipt.row, EXACT_ROW)
+assert.equal(durableReceipt.provenance.runtime_head,
+  '188631159b07f76ca3b081fd1b401090edfa1e21')
+assert.equal(durableReceipt.provenance.source_describe, 'v0.6.1-51-g18863115')
+assert.equal(durableReceipt.provenance.tracked_files_clean, true)
+assert.equal(durableReceipt.provenance.untracked_files_excluded, true)
+assert.equal(durableReceipt.provenance.binary.profile, BINARY_PROFILE)
+assert.equal(durableReceipt.provenance.binary.sha256,
+  '5c4584186fded5fcbb7e848a938afc006f597b3302ed31942562faa908ca3346')
+assert.equal(durableReceipt.provenance.binary.version, 'camelid v0.6.1-51-g18863115')
+assert.equal(durableReceipt.provenance.binary.health_build, 'v0.6.1-51-g18863115')
+assert.equal(durableReceipt.provenance.binary.built_from_clean_tracked_head, true)
+assert.equal(durableReceipt.provenance.artifact.size_bytes, EXACT_ROW.source.size_bytes)
+assert.equal(durableReceipt.provenance.artifact.sha256, EXACT_ROW.source.sha256)
+assert.equal(durableReceipt.provenance.artifact.verified_after_lock_acquisition, true)
+assert.equal(durableReceipt.provenance.artifact.verified_after_generation, true)
+assert.equal(durableReceipt.provenance.platform, 'windows-x86_64')
+assert.equal(durableReceipt.provenance.paths_redacted, true)
+assert.equal(durableReceipt.provenance.hostname_redacted, true)
+
+const durableLoaded = durableReceipt.steps
+  .find((step) => step.name === 'loaded_health').evidence
+const durableRaw = durableReceipt.steps
+  .find((step) => step.name === 'raw_first_forward').evidence
+const durableGpuSteps = durableReceipt.steps
+  .filter((step) => step.name === 'baseline_gpu' || step.name === 'final_gpu')
+assert.equal(durableReceipt.runtime_contract.requests.raw_first_forward.max_tokens, 1)
+assert.equal(durableReceipt.runtime_contract.requests.raw_first_forward.stream, false)
+assert.equal(durableReceipt.runtime_contract.requests.camelid_receipt_requested, false)
+assert.equal(durableRaw.choice_count, 1)
+assert.equal(durableRaw.generated_token_ids.length, 1)
+assert.equal(durableRaw.timings.weight_cache_hit, false)
+assert.equal(durableRaw.timings.prompt_cache_hit, false)
+assert.equal(durableRaw.timings.first_token_evaluated, true)
+assert.equal(durableRaw.camelid_receipt_present, false)
+for (const phase of durableRaw.memory_phases) {
+  assert.ok(phase.forward_passes > 0)
+  assert.equal(phase.materialization.has_lazy_q8_0_file_backing, true)
+  assert.ok(phase.materialization.q8_0_file_backed_tensor_count > 0)
+  assert.ok(phase.materialization.q8_0_file_backed_storage_bytes > 0)
+  assert.equal(phase.materialization.has_q8_0_f32_materialization, false)
+  assert.equal(phase.materialization.q8_0_f32_materialized_tensor_count, 0)
+  assert.equal(phase.materialization.q8_0_f32_materialized_bytes, 0)
+  assert.equal(phase.materialization.has_retained_q8_0_blocks, false)
+  assert.equal(phase.materialization.q8_0_retained_block_tensor_count, 0)
+  assert.equal(phase.materialization.q8_0_retained_block_bytes, 0)
+  assert.ok(phase.q8_file_reads.read_calls > 0)
+  assert.ok(phase.q8_file_reads.read_bytes > 0)
+  for (const [key, value] of Object.entries(phase.q8_file_reads)) {
+    if (key.startsWith('cache_')) assert.equal(value, 0)
+  }
+}
+assert.equal(durableLoaded.execution_plan.selected_backend, 'cpu_reference')
+assert.equal(durableLoaded.execution_plan.cuda_resident_active, false)
+assert.equal(durableLoaded.execution_plan.selected_q8_path, 'safe_dense_or_q8_cpu')
+for (const { evidence } of durableGpuSteps) {
+  assert.equal(evidence.enabled, false)
+  assert.equal(evidence.run_count, 0)
+  assert.equal(evidence.device_redacted, true)
+}
+assert.equal(durableReceipt.resource_observations.thresholds_tripped, false)
+assert.ok(durableReceipt.resource_observations.monitor_samples > 0)
+assert.ok(durableReceipt.resource_observations.preflight_available_physical_bytes
+  >= LIMITS.preflight_physical_bytes)
+assert.ok(durableReceipt.resource_observations.preflight_available_disk_bytes
+  >= LIMITS.preflight_disk_bytes)
+assert.ok(durableReceipt.resource_observations.minimum_available_physical_bytes
+  >= LIMITS.low_memory_abort_bytes)
+assert.ok(durableReceipt.resource_observations.peak_child_working_set_bytes
+  < LIMITS.child_working_set_abort_bytes)
+assert.equal(durableReceipt.isolation.startup_warmup_markers.raw_output_persisted, false)
+assert.equal(durableRaw.generated_text.redacted, true)
+const durableReceiptText = durableReceiptBytes.toString('utf8')
+assert.doesNotMatch(durableReceiptText, /[A-Za-z]:[\\/]/)
+assert.doesNotMatch(durableReceiptText, /target[\\/]model-qualification/i)
+assert.deepEqual(durableReceipt.gate_decision.authorized_roster_scope, ['gates.load_smoke'])
+assert.equal(durableReceipt.gate_decision.load_smoke, 'pass')
+assert.equal(durableReceipt.gate_decision.support_claim, false)
+assert.equal(durableReceipt.gate_decision.existing_parity_gate, 'fail_unchanged')
+assert.equal(durableReceipt.gate_decision.other_gates_unchanged, true)
+assert.equal(durableReceipt.gate_decision.disposition, EXACT_ROW.disposition)
+assert.equal(durableReceipt.gate_decision.target_tier, EXACT_ROW.target_tier)
 assert.deepEqual(STEP_CONTRACT.map(([name]) => name), [
   'baseline_health', 'baseline_gpu', 'load', 'verify_identity',
   'loaded_health', 'raw_first_forward', 'final_health', 'final_gpu',

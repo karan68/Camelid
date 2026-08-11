@@ -216,11 +216,10 @@
         },
         "load_smoke": {
           "required": true,
-          "status": "blocked",
+          "status": "pass",
           "evidence": [
-            "qa/model-qualification/qwen2.5-0.5b-q8-bootstrap-report.json"
-          ],
-          "reason": "The exact row loads and serves on the CPU reference lane, but runnable-smoke correctly refuses qwen2/Q8_0/BPE until that tuple is oracle-qualified."
+            "qa/model-qualification/qwen2.5-0.5b-q8-windows-cpu-load-smoke.json"
+          ]
         },
         "parity": {
           "required": true,

@@ -140,15 +140,16 @@ continuations, and the exact one-turn ChatML rendering. Passing that fixture is
 still only raw graph/tokenizer evidence; chat-template/API/context gates remain
 separate.
 
-Current bootstrap result: source, metadata, tokenizer, template, and the exact
-512-token context gate pass. The context receipt used a clean current-head
-binary, replayed Camelid deterministically, and matched all eight generated
-tokens and text against pinned llama.cpp. This does not waive the independent
-short-prompt result below.
-Raw greedy parity matches 3 of 4 prompts; the remaining prompt reverses two
-near-tied candidates, so it is recorded as a hard parity failure rather than
-waived. Load/smoke and complete API/WebUI gates remain blocked, and the row
-stays experimental/unverified.
+Current bootstrap result: source, metadata, tokenizer, template, bounded Windows
+CPU `load_smoke`, and the exact 512-token context gate pass. The load receipt
+uses a clean current-head release binary, loads the exact row on the CPU
+reference lane, and produces one deterministic raw token on a cold file-backed
+Q8 path without Q8-to-F32 materialization or GPU execution. This is a
+load-smoke-only result and makes no support, parity, API/WebUI, or performance
+claim. Raw greedy parity still matches 3 of 4 prompts; the remaining prompt
+reverses two near-tied candidates, so strict parity remains failed rather than
+waived. Complete API/WebUI remains blocked, and the row stays experimental in
+active validation.
 
 ## Phase 2 factory foundation
 
