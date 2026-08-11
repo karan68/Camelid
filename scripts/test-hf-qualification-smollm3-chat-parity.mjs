@@ -48,6 +48,12 @@ import {
 import { SmolLM3LoadSmokeError } from './hf-qualification-smollm3-load-smoke.mjs'
 
 const root = resolve('.')
+const durableReceiptBytes = await readFile(resolve(
+  root,
+  'qa/model-qualification/smollm3-3b-q8-windows-cpu-chat-parity-preparation.json',
+))
+const durableReceipt = JSON.parse(durableReceiptBytes)
+const fileSha256 = bytes => createHash('sha256').update(bytes).digest('hex')
 const binary = resolve('qualification-bin', 'camelid.exe')
 const artifact = resolve('qualification-artifacts', EXACT_ROW.source.file)
 const cwd = resolve('qualification-run', 'work')
@@ -223,6 +229,168 @@ assert.equal(committedGrounding.renderer_git_blob_sha1,
   '3de4cb8602356b6773bcdcbe0c4a69a4155e713f')
 assert.equal(committedGrounding.shape_case.normalized_prompt_sha256,
   '7619416ae94ba9a00378d976bfa944f5ba726747f9b67ba4e862d9a7fe20e4f1')
+assert.equal(
+  fileSha256(durableReceiptBytes),
+  '3d7d779f3dc08a79ed0332191b71e4afbb0e84250a4716d03ae9d44a37534d07',
+)
+assert.equal(
+  durableReceipt.receipt_id,
+  '713eaf51878b69b3b724d4f5403f553a38518c21f541d11faa38d5411627caaa',
+)
+assert.deepEqual(validateChatParityReceipt(durableReceipt), [])
+assert.equal(durableReceipt.schema, RECEIPT_SCHEMA)
+assert.equal(durableReceipt.gate, 'parity_preparation')
+assert.deepEqual(durableReceipt.row, EXACT_ROW)
+assert.deepEqual(durableReceipt.grounding, {
+  files: committedGrounding.identities,
+  renderer_git_blob_sha1: committedGrounding.renderer_git_blob_sha1,
+  template: committedGrounding.template,
+  shape_case: committedGrounding.shape_case,
+  runtime_envelope: 'smollm3-default-thinking-runtime-envelope-v1',
+  load_receipt_validated: true,
+})
+assert.equal(durableReceipt.provenance.runtime_head,
+  '3f3a01c0f2260ebd07b52fbc12df9c6c94ceda32')
+assert.equal(durableReceipt.provenance.source_describe, 'v0.6.1-55-g3f3a01c0')
+assert.equal(durableReceipt.provenance.tracked_files_clean, true)
+assert.equal(durableReceipt.provenance.untracked_files_excluded, true)
+assert.deepEqual(durableReceipt.provenance.camelid_binary, {
+  profile: 'release-fat-lto',
+  sha256: 'a07b4099fab4fd443f938a8525299706ecfe5540e24385535906ffe738b95912',
+  version: 'camelid v0.6.1-55-g3f3a01c0',
+  health_build: 'v0.6.1-55-g3f3a01c0',
+  path_redacted: true,
+})
+assert.deepEqual(durableReceipt.provenance.llama_cpp, {
+  ...LLAMA_PIN,
+  version_verified: true,
+  executable_path_redacted: true,
+  package_path_redacted: true,
+})
+assert.equal(durableReceipt.provenance.artifact.size_bytes, EXACT_ROW.source.size_bytes)
+assert.equal(durableReceipt.provenance.artifact.sha256, EXACT_ROW.source.sha256)
+assert.equal(durableReceipt.provenance.artifact.verified_after_lock_acquisition, true)
+assert.equal(durableReceipt.provenance.artifact.verified_after_both_engines, true)
+assert.deepEqual(durableReceipt.provenance.artifact.mutation_guard, {
+  mechanism: 'windows_file_stream_share_read',
+  read_access: 'allowed',
+  write_access: 'denied',
+  delete_access: 'denied',
+  rename_access: 'denied',
+  symbolic_links_rejected: true,
+  acquired_before_prehash: true,
+  held_through_camelid: true,
+  held_through_llama_cpp: true,
+  held_through_posthash: true,
+  released_token_observed: true,
+  helper_exit_code: 0,
+  artifact_path_in_helper_argv: false,
+})
+assert.equal(durableReceipt.provenance.paths_redacted, true)
+assert.equal(durableReceipt.provenance.hostname_redacted, true)
+assert.deepEqual(durableReceipt.runtime_contract.camelid.command, receiptCamelidCommand())
+assert.deepEqual(durableReceipt.runtime_contract.camelid.environment, SAFE_CAMELID_ENV)
+assert.deepEqual(durableReceipt.runtime_contract.camelid.request, {
+  ...CHAT_REQUEST,
+  camelid_enable_thinking_omitted: true,
+  camelid_receipt_requested: false,
+})
+assert.deepEqual(durableReceipt.runtime_contract.llama_cpp.command, receiptLlamaCommand())
+assert.deepEqual(durableReceipt.runtime_contract.llama_cpp.environment, SAFE_LLAMA_ENV)
+assert.deepEqual(durableReceipt.runtime_contract.llama_cpp.completion, {
+  prompt: 'identical_cross_engine_prompt_token_ids',
+  ...LLAMA_COMPLETION_SETTINGS,
+})
+assert.equal(durableReceipt.runtime_contract.prompt.token_count, 254)
+assert.equal(durableReceipt.runtime_contract.prompt.token_ids_sha256,
+  'e1e8659a361b75d7c8d12b3ebb46adfef7dc44b8d1147c9ba2c9580192f3b4ed')
+assert.deepEqual(durableReceipt.steps.map(({ name }) => name),
+  STEP_CONTRACT.map(([name]) => name))
+const durableSteps = Object.fromEntries(
+  durableReceipt.steps.map(({ name, evidence }) => [name, evidence]),
+)
+const durableGeneratedTokens = [128_002, 198, 33_413, 11]
+const durableTextIdentity = {
+  redacted: true,
+  utf8_bytes: 13,
+  sha256: '40d46cb3f0c0ca439a917b8f8b0eb662f08e372c841b7fa6776ca22c18e2a443',
+}
+assert.equal(durableSteps.camelid_tokenize_prompt.token_count, 254)
+assert.equal(durableSteps.llama_tokenize_prompt.token_count, 254)
+assert.equal(durableSteps.llama_tokenize_prompt.identical_to_camelid_prompt_token_ids, true)
+assert.deepEqual(durableSteps.camelid_chat_first_forward.generated_token_ids,
+  durableGeneratedTokens)
+assert.deepEqual(durableSteps.camelid_chat_first_forward.first_forward, {
+  weight_load_observed: true,
+  weight_cache_hit: false,
+  prompt_cache_hit: false,
+  first_token_evaluated: true,
+})
+assert.deepEqual(durableSteps.llama_completion_first_forward.generated_token_ids,
+  durableGeneratedTokens)
+assert.equal(durableSteps.llama_completion_first_forward.deterministic_top_k_only, true)
+assert.equal(durableSteps.llama_completion_first_forward.first_forward, true)
+assert.equal(durableSteps.camelid_apply_template_after.identical_to_frozen_pre_forward_prompt,
+  true)
+assert.deepEqual(durableReceipt.comparison, {
+  prompt_render_stable_across_camelid_forward: true,
+  prompt_token_ids_cross_engine_exact: true,
+  generated_token_ids: {
+    camelid: durableGeneratedTokens,
+    llama_cpp: durableGeneratedTokens,
+    exact_match: true,
+    first_divergent_index: -1,
+    all_four_non_eog: true,
+  },
+  canonical_detokenized_text: {
+    camelid: durableTextIdentity,
+    llama_cpp: durableTextIdentity,
+    exact_utf8_match: true,
+    camelid_bubble_equals_detokenized_trim: true,
+    llama_content_equals_detokenized: true,
+  },
+  exact_token_and_text_match: true,
+})
+assert.equal(durableReceipt.isolation.max_concurrent_engine_children, 1)
+assert.deepEqual(durableReceipt.isolation.lifecycle_events,
+  ['camelid_started', 'camelid_closed', 'llama_cpp_started', 'llama_cpp_closed'])
+assert.equal(durableReceipt.isolation.camelid_chat_first_and_only_forward, true)
+assert.equal(durableReceipt.isolation.llama_completion_first_and_only_forward, true)
+assert.deepEqual(durableReceipt.isolation.startup_warmup_markers, {
+  camelid: {
+    warming_up_seen: false,
+    generation_warmup_complete_seen: false,
+    raw_output_persisted: false,
+  },
+  llama_cpp: {
+    warming_up_seen: false,
+    generation_warmup_complete_seen: false,
+    raw_output_persisted: false,
+  },
+})
+assert.equal(durableReceipt.resource_observations.thresholds_tripped, false)
+assert.equal(durableReceipt.resource_observations.camelid.thresholds_tripped, false)
+assert.equal(durableReceipt.resource_observations.llama_cpp.thresholds_tripped, false)
+assert.deepEqual(durableReceipt.gate_decision, {
+  parity_preparation: 'pass',
+  bounded_evidence_publishable: true,
+  roster_parity_gate: 'blocked_unchanged',
+  template_gate: 'blocked_unchanged',
+  api_webui_gate: 'pending_unchanged',
+  context_gate: 'pending_unchanged',
+  load_smoke_gate: 'pass_unchanged',
+  support_claim: false,
+  disposition: 'hold',
+  target_tier: 'experimental_exact_row',
+  authorized_roster_scope: [],
+  other_gates_unchanged: true,
+})
+assert.deepEqual(durableReceipt.does_not_prove, DOES_NOT_PROVE)
+const durableSerialized = JSON.stringify(durableReceipt)
+assert.doesNotMatch(durableSerialized,
+  /(?:[A-Za-z]:\\|file:\/\/|\\\\[^\\]|\/Users\/|\/home\/|\/tmp\/)/i)
+assert.doesNotMatch(durableSerialized,
+  /(?:bearer\s+|basic\s+|hf_[A-Za-z0-9]{8,}|(?:token|password|secret)\s*[:=])/i)
 const shapePack = JSON.parse(await readFile(resolve(GROUNDING_FILES.shape_pack.path), 'utf8'))
 const shapeCase = shapePack.cases.find((entry) => entry.id
   === 'default_think_single_user_generation_prompt')

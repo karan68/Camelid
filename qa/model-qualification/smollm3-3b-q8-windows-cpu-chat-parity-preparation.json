@@ -1,0 +1,996 @@
+{
+  "schema": "camelid.model-qualification.chat-parity-preparation/v1",
+  "receipt_id": "713eaf51878b69b3b724d4f5403f553a38518c21f541d11faa38d5411627caaa",
+  "created_utc": "2026-08-11T13:27:12.944Z",
+  "gate": "parity_preparation",
+  "row": {
+    "id": "smollm3_3b_q8_0",
+    "family": "smollm3",
+    "architecture": "smollm3",
+    "quantization": "Q8_0",
+    "target_tier": "experimental_exact_row",
+    "disposition": "hold",
+    "source": {
+      "repo": "ggml-org/SmolLM3-3B-GGUF",
+      "file": "SmolLM3-Q8_0.gguf",
+      "revision": "4965cb60b150737b68a0408c36aeefb65078f894",
+      "size_bytes": 3275574624,
+      "sha256": "8aa8cc74656137174a1988d993b00828e65a86fd68773412b632a75aa1373248",
+      "license": "apache-2.0"
+    }
+  },
+  "grounding": {
+    "files": {
+      "source_lock": {
+        "path": "qa/model-qualification/smollm3-3b-q8-source-lock.json",
+        "sha256": "24ef388389050e55f32698a5095da386efe7d8316f85552d64cd39e2e4dcfaf9"
+      },
+      "header_receipt": {
+        "path": "qa/model-qualification/smollm3-3b-q8-header-inspection.json",
+        "sha256": "6faa8cee4a70b5821f485e2debc8a9263d02ebbf5c346138221e9f78a46c9dae"
+      },
+      "tokenizer_receipt": {
+        "path": "qa/model-qualification/smollm3-3b-q8-header-tokenizer-parity.json",
+        "sha256": "4e3f3b74346b4b005a462ab888a50d9bacdd01cc5a20d05e57682d70eff9afe4"
+      },
+      "shape_pack": {
+        "path": "qa/prompt-packs/smollm3-chat-template-shapes-v1.json",
+        "sha256": "d46794448b7c2585d0aa83dfd7bb17d4904c2dcbc048ade1ef68cd3863166de6"
+      },
+      "runtime_envelope": {
+        "path": "qa/model-qualification/fixtures/smollm3-default-thinking-runtime-envelope-v1.json",
+        "sha256": "9bd93ef2470936ee24f0e740892b8e7bf28967f17d8ae566215a5935b576fee5"
+      },
+      "load_receipt": {
+        "path": "qa/model-qualification/smollm3-3b-q8-windows-cpu-load-smoke.json",
+        "sha256": "4c156199ef4395188aa64210401bb3bfa40e8ef8acdb58c4e4908cc583257b17",
+        "receipt_id": "7d5a31a30609db49847790d69fd809612d579000f9fa7f4857f0b753dd4a5aa4"
+      }
+    },
+    "renderer_git_blob_sha1": "3de4cb8602356b6773bcdcbe0c4a69a4155e713f",
+    "template": {
+      "utf8_bytes": 5493,
+      "sha256": "b9b66f04c64fbb8695cf5b35c37780efd0b8e0829fbfe3e30fafb9f469b7d30e"
+    },
+    "shape_case": {
+      "id": "default_think_single_user_generation_prompt",
+      "normalized_prompt_utf8_bytes": 1392,
+      "normalized_prompt_sha256": "7619416ae94ba9a00378d976bfa944f5ba726747f9b67ba4e862d9a7fe20e4f1",
+      "date_placeholder": "{{CURRENT_DATE_DD_MONTH_YYYY}}"
+    },
+    "runtime_envelope": "smollm3-default-thinking-runtime-envelope-v1",
+    "load_receipt_validated": true
+  },
+  "provenance": {
+    "runtime_head": "3f3a01c0f2260ebd07b52fbc12df9c6c94ceda32",
+    "source_describe": "v0.6.1-55-g3f3a01c0",
+    "tracked_files_clean": true,
+    "untracked_files_excluded": true,
+    "camelid_binary": {
+      "profile": "release-fat-lto",
+      "sha256": "a07b4099fab4fd443f938a8525299706ecfe5540e24385535906ffe738b95912",
+      "version": "camelid v0.6.1-55-g3f3a01c0",
+      "health_build": "v0.6.1-55-g3f3a01c0",
+      "path_redacted": true
+    },
+    "llama_cpp": {
+      "project": "llama.cpp",
+      "build": 9632,
+      "revision": "acd79d603cb2e1c84c0886137b80f1ad649b6857",
+      "reported_revision": "acd79d603",
+      "platform": "win32-x64",
+      "executable": "llama-server.exe",
+      "executable_size_bytes": 9216,
+      "executable_sha256": "6c787bf07ac1d7e1bbaa1ee176c3ef0df58ea86494c8c1b1d2d9f4a9176b19ae",
+      "server_impl_executable": "llama-server-impl.dll",
+      "server_impl_size_bytes": 9072128,
+      "server_impl_sha256": "df4fd737e380ba2cd39654af9233da22e2cdcbbf43ac376009cbec47aaaec750",
+      "package_file_count": 51,
+      "package_manifest_bytes": 4682,
+      "package_manifest_sha256": "d70bbe8beb7848396d0993ee533062c200350fd9961e2b92c799b24f94a33e93",
+      "archive": "llama-b9632-bin-win-cpu-x64.zip",
+      "archive_size_bytes": 16899258,
+      "archive_sha256": "b835d5c5155dd2a5ed748a0351debf2ede0dc9f808757e0429f8700a11832dcd",
+      "version_verified": true,
+      "executable_path_redacted": true,
+      "package_path_redacted": true
+    },
+    "artifact": {
+      "size_bytes": 3275574624,
+      "sha256": "8aa8cc74656137174a1988d993b00828e65a86fd68773412b632a75aa1373248",
+      "verified_after_lock_acquisition": true,
+      "verified_after_both_engines": true,
+      "mutation_guard": {
+        "mechanism": "windows_file_stream_share_read",
+        "read_access": "allowed",
+        "write_access": "denied",
+        "delete_access": "denied",
+        "rename_access": "denied",
+        "symbolic_links_rejected": true,
+        "acquired_before_prehash": true,
+        "held_through_camelid": true,
+        "held_through_llama_cpp": true,
+        "held_through_posthash": true,
+        "released_token_observed": true,
+        "helper_exit_code": 0,
+        "artifact_path_in_helper_argv": false
+      },
+      "path_redacted": true
+    },
+    "platform": "windows-x86_64",
+    "paths_redacted": true,
+    "hostname_redacted": true
+  },
+  "isolation": {
+    "addresses": {
+      "camelid": "127.0.0.1:8297",
+      "llama_cpp": "127.0.0.1:8299"
+    },
+    "engine_order": [
+      "camelid",
+      "llama_cpp"
+    ],
+    "max_concurrent_engine_children": 1,
+    "lifecycle_events": [
+      "camelid_started",
+      "camelid_closed",
+      "llama_cpp_started",
+      "llama_cpp_closed"
+    ],
+    "preexisting_engine_processes_absent": true,
+    "both_ports_unbound_before_start": true,
+    "ports_unbound_after_each_stop": {
+      "camelid": true,
+      "llama_cpp": true
+    },
+    "camelid_no_startup_model": true,
+    "camelid_chat_first_and_only_forward": true,
+    "llama_completion_first_and_only_forward": true,
+    "camelid_closed_and_stdio_drained_before_llama_start": true,
+    "llama_closed_and_stdio_drained_before_posthash": true,
+    "child_handle_only_termination": true,
+    "termination_observed": {
+      "camelid": true,
+      "llama_cpp": true
+    },
+    "startup_warmup_markers": {
+      "camelid": {
+        "warming_up_seen": false,
+        "generation_warmup_complete_seen": false,
+        "raw_output_persisted": false
+      },
+      "llama_cpp": {
+        "warming_up_seen": false,
+        "generation_warmup_complete_seen": false,
+        "raw_output_persisted": false
+      }
+    }
+  },
+  "runtime_contract": {
+    "camelid": {
+      "command": [
+        "<camelid>",
+        "serve",
+        "--addr",
+        "127.0.0.1:8297",
+        "--models-dir",
+        "<empty-models-dir>",
+        "--threads",
+        "4",
+        "--gpu",
+        "off",
+        "--deterministic",
+        "--kv-quant",
+        "f16",
+        "--no-open",
+        "--max-prompt-tokens",
+        "1024",
+        "--max-generation-tokens",
+        "4"
+      ],
+      "environment": {
+        "CAMELID_PROFILE": "safe",
+        "CAMELID_LAZY_Q8_0_LINEAR": "1",
+        "CAMELID_X86_Q8_REPACK": "off",
+        "CAMELID_Q8_0_FILE_CACHE_BYTES": "0",
+        "CAMELID_PREFILL_LAYER_MAJOR_Q8_0_FILE_CACHE_BYTES": "0",
+        "CAMELID_MAX_CPU_WEIGHT_MATERIALIZATION_BYTES": "1073741824",
+        "CAMELID_MAX_KV_CACHE_BYTES": "268435456",
+        "CAMELID_KV_POOL_BUDGET_BYTES": "268435456",
+        "CAMELID_FORWARD_RSS_TIMINGS": "on",
+        "CAMELID_GENERATION_TIMEOUT_MS": "1800000",
+        "CAMELID_QUEUE_DEPTH": "1",
+        "CAMELID_CONTINUOUS_BATCH_SLOTS": "1",
+        "CAMELID_NO_REMOTE_DIMS": "1",
+        "CAMELID_PREFIX_CACHE_MIN_TOKENS": "1024"
+      },
+      "request": {
+        "model": "smollm3_3b_q8_0",
+        "messages": [
+          {
+            "role": "user",
+            "content": "Hello, please help me."
+          }
+        ],
+        "max_tokens": 4,
+        "temperature": 0,
+        "top_k": 1,
+        "seed": 0,
+        "stream": false,
+        "camelid_enable_thinking_omitted": true,
+        "camelid_receipt_requested": false
+      }
+    },
+    "llama_cpp": {
+      "command": [
+        "<llama-server>",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "8299",
+        "-m",
+        "<artifact>",
+        "-ngl",
+        "0",
+        "-c",
+        "512",
+        "-b",
+        "512",
+        "-ub",
+        "512",
+        "-t",
+        "4",
+        "-ctk",
+        "f16",
+        "-ctv",
+        "f16",
+        "-fa",
+        "off",
+        "--no-repack",
+        "--no-warmup",
+        "-np",
+        "1",
+        "--no-cont-batching"
+      ],
+      "environment": {
+        "CUDA_VISIBLE_DEVICES": "-1"
+      },
+      "tokenize": {
+        "content": "exact_frozen_camelid_rendered_prompt",
+        "add_special": false,
+        "parse_special": true
+      },
+      "completion": {
+        "prompt": "identical_cross_engine_prompt_token_ids",
+        "n_predict": 4,
+        "temperature": 0,
+        "top_k": 1,
+        "seed": 0,
+        "cache_prompt": false,
+        "samplers": [
+          "top_k"
+        ],
+        "return_tokens": true,
+        "stream": false
+      }
+    },
+    "prompt": {
+      "rendered_text_redacted": true,
+      "actual_utf8_bytes": 1376,
+      "actual_sha256": "96f94aa3b0be0d70346ce348686672cd9f3266edcd6eec1fddcc291bdc051077",
+      "normalized_utf8_bytes": 1392,
+      "normalized_sha256": "7619416ae94ba9a00378d976bfa944f5ba726747f9b67ba4e862d9a7fe20e4f1",
+      "token_count": 254,
+      "token_ids_sha256": "e1e8659a361b75d7c8d12b3ebb46adfef7dc44b8d1147c9ba2c9580192f3b4ed",
+      "token_ids_persisted_in_camelid_step": true
+    },
+    "limits": {
+      "startup_timeout_ms": 60000,
+      "load_timeout_ms": 1200000,
+      "generation_timeout_ms": 1860000,
+      "ordinary_request_timeout_ms": 30000,
+      "monitor_interval_ms": 1000,
+      "low_memory_abort_bytes": 1073741824,
+      "camelid_child_working_set_abort_bytes": 2147483648,
+      "llama_child_working_set_abort_bytes": 4294967296,
+      "consecutive_abort_samples": 2,
+      "preflight_disk_bytes": 4294967296,
+      "preflight_physical_bytes": 6442450944,
+      "max_response_bytes": 16777216,
+      "max_prompt_tokens": 1024,
+      "generated_tokens": 4
+    }
+  },
+  "steps": [
+    {
+      "ordinal": 1,
+      "name": "camelid_baseline_health",
+      "engine": "camelid",
+      "method": "GET",
+      "endpoint": "/v1/health",
+      "http_status": 200,
+      "elapsed_ms": 1003,
+      "evidence": {
+        "loaded_now": false,
+        "generation_ready": false,
+        "active_model_id": null,
+        "version": "0.6.1",
+        "build": "v0.6.1-55-g3f3a01c0",
+        "backend": "none",
+        "selected_backend": null,
+        "cuda_resident_active": null,
+        "queue_idle": true,
+        "q8_policy": "forced_lazy_file_backed_q8",
+        "listen_addr": "127.0.0.1:8297"
+      }
+    },
+    {
+      "ordinal": 2,
+      "name": "camelid_baseline_gpu",
+      "engine": "camelid",
+      "method": "GET",
+      "endpoint": "/api/runtime/gpu",
+      "http_status": 200,
+      "elapsed_ms": 3,
+      "evidence": {
+        "available": true,
+        "enabled": false,
+        "backend_redacted": true,
+        "run_count": 0,
+        "device_redacted": true
+      }
+    },
+    {
+      "ordinal": 3,
+      "name": "camelid_load",
+      "engine": "camelid",
+      "method": "POST",
+      "endpoint": "/models/load",
+      "http_status": 200,
+      "elapsed_ms": 2003,
+      "evidence": {
+        "id": "smollm3_3b_q8_0",
+        "status": "loaded",
+        "generation_ready": true,
+        "model_path_redacted": true,
+        "request_path_redacted": true
+      }
+    },
+    {
+      "ordinal": 4,
+      "name": "camelid_verify_identity",
+      "engine": "camelid",
+      "method": "GET",
+      "endpoint": "/api/models/verify",
+      "http_status": 200,
+      "elapsed_ms": 36,
+      "evidence": {
+        "model_id": "smollm3_3b_q8_0",
+        "gguf_sha256": "8aa8cc74656137174a1988d993b00828e65a86fd68773412b632a75aa1373248",
+        "eligible": false,
+        "profile_id": null,
+        "report": null
+      }
+    },
+    {
+      "ordinal": 5,
+      "name": "camelid_loaded_health",
+      "engine": "camelid",
+      "method": "GET",
+      "endpoint": "/v1/health",
+      "http_status": 200,
+      "elapsed_ms": 1,
+      "evidence": {
+        "loaded_now": true,
+        "generation_ready": true,
+        "active_model_id": "smollm3_3b_q8_0",
+        "version": "0.6.1",
+        "build": "v0.6.1-55-g3f3a01c0",
+        "backend": "llama",
+        "selected_backend": "cpu_reference",
+        "cuda_resident_active": false,
+        "queue_idle": true,
+        "q8_policy": "forced_lazy_file_backed_q8",
+        "listen_addr": "127.0.0.1:8297"
+      }
+    },
+    {
+      "ordinal": 6,
+      "name": "camelid_props",
+      "engine": "camelid",
+      "method": "GET",
+      "endpoint": "/props",
+      "http_status": 200,
+      "elapsed_ms": 2,
+      "evidence": {
+        "model_id": "smollm3_3b_q8_0",
+        "generation_ready": true,
+        "template": {
+          "utf8_bytes": 5493,
+          "sha256": "b9b66f04c64fbb8695cf5b35c37780efd0b8e0829fbfe3e30fafb9f469b7d30e"
+        },
+        "template_redacted": true,
+        "default_thinking_text_envelope": true
+      }
+    },
+    {
+      "ordinal": 7,
+      "name": "camelid_apply_template_before",
+      "engine": "camelid",
+      "method": "POST",
+      "endpoint": "/apply-template",
+      "http_status": 200,
+      "elapsed_ms": 35,
+      "evidence": {
+        "actual_prompt_utf8_bytes": 1376,
+        "actual_prompt_sha256": "96f94aa3b0be0d70346ce348686672cd9f3266edcd6eec1fddcc291bdc051077",
+        "normalized_prompt_utf8_bytes": 1392,
+        "normalized_prompt_sha256": "7619416ae94ba9a00378d976bfa944f5ba726747f9b67ba4e862d9a7fe20e4f1",
+        "dynamic_date_occurrences": 1,
+        "dynamic_date_redacted": true,
+        "default_thinking": true,
+        "add_generation_prompt": true
+      }
+    },
+    {
+      "ordinal": 8,
+      "name": "camelid_tokenize_prompt",
+      "engine": "camelid",
+      "method": "POST",
+      "endpoint": "/tokenize",
+      "http_status": 200,
+      "elapsed_ms": 231,
+      "evidence": {
+        "token_count": 254,
+        "token_ids_sha256": "e1e8659a361b75d7c8d12b3ebb46adfef7dc44b8d1147c9ba2c9580192f3b4ed",
+        "add_special": false,
+        "parse_special": true,
+        "prompt_text_redacted": true
+      }
+    },
+    {
+      "ordinal": 9,
+      "name": "camelid_chat_first_forward",
+      "engine": "camelid",
+      "method": "POST",
+      "endpoint": "/v1/chat/completions",
+      "http_status": 200,
+      "elapsed_ms": 21941,
+      "evidence": {
+        "prompt_token_ids": [
+          128011,
+          9125,
+          198,
+          567,
+          34689,
+          271,
+          81434,
+          356,
+          28540,
+          2696,
+          25,
+          5651,
+          220,
+          2366,
+          20,
+          198,
+          15724,
+          2696,
+          25,
+          220,
+          806,
+          6287,
+          220,
+          2366,
+          21,
+          198,
+          26197,
+          287,
+          14904,
+          25,
+          611,
+          27963,
+          271,
+          567,
+          8572,
+          39397,
+          271,
+          2675,
+          527,
+          264,
+          11190,
+          15592,
+          18328,
+          7086,
+          4487,
+          337,
+          11237,
+          11,
+          16572,
+          555,
+          473,
+          36368,
+          19109,
+          13,
+          4718,
+          3560,
+          439,
+          459,
+          18328,
+          18065,
+          27461,
+          24919,
+          4860,
+          1555,
+          264,
+          37538,
+          7422,
+          1920,
+          1603,
+          8405,
+          279,
+          1620,
+          24473,
+          323,
+          13687,
+          10105,
+          13,
+          1115,
+          7612,
+          23387,
+          304,
+          264,
+          16195,
+          11008,
+          315,
+          6492,
+          11,
+          29385,
+          4954,
+          11,
+          27501,
+          11,
+          32834,
+          24280,
+          11,
+          22599,
+          11,
+          1203,
+          45653,
+          11,
+          323,
+          20140,
+          311,
+          2274,
+          1664,
+          12,
+          25742,
+          291,
+          7422,
+          1920,
+          13,
+          5321,
+          6070,
+          701,
+          2077,
+          1139,
+          1403,
+          1925,
+          14491,
+          25,
+          36287,
+          323,
+          12761,
+          1701,
+          279,
+          5300,
+          3645,
+          25,
+          220,
+          128002,
+          36287,
+          3857,
+          220,
+          128003,
+          12761,
+          3857,
+          13,
+          763,
+          279,
+          36287,
+          3857,
+          11,
+          7872,
+          701,
+          33811,
+          1920,
+          304,
+          7504,
+          13,
+          9062,
+          3094,
+          1288,
+          2997,
+          11944,
+          38864,
+          1778,
+          439,
+          22209,
+          287,
+          4860,
+          11,
+          29385,
+          4954,
+          9959,
+          14955,
+          11,
+          87881,
+          287,
+          502,
+          6848,
+          11,
+          69963,
+          279,
+          13708,
+          315,
+          279,
+          1510,
+          7504,
+          11,
+          74285,
+          904,
+          6103,
+          11,
+          323,
+          17951,
+          5977,
+          3766,
+          7504,
+          13,
+          763,
+          279,
+          12761,
+          3857,
+          11,
+          3196,
+          389,
+          5370,
+          13865,
+          11,
+          48539,
+          811,
+          11,
+          323,
+          63851,
+          505,
+          279,
+          36287,
+          3857,
+          11,
+          60826,
+          3118,
+          279,
+          1620,
+          6425,
+          430,
+          499,
+          82577,
+          4495,
+          13,
+          578,
+          12761,
+          3857,
+          1288,
+          387,
+          20406,
+          11,
+          13687,
+          11,
+          323,
+          64694,
+          323,
+          7872,
+          5995,
+          7504,
+          4460,
+          311,
+          5662,
+          279,
+          17102,
+          382,
+          128011,
+          882,
+          198,
+          9906,
+          11,
+          4587,
+          1520,
+          757,
+          13,
+          128012,
+          198,
+          128011,
+          78191,
+          198
+        ],
+        "generated_token_ids": [
+          128002,
+          198,
+          33413,
+          11
+        ],
+        "bubble": {
+          "redacted": true,
+          "utf8_bytes": 13,
+          "sha256": "40d46cb3f0c0ca439a917b8f8b0eb662f08e372c841b7fa6776ca22c18e2a443"
+        },
+        "usage": {
+          "prompt_tokens": 254,
+          "completion_tokens": 4,
+          "total_tokens": 258
+        },
+        "finish_reason": "length",
+        "first_token_top_logit_verified": true,
+        "per_step_logit_diagnostics_absent_or_empty": true,
+        "first_forward": {
+          "weight_load_observed": true,
+          "weight_cache_hit": false,
+          "prompt_cache_hit": false,
+          "first_token_evaluated": true
+        },
+        "generated_ids_non_eog": true,
+        "camelid_receipt_present": false
+      }
+    },
+    {
+      "ordinal": 10,
+      "name": "camelid_detokenize_generated",
+      "engine": "camelid",
+      "method": "POST",
+      "endpoint": "/detokenize",
+      "http_status": 200,
+      "elapsed_ms": 185,
+      "evidence": {
+        "generated_token_count": 4,
+        "content": {
+          "redacted": true,
+          "utf8_bytes": 13,
+          "sha256": "40d46cb3f0c0ca439a917b8f8b0eb662f08e372c841b7fa6776ca22c18e2a443"
+        },
+        "trimmed_content": {
+          "redacted": true,
+          "utf8_bytes": 13,
+          "sha256": "40d46cb3f0c0ca439a917b8f8b0eb662f08e372c841b7fa6776ca22c18e2a443"
+        },
+        "bubble_equals_detokenized_trim": true
+      }
+    },
+    {
+      "ordinal": 11,
+      "name": "camelid_apply_template_after",
+      "engine": "camelid",
+      "method": "POST",
+      "endpoint": "/apply-template",
+      "http_status": 200,
+      "elapsed_ms": 26,
+      "evidence": {
+        "actual_prompt_utf8_bytes": 1376,
+        "actual_prompt_sha256": "96f94aa3b0be0d70346ce348686672cd9f3266edcd6eec1fddcc291bdc051077",
+        "normalized_prompt_utf8_bytes": 1392,
+        "normalized_prompt_sha256": "7619416ae94ba9a00378d976bfa944f5ba726747f9b67ba4e862d9a7fe20e4f1",
+        "dynamic_date_occurrences": 1,
+        "dynamic_date_redacted": true,
+        "default_thinking": true,
+        "add_generation_prompt": true,
+        "identical_to_frozen_pre_forward_prompt": true
+      }
+    },
+    {
+      "ordinal": 12,
+      "name": "camelid_final_health",
+      "engine": "camelid",
+      "method": "GET",
+      "endpoint": "/v1/health",
+      "http_status": 200,
+      "elapsed_ms": 1,
+      "evidence": {
+        "loaded_now": true,
+        "generation_ready": true,
+        "active_model_id": "smollm3_3b_q8_0",
+        "version": "0.6.1",
+        "build": "v0.6.1-55-g3f3a01c0",
+        "backend": "llama",
+        "selected_backend": "cpu_reference",
+        "cuda_resident_active": false,
+        "queue_idle": true,
+        "q8_policy": "forced_lazy_file_backed_q8",
+        "listen_addr": "127.0.0.1:8297"
+      }
+    },
+    {
+      "ordinal": 13,
+      "name": "camelid_final_gpu",
+      "engine": "camelid",
+      "method": "GET",
+      "endpoint": "/api/runtime/gpu",
+      "http_status": 200,
+      "elapsed_ms": 0,
+      "evidence": {
+        "available": true,
+        "enabled": false,
+        "backend_redacted": true,
+        "run_count": 0,
+        "device_redacted": true
+      }
+    },
+    {
+      "ordinal": 14,
+      "name": "llama_health",
+      "engine": "llama_cpp",
+      "method": "GET",
+      "endpoint": "/health",
+      "http_status": 200,
+      "elapsed_ms": 1525,
+      "evidence": {
+        "status": "ok",
+        "model_loaded": true,
+        "address": "127.0.0.1:8299"
+      }
+    },
+    {
+      "ordinal": 15,
+      "name": "llama_tokenize_prompt",
+      "engine": "llama_cpp",
+      "method": "POST",
+      "endpoint": "/tokenize",
+      "http_status": 200,
+      "elapsed_ms": 3,
+      "evidence": {
+        "token_count": 254,
+        "token_ids_sha256": "e1e8659a361b75d7c8d12b3ebb46adfef7dc44b8d1147c9ba2c9580192f3b4ed",
+        "add_special": false,
+        "parse_special": true,
+        "prompt_text_redacted": true,
+        "identical_to_camelid_prompt_token_ids": true
+      }
+    },
+    {
+      "ordinal": 16,
+      "name": "llama_completion_first_forward",
+      "engine": "llama_cpp",
+      "method": "POST",
+      "endpoint": "/completion",
+      "http_status": 200,
+      "elapsed_ms": 5661,
+      "evidence": {
+        "generated_token_ids": [
+          128002,
+          198,
+          33413,
+          11
+        ],
+        "content": {
+          "redacted": true,
+          "utf8_bytes": 13,
+          "sha256": "40d46cb3f0c0ca439a917b8f8b0eb662f08e372c841b7fa6776ca22c18e2a443"
+        },
+        "generated_token_count": 4,
+        "generated_ids_non_eog": true,
+        "deterministic_top_k_only": true,
+        "first_forward": true
+      }
+    },
+    {
+      "ordinal": 17,
+      "name": "llama_detokenize_generated",
+      "engine": "llama_cpp",
+      "method": "POST",
+      "endpoint": "/detokenize",
+      "http_status": 200,
+      "elapsed_ms": 2,
+      "evidence": {
+        "generated_token_count": 4,
+        "content": {
+          "redacted": true,
+          "utf8_bytes": 13,
+          "sha256": "40d46cb3f0c0ca439a917b8f8b0eb662f08e372c841b7fa6776ca22c18e2a443"
+        },
+        "completion_content_equals_detokenized": true
+      }
+    },
+    {
+      "ordinal": 18,
+      "name": "llama_final_health",
+      "engine": "llama_cpp",
+      "method": "GET",
+      "endpoint": "/health",
+      "http_status": 200,
+      "elapsed_ms": 0,
+      "evidence": {
+        "status": "ok",
+        "model_loaded": true,
+        "address": "127.0.0.1:8299"
+      }
+    }
+  ],
+  "comparison": {
+    "prompt_render_stable_across_camelid_forward": true,
+    "prompt_token_ids_cross_engine_exact": true,
+    "generated_token_ids": {
+      "camelid": [
+        128002,
+        198,
+        33413,
+        11
+      ],
+      "llama_cpp": [
+        128002,
+        198,
+        33413,
+        11
+      ],
+      "exact_match": true,
+      "first_divergent_index": -1,
+      "all_four_non_eog": true
+    },
+    "canonical_detokenized_text": {
+      "camelid": {
+        "redacted": true,
+        "utf8_bytes": 13,
+        "sha256": "40d46cb3f0c0ca439a917b8f8b0eb662f08e372c841b7fa6776ca22c18e2a443"
+      },
+      "llama_cpp": {
+        "redacted": true,
+        "utf8_bytes": 13,
+        "sha256": "40d46cb3f0c0ca439a917b8f8b0eb662f08e372c841b7fa6776ca22c18e2a443"
+      },
+      "exact_utf8_match": true,
+      "camelid_bubble_equals_detokenized_trim": true,
+      "llama_content_equals_detokenized": true
+    },
+    "exact_token_and_text_match": true
+  },
+  "resource_observations": {
+    "preflight_available_physical_bytes": 6756970496,
+    "preflight_available_disk_bytes": 55761186816,
+    "camelid": {
+      "samples": 16,
+      "minimum_available_physical_bytes": 6244372480,
+      "peak_child_working_set_bytes": 569683968,
+      "thresholds_tripped": false
+    },
+    "llama_cpp": {
+      "samples": 6,
+      "minimum_available_physical_bytes": 3388870656,
+      "peak_child_working_set_bytes": 3434430464,
+      "thresholds_tripped": false
+    },
+    "thresholds_tripped": false
+  },
+  "gate_decision": {
+    "parity_preparation": "pass",
+    "bounded_evidence_publishable": true,
+    "roster_parity_gate": "blocked_unchanged",
+    "template_gate": "blocked_unchanged",
+    "api_webui_gate": "pending_unchanged",
+    "context_gate": "pending_unchanged",
+    "load_smoke_gate": "pass_unchanged",
+    "support_claim": false,
+    "disposition": "hold",
+    "target_tier": "experimental_exact_row",
+    "authorized_roster_scope": [],
+    "other_gates_unchanged": true
+  },
+  "does_not_prove": [
+    "the roster parity matrix at token counts 1, 5, and 50",
+    "the blocked full template gate",
+    "api_webui or SSE qualification",
+    "context-512 qualification",
+    "support or promotion",
+    "performance or throughput",
+    "GPU execution or GPU parity",
+    "adjacent sizes, variants, or quantizations",
+    "more than one final-user default-thinking text case",
+    "system, tools, no-think, multimodal, streaming, or non-text chat shapes"
+  ]
+}
