@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { execFile } from 'node:child_process'
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -12,16 +13,23 @@ import { SmolLM3TemplateQualificationError } from './hf-qualification-smollm3-te
 import { TokenizerQualificationError } from './hf-qualification-tokenizer.mjs'
 import {
   artifactForRow,
+  candidateIdForSelection,
+  candidateMetadataStageFromHeader,
+  candidateSelectorDigest,
+  captureCandidateWorkspaceProvenance,
   defaultCamelidBinary,
   defaultLlamaTemplateAnalyzerBinary,
   defaultLlamaTokenizerBinary,
   firstUnresolvedStage,
   metadataStageFromHeader,
   metadataStageFromHeaderError,
+  parseArgs,
   publicRosterLabel,
+  resolveCandidateSourcePreflight,
   resolveSourcePreflight,
   resolveSourceStage,
   runFactory,
+  runCandidateFactory,
   selectRows,
   sourceLookupErrorCode,
   sourceSelectionForRow,
@@ -89,6 +97,29 @@ const qwen = roster.rows.find((row) => row.id === 'qwen2_5_0_5b_instruct_q8_0')
 const qwenMoe = roster.rows.find((row) => row.id === 'qwen3_30b_a3b_q8_0')
 const gemma = roster.rows.find((row) => row.id === 'gemma2_9b_it_q8_0')
 const smol = roster.rows.find((row) => row.id === 'smollm3_3b_q8_0')
+const candidateSelection = {
+  repo: 'example-org/Phase2-Candidate-GGUF',
+  file: 'weights/phase2-candidate-Q8_0.gguf',
+  revision: null,
+}
+const candidateSelectorSha256 = createHash('sha256')
+  .update(JSON.stringify(candidateSelection))
+  .digest('hex')
+const candidateId = `hf_selector_${candidateSelectorSha256.slice(0, 24)}`
+const opaqueRunIdentity = '01234567-89ab-4cde-8fab-0123456789ab'
+const opaqueCandidateId = 'hf_candidate_run_0123456789ab4cde8fab0123456789ab'
+const candidateLock = (overrides = {}) => ({
+  schema: 'camelid.hf-source-lock/v1',
+  repo: candidateSelection.repo,
+  file: candidateSelection.file,
+  revision: '7'.repeat(40),
+  size_bytes: 100,
+  sha256: '8'.repeat(64),
+  license: 'apache-2.0',
+  access: { gated: false, private: false, disabled: false },
+  download_url: `https://huggingface.co/${candidateSelection.repo}/resolve/${'7'.repeat(40)}/${candidateSelection.file}?download=true`,
+  ...overrides,
+})
 const committedSmolTemplatePack = JSON.parse(await readFile(
   resolve(root, 'qa/prompt-packs/smollm3-chat-template-shapes-v1.json'),
   'utf8',
@@ -147,6 +178,51 @@ assert.equal(
   '<external-roster>',
   'a scrubbed factory index must not copy an external absolute roster path',
 )
+assert.equal(candidateSelectorDigest(candidateSelection), candidateSelectorSha256)
+assert.equal(candidateIdForSelection(candidateSelection), candidateId)
+assert.deepEqual([...parseArgs([
+  '--repo=org/model',
+  '--file',
+  'weights/model=Q8_0.gguf',
+  '--inspect-header',
+])], [
+  ['repo', 'org/model'],
+  ['file', 'weights/model=Q8_0.gguf'],
+  ['inspect-header', true],
+])
+for (const argv of [
+  ['positional'],
+  ['--'],
+  ['--unknown'],
+  ['--repo='],
+  ['--repo=   '],
+  ['--repo'],
+  ['--repo', '   '],
+  ['--repo', '--file', 'model.gguf'],
+  ['--repo', 'org/model', '--repo', 'other/model'],
+  ['--inspect-header=true'],
+  ['--inspect-header', 'true'],
+  ['--repo', 'org/model', 'extra'],
+]) {
+  assert.throws(() => parseArgs(argv), /positional|unknown option|non-empty value|exactly one|duplicate|does not accept/)
+}
+for (const invalidPromptLimit of ['1junk', '01', '+1', '1.0', '1e2', '9007199254740992']) {
+  assert.throws(
+    () => parseArgs(['--prompt-limit', invalidPromptLimit]),
+    /canonical positive integer/,
+    `--prompt-limit ${invalidPromptLimit} must fail before any roster or source work`,
+  )
+}
+assert.equal(parseArgs(['--prompt-limit', '1']).get('prompt-limit'), '1')
+for (const invalidSelection of [
+  { repo: 'missing-owner', file: 'model.gguf', revision: null },
+  { repo: 'org/model', file: '../model.gguf', revision: null },
+  { repo: 'org/model', file: 'C:\\private\\model.gguf', revision: null },
+  { repo: 'org/model', file: 'model.safetensors', revision: null },
+  { repo: 'org/model', file: 'model.gguf', revision: 'main' },
+]) {
+  assert.throws(() => candidateIdForSelection(invalidSelection), /--repo|--file|--revision/)
+}
 
 const selectedSource = sourceSelectionForRow(qwen)
 assert.deepEqual(selectedSource, {
@@ -248,10 +324,39 @@ const headerReceiptFor = (row, overrides = {}) => ({
 const currentHeadMetadataStage = (row, receipt) => metadataStageFromHeader(row, receipt, {
   expectedSourceHead: currentSourceHead,
 })
+const candidateHeaderReceipt = (overrides = {}) => {
+  const lock = candidateLock()
+  const row = {
+    id: candidateId,
+    source: {
+      repo: lock.repo,
+      file: lock.file,
+      revision: lock.revision,
+    },
+    identity: {
+      size_bytes: lock.size_bytes,
+      sha256: lock.sha256,
+      architecture: 'qwen2',
+      quantization: 'Q8_0',
+    },
+    expected: { tokenizer_model: 'gpt2', tokenizer_pre: 'qwen2' },
+  }
+  const receipt = headerReceiptFor(row)
+  receipt.range = {
+    requested_bytes: 99,
+    received_bytes: 99,
+    content_range: { start: 0, end: 98, total: lock.size_bytes },
+    prefix_sha256: 'c'.repeat(64),
+  }
+  receipt.inspection.data_start_offset = 96
+  receipt.inspection.tensor_inventory.total_n_bytes = 4
+  return { ...receipt, ...overrides }
+}
 
 const tokenizerReceiptPaths = new Map([
   [gemma.id, 'qa/model-qualification/gemma2-9b-it-q8-header-tokenizer-parity.json'],
   [smol.id, 'qa/model-qualification/smollm3-3b-q8-header-tokenizer-parity.json'],
+  [qwenMoe.id, 'qa/model-qualification/qwen3-30b-a3b-q8-header-tokenizer-parity.json'],
 ])
 const durableTokenizerReceipts = new Map(await Promise.all(
   [...tokenizerReceiptPaths].map(async ([rowId, path]) => [
@@ -276,6 +381,15 @@ const tokenizerReceiptFor = (row) => {
   receipt.camelid.binary_sha256 = 'a'.repeat(64)
   return receipt
 }
+const durableQwenTokenizerBytes = await readFile(resolve(
+  root,
+  tokenizerReceiptPaths.get(qwenMoe.id),
+))
+assert.equal(
+  createHash('sha256').update(durableQwenTokenizerBytes).digest('hex'),
+  '021dbe0b4f6a94f7140daa8e02969106dab941e205d184ee60f683d58f13ea37',
+  'factory evidence must remain byte-bound to the clean-head Qwen3 tokenizer receipt',
+)
 
 for (const [rowId, receiptPath] of [
   ['qwen3_30b_a3b_q8_0', 'qa/model-qualification/qwen3-30b-a3b-q8-header-inspection.json'],
@@ -315,7 +429,10 @@ for (const [rowId, receiptPath] of [
       types: { Q8_0: 338, F32: 241 },
     })
     assert.equal(durableReceipt.support_claim, false)
-    assert.notEqual(durableRow.gates.tokenizer.status, 'pass')
+    assert.equal(durableRow.gates.tokenizer.status, 'pass')
+    assert(durableRow.gates.tokenizer.evidence.includes(
+      'qa/model-qualification/qwen3-30b-a3b-q8-header-tokenizer-parity.json',
+    ))
     assert.notEqual(durableRow.gates.template.status, 'pass')
   }
 }
@@ -388,6 +505,71 @@ q4kmMissingMixReceipt.inspection.tensor_inventory.types = { Q4_K: 4, F32: 1 }
 const q4kmMissingMixStage = currentHeadMetadataStage(q4kmRow, q4kmMissingMixReceipt)
 assert.equal(q4kmMissingMixStage.status, 'fail')
 assert.match(q4kmMissingMixStage.reason, /both Q4_K and Q6_K/)
+
+const passingCandidateHeaderStage = candidateMetadataStageFromHeader(
+  candidateId,
+  candidateLock(),
+  candidateHeaderReceipt(),
+  { expectedSourceHead: currentSourceHead },
+)
+assert.equal(passingCandidateHeaderStage.status, 'pass')
+assert.equal(passingCandidateHeaderStage.assessment, 'bounded_header_descriptor_inspection_only')
+assert.equal(passingCandidateHeaderStage.range.received_bytes, 99)
+assert.deepEqual(passingCandidateHeaderStage.observed.tensor_type_counts, { F32: 1, Q8_0: 4 })
+assert.equal(passingCandidateHeaderStage.scope.opaque_tensor_payload_prefix_bytes, 3)
+assert.equal(passingCandidateHeaderStage.scope.runtime_compatibility, 'not_run')
+assert.equal(passingCandidateHeaderStage.scope.support_claim, false)
+
+for (const [mutate, expectedErrorCode] of [
+  [(receipt) => { receipt.inspection.alignment = 24 }, 'header_descriptor_invariants_invalid'],
+  [(receipt) => { receipt.inspection.data_start_offset = 95 }, 'header_descriptor_invariants_invalid'],
+  [(receipt) => { receipt.inspection.alignment = 16; receipt.inspection.data_start_offset = 16 }, 'header_descriptor_invariants_invalid'],
+  [(receipt) => { receipt.inspection.tensor_inventory.total_n_bytes = 5 }, 'header_descriptor_invariants_invalid'],
+  [(receipt) => { receipt.inspection.tensor_inventory.total_n_bytes = 3 }, 'header_descriptor_invariants_invalid'],
+  [(receipt) => { delete receipt.inspection.tensor_inventory.types }, 'header_receipt_invalid'],
+  [(receipt) => { receipt.inspection.tensor_inventory.types = { F32: 1, Q8_0: 3 } }, 'header_receipt_invalid'],
+  [(receipt) => {
+    receipt.range.requested_bytes = 96
+    receipt.range.received_bytes = 96
+    receipt.range.content_range.end = 95
+  }, 'header_descriptor_invariants_invalid'],
+]) {
+  const receipt = candidateHeaderReceipt()
+  mutate(receipt)
+  const rejected = candidateMetadataStageFromHeader(
+    candidateId,
+    candidateLock(),
+    receipt,
+    { expectedSourceHead: currentSourceHead },
+  )
+  assert.equal(rejected.status, 'fail')
+  assert.equal(rejected.error_code, expectedErrorCode)
+}
+const forgedOpaqueCountReceipt = candidateHeaderReceipt()
+forgedOpaqueCountReceipt.scope.opaque_tensor_payload_prefix_bytes = 999
+assert.equal(
+  candidateMetadataStageFromHeader(
+    candidateId,
+    candidateLock(),
+    forgedOpaqueCountReceipt,
+    { expectedSourceHead: currentSourceHead },
+  ).scope.opaque_tensor_payload_prefix_bytes,
+  3,
+  'the compact report must derive opaque bytes instead of trusting a receipt-supplied count',
+)
+
+const fullCandidateReceipt = candidateHeaderReceipt()
+fullCandidateReceipt.range.requested_bytes = 100
+fullCandidateReceipt.range.received_bytes = 100
+fullCandidateReceipt.range.content_range.end = 99
+const forbiddenFullCandidateStage = candidateMetadataStageFromHeader(
+  candidateId,
+  candidateLock(),
+  fullCandidateReceipt,
+  { expectedSourceHead: currentSourceHead },
+)
+assert.equal(forbiddenFullCandidateStage.status, 'fail')
+assert.equal(forbiddenFullCandidateStage.error_code, 'header_full_artifact_forbidden')
 
 const maliciousHeaderReceipt = headerReceiptFor(qwen)
 maliciousHeaderReceipt.inspection.observed.architecture = 'C:\\private\\model.gguf test-secret-token'
@@ -487,6 +669,26 @@ assert.equal(passingTokenizerStage.scope.context, 'not_run')
 assert.equal(passingTokenizerStage.scope.support_claim, false)
 assert.equal(Object.hasOwn(passingTokenizerStage, 'cases'), false, 'full token arrays must stay out of factory reports')
 assert.equal(Object.hasOwn(passingTokenizerStage, 'does_not_prove'), false, 'arbitrary receipt prose must stay out of factory reports')
+
+const passingQwenMoeTokenizerStage = tokenizerStageFromReceipt(
+  qwenMoe,
+  tokenizerReceiptFor(qwenMoe),
+  roster.defaults,
+  { expectedSourceHead: currentSourceHead },
+)
+assert.equal(passingQwenMoeTokenizerStage.status, 'pass')
+assert.equal(passingQwenMoeTokenizerStage.result.case_count, 13)
+assert.equal(passingQwenMoeTokenizerStage.result.exact_match_count, 13)
+assert.equal(passingQwenMoeTokenizerStage.result.all_token_ids_match, true)
+assert.equal(passingQwenMoeTokenizerStage.observed.token_count, 151_936)
+assert.equal(passingQwenMoeTokenizerStage.observed.declared_add_bos_token, false)
+assert.equal(passingQwenMoeTokenizerStage.scope.template_rendering, 'not_run')
+assert.equal(passingQwenMoeTokenizerStage.scope.load, 'not_run')
+assert.equal(passingQwenMoeTokenizerStage.scope.generation, 'not_run')
+assert.equal(passingQwenMoeTokenizerStage.scope.api_webui, 'not_run')
+assert.equal(passingQwenMoeTokenizerStage.scope.context, 'not_run')
+assert.equal(passingQwenMoeTokenizerStage.scope.support_claim, false)
+assert.equal(Object.hasOwn(passingQwenMoeTokenizerStage, 'cases'), false)
 
 const staleTokenizerStage = tokenizerStageFromReceipt(
   smol,
@@ -700,6 +902,117 @@ const incompleteStage = await resolveSourceStage(incomplete, {
 assert.equal(incompleteStage.status, 'blocked')
 assert.match(incompleteStage.reason, /sha256/)
 assert.equal(incompleteResolverCalled, false, 'an incomplete roster identity must fail closed before network access')
+
+const candidatePreflight = await resolveCandidateSourcePreflight(candidateSelection, {
+  token: 'test-secret-token',
+  resolver: async (selection) => {
+    assert.deepEqual(selection, { ...candidateSelection, token: 'test-secret-token' })
+    return candidateLock()
+  },
+})
+assert.equal(candidatePreflight.stage.status, 'pass')
+assert.equal(candidatePreflight.stage.requested_revision, null)
+assert.equal(candidatePreflight.stage.revision, '7'.repeat(40))
+assert.equal(candidatePreflight.lock.download_url, candidateLock().download_url)
+assert.equal(JSON.stringify(candidatePreflight.stage).includes('download_url'), false)
+assert.equal(JSON.stringify(candidatePreflight.stage).includes('test-secret-token'), false)
+
+const pinnedCandidateSelection = { ...candidateSelection, revision: '7'.repeat(40) }
+const pinnedCandidatePreflight = await resolveCandidateSourcePreflight(pinnedCandidateSelection, {
+  resolver: async () => candidateLock(),
+})
+assert.equal(pinnedCandidatePreflight.stage.status, 'pass')
+assert.equal(pinnedCandidatePreflight.stage.requested_revision, '7'.repeat(40))
+assert.equal(pinnedCandidatePreflight.stage.revision, '7'.repeat(40))
+
+const gatedPublicCandidate = await resolveCandidateSourcePreflight(candidateSelection, {
+  resolver: async () => candidateLock({ access: { gated: true, private: false, disabled: false } }),
+})
+assert.equal(gatedPublicCandidate.stage.status, 'pass')
+assert.equal(gatedPublicCandidate.stage.access.gated, true)
+
+const candidateWrongLock = await resolveCandidateSourcePreflight(candidateSelection, {
+  resolver: async () => candidateLock({ repo: 'malicious/private-path' }),
+})
+assert.equal(candidateWrongLock.stage.status, 'fail')
+assert.equal(candidateWrongLock.stage.error_code, 'source_identity_invalid')
+assert.equal(candidateWrongLock.lock, null)
+assert.equal(JSON.stringify(candidateWrongLock.stage).includes('malicious'), false)
+
+const candidateWrongUrl = await resolveCandidateSourcePreflight(candidateSelection, {
+  resolver: async () => candidateLock({
+    download_url: `${candidateLock().download_url}&token=test-secret-token`,
+  }),
+})
+assert.equal(candidateWrongUrl.stage.status, 'fail')
+assert.equal(candidateWrongUrl.stage.error_code, 'source_identity_invalid')
+assert.equal(JSON.stringify(candidateWrongUrl.stage).includes('test-secret-token'), false)
+
+const candidateUnsafeLicense = await resolveCandidateSourcePreflight(candidateSelection, {
+  resolver: async () => candidateLock({ license: 'C:\\private\\license.txt bearer-token' }),
+})
+assert.equal(candidateUnsafeLicense.stage.status, 'blocked')
+assert.equal(candidateUnsafeLicense.stage.error_code, 'source_license_unavailable')
+assert.equal(JSON.stringify(candidateUnsafeLicense.stage).includes('bearer-token'), false)
+
+const privateCandidate = await resolveCandidateSourcePreflight(candidateSelection, {
+  resolver: async () => candidateLock({ access: { gated: true, private: true, disabled: false } }),
+})
+assert.equal(privateCandidate.stage.status, 'blocked')
+assert.equal(privateCandidate.stage.error_code, 'private_source_not_persisted')
+assert.equal(privateCandidate.stage.selector_redacted, true)
+assert.equal(Object.hasOwn(privateCandidate.stage, 'repo'), false)
+assert.equal(privateCandidate.lock, null)
+
+const disabledCandidate = await resolveCandidateSourcePreflight(candidateSelection, {
+  resolver: async () => candidateLock({ access: { gated: false, private: false, disabled: true } }),
+})
+assert.equal(disabledCandidate.stage.status, 'blocked')
+assert.equal(disabledCandidate.stage.error_code, 'source_disabled')
+assert.equal(disabledCandidate.lock, null)
+
+const candidateAccessSmuggling = await resolveCandidateSourcePreflight(candidateSelection, {
+  resolver: async () => candidateLock({
+    access: { gated: false, private: false, disabled: false, accessToken: 'secret' },
+  }),
+})
+assert.equal(candidateAccessSmuggling.stage.status, 'fail')
+assert.equal(candidateAccessSmuggling.stage.error_code, 'source_identity_invalid')
+assert.equal(JSON.stringify(candidateAccessSmuggling.stage).includes('accessToken'), false)
+
+const unavailableCandidate = await resolveCandidateSourcePreflight(candidateSelection, {
+  token: 'test-secret-token',
+  resolver: async () => { throw new Error('C:\\private\\model.gguf test-secret-token') },
+})
+assert.equal(unavailableCandidate.stage.status, 'blocked')
+assert.equal(unavailableCandidate.stage.error_code, 'source_lookup_error')
+assert.equal(JSON.stringify(unavailableCandidate.stage).includes('test-secret-token'), false)
+assert.equal(JSON.stringify(unavailableCandidate.stage).includes('private'), false)
+
+const capturedCandidateProvenance = await captureCandidateWorkspaceProvenance(root, {
+  gitImpl: async (_binary, args) => {
+    if (args[0] === 'rev-parse') return { stdout: `${currentSourceHead}\n` }
+    if (args.includes('--untracked-files=no')) return { stdout: '' }
+    return { stdout: '?? harmless-untracked-file.txt\n' }
+  },
+})
+assert.deepEqual(capturedCandidateProvenance, {
+  source_head: currentSourceHead,
+  source_dirty: true,
+  source_tracked_dirty: false,
+  source_inspection: 'observed',
+})
+assert.deepEqual(
+  await captureCandidateWorkspaceProvenance(root, {
+    gitImpl: async () => { throw new Error('C:\\private\\repo test-secret-token') },
+  }),
+  {
+    source_head: null,
+    source_dirty: null,
+    source_tracked_dirty: null,
+    source_inspection: 'unknown',
+  },
+)
 
 const blockedReport = {
   overall_status: 'blocked',
@@ -1499,6 +1812,293 @@ try {
   assert.equal(JSON.stringify(failedTemplateReport).includes('C:\\private'), false)
   assert.deepEqual(validateQualificationReport(failedTemplateReport), [])
   assert.deepEqual(validateQualificationReport(continuedTemplateReport), [])
+
+  let candidateResolverCalls = 0
+  let candidateHeaderCalls = 0
+  const candidateOut = join(factoryOut, 'selector-candidate-pass')
+  const candidateReport = await runFactory({
+    root,
+    candidate: candidateSelection,
+    outDir: candidateOut,
+    inspectHeader: true,
+    prefixBytes: 1024,
+    hfToken: 'test-secret-token',
+    now: () => new Date('2026-08-10T20:00:00.000Z'),
+    candidateWorkspaceInspector: async () => ({
+      source_head: currentSourceHead,
+      source_dirty: true,
+      source_tracked_dirty: false,
+      source_inspection: 'observed',
+    }),
+    sourceResolver: async (selection) => {
+      candidateResolverCalls += 1
+      assert.deepEqual(selection, { ...candidateSelection, token: 'test-secret-token' })
+      return candidateLock()
+    },
+    headerInspector: async (lock, options) => {
+      candidateHeaderCalls += 1
+      assert.deepEqual(lock, candidateLock())
+      assert.equal(options.rowId, candidateId)
+      assert.equal(options.prefixBytes, 99, 'candidate range must remain strictly smaller than the artifact')
+      assert.equal(options.token, 'test-secret-token')
+      assert.equal(options.sourceRoot, root)
+      return candidateHeaderReceipt()
+    },
+  })
+  assert.equal(candidateResolverCalls, 1)
+  assert.equal(candidateHeaderCalls, 1)
+  assert.equal(candidateReport.qualification_mode, 'unrostered_hf_selector')
+  assert.equal(candidateReport.row_id, candidateId)
+  assert.equal(candidateReport.candidate.identity_mode, 'public_selector_digest')
+  assert.equal(candidateReport.candidate.selector_sha256, candidateSelectorSha256)
+  assert.equal(candidateReport.candidate.selector_redacted, true)
+  assert.equal(candidateReport.stages.source.status, 'pass')
+  assert.equal(candidateReport.stages.source.requested_revision, null)
+  assert.equal(candidateReport.stages.metadata.status, 'pass')
+  assert.equal(candidateReport.stages.metadata.assessment, 'bounded_header_descriptor_inspection_only')
+  assert.equal(candidateReport.stages.metadata.range.received_bytes, 99)
+  assert.deepEqual(candidateReport.stages.metadata.observed.tensor_type_counts, { F32: 1, Q8_0: 4 })
+  assert.equal(candidateReport.source_dirty, true)
+  assert.equal(candidateReport.source_tracked_dirty, false)
+  assert.equal(candidateReport.stages.artifact.status, 'blocked')
+  assert.equal(candidateReport.stages.tokenizer.status, 'blocked')
+  assert.equal(candidateReport.stages.template.status, 'blocked')
+  assert.equal(candidateReport.stages.load_smoke.status, 'blocked')
+  assert.equal(candidateReport.stages.parity.status, 'blocked')
+  assert.equal(candidateReport.stages.api_webui.status, 'blocked')
+  assert.equal(candidateReport.stages.context.status, 'blocked')
+  assert.equal(candidateReport.overall_status, 'blocked')
+  assert.equal(candidateReport.support_claim, false)
+  const serializedCandidate = JSON.stringify(candidateReport)
+  assert.equal(serializedCandidate.includes('test-secret-token'), false)
+  assert.equal(serializedCandidate.includes('download_url'), false)
+  assert.equal(serializedCandidate.includes('source_template'), false)
+  assert.equal(serializedCandidate.includes('test receipt'), false)
+  assert.deepEqual(validateQualificationReport(candidateReport), [])
+  assert.deepEqual(
+    JSON.parse(await readFile(join(candidateOut, `${candidateId}-report.json`), 'utf8')),
+    candidateReport,
+  )
+
+  let privateCandidateHeaderCalled = false
+  const privateCandidateReport = await runCandidateFactory({
+    root,
+    candidate: candidateSelection,
+    outDir: join(factoryOut, 'selector-private-blocked'),
+    inspectHeader: true,
+    candidateRunIdentity: opaqueRunIdentity,
+    candidateWorkspaceInspector: async () => ({
+      source_head: currentSourceHead,
+      source_dirty: false,
+      source_tracked_dirty: false,
+      source_inspection: 'observed',
+    }),
+    sourceResolver: async () => candidateLock({
+      access: { gated: true, private: true, disabled: false },
+    }),
+    headerInspector: async () => {
+      privateCandidateHeaderCalled = true
+      throw new Error('must not inspect a private source')
+    },
+  })
+  assert.equal(privateCandidateHeaderCalled, false)
+  assert.equal(privateCandidateReport.row_id, opaqueCandidateId)
+  assert.equal(privateCandidateReport.candidate.identity_mode, 'opaque_run')
+  assert.equal(privateCandidateReport.candidate.run_id, opaqueRunIdentity)
+  assert.equal(Object.hasOwn(privateCandidateReport.candidate, 'selector_sha256'), false)
+  assert.equal(Object.hasOwn(privateCandidateReport.candidate, 'selector_id'), false)
+  assert.equal(privateCandidateReport.stages.source.error_code, 'private_source_not_persisted')
+  assert.equal(privateCandidateReport.stages.metadata.error_code, 'header_source_preflight_blocked')
+  assert.equal(Object.hasOwn(privateCandidateReport.stages.source, 'repo'), false)
+  assert.equal(JSON.stringify(privateCandidateReport).includes(candidateSelection.repo), false)
+  assert.deepEqual(validateQualificationReport(privateCandidateReport), [])
+  assert.deepEqual(
+    JSON.parse(await readFile(
+      join(factoryOut, 'selector-private-blocked', `${opaqueCandidateId}-report.json`),
+      'utf8',
+    )),
+    privateCandidateReport,
+  )
+
+  const lookupRunIdentity = 'fedcba98-7654-4321-8fed-cba987654321'
+  const lookupOpaqueId = 'hf_candidate_run_fedcba98765443218fedcba987654321'
+  const lookupFailureReport = await runCandidateFactory({
+    root,
+    candidate: candidateSelection,
+    outDir: join(factoryOut, 'selector-lookup-blocked'),
+    inspectHeader: true,
+    candidateRunIdentity: lookupRunIdentity,
+    candidateWorkspaceInspector: async () => ({
+      source_head: currentSourceHead,
+      source_dirty: false,
+      source_tracked_dirty: false,
+      source_inspection: 'observed',
+    }),
+    sourceResolver: async () => {
+      throw new Error(`C:\\private\\${candidateSelection.file} hf_secret`)
+    },
+  })
+  assert.equal(lookupFailureReport.row_id, lookupOpaqueId)
+  assert.equal(lookupFailureReport.candidate.identity_mode, 'opaque_run')
+  assert.equal(Object.hasOwn(lookupFailureReport.candidate, 'selector_sha256'), false)
+  assert.equal(JSON.stringify(lookupFailureReport).includes(candidateSelection.repo), false)
+  assert.equal(JSON.stringify(lookupFailureReport).includes(candidateSelection.file), false)
+  assert.equal(JSON.stringify(lookupFailureReport).includes('hf_secret'), false)
+  assert.deepEqual(validateQualificationReport(lookupFailureReport), [])
+
+  const headerFailureReport = await runCandidateFactory({
+    root,
+    candidate: candidateSelection,
+    outDir: join(factoryOut, 'selector-header-blocked'),
+    inspectHeader: true,
+    hfToken: 'test-secret-token',
+    candidateWorkspaceInspector: async () => ({
+      source_head: currentSourceHead,
+      source_dirty: false,
+      source_tracked_dirty: false,
+      source_inspection: 'observed',
+    }),
+    sourceResolver: async () => candidateLock(),
+    headerInspector: async () => {
+      throw new Error('C:\\private\\header.gguf test-secret-token')
+    },
+  })
+  assert.equal(headerFailureReport.stages.metadata.status, 'blocked')
+  assert.equal(headerFailureReport.stages.metadata.error_code, 'header_inspection_error')
+  assert.equal(JSON.stringify(headerFailureReport).includes('test-secret-token'), false)
+  assert.equal(JSON.stringify(headerFailureReport).includes('C:\\private'), false)
+  assert.equal(JSON.stringify(headerFailureReport).includes('header.gguf'), false)
+  assert.deepEqual(validateQualificationReport(headerFailureReport), [])
+
+  let tinyHeaderCalled = false
+  const tinyCandidateReport = await runCandidateFactory({
+    root,
+    candidate: candidateSelection,
+    outDir: join(factoryOut, 'selector-tiny-blocked'),
+    inspectHeader: true,
+    candidateWorkspaceInspector: async () => ({
+      source_head: currentSourceHead,
+      source_dirty: false,
+      source_tracked_dirty: false,
+      source_inspection: 'observed',
+    }),
+    sourceResolver: async () => candidateLock({ size_bytes: 1 }),
+    headerInspector: async () => { tinyHeaderCalled = true },
+  })
+  assert.equal(tinyHeaderCalled, false)
+  assert.equal(tinyCandidateReport.stages.source.status, 'pass')
+  assert.equal(tinyCandidateReport.stages.metadata.error_code, 'header_partial_range_unavailable')
+  assert.deepEqual(validateQualificationReport(tinyCandidateReport), [])
+
+  let unknownHeadHeaderCalled = false
+  const unknownHeadReport = await runCandidateFactory({
+    root,
+    candidate: candidateSelection,
+    outDir: join(factoryOut, 'selector-head-blocked'),
+    inspectHeader: true,
+    candidateWorkspaceInspector: async () => ({
+      source_head: null,
+      source_dirty: null,
+      source_tracked_dirty: null,
+      source_inspection: 'unknown',
+    }),
+    sourceResolver: async () => candidateLock(),
+    headerInspector: async () => { unknownHeadHeaderCalled = true },
+  })
+  assert.equal(unknownHeadHeaderCalled, false)
+  assert.equal(unknownHeadReport.stages.metadata.error_code, 'header_source_head_unavailable')
+  assert.deepEqual(validateQualificationReport(unknownHeadReport), [])
+
+  let trackedDirtyHeaderCalled = false
+  const trackedDirtyReport = await runCandidateFactory({
+    root,
+    candidate: candidateSelection,
+    outDir: join(factoryOut, 'selector-tracked-dirty-blocked'),
+    inspectHeader: true,
+    candidateWorkspaceInspector: async () => ({
+      source_head: currentSourceHead,
+      source_dirty: true,
+      source_tracked_dirty: true,
+      source_inspection: 'observed',
+    }),
+    sourceResolver: async () => candidateLock(),
+    headerInspector: async () => { trackedDirtyHeaderCalled = true },
+  })
+  assert.equal(trackedDirtyHeaderCalled, false)
+  assert.equal(trackedDirtyReport.stages.metadata.error_code, 'header_source_tracked_dirty')
+  assert.deepEqual(validateQualificationReport(trackedDirtyReport), [])
+
+  for (const conflict of [
+    { rows: [] },
+    { roster: undefined },
+    { modelsDir: '' },
+    { artifact: '' },
+    { inspectTokenizer: false },
+    { inspectTemplate: false },
+    { runSmoke: false },
+    { runGeneration: false },
+    { promptLimit: null },
+    { llamaTokenize: '' },
+    { llamaTemplateAnalysis: '' },
+  ]) {
+    let conflictResolverCalled = false
+    await assert.rejects(
+      runCandidateFactory({
+        root,
+        candidate: candidateSelection,
+        outDir: join(factoryOut, 'selector-conflict'),
+        inspectHeader: true,
+        ...conflict,
+        sourceResolver: async () => {
+          conflictResolverCalled = true
+          return candidateLock()
+        },
+      }),
+      /cannot be combined/,
+    )
+    assert.equal(conflictResolverCalled, false)
+  }
+  await assert.rejects(
+    runCandidateFactory({ root, candidate: candidateSelection }),
+    /requires --inspect-header/,
+  )
+  await assert.rejects(
+    runCandidateFactory({
+      root,
+      candidate: candidateSelection,
+      inspectHeader: true,
+      candidateRunIdentity: 'not-a-v4-uuid',
+      sourceResolver: async () => { throw new Error('offline') },
+    }),
+    /version-4 UUID/,
+  )
+  let invalidSelectorResolverCalled = false
+  await assert.rejects(
+    runCandidateFactory({
+      root,
+      candidate: { repo: 'org/model', file: '../private.gguf', revision: null },
+      inspectHeader: true,
+      sourceResolver: async () => { invalidSelectorResolverCalled = true },
+    }),
+    /--file/,
+  )
+  assert.equal(invalidSelectorResolverCalled, false)
+
+  let rosteredSelectorResolverCalled = false
+  await assert.rejects(
+    runCandidateFactory({
+      root,
+      candidate: {
+        repo: qwen.source.repo,
+        file: qwen.source.file,
+        revision: qwen.source.revision,
+      },
+      inspectHeader: true,
+      sourceResolver: async () => { rosteredSelectorResolverCalled = true },
+    }),
+    /already present in the Phase 1 roster/,
+  )
+  assert.equal(rosteredSelectorResolverCalled, false)
 
   let invalidBudgetResolverCalled = false
   let invalidBudgetInspectorCalled = false

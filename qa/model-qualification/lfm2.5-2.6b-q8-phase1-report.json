@@ -2,6 +2,7 @@
   "schema": "camelid.model-qualification-report/v1",
   "generated_at": "2026-08-10T14:25:34Z",
   "phase": 1,
+  "qualification_mode": "legacy_exact_row_promotion",
   "row_id": "lfm2_5_2_6b_q8_0",
   "source_head": "2cd9fa78f8dcaa78e011914076ecd1473ae99d0a",
   "runtime_head": "15ab4ddac5a21ac0f98f6ccba5e3ddff4b51a9b5",

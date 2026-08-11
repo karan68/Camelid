@@ -1,0 +1,603 @@
+{
+  "schema": "camelid.model-qualification.load-smoke/v1",
+  "receipt_id": "af388a3ef19951dab0da657e59963ad2d725136518a4aac28a1e23451ffa864b",
+  "created_utc": "2026-08-11T03:16:57.735Z",
+  "gate": "load_smoke",
+  "row": {
+    "id": "qwen2_5_0_5b_instruct_q8_0",
+    "family": "qwen2_5",
+    "architecture": "qwen2",
+    "quantization": "Q8_0",
+    "target_tier": "experimental_exact_row",
+    "disposition": "active_validation",
+    "source": {
+      "repo": "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+      "file": "qwen2.5-0.5b-instruct-q8_0.gguf",
+      "revision": "9217f5db79a29953eb74d5343926648285ec7e67",
+      "size_bytes": 675710816,
+      "sha256": "ca59ca7f13d0e15a8cfa77bd17e65d24f6844b554a7b6c12e07a5f89ff76844e",
+      "license": "apache-2.0"
+    }
+  },
+  "provenance": {
+    "runtime_head": "188631159b07f76ca3b081fd1b401090edfa1e21",
+    "source_describe": "v0.6.1-51-g18863115",
+    "tracked_files_clean": true,
+    "untracked_files_excluded": true,
+    "binary": {
+      "profile": "release-fat-lto",
+      "sha256": "5c4584186fded5fcbb7e848a938afc006f597b3302ed31942562faa908ca3346",
+      "version": "camelid v0.6.1-51-g18863115",
+      "health_build": "v0.6.1-51-g18863115",
+      "built_from_clean_tracked_head": true
+    },
+    "artifact": {
+      "size_bytes": 675710816,
+      "sha256": "ca59ca7f13d0e15a8cfa77bd17e65d24f6844b554a7b6c12e07a5f89ff76844e",
+      "verified_after_lock_acquisition": true,
+      "verified_after_generation": true,
+      "mutation_guard": {
+        "mechanism": "windows_file_stream_share_read",
+        "read_access": "allowed",
+        "write_access": "denied",
+        "delete_access": "denied",
+        "rename_access": "denied",
+        "symbolic_links_rejected": true,
+        "acquired_before_preload_hash": true,
+        "held_through_post_generation_hash": true,
+        "released_token_observed": true,
+        "helper_exit_code": 0,
+        "artifact_path_in_helper_argv": false
+      },
+      "path_redacted": true
+    },
+    "platform": "windows-x86_64",
+    "paths_redacted": true,
+    "hostname_redacted": true
+  },
+  "isolation": {
+    "no_startup_model": true,
+    "auto_select_roots": [
+      {
+        "kind": "configured_models_dir",
+        "exists": true,
+        "path_redacted": true,
+        "gguf_candidates": 0,
+        "default_preference_present": false
+      },
+      {
+        "kind": "executable_models_dir",
+        "exists": false,
+        "path_redacted": true,
+        "gguf_candidates": 0,
+        "default_preference_present": false
+      },
+      {
+        "kind": "executable_dir",
+        "exists": true,
+        "path_redacted": true,
+        "gguf_candidates": 0,
+        "default_preference_present": false
+      },
+      {
+        "kind": "cwd_models_dir",
+        "exists": false,
+        "path_redacted": true,
+        "gguf_candidates": 0,
+        "default_preference_present": false
+      },
+      {
+        "kind": "cwd",
+        "exists": true,
+        "path_redacted": true,
+        "gguf_candidates": 0,
+        "default_preference_present": false
+      }
+    ],
+    "loopback_only": true,
+    "address": "127.0.0.1:8298",
+    "qualification_port_unbound_before_start": true,
+    "llama_server_absent": true,
+    "harness_request_sequence_exclusive": true,
+    "inherited_camelid_env_cleared": true,
+    "child_handle_only_termination": true,
+    "child_termination_observed": true,
+    "startup_warmup_markers": {
+      "warming_up_seen": false,
+      "generation_warmup_complete_seen": false,
+      "raw_output_persisted": false
+    }
+  },
+  "runtime_contract": {
+    "command": [
+      "<camelid>",
+      "serve",
+      "--addr",
+      "127.0.0.1:8298",
+      "--models-dir",
+      "<empty-models-dir>",
+      "--threads",
+      "4",
+      "--gpu",
+      "off",
+      "--deterministic",
+      "--kv-quant",
+      "f16",
+      "--no-open",
+      "--max-prompt-tokens",
+      "1024",
+      "--max-generation-tokens",
+      "1"
+    ],
+    "cwd_redacted": true,
+    "environment": {
+      "CAMELID_PROFILE": "safe",
+      "CAMELID_LAZY_Q8_0_LINEAR": "1",
+      "CAMELID_X86_Q8_REPACK": "off",
+      "CAMELID_Q8_0_FILE_CACHE_BYTES": "0",
+      "CAMELID_PREFILL_LAYER_MAJOR_Q8_0_FILE_CACHE_BYTES": "0",
+      "CAMELID_MAX_CPU_WEIGHT_MATERIALIZATION_BYTES": "1073741824",
+      "CAMELID_MAX_KV_CACHE_BYTES": "268435456",
+      "CAMELID_KV_POOL_BUDGET_BYTES": "268435456",
+      "CAMELID_FORWARD_RSS_TIMINGS": "on",
+      "CAMELID_GENERATION_TIMEOUT_MS": "1800000",
+      "CAMELID_QUEUE_DEPTH": "1",
+      "CAMELID_CONTINUOUS_BATCH_SLOTS": "1",
+      "CAMELID_NO_REMOTE_DIMS": "1",
+      "CAMELID_PREFIX_CACHE_MIN_TOKENS": "1024"
+    },
+    "requests": {
+      "load": {
+        "path_redacted": true,
+        "id": "qwen2_5_0_5b_instruct_q8_0",
+        "unsupported_fields_omitted": true
+      },
+      "raw_first_forward": {
+        "model": "qwen2_5_0_5b_instruct_q8_0",
+        "prompt": "The capital of France is",
+        "max_tokens": 1,
+        "temperature": 0,
+        "stream": false
+      },
+      "camelid_receipt_requested": false
+    },
+    "limits": {
+      "startup_timeout_ms": 60000,
+      "load_timeout_ms": 1200000,
+      "generation_timeout_ms": 1860000,
+      "ordinary_request_timeout_ms": 30000,
+      "monitor_interval_ms": 1000,
+      "low_memory_abort_bytes": 1073741824,
+      "child_working_set_abort_bytes": 2147483648,
+      "consecutive_abort_samples": 2,
+      "preflight_disk_bytes": 4294967296,
+      "preflight_physical_bytes": 4294967296,
+      "max_response_bytes": 16777216
+    },
+    "readiness_semantics": "load_and_generation_ready_are_attemptability_not_forward_proof",
+    "first_forward_proof": "raw_completion_is_the_only_generative_request_and_reports_weight_cache_hit_false",
+    "excluded_legacy_storage_labels": [
+      "execution_plan.prefill_runtime_policy",
+      "execution_plan.fallback_path"
+    ]
+  },
+  "steps": [
+    {
+      "ordinal": 1,
+      "name": "baseline_health",
+      "method": "GET",
+      "endpoint": "/v1/health",
+      "http_status": 200,
+      "elapsed_ms": 857,
+      "evidence": {
+        "ok": true,
+        "engine": "camelid",
+        "version": "0.6.1",
+        "build": "v0.6.1-51-g18863115",
+        "loaded_now": false,
+        "generation_ready": false,
+        "vision_ready": false,
+        "active_model_id": null,
+        "backend": "none",
+        "model_family": null,
+        "q8_runtime": {
+          "policy": "forced_lazy_file_backed_q8",
+          "lazy_q8_linear": true,
+          "retain_q8_blocks": false,
+          "file_cache_bytes": 0
+        },
+        "execution_plan": null,
+        "queue": {
+          "depth": 0,
+          "queued_tasks": 0,
+          "active_task": false,
+          "active_generated_tokens": 0,
+          "continuous_batch_slots": 1
+        },
+        "executable_redacted": true,
+        "listen_addr": "127.0.0.1:8298"
+      }
+    },
+    {
+      "ordinal": 2,
+      "name": "baseline_gpu",
+      "method": "GET",
+      "endpoint": "/api/runtime/gpu",
+      "http_status": 200,
+      "elapsed_ms": 2,
+      "evidence": {
+        "available": true,
+        "enabled": false,
+        "backend": "cuda",
+        "run_count": 0,
+        "device_redacted": true
+      }
+    },
+    {
+      "ordinal": 3,
+      "name": "load",
+      "method": "POST",
+      "endpoint": "/models/load",
+      "http_status": 200,
+      "elapsed_ms": 1501,
+      "evidence": {
+        "request": {
+          "path_redacted": true,
+          "id": "qwen2_5_0_5b_instruct_q8_0"
+        },
+        "id": "qwen2_5_0_5b_instruct_q8_0",
+        "path": null,
+        "status": "loaded",
+        "generation_ready": true,
+        "model_path_redacted": true,
+        "compatibility": "partial_llama_server_models_load_local_path",
+        "scope": "single_local_model_load_alias"
+      }
+    },
+    {
+      "ordinal": 4,
+      "name": "verify_identity",
+      "method": "GET",
+      "endpoint": "/api/models/verify",
+      "http_status": 200,
+      "elapsed_ms": 24,
+      "evidence": {
+        "model_id": "qwen2_5_0_5b_instruct_q8_0",
+        "gguf_sha256": "ca59ca7f13d0e15a8cfa77bd17e65d24f6844b554a7b6c12e07a5f89ff76844e",
+        "eligible": false,
+        "profile_id": null,
+        "report": null
+      }
+    },
+    {
+      "ordinal": 5,
+      "name": "loaded_health",
+      "method": "GET",
+      "endpoint": "/v1/health",
+      "http_status": 200,
+      "elapsed_ms": 2,
+      "evidence": {
+        "ok": true,
+        "engine": "camelid",
+        "version": "0.6.1",
+        "build": "v0.6.1-51-g18863115",
+        "loaded_now": true,
+        "generation_ready": true,
+        "vision_ready": false,
+        "active_model_id": "qwen2_5_0_5b_instruct_q8_0",
+        "backend": "llama",
+        "model_family": "llama-family",
+        "q8_runtime": {
+          "policy": "forced_lazy_file_backed_q8",
+          "lazy_q8_linear": true,
+          "retain_q8_blocks": false,
+          "file_cache_bytes": 0
+        },
+        "execution_plan": {
+          "profile": "safe",
+          "operating_system": "windows",
+          "architecture": "x86_64",
+          "model_family": "qwen2",
+          "quant_type": "Q8_0",
+          "exact_model_row": "qwen2.5-0.5b-instruct",
+          "support_level": "unknown_or_unvalidated",
+          "selected_backend": "cpu_reference",
+          "selected_q8_path": "safe_dense_or_q8_cpu",
+          "diagnostics_status": "operator-requested RSS timings enabled; performance claims disabled",
+          "cuda_resident_active": false,
+          "legacy_storage_labels_excluded": [
+            "execution_plan.prefill_runtime_policy",
+            "execution_plan.fallback_path"
+          ]
+        },
+        "queue": {
+          "depth": 0,
+          "queued_tasks": 0,
+          "active_task": false,
+          "active_generated_tokens": 0,
+          "continuous_batch_slots": 1
+        },
+        "executable_redacted": true,
+        "listen_addr": "127.0.0.1:8298"
+      }
+    },
+    {
+      "ordinal": 6,
+      "name": "raw_first_forward",
+      "method": "POST",
+      "endpoint": "/v1/completions",
+      "http_status": 200,
+      "elapsed_ms": 985,
+      "evidence": {
+        "model": "qwen2_5_0_5b_instruct_q8_0",
+        "support_semantics": "load_only_existing_strict_parity_failure_unchanged",
+        "choice_count": 1,
+        "finish_reason": "length",
+        "usage": {
+          "prompt_tokens": 5,
+          "completion_tokens": 1,
+          "total_tokens": 6
+        },
+        "prompt_token_ids": [
+          785,
+          6722,
+          315,
+          9625,
+          374
+        ],
+        "generated_token_ids": [
+          12095
+        ],
+        "generated_text": {
+          "redacted": true,
+          "utf8_bytes": 6,
+          "sha256": "3ca6a054807c4570e33544afebd6d8bb79f6cdd96a48f19490a57919f499e801"
+        },
+        "logits": {
+          "emitted_count": 8,
+          "all_finite": true,
+          "greedy_top": {
+            "token_id": 12095,
+            "logit": 17.666138,
+            "probability": 0.3973158,
+            "rank": 1
+          }
+        },
+        "timings": {
+          "weight_load": 4,
+          "weight_cache_hit": false,
+          "prompt_cache_hit": false,
+          "first_token_evaluated": true,
+          "forward_total": 913.951
+        },
+        "memory_phases": [
+          {
+            "phase": "prefill",
+            "forward_passes": 1,
+            "materialization": {
+              "tensor_count": 219,
+              "dense_f32_tensor_count": 49,
+              "dense_f32_bytes": 175616,
+              "q8_0_source_tensor_count": 170,
+              "q8_0_f32_materialized_tensor_count": 0,
+              "q8_0_f32_materialized_bytes": 0,
+              "q8_0_file_backed_tensor_count": 170,
+              "q8_0_file_backed_storage_bytes": 669476864,
+              "q8_0_file_backed_f32_bytes_avoided": 2520383488,
+              "q8_0_file_backed_retained_block_bytes_if_enabled": 708857856,
+              "q8_0_file_handle_cached_count": 0,
+              "q8_0_retained_block_tensor_count": 0,
+              "q8_0_retained_block_bytes": 0,
+              "has_q8_0_f32_materialization": false,
+              "has_lazy_q8_0_file_backing": true,
+              "has_retained_q8_0_blocks": false
+            },
+            "q8_file_reads": {
+              "read_calls": 172,
+              "read_bytes": 380194528,
+              "cache_hits": 0,
+              "cache_hit_bytes": 0,
+              "cache_misses": 0,
+              "cache_miss_bytes": 0,
+              "cache_inserts": 0,
+              "cache_insert_bytes": 0,
+              "cache_evictions": 0,
+              "cache_evicted_bytes": 0,
+              "cache_merges": 0,
+              "cache_merged_bytes": 0,
+              "cache_decoded_scale_hits": 0,
+              "cache_decoded_scale_hit_blocks": 0,
+              "cache_entries": 0,
+              "cache_bytes": 0,
+              "cache_capacity_bytes": 0
+            },
+            "peak_rss_kib": null
+          },
+          {
+            "phase": "first_token",
+            "forward_passes": 1,
+            "materialization": {
+              "tensor_count": 219,
+              "dense_f32_tensor_count": 49,
+              "dense_f32_bytes": 175616,
+              "q8_0_source_tensor_count": 170,
+              "q8_0_f32_materialized_tensor_count": 0,
+              "q8_0_f32_materialized_bytes": 0,
+              "q8_0_file_backed_tensor_count": 170,
+              "q8_0_file_backed_storage_bytes": 669476864,
+              "q8_0_file_backed_f32_bytes_avoided": 2520383488,
+              "q8_0_file_backed_retained_block_bytes_if_enabled": 708857856,
+              "q8_0_file_handle_cached_count": 169,
+              "q8_0_retained_block_tensor_count": 0,
+              "q8_0_retained_block_bytes": 0,
+              "has_q8_0_f32_materialization": false,
+              "has_lazy_q8_0_file_backing": true,
+              "has_retained_q8_0_blocks": false
+            },
+            "q8_file_reads": {
+              "read_calls": 174,
+              "read_bytes": 524834744,
+              "cache_hits": 0,
+              "cache_hit_bytes": 0,
+              "cache_misses": 0,
+              "cache_miss_bytes": 0,
+              "cache_inserts": 0,
+              "cache_insert_bytes": 0,
+              "cache_evictions": 0,
+              "cache_evicted_bytes": 0,
+              "cache_merges": 0,
+              "cache_merged_bytes": 0,
+              "cache_decoded_scale_hits": 0,
+              "cache_decoded_scale_hit_blocks": 0,
+              "cache_entries": 0,
+              "cache_bytes": 0,
+              "cache_capacity_bytes": 0
+            },
+            "peak_rss_kib": null
+          },
+          {
+            "phase": "generation",
+            "forward_passes": 2,
+            "materialization": {
+              "tensor_count": 219,
+              "dense_f32_tensor_count": 49,
+              "dense_f32_bytes": 175616,
+              "q8_0_source_tensor_count": 170,
+              "q8_0_f32_materialized_tensor_count": 0,
+              "q8_0_f32_materialized_bytes": 0,
+              "q8_0_file_backed_tensor_count": 170,
+              "q8_0_file_backed_storage_bytes": 669476864,
+              "q8_0_file_backed_f32_bytes_avoided": 2520383488,
+              "q8_0_file_backed_retained_block_bytes_if_enabled": 708857856,
+              "q8_0_file_handle_cached_count": 169,
+              "q8_0_retained_block_tensor_count": 0,
+              "q8_0_retained_block_bytes": 0,
+              "has_q8_0_f32_materialization": false,
+              "has_lazy_q8_0_file_backing": true,
+              "has_retained_q8_0_blocks": false
+            },
+            "q8_file_reads": {
+              "read_calls": 346,
+              "read_bytes": 905029272,
+              "cache_hits": 0,
+              "cache_hit_bytes": 0,
+              "cache_misses": 0,
+              "cache_miss_bytes": 0,
+              "cache_inserts": 0,
+              "cache_insert_bytes": 0,
+              "cache_evictions": 0,
+              "cache_evicted_bytes": 0,
+              "cache_merges": 0,
+              "cache_merged_bytes": 0,
+              "cache_decoded_scale_hits": 0,
+              "cache_decoded_scale_hit_blocks": 0,
+              "cache_entries": 0,
+              "cache_bytes": 0,
+              "cache_capacity_bytes": 0
+            },
+            "peak_rss_kib": null
+          }
+        ],
+        "camelid_receipt_present": false
+      }
+    },
+    {
+      "ordinal": 7,
+      "name": "final_health",
+      "method": "GET",
+      "endpoint": "/v1/health",
+      "http_status": 200,
+      "elapsed_ms": 2,
+      "evidence": {
+        "ok": true,
+        "engine": "camelid",
+        "version": "0.6.1",
+        "build": "v0.6.1-51-g18863115",
+        "loaded_now": true,
+        "generation_ready": true,
+        "vision_ready": false,
+        "active_model_id": "qwen2_5_0_5b_instruct_q8_0",
+        "backend": "llama",
+        "model_family": "llama-family",
+        "q8_runtime": {
+          "policy": "forced_lazy_file_backed_q8",
+          "lazy_q8_linear": true,
+          "retain_q8_blocks": false,
+          "file_cache_bytes": 0
+        },
+        "execution_plan": {
+          "profile": "safe",
+          "operating_system": "windows",
+          "architecture": "x86_64",
+          "model_family": "qwen2",
+          "quant_type": "Q8_0",
+          "exact_model_row": "qwen2.5-0.5b-instruct",
+          "support_level": "unknown_or_unvalidated",
+          "selected_backend": "cpu_reference",
+          "selected_q8_path": "safe_dense_or_q8_cpu",
+          "diagnostics_status": "operator-requested RSS timings enabled; performance claims disabled",
+          "cuda_resident_active": false,
+          "legacy_storage_labels_excluded": [
+            "execution_plan.prefill_runtime_policy",
+            "execution_plan.fallback_path"
+          ]
+        },
+        "queue": {
+          "depth": 0,
+          "queued_tasks": 0,
+          "active_task": false,
+          "active_generated_tokens": 0,
+          "continuous_batch_slots": 1
+        },
+        "executable_redacted": true,
+        "listen_addr": "127.0.0.1:8298"
+      }
+    },
+    {
+      "ordinal": 8,
+      "name": "final_gpu",
+      "method": "GET",
+      "endpoint": "/api/runtime/gpu",
+      "http_status": 200,
+      "elapsed_ms": 1,
+      "evidence": {
+        "available": true,
+        "enabled": false,
+        "backend": "cuda",
+        "run_count": 0,
+        "device_redacted": true
+      }
+    }
+  ],
+  "resource_observations": {
+    "preflight_available_physical_bytes": 5550141440,
+    "preflight_available_disk_bytes": 22769324032,
+    "monitor_samples": 3,
+    "minimum_available_physical_bytes": 5472620544,
+    "peak_child_working_set_bytes": 246530048,
+    "thresholds_tripped": false
+  },
+  "gate_decision": {
+    "load_smoke": "pass",
+    "support_claim": false,
+    "disposition": "active_validation",
+    "target_tier": "experimental_exact_row",
+    "authorized_roster_scope": [
+      "gates.load_smoke"
+    ],
+    "existing_parity_gate": "fail_unchanged",
+    "other_gates_unchanged": true
+  },
+  "does_not_prove": [
+    "llama.cpp token or text parity; the existing strict parity gate remains failed",
+    "output correctness beyond one finite greedy token",
+    "chat-completions, streaming SSE, repeated requests, Models-page, or WebUI readiness",
+    "chat-template coverage beyond the separately pinned one-user-turn shape",
+    "the separately qualified 512-token context bucket or any larger context",
+    "performance or throughput",
+    "GPU execution",
+    "support or promotion",
+    "adjacent sizes, variants, or quantizations",
+    "system, tools, multi-turn, multimodal, or non-text chat shapes"
+  ]
+}

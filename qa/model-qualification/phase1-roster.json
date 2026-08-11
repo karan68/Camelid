@@ -216,11 +216,10 @@
         },
         "load_smoke": {
           "required": true,
-          "status": "blocked",
+          "status": "pass",
           "evidence": [
-            "qa/model-qualification/qwen2.5-0.5b-q8-bootstrap-report.json"
-          ],
-          "reason": "The exact row loads and serves on the CPU reference lane, but runnable-smoke correctly refuses qwen2/Q8_0/BPE until that tuple is oracle-qualified."
+            "qa/model-qualification/qwen2.5-0.5b-q8-windows-cpu-load-smoke.json"
+          ]
         },
         "parity": {
           "required": true,
@@ -511,16 +510,18 @@
           "evidence": [
             "qa/model-qualification/fixtures/smollm3-tokenizer-pre-v1.json",
             "qa/prompt-packs/smollm3-chat-template-shapes-v1.json",
+            "qa/model-qualification/fixtures/smollm3-default-thinking-runtime-envelope-v1.json",
             "scripts/hf-qualification-smollm3-template.mjs",
             "src/api/mod.rs"
           ],
-          "reason": "The pinned 5,493-byte dynamic ChatML template injects current-date metadata, reasoning policy, system overrides, custom instructions, and tool grammars. A preparation-only renderer and two default no-tool oracle shapes now exist, but production wiring, runtime token-ID parity, control-marker safety, and the remaining dynamic branches are unqualified. The executable HOLD still prevents fallback to generic Qwen3 ChatML."
+          "reason": "The exact 5,493-byte template now has an architecture-scoped renderer for the bounded default-thinking, text-only user/assistant envelope on /apply-template and chat preparation. The template gate remains blocked because system/custom-instruction/system-override, tools/tool history, explicit no-think, nontext shapes, and full real-artifact HTTP prompt-token parity remain unqualified."
         },
         "load_smoke": {
           "required": true,
-          "status": "blocked",
-          "evidence": [],
-          "reason": "SmolLM3 is excluded from runnable admission and its CPU path has no real-row receipt."
+          "status": "pass",
+          "evidence": [
+            "qa/model-qualification/smollm3-3b-q8-windows-cpu-load-smoke.json"
+          ]
         },
         "parity": {
           "required": true,
@@ -598,8 +599,11 @@
         },
         "tokenizer": {
           "required": true,
-          "status": "pending",
-          "evidence": []
+          "status": "pass",
+          "evidence": [
+            "src/tokenizer/mod.rs",
+            "qa/model-qualification/qwen3-30b-a3b-q8-header-tokenizer-parity.json"
+          ]
         },
         "template": {
           "required": true,

@@ -46,14 +46,18 @@ page progressively harder to scan.
 5. **SmolLM3** actually declares `tokenizer.ggml.pre = smaug-bpe`, an exact
    llama3-regex alias in the pinned reference. Its exact-row tokenizer pack now
    passes, including the dialect-specific absent-BOS default. Legacy `smollm`
-   remains a distinct two-pass dialect and must not be used as a shortcut. A
-   preparation-only renderer now locks two default no-tool prompt shapes; the
-   production route and the remaining dynamic branches remain the next gate.
-6. **Qwen3 MoE** has an authoritative official 32.48 GB artifact anchor and a
-   bounded prefix that confirms its metadata and 579 tensor descriptors. That
-   receipt predates the tracked-worktree provenance requirement, so metadata
-   remains blocked pending a clean-current-HEAD rerun. Synthetic browse fixtures
-   are not candidates.
+   remains a distinct two-pass dialect and must not be used as a shortcut. An
+   exact-template renderer now opens only the default-thinking, text-only,
+   strictly alternating user/assistant envelope; every other dynamic branch
+   remains a typed HOLD, so the template gate is still incomplete.
+6. **Qwen3 MoE** now has an authoritative official 32.48 GB artifact anchor and
+   a clean-head 13-case exact-row `qwen2` tokenizer receipt against pinned
+   llama.cpp b9632. This independent tokenizer evidence arrived out of order;
+   the older standalone header receipt still predates the tracked-worktree
+   provenance requirement, so metadata remains blocked pending a
+   current-contract rerun. Its embedded Qwen3 template and MoE routing semantics
+   still need qualification before a large download.
+   Synthetic browse fixtures are not candidates.
 
 The work order reflects implementation closeness. The full LFM2 artifact has
 now been identity-checked and exercised at its pinned SHA-256; its promotion no
@@ -69,11 +73,11 @@ promotion; the other five families remain active dispositions:
 | Family | Current result | Next honest gate |
 |---|---|---|
 | LFM2 | **Complete / promoted exact-row smoke.** All eight Phase 1 gates pass for `LFM2.5-2.6B-Q8_0.gguf` on the Windows CPU runnable lane, and the exact-row handoff independently passes on the resident-Metal lane on one Apple M4 / macOS 26.5 / arm64 host. | Context above 512 tokens, CUDA, other Apple hardware, and separately evidenced neighboring sizes/quants or broader sampling/tool boundaries. |
-| Qwen2.5 | Source, metadata, tokenizer, and template pass; strict greedy parity remains failed on one stable cross-engine numeric frontier. A prepared 512-token capture is not accepted because its required verifier transcript is absent from Git. | Recover or rerun the complete 512-token bundle, then complete the layer trace and API/WebUI/SSE smoke; do not waive the short-token mismatch. |
+| Qwen2.5 | Source, metadata, tokenizer, template, and guarded Windows CPU load smoke pass; strict greedy parity remains failed on one stable cross-engine numeric frontier. A prepared 512-token capture is not accepted because its required verifier transcript is absent from Git. | Recover or rerun the complete 512-token bundle, then complete the layer trace and API/WebUI/SSE smoke; do not waive the short-token mismatch. |
 | Phi-3 | Generic head-dim-96 CPU cache reads are bit-identical; the unproven partial Metal PV tile now falls back. | Repeat the exact-row Metal prefill/decode receipt before changing the HOLD. |
 | Gemma 2 | Source identity, clean-head bounded exact-row metadata, seven-case tokenizer parity, and the exact IT template route pass; substituted templates and invalid shapes fail closed. | Full-artifact identity/load and greedy parity, then API/WebUI/context. |
-| SmolLM3 | Source, clean-head bounded exact-row metadata, and the 10-case `smaug-bpe` tokenizer pack pass. Its absent BOS metadata resolves exactly like pinned llama.cpp. Two default no-tool prompt shapes are preparation-qualified, while the production dynamic template remains under an executable HOLD. | Wire only after runtime token-ID parity and control-marker safety are locked, then qualify system/custom/tool/no-think branches; load, generation, API/WebUI, and context remain blocked. |
-| Qwen3 MoE | The official 32.48 GB row is pinned, and a bounded 32 MiB prefix confirms `qwen3moe` / `gpt2` / `qwen2`, the Q8_0/F32 inventory, and all 579 descriptors. The receipt is preparatory because it predates tracked-worktree provenance. | Rerun metadata qualification from a tracked-clean current HEAD, then qualify the exact-row tokenizer and template before full-artifact load and MoE parity. |
+| SmolLM3 | Source, clean-head bounded exact-row metadata, the 10-case `smaug-bpe` tokenizer pack, and a guarded exact-row Windows CPU load smoke pass. The 3,275,574,624-byte Q8_0 artifact loaded on the Safe `cpu_reference` lane; the raw first forward and bounded default-thinking chat follow-up each emitted one finite greedy token. All 254 Q8 tensors remained lazy and file-backed with zero Q8-to-F32 materialization or retained blocks, and CUDA remained disabled. | The full template gate remains blocked outside the narrow default-thinking text envelope. Next is pinned greedy parity, then complete API/WebUI/SSE and 512-token context evidence. This receipt makes no correctness, performance, GPU, support, adjacent-row, tools, system, no-think, multimodal, or non-text claim. |
+| Qwen3 MoE | Source identity and an independent clean 13-case tokenizer receipt pass for the official 32.48 GB row. The pack pins absent automatic BOS insertion, exact Qwen2 regex splits, CONTROL ChatML markers, USER_DEFINED tool/reasoning tags, and UNUSED padding behavior. The older standalone metadata receipt remains preparatory because it predates tracked-worktree provenance. | Rerun metadata qualification under the current provenance contract, then qualify the embedded 4,100-byte Qwen3 template before full-artifact identity/load and MoE parity; tokenizer evidence makes no metadata, template, load, generation, API, context, or support claim. |
 
 Phase 1 remains active for Qwen2.5, Phi-3, Gemma 2, SmolLM3, and Qwen3 MoE.
 LFM2's completed exact row does not promote those families or any adjacent
@@ -155,14 +159,19 @@ continuations, and the exact one-turn ChatML rendering. Passing that fixture is
 still only raw graph/tokenizer evidence; chat-template/API/context gates remain
 separate.
 
-Current bootstrap result: source, metadata, tokenizer, and template pass. A
-Windows 512-token capture was prepared, but its required verifier transcript is
-not tracked, so the public context gate remains blocked rather than accepting an
-incomplete bundle. Recover the exact checksummed transcript or rerun the lane.
-Raw greedy parity matches 3 of 4 prompts; the remaining prompt reverses two
-near-tied candidates, so it is recorded as a hard parity failure rather than
-waived. Load/smoke and complete API/WebUI gates remain blocked, and the row
-stays experimental/unverified.
+Current bootstrap result: source, metadata, tokenizer, template, bounded Windows
+CPU `load_smoke` pass. The load receipt
+uses a clean current-head release binary, loads the exact row on the CPU
+reference lane, and produces one deterministic raw token on a cold file-backed
+Q8 path without Q8-to-F32 materialization or GPU execution. This is a
+load-smoke-only result and makes no support, parity, API/WebUI, or performance
+claim. A Windows 512-token capture was prepared, but its required verifier
+transcript is not tracked, so the public context gate remains blocked rather
+than accepting an incomplete bundle. Recover the exact checksummed transcript
+or rerun the lane. Raw greedy parity still matches 3 of 4 prompts; the remaining prompt
+reverses two near-tied candidates, so strict parity remains failed rather than
+waived. Complete API/WebUI remains blocked, and the row stays experimental in
+active validation.
 
 ## Phase 2 factory foundation
 
@@ -183,6 +192,13 @@ Phase 2 has started without weakening the Phase 1 evidence boundary:
   exact-row tokenizer pack only after metadata passes. A passing tokenizer
   receipt advances only the report's tokenizer stage; artifact, template,
   load, generation, API/WebUI, and context gates remain unchanged.
+  `--inspect-template` is a separate, mutually exclusive SmolLM3 preparation
+  lane. It binds the same immutable 32 MiB prefix to the 5,493-byte template and
+  a pinned analyzer/shape pack, but keeps the runtime template stage blocked;
+  nested preparation success is not a renderer or support claim. A later,
+  separately locked runtime-envelope fixture opens only the exact
+  default-thinking text shape; it does not rewrite that historical preparation
+  receipt or advance the roster's still-blocked full template gate.
 - `scripts/check-model-qualification-report.mjs` validates the committed report
   contract, fail-closed overall status, and privacy boundary before evidence is
   accepted.
@@ -194,11 +210,14 @@ Phase 2 has started without weakening the Phase 1 evidence boundary:
   and compact tensor-inventory hash. It aborts if a server ignores `Range`, so
   inspecting a 30+ GiB candidate cannot silently become a full download.
 - `scripts/hf-qualification-tokenizer.mjs` provides bounded exact-row tokenizer
-  lanes for Gemma 2 and SmolLM3. It compares Camelid against pinned llama.cpp
+  lanes for Gemma 2, SmolLM3, and Qwen3 MoE. It compares Camelid against pinned llama.cpp
   using unchanged tokenizer metadata from an immutable 32 MiB prefix. The
   SmolLM3 pack includes empty/default-special handling, exact `Hello` IDs,
   Unicode/contraction/digit splits, ChatML controls, and USER_DEFINED tool tags;
-  both lanes explicitly decline weight-load, generation, template-rendering,
+  the Qwen3 MoE pack additionally pins all 13 exact ID arrays, explicit
+  `add_bos_token=false`, CONTROL versus USER_DEFINED behavior, UNUSED padding,
+  the committed header receipt, and the deterministic vocabulary-only derivative.
+  All lanes explicitly decline weight-load, generation, template-rendering,
   API, and support claims. The factory calls the same lane with its already
   validated source lock. Camelid and pinned llama.cpp identities are checked
   before the tokenizer range request, and source HEAD plus tracked-clean state

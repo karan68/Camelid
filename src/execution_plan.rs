@@ -420,11 +420,15 @@ pub fn plan_for_model_with_platform_and_env(
     let model_family = model_family(&row, gguf);
     let quant_type = quant_type(gguf);
     let thread_count = threads.unwrap_or_else(default_thread_count);
-    let diagnostics_status = match profile {
-        ExecutionProfile::Debug => {
-            "debug diagnostics enabled; performance claims disabled".to_string()
-        }
-        _ => "standard diagnostics; RSS timings disabled by default".to_string(),
+    let debug_diagnostics = matches!(profile, ExecutionProfile::Debug);
+    let operator_forward_rss_timings = planner_env.flag_enabled("CAMELID_FORWARD_RSS_TIMINGS");
+    let forward_rss_timings_enabled = debug_diagnostics || operator_forward_rss_timings;
+    let diagnostics_status = if debug_diagnostics {
+        "debug diagnostics enabled; performance claims disabled".to_string()
+    } else if operator_forward_rss_timings {
+        "operator-requested RSS timings enabled; performance claims disabled".to_string()
+    } else {
+        "standard diagnostics; RSS timings disabled by default".to_string()
     };
 
     let mut reasons = vec![profile_reason];
@@ -432,7 +436,7 @@ pub fn plan_for_model_with_platform_and_env(
     reasons.push(format!("quant_type={quant_type}"));
 
     let mut env_updates: BTreeMap<&'static str, Option<&'static str>> = BTreeMap::new();
-    if matches!(profile, ExecutionProfile::Debug) {
+    if forward_rss_timings_enabled {
         env_updates.insert("CAMELID_FORWARD_RSS_TIMINGS", Some("on"));
     }
 
@@ -2887,6 +2891,7 @@ mod tests {
     fn clear_profile_env() {
         for key in [
             "CAMELID_PROFILE",
+            "CAMELID_FORWARD_RSS_TIMINGS",
             "CAMELID_MAC_Q8_REPACK",
             "CAMELID_MAC_Q8_PREFILL_I8MM",
             "CAMELID_MAC_Q8_SCHED",
@@ -3243,7 +3248,80 @@ mod tests {
             outcome.plan.prefill_runtime_policy,
             "always_retained_reference_path"
         );
+        assert!(outcome
+            .plan
+            .diagnostics_status
+            .contains("RSS timings disabled by default"));
+        assert!(!outcome
+            .env_updates
+            .contains_key("CAMELID_FORWARD_RSS_TIMINGS"));
         assert!(!outcome.env_updates.contains_key("CAMELID_MAC_Q8_REPACK"));
+        clear_profile_env();
+    }
+
+    #[test]
+    fn safe_profile_preserves_explicit_forward_rss_timings_through_plan_apply() {
+        let _guard = env_lock();
+        clear_profile_env();
+        env::set_var("CAMELID_PROFILE", "safe");
+        env::set_var("CAMELID_FORWARD_RSS_TIMINGS", "on");
+        let planner_env = PlannerEnv::capture();
+        let outcome = plan_for_model_with_platform_and_env(
+            &PathBuf::from("/tmp/Llama-3.2-3B-Instruct-Q8_0.gguf"),
+            &fixture("Llama 3.2 3B Instruct"),
+            Some(8),
+            platform("windows", "x86_64", &["avx2"]),
+            &planner_env,
+        );
+
+        assert_eq!(outcome.plan.profile, ExecutionProfile::Safe);
+        assert!(outcome
+            .plan
+            .diagnostics_status
+            .contains("operator-requested RSS timings enabled"));
+        assert_eq!(
+            outcome.env_updates.get("CAMELID_FORWARD_RSS_TIMINGS"),
+            Some(&Some("on"))
+        );
+
+        // This is the exact capture -> plan -> apply sequence used by
+        // POST /models/load. A stale live value must not override the captured
+        // operator request, and applying the plan must not remove that request.
+        env::set_var("CAMELID_FORWARD_RSS_TIMINGS", "off");
+        planner_env.apply(&outcome.env_updates);
+        assert_eq!(env::var("CAMELID_FORWARD_RSS_TIMINGS").as_deref(), Ok("on"));
+        clear_profile_env();
+    }
+
+    #[test]
+    fn auto_and_experimental_preserve_explicit_forward_rss_timings() {
+        let _guard = env_lock();
+        for (requested, expected) in [
+            ("auto", ExecutionProfile::Auto),
+            ("experimental", ExecutionProfile::Experimental),
+        ] {
+            clear_profile_env();
+            env::set_var("CAMELID_PROFILE", requested);
+            env::set_var("CAMELID_FORWARD_RSS_TIMINGS", "on");
+            let planner_env = PlannerEnv::capture();
+            let outcome = plan_for_model_with_platform_and_env(
+                &PathBuf::from("/tmp/Llama-3.2-3B-Instruct-Q8_0.gguf"),
+                &fixture("Llama 3.2 3B Instruct"),
+                Some(8),
+                platform("windows", "x86_64", &["avx2"]),
+                &planner_env,
+            );
+
+            assert_eq!(outcome.plan.profile, expected);
+            assert!(outcome
+                .plan
+                .diagnostics_status
+                .contains("operator-requested RSS timings enabled"));
+            assert_eq!(
+                outcome.env_updates.get("CAMELID_FORWARD_RSS_TIMINGS"),
+                Some(&Some("on"))
+            );
+        }
         clear_profile_env();
     }
 

@@ -5,10 +5,12 @@ import { createHash } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import {
   GEMMA2_CASES,
+  QWEN3_MOE_CASES,
   SMOLLM3_CASES,
   TokenizerQualificationError,
   assessTokenizerReceipt,
   assertGemma2TokenizerMetadata,
+  assertQwen3MoeTokenizerMetadata,
   assertSmolLM3TokenizerMetadata,
   buildCamelidArgs,
   buildLlamaArgs,
@@ -24,7 +26,9 @@ import {
   tokenizerPackAvailable,
   tokenizerPrefixBytesForRow,
   validateGemma2TokenizerReceipt,
+  validateQwen3MoeTokenizerReceipt,
   validateSmolLM3TokenizerReceipt,
+  verifyLlamaCppPackage,
 } from './hf-qualification-tokenizer.mjs'
 import { validateLockAgainstSelection } from './hf-qualification-source.mjs'
 
@@ -59,8 +63,10 @@ assert.throws(
 )
 assert.equal(tokenizerPackAvailable('gemma2_9b_it_q8_0'), true)
 assert.equal(tokenizerPackAvailable('smollm3_3b_q8_0'), true)
+assert.equal(tokenizerPackAvailable('qwen3_30b_a3b_q8_0'), true)
 assert.equal(tokenizerPackAvailable('not_a_pack'), false)
 assert.equal(tokenizerPrefixBytesForRow('gemma2_9b_it_q8_0'), 32 * 1024 * 1024)
+assert.equal(tokenizerPrefixBytesForRow('qwen3_30b_a3b_q8_0'), 32 * 1024 * 1024)
 assert.equal(tokenizerPrefixBytesForRow('not_a_pack'), null)
 
 const typedTokenizerFailure = classifyTokenizerQualificationError(
@@ -103,6 +109,50 @@ assert.deepEqual(classifyTokenizerQualificationError(mutatedKnownTokenizerError)
 })
 assert.throws(() => parseLlamaVersionOutput('unknown version'), /parseable build revision/)
 
+const knownWindowsExitOne = new Error('llama-cli historical exit status')
+knownWindowsExitOne.code = 1
+knownWindowsExitOne.killed = false
+knownWindowsExitOne.signal = null
+knownWindowsExitOne.stdout = 'version: 9632 (acd79d603)\nbuilt with Clang'
+const acceptedWindowsPackage = await verifyLlamaCppPackage('llama-tokenize.exe', {
+  platform: 'win32',
+  execImpl: async () => { throw knownWindowsExitOne },
+  readFileImpl: async () => Buffer.from('test-binary'),
+})
+assert.equal(acceptedWindowsPackage.revision, 'acd79d603')
+assert.equal(acceptedWindowsPackage.build, 9_632)
+
+for (const processFailure of [
+  Object.assign(new Error('timeout'), {
+    code: null,
+    killed: true,
+    signal: 'SIGTERM',
+    stdout: 'version: 9632 (acd79d603)',
+  }),
+  Object.assign(new Error('arbitrary exit'), {
+    code: 2,
+    killed: false,
+    signal: null,
+    stdout: 'version: 9632 (acd79d603)',
+  }),
+  Object.assign(new Error('missing executable'), {
+    code: 'ENOENT',
+    killed: false,
+    signal: null,
+    stdout: 'version: 9632 (acd79d603)',
+  }),
+]) {
+  await assert.rejects(
+    verifyLlamaCppPackage('llama-tokenize.exe', {
+      platform: 'win32',
+      execImpl: async () => { throw processFailure },
+      readFileImpl: async () => Buffer.from('test-binary'),
+    }),
+    (error) => error === processFailure,
+    'partial version output must not certify a failed/killed/timed-out oracle probe',
+  )
+}
+
 assert.deepEqual(classifyCamelidProvenance({
   version: 'camelid v0.6.1-24-g96db3486',
   sourceHead: '96db34867b0402f7775670d4a767fae73b6b19d9',
@@ -130,6 +180,7 @@ assert.equal(classifyCamelidProvenance({
 
 assert.equal(normalizeTokenizerPrefixBytes('gemma2_9b_it_q8_0', 32 * 1024 * 1024), 32 * 1024 * 1024)
 assert.equal(normalizeTokenizerPrefixBytes('smollm3_3b_q8_0', '33554432'), 32 * 1024 * 1024)
+assert.equal(normalizeTokenizerPrefixBytes('qwen3_30b_a3b_q8_0', '33554432'), 32 * 1024 * 1024)
 assert.throws(
   () => normalizeTokenizerPrefixBytes('smollm3_3b_q8_0', 16 * 1024 * 1024),
   /requires exactly 33554432 prefix bytes/,
@@ -268,6 +319,76 @@ assert.throws(
   /special-token type counts mismatch/,
 )
 
+const qwen3Tokens = Array(151_936).fill('x')
+const qwen3Types = Array(151_936).fill(1)
+for (let id = 151_643; id < 151_669; id += 1) qwen3Types[id] = 3
+for (const id of [151_657, 151_658, 151_665, 151_666, 151_667, 151_668]) {
+  qwen3Types[id] = 4
+}
+for (const [id, text] of [
+  [151_643, '<|endoftext|>'],
+  [151_644, '<|im_start|>'],
+  [151_645, '<|im_end|>'],
+  [151_657, '<tool_call>'],
+  [151_658, '</tool_call>'],
+  [151_665, '<tool_response>'],
+  [151_666, '</tool_response>'],
+  [151_667, '<think>'],
+  [151_668, '</think>'],
+]) qwen3Tokens[id] = text
+for (let id = 151_669; id < 151_936; id += 1) {
+  qwen3Tokens[id] = `[PAD${id}]`
+  qwen3Types[id] = 5
+}
+const qwen3Metadata = {
+  'general.architecture': 'qwen3moe',
+  'tokenizer.ggml.model': 'gpt2',
+  'tokenizer.ggml.pre': 'qwen2',
+  'tokenizer.ggml.bos_token_id': 151_643,
+  'tokenizer.ggml.eos_token_id': 151_645,
+  'tokenizer.ggml.padding_token_id': 151_643,
+  'tokenizer.ggml.add_bos_token': false,
+  'tokenizer.ggml.tokens': qwen3Tokens,
+  'tokenizer.ggml.merges': Array(151_387).fill('a b'),
+  'tokenizer.ggml.token_type': qwen3Types,
+  'tokenizer.chat_template': 'intentionally not the pinned 4100-byte template',
+}
+assert.throws(
+  () => assertQwen3MoeTokenizerMetadata({ metadata: qwen3Metadata }),
+  /chat template does not match/,
+  'all grounded Qwen3 MoE metadata must reach the final exact template check',
+)
+for (const key of ['tokenizer.ggml.add_eos_token', 'tokenizer.ggml.add_space_prefix']) {
+  assert.throws(
+    () => assertQwen3MoeTokenizerMetadata({ metadata: { ...qwen3Metadata, [key]: false } }),
+    new RegExp(`unexpectedly declares ${key.replaceAll('.', '\\.')}`),
+    `the exact Qwen3 MoE row pins ${key} absence`,
+  )
+}
+assert.throws(
+  () => assertQwen3MoeTokenizerMetadata({
+    metadata: { ...qwen3Metadata, 'tokenizer.ggml.add_bos_token': true },
+  }),
+  /add_bos_token mismatch/,
+  'the Qwen3 MoE BOS id must not imply automatic BOS insertion',
+)
+const driftedQwen3Types = [...qwen3Types]
+driftedQwen3Types[151_935] = 1
+assert.throws(
+  () => assertQwen3MoeTokenizerMetadata({
+    metadata: { ...qwen3Metadata, 'tokenizer.ggml.token_type': driftedQwen3Types },
+  }),
+  /special-token type counts mismatch/,
+)
+const driftedQwen3Pad = [...qwen3Tokens]
+driftedQwen3Pad[151_935] = '[PAD-drifted]'
+assert.throws(
+  () => assertQwen3MoeTokenizerMetadata({
+    metadata: { ...qwen3Metadata, 'tokenizer.ggml.tokens': driftedQwen3Pad },
+  }),
+  /unused token 151935 mismatch/,
+)
+
 assert.equal(GEMMA2_CASES.length, 7)
 assert(GEMMA2_CASES.some((testCase) => testCase.parse_special))
 assert(GEMMA2_CASES.some((testCase) => !testCase.parse_special))
@@ -279,6 +400,23 @@ assert(SMOLLM3_CASES.some((testCase) => /unicode/.test(testCase.id)))
 assert(SMOLLM3_CASES.some((testCase) => /contractions/.test(testCase.id)))
 assert(SMOLLM3_CASES.some((testCase) => testCase.parse_special))
 assert(SMOLLM3_CASES.some((testCase) => !testCase.parse_special))
+assert.equal(QWEN3_MOE_CASES.length, 13)
+assert.deepEqual(QWEN3_MOE_CASES.find((testCase) => testCase.id === 'empty_with_add_special').expected_ids, [])
+assert.deepEqual(
+  QWEN3_MOE_CASES.find((testCase) => testCase.id === 'plain_ascii_with_add_special').expected_ids,
+  [9_707],
+)
+assert.deepEqual(
+  QWEN3_MOE_CASES.find((testCase) => testCase.id === 'plain_ascii_without_add_special').expected_ids,
+  [9_707],
+)
+assert(QWEN3_MOE_CASES.some((testCase) => testCase.id === 'single_user_chat_controls'
+  && testCase.parse_special))
+assert(QWEN3_MOE_CASES.some((testCase) => testCase.id === 'chat_controls_as_ordinary_text'
+  && !testCase.parse_special))
+assert(QWEN3_MOE_CASES.some((testCase) => testCase.id === 'user_defined_tool_tags_without_parse_special'))
+assert(QWEN3_MOE_CASES.some((testCase) => testCase.id === 'unused_pad_with_parse_special'))
+assert(QWEN3_MOE_CASES.every((testCase) => Array.isArray(testCase.expected_ids)))
 
 const selected = sourceSelectionForRow({
   id: 'gemma2_9b_it_q8_0',
@@ -313,6 +451,14 @@ const roster = JSON.parse(readFileSync(
   new URL('../qa/model-qualification/phase1-roster.json', import.meta.url),
   'utf8',
 ))
+const qwen3HeaderReceiptBytes = readFileSync(
+  new URL('../qa/model-qualification/qwen3-30b-a3b-q8-header-inspection.json', import.meta.url),
+)
+assert.equal(
+  sha256(qwen3HeaderReceiptBytes),
+  '293f8dd99f4f31478a0a6a7b3fc9c3e6a1c224a9df0b1dc3253e619d93a2dc33',
+  'the Qwen3 MoE tokenizer pack must remain bound to the committed header receipt bytes',
+)
 const receiptRow = roster.rows.find((row) => row.id === 'gemma2_9b_it_q8_0')
 assert.deepEqual(
   validateGemma2TokenizerReceipt(receipt, receiptRow, roster.defaults),
@@ -760,6 +906,7 @@ const syntheticSmolReceipt = {
     prefix_sha256: '2d043b2114b89100c7ba464e57375a6f32c06c04729542d54ed684b5e8c5016e',
     temporary_paths_redacted: true,
     temporary_files_deleted: true,
+    scope_note: 'the prefix hash includes opaque initial tensor payload bytes after data_start_offset; it is not a full payload or full artifact hash',
   },
   grounding: {
     header_receipt: 'qa/model-qualification/smollm3-3b-q8-header-inspection.json',
@@ -804,6 +951,12 @@ const syntheticSmolReceipt = {
     all_token_ids_match: true,
     support_decision: 'smollm3_exact_row_tokenizer_gate_only',
   },
+  does_not_prove: [
+    'full artifact integrity or presence on this host',
+    'weight load, logits, generation, or greedy-token parity',
+    'API, SSE, Models page, WebUI, or context readiness',
+    'sampling, tools, GPU execution, performance, neighboring rows, or broad SmolLM3 support',
+  ],
 }
 assert.deepEqual(
   validateSmolLM3TokenizerReceipt(syntheticSmolReceipt, smolRow, roster.defaults),
@@ -902,6 +1055,383 @@ assert(
   validateSmolLM3TokenizerReceipt(smolNullCase, smolRow, roster.defaults)
     .some((error) => error.includes('id/order mismatch')),
   'null case entries must fail closed without throwing',
+)
+
+const qwen3Row = roster.rows.find((row) => row.id === 'qwen3_30b_a3b_q8_0')
+const durableQwen3ReceiptBytes = readFileSync(
+  new URL('../qa/model-qualification/qwen3-30b-a3b-q8-header-tokenizer-parity.json', import.meta.url),
+)
+assert.equal(
+  sha256(durableQwen3ReceiptBytes),
+  '021dbe0b4f6a94f7140daa8e02969106dab941e205d184ee60f683d58f13ea37',
+  'durable Qwen3 MoE tokenizer evidence must remain byte-identical to the clean-head receipt',
+)
+const durableQwen3Receipt = JSON.parse(durableQwen3ReceiptBytes.toString('utf8'))
+assert.deepEqual(
+  validateQwen3MoeTokenizerReceipt(durableQwen3Receipt, qwen3Row, roster.defaults),
+  [],
+  'durable Qwen3 MoE tokenizer evidence must remain bound to the exact row and oracle pack',
+)
+assert.equal(durableQwen3Receipt.provenance.source_head, 'ded8e95b95fadbe2e7ab6a03d48e4d1e9a2c32d6')
+assert.equal(durableQwen3Receipt.provenance.clean_current_head, true)
+assert.equal(durableQwen3Receipt.result.case_count, QWEN3_MOE_CASES.length)
+assert.equal(durableQwen3Receipt.result.exact_match_count, QWEN3_MOE_CASES.length)
+assert.equal(durableQwen3Receipt.result.all_token_ids_match, true)
+assert.equal(durableQwen3Receipt.result.support_decision, 'qwen3_moe_exact_row_tokenizer_gate_only')
+assert(durableQwen3Receipt.cases.every((testCase) => testCase.exact_match))
+assert.equal(qwen3Row.gates.tokenizer.status, 'pass')
+for (const downstream of ['template', 'load_smoke', 'parity', 'api_webui', 'context']) {
+  assert.notEqual(qwen3Row.gates[downstream].status, 'pass', `${downstream} must not ride tokenizer evidence`)
+}
+assert.equal(Object.hasOwn(durableQwen3Receipt, 'support_claim'), false)
+assert(!/[A-Za-z]:[\\/]/.test(JSON.stringify(durableQwen3Receipt)))
+
+const syntheticQwen3Cases = QWEN3_MOE_CASES.map((testCase) => ({
+  id: testCase.id,
+  text_utf8_bytes: Buffer.byteLength(testCase.text),
+  text_sha256: sha256(testCase.text),
+  add_special: testCase.add_special,
+  parse_special: testCase.parse_special,
+  camelid_ids: [...testCase.expected_ids],
+  llama_cpp_ids: [...testCase.expected_ids],
+  exact_match: true,
+  camelid_decoded_sha256: 'd'.repeat(64),
+}))
+const syntheticQwen3Receipt = {
+  schema: 'camelid.header-tokenizer-parity/v1',
+  generated_at: '2026-08-10T20:00:00.000Z',
+  provenance: structuredClone(receipt.provenance),
+  row_id: qwen3Row.id,
+  host: { platform: 'win32-x64', hostname_redacted: true },
+  source: {
+    repo: qwen3Row.source.repo,
+    file: qwen3Row.source.file,
+    revision: qwen3Row.source.revision,
+    size_bytes: qwen3Row.identity.size_bytes,
+    sha256: qwen3Row.identity.sha256,
+    license: qwen3Row.source.license,
+  },
+  bounded_fetch: {
+    requested_bytes: 32 * 1024 * 1024,
+    received_bytes: 32 * 1024 * 1024,
+    content_range: {
+      start: 0,
+      end: 32 * 1024 * 1024 - 1,
+      total: qwen3Row.identity.size_bytes,
+    },
+    prefix_sha256: '55c565264523c5862247d983f857b9034c04d762ee14fecfd68a827cdbb2d566',
+    temporary_paths_redacted: true,
+    temporary_files_deleted: true,
+    scope_note: 'the prefix hash includes opaque initial tensor payload bytes after data_start_offset; it is not a full payload or full artifact hash',
+  },
+  grounding: {
+    header_receipt: 'qa/model-qualification/qwen3-30b-a3b-q8-header-inspection.json',
+    header_receipt_sha256: '293f8dd99f4f31478a0a6a7b3fc9c3e6a1c224a9df0b1dc3253e619d93a2dc33',
+  },
+  tokenizer_metadata: {
+    token_count: 151_936,
+    merge_count: 151_387,
+    token_type_count: 151_936,
+    normal_token_count: 151_643,
+    special_token_count: 293,
+    control_token_count: 20,
+    user_defined_token_count: 6,
+    unused_token_count: 267,
+    bos_token_id: 151_643,
+    eos_token_id: 151_645,
+    padding_token_id: 151_643,
+    declared_add_bos_token: false,
+    declared_add_eos_token: 'absent',
+    declared_add_space_prefix: 'absent',
+    oracle_resolved_add_bos_token: false,
+    oracle_resolved_add_eos_token: false,
+    special_token_ids: {
+      endoftext: 151_643,
+      im_start: 151_644,
+      im_end: 151_645,
+      tool_call_start: 151_657,
+      tool_call_end: 151_658,
+      tool_response_start: 151_665,
+      tool_response_end: 151_666,
+      think_start: 151_667,
+      think_end: 151_668,
+      unused_first: 151_669,
+      unused_last: 151_935,
+    },
+    chat_template_utf8_bytes: 4_100,
+    chat_template_sha256: '57f1fd00f0013a2be96aa79b857391f27e23df5b5f847072b524c897e24d0361',
+  },
+  camelid: structuredClone(receipt.camelid),
+  oracle: {
+    ...structuredClone(receipt.oracle),
+    derivative: {
+      ...structuredClone(receipt.oracle.derivative),
+      original_tensor_count: 579,
+      metadata_count: 31,
+      patch_offset: 8,
+      sha256: '39c4ed3e1ec5dbf8b1582bef982b97436e2d83709cf02195255d7908c595a54d',
+      persisted: false,
+    },
+  },
+  cases: syntheticQwen3Cases,
+  result: {
+    case_count: syntheticQwen3Cases.length,
+    exact_match_count: syntheticQwen3Cases.length,
+    all_token_ids_match: true,
+    support_decision: 'qwen3_moe_exact_row_tokenizer_gate_only',
+  },
+  does_not_prove: [
+    'full artifact integrity or presence on this host',
+    'weight load, logits, generation, or greedy-token parity',
+    'API, SSE, Models page, WebUI, or context readiness',
+    'sampling, tools, GPU execution, performance, neighboring rows, or broad Qwen3 MoE support',
+  ],
+}
+assert.deepEqual(
+  validateQwen3MoeTokenizerReceipt(syntheticQwen3Receipt, qwen3Row, roster.defaults),
+  [],
+  'Qwen3 MoE durable receipt validator accepts only the exact source/header/oracle/ID pack',
+)
+
+const qwen3CallableLock = {
+  repo: qwen3Row.source.repo,
+  file: qwen3Row.source.file,
+  revision: qwen3Row.source.revision,
+  size_bytes: qwen3Row.identity.size_bytes,
+  sha256: qwen3Row.identity.sha256,
+  license: qwen3Row.source.license,
+  download_url: 'https://huggingface.co/example/unused-in-injected-tests',
+}
+const qwen3CallableOptions = (overrides = {}) => ({
+  row: qwen3Row,
+  defaults: roster.defaults,
+  binary: 'camelid',
+  llamaTokenize: 'llama-tokenize',
+  sourceRoot: 'virtual-source-root',
+  prefixBytes: 32 * 1024 * 1024,
+  sourceProvenanceImpl: async () => callableSource,
+  camelidIdentityImpl: async () => callableIdentity,
+  llamaPackageImpl: async () => callableLlamaPackage,
+  fetchPrefixImpl: async () => ({
+    bytes: callablePrefix,
+    requested_bytes: 32 * 1024 * 1024,
+    content_range: {
+      start: 0,
+      end: 32 * 1024 * 1024 - 1,
+      total: qwen3Row.identity.size_bytes,
+    },
+    prefix_sha256: '55c565264523c5862247d983f857b9034c04d762ee14fecfd68a827cdbb2d566',
+  }),
+  prefixSha256Impl: () => '55c565264523c5862247d983f857b9034c04d762ee14fecfd68a827cdbb2d566',
+  derivativeSha256Impl: () => '39c4ed3e1ec5dbf8b1582bef982b97436e2d83709cf02195255d7908c595a54d',
+  mkdtempImpl: async () => 'virtual-qwen3-tokenizer-temp',
+  writeFileImpl: async () => {},
+  inspectImpl: async () => ({ tensor_count: 579 }),
+  metadataValidatorImpl: () => structuredClone(syntheticQwen3Receipt.tokenizer_metadata),
+  deriveImpl: () => ({
+    bytes: Buffer.from('qwen3-vocab-only-derivative'),
+    original_tensor_count: 579,
+    metadata_count: 31,
+    patched_offset: 8,
+  }),
+  camelidCaseImpl: async (_binary, _prefix, _length, _temporary, testCase) => ({
+    ids: [...testCase.expected_ids],
+    decoded: testCase.text,
+  }),
+  llamaCaseImpl: async (_binary, _model, _temporary, testCase) => [...testCase.expected_ids],
+  rmImpl: async () => {},
+  now: () => new Date('2026-08-10T20:00:00.000Z'),
+  ...overrides,
+})
+const qwen3CallableReceipt = await inspectRemoteTokenizer(
+  qwen3CallableLock,
+  qwen3CallableOptions(),
+)
+assert.deepEqual(
+  validateQwen3MoeTokenizerReceipt(qwen3CallableReceipt, qwen3Row, roster.defaults),
+  [],
+  'the live Qwen3 qualifier must self-assess and emit only the exact pinned pack',
+)
+let qwen3PairedLiveCleanupCalls = 0
+await assert.rejects(
+  inspectRemoteTokenizer(qwen3CallableLock, qwen3CallableOptions({
+    camelidCaseImpl: async () => ({ ids: [42], decoded: 'forged' }),
+    llamaCaseImpl: async () => [42],
+    rmImpl: async () => { qwen3PairedLiveCleanupCalls += 1 },
+  })),
+  (error) => error instanceof TokenizerQualificationError
+    && error.code === 'tokenizer_probe_failed',
+  'matching-but-nonpinned engine arrays must fail before a durable receipt is returned',
+)
+assert.equal(qwen3PairedLiveCleanupCalls, 1, 'self-assessment failure must follow successful cleanup')
+
+const qwen3PairedForgery = structuredClone(syntheticQwen3Receipt)
+const forgedQwen3Case = qwen3PairedForgery.cases.find(
+  (testCase) => testCase.id === 'qwen2_digits_punctuation_newlines_and_case',
+)
+forgedQwen3Case.camelid_ids = [42]
+forgedQwen3Case.llama_cpp_ids = [42]
+assert(
+  validateQwen3MoeTokenizerReceipt(qwen3PairedForgery, qwen3Row, roster.defaults)
+    .some((error) => error.includes('pinned exact array')),
+  'paired engine-output forgery must not self-certify against exact-row ID pins',
+)
+const qwen3FalseBos = structuredClone(syntheticQwen3Receipt)
+for (const field of ['camelid_ids', 'llama_cpp_ids']) qwen3FalseBos.cases[0][field] = [151_643]
+assert(
+  validateQwen3MoeTokenizerReceipt(qwen3FalseBos, qwen3Row, roster.defaults)
+    .some((error) => error.includes('add_bos=false')),
+)
+const qwen3ControlLeak = structuredClone(syntheticQwen3Receipt)
+const qwen3OrdinaryControl = qwen3ControlLeak.cases.find(
+  (testCase) => testCase.id === 'chat_controls_as_ordinary_text',
+)
+for (const field of ['camelid_ids', 'llama_cpp_ids']) qwen3OrdinaryControl[field] = [151_644, 151_645]
+assert(
+  validateQwen3MoeTokenizerReceipt(qwen3ControlLeak, qwen3Row, roster.defaults)
+    .some((error) => error.includes('parsed despite parse_special=false')),
+)
+const qwen3ParsedControlDrift = structuredClone(syntheticQwen3Receipt)
+const qwen3ParsedControl = qwen3ParsedControlDrift.cases.find(
+  (testCase) => testCase.id === 'single_user_chat_controls',
+)
+for (const field of ['camelid_ids', 'llama_cpp_ids']) qwen3ParsedControl[field] = [42]
+assert(
+  validateQwen3MoeTokenizerReceipt(qwen3ParsedControlDrift, qwen3Row, roster.defaults)
+    .some((error) => error.includes('were not parsed to their exact IDs')),
+)
+const qwen3UserDefinedDrift = structuredClone(syntheticQwen3Receipt)
+for (const testCase of qwen3UserDefinedDrift.cases.filter(
+  (candidate) => candidate.id.startsWith('user_defined_tool_tags_'),
+)) {
+  testCase.camelid_ids = [77]
+  testCase.llama_cpp_ids = [77]
+}
+assert(
+  validateQwen3MoeTokenizerReceipt(qwen3UserDefinedDrift, qwen3Row, roster.defaults)
+    .some((error) => error.includes('lost exact boundary IDs')),
+)
+const qwen3ThinkDrift = structuredClone(syntheticQwen3Receipt)
+const qwen3ThinkCase = qwen3ThinkDrift.cases.find(
+  (testCase) => testCase.id === 'user_defined_think_tags_with_parse_special',
+)
+for (const field of ['camelid_ids', 'llama_cpp_ids']) qwen3ThinkCase[field] = [42]
+assert(
+  validateQwen3MoeTokenizerReceipt(qwen3ThinkDrift, qwen3Row, roster.defaults)
+    .some((error) => error.includes('think tags lost their exact boundary IDs')),
+)
+const qwen3UnusedParsed = structuredClone(syntheticQwen3Receipt)
+for (const testCase of qwen3UnusedParsed.cases.filter((candidate) => candidate.id.startsWith('unused_pad_'))) {
+  testCase.camelid_ids = [151_669]
+  testCase.llama_cpp_ids = [151_669]
+}
+assert(
+  validateQwen3MoeTokenizerReceipt(qwen3UnusedParsed, qwen3Row, roster.defaults)
+    .some((error) => error.includes('UNUSED padding token was parsed')),
+)
+const qwen3OutOfRange = structuredClone(syntheticQwen3Receipt)
+for (const field of ['camelid_ids', 'llama_cpp_ids']) qwen3OutOfRange.cases[1][field] = [151_936]
+assert(
+  validateQwen3MoeTokenizerReceipt(qwen3OutOfRange, qwen3Row, roster.defaults)
+    .some((error) => error.includes('invalid token IDs')),
+)
+const qwen3NullCase = structuredClone(syntheticQwen3Receipt)
+qwen3NullCase.cases[6] = null
+assert(
+  validateQwen3MoeTokenizerReceipt(qwen3NullCase, qwen3Row, roster.defaults)
+    .some((error) => error.includes('id/order mismatch')),
+  'Qwen3 MoE null case entries must fail closed without throwing',
+)
+const qwen3SourceDrift = structuredClone(syntheticQwen3Receipt)
+qwen3SourceDrift.source.sha256 = '0'.repeat(64)
+assert(
+  validateQwen3MoeTokenizerReceipt(qwen3SourceDrift, qwen3Row, roster.defaults)
+    .some((error) => error.includes('source.sha256 mismatch')),
+)
+const qwen3PrefixDrift = structuredClone(syntheticQwen3Receipt)
+qwen3PrefixDrift.bounded_fetch.prefix_sha256 = '0'.repeat(64)
+assert(
+  validateQwen3MoeTokenizerReceipt(qwen3PrefixDrift, qwen3Row, roster.defaults)
+    .some((error) => error.includes('grounded exact-row prefix')),
+)
+const qwen3TemplateDrift = structuredClone(syntheticQwen3Receipt)
+qwen3TemplateDrift.tokenizer_metadata.chat_template_sha256 = '0'.repeat(64)
+assert(
+  validateQwen3MoeTokenizerReceipt(qwen3TemplateDrift, qwen3Row, roster.defaults)
+    .some((error) => error.includes('chat_template_sha256 mismatch')),
+)
+const qwen3HeaderDrift = structuredClone(syntheticQwen3Receipt)
+qwen3HeaderDrift.grounding.header_receipt_sha256 = '0'.repeat(64)
+assert(
+  validateQwen3MoeTokenizerReceipt(qwen3HeaderDrift, qwen3Row, roster.defaults)
+    .some((error) => error.includes('header_receipt_sha256 mismatch')),
+)
+const qwen3DirtySource = structuredClone(syntheticQwen3Receipt)
+qwen3DirtySource.provenance.source_tracked_dirty = true
+assert(
+  validateQwen3MoeTokenizerReceipt(qwen3DirtySource, qwen3Row, roster.defaults)
+    .some((error) => error.includes('source was tracked-dirty')),
+)
+const qwen3InspectorDrift = structuredClone(syntheticQwen3Receipt)
+qwen3InspectorDrift.camelid.version = 'camelid v0.6.1-gffffffff'
+assert(
+  validateQwen3MoeTokenizerReceipt(qwen3InspectorDrift, qwen3Row, roster.defaults)
+    .some((error) => error.includes('is not derivable from Camelid version and source head')),
+)
+const qwen3OracleDrift = structuredClone(syntheticQwen3Receipt)
+qwen3OracleDrift.oracle.revision = 'deadbeef0'
+assert(
+  validateQwen3MoeTokenizerReceipt(qwen3OracleDrift, qwen3Row, roster.defaults)
+    .some((error) => error.includes('llama.cpp revision mismatch')),
+)
+const qwen3DerivativeDrift = structuredClone(syntheticQwen3Receipt)
+qwen3DerivativeDrift.oracle.derivative.sha256 = 'f'.repeat(64)
+assert(
+  validateQwen3MoeTokenizerReceipt(qwen3DerivativeDrift, qwen3Row, roster.defaults)
+    .some((error) => error.includes('deterministic exact-row derivative')),
+)
+const qwen3CleanupForgery = structuredClone(syntheticQwen3Receipt)
+qwen3CleanupForgery.bounded_fetch.temporary_files_deleted = false
+assert(
+  validateQwen3MoeTokenizerReceipt(qwen3CleanupForgery, qwen3Row, roster.defaults)
+    .some((error) => error.includes('temporary files were not confirmed deleted')),
+)
+const qwen3SummaryForgery = structuredClone(syntheticQwen3Receipt)
+qwen3SummaryForgery.result.exact_match_count = 0
+qwen3SummaryForgery.result.all_token_ids_match = false
+qwen3SummaryForgery.result.support_decision = 'supported'
+const qwen3SummaryErrors = validateQwen3MoeTokenizerReceipt(
+  qwen3SummaryForgery,
+  qwen3Row,
+  roster.defaults,
+)
+assert(qwen3SummaryErrors.some((error) => error.includes('result exact_match_count mismatch')))
+assert(qwen3SummaryErrors.some((error) => error.includes('result all_token_ids_match mismatch')))
+assert(qwen3SummaryErrors.some((error) => error.includes('support decision widened unexpectedly')))
+const qwen3MissingExclusions = structuredClone(syntheticQwen3Receipt)
+qwen3MissingExclusions.does_not_prove = []
+assert(
+  validateQwen3MoeTokenizerReceipt(qwen3MissingExclusions, qwen3Row, roster.defaults)
+    .some((error) => error.includes('does_not_prove exclusions mismatch')),
+)
+for (const [field, value] of [
+  ['support_claim', true],
+  ['template_gate', 'pass'],
+  ['load', 'pass'],
+]) {
+  const qwen3UnknownPromotion = structuredClone(syntheticQwen3Receipt)
+  qwen3UnknownPromotion[field] = value
+  assert(
+    validateQwen3MoeTokenizerReceipt(qwen3UnknownPromotion, qwen3Row, roster.defaults)
+      .some((error) => error.includes('top-level fields mismatch')),
+    `unknown promotion field ${field} must fail closed`,
+  )
+}
+const qwen3PathLeak = structuredClone(syntheticQwen3Receipt)
+qwen3PathLeak.debug_path = 'C:\\private\\Qwen3.gguf'
+assert(
+  validateQwen3MoeTokenizerReceipt(qwen3PathLeak, qwen3Row, roster.defaults)
+    .some((error) => error.includes('absolute Windows path')),
 )
 
 console.log('test-hf-qualification-tokenizer: all checks passed')

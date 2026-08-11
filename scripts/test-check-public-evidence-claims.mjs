@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict'
 import { mkdtemp, mkdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join, relative } from 'node:path'
+import { basename, join, relative } from 'node:path'
 import { spawnSync } from 'node:child_process'
 
 const tempRoot = await mkdtemp(join(tmpdir(), 'camelid-evidence-claims-'))
@@ -12,6 +12,11 @@ const staleMixtralRoot = join(tempRoot, 'stale-mixtral')
 const privatePathRoot = join(tempRoot, 'private-path')
 const privateWindowsCachePath = ['file:///C:', 'Users', 'tim', 'AppData', 'Local', 'camelid', 'model.gguf'].join('/')
 const escapeRegExp = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+const canonicalSlashes = value => value.replace(/\\/g, '/')
+const publicRelative = path => canonicalSlashes(relative(process.cwd(), path))
+
+assert.equal(canonicalSlashes('..\\fixtures\\bundle'), '../fixtures/bundle')
+assert.equal(publicRelative(join(goodRoot, 'bundle')).includes('\\'), false)
 
 await writeBundle(goodRoot, { mutate: false })
 await writeSingleRowContextBundle(goodRoot, { mutate: false })
@@ -147,7 +152,7 @@ async function writeMixtralPromotionAndBlockerEvidence(root, { reconciled, omitD
     schema: 'camelid.mixtral_exact_row_promotion_sync.v1',
     support_label: 'supported_exact_row_smoke',
     scope: 'validated exact row only; checked short-prompt envelope only',
-    required_prior_gates: promotionDependencies.map((name) => relative(process.cwd(), join(root, name))),
+    required_prior_gates: [...promotionDependencies],
   }
   const gate9Summary = {
     schema: 'camelid.mixtral_gate9a_long_output.v1',
@@ -161,7 +166,7 @@ async function writeMixtralPromotionAndBlockerEvidence(root, { reconciled, omitD
   await writeFile(join(syncDir, 'summary.json'), `${JSON.stringify(promotionSync, null, 2)}\n`)
   await writeFile(join(gate9Dir, 'summary.json'), `${JSON.stringify(gate9Summary, null, 2)}\n`)
   for (const dir of [backendDir, apiDir, webuiDir, rssDir]) {
-    await writeFile(join(dir, 'summary.json'), `${JSON.stringify({ bundle: dir.split('/').pop(), all_passed: true }, null, 2)}\n`)
+    await writeFile(join(dir, 'summary.json'), `${JSON.stringify({ bundle: basename(dir), all_passed: true }, null, 2)}\n`)
   }
   if (!reconciled) return
   await mkdir(reconcileDir, { recursive: true })
@@ -173,8 +178,8 @@ async function writeMixtralPromotionAndBlockerEvidence(root, { reconciled, omitD
     current_status: 'active_validation_partial_runtime',
     support_label: 'unsupported_bounded_one_token_runtime_only',
     support_boundary: 'Mixtral remains unsupported/blocked beyond bounded one-token runtime evidence; no broad Mixtral support is claimed.',
-    supersedes: supersededBundles.map((name) => relative(process.cwd(), join(root, name))),
-    blocker_evidence: [relative(process.cwd(), join(root, 'mixtral-8x7b-v0.1-q8-gate9a-50tok-test'))],
+    supersedes: supersededBundles.map((name) => publicRelative(join(root, name))),
+    blocker_evidence: [publicRelative(join(root, 'mixtral-8x7b-v0.1-q8-gate9a-50tok-test'))],
   }
   await writeFile(join(reconcileDir, 'manifest.json'), `${JSON.stringify(reconciliation, null, 2)}\n`)
 }
