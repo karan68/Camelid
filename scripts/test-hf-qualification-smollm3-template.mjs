@@ -6,6 +6,7 @@ import { existsSync } from 'node:fs'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
+import { canonicalGitTextBytes } from './lib/canonical-git-text.mjs'
 import {
   DATE_PLACEHOLDER,
   DEFAULT_THINKING_INSTRUCTION,
@@ -147,11 +148,11 @@ if (process.env.UPDATE_SMOLLM3_TEMPLATE_PACK === '1') {
 const pack = JSON.parse(await readFile(packPath, 'utf8'))
 assert.deepEqual(validateShapePack(pack), [])
 assert.equal(
-  sha256(await readFile(resolve(root, pack.grounding.header_receipt))),
+  sha256(canonicalGitTextBytes(await readFile(resolve(root, pack.grounding.header_receipt)))),
   pack.grounding.header_receipt_sha256,
 )
 assert.equal(
-  sha256(await readFile(resolve(root, pack.grounding.tokenizer_receipt))),
+  sha256(canonicalGitTextBytes(await readFile(resolve(root, pack.grounding.tokenizer_receipt)))),
   pack.grounding.tokenizer_receipt_sha256,
 )
 assert.equal(Buffer.byteLength(pack.source_template.text), TEMPLATE_UTF8_BYTES)

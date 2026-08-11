@@ -6,6 +6,7 @@ import { existsSync } from 'node:fs'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
+import { canonicalGitTextBytes } from './lib/canonical-git-text.mjs'
 import {
   COMMITTED_GROUNDING_INSPECTOR,
   COMPLETED_DIFF_SECTIONS,
@@ -63,7 +64,7 @@ for (const [pathField, hashField] of [
   ['template_fixture', 'template_fixture_sha256'],
 ]) {
   assert.equal(
-    sha256(await readFile(resolve(root, pack.grounding[pathField]))),
+    sha256(canonicalGitTextBytes(await readFile(resolve(root, pack.grounding[pathField])))),
     pack.grounding[hashField],
   )
 }

@@ -6,6 +6,7 @@ import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { SUPPORTED_MODELS } from '../frontend/src/lib/supportedModels.js'
 import { summarizeRoster, validateRoster } from './check-model-qualification-roster.mjs'
+import { canonicalGitTextBytes } from './lib/canonical-git-text.mjs'
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const path = join(root, 'qa', 'model-qualification', 'phase1-roster.json')
@@ -24,25 +25,25 @@ const smolRuntimeFixturePath = join(
   'smollm3-default-thinking-runtime-envelope-v1.json',
 )
 const smolRuntimeFixture = JSON.parse(await readFile(smolRuntimeFixturePath, 'utf8'))
-const smolPreparationPackBytes = await readFile(join(
+const smolPreparationPackBytes = canonicalGitTextBytes(await readFile(join(
   root,
   'qa',
   'prompt-packs',
   'smollm3-chat-template-shapes-v1.json',
-))
-const smolHeaderReceiptBytes = await readFile(join(
+)))
+const smolHeaderReceiptBytes = canonicalGitTextBytes(await readFile(join(
   root,
   'qa',
   'model-qualification',
   'smollm3-3b-q8-header-inspection.json',
-))
-const smolTokenizerReceiptBytes = await readFile(join(
+)))
+const smolTokenizerReceiptBytes = canonicalGitTextBytes(await readFile(join(
   root,
   'qa',
   'model-qualification',
   'smollm3-3b-q8-header-tokenizer-parity.json',
-))
-const apiSourceBytes = await readFile(join(root, 'src', 'api', 'mod.rs'))
+)))
+const apiSourceBytes = canonicalGitTextBytes(await readFile(join(root, 'src', 'api', 'mod.rs')))
 const apiSourceText = apiSourceBytes.toString('utf8')
 const exactKeys = (value, keys, label) => assert.deepEqual(
   Object.keys(value).sort(),

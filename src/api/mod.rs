@@ -31212,6 +31212,8 @@ impl CatalogItemView {
     }
 }
 
+// The curated row is intentionally expressed as one flat, auditable identity tuple.
+#[allow(clippy::too_many_arguments)]
 fn phase2_catalog_item(
     catalog_id: &'static str,
     name: &'static str,

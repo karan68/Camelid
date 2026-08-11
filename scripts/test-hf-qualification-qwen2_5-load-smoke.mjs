@@ -4,6 +4,7 @@ import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
 import { resolve } from 'node:path'
+import { canonicalGitTextBytes } from './lib/canonical-git-text.mjs'
 
 import {
   BINARY_PROFILE,
@@ -94,7 +95,7 @@ assert.equal(LIMITS.low_memory_abort_bytes, 1024 ** 3)
 assert.equal(LIMITS.child_working_set_abort_bytes, 2 * 1024 ** 3)
 assert.equal(LIMITS.consecutive_abort_samples, 2)
 assert.equal(
-  fileSha256(durableReceiptBytes),
+  fileSha256(canonicalGitTextBytes(durableReceiptBytes)),
   'f74bde1366aabce927ab808a9a8d229e0221cbdb20cd6a9eedd78d3319fa3870',
 )
 assert.equal(
