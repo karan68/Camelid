@@ -15,7 +15,7 @@ import { formatBytes } from '../lib/formatters'
 import { bucketByLane } from '../lib/modelLanes'
 import { loadLocalModelForChat, modelFilenameFromPath, unloadLocalModel } from '../lib/modelActivation'
 import { modelDeleteBlockedReason } from '../lib/modelDeletion'
-import { IconModels, IconRefresh } from '../components/ui/icons'
+import { IconClose, IconModels, IconRefresh, IconSearch } from '../components/ui/icons'
 
 /* The Models page: one scroll, five zones.
      1. Active model bar — what is loaded now, with Unload.
@@ -68,6 +68,10 @@ export default function ModelsView({
   const [defaultingFilename, setDefaultingFilename] = useState('')
   const [deleteNotice, setDeleteNotice] = useState('')
   const [catalogOperations, setCatalogOperations] = useState(new Set())
+  const [modelQuery, setModelQuery] = useState('')
+  /* How many curated catalog rows the current term matches, reported up by
+     CatalogLaneBrowse so the result line can say whether scrolling is worth it. */
+  const [catalogMatchCount, setCatalogMatchCount] = useState(null)
   const loadInFlightRef = useRef('')
 
   const laneBuckets = useMemo(
@@ -82,13 +86,32 @@ export default function ModelsView({
     () => new Set((spine.local?.models || []).filter((model) => model.ghost_moe_prepared).map((model) => model.filename)),
     [spine.local],
   )
-  const experimentalRows = laneBuckets
-    ? [
-        ...laneBuckets.compatible.map((entry) => ({ ...entry, _familyLane: 'compatible' })),
-        ...laneBuckets.eligible.map((entry) => ({ ...entry, _familyLane: 'eligible' })),
-        ...laneBuckets.not_anchored.map((entry) => ({ ...entry, _familyLane: 'not_anchored' })),
-      ]
-    : []
+  /* Name filter for the models already on this machine. It searches the display
+     name AND the filename, because a GGUF's file name is often the only place
+     the quantization appears — someone looking for "q4" means the file, not the
+     model family. The catalog below keeps its own search: that one reaches the
+     network to find models you do NOT have, which is a different question. */
+  const matchesModelQuery = (model) => {
+    const needle = modelQuery.trim().toLowerCase()
+    if (!needle) return true
+    return `${model?.name || ''} ${model?.filename || ''}`.toLowerCase().includes(needle)
+  }
+  const supportedRows = (laneBuckets ? laneBuckets.supported : []).filter(matchesModelQuery)
+  /* Keep the experimental sub-lanes separate after filtering. Their row types
+     expose different actions, so flattening only for the count and then mapping
+     the raw buckets would make the badge say "1" while unrelated rows remained
+     visible. Broad family terms such as "qwen" must render every Qwen2/Qwen3/4B
+     match and nothing outside that family. */
+  const compatibleRows = (laneBuckets ? laneBuckets.compatible : []).filter(matchesModelQuery)
+  const eligibleRows = (laneBuckets ? laneBuckets.eligible : []).filter(matchesModelQuery)
+  const notAnchoredRows = (laneBuckets ? laneBuckets.not_anchored : []).filter(matchesModelQuery)
+  const experimentalRows = [
+    ...compatibleRows.map((entry) => ({ ...entry, _familyLane: 'compatible' })),
+    ...eligibleRows.map((entry) => ({ ...entry, _familyLane: 'eligible' })),
+    ...notAnchoredRows.map((entry) => ({ ...entry, _familyLane: 'not_anchored' })),
+  ]
+  const filteringModels = Boolean(modelQuery.trim())
+  const localMatchCount = supportedRows.length + experimentalRows.length
   const deleteBlockedReason = modelDeleteBlockedReason({
     activeFilename: spine.activeFilename,
     residentModelsLoaded: spine.loadedModelIds.size > 0,
@@ -361,7 +384,27 @@ export default function ModelsView({
             Load, download, and manage the models on this machine.
           </p>
         </div>
-        <div className="cxv-head__actions">
+        <div className="cxv-head__actions models-head-actions">
+          <label className="cxv-search models-head-search">
+            <IconSearch size={17} />
+            <input
+              value={modelQuery}
+              onChange={(event) => setModelQuery(event.target.value)}
+              placeholder="Search models by name"
+              aria-label="Search models on this machine by name"
+              type="search"
+            />
+            {modelQuery && (
+              <button
+                type="button"
+                className="cxv-search__clear"
+                aria-label="Clear model search"
+                onClick={() => setModelQuery('')}
+              >
+                <IconClose size={14} />
+              </button>
+            )}
+          </label>
           <Button
             variant="outline"
             size="sm"
@@ -373,6 +416,38 @@ export default function ModelsView({
           </Button>
         </div>
       </header>
+
+      {/* One result line for the whole page rather than a changed empty state in
+          each section: the filter spans Supported and Experimental, so saying it
+          once is clearer than saying it twice. A search that matches nothing
+          locally is the moment someone is most likely looking for a model they
+          do not have yet, so it hands the term to the catalog instead of just
+          reporting failure. */}
+      {filteringModels && (
+        <div className="models-filter-summary" role="status">
+          <span>
+            {localMatchCount > 0
+              ? <>{localMatchCount} on this machine {localMatchCount === 1 ? 'matches' : 'match'} <strong>{modelQuery.trim()}</strong></>
+              : <>Nothing installed matches <strong>{modelQuery.trim()}</strong></>}
+            {catalogMatchCount !== null && catalogMatchCount > 0 && (
+              <> · {catalogMatchCount} to download in Get models</>
+            )}
+          </span>
+          <div className="models-filter-summary__actions">
+            {catalogMatchCount !== null && catalogMatchCount > 0 && (
+              <Button
+                variant="tonal"
+                size="sm"
+                icon={<IconSearch size={15} />}
+                onClick={() => document.querySelector('.catalog-lane-browse')?.scrollIntoView({ behavior: 'smooth', block: 'start' })}
+              >
+                Jump to Get models
+              </Button>
+            )}
+            <Button variant="ghost" size="sm" onClick={() => setModelQuery('')}>Clear</Button>
+          </div>
+        </div>
+      )}
 
       {/* Zone 1 — active model bar */}
       <ActiveModelBar
@@ -399,16 +474,16 @@ export default function ModelsView({
       {/* Zone 2 — supported local models (derived membership only) */}
       <Section
         title="Supported"
-        count={laneBuckets ? laneBuckets.supported.length : undefined}
+        count={laneBuckets ? supportedRows.length : undefined}
         subtitle="Verified to run correctly here."
       >
         {!laneBuckets ? (
           <p className="lane-empty">
             {spine.localLoading ? 'Scanning local models…' : runtimeOnline ? 'Local model scan unavailable.' : 'Runtime offline — the local scan resumes when the backend is back.'}
           </p>
-        ) : laneBuckets.supported.length ? (
+        ) : supportedRows.length ? (
           <ModelFamilyGroups
-            items={laneBuckets.supported}
+            items={supportedRows}
             initiallyOpen={(group) => group.items.some((model) => model.filename === spine.activeFilename)}
             renderItem={(m) => (
               <SupportedRow
@@ -429,7 +504,7 @@ export default function ModelsView({
             )}
           />
         ) : (
-          <p className="lane-empty">No verified models on this machine yet — download one below in “Get models”.</p>
+          <p className="lane-empty">{filteringModels ? 'No verified model matches this search.' : 'No verified models on this machine yet — download one below in “Get models”.'}</p>
         )}
       </Section>
 
@@ -494,7 +569,7 @@ export default function ModelsView({
             )}
           />
         ) : (
-          <p className="lane-empty">Nothing experimental on this machine — every downloaded model is verified.</p>
+          <p className="lane-empty">{filteringModels ? 'No experimental model matches this search.' : 'Nothing experimental on this machine — every downloaded model is verified.'}</p>
         )}
       </Section>
 
@@ -507,6 +582,8 @@ export default function ModelsView({
 
       {/* Zone 5 — get models: curated picks + live Hugging Face search */}
       <CatalogLaneBrowse
+        externalQuery={modelQuery}
+        onCuratedMatchCount={setCatalogMatchCount}
         apiBase={catalogApiBase || apiBase}
         capabilities={capabilities}
         localFilenames={spine.localFilenames}
