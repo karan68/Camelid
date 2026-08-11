@@ -363,9 +363,11 @@ assert.match(modelsViewSource, /\.\.\.eligibleRows\.map\(\(entry\) => \(\{ \.\.\
 assert.match(modelsViewSource, /\.\.\.notAnchoredRows\.map\(\(entry\) => \(\{ \.\.\.entry, _familyLane: 'not_anchored' \}\)\)/, 'the grouped Experimental section must derive Not anchored rows from the filtered list')
 assert.match(modelsViewSource, /items=\{supportedRows\}/, 'the Supported family groups must render the filtered list')
 assert.match(modelsViewSource, /items=\{experimentalRows\}/, 'the Experimental family groups must render the filtered tagged list')
+assert.match(modelsViewSource, /filtering:\s*filteringModels[\s\S]*activeFilename:\s*spine\.activeFilename[\s\S]*loadedModelIds:\s*spine\.loadedModelIds/, 'local family disclosures must open for search, the active model, and resident sidecars')
+assert.equal((modelsViewSource.match(/initiallyOpen=\{localFamilyInitiallyOpen\}/g) || []).length, 2, 'both local lanes must use the shared disclosure-open policy')
 // A GGUF's filename is often the only place the quantization appears, so a
 // search for "q4" has to reach it.
-assert.match(modelsViewSource, /model\?\.name \|\| ''\} \$\{model\?\.filename \|\| ''/, 'the model search must match filename as well as display name')
+assert.match(modelsViewSource, /modelSearchText\(model\)\.includes\(needle\)/, 'the model search must match filename, display name, architecture, and visible family')
 // One search drives the whole page. Scoping it to installed models only meant
 // searching "qwen" on a machine without one reported failure while seven
 // downloadable Qwen builds sat further down the same page.
@@ -374,6 +376,8 @@ assert.match(catalogLaneBrowseSource, /setQuery\(String\(externalQuery \|\| ''\)
 // Two search boxes on one page is the thing this replaced, so the catalog's own
 // input must not render while the page is driving it.
 assert.match(catalogLaneBrowseSource, /\{!pageControlled && \(/, "the catalog's own search box must be hidden when the page drives the query")
+assert.match(catalogLaneBrowseSource, /initiallyOpen=\{\(\) => openFamilies\}/, 'catalog family disclosures must accept an explicit open-on-search policy')
+assert.equal((catalogLaneBrowseSource.match(/openFamilies=\{searching\}/g) || []).length, 3, 'curated, runnable live, and nested unsupported search families must not remain hidden in closed disclosures')
 // The result line has to say whether scrolling down is worth it.
 assert.match(modelsViewSource, /to download in Get models/, 'the result line must report how many catalog rows match')
 // Empty states must not keep claiming the machine has nothing while a filter is

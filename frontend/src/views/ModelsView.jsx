@@ -13,6 +13,7 @@ import { Notice } from '../components/ui/Notice'
 import { useModelsPageData } from '../hooks/useModelsPageData'
 import { formatBytes } from '../lib/formatters'
 import { bucketByLane } from '../lib/modelLanes'
+import { modelSearchText, shouldOpenModelFamily } from '../lib/modelFamilies'
 import { loadLocalModelForChat, modelFilenameFromPath, unloadLocalModel } from '../lib/modelActivation'
 import { modelDeleteBlockedReason } from '../lib/modelDeletion'
 import { IconClose, IconModels, IconRefresh, IconSearch } from '../components/ui/icons'
@@ -86,15 +87,13 @@ export default function ModelsView({
     () => new Set((spine.local?.models || []).filter((model) => model.ghost_moe_prepared).map((model) => model.filename)),
     [spine.local],
   )
-  /* Name filter for the models already on this machine. It searches the display
-     name AND the filename, because a GGUF's file name is often the only place
-     the quantization appears — someone looking for "q4" means the file, not the
-     model family. The catalog below keeps its own search: that one reaches the
-     network to find models you do NOT have, which is a different question. */
+  /* Search the same identity the row exposes: display name, filename,
+     architecture, and derived family label. The latter two matter for renamed
+     local files whose scan rows do not carry a display name. */
   const matchesModelQuery = (model) => {
     const needle = modelQuery.trim().toLowerCase()
     if (!needle) return true
-    return `${model?.name || ''} ${model?.filename || ''}`.toLowerCase().includes(needle)
+    return modelSearchText(model).includes(needle)
   }
   const supportedRows = (laneBuckets ? laneBuckets.supported : []).filter(matchesModelQuery)
   /* Keep the experimental sub-lanes separate after filtering. Their row types
@@ -112,6 +111,11 @@ export default function ModelsView({
   ]
   const filteringModels = Boolean(modelQuery.trim())
   const localMatchCount = supportedRows.length + experimentalRows.length
+  const localFamilyInitiallyOpen = (group) => shouldOpenModelFamily(group, {
+    filtering: filteringModels,
+    activeFilename: spine.activeFilename,
+    loadedModelIds: spine.loadedModelIds,
+  })
   const deleteBlockedReason = modelDeleteBlockedReason({
     activeFilename: spine.activeFilename,
     residentModelsLoaded: spine.loadedModelIds.size > 0,
@@ -484,7 +488,7 @@ export default function ModelsView({
         ) : supportedRows.length ? (
           <ModelFamilyGroups
             items={supportedRows}
-            initiallyOpen={(group) => group.items.some((model) => model.filename === spine.activeFilename)}
+            initiallyOpen={localFamilyInitiallyOpen}
             renderItem={(m) => (
               <SupportedRow
                 key={m.filename}
@@ -522,7 +526,7 @@ export default function ModelsView({
         ) : experimentalRows.length ? (
           <ModelFamilyGroups
             items={experimentalRows}
-            initiallyOpen={(group) => group.items.some((model) => model.filename === spine.activeFilename)}
+            initiallyOpen={localFamilyInitiallyOpen}
             renderItem={(m) => m._familyLane === 'compatible' ? (
               <CompatibleRow
                 key={m.filename}

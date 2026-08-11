@@ -85,3 +85,25 @@ export function groupByModelFamily(items = []) {
   }
   return groups
 }
+
+/* Keep the text users can see in a family disclosure searchable even when a
+   local file has been renamed. Local scan rows usually have no display `name`,
+   but their architecture can still place them under a visible family label. */
+export function modelSearchText(item = {}) {
+  return `${searchableIdentity(item)} ${item.architecture || ''} ${modelFamily(item)}`
+    .trim()
+    .toLowerCase()
+}
+
+/* Search results must not be hidden behind a closed disclosure. Outside search,
+   open the family containing any resident model, including an embedding
+   sidecar that is loaded without being the active chat model. */
+export function shouldOpenModelFamily(
+  group,
+  { filtering = false, activeFilename = '', loadedModelIds = new Set() } = {},
+) {
+  if (filtering) return true
+  return (group?.items || []).some(
+    (model) => model.filename === activeFilename || loadedModelIds.has(model.filename),
+  )
+}

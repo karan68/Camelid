@@ -762,12 +762,13 @@ function CatalogGroup({ title, marker, count, emptyText, children }) {
   )
 }
 
-function CatalogFamilyGroups({ items, renderItem }) {
+function CatalogFamilyGroups({ items, renderItem, openFamilies = false }) {
   return (
     <ModelFamilyGroups
       items={items}
       renderItem={renderItem}
       className="model-family-group--catalog"
+      initiallyOpen={() => openFamilies}
     />
   )
 }
@@ -1067,7 +1068,11 @@ export function CatalogLaneBrowse({
           count={curated.length}
           emptyText="No curated entries match."
         >
-          <CatalogFamilyGroups items={curated} renderItem={(item) => renderRow(item)} />
+          <CatalogFamilyGroups
+            items={curated}
+            renderItem={(item) => renderRow(item)}
+            openFamilies={searching}
+          />
         </CatalogGroup>
       ) : (
         <>
@@ -1123,7 +1128,11 @@ export function CatalogLaneBrowse({
             }
           >
             {loading ? <SearchSkeleton /> : (
-              <CatalogFamilyGroups items={loadable} renderItem={renderHfCard} />
+              <CatalogFamilyGroups
+                items={loadable}
+                renderItem={renderHfCard}
+                openFamilies={searching}
+              />
             )}
           </CatalogGroup>
           {!loading && unimplemented.length ? (
@@ -1134,7 +1143,11 @@ export function CatalogLaneBrowse({
               </summary>
               <p className="catalog-row-faint">{HF_GUESS_EXPLANATION}</p>
               <div className="catalog-list">
-                <CatalogFamilyGroups items={unimplemented} renderItem={renderHfCard} />
+                <CatalogFamilyGroups
+                  items={unimplemented}
+                  renderItem={renderHfCard}
+                  openFamilies={searching}
+                />
               </div>
             </details>
           ) : null}
