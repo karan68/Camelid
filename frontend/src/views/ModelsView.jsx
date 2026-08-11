@@ -85,10 +85,6 @@ export default function ModelsView({
     () => new Set((spine.local?.models || []).filter((model) => model.ghost_moe_prepared).map((model) => model.filename)),
     [spine.local],
   )
-  const allExperimentalRows = laneBuckets
-    ? [...laneBuckets.compatible, ...laneBuckets.eligible, ...laneBuckets.not_anchored]
-    : []
-
   /* Name filter for the models already on this machine. It searches the display
      name AND the filename, because a GGUF's file name is often the only place
      the quantization appears — someone looking for "q4" means the file, not the
@@ -100,7 +96,15 @@ export default function ModelsView({
     return `${model?.name || ''} ${model?.filename || ''}`.toLowerCase().includes(needle)
   }
   const supportedRows = (laneBuckets ? laneBuckets.supported : []).filter(matchesModelQuery)
-  const experimentalRows = allExperimentalRows.filter(matchesModelQuery)
+  /* Keep the experimental sub-lanes separate after filtering. Their row types
+     expose different actions, so flattening only for the count and then mapping
+     the raw buckets would make the badge say "1" while unrelated rows remained
+     visible. Broad family terms such as "qwen" must render every Qwen2/Qwen3/4B
+     match and nothing outside that family. */
+  const compatibleRows = (laneBuckets ? laneBuckets.compatible : []).filter(matchesModelQuery)
+  const eligibleRows = (laneBuckets ? laneBuckets.eligible : []).filter(matchesModelQuery)
+  const notAnchoredRows = (laneBuckets ? laneBuckets.not_anchored : []).filter(matchesModelQuery)
+  const experimentalRows = [...compatibleRows, ...eligibleRows, ...notAnchoredRows]
   const filteringModels = Boolean(modelQuery.trim())
   const localMatchCount = supportedRows.length + experimentalRows.length
   const deleteBlockedReason = modelDeleteBlockedReason({
@@ -479,7 +483,7 @@ export default function ModelsView({
           </p>
         ) : experimentalRows.length ? (
           <>
-            {laneBuckets.compatible.map((m) => (
+            {compatibleRows.map((m) => (
               <CompatibleRow
                 key={m.filename}
                 entry={m}
@@ -494,7 +498,7 @@ export default function ModelsView({
                 onMakeDefault={makeDefaultModel}
               />
             ))}
-            {laneBuckets.eligible.map((m) => (
+            {eligibleRows.map((m) => (
               <EligibleRow
                 key={m.filename}
                 entry={m}
@@ -505,7 +509,7 @@ export default function ModelsView({
                 onDelete={requestDeleteModel}
               />
             ))}
-            {laneBuckets.not_anchored.map((m) => (
+            {notAnchoredRows.map((m) => (
               <NotAnchoredRow
                 key={m.filename}
                 entry={m}

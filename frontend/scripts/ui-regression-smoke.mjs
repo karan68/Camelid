@@ -346,7 +346,12 @@ assert.doesNotMatch(modelsViewSource, /SUPPORTED_MODELS/, 'Models view must not 
 // the filtered lists rather than the raw buckets — otherwise a section keeps
 // showing rows the search excluded.
 assert.match(modelsViewSource, /supportedRows\s*=\s*\(laneBuckets \? laneBuckets\.supported : \[\]\)\.filter\(matchesModelQuery\)/, 'the Supported section must render the filtered rows')
-assert.match(modelsViewSource, /experimentalRows\s*=\s*allExperimentalRows\.filter\(matchesModelQuery\)/, 'the Experimental section must render the filtered rows')
+assert.match(modelsViewSource, /compatibleRows\s*=\s*\(laneBuckets \? laneBuckets\.compatible : \[\]\)\.filter\(matchesModelQuery\)/, 'the Compatible sub-lane must be filtered before rendering')
+assert.match(modelsViewSource, /eligibleRows\s*=\s*\(laneBuckets \? laneBuckets\.eligible : \[\]\)\.filter\(matchesModelQuery\)/, 'the Eligible sub-lane must be filtered before rendering')
+assert.match(modelsViewSource, /notAnchoredRows\s*=\s*\(laneBuckets \? laneBuckets\.not_anchored : \[\]\)\.filter\(matchesModelQuery\)/, 'the Not anchored sub-lane must be filtered before rendering')
+assert.match(modelsViewSource, /\{compatibleRows\.map\(\(m\) => \(/, 'the Experimental section must render filtered Compatible rows, not the raw bucket')
+assert.match(modelsViewSource, /\{eligibleRows\.map\(\(m\) => \(/, 'the Experimental section must render filtered Eligible rows, not the raw bucket')
+assert.match(modelsViewSource, /\{notAnchoredRows\.map\(\(m\) => \(/, 'the Experimental section must render filtered Not anchored rows, not the raw bucket')
 // A GGUF's filename is often the only place the quantization appears, so a
 // search for "q4" has to reach it.
 assert.match(modelsViewSource, /model\?\.name \|\| ''\} \$\{model\?\.filename \|\| ''/, 'the model search must match filename as well as display name')
