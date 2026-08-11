@@ -968,6 +968,8 @@ assert.equal(receipt.gate_decision.support_claim, false)
 assert.deepEqual(receipt.gate_decision.authorized_roster_scope, ['gates.load_smoke'])
 assert.equal(receipt.steps[6].name, 'raw_first_forward')
 assert.equal(receipt.steps[6].evidence.timings.weight_cache_hit, false)
+assert.equal(receipt.steps[6].evidence.timings.forward_total, 1,
+  'raw receipt must copy the API aggregate rather than add its component phases again')
 assert.equal(receipt.steps[6].evidence.memory_phases[0].peak_rss_kib, null)
 assert.equal(receipt.steps[6].evidence.logits.greedy_top.rank, 1)
 assert.equal(receipt.steps[6].evidence.logits.greedy_top.token_id,
@@ -975,6 +977,8 @@ assert.equal(receipt.steps[6].evidence.logits.greedy_top.token_id,
 assert.equal(receipt.steps[9].name, 'chat_followup')
 assert.equal(receipt.steps[9].evidence.timings.weight_cache_hit, true)
 assert.equal(receipt.steps[9].evidence.timings.weight_load, 3)
+assert.equal(receipt.steps[9].evidence.timings.forward_total, 1,
+  'chat receipt must copy the API aggregate rather than add its component phases again')
 assert.equal(receipt.provenance.source_describe, sourceDescribe)
 assert.equal(receipt.provenance.binary.version, binaryVersion)
 assert.equal(JSON.stringify(receipt).includes('C:\\qualification'), false)

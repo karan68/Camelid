@@ -1391,9 +1391,7 @@ function normalizeGeneration(body, { chat }) {
     && timings.weight_cache_hit === chat
     && timings.prompt_cache_hit === false
     && timings.prompt_evaluation?.first_token_evaluated === true, code)
-  const forwardTotal = Number(timings.prompt_evaluation.prefill?.forward_total || 0)
-    + Number(timings.prompt_evaluation.first_token?.forward_total || 0)
-    + Number(timings.generation?.forward_total || 0)
+  const forwardTotal = Number(timings.generation?.forward_total || 0)
   expect(finiteNumber(forwardTotal) && forwardTotal > 0, code)
   if (!chat) expect(timings.weight_load > 0, code)
   const memoryPhases = collectMemoryPhases(timings, code)
