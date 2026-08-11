@@ -21,6 +21,7 @@ import {
   buildChildEnv,
   buildServeArgs,
   classifyQwen25LoadSmokeError,
+  describeChildEnvironment,
   httpJson,
   inspectExactArtifactIdentity,
   normalizeGeneration,
@@ -80,7 +81,7 @@ async function expectCode(promise, code) {
   })
 }
 
-assert.equal(RECEIPT_SCHEMA, 'camelid.model-qualification.load-smoke/v1')
+assert.equal(RECEIPT_SCHEMA, 'camelid.model-qualification.load-smoke/v2')
 assert.equal(ROW_ID, 'qwen2_5_0_5b_instruct_q8_0')
 assert.equal(BINARY_PROFILE, 'release-fat-lto')
 assert.equal(EXECUTION_PLAN_EXACT_MODEL_ROW, 'qwen2.5-0.5b-instruct')
@@ -100,7 +101,10 @@ assert.equal(
   durableReceipt.receipt_id,
   'af388a3ef19951dab0da657e59963ad2d725136518a4aac28a1e23451ffa864b',
 )
-assert.deepEqual(validateLoadSmokeReceipt(durableReceipt), [])
+assert.equal(durableReceipt.schema, 'camelid.model-qualification.load-smoke/v1')
+const durableReceiptErrors = validateLoadSmokeReceipt(durableReceipt)
+assert.ok(durableReceiptErrors.some((error) => error.includes('runtime_contract.environment')),
+  'the immutable pre-hardening receipt must be rejected for omitting inherited OS env evidence')
 assert.deepEqual(durableReceipt.row, EXACT_ROW)
 assert.equal(durableReceipt.provenance.runtime_head,
   '188631159b07f76ca3b081fd1b401090edfa1e21')
@@ -218,11 +222,12 @@ assert.deepEqual(receiptCommand(), [
   '--no-open', '--max-prompt-tokens', '1024', '--max-generation-tokens', '1',
 ])
 
-const childEnv = buildChildEnv({
+const childInherited = {
   Path: 'safe-path',
   SystemRoot: 'C:\\Windows',
   ComSpec: 'C:\\Windows\\System32\\cmd.exe',
   TEMP: 'C:\\Temp',
+  TMP: 42,
   CAMELID_GPU: 'cuda',
   CAMELID_PROFILE: 'experimental',
   camelid_secret: 'must-be-cleared',
@@ -231,17 +236,65 @@ const childEnv = buildChildEnv({
   AWS_ACCESS_KEY_ID: 'AKIA_PRIVATE',
   AWS_SECRET_ACCESS_KEY: 'aws-private-credential',
   NODE_OPTIONS: '--require=C:\\private\\inject.cjs',
-})
+}
+const childEnv = buildChildEnv(childInherited)
+assert.equal(Object.isFrozen(childEnv), true)
 assert.equal(childEnv.PATH, 'safe-path')
 assert.equal(childEnv.SYSTEMROOT, 'C:\\Windows')
 assert.equal(childEnv.COMSPEC, 'C:\\Windows\\System32\\cmd.exe')
 assert.equal(childEnv.TEMP, 'C:\\Temp')
+assert.equal(Object.hasOwn(childEnv, 'TMP'), false, 'non-string inherited values must be omitted')
 assert.equal(childEnv.CAMELID_GPU, undefined)
 assert.equal(childEnv.camelid_secret, undefined)
 for (const secret of [
   'HF_TOKEN', 'GH_TOKEN', 'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'NODE_OPTIONS',
 ]) assert.equal(Object.hasOwn(childEnv, secret), false, `${secret} must not reach the child`)
 for (const [key, value] of Object.entries(SAFE_CAMELID_ENV)) assert.equal(childEnv[key], value)
+assert.throws(() => { childEnv.PATH = 'mutated' }, TypeError)
+const childEnvironmentDescriptor = describeChildEnvironment(childEnv)
+const expectedInheritedAllowlisted = {
+  COMSPEC: childInherited.ComSpec,
+  PATH: childInherited.Path,
+  SYSTEMROOT: childInherited.SystemRoot,
+  TEMP: childInherited.TEMP,
+}
+const environmentCommitmentDomain = 'camelid.model-qualification.child-environment/v1'
+const expectedEnvironmentCommitment = createHash('sha256')
+  .update(`${environmentCommitmentDomain}\0${JSON.stringify(canonical(expectedInheritedAllowlisted))}`)
+  .digest('hex')
+assert.deepEqual(childEnvironmentDescriptor, {
+  model_overrides: Object.fromEntries(Object.entries(SAFE_CAMELID_ENV)
+    .sort(([left], [right]) => left.localeCompare(right))),
+  windows_allowlist: [
+    'COMSPEC', 'PATH', 'PATHEXT', 'SYSTEMDRIVE', 'SYSTEMROOT', 'TEMP', 'TMP', 'WINDIR',
+  ],
+  present_os_keys: ['COMSPEC', 'PATH', 'SYSTEMROOT', 'TEMP'],
+  inherited_values_redacted: true,
+  inherited_allowlisted_values_commitment: {
+    domain: environmentCommitmentDomain,
+    algorithm: 'sha256',
+    digest: expectedEnvironmentCommitment,
+  },
+  effective_keys: [...new Set([
+    'COMSPEC', 'PATH', 'SYSTEMROOT', 'TEMP', ...Object.keys(SAFE_CAMELID_ENV),
+  ])].sort(),
+})
+const serializedEnvironmentDescriptor = JSON.stringify(childEnvironmentDescriptor)
+for (const value of Object.values(expectedInheritedAllowlisted)) {
+  assert.equal(serializedEnvironmentDescriptor.includes(value), false,
+    'allowlisted inherited values must remain committed but redacted')
+}
+for (const value of [
+  childInherited.HF_TOKEN,
+  childInherited.GH_TOKEN,
+  childInherited.AWS_SECRET_ACCESS_KEY,
+  childInherited.NODE_OPTIONS,
+]) assert.equal(serializedEnvironmentDescriptor.includes(value), false)
+assert.throws(
+  () => buildChildEnv({ Path: 'first', PATH: 'second' }),
+  (error) => classifyQwen25LoadSmokeError(error).error_code === 'load_smoke_options_invalid',
+  'case-colliding allowlisted keys must fail closed',
+)
 
 let streamedReadIndex = 0
 const streamedChunks = [Buffer.from('{"ok":'), Buffer.from('true}')]
@@ -779,6 +832,7 @@ function makeHarness({
   let requestIndex = 0
   let now = 1_000
   let guardStopped = false
+  let spawnedEnv = null
   const preflightReceipt = {
     platform: 'windows-x86_64',
     artifact: {
@@ -807,7 +861,13 @@ function makeHarness({
     },
   }
   const deps = {
-    inheritedEnv: { PATH: 'safe', CAMELID_GPU: 'cuda' },
+    inheritedEnv: {
+      PATH: 'qwen-private-path-value',
+      SystemRoot: 'qwen-private-system-root-value',
+      CAMELID_GPU: 'cuda',
+      HF_TOKEN: 'qwen-private-hf-value',
+      AWS_SECRET_ACCESS_KEY: 'qwen-private-aws-value',
+    },
     preflightImpl: async () => {
       events.push('preflight')
       return preflightReceipt
@@ -820,8 +880,10 @@ function makeHarness({
       events.push('preload-hash')
       return { size_bytes: EXACT_ROW.source.size_bytes, sha256: EXACT_ROW.source.sha256 }
     },
-    startProcessImpl: async () => {
+    startProcessImpl: async ({ env }) => {
       events.push('child-start')
+      spawnedEnv = env
+      assert.equal(Object.isFrozen(env), true)
       return handle
     },
     createResourceGuardImpl: async () => ({
@@ -870,7 +932,14 @@ function makeHarness({
     nowMsImpl: () => { now += 7; return now },
     nowIsoImpl: () => '2026-08-11T00:00:00.000Z',
   }
-  return { deps, events, lock, handle, requestCount: () => requestIndex }
+  return {
+    deps,
+    events,
+    lock,
+    handle,
+    requestCount: () => requestIndex,
+    spawnedEnv: () => spawnedEnv,
+  }
 }
 
 const runOptions = { root, binary, artifact, cwd, modelsDir, binaryProfile: BINARY_PROFILE }
@@ -911,11 +980,37 @@ assert.equal(receipt.gate_decision.disposition, 'active_validation')
 assert.equal(receipt.gate_decision.existing_parity_gate, 'fail_unchanged')
 assert.equal(receipt.gate_decision.support_claim, false)
 assert.deepEqual(receipt.gate_decision.authorized_roster_scope, ['gates.load_smoke'])
+assert.deepEqual(receipt.runtime_contract.environment,
+  describeChildEnvironment(successHarness.spawnedEnv()),
+  'the receipt environment descriptor must bind the exact frozen spawn environment')
+const serializedReceipt = JSON.stringify(receipt)
+for (const privateValue of [
+  successHarness.deps.inheritedEnv.PATH,
+  successHarness.deps.inheritedEnv.SystemRoot,
+  successHarness.deps.inheritedEnv.HF_TOKEN,
+  successHarness.deps.inheritedEnv.AWS_SECRET_ACCESS_KEY,
+]) assert.equal(serializedReceipt.includes(privateValue), false)
 assert.deepEqual(successHarness.events.slice(0, 4), [
   'preflight', 'lock-acquire', 'preload-hash', 'child-start',
 ])
 assert.ok(successHarness.events.indexOf('child-terminate') < successHarness.events.indexOf('postflight'))
 assert.ok(successHarness.events.indexOf('postflight') < successHarness.events.indexOf('lock-release'))
+
+for (const [description, mutate] of [
+  ['model override', (value) => { value.model_overrides.CAMELID_PROFILE = 'experimental' }],
+  ['Windows allowlist', (value) => { value.windows_allowlist.pop() }],
+  ['present OS key order', (value) => { value.present_os_keys.reverse() }],
+  ['inherited commitment', (value) => {
+    value.inherited_allowlisted_values_commitment.digest = '0'
+  }],
+  ['effective key union', (value) => { value.effective_keys.pop() }],
+  ['unknown descriptor field', (value) => { value.unexpected = true }],
+]) {
+  const tampered = deepClone(receipt)
+  mutate(tampered.runtime_contract.environment)
+  assert.ok(validateLoadSmokeReceipt(reseal(tampered))
+    .some((error) => error.includes('environment')), description)
+}
 
 const receiptWithoutId = deepClone(receipt)
 delete receiptWithoutId.receipt_id

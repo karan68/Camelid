@@ -23,7 +23,7 @@ import { promisify } from 'node:util'
 
 const execFileAsync = promisify(execFile)
 
-const RECEIPT_SCHEMA = 'camelid.model-qualification.load-smoke/v1'
+const RECEIPT_SCHEMA = 'camelid.model-qualification.load-smoke/v2'
 const ROW_ID = 'smollm3_3b_q8_0'
 const BINARY_PROFILE = 'release-fat-lto'
 const EXECUTION_PLAN_EXACT_MODEL_ROW = 'SmolLM3-Q8_0.gguf'
@@ -76,6 +76,7 @@ const WINDOWS_CHILD_ENV_ALLOWLIST = Object.freeze([
   'TMP',
   'WINDIR',
 ])
+const CHILD_ENV_COMMITMENT_DOMAIN = 'camelid.model-qualification.child-environment/v1'
 
 const LIMITS = Object.freeze({
   startup_timeout_ms: 60_000,
@@ -297,15 +298,47 @@ function expect(condition, code) {
 
 function buildChildEnv(inherited = process.env) {
   const clean = {}
+  const seenAllowlistedKeys = new Set()
   for (const [key, value] of Object.entries(inherited)) {
     const canonicalKey = key.toUpperCase()
-    if (WINDOWS_CHILD_ENV_ALLOWLIST.includes(canonicalKey)
-      && value !== undefined
-      && !Object.hasOwn(clean, canonicalKey)) {
-      clean[canonicalKey] = value
-    }
+    if (!WINDOWS_CHILD_ENV_ALLOWLIST.includes(canonicalKey)) continue
+    expect(!seenAllowlistedKeys.has(canonicalKey), 'load_smoke_options_invalid')
+    seenAllowlistedKeys.add(canonicalKey)
+    if (typeof value === 'string') clean[canonicalKey] = value
   }
-  return { ...clean, ...SAFE_CAMELID_ENV }
+  return Object.freeze({ ...clean, ...SAFE_CAMELID_ENV })
+}
+
+function describeChildEnvironment(env) {
+  expect(Object.isFrozen(env), 'load_smoke_options_invalid')
+  expect(Object.values(env).every((value) => typeof value === 'string'),
+    'load_smoke_options_invalid')
+  const presentOsKeys = WINDOWS_CHILD_ENV_ALLOWLIST.filter((key) => Object.hasOwn(env, key))
+  const inheritedAllowlisted = Object.fromEntries(
+    presentOsKeys.map((key) => [key, env[key]]),
+  )
+  const modelOverrides = Object.fromEntries(
+    Object.entries(SAFE_CAMELID_ENV).sort(([left], [right]) => left.localeCompare(right)),
+  )
+  const effectiveKeys = [...new Set([...presentOsKeys, ...Object.keys(modelOverrides)])].sort()
+  expect(sameJson(Object.keys(env).sort(), effectiveKeys)
+    && sameJson(childCamelidEnv(env), modelOverrides),
+  'load_smoke_options_invalid')
+  return {
+    model_overrides: structuredClone(modelOverrides),
+    windows_allowlist: [...WINDOWS_CHILD_ENV_ALLOWLIST],
+    present_os_keys: presentOsKeys,
+    inherited_values_redacted: true,
+    inherited_allowlisted_values_commitment: {
+      domain: CHILD_ENV_COMMITMENT_DOMAIN,
+      algorithm: 'sha256',
+      digest: sha256(Buffer.from(
+        `${CHILD_ENV_COMMITMENT_DOMAIN}\0${canonicalJson(inheritedAllowlisted)}`,
+        'utf8',
+      )),
+    },
+    effective_keys: effectiveKeys,
+  }
 }
 
 function buildServeArgs(modelsDir) {
@@ -1566,6 +1599,7 @@ function requestContract() {
 function buildReceipt({
   preflight,
   postflightArtifact,
+  environmentContract,
   steps,
   resources,
   logMarkers,
@@ -1614,7 +1648,7 @@ function buildReceipt({
     runtime_contract: {
       command: receiptCommand(),
       cwd_redacted: true,
-      environment: structuredClone(SAFE_CAMELID_ENV),
+      environment: structuredClone(environmentContract),
       requests: requestContract(),
       limits: structuredClone(LIMITS),
       readiness_semantics: 'header_config_tokenizer_attemptability_not_forward_proof',
@@ -1902,6 +1936,32 @@ function validateLoadSmokeReceiptUnsafe(receipt) {
     'command', 'cwd_redacted', 'environment', 'requests', 'limits', 'readiness_semantics',
     'first_forward_proof', 'excluded_legacy_storage_labels',
   ], 'runtime_contract')
+  const environment = receipt?.runtime_contract?.environment
+  const environmentCommitment = environment?.inherited_allowlisted_values_commitment
+  close(environment, [
+    'model_overrides', 'windows_allowlist', 'present_os_keys', 'inherited_values_redacted',
+    'inherited_allowlisted_values_commitment', 'effective_keys',
+  ], 'runtime_contract.environment')
+  close(environmentCommitment, [
+    'domain', 'algorithm', 'digest',
+  ], 'runtime_contract.environment.inherited_allowlisted_values_commitment')
+  const presentOsKeys = Array.isArray(environment?.present_os_keys)
+    ? environment.present_os_keys
+    : []
+  const expectedEffectiveKeys = [
+    ...new Set([...presentOsKeys, ...Object.keys(SAFE_CAMELID_ENV)]),
+  ].sort()
+  check(sameJson(environment?.model_overrides, SAFE_CAMELID_ENV)
+    && sameJson(environment?.windows_allowlist, WINDOWS_CHILD_ENV_ALLOWLIST)
+    && Array.isArray(environment?.present_os_keys)
+    && sameJson(presentOsKeys, [...new Set(presentOsKeys)].sort())
+    && presentOsKeys.every((key) => WINDOWS_CHILD_ENV_ALLOWLIST.includes(key))
+    && environment?.inherited_values_redacted === true
+    && environmentCommitment?.domain === CHILD_ENV_COMMITMENT_DOMAIN
+    && environmentCommitment?.algorithm === 'sha256'
+    && /^[0-9a-f]{64}$/.test(environmentCommitment?.digest || '')
+    && sameJson(environment?.effective_keys, expectedEffectiveKeys),
+  'child environment contract must remain exact, committed, and value-redacted')
   close(receipt?.runtime_contract?.requests, [
     'load', 'raw_first_forward', 'chat_followup', 'camelid_receipt_requested',
   ], 'runtime_contract.requests')
@@ -1921,7 +1981,6 @@ function validateLoadSmokeReceiptUnsafe(receipt) {
   check(sameJson(receipt?.runtime_contract?.limits, LIMITS), 'runtime limits must remain exact')
   check(sameJson(receipt?.runtime_contract?.command, receiptCommand()), 'serve command must be exact and no-model')
   check(!receipt?.runtime_contract?.command?.includes('--model'), 'serve command must not contain --model')
-  check(sameJson(receipt?.runtime_contract?.environment, SAFE_CAMELID_ENV), 'Camelid environment allowlist must be exact')
   check(receipt?.runtime_contract?.requests?.camelid_receipt_requested === false,
     'camelid_receipt must remain disabled')
   check(sameJson(receipt?.runtime_contract?.requests?.raw_first_forward, RAW_REQUEST),
@@ -2270,7 +2329,7 @@ async function runSmolLM3LoadSmoke(rawOptions, deps = {}) {
   expect(rawOptions?.binary && rawOptions?.artifact && rawOptions?.cwd && rawOptions?.modelsDir,
     'load_smoke_options_invalid')
   expect(options.binaryProfile === BINARY_PROFILE, 'load_smoke_options_invalid')
-  const env = buildChildEnv(deps.inheritedEnv || process.env)
+  const env = buildChildEnv(deps.inheritedEnv ?? process.env)
   expect(sameJson(childCamelidEnv(env), Object.fromEntries(Object.entries(SAFE_CAMELID_ENV)
     .sort(([left], [right]) => left.localeCompare(right)))), 'load_smoke_options_invalid')
   const args = buildServeArgs(options.modelsDir)
@@ -2332,6 +2391,7 @@ async function runSmolLM3LoadSmoke(rawOptions, deps = {}) {
   let postflight
   let healthBuild
   let evidenceError = null
+  let environmentContract
 
   try {
     lockedPreloadArtifact = await whileArtifactLockHeld(() => (
@@ -2346,6 +2406,7 @@ async function runSmolLM3LoadSmoke(rawOptions, deps = {}) {
     try {
       let startedHandle
       try {
+        environmentContract = describeChildEnvironment(env)
         startedHandle = deps.startProcessImpl
           ? await deps.startProcessImpl({ binary: options.binary, args, cwd: options.cwd, env })
           : startCamelidProcess({ binary: options.binary, args, cwd: options.cwd, env }, deps)
@@ -2617,6 +2678,7 @@ async function runSmolLM3LoadSmoke(rawOptions, deps = {}) {
   const receipt = buildReceipt({
     preflight,
     postflightArtifact: receiptArtifact,
+    environmentContract,
     steps,
     resources,
     logMarkers,
@@ -2741,6 +2803,7 @@ export {
   canonicalJson,
   classifySmolLM3LoadSmokeError,
   createResourceGuard,
+  describeChildEnvironment,
   httpJson,
   inspectProvenance,
   inspectExactArtifactIdentity,

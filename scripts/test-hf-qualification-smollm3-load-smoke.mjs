@@ -29,6 +29,7 @@ import {
   canonicalJson,
   classifySmolLM3LoadSmokeError,
   createResourceGuard,
+  describeChildEnvironment,
   httpJson,
   inspectExactArtifactIdentity,
   inspectProvenance,
@@ -63,7 +64,7 @@ const fileSha256 = bytes => createHash('sha256').update(bytes).digest('hex')
 assert.equal(Buffer.byteLength(template, 'utf8'), 5_493)
 assert.equal(EXACT_ROW.source.size_bytes, 3_275_574_624)
 assert.equal(EXACT_ROW.source.sha256, '8aa8cc74656137174a1988d993b00828e65a86fd68773412b632a75aa1373248')
-assert.equal(RECEIPT_SCHEMA, 'camelid.model-qualification.load-smoke/v1')
+assert.equal(RECEIPT_SCHEMA, 'camelid.model-qualification.load-smoke/v2')
 assert.equal(SERVER_ADDR, '127.0.0.1:8297')
 assert.equal(
   fileSha256(durableReceiptBytes),
@@ -73,7 +74,10 @@ assert.equal(
   durableReceipt.receipt_id,
   '7d5a31a30609db49847790d69fd809612d579000f9fa7f4857f0b753dd4a5aa4',
 )
-assert.deepEqual(validateLoadSmokeReceipt(durableReceipt), [])
+assert.equal(durableReceipt.schema, 'camelid.model-qualification.load-smoke/v1')
+const durableReceiptErrors = validateLoadSmokeReceipt(durableReceipt)
+assert.ok(durableReceiptErrors.some((error) => error.includes('runtime_contract.environment')),
+  'the immutable pre-hardening receipt must be rejected for omitting inherited OS env evidence')
 assert.equal(durableReceipt.provenance.runtime_head, '0634334c0f912e5ab71710dc7542af7be3b97263')
 assert.equal(durableReceipt.provenance.source_describe, 'v0.6.1-49-g0634334c')
 assert.deepEqual(durableReceipt.provenance.binary, {
@@ -180,6 +184,7 @@ const inherited = {
   SystemRoot: 'C:\\Windows',
   ComSpec: 'C:\\Windows\\System32\\cmd.exe',
   TEMP: 'C:\\Temp',
+  TMP: 42,
   CAMELID_MODEL: 'C:\\private\\startup.gguf',
   camelid_gpu: 'on',
   CAMELID_RETAIN_Q8_BLOCKS: '1',
@@ -191,11 +196,13 @@ const inherited = {
   NODE_OPTIONS: '--require=C:\\private\\inject.cjs',
 }
 const childEnv = buildChildEnv(inherited)
+assert.equal(Object.isFrozen(childEnv), true)
 assert.equal(childEnv.PATH, inherited.Path)
 assert.equal(childEnv.PATHEXT, inherited.PATHEXT)
 assert.equal(childEnv.SYSTEMROOT, inherited.SystemRoot)
 assert.equal(childEnv.COMSPEC, inherited.ComSpec)
 assert.equal(childEnv.TEMP, inherited.TEMP)
+assert.equal(Object.hasOwn(childEnv, 'TMP'), false, 'non-string inherited values must be omitted')
 assert.deepEqual(
   Object.fromEntries(Object.entries(childEnv).filter(([key]) => key.toUpperCase().startsWith('CAMELID_'))),
   SAFE_CAMELID_ENV,
@@ -207,6 +214,52 @@ assert.equal(Object.hasOwn(childEnv, 'CAMELID_API_KEY'), false)
 for (const secret of [
   'HF_TOKEN', 'GH_TOKEN', 'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'NODE_OPTIONS',
 ]) assert.equal(Object.hasOwn(childEnv, secret), false, `${secret} must not reach the child`)
+assert.throws(() => { childEnv.PATH = 'mutated' }, TypeError)
+const childEnvironmentDescriptor = describeChildEnvironment(childEnv)
+const expectedInheritedAllowlisted = {
+  COMSPEC: inherited.ComSpec,
+  PATH: inherited.Path,
+  PATHEXT: inherited.PATHEXT,
+  SYSTEMROOT: inherited.SystemRoot,
+  TEMP: inherited.TEMP,
+}
+const environmentCommitmentDomain = 'camelid.model-qualification.child-environment/v1'
+const expectedEnvironmentCommitment = createHash('sha256')
+  .update(`${environmentCommitmentDomain}\0${canonicalJson(expectedInheritedAllowlisted)}`)
+  .digest('hex')
+assert.deepEqual(childEnvironmentDescriptor, {
+  model_overrides: Object.fromEntries(Object.entries(SAFE_CAMELID_ENV)
+    .sort(([left], [right]) => left.localeCompare(right))),
+  windows_allowlist: [
+    'COMSPEC', 'PATH', 'PATHEXT', 'SYSTEMDRIVE', 'SYSTEMROOT', 'TEMP', 'TMP', 'WINDIR',
+  ],
+  present_os_keys: ['COMSPEC', 'PATH', 'PATHEXT', 'SYSTEMROOT', 'TEMP'],
+  inherited_values_redacted: true,
+  inherited_allowlisted_values_commitment: {
+    domain: environmentCommitmentDomain,
+    algorithm: 'sha256',
+    digest: expectedEnvironmentCommitment,
+  },
+  effective_keys: [...new Set([
+    'COMSPEC', 'PATH', 'PATHEXT', 'SYSTEMROOT', 'TEMP', ...Object.keys(SAFE_CAMELID_ENV),
+  ])].sort(),
+})
+const serializedEnvironmentDescriptor = JSON.stringify(childEnvironmentDescriptor)
+for (const value of Object.values(expectedInheritedAllowlisted)) {
+  assert.equal(serializedEnvironmentDescriptor.includes(value), false,
+    'allowlisted inherited values must remain committed but redacted')
+}
+for (const value of [
+  inherited.HF_TOKEN,
+  inherited.GH_TOKEN,
+  inherited.AWS_SECRET_ACCESS_KEY,
+  inherited.NODE_OPTIONS,
+]) assert.equal(serializedEnvironmentDescriptor.includes(value), false)
+assert.throws(
+  () => buildChildEnv({ Path: 'first', PATH: 'second' }),
+  (error) => error.code === 'load_smoke_options_invalid',
+  'case-colliding allowlisted keys must fail closed',
+)
 
 let streamedReadIndex = 0
 const streamedChunks = [Buffer.from('{"ok":'), Buffer.from('true}')]
@@ -1040,6 +1093,7 @@ function makeHarness({
   }
   const fixturePreflight = preflight()
   let clock = 0
+  let spawnedEnv = null
   const deps = {
     inheritedEnv: inherited,
     preflightImpl: async () => clone(fixturePreflight),
@@ -1072,6 +1126,8 @@ function makeHarness({
     },
     startProcessImpl: async ({ args, cwd, env }) => {
       lifecycle.push('start')
+      spawnedEnv = env
+      assert.equal(Object.isFrozen(env), true)
       assert.equal(args.includes('--model'), false)
       assert.equal(cwd, resolve('C:\\qualification\\run'))
       assert.deepEqual(
@@ -1165,6 +1221,7 @@ function makeHarness({
     lifecycle,
     postflightCalls: () => postflightCalls,
     lockReleased: () => lockReleased,
+    spawnedEnv: () => spawnedEnv,
   }
 }
 
@@ -1189,6 +1246,9 @@ assert.equal(receipt.provenance.artifact.mutation_guard.mechanism, 'windows_file
 assert.equal(receipt.provenance.artifact.mutation_guard.artifact_path_in_helper_argv, false)
 assert.equal(receipt.gate_decision.support_claim, false)
 assert.deepEqual(receipt.gate_decision.authorized_roster_scope, ['gates.load_smoke'])
+assert.deepEqual(receipt.runtime_contract.environment,
+  describeChildEnvironment(success.spawnedEnv()),
+  'the receipt environment descriptor must bind the exact frozen spawn environment')
 assert.equal(receipt.steps[6].name, 'raw_first_forward')
 assert.equal(receipt.steps[6].evidence.timings.weight_cache_hit, false)
 assert.equal(receipt.steps[6].evidence.timings.forward_total, 1,
@@ -1205,6 +1265,15 @@ assert.equal(receipt.steps[9].evidence.timings.forward_total, 1,
 assert.equal(receipt.provenance.source_describe, sourceDescribe)
 assert.equal(receipt.provenance.binary.version, binaryVersion)
 assert.equal(JSON.stringify(receipt).includes('C:\\qualification'), false)
+for (const privateValue of [
+  inherited.Path,
+  inherited.SystemRoot,
+  inherited.ComSpec,
+  inherited.HF_TOKEN,
+  inherited.GH_TOKEN,
+  inherited.AWS_SECRET_ACCESS_KEY,
+  inherited.NODE_OPTIONS,
+]) assert.equal(JSON.stringify(receipt).includes(privateValue), false)
 assert.equal(JSON.stringify(receipt).includes('response-id-must-not-persist'), false)
 assert.equal(JSON.stringify(receipt).includes(template.slice(0, 256)), false)
 assert.equal(JSON.stringify(receipt).includes('camelid_receipt'), true, 'the receipt records the false request contract')
@@ -1230,6 +1299,24 @@ for (const [description, mutator, fragment] of [
   }, 'lazy-Q8'],
   ['hidden startup model', (value) => { value.runtime_contract.command.push('--model', '<redacted>') }, 'serve command'],
   ['receipt request', (value) => { value.runtime_contract.requests.raw_first_forward.camelid_receipt = true }, 'raw first-forward'],
+  ['environment model override', (value) => {
+    value.runtime_contract.environment.model_overrides.CAMELID_PROFILE = 'experimental'
+  }, 'child environment'],
+  ['environment Windows allowlist', (value) => {
+    value.runtime_contract.environment.windows_allowlist.pop()
+  }, 'child environment'],
+  ['environment present key order', (value) => {
+    value.runtime_contract.environment.present_os_keys.reverse()
+  }, 'child environment'],
+  ['environment commitment', (value) => {
+    value.runtime_contract.environment.inherited_allowlisted_values_commitment.digest = '0'
+  }, 'child environment'],
+  ['environment effective keys', (value) => {
+    value.runtime_contract.environment.effective_keys.pop()
+  }, 'child environment'],
+  ['environment unknown field', (value) => {
+    value.runtime_contract.environment.unexpected = true
+  }, 'runtime_contract.environment'],
   ['Q8 policy', (value) => { value.steps[4].evidence.q8_runtime.policy = 'legacy' }, 'forced-lazy'],
   ['baseline ok', (value) => { value.steps[0].evidence.ok = false }, 'baseline_health scalar'],
   ['baseline engine', (value) => { value.steps[0].evidence.engine = 'forged' }, 'baseline_health scalar'],

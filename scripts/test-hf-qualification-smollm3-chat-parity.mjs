@@ -35,6 +35,7 @@ import {
   buildLlamaServeArgs,
   buildWindowsChildEnv,
   classifySmolLM3ChatParityError,
+  describeChildEnvironment,
   httpJson,
   inspectExactArtifactIdentity,
   inspectGroundings,
@@ -96,6 +97,7 @@ assert.equal(RECEIPT_SCHEMA, 'camelid.model-qualification.chat-parity-preparatio
 assert.equal(ROW_ID, 'smollm3_3b_q8_0')
 assert.equal(BINARY_PROFILE, 'release-fat-lto')
 assert.equal(CAMELID_ADDR, '127.0.0.1:8297')
+assert.equal(CAMELID_RELEASE_VERSION, '0.6.1')
 assert.equal(LLAMA_ADDR, '127.0.0.1:8299')
 assert.deepEqual(EXACT_ROW.source, {
   repo: 'ggml-org/SmolLM3-3B-GGUF',
@@ -113,8 +115,6 @@ assert.equal(GROUNDING_FILES.shape_pack.sha256,
   'd46794448b7c2585d0aa83dfd7bb17d4904c2dcbc048ade1ef68cd3863166de6')
 assert.equal(GROUNDING_FILES.runtime_envelope.sha256,
   '2f776f5fd64f0836d3c26cd6bac3363c5276ff6294b9677c10672956387a5cb3')
-assert.equal(GROUNDING_FILES.load_receipt.sha256,
-  '4c156199ef4395188aa64210401bb3bfa40e8ef8acdb58c4e4908cc583257b17')
 assert.equal(LLAMA_PIN.executable_sha256,
   '6c787bf07ac1d7e1bbaa1ee176c3ef0df58ea86494c8c1b1d2d9f4a9176b19ae')
 assert.equal(LLAMA_PIN.server_impl_sha256,
@@ -154,6 +154,7 @@ assert.ok(LIMITS.preflight_physical_bytes
 assert.ok(LIMITS.llama_child_working_set_abort_bytes
   > LIMITS.camelid_child_working_set_abort_bytes)
 assert.ok(DOES_NOT_PROVE.some((claim) => claim.includes('1, 5, and 50')))
+assert.ok(DOES_NOT_PROVE.some((claim) => claim.includes('blocked load-smoke gate')))
 assert.ok(DOES_NOT_PROVE.some((claim) => claim.includes('support or promotion')))
 
 const camelidArgs = buildCamelidServeArgs(modelsDir)
@@ -203,6 +204,13 @@ assert.deepEqual(buildWindowsChildEnv(hostileInheritedEnv), {
   PATHEXT: '.EXE',
   SYSTEMROOT: 'C:\\Windows',
 })
+for (const inherited of [
+  { Path: 'first', PATH: 'second' },
+  { PATH: 7 },
+]) {
+  assert.throws(() => buildWindowsChildEnv(inherited),
+    (error) => error?.code === 'chat_parity_options_invalid')
+}
 const childEnv = buildChildEnv(hostileInheritedEnv)
 assert.equal(childEnv.PATH, 'kept')
 assert.equal(childEnv.CAMELID_SECRET, undefined)
@@ -212,6 +220,24 @@ assert.equal(llamaEnv.PATH, 'kept')
 assert.equal(llamaEnv.LLAMA_ARG, undefined)
 assert.equal(llamaEnv.CUDA_VISIBLE_DEVICES, '-1')
 assert.deepEqual(SAFE_LLAMA_ENV, { CUDA_VISIBLE_DEVICES: '-1' })
+const camelidEnvironmentContract = describeChildEnvironment(childEnv, SAFE_CAMELID_ENV)
+const llamaEnvironmentContract = describeChildEnvironment(llamaEnv, SAFE_LLAMA_ENV)
+for (const [contract, env, overrides] of [
+  [camelidEnvironmentContract, childEnv, SAFE_CAMELID_ENV],
+  [llamaEnvironmentContract, llamaEnv, SAFE_LLAMA_ENV],
+]) {
+  assert.equal(contract.schema, 'camelid.windows-child-environment/v1')
+  assert.deepEqual(contract.model_overrides, overrides)
+  assert.deepEqual(contract.inherited_os_allowlist, WINDOWS_CHILD_ENV_ALLOWLIST)
+  assert.deepEqual(contract.inherited_os_keys_present, ['PATH', 'PATHEXT', 'SYSTEMROOT'])
+  assert.equal(contract.inherited_os_values_redacted, true)
+  assert.match(contract.inherited_os_environment_sha256, /^[0-9a-f]{64}$/)
+  assert.deepEqual(contract.effective_keys, Object.keys(env).sort())
+  assert.equal(contract.unlisted_keys_present, false)
+  assert.doesNotMatch(JSON.stringify(contract), /kept|C:\\Windows/)
+}
+assert.equal(camelidEnvironmentContract.inherited_os_environment_sha256,
+  llamaEnvironmentContract.inherited_os_environment_sha256)
 for (const secret of ['HF_TOKEN', 'GH_TOKEN', 'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY']) {
   assert.equal(childEnv[secret], undefined)
   assert.equal(llamaEnv[secret], undefined)
@@ -663,8 +689,13 @@ assert.equal(receipt.comparison.exact_token_and_text_match, true)
 assert.equal(receipt.gate_decision.parity_preparation, 'pass')
 assert.equal(receipt.gate_decision.bounded_evidence_publishable, true)
 assert.equal(receipt.gate_decision.roster_parity_gate, 'blocked_unchanged')
+assert.equal(receipt.gate_decision.load_smoke_gate, 'blocked_unchanged')
 assert.deepEqual(receipt.gate_decision.authorized_roster_scope, [])
 assert.equal(receipt.gate_decision.support_claim, false)
+assert.deepEqual(receipt.runtime_contract.camelid.environment,
+  describeChildEnvironment(happySynthetic.starts[0].env, SAFE_CAMELID_ENV))
+assert.deepEqual(receipt.runtime_contract.llama_cpp.environment,
+  describeChildEnvironment(happySynthetic.starts[1].env, SAFE_LLAMA_ENV))
 for (const name of ['camelid_baseline_health', 'camelid_loaded_health',
   'camelid_final_health']) {
   const evidence = receipt.steps.find((step) => step.name === name).evidence
@@ -676,6 +707,7 @@ assert.deepEqual(receipt.isolation.lifecycle_events,
 assert.equal(receipt.isolation.max_concurrent_engine_children, 1)
 assert.deepEqual(happySynthetic.starts.map((entry) => entry.engine), ['camelid', 'llama_cpp'])
 for (const start of happySynthetic.starts) {
+  assert.equal(Object.isFrozen(start.env), true, `${start.engine} environment must be immutable`)
   for (const secret of ['HF_TOKEN', 'GH_TOKEN', 'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY']) {
     assert.equal(start.env[secret], undefined, `${start.engine} must not inherit ${secret}`)
   }
@@ -839,6 +871,18 @@ const tamperCases = [
     'keys must be exact'],
   ['unknown llama contract field', (value) => { value.runtime_contract.llama_cpp.extra = true },
     'keys must be exact'],
+  ['cross-engine inherited environment', (value) => {
+    value.runtime_contract.llama_cpp.environment.inherited_os_environment_sha256 = '0'.repeat(64)
+  }, 'same inherited OS environment'],
+  ['llama inherited environment key', (value) => {
+    value.runtime_contract.llama_cpp.environment.inherited_os_keys_present.push('WINDIR')
+  }, 'environment contract'],
+  ['unlisted environment key flag', (value) => {
+    value.runtime_contract.camelid.environment.unlisted_keys_present = true
+  }, 'environment contract'],
+  ['llama environment override', (value) => {
+    value.runtime_contract.llama_cpp.environment.model_overrides.CUDA_VISIBLE_DEVICES = '0'
+  }, 'environment contract'],
   ['llama request depth', (value) => { value.runtime_contract.llama_cpp.completion.n_predict = 1 },
     'runtime'],
   ['prompt byte count', (value) => { value.runtime_contract.prompt.actual_utf8_bytes += 1 },

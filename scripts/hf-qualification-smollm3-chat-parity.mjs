@@ -35,7 +35,6 @@ import {
   SmolLM3LoadSmokeError,
   startCamelidProcess,
   terminateSpawnedChild,
-  validateLoadSmokeReceipt as validateCommittedLoadReceipt,
 } from './hf-qualification-smollm3-load-smoke.mjs'
 
 const execFileAsync = promisify(execFile)
@@ -94,11 +93,6 @@ const GROUNDING_FILES = Object.freeze({
   runtime_envelope: Object.freeze({
     path: 'qa/model-qualification/fixtures/smollm3-default-thinking-runtime-envelope-v1.json',
     sha256: '2f776f5fd64f0836d3c26cd6bac3363c5276ff6294b9677c10672956387a5cb3',
-  }),
-  load_receipt: Object.freeze({
-    path: 'qa/model-qualification/smollm3-3b-q8-windows-cpu-load-smoke.json',
-    sha256: '4c156199ef4395188aa64210401bb3bfa40e8ef8acdb58c4e4908cc583257b17',
-    receipt_id: '7d5a31a30609db49847790d69fd809612d579000f9fa7f4857f0b753dd4a5aa4',
   }),
 })
 
@@ -170,7 +164,6 @@ const GROUNDING_FILE_SIZE_BYTES = Object.freeze({
   tokenizer_receipt: 10_847,
   shape_pack: 14_968,
   runtime_envelope: 5_578,
-  load_receipt: 34_360,
 })
 
 const LIMITS = Object.freeze({
@@ -237,6 +230,7 @@ const STEP_CONTRACT = Object.freeze([
 
 const DOES_NOT_PROVE = Object.freeze([
   'the roster parity matrix at token counts 1, 5, and 50',
+  'the blocked load-smoke gate',
   'the blocked full template gate',
   'api_webui or SSE qualification',
   'context-512 qualification',
@@ -339,27 +333,29 @@ function buildWindowsChildEnv(inherited = process.env) {
   const clean = {}
   for (const [key, value] of Object.entries(inherited)) {
     const canonicalKey = key.toUpperCase()
-    if (WINDOWS_CHILD_ENV_ALLOWLIST.includes(canonicalKey)
-      && value !== undefined
-      && !Object.hasOwn(clean, canonicalKey)) {
-      clean[canonicalKey] = value
-    }
+    if (!WINDOWS_CHILD_ENV_ALLOWLIST.includes(canonicalKey)) continue
+    expect(typeof value === 'string' && !Object.hasOwn(clean, canonicalKey),
+      'chat_parity_options_invalid')
+    clean[canonicalKey] = value
   }
-  return clean
+  return Object.freeze(clean)
 }
 
 function buildChildEnv(inherited = process.env) {
   const clean = buildWindowsChildEnv(inherited)
-  return { ...clean, ...SAFE_CAMELID_ENV }
+  return Object.freeze({ ...clean, ...SAFE_CAMELID_ENV })
 }
 
 function buildLlamaEnv(inherited = process.env) {
   const clean = buildWindowsChildEnv(inherited)
-  return { ...clean, ...SAFE_LLAMA_ENV }
+  return Object.freeze({ ...clean, ...SAFE_LLAMA_ENV })
 }
 
 function hardenWindowsChildDeps(deps = {}) {
-  const inheritedEnv = deps.inheritedEnv || process.env
+  const inheritedEnv = Object.freeze(Object.fromEntries(
+    Object.entries(deps.inheritedEnv ?? process.env)
+      .filter(([, value]) => typeof value === 'string'),
+  ))
   const execFileImpl = deps.execFileImpl || execFileAsync
   const spawnImpl = deps.spawnImpl || spawn
   return {
@@ -380,6 +376,34 @@ function childEnvSubset(env, prefix) {
   return Object.fromEntries(Object.entries(env)
     .filter(([key]) => key.toUpperCase().startsWith(prefix))
     .sort(([left], [right]) => left.localeCompare(right)))
+}
+
+function describeChildEnvironment(env, modelOverrides) {
+  const inheritedKeys = Object.keys(env)
+    .filter((key) => WINDOWS_CHILD_ENV_ALLOWLIST.includes(key))
+    .sort()
+  const inheritedEnvironment = Object.fromEntries(
+    inheritedKeys.map((key) => [key, env[key]]),
+  )
+  const effectiveKeys = Object.keys(env).sort()
+  const expectedKeys = [...inheritedKeys, ...Object.keys(modelOverrides)].sort()
+  expect(sameJson(effectiveKeys, expectedKeys)
+    && sameJson(Object.fromEntries(Object.entries(env)
+      .filter(([key]) => Object.hasOwn(modelOverrides, key))), modelOverrides),
+  'chat_parity_options_invalid')
+  return {
+    schema: 'camelid.windows-child-environment/v1',
+    model_overrides: structuredClone(modelOverrides),
+    inherited_os_allowlist: [...WINDOWS_CHILD_ENV_ALLOWLIST],
+    inherited_os_keys_present: inheritedKeys,
+    inherited_os_values_redacted: true,
+    inherited_os_environment_sha256: sha256(Buffer.from(
+      `camelid.windows-child-environment/v1\0${canonicalJson(inheritedEnvironment)}`,
+      'utf8',
+    )),
+    effective_keys: effectiveKeys,
+    unlisted_keys_present: false,
+  }
 }
 
 function buildCamelidServeArgs(modelsDir) {
@@ -650,7 +674,6 @@ async function inspectGroundings(root, {
   const shape = documents.shape_pack
   const runtime = documents.runtime_envelope
   const tokenizer = documents.tokenizer_receipt
-  const loadReceipt = documents.load_receipt
   const shapeCase = shape?.cases?.find((entry) => entry?.id === SHAPE_CASE_ID)
   expect(source?.row_id === ROW_ID && sameJson({
     repo: source?.repo,
@@ -688,11 +711,6 @@ async function inspectGroundings(root, {
   expect(tokenizer?.row_id === ROW_ID
     && tokenizer?.tokenizer_metadata?.eos_token_id === EOG_TOKEN_IDS[0]
     && tokenizer?.tokenizer_metadata?.chat_control_token_ids?.im_end === EOG_TOKEN_IDS[0],
-  'chat_parity_grounding_invalid')
-  expect(loadReceipt?.receipt_id === GROUNDING_FILES.load_receipt.receipt_id
-    && validateCommittedLoadReceipt(loadReceipt).length === 0
-    && loadReceipt?.gate_decision?.support_claim === false
-    && sameJson(loadReceipt?.gate_decision?.authorized_roster_scope, ['gates.load_smoke']),
   'chat_parity_grounding_invalid')
   let rendererBlob
   try {
@@ -1408,6 +1426,7 @@ async function runCamelidPhase({ options, preflight, artifactLock, lifecycle, st
   const env = buildChildEnv(deps.inheritedEnv || process.env)
   expect(sameJson(childEnvSubset(env, 'CAMELID_'), SAFE_CAMELID_ENV),
     'chat_parity_options_invalid')
+  const environment = describeChildEnvironment(env, SAFE_CAMELID_ENV)
   const args = buildCamelidServeArgs(options.modelsDir)
   expect(!args.includes('--model'), 'chat_parity_options_invalid')
   const handle = await startEngine({ engine: 'camelid', binary: options.binary, args,
@@ -1515,7 +1534,7 @@ async function runCamelidPhase({ options, preflight, artifactLock, lifecycle, st
     catch (error) { primaryError = error }
   }
   if (primaryError) throw primaryError
-  return { context, resources }
+  return { context, resources, environment }
 }
 
 async function runLlamaPhase({ options, camelid, artifactLock, lifecycle, steps, deps }) {
@@ -1529,6 +1548,7 @@ async function runLlamaPhase({ options, camelid, artifactLock, lifecycle, steps,
   const env = buildLlamaEnv(deps.inheritedEnv || process.env)
   expect(sameJson(childEnvSubset(env, 'CUDA_'), SAFE_LLAMA_ENV),
     'chat_parity_options_invalid')
+  const environment = describeChildEnvironment(env, SAFE_LLAMA_ENV)
   const args = buildLlamaServeArgs(options.artifact)
   const handle = await startEngine({ engine: 'llama_cpp', binary: options.llamaServer, args,
     cwd: dirname(options.llamaServer), env, lifecycle, deps })
@@ -1610,7 +1630,7 @@ async function runLlamaPhase({ options, camelid, artifactLock, lifecycle, steps,
     catch (error) { primaryError = error }
   }
   if (primaryError) throw primaryError
-  return { context, resources }
+  return { context, resources, environment }
 }
 
 function redactedText(text) {
@@ -1637,7 +1657,6 @@ function buildReceipt({ preflight, artifact, lifecycle, steps, camelid, llama, c
       template: structuredClone(TEMPLATE_IDENTITY),
       shape_case: structuredClone(preflight.groundings.shape_case),
       runtime_envelope: 'smollm3-default-thinking-runtime-envelope-v1',
-      load_receipt_validated: true,
     },
     provenance: {
       runtime_head: preflight.provenance.runtime_head,
@@ -1682,13 +1701,13 @@ function buildReceipt({ preflight, artifact, lifecycle, steps, camelid, llama, c
     runtime_contract: {
       camelid: {
         command: receiptCamelidCommand(),
-        environment: structuredClone(SAFE_CAMELID_ENV),
+        environment: structuredClone(camelid.environment),
         request: { ...structuredClone(CHAT_REQUEST), camelid_enable_thinking_omitted: true,
           camelid_receipt_requested: false },
       },
       llama_cpp: {
         command: receiptLlamaCommand(),
-        environment: structuredClone(SAFE_LLAMA_ENV),
+        environment: structuredClone(llama.environment),
         tokenize: { content: 'exact_frozen_camelid_rendered_prompt',
           ...structuredClone(TOKENIZE_FLAGS) },
         completion: { prompt: 'identical_cross_engine_prompt_token_ids',
@@ -1742,7 +1761,7 @@ function buildReceipt({ preflight, artifact, lifecycle, steps, camelid, llama, c
       template_gate: 'blocked_unchanged',
       api_webui_gate: 'pending_unchanged',
       context_gate: 'pending_unchanged',
-      load_smoke_gate: 'pass_unchanged',
+      load_smoke_gate: 'blocked_unchanged',
       support_claim: false,
       disposition: 'hold',
       target_tier: 'experimental_exact_row',
@@ -1872,7 +1891,7 @@ function validateReceiptUnsafe(receipt) {
     && new Date(receipt.created_utc).toISOString() === receipt.created_utc,
   'created_utc must be canonical UTC')
   close(receipt?.grounding, ['files', 'renderer_git_blob_sha1', 'template', 'shape_case',
-    'runtime_envelope', 'load_receipt_validated'], 'grounding')
+    'runtime_envelope'], 'grounding')
   check(sameJson(receipt?.grounding?.files, GROUNDING_FILES)
     && receipt?.grounding?.renderer_git_blob_sha1 === RENDERER_GIT_BLOB_SHA1
     && sameJson(receipt?.grounding?.template, TEMPLATE_IDENTITY)
@@ -1882,8 +1901,7 @@ function validateReceiptUnsafe(receipt) {
       normalized_prompt_sha256: NORMALIZED_PROMPT_SHA256,
       date_placeholder: DATE_PLACEHOLDER,
     })
-    && receipt?.grounding?.runtime_envelope === 'smollm3-default-thinking-runtime-envelope-v1'
-    && receipt?.grounding?.load_receipt_validated === true,
+    && receipt?.grounding?.runtime_envelope === 'smollm3-default-thinking-runtime-envelope-v1',
   'grounding identities must remain exact')
   close(receipt?.provenance, ['runtime_head', 'source_describe', 'tracked_files_clean',
     'untracked_files_excluded', 'camelid_binary', 'llama_cpp', 'artifact', 'platform',
@@ -1964,15 +1982,46 @@ function validateReceiptUnsafe(receipt) {
     'runtime_contract.camelid')
   close(receipt?.runtime_contract?.llama_cpp, ['command', 'environment', 'tokenize', 'completion'],
     'runtime_contract.llama_cpp')
+  const validateEnvironment = (environment, modelOverrides, path) => {
+    close(environment, ['schema', 'model_overrides', 'inherited_os_allowlist',
+      'inherited_os_keys_present', 'inherited_os_values_redacted',
+      'inherited_os_environment_sha256', 'effective_keys', 'unlisted_keys_present'], path)
+    const inheritedKeys = Array.isArray(environment?.inherited_os_keys_present)
+      ? environment.inherited_os_keys_present : []
+    const effectiveKeys = Array.isArray(environment?.effective_keys)
+      ? environment.effective_keys : []
+    const expectedKeys = [...inheritedKeys, ...Object.keys(modelOverrides)].sort()
+    check(environment?.schema === 'camelid.windows-child-environment/v1'
+      && sameJson(environment?.model_overrides, modelOverrides)
+      && sameJson(environment?.inherited_os_allowlist, WINDOWS_CHILD_ENV_ALLOWLIST)
+      && inheritedKeys.every((key) => typeof key === 'string'
+        && WINDOWS_CHILD_ENV_ALLOWLIST.includes(key))
+      && new Set(inheritedKeys).size === inheritedKeys.length
+      && sameJson(inheritedKeys, [...inheritedKeys].sort())
+      && environment?.inherited_os_values_redacted === true
+      && /^[0-9a-f]{64}$/.test(environment?.inherited_os_environment_sha256 || '')
+      && effectiveKeys.every((key) => typeof key === 'string')
+      && sameJson(effectiveKeys, expectedKeys)
+      && environment?.unlisted_keys_present === false,
+    `${path} must seal the exact privacy-safe child environment contract`)
+  }
+  validateEnvironment(receipt?.runtime_contract?.camelid?.environment, SAFE_CAMELID_ENV,
+    'runtime_contract.camelid.environment')
+  validateEnvironment(receipt?.runtime_contract?.llama_cpp?.environment, SAFE_LLAMA_ENV,
+    'runtime_contract.llama_cpp.environment')
+  check(sameJson(
+    receipt?.runtime_contract?.camelid?.environment?.inherited_os_keys_present,
+    receipt?.runtime_contract?.llama_cpp?.environment?.inherited_os_keys_present,
+  ) && receipt?.runtime_contract?.camelid?.environment?.inherited_os_environment_sha256
+    === receipt?.runtime_contract?.llama_cpp?.environment?.inherited_os_environment_sha256,
+  'both engines must seal the same inherited OS environment')
   check(sameJson(receipt?.runtime_contract?.camelid?.command, receiptCamelidCommand())
     && !receipt?.runtime_contract?.camelid?.command?.includes('--model')
-    && sameJson(receipt?.runtime_contract?.camelid?.environment, SAFE_CAMELID_ENV)
     && sameJson(receipt?.runtime_contract?.camelid?.request, {
       ...structuredClone(CHAT_REQUEST), camelid_enable_thinking_omitted: true,
       camelid_receipt_requested: false,
     })
     && sameJson(receipt?.runtime_contract?.llama_cpp?.command, receiptLlamaCommand())
-    && sameJson(receipt?.runtime_contract?.llama_cpp?.environment, SAFE_LLAMA_ENV)
     && sameJson(receipt?.runtime_contract?.llama_cpp?.tokenize, {
       content: 'exact_frozen_camelid_rendered_prompt', ...structuredClone(TOKENIZE_FLAGS),
     })
@@ -2248,7 +2297,7 @@ function validateReceiptUnsafe(receipt) {
     && decision?.template_gate === 'blocked_unchanged'
     && decision?.api_webui_gate === 'pending_unchanged'
     && decision?.context_gate === 'pending_unchanged'
-    && decision?.load_smoke_gate === 'pass_unchanged'
+    && decision?.load_smoke_gate === 'blocked_unchanged'
     && decision?.support_claim === false && decision?.disposition === 'hold'
     && decision?.target_tier === 'experimental_exact_row'
     && sameJson(decision?.authorized_roster_scope, [])
@@ -2512,6 +2561,7 @@ export {
   buildWindowsChildEnv,
   buildReceipt,
   classifySmolLM3ChatParityError,
+  describeChildEnvironment,
   httpJson,
   inspectExactArtifactIdentity,
   inspectGroundings,

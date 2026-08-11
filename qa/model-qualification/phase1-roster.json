@@ -216,10 +216,9 @@
         },
         "load_smoke": {
           "required": true,
-          "status": "pass",
-          "evidence": [
-            "qa/model-qualification/qwen2.5-0.5b-q8-windows-cpu-load-smoke.json"
-          ]
+          "status": "blocked",
+          "evidence": [],
+          "reason": "A real-row Windows CPU run completed, but its pre-hardening receipt sealed only the CAMELID overrides while the child inherited unrecorded host environment variables. Rerun with the hardened privacy-safe effective-environment contract before advancing this gate."
         },
         "parity": {
           "required": true,
@@ -518,10 +517,9 @@
         },
         "load_smoke": {
           "required": true,
-          "status": "pass",
-          "evidence": [
-            "qa/model-qualification/smollm3-3b-q8-windows-cpu-load-smoke.json"
-          ]
+          "status": "blocked",
+          "evidence": [],
+          "reason": "A real-row Windows CPU run completed, but its pre-hardening receipt sealed only the CAMELID overrides while the child inherited unrecorded host environment variables. Rerun with the hardened privacy-safe effective-environment contract before advancing this gate."
         },
         "parity": {
           "required": true,

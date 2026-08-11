@@ -73,10 +73,10 @@ promotion; the other five families remain active dispositions:
 | Family | Current result | Next honest gate |
 |---|---|---|
 | LFM2 | **Complete / promoted exact-row smoke.** All eight Phase 1 gates pass for `LFM2.5-2.6B-Q8_0.gguf` on the Windows CPU runnable lane, and the exact-row handoff independently passes on the resident-Metal lane on one Apple M4 / macOS 26.5 / arm64 host. | Context above 512 tokens, CUDA, other Apple hardware, and separately evidenced neighboring sizes/quants or broader sampling/tool boundaries. |
-| Qwen2.5 | Source, metadata, tokenizer, template, and guarded Windows CPU load smoke pass; strict greedy parity remains failed on one stable cross-engine numeric frontier. A prepared 512-token capture is not accepted because its required verifier transcript is absent from Git. | Recover or rerun the complete 512-token bundle, then complete the layer trace and API/WebUI/SSE smoke; do not waive the short-token mismatch. |
+| Qwen2.5 | Source, metadata, tokenizer, and template pass; strict greedy parity remains failed on one stable cross-engine numeric frontier. The pre-hardening Windows load capture is not accepted because its sealed environment omits inherited host variables, and the prepared 512-token capture is incomplete because its verifier transcript is absent from Git. | Rerun load smoke under the hardened environment contract, recover or rerun the complete 512-token bundle, then complete the layer trace and API/WebUI/SSE smoke; do not waive the short-token mismatch. |
 | Phi-3 | Generic head-dim-96 CPU cache reads are bit-identical; the unproven partial Metal PV tile now falls back. | Repeat the exact-row Metal prefill/decode receipt before changing the HOLD. |
 | Gemma 2 | Source identity, clean-head bounded exact-row metadata, seven-case tokenizer parity, and the exact IT template route pass; substituted templates and invalid shapes fail closed. | Full-artifact identity/load and greedy parity, then API/WebUI/context. |
-| SmolLM3 | Source, clean-head bounded exact-row metadata, the 10-case `smaug-bpe` tokenizer pack, and a guarded exact-row Windows CPU load smoke pass. The 3,275,574,624-byte Q8_0 artifact loaded on the Safe `cpu_reference` lane; the raw first forward and bounded default-thinking chat follow-up each emitted one finite greedy token. All 254 Q8 tensors remained lazy and file-backed with zero Q8-to-F32 materialization or retained blocks, and CUDA remained disabled. | The full template gate remains blocked outside the narrow default-thinking text envelope. Next is pinned greedy parity, then complete API/WebUI/SSE and 512-token context evidence. This receipt makes no correctness, performance, GPU, support, adjacent-row, tools, system, no-think, multimodal, or non-text claim. |
+| SmolLM3 | Source, clean-head bounded exact-row metadata, the 10-case `smaug-bpe` tokenizer pack, and an architecture-scoped renderer for the narrow default-thinking text envelope are in place. The pre-hardening Windows load capture is not accepted because its sealed environment omits inherited host variables. | The full template gate remains blocked outside the narrow envelope. Rerun load smoke under the hardened environment contract before pinned greedy parity, then complete API/WebUI/SSE and 512-token context evidence. No load, correctness, performance, GPU, support, adjacent-row, tools, system, no-think, multimodal, or non-text claim is made. |
 | Qwen3 MoE | Source identity and an independent clean 13-case tokenizer receipt pass for the official 32.48 GB row. The pack pins absent automatic BOS insertion, exact Qwen2 regex splits, CONTROL ChatML markers, USER_DEFINED tool/reasoning tags, and UNUSED padding behavior. The older standalone metadata receipt remains preparatory because it predates tracked-worktree provenance. | Rerun metadata qualification under the current provenance contract, then qualify the embedded 4,100-byte Qwen3 template before full-artifact identity/load and MoE parity; tokenizer evidence makes no metadata, template, load, generation, API, context, or support claim. |
 
 Phase 1 remains active for Qwen2.5, Phi-3, Gemma 2, SmolLM3, and Qwen3 MoE.
@@ -159,13 +159,12 @@ continuations, and the exact one-turn ChatML rendering. Passing that fixture is
 still only raw graph/tokenizer evidence; chat-template/API/context gates remain
 separate.
 
-Current bootstrap result: source, metadata, tokenizer, template, bounded Windows
-CPU `load_smoke` pass. The load receipt
-uses a clean current-head release binary, loads the exact row on the CPU
-reference lane, and produces one deterministic raw token on a cold file-backed
-Q8 path without Q8-to-F32 materialization or GPU execution. This is a
-load-smoke-only result and makes no support, parity, API/WebUI, or performance
-claim. A Windows 512-token capture was prepared, but its required verifier
+Current bootstrap result: source, metadata, tokenizer, and template pass. A
+pre-hardening Windows CPU load capture is retained only for diagnosis: its
+sealed runtime contract records the fixed `CAMELID_*` overrides but omits the
+host environment inherited by the child, so it cannot advance `load_smoke`.
+Rerun the exact row under the hardened privacy-safe environment contract. A
+Windows 512-token capture was also prepared, but its required verifier
 transcript is not tracked, so the public context gate remains blocked rather
 than accepting an incomplete bundle. Recover the exact checksummed transcript
 or rerun the lane. Raw greedy parity still matches 3 of 4 prompts; the remaining prompt
