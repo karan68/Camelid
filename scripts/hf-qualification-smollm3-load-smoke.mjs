@@ -987,7 +987,8 @@ async function sampleWindowsResources(pid, { execFileImpl = execFileAsync } = {}
   expect(Number.isSafeInteger(pid) && pid > 0, 'load_smoke_resource_telemetry_unavailable')
   const script = `$p=Get-Process -Id ${pid} -ErrorAction Stop; `
     + '$o=Get-CimInstance Win32_OperatingSystem; '
-    + '[Console]::Out.Write("{0},{1}" -f ([int64]$o.FreePhysicalMemory*1024),([int64]$p.WorkingSet64))'
+    + '[Console]::Out.Write([string]::Format("{0},{1}",'
+    + '([int64]$o.FreePhysicalMemory*1024),([int64]$p.WorkingSet64)))'
   try {
     const { stdout } = await execFileImpl('powershell.exe', [
       '-NoProfile', '-NonInteractive', '-Command', script,

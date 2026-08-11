@@ -1426,6 +1426,25 @@ assert.throws(
 await resourceGuard.stop()
 assert.equal(resourceGuard.summary().thresholds_tripped, true)
 
+if (process.platform === 'win32') {
+  const liveResourceGuard = createResourceGuard({ pid: process.pid }, {
+    limits: {
+      ...LIMITS,
+      low_memory_abort_bytes: 0,
+      child_working_set_abort_bytes: Number.MAX_SAFE_INTEGER,
+    },
+  })
+  for (let index = 0; index < 100 && liveResourceGuard.summary().samples === 0; index += 1) {
+    await delay(10)
+  }
+  await liveResourceGuard.stop()
+  const liveResources = liveResourceGuard.summary()
+  assert.ok(liveResources.samples >= 1, 'the real Windows resource sampler must return a sample')
+  assert.ok(liveResources.minimum_available_physical_bytes > 0)
+  assert.ok(liveResources.peak_child_working_set_bytes > 0)
+  assert.equal(liveResources.thresholds_tripped, false)
+}
+
 const signals = []
 let terminateResolve
 let closeResolve
