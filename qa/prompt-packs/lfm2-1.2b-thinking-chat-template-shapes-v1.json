@@ -1,0 +1,54 @@
+{
+  "schema": "camelid.chat_template_shape_pack/v1",
+  "pack_id": "lfm2-1.2b-thinking-chat-template-shapes-v1",
+  "purpose": "Locks the compact text-only LFM2.5 1.2B Thinking template against pinned llama.cpp b9632. This dialect opens a plain assistant turn and does not inject the 2.6B row's open <think> marker.",
+  "source": {
+    "repo": "LiquidAI/LFM2.5-1.2B-Thinking-GGUF",
+    "revision": "74ddb49ac3dbd31c744afaa7061530c6466de6a0",
+    "file": "LFM2.5-1.2B-Thinking-Q8_0.gguf",
+    "size_bytes": 1246254080,
+    "sha256": "255f9dcbb8f198c8b6e91b35a63349f062a4902bc58f59312f9b66de45fa9064",
+    "chat_template_utf8_bytes": 1783,
+    "chat_template_sha256": "f05bf4b967dc993bdc7a2fe6e43759ee218eb0eb340d68b063e1c4f8ad148176"
+  },
+  "equivalent_source_rows": [
+    {
+      "repo": "LiquidAI/LFM2.5-1.2B-Instruct-GGUF",
+      "revision": "76022b8bfa64af5862d6bce90a676c3cc9b17b52",
+      "file": "LFM2.5-1.2B-Instruct-Q8_0.gguf",
+      "size_bytes": 1246253888,
+      "sha256": "f6b981dcb86917fa463f78a362320bd5e2dc45445df147287eedb85e5a30d26a",
+      "chat_template_utf8_bytes": 1783,
+      "chat_template_sha256": "f05bf4b967dc993bdc7a2fe6e43759ee218eb0eb340d68b063e1c4f8ad148176"
+    }
+  ],
+  "oracle": {
+    "engine": "llama.cpp llama-server /apply-template and /tokenize",
+    "build": "b9632",
+    "revision": "acd79d603",
+    "add_generation_prompt": true,
+    "add_special": true,
+    "parse_special": true
+  },
+  "shapes": [
+    {
+      "id": "single_user",
+      "messages": [{"role": "user", "content": "What is the capital of France?"}],
+      "expected_prompt": "<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n",
+      "prompt_ids": [1, 6, 6423, 708, 3493, 856, 779, 5706, 803, 4481, 540, 7, 708, 6, 64015, 708]
+    },
+    {
+      "id": "system_user",
+      "messages": [{"role": "system", "content": "You are a helpful assistant."}, {"role": "user", "content": "Name a primary color."}],
+      "expected_prompt": "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nName a primary color.<|im_end|>\n<|im_start|>assistant\n",
+      "prompt_ids": [1, 6, 24131, 708, 4083, 938, 768, 11538, 16701, 523, 7, 708, 6, 6423, 708, 3118, 768, 5410, 4100, 523, 7, 708, 6, 64015, 708]
+    },
+    {
+      "id": "multi_turn",
+      "messages": [{"role": "user", "content": "Say hello."}, {"role": "assistant", "content": "Hello!"}, {"role": "user", "content": "Say it again."}],
+      "expected_prompt": "<|im_start|>user\nSay hello.<|im_end|>\n<|im_start|>assistant\nHello!<|im_end|>\n<|im_start|>user\nSay it again.<|im_end|>\n<|im_start|>assistant\n",
+      "prompt_ids": [1, 6, 6423, 708, 560, 892, 64033, 523, 7, 708, 6, 64015, 708, 36309, 510, 7, 708, 6, 6423, 708, 560, 892, 936, 2030, 523, 7, 708, 6, 64015, 708]
+    }
+  ],
+  "does_not_prove": ["tools", "multimodal content", "generation parity", "load", "API/WebUI readiness", "context", "support"]
+}

@@ -3,6 +3,7 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import { readFileSync } from 'node:fs'
+import { canonicalGitTextBytes } from './lib/canonical-git-text.mjs'
 import {
   GEMMA2_CASES,
   QWEN3_MOE_CASES,
@@ -455,7 +456,7 @@ const qwen3HeaderReceiptBytes = readFileSync(
   new URL('../qa/model-qualification/qwen3-30b-a3b-q8-header-inspection.json', import.meta.url),
 )
 assert.equal(
-  sha256(qwen3HeaderReceiptBytes),
+  sha256(canonicalGitTextBytes(qwen3HeaderReceiptBytes)),
   '293f8dd99f4f31478a0a6a7b3fc9c3e6a1c224a9df0b1dc3253e619d93a2dc33',
   'the Qwen3 MoE tokenizer pack must remain bound to the committed header receipt bytes',
 )
@@ -1062,7 +1063,7 @@ const durableQwen3ReceiptBytes = readFileSync(
   new URL('../qa/model-qualification/qwen3-30b-a3b-q8-header-tokenizer-parity.json', import.meta.url),
 )
 assert.equal(
-  sha256(durableQwen3ReceiptBytes),
+  sha256(canonicalGitTextBytes(durableQwen3ReceiptBytes)),
   '021dbe0b4f6a94f7140daa8e02969106dab941e205d184ee60f683d58f13ea37',
   'durable Qwen3 MoE tokenizer evidence must remain byte-identical to the clean-head receipt',
 )

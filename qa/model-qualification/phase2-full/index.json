@@ -1,0 +1,65 @@
+{
+  "schema": "camelid.model-qualification-index/v1",
+  "generated_at": "2026-08-11T17:39:44.498Z",
+  "roster": "qa/model-qualification/phase2-roster.json",
+  "roster_schema": "camelid.model-qualification-roster/v1",
+  "models_dir_env": "CAMELID_MODELS_DIR",
+  "models_dir_configured": true,
+  "source_head": "fcab3e2f1debe4ef1b999b3e7ab193947d978f85",
+  "source_dirty": true,
+  "counts": {
+    "pass": 0,
+    "fail": 0,
+    "blocked": 6
+  },
+  "rows": [
+    {
+      "priority": 3,
+      "row_id": "gemma3_270m_it_q8_0",
+      "disposition": "active_validation",
+      "overall_status": "blocked",
+      "first_unresolved_stage": "template",
+      "report_file": "gemma3_270m_it_q8_0.json"
+    },
+    {
+      "priority": 6,
+      "row_id": "mistral_7b_instruct_v0_2_q8_0",
+      "disposition": "active_validation",
+      "overall_status": "blocked",
+      "first_unresolved_stage": "template",
+      "report_file": "mistral_7b_instruct_v0_2_q8_0.json"
+    },
+    {
+      "priority": 14,
+      "row_id": "deepseek_r1_distill_qwen_1_5b_q8_0",
+      "disposition": "active_validation",
+      "overall_status": "blocked",
+      "first_unresolved_stage": "template",
+      "report_file": "deepseek_r1_distill_qwen_1_5b_q8_0.json"
+    },
+    {
+      "priority": 15,
+      "row_id": "deepseek_r1_distill_llama_8b_q8_0",
+      "disposition": "active_validation",
+      "overall_status": "blocked",
+      "first_unresolved_stage": "template",
+      "report_file": "deepseek_r1_distill_llama_8b_q8_0.json"
+    },
+    {
+      "priority": 17,
+      "row_id": "phi4_mini_instruct_q8_0",
+      "disposition": "active_validation",
+      "overall_status": "blocked",
+      "first_unresolved_stage": "template",
+      "report_file": "phi4_mini_instruct_q8_0.json"
+    },
+    {
+      "priority": 20,
+      "row_id": "aya_expanse_8b_q4_k_m",
+      "disposition": "hold",
+      "overall_status": "blocked",
+      "first_unresolved_stage": "template",
+      "report_file": "aya_expanse_8b_q4_k_m.json"
+    }
+  ]
+}

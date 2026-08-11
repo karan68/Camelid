@@ -20,6 +20,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'nod
 import { pathToFileURL } from 'node:url'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { promisify, types as utilTypes } from 'node:util'
+import { canonicalGitTextBytes } from './lib/canonical-git-text.mjs'
 
 // Only row-neutral, already hardened lifecycle primitives are reused. The
 // parity identity, requests, response normalization, receipt, validator, and
@@ -92,11 +93,11 @@ const GROUNDING_FILES = Object.freeze({
   }),
   runtime_envelope: Object.freeze({
     path: 'qa/model-qualification/fixtures/smollm3-default-thinking-runtime-envelope-v1.json',
-    sha256: '2f776f5fd64f0836d3c26cd6bac3363c5276ff6294b9677c10672956387a5cb3',
+    sha256: '282b28e34803002c47ae61d323c675df4273f203a121d852494ab56d07a82f9f',
   }),
 })
 
-const RENDERER_GIT_BLOB_SHA1 = 'cb370d9d567d572a4feaf32ac4f3300dd34ef790'
+const RENDERER_GIT_BLOB_SHA1 = '2f69ce19c7123345d802218984bfb721351c0256'
 const SHAPE_CASE_ID = 'default_think_single_user_generation_prompt'
 const NORMALIZED_PROMPT_UTF8_BYTES = 1_392
 const NORMALIZED_PROMPT_SHA256 = '7619416ae94ba9a00378d976bfa944f5ba726747f9b67ba4e862d9a7fe20e4f1'
@@ -649,7 +650,6 @@ async function inspectGroundings(root, {
     await inspectRegularFileMetadata(path, {
       lstatImpl,
       statImpl,
-      expectedSize,
       maxBytes: LOCAL_FILE_LIMITS.grounding_bytes,
       unavailableCode: 'chat_parity_grounding_invalid',
       mismatchCode: 'chat_parity_grounding_invalid',
@@ -658,16 +658,17 @@ async function inspectGroundings(root, {
     let bytes
     try {
       streamedDigest = await sha256FileImpl(path, {
-        expectedSize,
         maxBytes: LOCAL_FILE_LIMITS.grounding_bytes,
       })
       bytes = await readFileImpl(path)
     }
     catch { throw parityError('chat_parity_grounding_invalid') }
-    expect(Buffer.isBuffer(bytes) && bytes.length === expectedSize
-      && streamedDigest === identity.sha256 && sha256(bytes) === identity.sha256,
+    const canonicalBytes = Buffer.isBuffer(bytes) ? canonicalGitTextBytes(bytes) : null
+    expect(Buffer.isBuffer(bytes) && bytes.length <= LOCAL_FILE_LIMITS.grounding_bytes
+      && streamedDigest === sha256(bytes) && canonicalBytes.length === expectedSize
+      && sha256(canonicalBytes) === identity.sha256,
     'chat_parity_grounding_invalid')
-    try { documents[name] = JSON.parse(bytes) }
+    try { documents[name] = JSON.parse(canonicalBytes) }
     catch { throw parityError('chat_parity_grounding_invalid') }
   }
   const source = documents.source_lock

@@ -8,6 +8,7 @@ import { tmpdir } from 'node:os'
 import { basename, dirname, join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { promisify } from 'node:util'
+import { canonicalGitTextBytes } from './lib/canonical-git-text.mjs'
 import { validateRoster } from './check-model-qualification-roster.mjs'
 import {
   HeaderInspectionError,
@@ -924,24 +925,24 @@ async function readGroundingSnapshot(root, readFileImpl = readFile, {
       await inspectRegularFileMetadata(path, {
         lstatImpl,
         statImpl,
-        expectedSize,
         maxBytes: LOCAL_FILE_LIMITS.grounding_bytes,
         unavailableCode: 'qwen3moe_template_grounding_unavailable',
         mismatchCode: 'qwen3moe_template_grounding_mismatch',
       })
       const streamedDigest = await sha256FileImpl(path, {
-        expectedSize,
         maxBytes: LOCAL_FILE_LIMITS.grounding_bytes,
       })
       const bytes = await readFileImpl(path)
+      const canonicalBytes = Buffer.isBuffer(bytes) ? canonicalGitTextBytes(bytes) : null
       if (!Buffer.isBuffer(bytes)
-        || bytes.length !== expectedSize
-        || streamedDigest !== expectedHash
-        || sha256(bytes) !== expectedHash) {
+        || bytes.length > LOCAL_FILE_LIMITS.grounding_bytes
+        || streamedDigest !== sha256(bytes)
+        || canonicalBytes.length !== expectedSize
+        || sha256(canonicalBytes) !== expectedHash) {
         throw templateError('qwen3moe_template_grounding_mismatch')
       }
-      entries.push({ relativePath, bytes, digest: streamedDigest,
-        parsed: JSON.parse(bytes.toString('utf8')) })
+      entries.push({ relativePath, bytes: canonicalBytes, digest: expectedHash,
+        parsed: JSON.parse(canonicalBytes.toString('utf8')) })
     }
   } catch (error) {
     if (error instanceof Qwen3MoeTemplateQualificationError) throw error

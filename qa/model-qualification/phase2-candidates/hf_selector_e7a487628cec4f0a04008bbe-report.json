@@ -1,0 +1,181 @@
+{
+  "schema": "camelid.model-qualification-report/v1",
+  "generated_at": "2026-08-11T16:51:13.252Z",
+  "phase": 2,
+  "qualification_mode": "unrostered_hf_selector",
+  "row_id": "hf_selector_e7a487628cec4f0a04008bbe",
+  "candidate": {
+    "identity_mode": "public_selector_digest",
+    "selector_id": "hf_selector_e7a487628cec4f0a04008bbe",
+    "selector_sha256": "e7a487628cec4f0a04008bbe9a8c385fd45a272322e22fa52161b687b0b3a792",
+    "selector_redacted": true,
+    "requested_revision_pinned": false,
+    "roster_membership": "absent_from_phase1_roster"
+  },
+  "source_head": "fcab3e2f1debe4ef1b999b3e7ab193947d978f85",
+  "source_dirty": true,
+  "source_tracked_dirty": false,
+  "source_inspection": "observed",
+  "host": {
+    "hostname_redacted": true,
+    "platform": "darwin",
+    "release": "25.5.0",
+    "arch": "arm64"
+  },
+  "backend": {
+    "serve": "not_run",
+    "env": {}
+  },
+  "artifact": {
+    "local_path_redacted": true,
+    "full_artifact_download": "not_run",
+    "full_artifact_sha256": "not_run"
+  },
+  "stages": {
+    "source": {
+      "status": "pass",
+      "resolution": "live_huggingface",
+      "repo": "unsloth/Qwen3.5-2B-GGUF",
+      "file": "Qwen3.5-2B-Q8_0.gguf",
+      "requested_revision": null,
+      "revision": "f6d5376be1edb4d416d56da11e5397a961aca8ae",
+      "size_bytes": 2012012800,
+      "sha256": "1b04acba824817554f4ce23639bc8495ff70453b8fcb047900c731521021f2c1",
+      "license": "apache-2.0",
+      "access": {
+        "gated": false,
+        "private": false,
+        "disabled": false
+      }
+    },
+    "artifact": {
+      "status": "blocked",
+      "error_code": "full_artifact_not_downloaded",
+      "reason": "selector qualification never downloads or verifies the full artifact"
+    },
+    "metadata": {
+      "status": "pass",
+      "mode": "remote_immutable_prefix",
+      "inspection_generated_at": "2026-08-11T16:51:16.377Z",
+      "host": {
+        "hostname_redacted": true,
+        "platform": "darwin",
+        "release": "25.5.0",
+        "arch": "arm64"
+      },
+      "inspector": {
+        "version": "camelid v0.6.1-76-gfcab3e2f",
+        "binary_sha256": "b376f93725f51324928601e4cb90981d6e8fb308c823939034d3b7df7dafe84a",
+        "source_head": "fcab3e2f1debe4ef1b999b3e7ab193947d978f85",
+        "source_tracked_dirty": false,
+        "binary_commit_abbrev": "fcab3e2f",
+        "binary_reports_dirty": false,
+        "binary_matches_source_head": true,
+        "clean_current_head": true,
+        "binary_path_redacted": true,
+        "command": [
+          "<camelid>",
+          "inspect-prefix",
+          "<remote-gguf-prefix>",
+          "--declared-len",
+          "2012012800"
+        ]
+      },
+      "source": {
+        "repo": "unsloth/Qwen3.5-2B-GGUF",
+        "file": "Qwen3.5-2B-Q8_0.gguf",
+        "revision": "f6d5376be1edb4d416d56da11e5397a961aca8ae",
+        "size_bytes": 2012012800,
+        "sha256": "1b04acba824817554f4ce23639bc8495ff70453b8fcb047900c731521021f2c1"
+      },
+      "range": {
+        "requested_bytes": 67108864,
+        "received_bytes": 67108864,
+        "content_range": {
+          "start": 0,
+          "end": 67108863,
+          "total": 2012012800
+        },
+        "prefix_sha256": "9dcbb4a275f02b00c2bb49e8ec6ffc50f79f69cfa57140fd3e5b4e1ac3138893"
+      },
+      "observed": {
+        "gguf_version": 3,
+        "architecture": "qwen35",
+        "tokenizer_model": "gpt2",
+        "tokenizer_pre": "qwen35",
+        "general_file_type": 7,
+        "declared_quantization": "Q8_0",
+        "headline_quant": "Q8_0",
+        "tensor_count": 320,
+        "metadata_count": 46,
+        "alignment": 32,
+        "data_start_offset": 10961920,
+        "tensor_payload_n_bytes": 2001050880,
+        "tensor_inventory_sha256": "336d16acfa47e3c9af7f9abb205ffc3a10e96f1d9503994ab8e996501bd7a26f",
+        "tensor_type_counts": {
+          "F32": 133,
+          "Q8_0": 187
+        }
+      },
+      "scope": {
+        "prefix_sha256": "all_received_prefix_bytes",
+        "tensor_payload": "partially_range_fetched_opaque",
+        "opaque_tensor_payload_prefix_bytes": 56146944,
+        "full_artifact_sha256": "not_run",
+        "tensor_payload_interpretation": "not_run",
+        "load": "not_run",
+        "generation": "not_run",
+        "support_claim": false,
+        "runtime_compatibility": "not_run"
+      },
+      "assessment": "bounded_header_descriptor_inspection_only"
+    },
+    "tokenizer": {
+      "status": "blocked",
+      "error_code": "candidate_tokenizer_pack_unavailable",
+      "reason": "an unrostered selector has no exact-row tokenizer pack"
+    },
+    "template": {
+      "status": "blocked",
+      "error_code": "candidate_template_pack_unavailable",
+      "reason": "an unrostered selector has no exact-row template pack"
+    },
+    "load_smoke": {
+      "status": "blocked",
+      "error_code": "candidate_full_artifact_unavailable",
+      "reason": "load smoke requires a separately acquired and identity-verified full artifact"
+    },
+    "parity": {
+      "status": "blocked",
+      "error_code": "candidate_oracle_pack_unavailable",
+      "reason": "generation parity requires a separately pinned exact-row oracle pack"
+    },
+    "api_webui": {
+      "status": "blocked",
+      "error_code": "candidate_runtime_unqualified",
+      "reason": "API and WebUI qualification are downstream of exact-row runtime evidence"
+    },
+    "context": {
+      "status": "blocked",
+      "error_code": "candidate_context_unqualified",
+      "reason": "no exact-row context receipt exists for an unrostered selector"
+    }
+  },
+  "overall_status": "blocked",
+  "support_decision": "hold_unrostered_header_candidate",
+  "support_claim": false,
+  "scope": {
+    "source_resolution": "live_huggingface",
+    "header_inspection": "bounded_partial_range",
+    "full_artifact_download": "not_run",
+    "full_artifact_sha256": "not_run",
+    "tensor_payload_interpretation": "not_run",
+    "tokenizer": "not_run",
+    "template": "not_run",
+    "load": "not_run",
+    "generation": "not_run",
+    "api_webui": "not_run",
+    "context": "not_run",
+    "support_claim": false
+  }
+}

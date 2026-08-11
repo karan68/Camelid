@@ -1,0 +1,188 @@
+{
+  "schema": "camelid.model-qualification-oracle/v1",
+  "generated_at": "2026-08-11T17:03:58.311Z",
+  "row_id": "lfm2_5_1_2b_thinking_q8_0",
+  "scope": "tokenizer_and_raw_greedy_generation",
+  "artifact": {
+    "repo": "LiquidAI/LFM2.5-1.2B-Thinking-GGUF",
+    "revision": "74ddb49ac3dbd31c744afaa7061530c6466de6a0",
+    "file": "LFM2.5-1.2B-Thinking-Q8_0.gguf",
+    "size_bytes": 1246254080,
+    "sha256": "255f9dcbb8f198c8b6e91b35a63349f062a4902bc58f59312f9b66de45fa9064"
+  },
+  "oracle": {
+    "engine": "llama.cpp",
+    "build": "b9632",
+    "revision": "acd79d603",
+    "platform": "darwin-arm64",
+    "release": "25.5.0",
+    "llama_tokenize_sha256": "de1b813ddc9ad026d45c4f3f37b1f2052aa4c01b94a66ddcea2e8ac673bcc4ba",
+    "llama_server_sha256": "382096b1dc10da68c2bf0a97e1f0dd36db90531cdea1434760d8c1a70fea1310",
+    "command": [
+      "<llama-tokenize>",
+      "-m",
+      "<artifact>",
+      "-p",
+      "<prompt>",
+      "--ids",
+      "--no-escape",
+      "--log-disable"
+    ]
+  },
+  "raw_prompts": [
+    {
+      "text": "Hello",
+      "prompt_ids": [
+        1,
+        36309
+      ],
+      "generated_ids": [
+        521,
+        1203,
+        7498,
+        768,
+        2341
+      ],
+      "generated_text": ", but wait a second"
+    },
+    {
+      "text": "The capital of France is",
+      "prompt_ids": [
+        1,
+        1098,
+        5706,
+        803,
+        4481,
+        856
+      ],
+      "generated_ids": [
+        5242,
+        523,
+        859,
+        2539,
+        896
+      ],
+      "generated_text": " Paris. I think that"
+    },
+    {
+      "text": "Once upon a time",
+      "prompt_ids": [
+        1,
+        14142,
+        4380,
+        768,
+        1394
+      ],
+      "generated_ids": [
+        521,
+        1413,
+        1166,
+        1547,
+        1519
+      ],
+      "generated_text": ", there were two people"
+    },
+    {
+      "text": "The quick brown fox",
+      "prompt_ids": [
+        1,
+        1098,
+        4605,
+        10800,
+        36387
+      ],
+      "generated_ids": [
+        56586,
+        1391,
+        779,
+        46199,
+        4949
+      ],
+      "generated_text": " jumps over the lazy dog"
+    },
+    {
+      "text": "2 + 2 =",
+      "prompt_ids": [
+        1,
+        527,
+        2011,
+        730,
+        527,
+        1051
+      ],
+      "generated_ids": [
+        730,
+        529,
+        540,
+        35190,
+        521
+      ],
+      "generated_text": " 4? Wait,"
+    },
+    {
+      "text": "don't stop 12345\nUnicode café 東京 🙂",
+      "prompt_ids": [
+        1,
+        16203,
+        1901,
+        5910,
+        730,
+        10293,
+        2637,
+        708,
+        2951,
+        40039,
+        35499,
+        730,
+        20374,
+        57655
+      ],
+      "generated_ids": [
+        509,
+        549,
+        5399,
+        521,
+        779
+      ],
+      "generated_text": "\n\nHmm, the"
+    }
+  ],
+  "chat_templates": [],
+  "does_not_prove": [
+    "Camelid weight load, logits, generation, or greedy-token parity until the independent replay phase passes",
+    "chat-template rendering or prompt-token parity unless a separate exact-row shape pack is cited",
+    "API, WebUI, bounded context, performance, GPU execution, portability, neighboring rows, or broad-family support"
+  ],
+  "greedy_capture": {
+    "captured_at": "2026-08-11T17:50:03.190Z",
+    "endpoint": "/completion",
+    "prompt_input": "pinned_prompt_ids",
+    "max_new_tokens": 5,
+    "temperature": 0,
+    "top_k": 1,
+    "seed": 0,
+    "cache_prompt": false,
+    "samplers": [
+      "top_k"
+    ],
+    "backend": "cpu_reference_f32_kv_no_repack",
+    "llama_server_command": [
+      "<llama-server>",
+      "-m",
+      "<artifact>",
+      "-c",
+      "256",
+      "-ngl",
+      "0",
+      "-ctk",
+      "f32",
+      "-ctv",
+      "f32",
+      "-fa",
+      "off",
+      "--no-repack",
+      "--no-warmup",
+      "--log-disable"
+    ]
+  }
+}

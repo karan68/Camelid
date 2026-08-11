@@ -16,6 +16,7 @@ const REQUIRED_GATES = [
 const GATE_STATUSES = new Set(['pass', 'fail', 'blocked', 'pending'])
 const DISPOSITIONS = new Set(['active_validation', 'hold', 'backlog', 'blocked', 'promotion_candidate'])
 const TARGET_TIERS = new Set(['experimental_exact_row'])
+const PHASE_IDS = new Set([1, 2])
 const SHA256_RE = /^[0-9a-f]{64}$/
 const REVISION_RE = /^[0-9a-f]{40}$/
 const ID_RE = /^[a-z0-9][a-z0-9_]*$/
@@ -27,7 +28,7 @@ function validateRoster(roster, label = 'roster') {
   if (roster?.schema !== 'camelid.model-qualification-roster/v1') {
     fail('schema', 'expected camelid.model-qualification-roster/v1')
   }
-  if (roster?.phase?.id !== 1) fail('phase.id', 'expected integer 1')
+  if (!PHASE_IDS.has(roster?.phase?.id)) fail('phase.id', 'expected integer 1 or 2')
   if (roster?.phase?.status !== 'active') fail('phase.status', 'expected active')
   if (roster?.defaults?.models_dir_env !== 'CAMELID_MODELS_DIR') {
     fail('defaults.models_dir_env', 'use the runtime-standard plural CAMELID_MODELS_DIR')
@@ -77,6 +78,27 @@ function validateRoster(roster, label = 'roster') {
     }
     if (source.file !== null && typeof source.file !== 'string') fail(`${base}.source.file`, 'expected string or null')
     if (source.repo !== null && typeof source.repo !== 'string') fail(`${base}.source.repo`, 'expected string or null')
+
+    const lane = row.lane || {}
+    if (typeof lane.serve !== 'string' || !lane.serve) fail(`${base}.lane.serve`, 'expected non-empty string')
+    if (!lane.env || typeof lane.env !== 'object' || Array.isArray(lane.env)) {
+      fail(`${base}.lane.env`, 'expected an environment object')
+    } else if (!Object.entries(lane.env).every(([key, value]) => key && typeof value === 'string')) {
+      fail(`${base}.lane.env`, 'expected non-empty keys and string values')
+    }
+
+    const probes = row.probes || {}
+    if (probes.oracle_fixture !== null && typeof probes.oracle_fixture !== 'string') {
+      fail(`${base}.probes.oracle_fixture`, 'expected string or null')
+    }
+    for (const field of ['smoke', 'parity']) {
+      if (typeof probes[field] !== 'string' || !probes[field]) fail(`${base}.probes.${field}`, 'expected non-empty string')
+    }
+    if (!Array.isArray(probes.context_buckets)
+      || probes.context_buckets.length === 0
+      || !probes.context_buckets.every((value) => Number.isInteger(value) && value > 0)) {
+      fail(`${base}.probes.context_buckets`, 'expected non-empty positive-integer array')
+    }
 
     if (!TARGET_TIERS.has(row.target_tier)) fail(`${base}.target_tier`, `unsupported target tier ${JSON.stringify(row.target_tier)}`)
     if (!DISPOSITIONS.has(row.disposition)) fail(`${base}.disposition`, `unsupported disposition ${JSON.stringify(row.disposition)}`)

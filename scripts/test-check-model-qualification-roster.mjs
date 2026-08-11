@@ -4,11 +4,14 @@ import { createHash } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { SUPPORTED_MODELS } from '../frontend/src/lib/supportedModels.js'
 import { summarizeRoster, validateRoster } from './check-model-qualification-roster.mjs'
+import { canonicalGitTextBytes } from './lib/canonical-git-text.mjs'
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const path = join(root, 'qa', 'model-qualification', 'phase1-roster.json')
 const roster = JSON.parse(await readFile(path, 'utf8'))
+const phase2Path = join(root, 'qa', 'model-qualification', 'phase2-roster.json')
 const fileSha256 = bytes => createHash('sha256').update(bytes).digest('hex')
 const gitBlobSha1 = bytes => createHash('sha1')
   .update(Buffer.from(`blob ${bytes.length}\0`))
@@ -22,25 +25,25 @@ const smolRuntimeFixturePath = join(
   'smollm3-default-thinking-runtime-envelope-v1.json',
 )
 const smolRuntimeFixture = JSON.parse(await readFile(smolRuntimeFixturePath, 'utf8'))
-const smolPreparationPackBytes = await readFile(join(
+const smolPreparationPackBytes = canonicalGitTextBytes(await readFile(join(
   root,
   'qa',
   'prompt-packs',
   'smollm3-chat-template-shapes-v1.json',
-))
-const smolHeaderReceiptBytes = await readFile(join(
+)))
+const smolHeaderReceiptBytes = canonicalGitTextBytes(await readFile(join(
   root,
   'qa',
   'model-qualification',
   'smollm3-3b-q8-header-inspection.json',
-))
-const smolTokenizerReceiptBytes = await readFile(join(
+)))
+const smolTokenizerReceiptBytes = canonicalGitTextBytes(await readFile(join(
   root,
   'qa',
   'model-qualification',
   'smollm3-3b-q8-header-tokenizer-parity.json',
-))
-const apiSourceBytes = await readFile(join(root, 'src', 'api', 'mod.rs'))
+)))
+const apiSourceBytes = canonicalGitTextBytes(await readFile(join(root, 'src', 'api', 'mod.rs')))
 const apiSourceText = apiSourceBytes.toString('utf8')
 const exactKeys = (value, keys, label) => assert.deepEqual(
   Object.keys(value).sort(),
@@ -283,6 +286,31 @@ assert.ok(
 assert.ok(
   errorsAfter((candidate) => { candidate.rows[5].priority = 2 }).some((error) => error.includes('unique and contiguous')),
   'priorities must be deterministic',
+)
+
+const phase2Roster = JSON.parse(await readFile(phase2Path, 'utf8'))
+assert.deepEqual(validateRoster(phase2Roster, 'phase2'), [], 'the committed Phase 2 roster must validate')
+assert.equal(summarizeRoster(phase2Roster).length, 20, 'all twenty selected exact rows must remain visible')
+assert.deepEqual(
+  phase2Roster.rows.map((row) => row.priority),
+  Array.from({ length: 20 }, (_, index) => index + 1),
+  'Phase 2 priorities must retain the selected qualification order',
+)
+assert.equal(new Set(phase2Roster.rows.map((row) => row.id)).size, 20, 'Phase 2 row ids must remain unique')
+const frontendPhase2 = new Map(SUPPORTED_MODELS.map((row) => [row.catalog_id, row]))
+for (const row of phase2Roster.rows) {
+  const frontend = frontendPhase2.get(row.id)
+  assert.ok(frontend, `${row.id} must remain in the frontend fallback catalog`)
+  assert.equal(frontend.repo_id, row.source.repo, `${row.id} frontend repo must match the source lock`)
+  assert.equal(frontend.filename, row.identity.gguf_filename, `${row.id} frontend filename must match the source lock`)
+  assert.equal(frontend.size_bytes, row.identity.size_bytes, `${row.id} frontend size must match the source lock`)
+  assert.equal(frontend.quant, row.identity.quantization, `${row.id} frontend quant must match the source lock`)
+}
+const invalidPhase2 = structuredClone(phase2Roster)
+invalidPhase2.phase.id = 3
+assert.ok(
+  validateRoster(invalidPhase2, 'phase2').some((error) => error.includes('expected integer 1 or 2')),
+  'unrecognized qualification phases must fail closed',
 )
 
 console.log('test-check-model-qualification-roster: all checks passed')

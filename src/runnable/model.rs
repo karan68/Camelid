@@ -799,6 +799,10 @@ pub struct RunnableModel {
     pub head_dim: usize,
     pub rope_dim: usize,
     pub rope_base: f32,
+    /// Position-frequency multiplier used by linear RoPE scaling. GGUF stores
+    /// the expansion factor (for example 8); llama.cpp applies its reciprocal
+    /// to the angle, so an unscaled model carries 1 here.
+    rope_freq_scale: f32,
     pub eps: f32,
     pub vocab: usize,
     rope_neox: bool,
@@ -1030,15 +1034,23 @@ impl RunnableModel {
             validate_command_r_attemptability_slice(&gguf, &cfg)?;
         }
 
-        if let Some(kind) = cfg.rope_scaling_type.as_deref() {
-            if !kind.is_empty() && kind != "none" {
-                // Phase 4 brings up plain llama (TinyLlama: no scaling). linear/yarn/
-                // llama3 scaling is a named Phase 6 follow-up, not silently ignored.
-                return Err(BackendError::UnsupportedGguf(format!(
-                    "runnable lane: rope scaling {kind:?} not yet implemented (Phase 6)"
-                )));
+        let rope_freq_scale = match cfg.rope_scaling_type.as_deref().map(str::trim) {
+            None | Some("") | Some("none") => 1.0,
+            Some("linear") => {
+                let factor = cfg.rope_scaling_factor.unwrap_or(1.0);
+                if !factor.is_finite() || factor <= 0.0 {
+                    return Err(BackendError::InvalidModelMetadata(format!(
+                        "runnable lane: linear rope scaling factor must be finite and positive, got {factor}"
+                    )));
+                }
+                factor.recip()
             }
-        }
+            Some(kind) => {
+                return Err(BackendError::UnsupportedGguf(format!(
+                    "runnable lane: rope scaling {kind:?} not yet implemented"
+                )))
+            }
+        };
 
         let mut f = File::open(path).map_err(|e| BackendError::Io {
             path: path.into(),
@@ -1245,6 +1257,7 @@ impl RunnableModel {
                 head_dim,
                 rope_dim,
                 rope_base,
+                rope_freq_scale,
                 eps: cfg.rms_norm_epsilon,
                 vocab,
                 rope_neox: true, // NEOX split-half, partial over rope_dim (64) of head_dim (256)
@@ -1410,6 +1423,7 @@ impl RunnableModel {
                 head_dim,
                 rope_dim,
                 rope_base,
+                rope_freq_scale,
                 eps: cfg.rms_norm_epsilon,
                 vocab,
                 // llama.cpp classifies LLM_ARCH_LFM2 as LLAMA_ROPE_TYPE_NEOX
@@ -1551,6 +1565,7 @@ impl RunnableModel {
             head_dim,
             rope_dim,
             rope_base,
+            rope_freq_scale,
             eps: cfg.rms_norm_epsilon,
             vocab,
             rope_neox,
@@ -2530,7 +2545,7 @@ impl RunnableModel {
             let base = h * hd;
             for i in 0..half {
                 let freq = 1.0 / rope_base.powf(2.0 * i as f32 / self.rope_dim as f32);
-                let angle = pos as f32 * freq;
+                let angle = pos as f32 * self.rope_freq_scale * freq;
                 let (sin, cos) = angle.sin_cos();
                 let (a, b) = if self.rope_neox {
                     (base + i, base + i + half)

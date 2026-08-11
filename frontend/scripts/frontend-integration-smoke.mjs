@@ -23,6 +23,7 @@ try {
   const { default: ApiView } = await server.ssrLoadModule('/src/views/ApiView.jsx')
   const { default: SystemView } = await server.ssrLoadModule('/src/views/SystemView.jsx')
   const { default: ModelsView } = await server.ssrLoadModule('/src/views/ModelsView.jsx')
+  const { blockerNoteFor } = await server.ssrLoadModule('/src/components/models/UnsupportedBlocker.jsx')
   const { default: TopBar } = await server.ssrLoadModule('/src/components/TopBar.jsx')
   const { StreamingLoader, streamingStatusLabel } = await server.ssrLoadModule('/src/components/chat/render/StreamingIndicator.jsx')
   const { getChatGateState } = await server.ssrLoadModule('/src/lib/chatGate.js')
@@ -37,6 +38,21 @@ try {
   const { LLAMA32_3B_ACCEPTANCE_TARGET } = await server.ssrLoadModule('/src/lib/acceptanceTargets.js')
 
   const noop = () => {}
+  assert.match(
+    blockerNoteFor({ code: 'model_io_error' }),
+    /could not open this model from the configured storage location/,
+    'storage failures must explain the path problem instead of claiming the architecture is missing',
+  )
+  assert.doesNotMatch(
+    blockerNoteFor({ code: 'model_io_error' }),
+    /architecture is not implemented/,
+    'model_io_error must not borrow unsupported-architecture copy',
+  )
+  assert.match(
+    blockerNoteFor({ code: 'unsupported_model_architecture' }),
+    /architecture is not implemented/,
+    'the architecture-specific note remains reserved for the typed architecture blocker',
+  )
   const readyRuntime = {
     api_base: 'http://127.0.0.1:8181',
     loaded_now: true,
@@ -169,6 +185,28 @@ try {
     setTab: noop,
   }))
   assert.doesNotMatch(textOnlyRendered, /accept="image\/png,image\/jpeg"/, 'text-only runtime must not advertise an image control it cannot serve')
+
+  const loadedButNotRunnableMarkup = renderToStaticMarkup(React.createElement(ChatWorkspace, {
+    selectedConversation: null,
+    selectedModel,
+    selectedModelId: selectedModel.id,
+    setSelectedModelId: noop,
+    models: [selectedModel],
+    runtime: { ...readyRuntime, generation_ready: false },
+    capabilities,
+    pendingConversation: null,
+    composer: 'Keep this draft editable',
+    setComposer: noop,
+    saveToMemory: noop,
+    sendMessage: noop,
+    sending: false,
+    selectedModelRunnable: false,
+    setTab: noop,
+  }))
+  assert.match(loadedButNotRunnableMarkup, /loaded, but this build cannot run it for Chat/, 'a completed fail-closed load must not look like an endless warmup')
+  assert.match(loadedButNotRunnableMarkup, /· Not runnable/, 'the model picker must distinguish a blocked loaded row from an active load')
+  assert.match(loadedButNotRunnableMarkup, /Choose a runnable model; this loaded model is blocked/, 'the composer must give an actionable next step for a permanently blocked load')
+  assert.doesNotMatch(loadedButNotRunnableMarkup, /warming up|· Loading|finishes getting ready/, 'generation_ready=false after a completed load must not masquerade as transient progress')
 
   const embeddingModel = {
     id: 'bitnet-embeddings-270m',

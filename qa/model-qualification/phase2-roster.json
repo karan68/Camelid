@@ -1,0 +1,454 @@
+{
+  "schema": "camelid.model-qualification-roster/v1",
+  "phase": {
+    "id": 2,
+    "name": "qualify-fast-follow-exact-rows",
+    "status": "active",
+    "started_on": "2026-08-11",
+    "exit_policy": "Every selected exact artifact receives all eight fail-closed gates; family adjacency, metadata inspection, and header compatibility never promote support."
+  },
+  "defaults": {
+    "models_dir_env": "CAMELID_MODELS_DIR",
+    "token_counts": [1, 5, 50],
+    "context_buckets": [512],
+    "backend": "cpu_reference",
+    "llama_cpp": {
+      "build": "b9632",
+      "revision": "acd79d603",
+      "server_env": "CAMELID_LLAMA_SERVER_BIN",
+      "tokenize_env": "CAMELID_LLAMA_TOKENIZE_BIN"
+    }
+  },
+  "gate_order": [
+    "source",
+    "metadata",
+    "tokenizer",
+    "template",
+    "load_smoke",
+    "parity",
+    "api_webui",
+    "context"
+  ],
+  "rows": [
+    {
+      "priority": 1,
+      "id": "lfm2_5_1_2b_instruct_q8_0",
+      "identity": {"family": "lfm2_5", "architecture": "lfm2", "quantization": "Q8_0", "gguf_filename": "LFM2.5-1.2B-Instruct-Q8_0.gguf", "size_bytes": 1246253888, "sha256": "f6b981dcb86917fa463f78a362320bd5e2dc45445df147287eedb85e5a30d26a"},
+      "source": {"repo": "LiquidAI/LFM2.5-1.2B-Instruct-GGUF", "file": "LFM2.5-1.2B-Instruct-Q8_0.gguf", "revision": "76022b8bfa64af5862d6bce90a676c3cc9b17b52", "license": "LFM Open License v1.0"},
+      "expected": {"tokenizer_model": "gpt2", "tokenizer_pre": "lfm2", "chat_template": "lfm2_chatml"},
+      "lane": {"serve": "runnable", "env": {}},
+      "probes": {"oracle_fixture": "qa/model-qualification/fixtures/phase2/lfm2_5_1_2b_instruct_q8_0-tokenizer-b9632.json", "smoke": "runnable_smoke", "parity": "raw_greedy", "context_buckets": [512]},
+      "target_tier": "experimental_exact_row",
+      "disposition": "active_validation",
+      "gates": {
+        "source": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/phase2-candidates/hf_selector_0d2d01c7fe3d1622c26861be-report.json"]},
+        "metadata": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/phase2-candidates/hf_selector_0d2d01c7fe3d1622c26861be-report.json"]},
+        "tokenizer": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/fixtures/phase2/lfm2_5_1_2b_instruct_q8_0-tokenizer-b9632.json", "qa/model-qualification/phase2-full/lfm2_5_1_2b_instruct_q8_0.json"]},
+        "template": {"required": true, "status": "pass", "evidence": ["qa/prompt-packs/lfm2-1.2b-thinking-chat-template-shapes-v1.json", "src/api/mod.rs"]},
+        "load_smoke": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/phase2-runtime/lfm2_5_1_2b_instruct_q8_0.json"]},
+        "parity": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/phase2-runtime/lfm2_5_1_2b_instruct_q8_0.json"]},
+        "api_webui": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/phase2-surface-matrix.json"]},
+        "context": {"required": true, "status": "blocked", "evidence": [], "reason": "No exact-row 512-token reference receipt exists."}
+      }
+    },
+    {
+      "priority": 2,
+      "id": "lfm2_5_1_2b_thinking_q8_0",
+      "identity": {"family": "lfm2_5", "architecture": "lfm2", "quantization": "Q8_0", "gguf_filename": "LFM2.5-1.2B-Thinking-Q8_0.gguf", "size_bytes": 1246254080, "sha256": "255f9dcbb8f198c8b6e91b35a63349f062a4902bc58f59312f9b66de45fa9064"},
+      "source": {"repo": "LiquidAI/LFM2.5-1.2B-Thinking-GGUF", "file": "LFM2.5-1.2B-Thinking-Q8_0.gguf", "revision": "74ddb49ac3dbd31c744afaa7061530c6466de6a0", "license": "LFM Open License v1.0"},
+      "expected": {"tokenizer_model": "gpt2", "tokenizer_pre": "lfm2", "chat_template": "lfm2_thinking_chatml"},
+      "lane": {"serve": "runnable", "env": {}},
+      "probes": {"oracle_fixture": "qa/model-qualification/fixtures/phase2/lfm2_5_1_2b_thinking_q8_0-tokenizer-b9632.json", "smoke": "runnable_smoke", "parity": "raw_greedy", "context_buckets": [512]},
+      "target_tier": "experimental_exact_row",
+      "disposition": "active_validation",
+      "gates": {
+        "source": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/phase2-candidates/hf_selector_4b521bf849ecb4d2c1237459-report.json"]},
+        "metadata": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/phase2-candidates/hf_selector_4b521bf849ecb4d2c1237459-report.json"]},
+        "tokenizer": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/fixtures/phase2/lfm2_5_1_2b_thinking_q8_0-tokenizer-b9632.json", "qa/model-qualification/phase2-full/lfm2_5_1_2b_thinking_q8_0.json"]},
+        "template": {"required": true, "status": "pass", "evidence": ["qa/prompt-packs/lfm2-1.2b-thinking-chat-template-shapes-v1.json", "src/api/mod.rs"]},
+        "load_smoke": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/phase2-runtime-matrix.json"]},
+        "parity": {"required": true, "status": "fail", "evidence": ["qa/model-qualification/phase2-runtime-matrix.json"], "reason": "Deterministic greedy output diverges at generated token index 3 on the first probe."},
+        "api_webui": {"required": true, "status": "blocked", "evidence": [], "reason": "Runtime parity is a prerequisite for public-surface qualification."},
+        "context": {"required": true, "status": "blocked", "evidence": [], "reason": "No exact-row 512-token reference receipt exists."}
+      }
+    },
+    {
+      "priority": 3,
+      "id": "gemma3_270m_it_q8_0",
+      "identity": {"family": "gemma3", "architecture": "gemma3", "quantization": "Q8_0", "gguf_filename": "gemma-3-270m-it-Q8_0.gguf", "size_bytes": 291546144, "sha256": "d156a5159f2f79c1b1d53c7c1cc20f1ff28ab8d00f17a292620aad13399b9698"},
+      "source": {"repo": "unsloth/gemma-3-270m-it-GGUF", "file": "gemma-3-270m-it-Q8_0.gguf", "revision": "c90975dbd40c0c7b275fefaae758c3415c906238", "license": "gemma"},
+      "expected": {"tokenizer_model": "llama", "tokenizer_pre": "default", "chat_template": "gemma3_it_exact"},
+      "lane": {"serve": "runnable", "env": {}},
+      "probes": {"oracle_fixture": "qa/model-qualification/fixtures/phase2/gemma3_270m_it_q8_0-tokenizer-b9632.json", "smoke": "runnable_smoke", "parity": "raw_greedy", "context_buckets": [512]},
+      "target_tier": "experimental_exact_row",
+      "disposition": "active_validation",
+      "gates": {
+        "source": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/phase2-candidates/hf_selector_0a4a4a4e6531fc7db4f13202-report.json"]},
+        "metadata": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/phase2-candidates/hf_selector_0a4a4a4e6531fc7db4f13202-report.json"]},
+        "tokenizer": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/fixtures/phase2/gemma3_270m_it_q8_0-tokenizer-b9632.json", "qa/model-qualification/phase2-full/gemma3_270m_it_q8_0.json"]},
+        "template": {"required": true, "status": "pass", "evidence": ["qa/prompt-packs/gemma3-chat-template-shapes-v1.json", "qa/model-qualification/phase2-template-equivalence.json", "src/api/mod.rs"]},
+        "load_smoke": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/phase2-runtime/gemma3_270m_it_q8_0.json"]},
+        "parity": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/phase2-runtime/gemma3_270m_it_q8_0.json"]},
+        "api_webui": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/phase2-surface-matrix.json"]},
+        "context": {"required": true, "status": "blocked", "evidence": [], "reason": "No exact-row 512-token reference receipt exists."}
+      }
+    },
+    {
+      "priority": 4,
+      "id": "gemma3_4b_it_q8_0",
+      "identity": {"family": "gemma3", "architecture": "gemma3", "quantization": "Q8_0", "gguf_filename": "gemma-3-4b-it-Q8_0.gguf", "size_bytes": 4130226336, "sha256": "97b06383df48336e7d2f9b56b6ce545e0fa476407a62c0bd081b53447a58e644"},
+      "source": {"repo": "ggml-org/gemma-3-4b-it-GGUF", "file": "gemma-3-4b-it-Q8_0.gguf", "revision": "d0976223747697cb51e056d85c532013931fe52e", "license": "gemma"},
+      "expected": {"tokenizer_model": "llama", "tokenizer_pre": "default", "chat_template": "gemma3_it_exact"},
+      "lane": {"serve": "runnable", "env": {}},
+      "probes": {"oracle_fixture": "qa/model-qualification/fixtures/phase2/gemma3_4b_it_q8_0-tokenizer-b9632.json", "smoke": "runnable_smoke", "parity": "raw_greedy", "context_buckets": [512]},
+      "target_tier": "experimental_exact_row",
+      "disposition": "active_validation",
+      "gates": {
+        "source": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/phase2-candidates/hf_selector_cac4516cd7db00839cd6d63c-report.json"]},
+        "metadata": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/phase2-candidates/hf_selector_cac4516cd7db00839cd6d63c-report.json"]},
+        "tokenizer": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/fixtures/phase2/gemma3_4b_it_q8_0-tokenizer-b9632.json", "qa/model-qualification/phase2-full/gemma3_4b_it_q8_0.json"]},
+        "template": {"required": true, "status": "pass", "evidence": ["qa/prompt-packs/gemma3-chat-template-shapes-v1.json", "qa/model-qualification/phase2-template-equivalence.json", "src/api/mod.rs"]},
+        "load_smoke": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/phase2-runtime-matrix.json"]},
+        "parity": {"required": true, "status": "fail", "evidence": ["qa/model-qualification/phase2-runtime-matrix.json"], "reason": "Linear RoPE metadata now loads, but deterministic greedy output diverges at generated token index 3."},
+        "api_webui": {"required": true, "status": "blocked", "evidence": [], "reason": "Runtime parity is a prerequisite for text-only public-surface qualification."},
+        "context": {"required": true, "status": "blocked", "evidence": [], "reason": "No exact-row 512-token reference receipt exists."}
+      }
+    },
+    {
+      "priority": 5,
+      "id": "llama3_1_8b_instruct_q8_0",
+      "identity": {"family": "llama3_1", "architecture": "llama", "quantization": "Q8_0", "gguf_filename": "Meta-Llama-3.1-8B-Instruct-Q8_0.gguf", "size_bytes": 8540775840, "sha256": "9da71c45c90a821809821244d4971e5e5dfad7eb091f0b8ff0546392393b6283"},
+      "source": {"repo": "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF", "file": "Meta-Llama-3.1-8B-Instruct-Q8_0.gguf", "revision": "bf5b95e96dac0462e2a09145ec66cae9a3f12067", "license": "llama3.1"},
+      "expected": {"tokenizer_model": "gpt2", "tokenizer_pre": "llama-bpe", "chat_template": "llama3_chatml"},
+      "lane": {"serve": "runnable", "env": {"CAMELID_GPU": "off", "CAMELID_DETERMINISTIC": "1"}},
+      "probes": {"oracle_fixture": "qa/model-qualification/fixtures/phase2/llama3_1_8b_instruct_q8_0-tokenizer-b9632.json", "smoke": "runnable_smoke", "parity": "raw_greedy", "context_buckets": [512]},
+      "target_tier": "experimental_exact_row",
+      "disposition": "active_validation",
+      "gates": {
+        "source": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/phase2-candidates/hf_selector_8f5a0e4de2d2cd165805af74-report.json"]},
+        "metadata": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/phase2-candidates/hf_selector_8f5a0e4de2d2cd165805af74-report.json"]},
+        "tokenizer": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/fixtures/phase2/llama3_1_8b_instruct_q8_0-tokenizer-b9632.json", "qa/model-qualification/phase2-full/llama3_1_8b_instruct_q8_0.json"]},
+        "template": {"required": true, "status": "pass", "evidence": ["qa/prompt-packs/llama3.1-8b-instruct-text-shapes-v1.json", "src/api/mod.rs"]},
+        "load_smoke": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/phase2-runtime-matrix.json"]},
+        "parity": {"required": true, "status": "fail", "evidence": ["qa/model-qualification/phase2-runtime-matrix.json"], "reason": "Deterministic greedy output diverges at generated token index 3 on the first probe."},
+        "api_webui": {"required": true, "status": "blocked", "evidence": [], "reason": "Runtime parity is a prerequisite for public-surface qualification."},
+        "context": {"required": true, "status": "blocked", "evidence": [], "reason": "No exact-row 512-token reference receipt exists."}
+      }
+    },
+    {
+      "priority": 6,
+      "id": "mistral_7b_instruct_v0_2_q8_0",
+      "identity": {"family": "mistral", "architecture": "llama", "quantization": "Q8_0", "gguf_filename": "mistral-7b-instruct-v0.2.Q8_0.gguf", "size_bytes": 7695857952, "sha256": "f326f5f4f137f3ad30f8c9cc21d4d39e54476583e8306ee2931d5a022cb85b06"},
+      "source": {"repo": "TheBloke/Mistral-7B-Instruct-v0.2-GGUF", "file": "mistral-7b-instruct-v0.2.Q8_0.gguf", "revision": "3a6fbf4a41a1d52e415a4958cde6856d34b2db93", "license": "apache-2.0"},
+      "expected": {"tokenizer_model": "llama", "tokenizer_pre": null, "chat_template": "mistral_v0_2_instruct"},
+      "lane": {"serve": "runnable", "env": {"CAMELID_GPU": "off", "CAMELID_DETERMINISTIC": "1"}},
+      "probes": {"oracle_fixture": "qa/model-qualification/fixtures/phase2/mistral_7b_instruct_v0_2_q8_0-tokenizer-b9632.json", "smoke": "runnable_smoke", "parity": "raw_greedy", "context_buckets": [512]},
+      "target_tier": "experimental_exact_row",
+      "disposition": "active_validation",
+      "gates": {
+        "source": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/phase2-candidates/hf_selector_74a463a22a10fcab27b6aac3-report.json"]},
+        "metadata": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/phase2-candidates/hf_selector_74a463a22a10fcab27b6aac3-report.json"]},
+        "tokenizer": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/fixtures/phase2/mistral_7b_instruct_v0_2_q8_0-tokenizer-b9632.json", "qa/model-qualification/phase2-full/mistral_7b_instruct_v0_2_q8_0.json"]},
+        "template": {"required": true, "status": "pass", "evidence": ["qa/prompt-packs/mistral-7b-v0.2-instruct-shapes-v1.json", "src/api/mod.rs"]},
+        "load_smoke": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/phase2-runtime/mistral_7b_instruct_v0_2_q8_0.json"]},
+        "parity": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/phase2-runtime/mistral_7b_instruct_v0_2_q8_0.json"]},
+        "api_webui": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/phase2-surface-matrix.json"]},
+        "context": {"required": true, "status": "blocked", "evidence": [], "reason": "No exact-row 512-token reference receipt exists."}
+      }
+    },
+    {
+      "priority": 7,
+      "id": "qwen2_5_0_5b_instruct_q8_0",
+      "identity": {"family": "qwen2_5", "architecture": "qwen2", "quantization": "Q8_0", "gguf_filename": "qwen2.5-0.5b-instruct-q8_0.gguf", "size_bytes": 675710816, "sha256": "ca59ca7f13d0e15a8cfa77bd17e65d24f6844b554a7b6c12e07a5f89ff76844e"},
+      "source": {"repo": "Qwen/Qwen2.5-0.5B-Instruct-GGUF", "file": "qwen2.5-0.5b-instruct-q8_0.gguf", "revision": "9217f5db79a29953eb74d5343926648285ec7e67", "license": "apache-2.0"},
+      "expected": {"tokenizer_model": "gpt2", "tokenizer_pre": "qwen2", "chat_template": "qwen2_5_chatml"},
+      "lane": {"serve": "cpu_reference", "env": {"CAMELID_GPU": "off", "CAMELID_DETERMINISTIC": "1"}},
+      "probes": {"oracle_fixture": "qa/model-qualification/fixtures/qwen2.5-0.5b-q8-llamacpp-b9632.json", "smoke": "runnable_smoke", "parity": "raw_greedy", "context_buckets": [512]},
+      "target_tier": "experimental_exact_row",
+      "disposition": "active_validation",
+      "gates": {
+        "source": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/fixtures/qwen2.5-0.5b-q8-llamacpp-b9632.json"]},
+        "metadata": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/qwen2.5-0.5b-q8-bootstrap-report.json"]},
+        "tokenizer": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/fixtures/qwen2.5-0.5b-q8-llamacpp-b9632.json", "qa/model-qualification/qwen2.5-0.5b-q8-bootstrap-report.json"]},
+        "template": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/fixtures/qwen2.5-0.5b-q8-llamacpp-b9632.json", "src/api/mod.rs"]},
+        "load_smoke": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/phase2-runtime/qwen2_5_0_5b_instruct_q8_0.json"]},
+        "parity": {"required": true, "status": "fail", "evidence": ["qa/model-qualification/phase2-runtime/qwen2_5_0_5b_instruct_q8_0.json", "qa/model-qualification/qwen2.5-0.5b-q8-parity-localization.json"], "reason": "Three of four probes match; one probe flips only at the final generated token."},
+        "api_webui": {"required": true, "status": "blocked", "evidence": ["qa/model-qualification/qwen2.5-0.5b-q8-bootstrap-report.json"], "reason": "SSE and Models-page load-to-chat promotion smoke remain absent."},
+        "context": {"required": true, "status": "blocked", "evidence": [], "reason": "The required public verifier transcript is absent and must be regenerated."}
+      }
+    },
+    {
+      "priority": 8,
+      "id": "qwen2_5_1_5b_instruct_q8_0",
+      "identity": {"family": "qwen2_5", "architecture": "qwen2", "quantization": "Q8_0", "gguf_filename": "qwen2.5-1.5b-instruct-q8_0.gguf", "size_bytes": 1894532128, "sha256": "d7efb072e7724d25048a4fda0a3e10b04bdef5d06b1403a1c93bd9f1240a63c8"},
+      "source": {"repo": "Qwen/Qwen2.5-1.5B-Instruct-GGUF", "file": "qwen2.5-1.5b-instruct-q8_0.gguf", "revision": "91cad51170dc346986eccefdc2dd33a9da36ead9", "license": "apache-2.0"},
+      "expected": {"tokenizer_model": "gpt2", "tokenizer_pre": "qwen2", "chat_template": "qwen2_5_chatml"},
+      "lane": {"serve": "cpu_reference", "env": {"CAMELID_GPU": "off", "CAMELID_DETERMINISTIC": "1"}},
+      "probes": {"oracle_fixture": "qa/model-qualification/fixtures/phase2/qwen2_5_1_5b_instruct_q8_0-tokenizer-b9632.json", "smoke": "runnable_smoke", "parity": "raw_greedy", "context_buckets": [512]},
+      "target_tier": "experimental_exact_row",
+      "disposition": "active_validation",
+      "gates": {
+        "source": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/phase2-candidates/hf_selector_499d4d0143574ac081e796bb-report.json"]},
+        "metadata": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/phase2-candidates/hf_selector_499d4d0143574ac081e796bb-report.json"]},
+        "tokenizer": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/fixtures/phase2/qwen2_5_1_5b_instruct_q8_0-tokenizer-b9632.json", "qa/model-qualification/phase2-full/qwen2_5_1_5b_instruct_q8_0.json"]},
+        "template": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/fixtures/qwen2.5-0.5b-q8-llamacpp-b9632.json", "qa/model-qualification/phase2-template-equivalence.json", "src/api/mod.rs"]},
+        "load_smoke": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/phase2-runtime-matrix.json"]},
+        "parity": {"required": true, "status": "fail", "evidence": ["qa/model-qualification/phase2-runtime-matrix.json"], "reason": "Deterministic greedy output diverges at generated token index 4 on the first probe."},
+        "api_webui": {"required": true, "status": "blocked", "evidence": [], "reason": "Runtime parity is a prerequisite for public-surface qualification."},
+        "context": {"required": true, "status": "blocked", "evidence": [], "reason": "No exact-row 512-token reference receipt exists."}
+      }
+    },
+    {
+      "priority": 9,
+      "id": "qwen2_5_coder_1_5b_instruct_q8_0",
+      "identity": {"family": "qwen2_5_coder", "architecture": "qwen2", "quantization": "Q8_0", "gguf_filename": "qwen2.5-coder-1.5b-instruct-q8_0.gguf", "size_bytes": 1894532160, "sha256": "507de59046601282ba768a9789900e6ccf60ed93ddf346730b7c68eb0715bc47"},
+      "source": {"repo": "Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF", "file": "qwen2.5-coder-1.5b-instruct-q8_0.gguf", "revision": "f86cb2c1fa58255f8052cc32aeede1b7482d4361", "license": "apache-2.0"},
+      "expected": {"tokenizer_model": "gpt2", "tokenizer_pre": "qwen2", "chat_template": "qwen2_5_chatml"},
+      "lane": {"serve": "cpu_reference", "env": {"CAMELID_GPU": "off", "CAMELID_DETERMINISTIC": "1"}},
+      "probes": {"oracle_fixture": "qa/model-qualification/fixtures/phase2/qwen2_5_coder_1_5b_instruct_q8_0-tokenizer-b9632.json", "smoke": "runnable_smoke", "parity": "raw_greedy", "context_buckets": [512]},
+      "target_tier": "experimental_exact_row",
+      "disposition": "active_validation",
+      "gates": {
+        "source": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/phase2-candidates/hf_selector_34c51f6d613838100ea2f34e-report.json"]},
+        "metadata": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/phase2-candidates/hf_selector_34c51f6d613838100ea2f34e-report.json"]},
+        "tokenizer": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/fixtures/phase2/qwen2_5_coder_1_5b_instruct_q8_0-tokenizer-b9632.json", "qa/model-qualification/phase2-full/qwen2_5_coder_1_5b_instruct_q8_0.json"]},
+        "template": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/fixtures/qwen2.5-0.5b-q8-llamacpp-b9632.json", "qa/model-qualification/phase2-template-equivalence.json", "src/api/mod.rs"]},
+        "load_smoke": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/phase2-runtime/qwen2_5_coder_1_5b_instruct_q8_0.json"]},
+        "parity": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/phase2-runtime/qwen2_5_coder_1_5b_instruct_q8_0.json"]},
+        "api_webui": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/phase2-surface-matrix.json"]},
+        "context": {"required": true, "status": "blocked", "evidence": [], "reason": "No exact-row 512-token reference receipt exists."}
+      }
+    },
+    {
+      "priority": 10,
+      "id": "qwen3_5_0_8b_q8_0",
+      "identity": {"family": "qwen3_5", "architecture": "qwen35", "quantization": "Q8_0", "gguf_filename": "Qwen3.5-0.8B-Q8_0.gguf", "size_bytes": 811843840, "sha256": "0ad885ffd4bb022fc4f0d33a3308fa108ef8613159d3b3a67e23abca056b7a6c"},
+      "source": {"repo": "unsloth/Qwen3.5-0.8B-GGUF", "file": "Qwen3.5-0.8B-Q8_0.gguf", "revision": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0", "license": "apache-2.0"},
+      "expected": {"tokenizer_model": "gpt2", "tokenizer_pre": "qwen35", "chat_template": "qwen35_text_chatml"},
+      "lane": {"serve": "runnable", "env": {"CAMELID_GPU": "off", "CAMELID_DETERMINISTIC": "1"}},
+      "probes": {"oracle_fixture": "qa/model-qualification/fixtures/phase2/qwen3_5_0_8b_q8_0-tokenizer-b9632.json", "smoke": "runnable_smoke", "parity": "raw_greedy", "context_buckets": [512]},
+      "target_tier": "experimental_exact_row",
+      "disposition": "active_validation",
+      "gates": {
+        "source": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/phase2-candidates/hf_selector_2cb94d957d2d43afb9110050-report.json"]},
+        "metadata": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/phase2-candidates/hf_selector_2cb94d957d2d43afb9110050-report.json"]},
+        "tokenizer": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/fixtures/phase2/qwen3_5_0_8b_q8_0-tokenizer-b9632.json", "qa/model-qualification/phase2-full/qwen3_5_0_8b_q8_0.json"]},
+        "template": {"required": true, "status": "pass", "evidence": ["qa/prompt-packs/qwen3.5-text-chat-template-shapes-v1.json", "src/api/mod.rs"]},
+        "load_smoke": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/phase2-runtime/qwen3_5_0_8b_q8_0.json"]},
+        "parity": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/phase2-runtime/qwen3_5_0_8b_q8_0.json"]},
+        "api_webui": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/phase2-surface-matrix.json"]},
+        "context": {"required": true, "status": "blocked", "evidence": [], "reason": "No exact-row 512-token reference receipt exists."}
+      }
+    },
+    {
+      "priority": 11,
+      "id": "qwen3_5_2b_q8_0",
+      "identity": {"family": "qwen3_5", "architecture": "qwen35", "quantization": "Q8_0", "gguf_filename": "Qwen3.5-2B-Q8_0.gguf", "size_bytes": 2012012800, "sha256": "1b04acba824817554f4ce23639bc8495ff70453b8fcb047900c731521021f2c1"},
+      "source": {"repo": "unsloth/Qwen3.5-2B-GGUF", "file": "Qwen3.5-2B-Q8_0.gguf", "revision": "f6d5376be1edb4d416d56da11e5397a961aca8ae", "license": "apache-2.0"},
+      "expected": {"tokenizer_model": "gpt2", "tokenizer_pre": "qwen35", "chat_template": "qwen35_text_chatml"},
+      "lane": {"serve": "runnable", "env": {"CAMELID_GPU": "off", "CAMELID_DETERMINISTIC": "1"}},
+      "probes": {"oracle_fixture": "qa/model-qualification/fixtures/phase2/qwen3_5_2b_q8_0-tokenizer-b9632.json", "smoke": "runnable_smoke", "parity": "raw_greedy", "context_buckets": [512]},
+      "target_tier": "experimental_exact_row",
+      "disposition": "active_validation",
+      "gates": {
+        "source": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/phase2-candidates/hf_selector_e7a487628cec4f0a04008bbe-report.json"]},
+        "metadata": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/phase2-candidates/hf_selector_e7a487628cec4f0a04008bbe-report.json"]},
+        "tokenizer": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/fixtures/phase2/qwen3_5_2b_q8_0-tokenizer-b9632.json", "qa/model-qualification/phase2-full/qwen3_5_2b_q8_0.json"]},
+        "template": {"required": true, "status": "pass", "evidence": ["qa/prompt-packs/qwen3.5-text-chat-template-shapes-v1.json", "src/api/mod.rs"]},
+        "load_smoke": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/phase2-runtime/qwen3_5_2b_q8_0.json"]},
+        "parity": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/phase2-runtime/qwen3_5_2b_q8_0.json"]},
+        "api_webui": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/phase2-surface-matrix.json"]},
+        "context": {"required": true, "status": "blocked", "evidence": [], "reason": "No exact-row 512-token reference receipt exists."}
+      }
+    },
+    {
+      "priority": 12,
+      "id": "qwen3_5_4b_q8_0",
+      "identity": {"family": "qwen3_5", "architecture": "qwen35", "quantization": "Q8_0", "gguf_filename": "Qwen3.5-4B-Q8_0.gguf", "size_bytes": 4482403488, "sha256": "10cc391b403021dd11c614679d2fd92f611c3681d29e29651b717316965d61e1"},
+      "source": {"repo": "unsloth/Qwen3.5-4B-GGUF", "file": "Qwen3.5-4B-Q8_0.gguf", "revision": "e87f176479d0855a907a41277aca2f8ee7a09523", "license": "apache-2.0"},
+      "expected": {"tokenizer_model": "gpt2", "tokenizer_pre": "qwen35", "chat_template": "qwen35_text_chatml"},
+      "lane": {"serve": "runnable", "env": {"CAMELID_GPU": "off", "CAMELID_DETERMINISTIC": "1"}},
+      "probes": {"oracle_fixture": "qa/model-qualification/fixtures/phase2/qwen3_5_4b_q8_0-tokenizer-b9632.json", "smoke": "runnable_smoke", "parity": "raw_greedy", "context_buckets": [512]},
+      "target_tier": "experimental_exact_row",
+      "disposition": "active_validation",
+      "gates": {
+        "source": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/phase2-candidates/hf_selector_c5055cc7ae4003d2ef614aee-report.json"]},
+        "metadata": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/phase2-candidates/hf_selector_c5055cc7ae4003d2ef614aee-report.json"]},
+        "tokenizer": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/fixtures/phase2/qwen3_5_4b_q8_0-tokenizer-b9632.json", "qa/model-qualification/phase2-full/qwen3_5_4b_q8_0.json"]},
+        "template": {"required": true, "status": "pass", "evidence": ["qa/prompt-packs/qwen3.5-text-chat-template-shapes-v1.json", "src/api/mod.rs"]},
+        "load_smoke": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/phase2-runtime/qwen3_5_4b_q8_0.json"]},
+        "parity": {"required": true, "status": "fail", "evidence": ["qa/model-qualification/phase2-runtime/qwen3_5_4b_q8_0.json"], "reason": "Three of six deterministic greedy probes diverge from the pinned oracle."},
+        "api_webui": {"required": true, "status": "blocked", "evidence": [], "reason": "Text-only runtime parity is a prerequisite for public-surface qualification."},
+        "context": {"required": true, "status": "blocked", "evidence": [], "reason": "No exact-row 512-token reference receipt exists."}
+      }
+    },
+    {
+      "priority": 13,
+      "id": "qwen3_5_9b_q8_0",
+      "identity": {"family": "qwen3_5", "architecture": "qwen35", "quantization": "Q8_0", "gguf_filename": "Qwen3.5-9B-Q8_0.gguf", "size_bytes": 9527502048, "sha256": "809626574d0cb43d4becfa56169980da2bb448f2299270f7be443cb89d0a6ae4"},
+      "source": {"repo": "unsloth/Qwen3.5-9B-GGUF", "file": "Qwen3.5-9B-Q8_0.gguf", "revision": "3885219b6810b007914f3a7950a8d1b469d598a5", "license": "apache-2.0"},
+      "expected": {"tokenizer_model": "gpt2", "tokenizer_pre": "qwen35", "chat_template": "qwen35_text_chatml"},
+      "lane": {"serve": "runnable", "env": {"CAMELID_GPU": "off", "CAMELID_DETERMINISTIC": "1"}},
+      "probes": {"oracle_fixture": "qa/model-qualification/fixtures/phase2/qwen3_5_9b_q8_0-tokenizer-b9632.json", "smoke": "runnable_smoke", "parity": "raw_greedy", "context_buckets": [512]},
+      "target_tier": "experimental_exact_row",
+      "disposition": "active_validation",
+      "gates": {
+        "source": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/phase2-candidates/hf_selector_37d7f5aac5ec619a7fe6ae05-report.json"]},
+        "metadata": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/phase2-candidates/hf_selector_37d7f5aac5ec619a7fe6ae05-report.json"]},
+        "tokenizer": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/fixtures/phase2/qwen3_5_9b_q8_0-tokenizer-b9632.json", "qa/model-qualification/phase2-full/qwen3_5_9b_q8_0.json"]},
+        "template": {"required": true, "status": "pass", "evidence": ["qa/prompt-packs/qwen3.5-text-chat-template-shapes-v1.json", "src/api/mod.rs"]},
+        "load_smoke": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/phase2-runtime-matrix.json"]},
+        "parity": {"required": true, "status": "fail", "evidence": ["qa/model-qualification/phase2-runtime-matrix.json"], "reason": "Deterministic greedy output diverges at generated token index 3 on the first probe."},
+        "api_webui": {"required": true, "status": "blocked", "evidence": [], "reason": "Text-only runtime parity is a prerequisite for public-surface qualification."},
+        "context": {"required": true, "status": "blocked", "evidence": [], "reason": "No exact-row 512-token reference receipt exists."}
+      }
+    },
+    {
+      "priority": 14,
+      "id": "deepseek_r1_distill_qwen_1_5b_q8_0",
+      "identity": {"family": "deepseek_r1_distill_qwen", "architecture": "qwen2", "quantization": "Q8_0", "gguf_filename": "DeepSeek-R1-Distill-Qwen-1.5B-Q8_0.gguf", "size_bytes": 1894532416, "sha256": "068a721e47419ccfc94b6420118f772478544e1a0d4fad7118212774b3f9ba9e"},
+      "source": {"repo": "unsloth/DeepSeek-R1-Distill-Qwen-1.5B-GGUF", "file": "DeepSeek-R1-Distill-Qwen-1.5B-Q8_0.gguf", "revision": "3cb4d15544a2a5e07439592b9a0965b6445fbd34", "license": "apache-2.0"},
+      "expected": {"tokenizer_model": "gpt2", "tokenizer_pre": "deepseek-r1-qwen", "chat_template": "deepseek_r1_qwen_chatml"},
+      "lane": {"serve": "cpu_reference", "env": {"CAMELID_GPU": "off", "CAMELID_DETERMINISTIC": "1"}},
+      "probes": {"oracle_fixture": "qa/model-qualification/fixtures/phase2/deepseek_r1_distill_qwen_1_5b_q8_0-tokenizer-b9632.json", "smoke": "runnable_smoke", "parity": "raw_greedy", "context_buckets": [512]},
+      "target_tier": "experimental_exact_row",
+      "disposition": "active_validation",
+      "gates": {
+        "source": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/phase2-candidates/hf_selector_7400a5ff3424b14c3a745d9a-report.json"]},
+        "metadata": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/phase2-candidates/hf_selector_7400a5ff3424b14c3a745d9a-report.json"]},
+        "tokenizer": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/fixtures/phase2/deepseek_r1_distill_qwen_1_5b_q8_0-tokenizer-b9632.json", "qa/model-qualification/phase2-full/deepseek_r1_distill_qwen_1_5b_q8_0.json", "src/tokenizer/mod.rs"]},
+        "template": {"required": true, "status": "pass", "evidence": ["qa/prompt-packs/deepseek-r1-distill-text-shapes-v1.json", "src/api/mod.rs"]},
+        "load_smoke": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/phase2-runtime-matrix.json"]},
+        "parity": {"required": true, "status": "fail", "evidence": ["qa/model-qualification/phase2-runtime-matrix.json"], "reason": "Deterministic greedy output diverges at generated token index 3 on the first probe."},
+        "api_webui": {"required": true, "status": "blocked", "evidence": [], "reason": "Runtime parity is a prerequisite for public-surface qualification."},
+        "context": {"required": true, "status": "blocked", "evidence": [], "reason": "No exact-row 512-token reference receipt exists."}
+      }
+    },
+    {
+      "priority": 15,
+      "id": "deepseek_r1_distill_llama_8b_q8_0",
+      "identity": {"family": "deepseek_r1_distill_llama", "architecture": "llama", "quantization": "Q8_0", "gguf_filename": "DeepSeek-R1-Distill-Llama-8B-Q8_0.gguf", "size_bytes": 8540773088, "sha256": "8c6e3924d662d3f24a96b228a5c317510c27e91c587e71e78877ed18a875ec82"},
+      "source": {"repo": "unsloth/DeepSeek-R1-Distill-Llama-8B-GGUF", "file": "DeepSeek-R1-Distill-Llama-8B-Q8_0.gguf", "revision": "615f8936e16dfde29dcc00be71145d4d5ce8ed53", "license": "llama3.1"},
+      "expected": {"tokenizer_model": "gpt2", "tokenizer_pre": "llama-bpe", "chat_template": "deepseek_r1_llama_chatml"},
+      "lane": {"serve": "runnable", "env": {"CAMELID_GPU": "off", "CAMELID_DETERMINISTIC": "1"}},
+      "probes": {"oracle_fixture": "qa/model-qualification/fixtures/phase2/deepseek_r1_distill_llama_8b_q8_0-tokenizer-b9632.json", "smoke": "runnable_smoke", "parity": "raw_greedy", "context_buckets": [512]},
+      "target_tier": "experimental_exact_row",
+      "disposition": "active_validation",
+      "gates": {
+        "source": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/phase2-candidates/hf_selector_3743f47e9421922b500c2335-report.json"]},
+        "metadata": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/phase2-candidates/hf_selector_3743f47e9421922b500c2335-report.json"]},
+        "tokenizer": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/fixtures/phase2/deepseek_r1_distill_llama_8b_q8_0-tokenizer-b9632.json", "qa/model-qualification/phase2-full/deepseek_r1_distill_llama_8b_q8_0.json", "src/tokenizer/mod.rs"]},
+        "template": {"required": true, "status": "pass", "evidence": ["qa/prompt-packs/deepseek-r1-distill-text-shapes-v1.json", "src/api/mod.rs"]},
+        "load_smoke": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/phase2-runtime/deepseek_r1_distill_llama_8b_q8_0.json"]},
+        "parity": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/phase2-runtime/deepseek_r1_distill_llama_8b_q8_0.json"]},
+        "api_webui": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/phase2-surface-matrix.json"]},
+        "context": {"required": true, "status": "blocked", "evidence": [], "reason": "No exact-row 512-token reference receipt exists."}
+      }
+    },
+    {
+      "priority": 16,
+      "id": "phi3_mini_4k_instruct_q8_0",
+      "identity": {"family": "phi3", "architecture": "phi3", "quantization": "Q8_0", "gguf_filename": "Phi-3-mini-4k-instruct-Q8_0.gguf", "size_bytes": 4061221376, "sha256": "0ac8ee48aeebf7d1b354691fd1e29e91c32ad88bbad10ad45ac880dcd4372a47"},
+      "source": {"repo": "bartowski/Phi-3-mini-4k-instruct-GGUF", "file": "Phi-3-mini-4k-instruct-Q8_0.gguf", "revision": "e1447f6da0be91f91683c5d19f938d4f51122d88", "license": "mit"},
+      "expected": {"tokenizer_model": "llama", "tokenizer_pre": "default", "chat_template": "phi3_markers"},
+      "lane": {"serve": "cpu_reference", "env": {"CAMELID_GPU": "off", "CAMELID_DETERMINISTIC": "1"}},
+      "probes": {"oracle_fixture": "qa/model-qualification/fixtures/phase2/phi3_mini_4k_instruct_q8_0-tokenizer-b9632.json", "smoke": "runnable_smoke", "parity": "raw_greedy", "context_buckets": [512]},
+      "target_tier": "experimental_exact_row",
+      "disposition": "hold",
+      "gates": {
+        "source": {"required": true, "status": "pass", "evidence": ["MUSTER_ACQUISITION.md"]},
+        "metadata": {"required": true, "status": "pass", "evidence": ["qa/muster/HOLD-phi3-mini-4k-instruct-q8_0.json"]},
+        "tokenizer": {"required": true, "status": "pass", "evidence": ["qa/muster/phi3-hold-evidence/prompt-token-parity-q8-20260727.json", "qa/muster/phi3-hold-evidence/chat-prompt-token-parity-q8-20260727.json", "qa/model-qualification/fixtures/phase2/phi3_mini_4k_instruct_q8_0-tokenizer-b9632.json", "qa/model-qualification/phase2-full/phi3_mini_4k_instruct_q8_0.json"]},
+        "template": {"required": true, "status": "pass", "evidence": ["qa/muster/phi3-hold-evidence/chat-prompt-token-parity-q8-20260727.json"]},
+        "load_smoke": {"required": true, "status": "pass", "evidence": ["qa/muster/phi3-hold-evidence/nondeterminism-fixed-q8-20260728.json"]},
+        "parity": {"required": true, "status": "fail", "evidence": ["qa/muster/phi3-hold-evidence/generation-divergence-q8-20260727.json", "qa/model-qualification/phi3-mini-head96-prefill-localization.json"], "reason": "The fresh-prefill/incremental split remains unresolved pending an exact Metal rerun."},
+        "api_webui": {"required": true, "status": "blocked", "evidence": [], "reason": "Promotion smoke is downstream of unresolved generation parity."},
+        "context": {"required": true, "status": "blocked", "evidence": [], "reason": "Short-generation parity must close before a 512-token claim."}
+      }
+    },
+    {
+      "priority": 17,
+      "id": "phi4_mini_instruct_q8_0",
+      "identity": {"family": "phi4", "architecture": "phi3", "quantization": "Q8_0", "gguf_filename": "Phi-4-mini-instruct.Q8_0.gguf", "size_bytes": 4084611040, "sha256": "26188c6050d525376a88b04514c236c5e28a36730f1e936f2a00314212b7ba42"},
+      "source": {"repo": "unsloth/Phi-4-mini-instruct-GGUF", "file": "Phi-4-mini-instruct.Q8_0.gguf", "revision": "78eb92a46fc37e6b524df991ed9aca9bc6aa7b80", "license": "mit"},
+      "expected": {"tokenizer_model": "gpt2", "tokenizer_pre": "gpt-4o", "chat_template": "phi4_mini_chatml"},
+      "lane": {"serve": "runnable", "env": {"CAMELID_GPU": "off", "CAMELID_DETERMINISTIC": "1"}},
+      "probes": {"oracle_fixture": "qa/model-qualification/fixtures/phase2/phi4_mini_instruct_q8_0-tokenizer-b9632.json", "smoke": "runnable_smoke", "parity": "raw_greedy", "context_buckets": [512]},
+      "target_tier": "experimental_exact_row",
+      "disposition": "active_validation",
+      "gates": {
+        "source": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/phase2-candidates/hf_selector_f9149b3b2cb1a53b129b6477-report.json"]},
+        "metadata": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/phase2-candidates/hf_selector_f9149b3b2cb1a53b129b6477-report.json"]},
+        "tokenizer": {"required": true, "status": "pass", "evidence": ["qa/prompt-packs/phi4-mini-gpt4o-tokenizer-oracle-v1.json", "qa/model-qualification/fixtures/phase2/phi4_mini_instruct_q8_0-tokenizer-b9632.json", "qa/model-qualification/phase2-full/phi4_mini_instruct_q8_0.json", "src/tokenizer/mod.rs"]},
+        "template": {"required": true, "status": "pass", "evidence": ["qa/prompt-packs/phi4-mini-chat-template-shapes-v1.json", "src/api/mod.rs"]},
+        "load_smoke": {"required": true, "status": "fail", "evidence": ["qa/model-qualification/phase2-runtime-matrix.json"], "reason": "The runtime does not yet bind Phi-4's fused QKV tensor layout."},
+        "parity": {"required": true, "status": "blocked", "evidence": ["qa/model-qualification/phase2-runtime-matrix.json"], "reason": "Load fails before a real-weight forward pass."},
+        "api_webui": {"required": true, "status": "blocked", "evidence": [], "reason": "Runtime parity is a prerequisite for public-surface qualification."},
+        "context": {"required": true, "status": "blocked", "evidence": [], "reason": "No exact-row 512-token reference receipt exists."}
+      }
+    },
+    {
+      "priority": 18,
+      "id": "gemma2_9b_it_q8_0",
+      "identity": {"family": "gemma2", "architecture": "gemma2", "quantization": "Q8_0", "gguf_filename": "gemma-2-9b-it-q8_0.gguf", "size_bytes": 9827149312, "sha256": "59f2e1125fc3af738c256336fb11095da855050305b3705c6c779730a3a8d84e"},
+      "source": {"repo": "BenevolenceMessiah/gemma-2-9b-it-Q8_0-GGUF", "file": "gemma-2-9b-it-q8_0.gguf", "revision": "eb4741d7b2aece6d8519db62dc31d89029a40af8", "license": "gemma"},
+      "expected": {"tokenizer_model": "llama", "tokenizer_pre": "default", "chat_template": "gemma2_it_exact"},
+      "lane": {"serve": "runnable", "env": {}},
+      "probes": {"oracle_fixture": "qa/model-qualification/fixtures/phase2/gemma2_9b_it_q8_0-tokenizer-b9632.json", "smoke": "runnable_smoke", "parity": "chat_greedy", "context_buckets": [512]},
+      "target_tier": "experimental_exact_row",
+      "disposition": "active_validation",
+      "gates": {
+        "source": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/gemma2-9b-it-q8-source-lock.json", "qa/model-qualification/fixtures/gemma2-it-chat-template-v1.json"]},
+        "metadata": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/gemma2-9b-it-q8-header-tokenizer-parity.json", "src/model.rs"]},
+        "tokenizer": {"required": true, "status": "pass", "evidence": ["src/tokenizer/mod.rs", "qa/model-qualification/gemma2-9b-it-q8-header-tokenizer-parity.json", "qa/model-qualification/fixtures/phase2/gemma2_9b_it_q8_0-tokenizer-b9632.json", "qa/model-qualification/phase2-full/gemma2_9b_it_q8_0.json"]},
+        "template": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/fixtures/gemma2-it-chat-template-v1.json", "src/api/mod.rs"]},
+        "load_smoke": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/phase2-runtime/gemma2_9b_it_q8_0.json"]},
+        "parity": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/phase2-runtime/gemma2_9b_it_q8_0.json"]},
+        "api_webui": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/phase2-surface-matrix.json"]},
+        "context": {"required": true, "status": "pending", "evidence": []}
+      }
+    },
+    {
+      "priority": 19,
+      "id": "smollm3_3b_q8_0",
+      "identity": {"family": "smollm3", "architecture": "smollm3", "quantization": "Q8_0", "gguf_filename": "SmolLM3-Q8_0.gguf", "size_bytes": 3275574624, "sha256": "8aa8cc74656137174a1988d993b00828e65a86fd68773412b632a75aa1373248"},
+      "source": {"repo": "ggml-org/SmolLM3-3B-GGUF", "file": "SmolLM3-Q8_0.gguf", "revision": "4965cb60b150737b68a0408c36aeefb65078f894", "license": "apache-2.0"},
+      "expected": {"tokenizer_model": "gpt2", "tokenizer_pre": "smaug-bpe", "chat_template": "smollm3_dynamic_chatml"},
+      "lane": {"serve": "cpu_reference", "env": {"CAMELID_GPU": "off"}},
+      "probes": {"oracle_fixture": "qa/model-qualification/fixtures/phase2/smollm3_3b_q8_0-tokenizer-b9632.json", "smoke": "serve", "parity": "chat_greedy", "context_buckets": [512]},
+      "target_tier": "experimental_exact_row",
+      "disposition": "hold",
+      "gates": {
+        "source": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/smollm3-3b-q8-source-lock.json"]},
+        "metadata": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/smollm3-3b-q8-header-tokenizer-parity.json", "src/model.rs"]},
+        "tokenizer": {"required": true, "status": "pass", "evidence": ["src/tokenizer/mod.rs", "qa/model-qualification/smollm3-3b-q8-header-tokenizer-parity.json", "qa/model-qualification/fixtures/phase2/smollm3_3b_q8_0-tokenizer-b9632.json", "qa/model-qualification/phase2-full/smollm3_3b_q8_0.json"]},
+        "template": {"required": true, "status": "blocked", "evidence": ["qa/prompt-packs/smollm3-chat-template-shapes-v1.json", "qa/model-qualification/fixtures/smollm3-default-thinking-runtime-envelope-v1.json", "src/api/mod.rs"], "reason": "Only the bounded default-thinking text envelope is qualified; remaining template branches and real-artifact HTTP token parity are absent."},
+        "load_smoke": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/phase2-runtime/smollm3_3b_q8_0.json"]},
+        "parity": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/phase2-runtime/smollm3_3b_q8_0.json"]},
+        "api_webui": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/phase2-surface-matrix.json"], "reason": "Pass is bounded to the default-thinking envelope; the broader template gate remains blocked."},
+        "context": {"required": true, "status": "pending", "evidence": []}
+      }
+    },
+    {
+      "priority": 20,
+      "id": "aya_expanse_8b_q4_k_m",
+      "identity": {"family": "aya_expanse", "architecture": "command-r", "quantization": "Q4_K_M", "gguf_filename": "aya-expanse-8b-Q4_K_M.gguf", "size_bytes": 5056982720, "sha256": "9592bad943fe56cf93200286a0a4b00a158cd84a408f227b9978ec5879002fb8"},
+      "source": {"repo": "bartowski/aya-expanse-8b-GGUF", "file": "aya-expanse-8b-Q4_K_M.gguf", "revision": "f9d62ed0c58e6f2ae17975df990b1b8a4013b596", "license": "cc-by-nc-4.0"},
+      "expected": {"tokenizer_model": "gpt2", "tokenizer_pre": "command-r", "chat_template": "aya_start_of_turn"},
+      "lane": {"serve": "runnable", "env": {"CAMELID_GPU": "off", "CAMELID_DETERMINISTIC": "1"}},
+      "probes": {"oracle_fixture": "qa/model-qualification/fixtures/phase2/aya_expanse_8b_q4_k_m-tokenizer-b9632.json", "smoke": "runnable_smoke", "parity": "chat_greedy", "context_buckets": [512]},
+      "target_tier": "experimental_exact_row",
+      "disposition": "hold",
+      "gates": {
+        "source": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/phase3-command-r-aya-attemptability-report.json"]},
+        "metadata": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/phase3-command-r-aya-attemptability-report.json", "qa/model-qualification/fixtures/aya-expanse-8b-q4-k-m-command-r-v1.json"]},
+        "tokenizer": {"required": true, "status": "pass", "evidence": ["src/tokenizer/mod.rs", "qa/model-qualification/fixtures/phase2/aya_expanse_8b_q4_k_m-tokenizer-b9632.json", "qa/model-qualification/phase2-full/aya_expanse_8b_q4_k_m.json"]},
+        "template": {"required": true, "status": "pass", "evidence": ["qa/prompt-packs/aya-expanse-start-of-turn-shapes-v1.json", "src/api/mod.rs"]},
+        "load_smoke": {"required": true, "status": "pass", "evidence": ["qa/model-qualification/phase2-runtime/aya_expanse_8b_q4_k_m.json"]},
+        "parity": {"required": true, "status": "fail", "evidence": ["qa/model-qualification/phase2-runtime/aya_expanse_8b_q4_k_m.json"], "reason": "Five of six probes match; the math probe diverges at generated token index 3."},
+        "api_webui": {"required": true, "status": "blocked", "evidence": [], "reason": "No exact-row API, SSE, Models-page, or WebUI evidence exists."},
+        "context": {"required": true, "status": "blocked", "evidence": [], "reason": "No guarded 512-token reference-parity run exists."}
+      }
+    }
+  ]
+}

@@ -2,18 +2,19 @@
 import assert from 'node:assert/strict'
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import { spawnSync } from 'node:child_process'
 
 const script = 'scripts/bench-llama3-same-host.mjs'
 const tmp = await mkdtemp(join(tmpdir(), 'camelid-bench-plan-'))
+const modelPath = resolve('/tmp/Camelid Test/Llama-3.2-1B-Instruct-Q8_0.gguf')
 
 try {
   const planPath = join(tmp, 'plan.json')
   const planRun = spawnSync(process.execPath, [
     script,
     '--print-plan',
-    '--model', '/tmp/Camelid Test/Llama-3.2-1B-Instruct-Q8_0.gguf',
+    '--model', modelPath,
     '--model-id', 'llama32-1b-q8-plan',
     '--row-id', 'llama32_1b_instruct_q8_0',
     '--max-tokens', '8',
@@ -41,7 +42,7 @@ try {
   assert.ok(plan.method.evidence_context.host_class.cpu_count >= 1)
   assert.equal(plan.method.resource_snapshots.pre_start.label, 'pre_start')
   assert.match(plan.commands.harness, /--row-id llama32_1b_instruct_q8_0/)
-  assert.match(plan.commands.harness, /'\/tmp\/Camelid Test\/Llama-3\.2-1B-Instruct-Q8_0\.gguf'/)
+  assert.ok(plan.commands.harness.includes(`--model '${modelPath}'`))
   assert.match(plan.commands.llama_server, /--no-warmup/)
   assert.ok(plan.method.bounded_metrics.some((metric) => metric.includes('not tokenizer-ground-truth tokens')))
   assert.ok(plan.method.bounded_metrics.some((metric) => metric.includes('marker_presence')))
@@ -56,7 +57,7 @@ try {
   const uniquePlanRun = spawnSync(process.execPath, [
     script,
     '--print-plan',
-    '--model', '/tmp/Camelid Test/Llama-3.2-1B-Instruct-Q8_0.gguf',
+    '--model', modelPath,
     '--model-id', 'llama32-1b-q8-plan',
     '--row-id', 'llama32_1b_instruct_q8_0',
     '--max-tokens', '8',

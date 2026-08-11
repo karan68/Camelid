@@ -1648,17 +1648,46 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
         assert_eq!(row["latest_checked_result"], "pass");
     }
 
-    for (id, filename) in [
-        ("qwen25_7b_instruct_q8_0", "Qwen2.5-7B-Instruct-Q8_0.gguf"),
-        ("gemma2_9b_it_q8_0", "gemma-2-9b-it-Q8_0.gguf"),
-    ] {
-        let row = compatibility.iter().find(|item| item["id"] == id).unwrap();
-        assert_eq!(row["status"], "planned_exact_row_candidate");
-        assert_eq!(row["generation_runs"], "not_started");
-        assert_eq!(row["frontend_load_path_verified"], "fail_closed_planned");
-        assert_eq!(row["latest_checked_result"], "planning_only");
-        assert!(row["evidence"].as_str().unwrap().contains(filename));
-    }
+    let qwen25_7b = compatibility
+        .iter()
+        .find(|item| item["id"] == "qwen25_7b_instruct_q8_0")
+        .unwrap();
+    assert_eq!(qwen25_7b["status"], "planned_exact_row_candidate");
+    assert_eq!(qwen25_7b["generation_runs"], "not_started");
+    assert_eq!(
+        qwen25_7b["frontend_load_path_verified"],
+        "fail_closed_planned"
+    );
+    assert_eq!(qwen25_7b["latest_checked_result"], "planning_only");
+    assert!(qwen25_7b["evidence"]
+        .as_str()
+        .unwrap()
+        .contains("Qwen2.5-7B-Instruct-Q8_0.gguf"));
+
+    let gemma2_9b = compatibility
+        .iter()
+        .find(|item| item["id"] == "gemma2_9b_it_q8_0")
+        .unwrap();
+    assert_eq!(
+        gemma2_9b["status"],
+        "active_validation_api_webui_pass_pending_context"
+    );
+    assert_eq!(
+        gemma2_9b["generation_runs"],
+        "validated_deterministic_greedy"
+    );
+    assert_eq!(
+        gemma2_9b["frontend_load_path_verified"],
+        "validated_guarded_api_webui_smoke"
+    );
+    assert_eq!(
+        gemma2_9b["latest_checked_result"],
+        "active_validation_api_webui_pass_pending_context"
+    );
+    assert!(gemma2_9b["evidence"]
+        .as_str()
+        .unwrap()
+        .contains("phase2-runtime/gemma2_9b_it_q8_0.json"));
     let planned_quant = compatibility
         .iter()
         .find(|item| item["id"] == "llama_spm_q4_k_q5_k")

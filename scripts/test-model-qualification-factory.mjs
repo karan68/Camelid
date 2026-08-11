@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
+import { canonicalGitTextBytes } from './lib/canonical-git-text.mjs'
 import { validateQualificationReport } from './check-model-qualification-report.mjs'
 import { HeaderInspectionError, MAX_PREFIX_BYTES } from './hf-qualification-header.mjs'
 import { SmolLM3TemplateQualificationError } from './hf-qualification-smollm3-template.mjs'
@@ -386,7 +387,7 @@ const durableQwenTokenizerBytes = await readFile(resolve(
   tokenizerReceiptPaths.get(qwenMoe.id),
 ))
 assert.equal(
-  createHash('sha256').update(durableQwenTokenizerBytes).digest('hex'),
+  createHash('sha256').update(canonicalGitTextBytes(durableQwenTokenizerBytes)).digest('hex'),
   '021dbe0b4f6a94f7140daa8e02969106dab941e205d184ee60f683d58f13ea37',
   'factory evidence must remain byte-bound to the clean-head Qwen3 tokenizer receipt',
 )

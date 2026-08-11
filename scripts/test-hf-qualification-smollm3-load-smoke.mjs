@@ -9,6 +9,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { PassThrough, Writable } from 'node:stream'
 import { setTimeout as delay } from 'node:timers/promises'
+import { canonicalGitTextBytes } from './lib/canonical-git-text.mjs'
 import {
   CHAT_REQUEST,
   DOES_NOT_PROVE,
@@ -67,7 +68,7 @@ assert.equal(EXACT_ROW.source.sha256, '8aa8cc74656137174a1988d993b00828e65a86fd6
 assert.equal(RECEIPT_SCHEMA, 'camelid.model-qualification.load-smoke/v2')
 assert.equal(SERVER_ADDR, '127.0.0.1:8297')
 assert.equal(
-  fileSha256(durableReceiptBytes),
+  fileSha256(canonicalGitTextBytes(durableReceiptBytes)),
   '4c156199ef4395188aa64210401bb3bfa40e8ef8acdb58c4e4908cc583257b17',
 )
 assert.equal(

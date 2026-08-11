@@ -491,6 +491,12 @@ fn resolve_gpt2_pre_tokenizer(
         // than approximating it with llama-bpe digit grouping.
         Some("command-r") => Ok(BpePreTokenizer::CommandR),
         Some("qwen2") => Ok(BpePreTokenizer::Qwen2),
+        // `deepseek-r1-qwen` is an exact qwen2 alias in the pinned llama.cpp
+        // vocabulary switch: both spellings select LLAMA_VOCAB_PRE_TYPE_QWEN2
+        // and the same split regex. Keep the alias explicit so the distinct
+        // DeepSeek source identity remains visible without duplicating a
+        // splitter or silently accepting other DeepSeek dialects.
+        Some("deepseek-r1-qwen") => Ok(BpePreTokenizer::Qwen2),
         // `stablelm2` is an EXACT alias of `qwen2`: llama.cpp puts
         // LLAMA_VOCAB_PRE_TYPE_STABLELM2 and _QWEN2 in the same switch arm with one
         // shared regex body, so no new splitter is required. Verified
@@ -533,7 +539,7 @@ fn resolve_gpt2_pre_tokenizer(
         )),
         None if is_llama3_bpe_signature(token_texts) => Ok(BpePreTokenizer::Llama3),
         other => Err(BackendError::UnsupportedTokenizer(format!(
-            "unsupported GPT-2/BPE pre-tokenizer {other:?}; currently supported: llama-bpe, command-r, qwen2, qwen35, stablelm2, lfm2, smaug-bpe, smollm, tekken"
+            "unsupported GPT-2/BPE pre-tokenizer {other:?}; currently supported: llama-bpe, command-r, qwen2, deepseek-r1-qwen, qwen35, stablelm2, lfm2, smaug-bpe, smollm, tekken"
         ))),
     }
 }
@@ -576,15 +582,29 @@ fn resolve_add_bos(
 /// where `$(offset)` is the `data_start_offset` the reader reports.
 const PHI4_MINI_Q4KM_HEADER_SHA256: &str =
     "971d9aac49438815528a5036221d85b2b0cbaf8c13e05f412c4574e16d186312";
+const PHI4_MINI_Q8_HEADER_SHA256: &str =
+    "fa7fa727c8b63338ceac32be0a0311e3af58c7826c1fee82c6689694eeb39931";
 
-fn is_exact_phi4_mini_q4km(file: &GgufFile) -> bool {
-    let named_phi4 = file.architecture() == Some("phi3")
-        && file.model_name() == Some("Phi 4 Mini Instruct")
-        && file.path.file_name().and_then(|name| name.to_str())
-            == Some("Phi-4-mini-instruct-Q4_K_M.gguf");
-    named_phi4
-        && sha256_file_prefix(&file.path, file.data_start_offset)
-            .is_some_and(|sha256| sha256 == PHI4_MINI_Q4KM_HEADER_SHA256)
+fn is_pinned_phi4_mini_gpt4o_header(file_name: Option<&str>, header_sha256: &str) -> bool {
+    matches!(
+        (file_name, header_sha256),
+        (
+            Some("Phi-4-mini-instruct-Q4_K_M.gguf"),
+            PHI4_MINI_Q4KM_HEADER_SHA256
+        ) | (
+            Some("Phi-4-mini-instruct.Q8_0.gguf"),
+            PHI4_MINI_Q8_HEADER_SHA256
+        )
+    )
+}
+
+fn is_exact_phi4_mini_gpt4o(file: &GgufFile) -> bool {
+    if file.architecture() != Some("phi3") || file.model_name() != Some("Phi 4 Mini Instruct") {
+        return false;
+    }
+    let file_name = file.path.file_name().and_then(|name| name.to_str());
+    sha256_file_prefix(&file.path, file.data_start_offset)
+        .is_some_and(|sha256| is_pinned_phi4_mini_gpt4o_header(file_name, &sha256))
 }
 
 /// SHA-256 of exactly the first `len` bytes of `path`, or `None` if the file
@@ -643,7 +663,7 @@ impl Tokenizer {
             resolve_gpt2_pre_tokenizer(
                 file.metadata_string("tokenizer.ggml.pre"),
                 &token_texts,
-                is_exact_phi4_mini_q4km(file),
+                is_exact_phi4_mini_gpt4o(file),
             )?
         } else {
             BpePreTokenizer::default()
@@ -1214,6 +1234,7 @@ impl Tokenizer {
 
     fn decode_bpe(&self, token_ids: &[TokenId], remove_special: bool) -> Result<String> {
         let mut bytes = Vec::new();
+        let mut text = String::new();
         for id in token_ids {
             if remove_special && self.is_special(*id) {
                 continue;
@@ -1223,6 +1244,11 @@ impl Tokenizer {
             })?;
             if remove_special && (token.kind == TokenKind::Control || is_chat_control_marker(token))
             {
+                continue;
+            }
+            if token.kind == TokenKind::Control || is_chat_control_marker(token) {
+                flush_bytes(&mut bytes, &mut text)?;
+                text.push_str(&token.text);
                 continue;
             }
             for ch in token.text.chars() {
@@ -1248,12 +1274,8 @@ impl Tokenizer {
         // strip_prefix delta diff and duplicate the line). For complete sequences the
         // valid prefix is the whole string, byte-for-byte identical to a strict decode,
         // so token-AND-text parity is unaffected.
-        match std::str::from_utf8(&bytes) {
-            Ok(text) => Ok(text.to_string()),
-            Err(err) => Ok(std::str::from_utf8(&bytes[..err.valid_up_to()])
-                .unwrap_or("")
-                .to_string()),
-        }
+        flush_bytes(&mut bytes, &mut text)?;
+        Ok(text)
     }
 
     fn normalize_spm_text(&self, text: &str, parse_special: bool) -> String {
@@ -2497,7 +2519,7 @@ fn flush_bytes(bytes: &mut Vec<u8>, text: &mut String) -> Result<()> {
 mod tests {
     use super::{
         bpe_byte_to_char, bpe_pretokenize, bpe_pretokenize_gpt4o, bpe_pretokenize_smollm,
-        bpe_pretokenize_with, is_chat_control_marker, is_exact_phi4_mini_q4km, is_mark,
+        bpe_pretokenize_with, is_chat_control_marker, is_exact_phi4_mini_gpt4o, is_mark,
         resolve_add_bos, BpePreTokenizer, BpeRegistry, SpecialTokens, Token, TokenKind, Tokenizer,
         TokenizerConfig, TokenizerModel, SPM_SPACE,
     };
@@ -2875,6 +2897,37 @@ mod tests {
     }
 
     #[test]
+    fn bpe_decode_preserves_unicode_control_tokens_when_requested() {
+        let tokens = vec![
+            Token {
+                id: 0,
+                text: "<｜begin▁of▁sentence｜>".to_string(),
+                score: 0.0,
+                kind: TokenKind::Control,
+            },
+            Token {
+                id: 1,
+                text: bpe_byte_to_char(b'A').to_string(),
+                score: 0.0,
+                kind: TokenKind::Normal,
+            },
+        ];
+        let tokenizer = tokenizer_with(
+            TokenizerModel::Gpt2Bpe,
+            tokens,
+            SpecialTokens {
+                bos: Some(0),
+                ..SpecialTokens::default()
+            },
+        );
+        assert_eq!(
+            tokenizer.decode(&[0, 1], false).unwrap(),
+            "<｜begin▁of▁sentence｜>A"
+        );
+        assert_eq!(tokenizer.decode(&[0, 1], true).unwrap(), "A");
+    }
+
+    #[test]
     fn constraint_token_bytes_preserve_fragments_spaces_and_specials() {
         let spm_tokens = vec![
             Token {
@@ -3114,7 +3167,10 @@ mod tests {
 
     #[test]
     fn resolve_gpt2_pre_tokenizer_gates_the_missing_pre_recovery() {
-        use super::{is_exact_phi4_mini_q4km, resolve_gpt2_pre_tokenizer, BpePreTokenizer};
+        use super::{
+            is_exact_phi4_mini_gpt4o, is_pinned_phi4_mini_gpt4o_header, resolve_gpt2_pre_tokenizer,
+            BpePreTokenizer, PHI4_MINI_Q4KM_HEADER_SHA256, PHI4_MINI_Q8_HEADER_SHA256,
+        };
         use crate::gguf::{GgufFile, GgufMetadataValue};
         use std::{collections::BTreeMap, path::PathBuf};
         let mut sig = vec![String::new(); 128_256];
@@ -3132,6 +3188,10 @@ mod tests {
         ));
         assert!(matches!(
             resolve_gpt2_pre_tokenizer(Some("qwen2"), &no_sig, false),
+            Ok(BpePreTokenizer::Qwen2)
+        ));
+        assert!(matches!(
+            resolve_gpt2_pre_tokenizer(Some("deepseek-r1-qwen"), &no_sig, false),
             Ok(BpePreTokenizer::Qwen2)
         ));
         assert!(matches!(
@@ -3235,10 +3295,23 @@ mod tests {
             ]),
             tensors: Vec::new(),
         };
-        assert!(!is_exact_phi4_mini_q4km(&exact));
+        assert!(!is_exact_phi4_mini_gpt4o(&exact));
         let mut renamed = exact.clone();
         renamed.path = PathBuf::from("renamed.gguf");
-        assert!(!is_exact_phi4_mini_q4km(&renamed));
+        assert!(!is_exact_phi4_mini_gpt4o(&renamed));
+
+        assert!(is_pinned_phi4_mini_gpt4o_header(
+            Some("Phi-4-mini-instruct-Q4_K_M.gguf"),
+            PHI4_MINI_Q4KM_HEADER_SHA256,
+        ));
+        assert!(is_pinned_phi4_mini_gpt4o_header(
+            Some("Phi-4-mini-instruct.Q8_0.gguf"),
+            PHI4_MINI_Q8_HEADER_SHA256,
+        ));
+        assert!(!is_pinned_phi4_mini_gpt4o_header(
+            Some("renamed.gguf"),
+            PHI4_MINI_Q8_HEADER_SHA256,
+        ));
     }
 
     // The artifact pin hashes only `[0, data_start_offset)`, so the bounded
@@ -3651,7 +3724,7 @@ mod tests {
         assert_eq!(gguf.architecture(), Some("phi3"));
         assert_eq!(gguf.model_name(), Some("Phi 4 Mini Instruct"));
         assert_eq!(gguf.metadata_string("tokenizer.ggml.pre"), Some("gpt-4o"));
-        assert!(is_exact_phi4_mini_q4km(&gguf));
+        assert!(is_exact_phi4_mini_gpt4o(&gguf));
         let tokenizer = Tokenizer::from_gguf(&gguf).expect("load Phi-4-mini tokenizer");
         assert!(
             tokenizer.special.eog.contains(&200_020),
