@@ -2,6 +2,7 @@
 
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -10,6 +11,7 @@ import { PassThrough, Writable } from 'node:stream'
 import { setTimeout as delay } from 'node:timers/promises'
 import {
   CHAT_REQUEST,
+  DOES_NOT_PROVE,
   EXACT_ROW,
   EXPECTED_TEMPLATE_CAPS,
   LEGACY_STORAGE_LABELS,
@@ -51,12 +53,112 @@ const templatePack = JSON.parse(await readFile(
   'utf8',
 ))
 const template = templatePack.source_template.text
+const durableReceiptBytes = await readFile(resolve(
+  root,
+  'qa/model-qualification/smollm3-3b-q8-windows-cpu-load-smoke.json',
+))
+const durableReceipt = JSON.parse(durableReceiptBytes)
+const fileSha256 = bytes => createHash('sha256').update(bytes).digest('hex')
 
 assert.equal(Buffer.byteLength(template, 'utf8'), 5_493)
 assert.equal(EXACT_ROW.source.size_bytes, 3_275_574_624)
 assert.equal(EXACT_ROW.source.sha256, '8aa8cc74656137174a1988d993b00828e65a86fd68773412b632a75aa1373248')
 assert.equal(RECEIPT_SCHEMA, 'camelid.model-qualification.load-smoke/v1')
 assert.equal(SERVER_ADDR, '127.0.0.1:8297')
+assert.equal(
+  fileSha256(durableReceiptBytes),
+  '4c156199ef4395188aa64210401bb3bfa40e8ef8acdb58c4e4908cc583257b17',
+)
+assert.equal(
+  durableReceipt.receipt_id,
+  '7d5a31a30609db49847790d69fd809612d579000f9fa7f4857f0b753dd4a5aa4',
+)
+assert.deepEqual(validateLoadSmokeReceipt(durableReceipt), [])
+assert.equal(durableReceipt.provenance.runtime_head, '0634334c0f912e5ab71710dc7542af7be3b97263')
+assert.equal(durableReceipt.provenance.source_describe, 'v0.6.1-49-g0634334c')
+assert.deepEqual(durableReceipt.provenance.binary, {
+  profile: 'release-fat-lto',
+  sha256: 'e3e7e08609e132785c7ddf4fc00bdab001d288b8c23fe782c757acf22fdcef3e',
+  version: 'camelid v0.6.1-49-g0634334c',
+  health_build: 'v0.6.1-49-g0634334c',
+  built_from_clean_tracked_head: true,
+})
+assert.equal(durableReceipt.provenance.tracked_files_clean, true)
+assert.equal(durableReceipt.provenance.untracked_files_excluded, true)
+assert.equal(durableReceipt.row.id, EXACT_ROW.id)
+assert.deepEqual(durableReceipt.row.source, EXACT_ROW.source)
+assert.deepEqual(durableReceipt.steps.map(({ name }) => name), STEP_CONTRACT.map(([name]) => name))
+const durableSteps = Object.fromEntries(durableReceipt.steps.map(({ name, evidence }) => [name, evidence]))
+const durableRaw = durableSteps.raw_first_forward
+const durableChat = durableSteps.chat_followup
+assert.equal(durableRaw.timings.weight_cache_hit, false)
+assert.equal(durableRaw.timings.forward_total, 2847.006)
+assert.equal(durableRaw.generated_token_ids.length, 1)
+assert.equal(durableRaw.logits.greedy_top.token_id, durableRaw.generated_token_ids[0])
+assert.equal(Number.isFinite(durableRaw.logits.greedy_top.logit), true)
+assert.equal(durableChat.lane, 'experimental')
+assert.equal(durableChat.timings.weight_cache_hit, true)
+assert.equal(durableChat.timings.forward_total, 16855.325)
+assert.equal(durableChat.generated_token_ids.length, 1)
+assert.equal(durableChat.logits.greedy_top.token_id, durableChat.generated_token_ids[0])
+assert.equal(Number.isFinite(durableChat.logits.greedy_top.logit), true)
+const durableMemoryPhases = [...durableRaw.memory_phases, ...durableChat.memory_phases]
+assert.equal(durableMemoryPhases.length, 6)
+for (const phaseEvidence of durableMemoryPhases) {
+  const materialization = phaseEvidence.materialization
+  const reads = phaseEvidence.q8_file_reads
+  assert.equal(materialization.q8_0_source_tensor_count, 254)
+  assert.equal(materialization.q8_0_file_backed_tensor_count, 254)
+  assert.equal(materialization.q8_0_f32_materialized_tensor_count, 0)
+  assert.equal(materialization.q8_0_f32_materialized_bytes, 0)
+  assert.equal(materialization.q8_0_retained_block_tensor_count, 0)
+  assert.equal(materialization.q8_0_retained_block_bytes, 0)
+  assert.equal(materialization.has_lazy_q8_0_file_backing, true)
+  assert.equal(materialization.has_q8_0_f32_materialization, false)
+  assert.equal(materialization.has_retained_q8_0_blocks, false)
+  assert.ok(reads.read_calls > 0)
+  assert.ok(reads.read_bytes > 0)
+  for (const key of [
+    'cache_hits', 'cache_hit_bytes', 'cache_misses', 'cache_miss_bytes',
+    'cache_inserts', 'cache_insert_bytes', 'cache_evictions', 'cache_evicted_bytes',
+    'cache_merges', 'cache_merged_bytes', 'cache_decoded_scale_hits',
+    'cache_decoded_scale_hit_blocks', 'cache_entries', 'cache_bytes', 'cache_capacity_bytes',
+  ]) assert.equal(reads[key], 0, `${key} must remain zero in the durable receipt`)
+}
+assert.deepEqual(durableSteps.loaded_health.execution_plan, {
+  profile: 'safe',
+  operating_system: 'windows',
+  architecture: 'x86_64',
+  model_family: 'smollm3',
+  quant_type: 'Q8_0',
+  exact_model_row: 'SmolLM3-Q8_0.gguf',
+  support_level: 'unknown_or_unvalidated',
+  selected_backend: 'cpu_reference',
+  selected_q8_path: 'safe_dense_or_q8_cpu',
+  diagnostics_status: 'operator-requested RSS timings enabled; performance claims disabled',
+  cuda_resident_active: false,
+  legacy_storage_labels_excluded: [...LEGACY_STORAGE_LABELS],
+})
+for (const name of ['baseline_gpu', 'post_raw_gpu', 'final_gpu']) {
+  assert.equal(durableSteps[name].enabled, false)
+  assert.equal(durableSteps[name].run_count, 0)
+}
+assert.ok(durableReceipt.resource_observations.monitor_samples > 0)
+assert.ok(durableReceipt.resource_observations.minimum_available_physical_bytes > 0)
+assert.ok(durableReceipt.resource_observations.peak_child_working_set_bytes > 0)
+assert.equal(durableReceipt.resource_observations.thresholds_tripped, false)
+assert.deepEqual(durableReceipt.gate_decision, {
+  load_smoke: 'pass',
+  support_claim: false,
+  disposition: 'hold',
+  target_tier: 'experimental_exact_row',
+  authorized_roster_scope: ['gates.load_smoke'],
+  other_gates_unchanged: true,
+})
+assert.deepEqual(durableReceipt.does_not_prove, DOES_NOT_PROVE)
+const durableSerialized = JSON.stringify(durableReceipt)
+assert.doesNotMatch(durableSerialized, /(?:[A-Za-z]:\\|file:\/\/|\\\\[^\\]|\/Users\/|\/home\/|\/tmp\/)/i)
+assert.doesNotMatch(durableSerialized, /(?:bearer\s+|basic\s+|hf_[A-Za-z0-9]{8,}|(?:token|password|secret)\s*[:=])/i)
 assert.deepEqual(STEP_CONTRACT.map(([name]) => name), [
   'baseline_health',
   'baseline_gpu',

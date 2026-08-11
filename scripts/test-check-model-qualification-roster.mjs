@@ -5,6 +5,7 @@ import { readFile } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { summarizeRoster, validateRoster } from './check-model-qualification-roster.mjs'
+import { validateLoadSmokeReceipt } from './hf-qualification-smollm3-load-smoke.mjs'
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const path = join(root, 'qa', 'model-qualification', 'phase1-roster.json')
@@ -56,6 +57,13 @@ const smolTokenizerReceiptBytes = await readFile(join(
   'model-qualification',
   'smollm3-3b-q8-header-tokenizer-parity.json',
 ))
+const smolLoadReceiptBytes = await readFile(join(
+  root,
+  'qa',
+  'model-qualification',
+  'smollm3-3b-q8-windows-cpu-load-smoke.json',
+))
+const smolLoadReceipt = JSON.parse(smolLoadReceiptBytes)
 const apiSourceBytes = await readFile(join(root, 'src', 'api', 'mod.rs'))
 const apiSourceText = apiSourceBytes.toString('utf8')
 const exactKeys = (value, keys, label) => assert.deepEqual(
@@ -118,6 +126,29 @@ assert.match(qwenVerifyLog, /PASS reference-rerun: generated tokens \(8\) and te
 assert.match(qwenVerifyLog, /RECEIPT VERIFIED \(self-digest, lane identity, Camelid replay, and llama\.cpp reference re-run all passed/)
 assert.equal(summarizeRoster(roster)[3].next_gate, 'load_smoke', 'Gemma2 advances through exact-row metadata, tokenizer, and template evidence')
 assert.equal(summarizeRoster(roster)[4].next_gate, 'template', 'SmolLM3 advances through exact-row tokenizer evidence while preserving its dynamic-template HOLD')
+const smolRow = roster.rows[4]
+const smolSummary = summarizeRoster(roster)[4]
+assert.equal(smolRow.gates.load_smoke.status, 'pass')
+assert.deepEqual(smolRow.gates.load_smoke.evidence, [
+  'qa/model-qualification/smollm3-3b-q8-windows-cpu-load-smoke.json',
+])
+assert.equal(Object.hasOwn(smolRow.gates.load_smoke, 'reason'), false)
+assert.deepEqual(smolSummary.gates, { pass: 4, fail: 0, blocked: 2, pending: 2 })
+assert.equal(smolSummary.next_gate, 'template')
+assert.equal(smolRow.gates.template.status, 'blocked')
+assert.equal(smolRow.gates.parity.status, 'blocked')
+assert.equal(smolRow.gates.api_webui.status, 'pending')
+assert.equal(smolRow.gates.context.status, 'pending')
+assert.equal(smolRow.disposition, 'hold')
+assert.equal(fileSha256(smolLoadReceiptBytes), '4c156199ef4395188aa64210401bb3bfa40e8ef8acdb58c4e4908cc583257b17')
+assert.equal(smolLoadReceipt.receipt_id, '7d5a31a30609db49847790d69fd809612d579000f9fa7f4857f0b753dd4a5aa4')
+assert.deepEqual(validateLoadSmokeReceipt(smolLoadReceipt), [])
+assert.equal(smolLoadReceipt.row.id, smolRow.id)
+assert.equal(smolLoadReceipt.row.source.size_bytes, smolRow.identity.size_bytes)
+assert.equal(smolLoadReceipt.row.source.sha256, smolRow.identity.sha256)
+assert.deepEqual(smolLoadReceipt.gate_decision.authorized_roster_scope, ['gates.load_smoke'])
+assert.equal(smolLoadReceipt.gate_decision.support_claim, false)
+assert.equal(smolLoadReceipt.gate_decision.disposition, 'hold')
 assert.equal(summarizeRoster(roster)[5].next_gate, 'template', 'Qwen3 MoE advances through exact-row tokenizer evidence while preserving every downstream HOLD')
 exactKeys(
   smolRuntimeFixture,

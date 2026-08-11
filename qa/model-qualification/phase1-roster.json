@@ -520,9 +520,10 @@
         },
         "load_smoke": {
           "required": true,
-          "status": "blocked",
-          "evidence": [],
-          "reason": "SmolLM3 is excluded from runnable admission and its CPU path has no real-row receipt."
+          "status": "pass",
+          "evidence": [
+            "qa/model-qualification/smollm3-3b-q8-windows-cpu-load-smoke.json"
+          ]
         },
         "parity": {
           "required": true,
