@@ -1090,6 +1090,24 @@ mod tests {
         );
     }
 
+    /// Whether a request head and its declared body have both arrived.
+    ///
+    /// One read is not enough: [`request_head`] writes the head and the body
+    /// separately, so they can land in separate segments.
+    fn request_complete(raw: &[u8]) -> bool {
+        let Some(split) = find_header_end(raw) else {
+            return false;
+        };
+        let head = String::from_utf8_lossy(&raw[..split.headers_end]);
+        let declared = head
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .find(|(name, _)| name.trim().eq_ignore_ascii_case("content-length"))
+            .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        raw.len() >= split.body_start + declared
+    }
+
     /// Answer one connection with canned bytes and hang up, so a frame that
     /// stops early can be exercised without a stub node.
     fn canned_node(raw: &'static [u8]) -> u16 {
@@ -1099,8 +1117,17 @@ mod tests {
             let Ok((mut stream, _)) = listener.accept() else {
                 return;
             };
-            let mut scratch = [0_u8; 4096];
-            let _ = stream.read(&mut scratch);
+            // Every byte of the request has to be consumed before answering:
+            // closing a socket that still holds unread bytes is an abortive
+            // close on Windows, and it discards the reply along with them.
+            let mut request = Vec::new();
+            let mut scratch = [0_u8; 1024];
+            while !request_complete(&request) {
+                match stream.read(&mut scratch) {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => request.extend_from_slice(&scratch[..read]),
+                }
+            }
             let _ = stream.write_all(raw);
         });
         port
@@ -1114,8 +1141,8 @@ mod tests {
             "/v1/chat/completions",
             Some(b"{}"),
             None,
-            Duration::from_secs(2),
-            Duration::from_secs(2),
+            Duration::from_secs(10),
+            Duration::from_secs(10),
             LIMIT,
         )
         .expect("the canned node answers")
