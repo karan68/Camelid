@@ -28,7 +28,7 @@ use axum::extract::rejection::JsonRejection;
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::Value;
 
@@ -61,6 +61,7 @@ struct ServerState {
 pub fn router(fabric: Fabric, config: ServeConfig) -> Router {
     Router::new()
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/models", get(models))
         // Without this, axum's 2 MiB default would refuse conversations the
         // node behind the proxy accepts.
         .layer(DefaultBodyLimit::max(DEFAULT_MAX_REQUEST_BODY_BYTES))
@@ -115,6 +116,45 @@ pub async fn serve_on(
     config: ServeConfig,
 ) -> std::io::Result<()> {
     axum::serve(listener, router(fabric, config)).await
+}
+
+/// List every model the fabric can currently route to.
+///
+/// A client points at one address, so it has to be able to ask that address
+/// what it can serve; the per-node listing is not reachable through the proxy.
+/// The answer is the union across ready nodes, in the same shape a node
+/// answers, minus the per-file `meta`: two nodes can serve one model id from
+/// different files, and there is no honest way to merge that.
+///
+/// No ready node means an empty list rather than an error. "Nothing right now"
+/// is the truthful answer to a discovery question, and a model picker can show
+/// it without special-casing a failure.
+async fn models(State(state): State<ServerState>) -> Response {
+    let fabric = Arc::clone(&state.fabric);
+    // Observing is blocking socket I/O against every node, same as a dispatch.
+    let snapshots = match tokio::task::spawn_blocking(move || fabric.observe()).await {
+        Ok(snapshots) => snapshots,
+        Err(join_error) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("could not observe the fabric: {join_error}"),
+            )
+        }
+    };
+
+    let data: Vec<Value> = super::servable_models(&snapshots)
+        .into_iter()
+        .map(|id| {
+            serde_json::json!({
+                "id": id,
+                "object": "model",
+                "created": 0,
+                "owned_by": "camelid",
+            })
+        })
+        .collect();
+
+    Json(serde_json::json!({ "object": "list", "data": data })).into_response()
 }
 
 async fn chat_completions(
@@ -199,7 +239,28 @@ fn rejected_body(rejection: JsonRejection) -> Response {
 }
 
 fn route_error(error: RouteError) -> Response {
-    error_response(StatusCode::SERVICE_UNAVAILABLE, &error.to_string())
+    match &error {
+        // Asking again will not make the model appear, and the nodes themselves
+        // answer 404 `model_not_found` for exactly this. Answering 503 told
+        // clients to retry, so an SDK spent its whole retry budget on a refusal
+        // that could never change.
+        RouteError::ModelUnavailable { .. } => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": {
+                    "message": error.to_string(),
+                    "type": "fabric_error",
+                    "code": "model_not_found",
+                    "param": "model",
+                }
+            })),
+        )
+            .into_response(),
+        // These can genuinely clear on their own, so they stay retryable.
+        RouteError::NoNodesConfigured | RouteError::AllNodesUnavailable { .. } => {
+            error_response(StatusCode::SERVICE_UNAVAILABLE, &error.to_string())
+        }
+    }
 }
 
 fn forward_error(error: ForwardError) -> Response {
@@ -241,6 +302,137 @@ mod tests {
             .await
             .expect("collect body");
         (status, serde_json::from_slice(&bytes).expect("json body"))
+    }
+
+    fn get_request(uri: &str) -> axum::http::Request<axum::body::Body> {
+        axum::http::Request::builder()
+            .method("GET")
+            .uri(uri)
+            .body(axum::body::Body::empty())
+            .expect("valid request")
+    }
+
+    fn proxy(fabric: Fabric) -> Router {
+        router(
+            fabric,
+            ServeConfig {
+                mode: RouteMode::Throughput,
+                forward_timeout: Duration::from_millis(200),
+            },
+        )
+    }
+
+    /// A client points at one address, so that address has to answer what it
+    /// can serve. This used to 404, which left every model picker empty.
+    #[tokio::test]
+    async fn the_models_route_answers_a_list_even_with_nothing_to_serve() {
+        let response = proxy(Fabric::new(Vec::new()))
+            .oneshot(get_request("/v1/models"))
+            .await
+            .expect("router answers");
+        let (status, body) = read_json(response).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["object"], "list");
+        assert_eq!(
+            body["data"].as_array().expect("a data array").len(),
+            0,
+            "nothing ready is an empty list, not an error"
+        );
+    }
+
+    /// A model this fabric does not serve will not appear by asking again, and
+    /// the nodes answer 404 `model_not_found` for it. Answering 503 told
+    /// clients to retry: an OpenAI SDK spent its whole retry budget on a
+    /// permanent refusal.
+    #[tokio::test]
+    async fn an_unservable_model_is_refused_as_not_found_not_as_try_again() {
+        let node = StubModelNode::start("llama-3b");
+        let fabric = Fabric::new(vec![node.spec("only")]).with_timeout(Duration::from_secs(2));
+        let response = proxy(fabric)
+            .oneshot(request(
+                serde_json::json!({ "model": "no-such-model", "messages": [] }),
+            ))
+            .await
+            .expect("router answers");
+        let (status, body) = read_json(response).await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"]["code"], "model_not_found");
+        assert_eq!(body["error"]["param"], "model");
+        // The message still names what the fabric *can* serve, which is the
+        // part an operator acts on.
+        let message = body["error"]["message"].as_str().expect("a message");
+        assert!(message.contains("llama-3b"), "{message}");
+    }
+
+    /// A fabric whose nodes are merely unreachable can recover on its own, so
+    /// that refusal stays retryable.
+    #[tokio::test]
+    async fn an_unreachable_fabric_is_still_a_retryable_503() {
+        let fabric = Fabric::new(vec![NodeSpec {
+            label: "dead".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: 1,
+        }])
+        .with_timeout(Duration::from_millis(200));
+        let response = proxy(fabric)
+            .oneshot(request(serde_json::json!({ "model": "m", "messages": [] })))
+            .await
+            .expect("router answers");
+        let (status, _) = read_json(response).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// A node stub answering only `/v1/health`, which is all placement reads.
+    struct StubModelNode {
+        port: u16,
+        shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl StubModelNode {
+        fn start(model: &str) -> Self {
+            use std::io::{Read, Write};
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            let port = listener.local_addr().expect("addr").port();
+            let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let flag = std::sync::Arc::clone(&shutdown);
+            let body = format!(
+                r#"{{"ok":true,"generation_ready":true,"active_model_id":"{model}","backend":"llama","version":"0.6.1","engine_queued_tasks":0,"engine_queue_depth":0}}"#
+            );
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    if flag.load(std::sync::atomic::Ordering::SeqCst) {
+                        break;
+                    }
+                    let Ok(mut stream) = stream else { continue };
+                    let mut scratch = [0_u8; 1024];
+                    let _ = stream.read(&mut scratch);
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                }
+            });
+            Self { port, shutdown }
+        }
+
+        fn spec(&self, label: &str) -> NodeSpec {
+            NodeSpec {
+                label: label.to_string(),
+                host: "127.0.0.1".to_string(),
+                port: self.port,
+            }
+        }
+    }
+
+    impl Drop for StubModelNode {
+        fn drop(&mut self) {
+            self.shutdown
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = std::net::TcpStream::connect(("127.0.0.1", self.port));
+        }
     }
 
     #[tokio::test]
