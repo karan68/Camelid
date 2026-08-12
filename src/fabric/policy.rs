@@ -104,6 +104,13 @@ pub enum RouteError {
         model: String,
         /// What the ready nodes are actually serving.
         serving: Vec<String>,
+        /// Configured nodes that could not be consulted, because they were
+        /// unreachable or reachable but not ready.
+        ///
+        /// This is what separates "the fabric does not serve that model" from
+        /// "the fabric cannot say yet": while any node is unaccounted for, one
+        /// of them may be the node that owns the model.
+        unobserved: usize,
     },
 }
 
@@ -118,15 +125,22 @@ impl std::fmt::Display for RouteError {
                 f,
                 "no node can serve: {unreachable} unreachable, {not_ready} reachable but not ready"
             ),
-            Self::ModelUnavailable { model, serving } => {
-                if serving.is_empty() {
-                    write!(f, "no ready node is serving model `{model}`")
-                } else {
-                    write!(
+            Self::ModelUnavailable {
+                model,
+                serving,
+                unobserved,
+            } => {
+                write!(f, "no ready node is serving model `{model}`")?;
+                if !serving.is_empty() {
+                    write!(f, "; ready nodes serve: {}", serving.join(", "))?;
+                }
+                match unobserved {
+                    0 => Ok(()),
+                    1 => write!(f, "; 1 node could not be consulted, so this may change"),
+                    many => write!(
                         f,
-                        "no ready node is serving model `{model}`; ready nodes serve: {}",
-                        serving.join(", ")
-                    )
+                        "; {many} nodes could not be consulted, so this may change"
+                    ),
                 }
             }
         }
@@ -183,6 +197,7 @@ pub fn route(
                 return Err(RouteError::ModelUnavailable {
                     model: model.to_string(),
                     serving,
+                    unobserved: snapshots.len() - ready.len(),
                 });
             }
             matched
@@ -389,6 +404,7 @@ mod tests {
             Err(RouteError::ModelUnavailable {
                 model: "gemma-27b".to_string(),
                 serving: vec!["llama-3b".to_string(), "qwen-4b".to_string()],
+                unobserved: 0,
             })
         );
     }
@@ -400,6 +416,50 @@ mod tests {
         let nodes = vec![ready("a", None, 99)];
         let decision = route(&nodes, &RouteRequest::new(RouteMode::Throughput)).expect("routes");
         assert_eq!(decision.label, "a");
+    }
+
+    /// A node that never answered may be the one holding the model, so the
+    /// refusal has to record that the fabric could not see the whole picture.
+    /// A caller reads this to tell a permanent refusal from a temporary one.
+    #[test]
+    fn a_refusal_records_the_nodes_it_could_not_consult() {
+        let nodes = vec![
+            ready("up", Some("llama-3b"), 0),
+            unreachable("down"),
+            not_ready("loading"),
+        ];
+        let request = RouteRequest::new(RouteMode::Throughput).with_model(Some("qwen-4b"));
+        match route(&nodes, &request).expect_err("nothing ready serves it") {
+            RouteError::ModelUnavailable { unobserved, .. } => assert_eq!(unobserved, 2),
+            other => panic!("expected ModelUnavailable, got {other:?}"),
+        }
+    }
+
+    /// The control: with every node accounted for, the same refusal is final.
+    #[test]
+    fn a_refusal_from_a_fully_observed_fabric_records_nothing_missing() {
+        let nodes = vec![ready("a", Some("llama-3b"), 0), ready("b", None, 0)];
+        let request = RouteRequest::new(RouteMode::Throughput).with_model(Some("qwen-4b"));
+        match route(&nodes, &request).expect_err("nothing serves it") {
+            RouteError::ModelUnavailable { unobserved, .. } => assert_eq!(unobserved, 0),
+            other => panic!("expected ModelUnavailable, got {other:?}"),
+        }
+    }
+
+    /// The message is what an operator acts on, so it has to say the fabric
+    /// could not see everything rather than implying the model is simply gone.
+    #[test]
+    fn an_incomplete_refusal_says_so_in_its_message() {
+        let nodes = vec![ready("up", Some("llama-3b"), 0), unreachable("down")];
+        let request = RouteRequest::new(RouteMode::Throughput).with_model(Some("qwen-4b"));
+        let message = route(&nodes, &request)
+            .expect_err("nothing ready serves it")
+            .to_string();
+        assert!(message.contains("llama-3b"), "{message}");
+        assert!(
+            message.contains("1 node could not be consulted"),
+            "{message}"
+        );
     }
 
     #[test]
@@ -454,6 +514,7 @@ mod tests {
             Err(RouteError::ModelUnavailable {
                 model: "llama-3b".to_string(),
                 serving: Vec::new(),
+                unobserved: 0,
             })
         );
     }

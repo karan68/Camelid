@@ -244,7 +244,10 @@ fn route_error(error: RouteError) -> Response {
         // answer 404 `model_not_found` for exactly this. Answering 503 told
         // clients to retry, so an SDK spent its whole retry budget on a refusal
         // that could never change.
-        RouteError::ModelUnavailable { .. } => (
+        //
+        // Only when every node answered, though: a node still unaccounted for
+        // may be the one that owns the model, and that refusal can clear.
+        RouteError::ModelUnavailable { unobserved: 0, .. } => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({
                 "error": {
@@ -257,7 +260,9 @@ fn route_error(error: RouteError) -> Response {
         )
             .into_response(),
         // These can genuinely clear on their own, so they stay retryable.
-        RouteError::NoNodesConfigured | RouteError::AllNodesUnavailable { .. } => {
+        RouteError::ModelUnavailable { .. }
+        | RouteError::NoNodesConfigured
+        | RouteError::AllNodesUnavailable { .. } => {
             error_response(StatusCode::SERVICE_UNAVAILABLE, &error.to_string())
         }
     }
@@ -341,6 +346,27 @@ mod tests {
         );
     }
 
+    /// The empty case above passes just as well against a route that can only
+    /// ever answer nothing, so this is the one that proves it observes.
+    #[tokio::test]
+    async fn the_models_route_lists_what_a_ready_node_is_serving() {
+        let node = StubModelNode::start("llama-3b");
+        let fabric = Fabric::new(vec![node.spec("only")]).with_timeout(Duration::from_secs(2));
+        let response = proxy(fabric)
+            .oneshot(get_request("/v1/models"))
+            .await
+            .expect("router answers");
+        let (status, body) = read_json(response).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["object"], "list");
+        let data = body["data"].as_array().expect("a data array");
+        assert_eq!(data.len(), 1, "{body}");
+        assert_eq!(data[0]["id"], "llama-3b");
+        assert_eq!(data[0]["object"], "model");
+        assert_eq!(data[0]["owned_by"], "camelid");
+    }
+
     /// A model this fabric does not serve will not appear by asking again, and
     /// the nodes answer 404 `model_not_found` for it. Answering 503 told
     /// clients to retry: an OpenAI SDK spent its whole retry budget on a
@@ -364,6 +390,40 @@ mod tests {
         // part an operator acts on.
         let message = body["error"]["message"].as_str().expect("a message");
         assert!(message.contains("llama-3b"), "{message}");
+    }
+
+    /// The same refusal is *not* final when a node could not be consulted: the
+    /// node that is down may be the one that owns the model, so a 404 would
+    /// tell an SDK to give up on something a retry would find. This is the
+    /// difference between a model that is absent and a fabric that cannot yet
+    /// say.
+    #[tokio::test]
+    async fn a_model_missing_only_because_a_node_is_down_stays_retryable() {
+        let node = StubModelNode::start("llama-3b");
+        let fabric = Fabric::new(vec![
+            node.spec("up"),
+            // Port 1 is closed, so this node is observed as unreachable.
+            NodeSpec {
+                label: "down".to_string(),
+                host: "127.0.0.1".to_string(),
+                port: 1,
+            },
+        ])
+        .with_timeout(Duration::from_millis(500));
+
+        let response = proxy(fabric)
+            .oneshot(request(
+                serde_json::json!({ "model": "no-such-model", "messages": [] }),
+            ))
+            .await
+            .expect("router answers");
+        let (status, body) = read_json(response).await;
+
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a node that never answered may be the one serving it: {body}"
+        );
     }
 
     /// A fabric whose nodes are merely unreachable can recover on its own, so
@@ -406,8 +466,17 @@ mod tests {
                         break;
                     }
                     let Ok(mut stream) = stream else { continue };
+                    // Read to the end of the head before answering: closing a
+                    // socket that still holds unread bytes is an abortive close
+                    // on Windows, and it discards the reply along with them.
+                    let mut request = Vec::new();
                     let mut scratch = [0_u8; 1024];
-                    let _ = stream.read(&mut scratch);
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match stream.read(&mut scratch) {
+                            Ok(0) | Err(_) => break,
+                            Ok(read) => request.extend_from_slice(&scratch[..read]),
+                        }
+                    }
                     let response = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                         body.len()
