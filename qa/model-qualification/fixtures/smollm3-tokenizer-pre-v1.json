@@ -1,0 +1,89 @@
+{
+  "schema": "camelid.tokenizer-pre-fixture/v1",
+  "pack_id": "smollm3-tokenizer-pre-v1",
+  "support_scope": "tokenizer_pre_resolution_and_splitter_only_no_real_row_support",
+  "artifact": {
+    "repo": "ggml-org/SmolLM3-3B-GGUF",
+    "revision": "4965cb60b150737b68a0408c36aeefb65078f894",
+    "file": "SmolLM3-Q8_0.gguf",
+    "size_bytes": 3275574624,
+    "hf_lfs_sha256": "8aa8cc74656137174a1988d993b00828e65a86fd68773412b632a75aa1373248",
+    "architecture": "smollm3",
+    "tokenizer_model": "gpt2",
+    "tokenizer_pre": "smaug-bpe",
+    "token_count": 128256,
+    "merge_count": 280147,
+    "tensor_count": 326
+  },
+  "oracle": {
+    "project": "ggml-org/llama.cpp",
+    "revision": "acd79d603",
+    "source": "src/llama-vocab.cpp",
+    "smaug_mapping": "LLAMA_VOCAB_PRE_TYPE_SMAUG",
+    "smaug_regex": "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+",
+    "smaug_semantics": "The pinned source places SMAUG and DBRX in one arm and labels the shared regex 'same as llama3'.",
+    "legacy_smollm_mapping": "LLAMA_VOCAB_PRE_TYPE_SMOLLM",
+    "legacy_smollm_regexes": [
+      "\\p{N}",
+      "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)"
+    ],
+    "legacy_smollm_semantics": "The first isolated-regex pass partitions every Unicode number code point. The second pass uses case-sensitive lowercase contractions and permits only one literal ASCII space before letter/number/punctuation runs."
+  },
+  "chat_template_blocker": {
+    "source_template_utf8_bytes": 5493,
+    "source_template_sha256": "b9b66f04c64fbb8695cf5b35c37780efd0b8e0829fbfe3e30fafb9f469b7d30e",
+    "required_signature_markers": [
+      "<|im_start|>",
+      "Knowledge Cutoff Date: June 2025",
+      "strftime_now",
+      "Reasoning Mode:",
+      "/system_override"
+    ],
+    "reason": "The real row's ChatML is not generic Qwen3 ChatML. It injects date-dependent metadata, thinking-mode policy, custom instructions, system override behavior, and tool grammars. Camelid must fail chat closed until that exact contract has a deterministic renderer and oracle fixture. Raw completion remains a separate qualification lane."
+  },
+  "legacy_smollm_segment_cases": [
+    {
+      "id": "digits_are_isolated_before_gpt2_pass",
+      "text": "Hello 123 world",
+      "segments": ["Hello", " ", "1", "2", "3", " world"]
+    },
+    {
+      "id": "contractions_are_case_sensitive",
+      "text": "can't CAN'T John's",
+      "segments": ["can", "'t", " CAN", "'", "T", " John", "'s"]
+    },
+    {
+      "id": "punctuation_does_not_prefix_letters",
+      "text": "foo-bar BAZ_qux",
+      "segments": ["foo", "-", "bar", " BAZ", "_", "qux"]
+    },
+    {
+      "id": "unicode_numbers_are_individually_partitioned",
+      "text": "naïve café 中文１２３",
+      "segments": ["naïve", " café", " 中文", "１", "２", "３"]
+    },
+    {
+      "id": "whitespace_leaves_one_prefix_for_the_next_word",
+      "text": "x  y",
+      "segments": ["x", " ", " y"]
+    },
+    {
+      "id": "newlines_use_gpt2_whitespace_behavior",
+      "text": "a/b\nc",
+      "segments": ["a", "/", "b", "\n", "c"]
+    }
+  ],
+  "disposition": {
+    "actual_row": "smaug-bpe is an exact llama3 alias and can be admitted without a new splitter",
+    "legacy_smollm": "implement only as its distinct two-pass splitter; never alias it to llama3 or qwen2",
+    "not_claimed": [
+      "real GGUF token-id parity",
+      "model load",
+      "generation parity",
+      "chat-template parity",
+      "API or WebUI smoke",
+      "context",
+      "real-row support"
+    ]
+  }
+}

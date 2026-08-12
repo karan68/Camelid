@@ -435,16 +435,40 @@ fn guess_quant(filename: &str) -> Option<String> {
 fn guess_architecture(filename: &str, repo_id: &str) -> String {
     let hay = format!("{repo_id} {filename}").to_lowercase();
     const TABLE: &[(&str, &str)] = &[
+        // Match the most specific Qwen spellings first: otherwise every
+        // qwen3moe/qwen3.5 repo is swallowed by the broad `qwen3` token and the
+        // Models page reports the wrong implementation verdict.
+        // Official Qwen3 MoE repositories encode total/active parameters in
+        // their names instead of spelling "moe".
+        ("qwen3-30b-a3b", "qwen3moe"),
+        ("qwen3-235b-a22b", "qwen3moe"),
+        ("qwen3moe", "qwen3moe"),
+        ("qwen3-moe", "qwen3moe"),
+        ("qwen3_moe", "qwen3moe"),
+        ("qwen3.5", "qwen35"),
+        ("qwen3-5", "qwen35"),
+        ("qwen3_5", "qwen35"),
+        ("qwen35", "qwen35"),
         ("qwen3", "qwen3"),
+        ("qwen2.5", "qwen2"),
+        ("qwen2-5", "qwen2"),
+        ("qwen2_5", "qwen2"),
         ("qwen2", "qwen2"),
         ("smollm3", "smollm3"),
-        ("smollm", "smollm3"),
+        // SmolLM/SmolLM2 GGUFs use the llama graph; only SmolLM3 has the NoPE
+        // schedule represented by the distinct smollm3 architecture.
+        ("smollm2", "llama"),
+        ("smollm", "llama"),
         ("gemma-4", "gemma4"),
         ("gemma4", "gemma4"),
         ("gemma-3", "gemma3"),
         ("gemma3", "gemma3"),
+        ("gemma-2", "gemma2"),
+        ("gemma2", "gemma2"),
         ("phi-3", "phi3"),
         ("phi3", "phi3"),
+        ("bitnet-b1.58", "bitnet-b1.58"),
+        ("bitnet-b1-58", "bitnet-b1.58"),
         ("lfm2", "lfm2"),
         ("mixtral", "mixtral"),
         ("mistral", "mistral"),
@@ -488,6 +512,30 @@ mod tests {
         assert_eq!(
             guess_architecture("gemma-3-1b-it-Q8_0.gguf", "ggml-org/x"),
             "gemma3"
+        );
+        assert_eq!(
+            guess_architecture("Qwen3.5-9B-Q8_0.gguf", "org/Qwen3.5-9B-GGUF"),
+            "qwen35"
+        );
+        assert_eq!(
+            guess_architecture("Qwen3-30B-A3B-Q4_K_M.gguf", "Qwen/Qwen3-30B-A3B-GGUF"),
+            "qwen3moe"
+        );
+        assert_eq!(
+            guess_architecture("Qwen3-235B-A22B-Q4_K_M.gguf", "Qwen/Qwen3-235B-A22B-GGUF"),
+            "qwen3moe"
+        );
+        assert_eq!(
+            guess_architecture("qwen2.5-coder-7b-q8_0.gguf", "Qwen/Qwen2.5-Coder-GGUF"),
+            "qwen2"
+        );
+        assert_eq!(
+            guess_architecture("SmolLM2-1.7B-Q8_0.gguf", "org/SmolLM2-GGUF"),
+            "llama"
+        );
+        assert_eq!(
+            guess_architecture("Gemma-2-9B-Q8_0.gguf", "org/Gemma-2-GGUF"),
+            "gemma2"
         );
         assert_eq!(guess_architecture("mystery.gguf", "someone/mystery"), "");
     }

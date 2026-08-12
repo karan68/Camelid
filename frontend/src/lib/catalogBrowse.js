@@ -1,3 +1,10 @@
+import {
+  exactCompatibilityTargetForModel,
+  isCompatibilitySupportedForModel,
+  isNumericalVarianceRunnableCompatibilityTarget,
+  isVerifiedRunnableCompatibilityTarget,
+} from './capabilities.js'
+
 /* Pure presentation logic for the "Get models" catalog browse.
 
    It lives outside the component so the three rules that actually decide what the
@@ -10,9 +17,159 @@
       `IQ3_M`, `IQ4_XS`, ... of the same weights). Grouping happens here.
    2. Quantization is a quality/size tradeoff the user is currently given no help
       with. The ordering and the plain-language note come from one table.
-   3. Fit is never guessed. Every helper here distinguishes "does not fit",
+   3. A backend-provided current-host lane outranks the static support ledger.
+      This keeps platform-scoped evidence on the host that actually earned it.
+   4. Fit is never guessed. Every helper here distinguishes "does not fit",
       "does not fit right now", and "we do not know" — collapsing them is what made
       the advisory read as "nothing works on this machine". */
+
+/* --- predicted support lane ---------------------------------------------- */
+
+/* The backend's current-host verdict wins whenever it is present. The static
+   capabilities ledger describes every certified platform lane, so consulting it
+   first would let a platform-scoped row read Supported on a host with no receipt.
+   Absence preserves the existing behavior for ordinary curated rows and older
+   servers; any explicit unknown/unsupported value fails closed. */
+export function catalogQualification(item, capabilities) {
+  // Live Hugging Face metadata is filename-guessed and can never imply support
+  // or exact-row verification.
+  if (item?.group === 'experimental') {
+    return {
+      kind: 'unverified',
+      label: 'Unverified',
+      detail: 'Live Hugging Face result. Camelid has not inspected or compared this exact file.',
+    }
+  }
+
+  const target = exactCompatibilityTargetForModel(capabilities, null, item)
+
+  // A host-scoped backend verdict outranks the static contract. Supported rows
+  // whose receipts cover a different host remain runnable here, but may not borrow
+  // the Supported badge.
+  if (item?.host_lane_class != null) {
+    if (item.host_lane_class === 'supported') {
+      return { kind: 'supported', label: 'Supported', detail: '' }
+    }
+    if (item.host_lane_class === 'runnable_with_variance') {
+      return {
+        kind: 'variance',
+        label: 'Runnable',
+        detail: target?.full_support_blockers || 'This exact model loads and generates, but some deterministic token IDs differ from the pinned reference.',
+        target,
+      }
+    }
+    if (item.host_lane_class === 'unsupported') {
+      return {
+        kind: 'blocked',
+        label: 'Cannot run',
+        detail: 'Camelid does not have a runnable implementation for this model on the current host.',
+        target,
+      }
+    }
+    if (item.host_lane_class === 'experimental_implemented') {
+      return {
+        kind: 'runnable',
+        label: 'Runnable',
+        detail: target?.status?.startsWith('supported')
+          ? 'This exact row is supported on a qualified host; this host has a runnable path without the same support receipt.'
+          : 'Camelid implements this model on the current host, but this exact run configuration is not fully supported.',
+        target,
+      }
+    }
+    return {
+      kind: 'blocked',
+      label: 'Cannot run',
+      detail: 'Camelid did not recognize the backend lane reported for this model on the current host.',
+      target,
+    }
+  }
+
+  if (isCompatibilitySupportedForModel(capabilities, null, item)) {
+    return { kind: 'supported', label: 'Supported', detail: '', target }
+  }
+
+  if (isVerifiedRunnableCompatibilityTarget(target)) {
+    return {
+      kind: 'verified',
+      label: 'Verified',
+      detail: 'Exact artifact passed load, deterministic output comparison, and guarded API/WebUI checks. Extended-context support is still pending.',
+      target,
+    }
+  }
+
+  const status = String(target?.status || '').toLowerCase()
+  const parity = String(target?.parity_audited || '').toLowerCase()
+  if (status.includes('blocked_load')) {
+    return {
+      kind: 'blocked',
+      label: 'Load blocked',
+      detail: target?.full_support_blockers || 'The exact artifact does not complete Camelid\'s load path yet.',
+      target,
+    }
+  }
+  if (isNumericalVarianceRunnableCompatibilityTarget(target)) {
+    return {
+      kind: 'variance',
+      label: 'Runnable',
+      detail: target?.full_support_blockers || 'This exact model loads and generates, but some deterministic token IDs differ from the pinned reference.',
+      target,
+    }
+  }
+  if (status.includes('blocked_parity') || parity.includes('failed') || parity.includes('divergence')) {
+    return {
+      kind: 'mismatch',
+      label: 'Output mismatch',
+      detail: target?.full_support_blockers || 'The model loads, but deterministic output differs from the pinned reference.',
+      target,
+    }
+  }
+  if (status.includes('blocked_template')) {
+    return {
+      kind: 'limited',
+      label: 'Chat limited',
+      detail: target?.full_support_blockers || 'Raw generation works, but the public chat-template envelope is not verified.',
+      target,
+    }
+  }
+  if (status.startsWith('active_validation')) {
+    return {
+      kind: 'validating',
+      label: 'Validation pending',
+      detail: target?.full_support_blockers || 'This exact row is still being validated.',
+      target,
+    }
+  }
+  if (status.startsWith('planned')) {
+    return {
+      kind: 'unverified',
+      label: 'Not verified',
+      detail: target?.full_support_blockers || 'This exact row is planned but has not completed runtime qualification.',
+      target,
+    }
+  }
+  if (item?.oracle_qualified) {
+    return {
+      kind: 'runnable',
+      label: 'Runnable',
+      detail: 'Camelid implements this architecture and quantization; this exact file does not have a full support receipt.',
+      target,
+    }
+  }
+  return {
+    kind: 'unverified',
+    label: 'Not verified',
+    detail: 'This curated file does not yet have an exact-row runtime qualification result.',
+    target,
+  }
+}
+
+export function predictedLane(item, capabilities) {
+  const qualification = catalogQualification(item, capabilities)
+
+  if (qualification.kind === 'supported') return 'supported'
+  if (qualification.kind === 'verified' || qualification.kind === 'runnable' || qualification.kind === 'variance') return 'compatible'
+  return 'not_anchored'
+}
 
 /* --- fit ------------------------------------------------------------------ */
 
@@ -256,11 +413,23 @@ export function partitionByArchSupport(groups) {
 
 /* Split curated rows into what this machine can run and what it cannot, for the
    no-search landing state. Rows with an `unknown` verdict count as runnable: an
-   unprobed host must not have its whole catalog folded away. */
+   unprobed host must not have its whole catalog folded away.
+
+   Only a PERMANENT refusal is folded away. `insufficient_free_memory` means the
+   machine is big enough and the memory is merely in use right now, which changes
+   the moment another app closes — folding those rows away made a busy machine
+   look like a small one. On a host with little free memory that was most of the
+   catalog: measured here, 31 of 33 curated rows collapsed behind a disclosure and
+   the page read as broken. Those rows stay in the list, where they already render
+   an amber chip, the reason, and the Re-check button that re-probes memory live.
+   `wont_fit` is the one refusal freeing memory cannot change, so it still folds. */
 export function partitionCuratedByFit(items) {
+  const permanentlyRefused = (item) => isRefusingFit(item.fit)
+    && !fitIsRecheckable(item.fit)
+    && !ghostMoeFits(item)
   return {
-    runnable: items.filter((item) => !isRefusingFit(item.fit) || ghostMoeFits(item)),
-    blocked: items.filter((item) => isRefusingFit(item.fit) && !ghostMoeFits(item)),
+    runnable: items.filter((item) => !permanentlyRefused(item)),
+    blocked: items.filter(permanentlyRefused),
   }
 }
 

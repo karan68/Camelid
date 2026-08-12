@@ -146,6 +146,7 @@ export async function readStreamingChatCompletion(response, onDelta, { estimateT
       if (role && !delta && !reasoningDelta) onStreamEvent?.({ type: 'role', role, ...streamMetrics() })
       if (reasoningDelta && !delta) {
         completionTokens += 1
+        onStreamEvent?.({ type: 'reasoning', delta: reasoningDelta, ...streamMetrics() })
       }
       if (delta) {
         completionTokens += 1

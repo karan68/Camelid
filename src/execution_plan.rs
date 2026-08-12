@@ -273,12 +273,22 @@ fn env_updates_enable_gate(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlanPlatform {
     pub operating_system: String,
+    /// Host operating-system product version. On macOS this is the exact
+    /// `sw_vers -productVersion` value used to scope host-specific receipts.
+    pub operating_system_version: String,
     pub architecture: String,
     pub platform_label: String,
+    /// Hardware model identifier (for example `Mac16,10`), distinct from the
+    /// processor brand. Unknown on platforms where Camelid has no stable probe.
+    pub host_model_identifier: String,
     pub cpu_model: String,
     pub cpu_features: Vec<String>,
     /// A usable Metal compute device exists on this host (always false off macOS).
     pub metal_available: bool,
+    /// A usable CUDA compute device exists, independent of the resident-Q8 gate.
+    pub cuda_available: bool,
+    /// State of the platform-neutral user GPU switch.
+    pub gpu_accel_enabled: bool,
     /// The CUDA resident decode engine will drive decode for this process (a usable
     /// CUDA device is present, GPU acceleration is on, and neither deterministic mode
     /// nor `CAMELID_CUDA_RESIDENT_DECODE=0` forces the CPU reference). When true, the
@@ -291,19 +301,27 @@ pub struct PlanPlatform {
 impl PlanPlatform {
     pub fn current() -> Self {
         let operating_system = env::consts::OS.to_string();
+        let operating_system_version = operating_system_version();
         let architecture = env::consts::ARCH.to_string();
         let cpu_features = cpu_features();
+        let host_model_identifier = host_model_identifier();
         let cpu_model = cpu_model();
         let platform_label = platform_label(&operating_system, &architecture, &cpu_model);
         let metal_available = crate::metal::detect_metal_device().available;
+        let cuda_available = crate::cuda::is_available();
+        let gpu_accel_enabled = crate::cuda::gpu_accel_enabled();
         let cuda_resident_active = cuda_resident_decode_will_run();
         Self {
             operating_system,
+            operating_system_version,
             architecture,
             platform_label,
+            host_model_identifier,
             cpu_model,
             cpu_features,
             metal_available,
+            cuda_available,
+            gpu_accel_enabled,
             cuda_resident_active,
         }
     }
@@ -402,11 +420,15 @@ pub fn plan_for_model_with_platform_and_env(
     let model_family = model_family(&row, gguf);
     let quant_type = quant_type(gguf);
     let thread_count = threads.unwrap_or_else(default_thread_count);
-    let diagnostics_status = match profile {
-        ExecutionProfile::Debug => {
-            "debug diagnostics enabled; performance claims disabled".to_string()
-        }
-        _ => "standard diagnostics; RSS timings disabled by default".to_string(),
+    let debug_diagnostics = matches!(profile, ExecutionProfile::Debug);
+    let operator_forward_rss_timings = planner_env.flag_enabled("CAMELID_FORWARD_RSS_TIMINGS");
+    let forward_rss_timings_enabled = debug_diagnostics || operator_forward_rss_timings;
+    let diagnostics_status = if debug_diagnostics {
+        "debug diagnostics enabled; performance claims disabled".to_string()
+    } else if operator_forward_rss_timings {
+        "operator-requested RSS timings enabled; performance claims disabled".to_string()
+    } else {
+        "standard diagnostics; RSS timings disabled by default".to_string()
     };
 
     let mut reasons = vec![profile_reason];
@@ -414,7 +436,7 @@ pub fn plan_for_model_with_platform_and_env(
     reasons.push(format!("quant_type={quant_type}"));
 
     let mut env_updates: BTreeMap<&'static str, Option<&'static str>> = BTreeMap::new();
-    if matches!(profile, ExecutionProfile::Debug) {
+    if forward_rss_timings_enabled {
         env_updates.insert("CAMELID_FORWARD_RSS_TIMINGS", Some("on"));
     }
 
@@ -426,6 +448,7 @@ pub fn plan_for_model_with_platform_and_env(
     // tensor present, "Q4_K_M" meant K-quant tensors with no Q8_0.
     let has_tensor = |t: GgufTensorType| gguf.tensors.iter().any(|tensor| tensor.tensor_type == t);
     let has_q8_0_tensors = has_tensor(GgufTensorType::Q8_0);
+    let has_i2_s_tensors = has_tensor(GgufTensorType::I2S);
     let has_kquant_tensors = has_tensor(GgufTensorType::Q4K) || has_tensor(GgufTensorType::Q6K);
     let has_prism_low_bit_tensors = has_tensor(GgufTensorType::Q1_0)
         || has_tensor(GgufTensorType::Q2_0G64)
@@ -484,14 +507,30 @@ pub fn plan_for_model_with_platform_and_env(
         && !matches!(profile, ExecutionProfile::Safe)
         && (gguf.architecture() != Some("qwen35")
             || !planner_env.flag_disabled("CAMELID_QWEN35_CUDA"));
-    let support_level = if prism_supported_macos {
+    let mut support_level = if prism_supported_macos {
         "supported_exact_row_smoke_macos_metal".to_string()
     } else if prism_supported_windows {
         "supported_exact_row_smoke_windows_cuda".to_string()
     } else {
         support_level(&row, &quant_type)
     };
-    reasons.push(format!("support_level={support_level}"));
+
+    let bitnet_gpu_allowed =
+        platform.gpu_accel_enabled && !planner_env.flag_disabled("CAMELID_BITNET_GPU");
+    let bitnet_backend = if bitnet_gpu_allowed && platform.cuda_available {
+        "cuda"
+    } else if bitnet_gpu_allowed && platform.metal_available {
+        "metal"
+    } else {
+        "cpu"
+    };
+    let bitnet_kernel_path =
+        match crate::bitnet_kernels::BitNetKernelMode::from_env().effective_cpu() {
+            crate::bitnet_kernels::BitNetKernelMode::I2S => "i2_s_canonical_direct",
+            crate::bitnet_kernels::BitNetKernelMode::Tl1 => "i2_s_canonical_tl1_lookup",
+            crate::bitnet_kernels::BitNetKernelMode::Tl2 => "i2_s_canonical_tl2_lookup",
+            crate::bitnet_kernels::BitNetKernelMode::Auto => unreachable!("auto resolved"),
+        };
 
     let (
         selected_backend,
@@ -500,7 +539,55 @@ pub fn plan_for_model_with_platform_and_env(
         prefill_runtime_policy,
         decode_path,
         fallback_path,
-    ) = if gguf.architecture() == Some("gemma4") {
+    ) = if crate::model::is_bitnet_embedding_model(gguf) && has_i2_s_tensors {
+        reasons.push(format!(
+            "exact Microsoft BitNet embedding GGUF: decoder-only qwen3/gemma3 graph with \
+             canonical I2_S projections executes through the experimental {bitnet_backend} \
+             cleanroom kernel; GPU dispatch falls back to the CPU oracle and generative \
+             endpoints fail closed"
+        ));
+        (
+            match bitnet_backend {
+                "cuda" => "bitnet_embedding_cuda_runtime",
+                "metal" => "bitnet_embedding_metal_runtime",
+                _ => "bitnet_embedding_cpu_runtime",
+            },
+            bitnet_kernel_path,
+            match bitnet_backend {
+                "cuda" => "bitnet_embedding_cuda_full_sequence",
+                "metal" => "bitnet_embedding_metal_full_sequence",
+                _ => "bitnet_embedding_cpu_full_sequence",
+            },
+            "experimental_exact_artifact_geometry",
+            "mean_pool_l2_normalize",
+            "no_generation_fallback",
+        )
+    } else if gguf.architecture() == Some("bitnet-b1.58") && has_i2_s_tensors {
+        reasons.push(format!(
+            "BitNet-b1.58 canonical I2_S row: causal SubLN graph executes through the \
+             experimental {bitnet_backend} cleanroom kernel with CPU fallback"
+        ));
+        (
+            match bitnet_backend {
+                "cuda" => "bitnet_runnable_cuda_runtime",
+                "metal" => "bitnet_runnable_metal_runtime",
+                _ => "bitnet_runnable_cpu_runtime",
+            },
+            bitnet_kernel_path,
+            match bitnet_backend {
+                "cuda" => "bitnet_runnable_cuda_prefill",
+                "metal" => "bitnet_runnable_metal_prefill",
+                _ => "bitnet_runnable_cpu_prefill",
+            },
+            "experimental_cleanroom_graph",
+            match bitnet_backend {
+                "cuda" => "bitnet_runnable_cuda_decode",
+                "metal" => "bitnet_runnable_metal_decode",
+                _ => "bitnet_runnable_cpu_decode",
+            },
+            "bitnet_cleanroom_cpu_fallback",
+        )
+    } else if gguf.architecture() == Some("gemma4") {
         // gemma4 rows are served by their OWN runtime (`Gemma4ServeRuntime`), not
         // by the generic dense engine, so the generic Q8/K-quant arms below would
         // describe a lane this row never takes. Phase 0 of the gemma3→CUDA
@@ -587,8 +674,7 @@ pub fn plan_for_model_with_platform_and_env(
         && platform.operating_system == "macos"
         && platform.architecture == "aarch64"
         && platform.metal_available
-        && !matches!(profile, ExecutionProfile::Safe)
-        && !planner_env.flag_disabled("CAMELID_LFM2_METAL")
+        && lfm2_metal_policy_allows(&profile, planner_env.flag_disabled("CAMELID_LFM2_METAL"))
     {
         // The lfm2 resident Metal graph. Without this arm lfm2 fell through every
         // arm below to the safe path and `/v1/health` reported `cpu_reference` /
@@ -784,6 +870,48 @@ pub fn plan_for_model_with_platform_and_env(
             "safe_cpu_reference_path",
         )
     };
+
+    // LFM2.5-2.6B is supported only on the two lanes that carry receipts. Its
+    // row-table entry is recognition-only so a Linux host, a neighboring Mac,
+    // Safe mode, or a CPU fallback cannot inherit the platform-blind claim.
+    // Evaluate this after route selection: the Mac receipt is specifically for
+    // the resident backend/prefill/decode labels below, not merely for a host
+    // on which Metal happens to be present.
+    if is_lfm2_5_2_6b_exact_row(&row) {
+        support_level = if lfm2_selected_lane_supported(
+            &profile,
+            &platform,
+            model_path,
+            gguf,
+            &quant_type,
+            selected_backend,
+            prefill_path,
+            decode_path,
+        ) {
+            "supported_exact_row_smoke".into()
+        } else {
+            "unknown_or_unvalidated".into()
+        };
+    }
+    if is_phi3_mini_4k_exact_row(&row) {
+        support_level = if phi3_selected_lane_supported(
+            &profile,
+            &platform,
+            model_path,
+            gguf,
+            &quant_type,
+            selected_backend,
+            prefill_path,
+            decode_path,
+        ) {
+            "supported_exact_row_smoke".into()
+        } else {
+            "unknown_or_unvalidated".into()
+        };
+    }
+    // Preserve the stable reason ordering (profile, row, quant, support, lane)
+    // even though platform-scoped support can only be decided after lane selection.
+    reasons.insert(3, format!("support_level={support_level}"));
 
     let plan = ExecutionPlan {
         profile,
@@ -1833,11 +1961,103 @@ fn support_level(row: &str, quant_type: &str) -> String {
         return "unknown_or_unvalidated".into();
     }
     let level = recognized_row_level(row);
-    if level == "recognized_prism_bonsai_exact_row" {
+    if matches!(
+        level,
+        "recognized_prism_bonsai_exact_row"
+            | "recognized_lfm2_5_2_6b_exact_row"
+            | "recognized_phi3_mini_4k_exact_row"
+    ) {
         "unknown_or_unvalidated".into()
     } else {
         level.into()
     }
+}
+
+/// Exact public LFM2.5 2.6B row recognition. Keep this stem match narrow: a
+/// future Base, tool, multimodal, or differently versioned file must not
+/// inherit the one Q8_0 receipt merely because its name contains `2.6B`.
+fn is_lfm2_5_2_6b_exact_row(row: &str) -> bool {
+    let normalized = normalize_row(row);
+    let stem = normalized.strip_suffix("_gguf").unwrap_or(&normalized);
+    matches!(stem, "lfm2_5_2_6b" | "lfm2_5_2_6b_q8_0")
+}
+
+/// Exact public Phi-3 Mini 4K Instruct row recognition. `general.name` in the
+/// certified GGUF is only `Phi3`, so recognition must be anchored to the narrow
+/// catalog filename rather than widening to every model with a phi3 header.
+fn is_phi3_mini_4k_exact_row(row: &str) -> bool {
+    let normalized = normalize_row(row);
+    let stem = normalized.strip_suffix("_gguf").unwrap_or(&normalized);
+    stem == "phi_3_mini_4k_instruct_q8_0" || stem == "phi3_mini_4k_instruct_q8_0"
+}
+
+/// Whether the selected execution plan is one of the two receipted LFM lanes.
+///
+/// Windows evidence covers the non-Safe x86_64 runnable CPU plan. The macOS
+/// receipt is narrower: one Mac16,10 with the base Apple M4 CPU, macOS 26.5,
+/// and the exact resident-Metal backend/prefill/decode labels. Every other
+/// platform or fallback remains recognition-only.
+#[allow(clippy::too_many_arguments)]
+fn lfm2_selected_lane_supported(
+    profile: &ExecutionProfile,
+    platform: &PlanPlatform,
+    model_path: &Path,
+    gguf: &GgufFile,
+    quant_type: &str,
+    selected_backend: &str,
+    prefill_path: &str,
+    decode_path: &str,
+) -> bool {
+    if matches!(profile, ExecutionProfile::Safe)
+        || gguf.architecture() != Some("lfm2")
+        || quant_type != "Q8_0"
+        || model_path.file_name().and_then(|name| name.to_str()) != Some("LFM2.5-2.6B-Q8_0.gguf")
+    {
+        return false;
+    }
+
+    let windows_runnable_cpu = platform.operating_system == "windows"
+        && platform.architecture == "x86_64"
+        && selected_backend == "cpu_reference"
+        && prefill_path == "safe_cpu_prefill"
+        && decode_path == "safe_cpu_decode";
+    let exact_m4_resident_metal = platform.operating_system == "macos"
+        && platform.operating_system_version.trim() == "26.5"
+        && platform.architecture == "aarch64"
+        && platform.host_model_identifier.trim() == "Mac16,10"
+        && platform.cpu_model.trim() == "Apple M4"
+        && selected_backend == "metal_resident_lfm2_runtime"
+        && prefill_path == "lfm2_metal_resident_prefill"
+        && decode_path == "lfm2_metal_resident_decode";
+
+    windows_runnable_cpu || exact_m4_resident_metal
+}
+
+/// Windows x86_64 exact-row lane that cleared Phi-3's stale head-dimension hold.
+/// The current receipt covers the conservative CPU reference prefill/decode path;
+/// other platforms and a future optimized route remain recognition-only until
+/// independently re-run.
+#[allow(clippy::too_many_arguments)]
+fn phi3_selected_lane_supported(
+    profile: &ExecutionProfile,
+    platform: &PlanPlatform,
+    model_path: &Path,
+    gguf: &GgufFile,
+    quant_type: &str,
+    selected_backend: &str,
+    prefill_path: &str,
+    decode_path: &str,
+) -> bool {
+    !matches!(profile, ExecutionProfile::Safe)
+        && platform.operating_system == "windows"
+        && platform.architecture == "x86_64"
+        && gguf.architecture() == Some("phi3")
+        && quant_type == "Q8_0"
+        && model_path.file_name().and_then(|name| name.to_str())
+            == Some("Phi-3-mini-4k-instruct-Q8_0.gguf")
+        && selected_backend == "cpu_reference"
+        && prefill_path == "safe_cpu_prefill"
+        && decode_path == "safe_cpu_decode"
 }
 
 /// Quant certified for one exact Prism/Bonsai artifact name. Exact normalized
@@ -1909,6 +2129,22 @@ fn recognized_row_level(row: &str) -> &'static str {
         // Non-Q8_0 quants of the same name report unknown via `support_level`
         // and are declined by the resident admission (hazard H5).
         "supported_exact_row_smoke_sub512"
+    } else if is_lfm2_5_2_6b_exact_row(row) {
+        // Recognition only. Some published conversions use an opaque hash for
+        // `general.name`, so recognizing the exact filename lets
+        // `exact_model_row` expose the capabilities row. The plan promotes
+        // this marker only after a receipted platform and actual selected lane
+        // both match; platform-blind `support_level` maps it back to unknown.
+        //
+        // This does not admit LFM2 to the optimized dense Q8 planner:
+        // `is_supported_exact_q8_row` rejects runnable-only architectures
+        // before consulting this table.
+        "recognized_lfm2_5_2_6b_exact_row"
+    } else if is_phi3_mini_4k_exact_row(row) {
+        // Recognition only. Windows x86_64 promotes this marker after route
+        // selection; the marker itself is platform-blind and therefore never a
+        // support claim.
+        "recognized_phi3_mini_4k_exact_row"
     } else if normalized.contains("ornith_1_0_9b") {
         // Ornith-1.0-9B (qwen35 hybrid gated-delta-net), certified on the
         // runnable serve lane. `/api/capabilities` has carried
@@ -1946,7 +2182,8 @@ fn recognized_row_level(row: &str) -> &'static str {
 /// for a row that is certified on a lane this engine does not own.
 ///
 /// Runnable-only archs are excluded FIRST, before the table is consulted at all.
-/// `crate::model::is_runnable_only_arch` (qwen35, gemma2, lfm2) marks the archs
+/// `crate::model::is_runnable_only_arch` (qwen35, gemma2, lfm2, bitnet-b1.58)
+/// marks the archs
 /// whose only correct forward pass lives in `crate::runnable` on EVERY host. The
 /// arm this predicate gates dispatches to `select_macos_q8_plan` and
 /// `select_x86_q8_plan`, which would describe an engine that cannot run them and
@@ -2008,6 +2245,11 @@ fn model_family(row: &str, gguf: &GgufFile) -> String {
 fn quant_type(gguf: &GgufFile) -> String {
     let has = |t: GgufTensorType| gguf.tensors.iter().any(|tensor| tensor.tensor_type == t);
     let has_q8_0 = has(GgufTensorType::Q8_0);
+    // BitNet and Prism both use general.file_type=40 in their respective forks.
+    // GGML tensor type 36 is definitive for BitNet's I2_S payload.
+    if has(GgufTensorType::I2S) {
+        return "I2_S".into();
+    }
     // File type 41 identifies Prism Q2_0 but cannot identify its deployed
     // block geometry. The directory resolver can, so it outranks metadata.
     if has(GgufTensorType::Q2_0G64) {
@@ -2137,6 +2379,28 @@ fn cpu_model() -> String {
     }
 }
 
+fn host_model_identifier() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        command_output("sysctl", &["-n", "hw.model"]).unwrap_or_else(|| "unknown".into())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        "unknown".into()
+    }
+}
+
+fn operating_system_version() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        command_output("sw_vers", &["-productVersion"]).unwrap_or_else(|| "unknown".into())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        "unknown".into()
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn command_output(program: &str, args: &[&str]) -> Option<String> {
     std::process::Command::new(program)
@@ -2223,6 +2487,28 @@ fn env_flag_disabled(key: &str) -> bool {
     env::var(key).is_ok_and(|value| flag_value_disabled(&value))
 }
 
+/// Whether the LFM2 resident-Metal plan may be selected from operator policy.
+/// Runtime routing calls the same predicate so `CAMELID_PROFILE=safe` and the
+/// explicit LFM opt-out cannot leave health reporting CPU while Metal runs.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn lfm2_metal_plan_selectable() -> bool {
+    lfm2_metal_policy_allows(
+        &requested_profile().0,
+        env_flag_disabled("CAMELID_LFM2_METAL"),
+    )
+}
+
+/// The promotion receipts cover the normal runnable profile, not Safe (or an
+/// invalid profile that resolves to Safe). API/catalog host classification uses
+/// this same parser so it cannot disagree with the stored execution plan.
+pub(crate) fn supported_profile_selected() -> bool {
+    !matches!(requested_profile().0, ExecutionProfile::Safe)
+}
+
+fn lfm2_metal_policy_allows(profile: &ExecutionProfile, explicitly_disabled: bool) -> bool {
+    !matches!(profile, ExecutionProfile::Safe) && !explicitly_disabled
+}
+
 #[allow(dead_code)]
 fn env_flag_enabled(key: &str) -> bool {
     env::var(key).is_ok_and(|value| flag_value_enabled(&value))
@@ -2254,6 +2540,20 @@ mod tests {
                 "{v:?} must leave the default-on lane enabled for BOTH gates"
             );
         }
+
+        let _guard = crate::test_support::env_lock();
+        env::set_var("CAMELID_PROFILE", "safe");
+        env::remove_var("CAMELID_LFM2_METAL");
+        assert!(
+            !lfm2_metal_plan_selectable(),
+            "Safe profile must disable both LFM plan selection and runtime routing"
+        );
+        env::set_var("CAMELID_PROFILE", "auto");
+        assert!(lfm2_metal_plan_selectable());
+        env::set_var("CAMELID_LFM2_METAL", "0");
+        assert!(!lfm2_metal_plan_selectable());
+        env::remove_var("CAMELID_PROFILE");
+        env::remove_var("CAMELID_LFM2_METAL");
     }
 
     use super::*;
@@ -2266,11 +2566,15 @@ mod tests {
     fn platform(os: &str, arch: &str, features: &[&str]) -> PlanPlatform {
         PlanPlatform {
             operating_system: os.into(),
+            operating_system_version: "fixture-os-version".into(),
             architecture: arch.into(),
             platform_label: platform_label(os, arch, "Apple M4"),
+            host_model_identifier: "fixture-host-model".into(),
             cpu_model: "fixture cpu".into(),
             cpu_features: features.iter().map(|feature| (*feature).into()).collect(),
             metal_available: false,
+            cuda_available: false,
+            gpu_accel_enabled: false,
             cuda_resident_active: false,
         }
     }
@@ -2278,14 +2582,26 @@ mod tests {
     fn metal_platform(os: &str, arch: &str, features: &[&str]) -> PlanPlatform {
         PlanPlatform {
             metal_available: true,
+            gpu_accel_enabled: true,
             ..platform(os, arch, features)
         }
     }
 
     fn cuda_platform(os: &str, arch: &str, features: &[&str]) -> PlanPlatform {
         PlanPlatform {
+            cuda_available: true,
+            gpu_accel_enabled: true,
             cuda_resident_active: true,
             ..platform(os, arch, features)
+        }
+    }
+
+    fn receipted_lfm2_m4_platform() -> PlanPlatform {
+        PlanPlatform {
+            operating_system_version: "26.5".into(),
+            host_model_identifier: "Mac16,10".into(),
+            cpu_model: "Apple M4".into(),
+            ..metal_platform("macos", "aarch64", &["dotprod", "i8mm"])
         }
     }
 
@@ -2634,6 +2950,7 @@ mod tests {
     fn clear_profile_env() {
         for key in [
             "CAMELID_PROFILE",
+            "CAMELID_FORWARD_RSS_TIMINGS",
             "CAMELID_MAC_Q8_REPACK",
             "CAMELID_MAC_Q8_PREFILL_I8MM",
             "CAMELID_MAC_Q8_SCHED",
@@ -2643,6 +2960,7 @@ mod tests {
             "CAMELID_METAL_KQUANT",
             "CAMELID_METAL_F32Y",
             "CAMELID_METAL_WIRE",
+            "CAMELID_LFM2_METAL",
             "CAMELID_QWEN35_CUDA",
             "CAMELID_X86_Q8_REPACK",
             "CAMELID_X86_Q8_KERNEL",
@@ -2713,6 +3031,237 @@ mod tests {
             ),
             "Llama 3.2 1B Instruct"
         );
+    }
+
+    #[test]
+    fn lfm2_filename_is_recognized_without_platform_blind_support_or_dense_q8_admission() {
+        let capabilities_status = crate::api::capabilities_response()
+            .model_compatibility
+            .iter()
+            .find(|target| target.id == "lfm2_5_2_6b_q8_0")
+            .expect("the LFM2.5-2.6B Q8_0 row must be advertised")
+            .status;
+        assert_eq!(capabilities_status, "supported_exact_row_smoke");
+
+        let mut gguf = quant_fixture(
+            "799e37a4e60bdaae",
+            None,
+            &[GgufTensorType::Q8_0, GgufTensorType::F32],
+        );
+        gguf.metadata.insert(
+            "general.architecture".into(),
+            GgufMetadataValue::String("lfm2".into()),
+        );
+        let row = exact_model_row(&PathBuf::from("/models/LFM2.5-2.6B-Q8_0.gguf"), &gguf);
+
+        assert_eq!(row, "LFM2.5-2.6B-Q8_0.gguf");
+        assert_eq!(
+            recognized_row_level(&row),
+            "recognized_lfm2_5_2_6b_exact_row"
+        );
+        assert_eq!(support_level(&row, "Q8_0"), "unknown_or_unvalidated");
+        assert_eq!(support_level(&row, "Q4_K_M"), "unknown_or_unvalidated");
+        assert!(
+            !is_supported_exact_q8_row(&row, &gguf),
+            "LFM2 is certified on its runnable lane, not the optimized dense Q8 engine"
+        );
+    }
+
+    fn lfm2_q8_fixture() -> GgufFile {
+        let mut gguf = quant_fixture(
+            "799e37a4e60bdaae",
+            None,
+            &[GgufTensorType::Q8_0, GgufTensorType::F32],
+        );
+        gguf.metadata.insert(
+            "general.architecture".into(),
+            GgufMetadataValue::String("lfm2".into()),
+        );
+        gguf
+    }
+
+    fn lfm2_plan(filename: &str, platform: PlanPlatform) -> ExecutionPlanOutcome {
+        plan_for_model_with_platform(
+            &PathBuf::from(format!("/models/{filename}")),
+            &lfm2_q8_fixture(),
+            Some(8),
+            platform,
+        )
+    }
+
+    fn phi3_q8_fixture() -> GgufFile {
+        let mut gguf = quant_fixture("Phi3", None, &[GgufTensorType::Q8_0, GgufTensorType::F32]);
+        gguf.metadata.insert(
+            "general.architecture".into(),
+            GgufMetadataValue::String("phi3".into()),
+        );
+        gguf
+    }
+
+    fn phi3_plan(filename: &str, platform: PlanPlatform) -> ExecutionPlanOutcome {
+        plan_for_model_with_platform(
+            &PathBuf::from(format!("/models/{filename}")),
+            &phi3_q8_fixture(),
+            Some(8),
+            platform,
+        )
+    }
+
+    #[test]
+    fn lfm2_support_level_is_limited_to_the_two_receipted_execution_lanes() {
+        let _guard = env_lock();
+        clear_profile_env();
+
+        let windows = lfm2_plan(
+            "LFM2.5-2.6B-Q8_0.gguf",
+            platform("windows", "x86_64", &["avx2"]),
+        );
+        assert_eq!(windows.plan.profile, ExecutionProfile::Auto);
+        assert_eq!(windows.plan.selected_backend, "cpu_reference");
+        assert_eq!(windows.plan.prefill_path, "safe_cpu_prefill");
+        assert_eq!(windows.plan.decode_path, "safe_cpu_decode");
+        assert_eq!(windows.plan.support_level, "supported_exact_row_smoke");
+
+        let mac = lfm2_plan("LFM2.5-2.6B-Q8_0.gguf", receipted_lfm2_m4_platform());
+        assert_eq!(mac.plan.profile, ExecutionProfile::Auto);
+        assert_eq!(mac.plan.selected_backend, "metal_resident_lfm2_runtime");
+        assert_eq!(mac.plan.prefill_path, "lfm2_metal_resident_prefill");
+        assert_eq!(mac.plan.decode_path, "lfm2_metal_resident_decode");
+        assert_eq!(mac.plan.support_level, "supported_exact_row_smoke");
+
+        let linux = lfm2_plan(
+            "LFM2.5-2.6B-Q8_0.gguf",
+            platform("linux", "x86_64", &["avx2"]),
+        );
+        assert_eq!(linux.plan.support_level, "unknown_or_unvalidated");
+
+        clear_profile_env();
+    }
+
+    #[test]
+    fn lfm2_support_level_fails_closed_off_the_exact_m4_receipt() {
+        let _guard = env_lock();
+        clear_profile_env();
+
+        let mut m3 = receipted_lfm2_m4_platform();
+        m3.host_model_identifier = "Mac15,6".into();
+        m3.cpu_model = "Apple M3".into();
+        assert_eq!(
+            lfm2_plan("LFM2.5-2.6B-Q8_0.gguf", m3).plan.support_level,
+            "unknown_or_unvalidated"
+        );
+
+        let mut other_model_identifier = receipted_lfm2_m4_platform();
+        other_model_identifier.host_model_identifier = "Mac16,11".into();
+        assert_eq!(
+            lfm2_plan("LFM2.5-2.6B-Q8_0.gguf", other_model_identifier)
+                .plan
+                .support_level,
+            "unknown_or_unvalidated"
+        );
+
+        let mut other_os_version = receipted_lfm2_m4_platform();
+        other_os_version.operating_system_version = "26.6".into();
+        assert_eq!(
+            lfm2_plan("LFM2.5-2.6B-Q8_0.gguf", other_os_version)
+                .plan
+                .support_level,
+            "unknown_or_unvalidated"
+        );
+
+        let mut cpu_fallback = platform("macos", "aarch64", &["dotprod", "i8mm"]);
+        cpu_fallback.operating_system_version = "26.5".into();
+        cpu_fallback.host_model_identifier = "Mac16,10".into();
+        cpu_fallback.cpu_model = "Apple M4".into();
+        let cpu_fallback = lfm2_plan("LFM2.5-2.6B-Q8_0.gguf", cpu_fallback);
+        assert_eq!(cpu_fallback.plan.selected_backend, "cpu_reference");
+        assert_eq!(cpu_fallback.plan.support_level, "unknown_or_unvalidated");
+
+        env::set_var("CAMELID_PROFILE", "safe");
+        let safe_mac = lfm2_plan("LFM2.5-2.6B-Q8_0.gguf", receipted_lfm2_m4_platform());
+        assert_eq!(safe_mac.plan.profile, ExecutionProfile::Safe);
+        assert_eq!(safe_mac.plan.selected_backend, "cpu_reference");
+        assert_eq!(safe_mac.plan.support_level, "unknown_or_unvalidated");
+        let safe_windows = lfm2_plan(
+            "LFM2.5-2.6B-Q8_0.gguf",
+            platform("windows", "x86_64", &["avx2"]),
+        );
+        assert_eq!(safe_windows.plan.profile, ExecutionProfile::Safe);
+        assert_eq!(safe_windows.plan.support_level, "unknown_or_unvalidated");
+        env::remove_var("CAMELID_PROFILE");
+
+        let neighboring_model =
+            lfm2_plan("LFM2.5-2.6B-Base-Q8_0.gguf", receipted_lfm2_m4_platform());
+        assert_eq!(
+            neighboring_model.plan.support_level,
+            "unknown_or_unvalidated"
+        );
+
+        let mut renamed = lfm2_q8_fixture();
+        renamed.metadata.insert(
+            "general.name".into(),
+            GgufMetadataValue::String("LFM2.5-2.6B".into()),
+        );
+        let renamed = plan_for_model_with_platform(
+            &PathBuf::from("/models/repacked-lfm2.gguf"),
+            &renamed,
+            Some(8),
+            receipted_lfm2_m4_platform(),
+        );
+        assert_eq!(
+            renamed.plan.support_level, "unknown_or_unvalidated",
+            "a general.name match cannot promote a renamed artifact"
+        );
+
+        clear_profile_env();
+    }
+
+    #[test]
+    fn phi3_mini_q8_support_is_exact_and_windows_only() {
+        let _guard = env_lock();
+        clear_profile_env();
+
+        let windows = phi3_plan(
+            "Phi-3-mini-4k-instruct-Q8_0.gguf",
+            platform("windows", "x86_64", &["avx2"]),
+        );
+        assert_eq!(
+            windows.plan.exact_model_row,
+            "Phi-3-mini-4k-instruct-Q8_0.gguf"
+        );
+        assert_eq!(windows.plan.selected_backend, "cpu_reference");
+        assert_eq!(windows.plan.prefill_path, "safe_cpu_prefill");
+        assert_eq!(windows.plan.decode_path, "safe_cpu_decode");
+        assert_eq!(windows.plan.support_level, "supported_exact_row_smoke");
+
+        for other in [
+            phi3_plan(
+                "Phi-3-mini-4k-instruct-Q8_0.gguf",
+                platform("linux", "x86_64", &["avx2"]),
+            ),
+            phi3_plan(
+                "Phi-3-mini-4k-instruct-Q8_0.gguf",
+                platform("windows", "aarch64", &[]),
+            ),
+            phi3_plan(
+                "repacked-phi3.gguf",
+                platform("windows", "x86_64", &["avx2"]),
+            ),
+        ] {
+            assert_eq!(other.plan.support_level, "unknown_or_unvalidated");
+        }
+
+        env::set_var("CAMELID_PROFILE", "safe");
+        assert_eq!(
+            phi3_plan(
+                "Phi-3-mini-4k-instruct-Q8_0.gguf",
+                platform("windows", "x86_64", &["avx2"]),
+            )
+            .plan
+            .support_level,
+            "unknown_or_unvalidated"
+        );
+        clear_profile_env();
     }
 
     #[test]
@@ -2824,7 +3373,80 @@ mod tests {
             outcome.plan.prefill_runtime_policy,
             "always_retained_reference_path"
         );
+        assert!(outcome
+            .plan
+            .diagnostics_status
+            .contains("RSS timings disabled by default"));
+        assert!(!outcome
+            .env_updates
+            .contains_key("CAMELID_FORWARD_RSS_TIMINGS"));
         assert!(!outcome.env_updates.contains_key("CAMELID_MAC_Q8_REPACK"));
+        clear_profile_env();
+    }
+
+    #[test]
+    fn safe_profile_preserves_explicit_forward_rss_timings_through_plan_apply() {
+        let _guard = env_lock();
+        clear_profile_env();
+        env::set_var("CAMELID_PROFILE", "safe");
+        env::set_var("CAMELID_FORWARD_RSS_TIMINGS", "on");
+        let planner_env = PlannerEnv::capture();
+        let outcome = plan_for_model_with_platform_and_env(
+            &PathBuf::from("/tmp/Llama-3.2-3B-Instruct-Q8_0.gguf"),
+            &fixture("Llama 3.2 3B Instruct"),
+            Some(8),
+            platform("windows", "x86_64", &["avx2"]),
+            &planner_env,
+        );
+
+        assert_eq!(outcome.plan.profile, ExecutionProfile::Safe);
+        assert!(outcome
+            .plan
+            .diagnostics_status
+            .contains("operator-requested RSS timings enabled"));
+        assert_eq!(
+            outcome.env_updates.get("CAMELID_FORWARD_RSS_TIMINGS"),
+            Some(&Some("on"))
+        );
+
+        // This is the exact capture -> plan -> apply sequence used by
+        // POST /models/load. A stale live value must not override the captured
+        // operator request, and applying the plan must not remove that request.
+        env::set_var("CAMELID_FORWARD_RSS_TIMINGS", "off");
+        planner_env.apply(&outcome.env_updates);
+        assert_eq!(env::var("CAMELID_FORWARD_RSS_TIMINGS").as_deref(), Ok("on"));
+        clear_profile_env();
+    }
+
+    #[test]
+    fn auto_and_experimental_preserve_explicit_forward_rss_timings() {
+        let _guard = env_lock();
+        for (requested, expected) in [
+            ("auto", ExecutionProfile::Auto),
+            ("experimental", ExecutionProfile::Experimental),
+        ] {
+            clear_profile_env();
+            env::set_var("CAMELID_PROFILE", requested);
+            env::set_var("CAMELID_FORWARD_RSS_TIMINGS", "on");
+            let planner_env = PlannerEnv::capture();
+            let outcome = plan_for_model_with_platform_and_env(
+                &PathBuf::from("/tmp/Llama-3.2-3B-Instruct-Q8_0.gguf"),
+                &fixture("Llama 3.2 3B Instruct"),
+                Some(8),
+                platform("windows", "x86_64", &["avx2"]),
+                &planner_env,
+            );
+
+            assert_eq!(outcome.plan.profile, expected);
+            assert!(outcome
+                .plan
+                .diagnostics_status
+                .contains("operator-requested RSS timings enabled"));
+            assert_eq!(
+                outcome.env_updates.get("CAMELID_FORWARD_RSS_TIMINGS"),
+                Some(&Some("on"))
+            );
+        }
         clear_profile_env();
     }
 
@@ -3785,7 +4407,7 @@ mod tests {
         // the level list — so it still holds if a runnable-only arch ever ships
         // under a row name the optimized engine does recognize, and it keeps
         // holding if `supported_exact_row_smoke` is later added to that list.
-        for arch in ["qwen35", "gemma2", "lfm2"] {
+        for arch in ["qwen35", "gemma2", "lfm2", "bitnet-b1.58"] {
             assert!(
                 crate::model::is_runnable_only_arch(arch),
                 "{arch} must stay in the runnable-only set for this guard to mean anything"
@@ -3800,6 +4422,100 @@ mod tests {
                 "{arch} is runnable-only and must be refused before the row table is read"
             );
         }
+    }
+
+    #[test]
+    fn bitnet_i2_s_plans_disclose_the_runtime_that_serves_them() {
+        let _guard = env_lock();
+        env::remove_var("CAMELID_BITNET_GPU");
+        env::remove_var("CAMELID_BITNET_KERNEL");
+        let mut causal = quant_fixture(
+            "bitnet2b",
+            Some(40),
+            &[GgufTensorType::I2S, GgufTensorType::F16],
+        );
+        causal.metadata.insert(
+            "general.architecture".into(),
+            GgufMetadataValue::String("bitnet-b1.58".into()),
+        );
+        let causal_plan = plan_for_model_with_platform(
+            &PathBuf::from("/models/ggml-model-i2_s.gguf"),
+            &causal,
+            Some(8),
+            platform("linux", "x86_64", &["avx2"]),
+        );
+        assert_eq!(causal_plan.plan.quant_type, "I2_S");
+        assert_eq!(
+            causal_plan.plan.selected_backend,
+            "bitnet_runnable_cpu_runtime"
+        );
+        let metal_causal_plan = plan_for_model_with_platform(
+            &PathBuf::from("/models/ggml-model-i2_s.gguf"),
+            &causal,
+            Some(8),
+            metal_platform("macos", "aarch64", &["neon"]),
+        );
+        assert_eq!(
+            metal_causal_plan.plan.selected_backend,
+            "bitnet_runnable_metal_runtime"
+        );
+        env::set_var("CAMELID_BITNET_GPU", "0");
+        env::set_var("CAMELID_BITNET_KERNEL", "tl1");
+        let forced_cpu_plan = plan_for_model_with_platform(
+            &PathBuf::from("/models/ggml-model-i2_s.gguf"),
+            &causal,
+            Some(8),
+            metal_platform("macos", "aarch64", &["neon"]),
+        );
+        assert_eq!(
+            forced_cpu_plan.plan.selected_backend,
+            "bitnet_runnable_cpu_runtime"
+        );
+        assert_eq!(
+            forced_cpu_plan.plan.selected_q8_path,
+            "i2_s_canonical_tl1_lookup"
+        );
+        env::remove_var("CAMELID_BITNET_GPU");
+        env::remove_var("CAMELID_BITNET_KERNEL");
+
+        let mut embedding = quant_fixture(
+            "bitnet-embeddings-270m",
+            Some(40),
+            &[GgufTensorType::I2S, GgufTensorType::F16],
+        );
+        embedding.metadata.insert(
+            "general.architecture".into(),
+            GgufMetadataValue::String("gemma3".into()),
+        );
+        embedding.metadata.insert(
+            "general.name".into(),
+            GgufMetadataValue::String("bitnet-embeddings-270m".into()),
+        );
+        let embedding_plan = plan_for_model_with_platform(
+            &PathBuf::from("/models/bitnet-embeddings-270m-bf16-i2_s.gguf"),
+            &embedding,
+            Some(8),
+            platform("linux", "x86_64", &["avx2"]),
+        );
+        assert_eq!(
+            embedding_plan.plan.selected_backend,
+            "bitnet_embedding_cpu_runtime"
+        );
+        assert_eq!(embedding_plan.plan.decode_path, "mean_pool_l2_normalize");
+        let cuda_embedding_plan = plan_for_model_with_platform(
+            &PathBuf::from("C:/models/bitnet-embeddings-270m-bf16-i2_s.gguf"),
+            &embedding,
+            Some(8),
+            cuda_platform("windows", "x86_64", &["avx2"]),
+        );
+        assert_eq!(
+            cuda_embedding_plan.plan.selected_backend,
+            "bitnet_embedding_cuda_runtime"
+        );
+        assert_eq!(
+            cuda_embedding_plan.plan.prefill_path,
+            "bitnet_embedding_cuda_full_sequence"
+        );
     }
 
     #[test]

@@ -1,12 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { isCompatibilitySupportedForModel } from '../../lib/capabilities'
-import { beginCatalogSettlement, catalogDownloadSettlement, completeCatalogAcquisition, reserveCatalogAcquisition } from '../../lib/catalogActivation'
+import { beginCatalogSettlement, catalogDownloadSettlement, completeCatalogAcquisition } from '../../lib/catalogActivation'
 import {
   catalogBundleInstalled,
   catalogCompanionArtifacts,
   missingCatalogArtifacts,
 } from '../../lib/catalogCompanions'
 import {
+  catalogQualification,
   defaultFileIndex,
   fitDetail,
   fitIsRecheckable,
@@ -17,14 +17,17 @@ import {
   isRefusingFit,
   partitionByArchSupport,
   partitionCuratedByFit,
+  predictedLane,
   quantAdvice,
 } from '../../lib/catalogBrowse'
 import { SUPPORTED_MODELS } from '../../lib/supportedModels'
 import { formatBytes } from '../../lib/formatters'
+import { isEmbeddingOnlyModel } from '../../lib/modelCapabilities.js'
 import { Button } from '../ui/Button'
 import { EvidenceChip } from '../ui/EvidenceChip'
 import { IconCheck } from '../ui/icons'
 import { Notice } from '../ui/Notice'
+import { ModelFamilyGroups } from './ModelFamilyGroups'
 
 /* Zone 5 — Get models. Curated picks first, then live Hugging Face GGUF search
    (>= 2 chars). Each row shows which lane it WOULD land in (derived: supported
@@ -33,8 +36,8 @@ import { Notice } from '../ui/Notice'
    background/auto pulls. Live progress renders in the global Downloads zone —
    rows here only reflect their own acquisition state, read from the shared
    downloads poll + the live /api/models/local scan (never localStorage). After a
-   download lands, smoke-admission runs for oracle-qualified combos and the model
-   appears in its derived local section.
+   supported or runnable curated download lands, Camelid starts it through the
+   normal guarded load path; unanchored Hub guesses remain download-only.
 
    Hugging Face results are grouped into one card per repo with a quantization
    picker. The Hub returns files, and a single repo routinely ships 20-27 quants of
@@ -51,21 +54,20 @@ const CURATED_DECORATION = new Map(SUPPORTED_MODELS.map((item) => [item.catalog_
 const HF_GUESS_EXPLANATION =
   'Architecture and quantization are read from the filename, not the model. The real lane is only known after the file loads.'
 
-/* Predicted lane for a catalog entry — derived, never a hand-authored label. */
-function predictedLane(item, capabilities) {
-  // Experimental (live Hugging Face) rows are advisory only: their architecture/quant
-  // are filename guesses, so they can never anchor a lane or imply support — even when
-  // the filename happens to coincide with a supported contract row. Always not-anchored.
-  if (item.group === 'experimental') return 'not_anchored'
-  if (isCompatibilitySupportedForModel(capabilities, null, item)) return 'supported'
-  if (item.oracle_qualified) return 'compatible'
-  return 'not_anchored'
-}
-
-function laneChip(lane) {
-  if (lane === 'supported') return <EvidenceChip state="supported" asText>Supported</EvidenceChip>
-  if (lane === 'compatible') return <EvidenceChip state="runnable" asText>Experimental</EvidenceChip>
-  return <EvidenceChip state="unsupported" asText>Experimental</EvidenceChip>
+function qualificationChip(qualification) {
+  if (qualification.kind === 'supported') {
+    return <EvidenceChip state="supported" asText>Supported</EvidenceChip>
+  }
+  if (qualification.kind === 'verified' || qualification.kind === 'runnable') {
+    return <EvidenceChip state="runnable" asText>{qualification.label}</EvidenceChip>
+  }
+  if (qualification.kind === 'variance') {
+    return <EvidenceChip state="evidence" asText>{qualification.label}</EvidenceChip>
+  }
+  if (qualification.kind === 'limited' || qualification.kind === 'validating') {
+    return <EvidenceChip state="evidence" asText>{qualification.label}</EvidenceChip>
+  }
+  return <EvidenceChip state="unsupported" asText>{qualification.label}</EvidenceChip>
 }
 
 /* A small CPU/chip glyph so the capacity chip reads as "your hardware" — distinct
@@ -262,7 +264,6 @@ function CatalogRow({
   onAcquired,
   canceled,
   onDownloadRetry,
-  acquisitionLocked,
   onAcquisitionPending,
   onAcquisitionSettled,
   onStartModel,
@@ -279,7 +280,6 @@ function CatalogRow({
   const [phase, setPhase] = useState('idle')
   const [message, setMessage] = useState('')
   const [isError, setIsError] = useState(false)
-  const [failedStage, setFailedStage] = useState('')
   // Ghost-MoE changes the on-disk representation, so keep it an explicit user
   // opt-in. `recommended` decorates the option but must never tick it on behalf
   // of the user; prepared installs remain checked and locked by design.
@@ -291,7 +291,9 @@ function CatalogRow({
   const acquisitionModeRef = useRef('download')
   const acquisitionItemRef = useRef(item)
   const settlementInFlightRef = useRef(false)
+  const qualification = catalogQualification(item, capabilities)
   const lane = predictedLane(item, capabilities)
+  const embeddingOnly = isEmbeddingOnlyModel(item)
   const decoration = item.group === 'experimental' ? null : CURATED_DECORATION.get(item.catalog_id)
   // ANY load-refusing verdict must stop the auto-start chain, not just `wont_fit`:
   // the load-time guard refuses both, so chaining into it would end in a 422.
@@ -299,12 +301,14 @@ function CatalogRow({
   const ghostMoeUsable = ghostMoeFits(item)
   const useGhostMoe = ghostMoePrepared || (ghostMoeSelected && ghostMoeUsable)
   const effectiveFitRefusal = refusedByFit && !useGhostMoe
-  const downloadAndStart = lane === 'supported' && !effectiveFitRefusal
-  const smokeAfterDownload = item.group !== 'experimental'
-    && !effectiveFitRefusal
-    && !downloadAndStart
-    && item.oracle_qualified
-  const acquisitionMode = downloadAndStart ? 'start' : smokeAfterDownload ? 'smoke' : 'download'
+  // A compatible curated row is already implemented and oracle-anchored. The
+  // authoritative inspect/load path below performs the real header and runtime
+  // safety checks, so forcing a second, minute-long smoke admission before the
+  // user can start it adds latency without adding a load-time guard. Live Hub
+  // guesses remain download-only because predictedLane deliberately returns
+  // `not_anchored` for them.
+  const downloadAndStart = (lane === 'supported' || lane === 'compatible') && !effectiveFitRefusal
+  const acquisitionMode = downloadAndStart ? 'start' : 'download'
   const downloading = activeDownload?.status === 'downloading' || activeDownload?.status === 'preparing'
   const preparingGhost = activeDownload?.status === 'preparing'
   const downloadFailed = activeDownload?.status === 'failed'
@@ -326,7 +330,7 @@ function CatalogRow({
   }, [item.catalog_id, onOperationBusy, operationBusy])
 
   useEffect(() => {
-    if (phase !== 'idle' || !rejoinableDownload || acquisitionLocked) return
+    if (phase !== 'idle' || !rejoinableDownload) return
     if (onAcquisitionPending?.(item) === false) return
     sawDownloadRef.current = true
     startedAtRef.current = Date.now()
@@ -337,12 +341,11 @@ function CatalogRow({
     setMessage('Rejoined the active download.')
     setIsError(false)
     setPhase('waiting')
-  }, [acquisitionLocked, acquisitionMode, activeDownload?.continuation_mode, item, onAcquisitionPending, phase, rejoinableDownload])
+  }, [acquisitionMode, activeDownload?.continuation_mode, item, onAcquisitionPending, phase, rejoinableDownload])
 
   const finishLanded = useCallback(async () => {
     if (!beginCatalogSettlement(settlementInFlightRef)) return
     setIsError(false)
-    setFailedStage('')
     onAcquired?.()
     const result = await completeCatalogAcquisition({
       item: acquisitionItemRef.current,
@@ -353,7 +356,6 @@ function CatalogRow({
     })
     setMessage(result.message)
     if (!result.ok) {
-      setFailedStage(result.stage)
       setIsError(true)
       setPhase('failed')
       onAcquisitionSettled?.(item.catalog_id)
@@ -368,7 +370,6 @@ function CatalogRow({
       })
       if (!ack.ok) throw new Error(`acknowledgement failed (HTTP ${ack.status})`)
     } catch (error) {
-      setFailedStage(result.started ? 'loading' : 'checking')
       setIsError(true)
       setMessage(`The model is ready, but Camelid could not finalize the download state: ${String(error?.message || error)}`)
       setPhase('failed')
@@ -506,10 +507,11 @@ function CatalogRow({
               {item.architecture ? ` · ${item.architecture}` : ''}
             </span>
           </div>
-          {laneChip(lane)}
+          {qualificationChip(qualification)}
         </div>
       )}
       <FitAdvisory item={item} onCheckFit={onCheckFit} checking={checkingFit} />
+      {qualification.detail ? <p className="catalog-row-faint">{qualification.detail}</p> : null}
       {decoration?.blurb ? <p className="catalog-row-blurb">{decoration.blurb}</p> : null}
       <GhostMoeOption
         item={item}
@@ -523,16 +525,7 @@ function CatalogRow({
         <div className="catalog-start" role="status" aria-live="polite">
           {downloadAndStart ? (
             <ol className="catalog-start-steps" aria-label="Download and start progress">
-              {['Download', 'Check', 'Load'].map((label, index) => (
-                <li key={label} className={index < activeStage ? 'is-done' : index === activeStage ? 'is-active' : ''}>
-                  <span>{index < activeStage ? <IconCheck size={12} /> : index + 1}</span>
-                  {label}
-                </li>
-              ))}
-            </ol>
-          ) : smokeAfterDownload ? (
-            <ol className="catalog-start-steps catalog-start-steps--two" aria-label="Download and check progress">
-              {['Download', 'Check'].map((label, index) => (
+              {['Download', 'Prepare', 'Start'].map((label, index) => (
                 <li key={label} className={index < activeStage ? 'is-done' : index === activeStage ? 'is-active' : ''}>
                   <span>{index < activeStage ? <IconCheck size={12} /> : index + 1}</span>
                   {label}
@@ -542,9 +535,11 @@ function CatalogRow({
           ) : null}
           <p className="catalog-row-faint">
             {phase === 'checking'
-              ? 'Download complete — checking the model…'
+              ? 'Download complete — preparing the model…'
               : phase === 'loading'
-                ? 'Check passed — loading the model for Chat…'
+                ? embeddingOnly
+                  ? 'Starting the embedding sidecar…'
+                  : 'Starting the model for Chat…'
                 : preparingGhost
                   ? 'Preparing Ghost MoE — repacking routed experts and reclaiming the full download…'
                 : downloading
@@ -561,7 +556,7 @@ function CatalogRow({
             Anything already downloaded stays on disk. Chat opens only once everything needed has finished downloading.
           </p>
           <Button variant="outline" size="sm" onClick={retryAcquisition}>
-            {failedStage === 'checking' ? 'Retry check' : 'Retry start'}
+            Retry start
           </Button>
         </div>
       ) : phase === 'done' ? (
@@ -579,8 +574,8 @@ function CatalogRow({
           ) : null}
           {item.group !== 'experimental' && lane === 'not_anchored' ? (
             <p className="catalog-row-faint">
-              This model can still be downloaded — it will appear under Experimental, and its
-              output isn&rsquo;t verified.
+              This model can still be downloaded — it will appear under Other local models with
+              the same evidence status.
             </p>
           ) : null}
           {message ? <p className={isError ? 'catalog-row-error' : 'catalog-row-faint'}>{message}</p> : null}
@@ -589,8 +584,6 @@ function CatalogRow({
               variant="tonal"
               size="sm"
               onClick={openConfirmation}
-              disabled={acquisitionLocked}
-              title={acquisitionLocked ? 'Wait for the current download to finish' : undefined}
             >
               {onlyCompanionsMissing
                 ? downloadAndStart
@@ -625,7 +618,7 @@ function CatalogRow({
               Download <strong>{item.filename}</strong> plus its required vision projector{' '}
               <strong>{companions[0].filename}</strong> ({formatBytes(missingBytes)})? Camelid downloads both into your
               local models folder and enables image prompts only after both files land.
-              {downloadAndStart ? ' It will then check the model, load it, and open Chat.' : ''}
+              {downloadAndStart ? ' It will then start the model and open Chat.' : ''}
             </p>
           ) : (
             <p>
@@ -641,9 +634,9 @@ function CatalogRow({
                 </>
               )}
               {useGhostMoe
-                ? ' Camelid will repack routed experts for Ghost MoE, reclaim the temporary full GGUF, check the prepared model, and open Chat.'
+                ? ' Camelid will repack routed experts for Ghost MoE, reclaim the temporary full GGUF, start the prepared model, and open Chat.'
                 : downloadAndStart
-                  ? ' Camelid will check it, load it, and open Chat after the download.'
+                  ? ' Camelid will start it and open Chat after the download.'
                   : ''}
             </p>
           )}
@@ -706,7 +699,7 @@ function HfModelCard({ group, renderRow, onCheckFit, isCheckingFit }) {
             ) : null}
           </p>
         </div>
-        <EvidenceChip state="unsupported" asText>Experimental</EvidenceChip>
+        <EvidenceChip state="unsupported" asText>Unverified</EvidenceChip>
       </div>
 
       <div className="hf-quant-picker">
@@ -768,6 +761,17 @@ function CatalogGroup({ title, marker, count, emptyText, children }) {
   )
 }
 
+function CatalogFamilyGroups({ items, renderItem, openFamilies = false }) {
+  return (
+    <ModelFamilyGroups
+      items={items}
+      renderItem={renderItem}
+      className="model-family-group--catalog"
+      initiallyOpen={() => openFamilies}
+    />
+  )
+}
+
 export function CatalogLaneBrowse({
   apiBase = '',
   capabilities,
@@ -784,19 +788,28 @@ export function CatalogLaneBrowse({
   onStartModel,
   onModelStarted,
   onOperationBusy,
+  externalQuery,
+  onCuratedMatchCount,
 }) {
   const base = (apiBase || '').replace(/\/$/, '')
   const [items, setItems] = useState(null)
   const [query, setQuery] = useState('')
+  /* The Models page owns one search for the whole page, so when it drives this
+     component the box here would be a second, competing input — it is hidden and
+     this query simply follows the page's. Empty is synced too: clearing up there
+     must clear the catalog, not strand an old term down here. */
+  const pageControlled = externalQuery !== undefined
+  useEffect(() => {
+    if (!pageControlled) return
+    setQuery(String(externalQuery || ''))
+  }, [pageControlled, externalQuery])
   const [debouncedQuery, setDebouncedQuery] = useState('')
   const [nextCursor, setNextCursor] = useState(null)
   const [loading, setLoading] = useState(false)
   const [loadingMore, setLoadingMore] = useState(false)
   const [error, setError] = useState('')
-  const [pendingCatalogId, setPendingCatalogId] = useState('')
-  const [pendingItem, setPendingItem] = useState(null)
+  const [pendingItems, setPendingItems] = useState([])
   const [checkingFitIds, setCheckingFitIds] = useState(() => new Set())
-  const pendingCatalogIdRef = useRef('')
   const requestSequenceRef = useRef(0)
   const inFlightRef = useRef(null)
 
@@ -844,20 +857,18 @@ export function CatalogLaneBrowse({
   useEffect(() => () => inFlightRef.current?.abort(), [])
 
   const reserveAcquisition = useCallback((item) => {
-    const catalogId = item.catalog_id
-    const reservation = reserveCatalogAcquisition(pendingCatalogIdRef.current, catalogId)
-    if (!reservation.accepted) return false
-    pendingCatalogIdRef.current = reservation.catalogId
-    setPendingCatalogId(catalogId)
-    setPendingItem(item)
+    // Each row owns its own acquisition state and the backend rejects only real
+    // conflicts (same catalog id or overlapping destination files). Keep every
+    // pending row visible, but never serialize unrelated model downloads here.
+    setPendingItems((current) => [
+      item,
+      ...current.filter((pending) => pending.catalog_id !== item.catalog_id),
+    ])
     return true
   }, [])
 
   const settleAcquisition = useCallback((catalogId) => {
-    if (pendingCatalogIdRef.current !== catalogId) return
-    pendingCatalogIdRef.current = ''
-    setPendingCatalogId('')
-    setPendingItem(null)
+    setPendingItems((current) => current.filter((item) => item.catalog_id !== catalogId))
   }, [])
 
   // Append the next page of experimental (Hugging Face) results.
@@ -948,7 +959,6 @@ export function CatalogLaneBrowse({
       onAcquired={onAcquired}
       canceled={canceledCatalogIds.has(item.catalog_id)}
       onDownloadRetry={onDownloadRetry}
-      acquisitionLocked={Boolean(pendingCatalogId && pendingCatalogId !== item.catalog_id)}
       onAcquisitionPending={reserveAcquisition}
       onAcquisitionSettled={settleAcquisition}
       onStartModel={onStartModel}
@@ -966,17 +976,18 @@ export function CatalogLaneBrowse({
     base, canceledCatalogIds, capabilities, checkFit, downloads, installAvailable,
     ghostMoePreparedFilenames, installBlockedReason, isCheckingFit, localFilenames, onAcquired, onDownloadAcknowledged,
     onDownloadRetry, onInstallStarted, onModelStarted, onOperationBusy, onStartModel,
-    pendingCatalogId, reserveAcquisition, settleAcquisition,
+    reserveAcquisition, settleAcquisition,
   ])
 
-  // A row whose acquisition is in flight must keep rendering even if a newer
-  // search no longer returns it, or the user loses sight of their own download.
+  // Every row whose acquisition is in flight must keep rendering even if a newer
+  // search no longer returns it, or the user loses sight of parallel downloads.
   const visibleItems = useMemo(() => {
     const rows = items || []
-    return pendingItem && !rows.some((item) => item.catalog_id === pendingItem.catalog_id)
-      ? [pendingItem, ...rows]
-      : rows
-  }, [items, pendingItem])
+    const missingPending = pendingItems.filter(
+      (pending) => !rows.some((item) => item.catalog_id === pending.catalog_id),
+    )
+    return [...missingPending, ...rows]
+  }, [items, pendingItems])
   const curated = useMemo(
     () => visibleItems.filter((it) => it.group !== 'experimental'),
     [visibleItems],
@@ -986,6 +997,15 @@ export function CatalogLaneBrowse({
     [visibleItems],
   )
   const searching = debouncedQuery.length >= 2
+
+  /* The page's result line needs to know whether scrolling down is worth it, so
+     report how many curated rows the current term matches. Curated only: live
+     Hugging Face results arrive asynchronously, and a count that changed after
+     the fact would be worse than no count. */
+  useEffect(() => {
+    if (!onCuratedMatchCount) return
+    onCuratedMatchCount(searching ? curated.length : null)
+  }, [onCuratedMatchCount, searching, curated.length])
 
   const hfGroups = useMemo(() => groupHfFilesByRepo(experimental), [experimental])
   const { loadable, unimplemented } = useMemo(() => partitionByArchSupport(hfGroups), [hfGroups])
@@ -1012,18 +1032,21 @@ export function CatalogLaneBrowse({
         <h2>Get models</h2>
       </div>
       <p className="local-lane-intro">
-        Curated picks are verified to run well here. Searching also browses live Hugging Face
-        models — those are experimental, and their output isn&rsquo;t verified. Every download asks
+        Curated picks are pinned exact files with a visible qualification result. Verified rows
+        passed load, deterministic output comparison, and guarded app/API checks; rows with a hold
+        show the exact reason. Live Hugging Face search results are unverified. Every download asks
         for confirmation first; progress appears in Downloads above, and finished downloads join
         the sections above.
       </p>
-      <input
-        className="catalog-search"
-        aria-label="Search model catalog"
-        value={query}
-        onChange={(e) => setQuery(e.target.value)}
-        placeholder="Search curated picks and live Hugging Face GGUFs (name, repo, filename)"
-      />
+      {!pageControlled && (
+        <input
+          className="catalog-search"
+          aria-label="Search model catalog"
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          placeholder="Search curated picks and live Hugging Face GGUFs (name, repo, filename)"
+        />
+      )}
       <UndeterminedFitNotice items={visibleItems} />
       {error ? (
         <Notice
@@ -1041,25 +1064,41 @@ export function CatalogLaneBrowse({
           count={curated.length}
           emptyText="No curated entries match."
         >
-          {curated.map((item) => renderRow(item))}
+          <CatalogFamilyGroups
+            items={curated}
+            renderItem={(item) => renderRow(item)}
+            openFamilies={searching}
+          />
         </CatalogGroup>
       ) : (
         <>
+          {/* The list holds everything this machine can run, including rows whose
+              memory is merely occupied right now — each carries its own amber chip
+              and Re-check button, so the state is visible per row instead of
+              hiding the model. Only models too big for the machine fold away. */}
           <CatalogGroup
-            title="Curated — runs on this machine"
+            title="Curated picks"
             marker={null}
             count={curatedRunnable.length}
-            emptyText="No curated model fits the memory free right now. Close some applications, then use Re-check on one of the rows below."
+            emptyText="No curated model matches."
           >
-            {curatedRunnable.map((item) => renderRow(item))}
+            <CatalogFamilyGroups
+              items={curatedRunnable}
+              renderItem={(item) => renderRow(item)}
+            />
           </CatalogGroup>
           {curatedBlocked.length ? (
             <details className="catalog-collapsed">
               <summary>
-                {curatedBlocked.length} more curated model{curatedBlocked.length === 1 ? '' : 's'} this
-                machine cannot load right now
+                {curatedBlocked.length} model{curatedBlocked.length === 1 ? '' : 's'} too big for this
+                machine
               </summary>
-              <div className="catalog-list">{curatedBlocked.map((item) => renderRow(item))}</div>
+              <div className="catalog-list">
+                <CatalogFamilyGroups
+                  items={curatedBlocked}
+                  renderItem={(item) => renderRow(item)}
+                />
+              </div>
             </details>
           ) : null}
         </>
@@ -1068,7 +1107,7 @@ export function CatalogLaneBrowse({
       {searching && items !== null ? (
         <>
           <CatalogGroup
-            title="Experimental (Hugging Face)"
+            title="Hugging Face (unverified)"
             marker={
               <span className="catalog-experimental-marker">
                 <EvidenceChip state="unsupported" asText>Unverified</EvidenceChip>
@@ -1084,7 +1123,13 @@ export function CatalogLaneBrowse({
                 : 'No live Hugging Face GGUFs match (or the Hub is unreachable).'
             }
           >
-            {loading ? <SearchSkeleton /> : loadable.map(renderHfCard)}
+            {loading ? <SearchSkeleton /> : (
+              <CatalogFamilyGroups
+                items={loadable}
+                renderItem={renderHfCard}
+                openFamilies={searching}
+              />
+            )}
           </CatalogGroup>
           {!loading && unimplemented.length ? (
             <details className="catalog-collapsed">
@@ -1093,7 +1138,13 @@ export function CatalogLaneBrowse({
                 Camelid can&rsquo;t run
               </summary>
               <p className="catalog-row-faint">{HF_GUESS_EXPLANATION}</p>
-              <div className="catalog-list">{unimplemented.map(renderHfCard)}</div>
+              <div className="catalog-list">
+                <CatalogFamilyGroups
+                  items={unimplemented}
+                  renderItem={renderHfCard}
+                  openFamilies={searching}
+                />
+              </div>
             </details>
           ) : null}
           {nextCursor && !loading ? (

@@ -1,0 +1,190 @@
+{
+  "schema": "camelid.model-qualification-oracle/v1",
+  "generated_at": "2026-08-11T17:18:43.033Z",
+  "row_id": "gemma3_4b_it_q8_0",
+  "scope": "tokenizer_and_raw_greedy_generation",
+  "artifact": {
+    "repo": "ggml-org/gemma-3-4b-it-GGUF",
+    "revision": "d0976223747697cb51e056d85c532013931fe52e",
+    "file": "gemma-3-4b-it-Q8_0.gguf",
+    "size_bytes": 4130226336,
+    "sha256": "97b06383df48336e7d2f9b56b6ce545e0fa476407a62c0bd081b53447a58e644"
+  },
+  "oracle": {
+    "engine": "llama.cpp",
+    "build": "b9632",
+    "revision": "acd79d603",
+    "platform": "darwin-arm64",
+    "release": "25.5.0",
+    "llama_tokenize_sha256": "de1b813ddc9ad026d45c4f3f37b1f2052aa4c01b94a66ddcea2e8ac673bcc4ba",
+    "llama_server_sha256": "382096b1dc10da68c2bf0a97e1f0dd36db90531cdea1434760d8c1a70fea1310",
+    "command": [
+      "<llama-tokenize>",
+      "-m",
+      "<artifact>",
+      "-p",
+      "<prompt>",
+      "--ids",
+      "--no-escape",
+      "--log-disable"
+    ]
+  },
+  "raw_prompts": [
+    {
+      "text": "Hello",
+      "prompt_ids": [
+        2,
+        9259
+      ],
+      "generated_ids": [
+        236743,
+        236778,
+        236771,
+        236778,
+        236812
+      ],
+      "generated_text": " 2024"
+    },
+    {
+      "text": "The capital of France is",
+      "prompt_ids": [
+        2,
+        818,
+        5279,
+        529,
+        7001,
+        563
+      ],
+      "generated_ids": [
+        9079,
+        236761,
+        108,
+        50429,
+        563
+      ],
+      "generated_text": " Paris.\n\nParis is"
+    },
+    {
+      "text": "Once upon a time",
+      "prompt_ids": [
+        2,
+        14946,
+        3324,
+        496,
+        990
+      ],
+      "generated_ids": [
+        236764,
+        528,
+        496,
+        1944,
+        9744
+      ],
+      "generated_text": ", in a small village"
+    },
+    {
+      "text": "The quick brown fox",
+      "prompt_ids": [
+        2,
+        818,
+        3823,
+        8864,
+        37423
+      ],
+      "generated_ids": [
+        38167,
+        1024,
+        506,
+        31770,
+        4799
+      ],
+      "generated_text": " jumps over the lazy dog"
+    },
+    {
+      "text": "2 + 2 =",
+      "prompt_ids": [
+        2,
+        236778,
+        900,
+        236743,
+        236778,
+        578
+      ],
+      "generated_ids": [
+        2360,
+        108,
+        3689,
+        563,
+        506
+      ],
+      "generated_text": " ?\n\nWhat is the"
+    },
+    {
+      "text": "don't stop 12345\nUnicode café 東京 🙂",
+      "prompt_ids": [
+        2,
+        13246,
+        236789,
+        236745,
+        4721,
+        236743,
+        236770,
+        236778,
+        236800,
+        236812,
+        236810,
+        107,
+        123540,
+        33443,
+        86459,
+        57235
+      ],
+      "generated_ids": [
+        107,
+        2574,
+        1411,
+        2769,
+        236761
+      ],
+      "generated_text": "\nhttps://www."
+    }
+  ],
+  "chat_templates": [],
+  "does_not_prove": [
+    "Camelid weight load, logits, generation, or greedy-token parity until the independent replay phase passes",
+    "chat-template rendering or prompt-token parity unless a separate exact-row shape pack is cited",
+    "API, WebUI, bounded context, performance, GPU execution, portability, neighboring rows, or broad-family support"
+  ],
+  "greedy_capture": {
+    "captured_at": "2026-08-11T17:50:47.675Z",
+    "endpoint": "/completion",
+    "prompt_input": "pinned_prompt_ids",
+    "max_new_tokens": 5,
+    "temperature": 0,
+    "top_k": 1,
+    "seed": 0,
+    "cache_prompt": false,
+    "samplers": [
+      "top_k"
+    ],
+    "backend": "cpu_reference_f32_kv_no_repack",
+    "llama_server_command": [
+      "<llama-server>",
+      "-m",
+      "<artifact>",
+      "-c",
+      "256",
+      "-ngl",
+      "0",
+      "-ctk",
+      "f32",
+      "-ctv",
+      "f32",
+      "-fa",
+      "off",
+      "--no-repack",
+      "--no-warmup",
+      "--log-disable"
+    ]
+  }
+}

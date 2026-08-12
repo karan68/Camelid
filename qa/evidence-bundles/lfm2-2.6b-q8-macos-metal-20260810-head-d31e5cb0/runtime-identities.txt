@@ -1,0 +1,17 @@
+camelid_head=d31e5cb02bd3633407cbd3e6e89aeac5bacde617
+camelid_version=v0.6.1-26-gd31e5cb0
+camelid_binary_sha256=96314b2022606f5f70495f6ed86652a5d001a946395cf1a96f7b26f9fd650de1
+camelid_binary=$CAMELID_BIN
+
+model_repo=LiquidAI/LFM2.5-2.6B-GGUF
+model_revision=b421ad1d549afeda6a0fb2ad3a697cb5a7879adc
+model_filename=LFM2.5-2.6B-Q8_0.gguf
+model_size_bytes=2874779456
+model_sha256=36587fdf27bdfc69caf2637273679a0870ec155162161bde6fd16e8c70bdb757
+model_license=LFM Open License v1.0
+
+llama_server_version=9632
+llama_server_revision=acd79d603
+llama_server_platform=Darwin arm64
+llama_server_binary_sha256=382096b1dc10da68c2bf0a97e1f0dd36db90531cdea1434760d8c1a70fea1310
+llama_server_binary=$CAMELID_LLAMA_CPP_BIN/llama-server

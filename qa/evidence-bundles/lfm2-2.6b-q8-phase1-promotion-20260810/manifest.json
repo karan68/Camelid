@@ -1,0 +1,58 @@
+{
+  "schema": "camelid.evidence_bundle_manifest/v1",
+  "bundle": "lfm2-2.6b-q8-phase1-promotion-20260810",
+  "generated_utc": "2026-08-10T14:25:34Z",
+  "qualification_harness_head": "2cd9fa78f8dcaa78e011914076ecd1473ae99d0a",
+  "runtime_head": "15ab4ddac5a21ac0f98f6ccba5e3ddff4b51a9b5",
+  "runtime_binary_sha256": "9f499feb3d0073b5d88467123a3f4294e90ecb2c3254f326eb4ddd6b8d8516d8",
+  "checkout_state_before_final_run": "tracked files clean; unrelated untracked readme-preview.html preserved",
+  "host": {
+    "platform": "windows-x64",
+    "backend": "cpu_reference",
+    "hostname_redacted": true
+  },
+  "model": {
+    "row_id": "lfm2_5_2_6b_q8_0",
+    "repo_id": "LiquidAI/LFM2.5-2.6B-GGUF",
+    "revision": "b421ad1d549afeda6a0fb2ad3a697cb5a7879adc",
+    "filename": "LFM2.5-2.6B-Q8_0.gguf",
+    "size_bytes": 2874779456,
+    "sha256": "36587fdf27bdfc69caf2637273679a0870ec155162161bde6fd16e8c70bdb757",
+    "license": "LFM Open License v1.0"
+  },
+  "oracle": {
+    "tool": "llama.cpp llama-server",
+    "build": 9632,
+    "revision": "acd79d603",
+    "gpu_layers": 0,
+    "cache_type_k": "f32",
+    "cache_type_v": "f32",
+    "flash_attention": "off",
+    "repack": "off"
+  },
+  "gates": {
+    "short_greedy": "pass: tokenizer plus 4 prompts x 24 generated IDs (96/96) match",
+    "context_512": "pass: exact 512 rendered prompt IDs and 8/8 generated IDs/text match",
+    "api_nonstreaming_chat": "pass: 8-token runnable response with prompt/generated token diagnostics",
+    "legacy_completions": "skipped by design: runnable-only architecture keeps /v1/completions typed fail-closed",
+    "streaming_chat": "pass: 128-token ceiling; natural stop at 43 completion tokens; finish, usage, done in order",
+    "models_page": "pass: exact filename/size/SHA and lane_class=supported",
+    "timing_summary": "skipped: runnable lane does not emit dense camelid.timings_ms diagnostics"
+  },
+  "support_decision": "supported_exact_row_smoke",
+  "artifacts": [
+    "context-summary.json",
+    "parity-receipt.json",
+    "verify.log",
+    "api-webui-summary.json",
+    "chat-response.json",
+    "frontend-smoke.log",
+    "MAC_HANDOFF.md",
+    "SHA256SUMS"
+  ],
+  "external_evidence": [
+    "qa/runnable/lfm2-parity.json",
+    "tests/fixtures/lfm2_parity/lfm2.json",
+    "tests/fixtures/lfm2_parity/lfm2-chat-template.json"
+  ]
+}

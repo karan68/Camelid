@@ -49,7 +49,7 @@ function TopBar({
     || models.find((m) => modelRuntimeIdMatches(m, runtime))
   const gate = getChatGateState(capabilities, selectedModel, runtime)
   const apiUnavailable = runtime?.status === 'offline'
-  const tone = gate.chatUnlocked ? 'ready' : apiUnavailable ? 'offline' : runtime?.loaded_now ? 'warn' : 'neutral'
+  const tone = gate.chatUnlocked || gate.embeddingReady ? 'ready' : apiUnavailable ? 'offline' : runtime?.loaded_now ? 'warn' : 'neutral'
   const modelName = selectedModel?.name || 'No model selected'
   /* Narrow screens swap the full name for this short form (dot + first word)
      so the view title keeps the room; see the 480px rules in shell.css. */
@@ -81,13 +81,19 @@ function TopBar({
             type="button"
             className="topbar__model"
             onClick={() => setTab('library')}
-            title={gate.chatUnlocked ? `${modelName} is ready` : 'Open Models to load or switch models'}
+            title={gate.chatUnlocked
+              ? `${modelName} is ready`
+              : gate.embeddingReady
+                ? `${modelName} is ready for embeddings, not Chat`
+                : gate.embeddingOnly
+                  ? `${modelName} is an embedding model — load it from Models`
+                  : 'Open Models to load or switch models'}
           >
             <StatusDot tone={tone} pulse={gate.chatUnlocked} />
             <span className="topbar__model-name">{clampText(modelName, 32)}</span>
             <span className="topbar__model-short">{modelShortName}</span>
             {selectedModel && !gate.contractSupported && !apiUnavailable && (
-              <span className="topbar__model-hint">· Unverified model</span>
+              <span className="topbar__model-hint">· {gate.embeddingOnly ? 'Embedding only' : 'Unverified model'}</span>
             )}
           </button>
         </div>

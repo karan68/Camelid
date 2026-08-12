@@ -33,20 +33,17 @@ impl TokenizerModel {
 }
 
 /// GPT-2/BPE pre-tokenizer dialect (`tokenizer.ggml.pre`). The byte-level BPE
-/// merge step is identical across these; the pre-tokenization regex that splits
-/// raw text into pieces differs in exactly one branch — digit grouping.
+/// merge step is identical across these; the pre-tokenization grammar that
+/// splits raw text into pieces is selected explicitly and must never be
+/// guessed from architecture alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BpePreTokenizer {
     /// llama.cpp `llama-bpe` (Llama 3 / GPT-4 tiktoken): digits group in runs of
     /// up to three (`\p{N}{1,3}`).
     #[default]
     Llama3,
-    /// **Unreachable scaffolding — does NOT model llama.cpp's `command-r`.**
-    ///
-    /// This variant is parameterised as "llama-bpe with 3-digit grouping", but the
-    /// reference `LLAMA_VOCAB_PRE_TYPE_COMMAND_R` is not in the llama3 family at
-    /// all. llama.cpp groups it with SMOLLM/STARCODER/REFACT and uses a TWO-regex
-    /// list (`src/llama-vocab.cpp`):
+    /// llama.cpp `command-r`: the same two-pass GPT-2 dialect used by its
+    /// SMOLLM/STARCODER/REFACT arm:
     ///
     /// ```text
     /// "\p{N}",
@@ -59,12 +56,17 @@ pub enum BpePreTokenizer {
     /// prefix only) rather than `[^\r\n\p{L}\p{N}]?\p{L}+` (any non-alphanumeric
     /// prefix); and the contractions are case-SENSITIVE rather than `'[sS]`-style.
     ///
-    /// It is scaffolding rather than a live defect: command-r is refused at the
-    /// architecture axis before any tokenizer runs, and `resolve_gpt2_pre_tokenizer`
-    /// now refuses the `command-r` metadata value outright, so this variant cannot
-    /// be reached from a GGUF. Implementing it properly means adding a genuinely
-    /// different splitter, not another `digit_group_max` value.
+    /// The dedicated two-pass splitter is shared with [`Self::SmolLm`], while
+    /// the distinct enum value preserves the source metadata identity in tests
+    /// and diagnostics.
     CommandR,
+    /// llama.cpp `smollm`: a two-pass legacy GPT-2 dialect. The first isolated
+    /// regex (`\p{N}`) partitions every Unicode number code point; the second
+    /// is the case-sensitive GPT-2 expression with a literal optional ASCII
+    /// space before letter/number/punctuation runs. This is NOT the dialect of
+    /// the pinned SmolLM3 Q8_0 row (that file says `smaug-bpe`, an exact Llama3
+    /// alias), but other GGUFs do carry the `smollm` metadata value.
+    SmolLm,
     /// llama.cpp `qwen2` (Qwen2/Qwen3): each digit is its own piece (`\p{N}`).
     /// Byte-for-byte identical to `llama-bpe` in every other branch — verified
     /// against `llama-vocab.cpp` LLAMA_VOCAB_PRE_TYPE_LLAMA3 vs _QWEN2.
@@ -105,7 +107,7 @@ impl BpePreTokenizer {
     /// Maximum number of consecutive digits the pre-tokenizer keeps in one piece.
     fn digit_group_max(self) -> usize {
         match self {
-            Self::Llama3 | Self::CommandR | Self::Gpt4o => 3,
+            Self::Llama3 | Self::CommandR | Self::SmolLm | Self::Gpt4o => 3,
             Self::Qwen2 | Self::Qwen35 | Self::Tekken => 1,
         }
     }
@@ -123,7 +125,7 @@ impl BpePreTokenizer {
     /// group at all, so `"John's"` is one segment under gpt-4o and two under
     /// tekken. This is one of only two differences between the dialects.
     fn word_takes_contraction(self) -> bool {
-        !matches!(self, Self::Tekken)
+        !matches!(self, Self::Tekken | Self::CommandR | Self::SmolLm)
     }
 
     /// Whether this dialect uses the case-run word grammar
@@ -484,19 +486,17 @@ fn resolve_gpt2_pre_tokenizer(
 ) -> Result<BpePreTokenizer> {
     match pre {
         Some("llama-bpe") => Ok(BpePreTokenizer::Llama3),
-        // `command-r` is refused rather than mapped: [`BpePreTokenizer::CommandR`]
-        // models it as llama3-with-3-digit-grouping, but the reference dialect is
-        // a different two-regex form entirely (see that variant's docs). Accepting
-        // it here would silently mis-tokenize. The architecture is refused upstream
-        // anyway, so this closes a latent footgun rather than removing a capability.
-        Some("command-r") => Err(BackendError::UnsupportedTokenizer(
-            "command-r's pre-tokenizer is not implemented: the reference dialect is \
-             not in the llama-bpe family (digits split individually, ` ?\\p{L}+` \
-             letter branch, case-sensitive contractions) and Camelid's CommandR \
-             variant does not model it"
-                .to_string(),
-        )),
+        // The pinned reference places Command R in the same two-regex arm as
+        // legacy SmolLM. Route it to the dedicated two-pass splitter rather
+        // than approximating it with llama-bpe digit grouping.
+        Some("command-r") => Ok(BpePreTokenizer::CommandR),
         Some("qwen2") => Ok(BpePreTokenizer::Qwen2),
+        // `deepseek-r1-qwen` is an exact qwen2 alias in the pinned llama.cpp
+        // vocabulary switch: both spellings select LLAMA_VOCAB_PRE_TYPE_QWEN2
+        // and the same split regex. Keep the alias explicit so the distinct
+        // DeepSeek source identity remains visible without duplicating a
+        // splitter or silently accepting other DeepSeek dialects.
+        Some("deepseek-r1-qwen") => Ok(BpePreTokenizer::Qwen2),
         // `stablelm2` is an EXACT alias of `qwen2`: llama.cpp puts
         // LLAMA_VOCAB_PRE_TYPE_STABLELM2 and _QWEN2 in the same switch arm with one
         // shared regex body, so no new splitter is required. Verified
@@ -516,6 +516,16 @@ fn resolve_gpt2_pre_tokenizer(
         // runnable smoke gate and the whole serve bridge even though the
         // forward pass is parity-certified.
         Some("lfm2") => Ok(BpePreTokenizer::Llama3),
+        // The pinned SmolLM3-3B Q8_0 row says `smaug-bpe`, NOT `smollm`.
+        // llama.cpp puts SMAUG and DBRX in one switch arm whose sole regex is
+        // byte-for-byte the LLAMA3 expression (the source comment is literally
+        // "same as llama3"). This is therefore an exact alias, grounded by
+        // qa/model-qualification/fixtures/smollm3-tokenizer-pre-v1.json.
+        Some("smaug-bpe") => Ok(BpePreTokenizer::Llama3),
+        // Legacy SmolLM conversions carry `smollm`, which llama.cpp maps to a
+        // distinct two-regex sequence. Never alias this spelling to llama3:
+        // digits, contractions, and punctuation-prefixed words differ.
+        Some("smollm") => Ok(BpePreTokenizer::SmolLm),
         // `tekken` (Mistral Nemo / Ministral / Mistral Small 3.x). Ungated, unlike
         // `gpt-4o`: this dialect is validated by token-id agreement against the
         // pinned llama-tokenize oracle on a real Mistral Nemo GGUF, not by an
@@ -529,9 +539,27 @@ fn resolve_gpt2_pre_tokenizer(
         )),
         None if is_llama3_bpe_signature(token_texts) => Ok(BpePreTokenizer::Llama3),
         other => Err(BackendError::UnsupportedTokenizer(format!(
-            "unsupported GPT-2/BPE pre-tokenizer {other:?}; currently supported: llama-bpe, qwen2, qwen35, stablelm2, tekken"
+            "unsupported GPT-2/BPE pre-tokenizer {other:?}; currently supported: llama-bpe, command-r, qwen2, deepseek-r1-qwen, qwen35, stablelm2, lfm2, smaug-bpe, smollm, tekken"
         ))),
     }
+}
+
+fn resolve_add_bos(
+    model_name: &str,
+    tokenizer_pre: Option<&str>,
+    explicit_add_bos: Option<bool>,
+) -> bool {
+    // Gemma's force-on behavior is an existing llama.cpp compatibility rule;
+    // keep it ahead of the ordinary metadata/default path.
+    if model_name.starts_with("gemma") {
+        return true;
+    }
+
+    // The pinned SmolLM3 row omits tokenizer.ggml.add_bos_token. llama.cpp's
+    // SMAUG vocabulary defaults that omission to false, while Camelid's broad
+    // BPE fallback historically defaulted it to true. Scope the correction to
+    // the exact `smaug-bpe` spelling and never override an explicit GGUF value.
+    explicit_add_bos.unwrap_or(tokenizer_pre != Some("smaug-bpe"))
 }
 
 /// SHA-256 of the pinned artifact's GGUF *header region* — bytes
@@ -554,15 +582,29 @@ fn resolve_gpt2_pre_tokenizer(
 /// where `$(offset)` is the `data_start_offset` the reader reports.
 const PHI4_MINI_Q4KM_HEADER_SHA256: &str =
     "971d9aac49438815528a5036221d85b2b0cbaf8c13e05f412c4574e16d186312";
+const PHI4_MINI_Q8_HEADER_SHA256: &str =
+    "fa7fa727c8b63338ceac32be0a0311e3af58c7826c1fee82c6689694eeb39931";
 
-fn is_exact_phi4_mini_q4km(file: &GgufFile) -> bool {
-    let named_phi4 = file.architecture() == Some("phi3")
-        && file.model_name() == Some("Phi 4 Mini Instruct")
-        && file.path.file_name().and_then(|name| name.to_str())
-            == Some("Phi-4-mini-instruct-Q4_K_M.gguf");
-    named_phi4
-        && sha256_file_prefix(&file.path, file.data_start_offset)
-            .is_some_and(|sha256| sha256 == PHI4_MINI_Q4KM_HEADER_SHA256)
+fn is_pinned_phi4_mini_gpt4o_header(file_name: Option<&str>, header_sha256: &str) -> bool {
+    matches!(
+        (file_name, header_sha256),
+        (
+            Some("Phi-4-mini-instruct-Q4_K_M.gguf"),
+            PHI4_MINI_Q4KM_HEADER_SHA256
+        ) | (
+            Some("Phi-4-mini-instruct.Q8_0.gguf"),
+            PHI4_MINI_Q8_HEADER_SHA256
+        )
+    )
+}
+
+fn is_exact_phi4_mini_gpt4o(file: &GgufFile) -> bool {
+    if file.architecture() != Some("phi3") || file.model_name() != Some("Phi 4 Mini Instruct") {
+        return false;
+    }
+    let file_name = file.path.file_name().and_then(|name| name.to_str());
+    sha256_file_prefix(&file.path, file.data_start_offset)
+        .is_some_and(|sha256| is_pinned_phi4_mini_gpt4o_header(file_name, &sha256))
 }
 
 /// SHA-256 of exactly the first `len` bytes of `path`, or `None` if the file
@@ -621,7 +663,7 @@ impl Tokenizer {
             resolve_gpt2_pre_tokenizer(
                 file.metadata_string("tokenizer.ggml.pre"),
                 &token_texts,
-                is_exact_phi4_mini_q4km(file),
+                is_exact_phi4_mini_gpt4o(file),
             )?
         } else {
             BpePreTokenizer::default()
@@ -785,12 +827,11 @@ impl Tokenizer {
                 // (without this, the BOS is dropped and the whole forward
                 // diverges). E-series/12B already ship true, so this is a no-op
                 // for them.
-                add_bos: if model_name.starts_with("gemma") {
-                    true
-                } else {
-                    file.metadata_bool("tokenizer.ggml.add_bos_token")
-                        .unwrap_or(true)
-                },
+                add_bos: resolve_add_bos(
+                    model_name,
+                    file.metadata_string("tokenizer.ggml.pre"),
+                    file.metadata_bool("tokenizer.ggml.add_bos_token"),
+                ),
                 add_eos: file
                     .metadata_bool("tokenizer.ggml.add_eos_token")
                     .unwrap_or(false),
@@ -1144,6 +1185,9 @@ impl Tokenizer {
                 .unwrap_or(text.len());
 
             let segments = match self.bpe_pre_tokenizer {
+                BpePreTokenizer::CommandR | BpePreTokenizer::SmolLm => {
+                    bpe_pretokenize_smollm(&text[byte_start..byte_end])
+                }
                 pre_tokenizer if pre_tokenizer.uses_case_run_words() => bpe_pretokenize_gpt4o(
                     &text[byte_start..byte_end],
                     pre_tokenizer.digit_group_max(),
@@ -1190,6 +1234,7 @@ impl Tokenizer {
 
     fn decode_bpe(&self, token_ids: &[TokenId], remove_special: bool) -> Result<String> {
         let mut bytes = Vec::new();
+        let mut text = String::new();
         for id in token_ids {
             if remove_special && self.is_special(*id) {
                 continue;
@@ -1199,6 +1244,11 @@ impl Tokenizer {
             })?;
             if remove_special && (token.kind == TokenKind::Control || is_chat_control_marker(token))
             {
+                continue;
+            }
+            if token.kind == TokenKind::Control || is_chat_control_marker(token) {
+                flush_bytes(&mut bytes, &mut text)?;
+                text.push_str(&token.text);
                 continue;
             }
             for ch in token.text.chars() {
@@ -1224,12 +1274,8 @@ impl Tokenizer {
         // strip_prefix delta diff and duplicate the line). For complete sequences the
         // valid prefix is the whole string, byte-for-byte identical to a strict decode,
         // so token-AND-text parity is unaffected.
-        match std::str::from_utf8(&bytes) {
-            Ok(text) => Ok(text.to_string()),
-            Err(err) => Ok(std::str::from_utf8(&bytes[..err.valid_up_to()])
-                .unwrap_or("")
-                .to_string()),
-        }
+        flush_bytes(&mut bytes, &mut text)?;
+        Ok(text)
     }
 
     fn normalize_spm_text(&self, text: &str, parse_special: bool) -> String {
@@ -1973,6 +2019,166 @@ fn is_gpt4o_punctuation(ch: char) -> bool {
     !is_whitespace(ch) && !is_gpt4o_letter(ch) && !is_gpt4o_number(ch)
 }
 
+/// llama.cpp `LLAMA_VOCAB_PRE_TYPE_SMOLLM`, ported from the exact two-regex
+/// sequence pinned in
+/// `qa/model-qualification/fixtures/smollm3-tokenizer-pre-v1.json`.
+///
+/// llama.cpp applies regex expressions sequentially to the offsets produced by
+/// the preceding expression. Consequently the first `\p{N}` pass isolates
+/// EVERY Unicode number code point before the GPT-2 pass runs; the later
+/// ` ?\p{N}+` branch cannot regroup adjacent digits. This is materially
+/// different from qwen2 (same single-digit outcome, different word grammar)
+/// and llama3 (case-insensitive contractions and arbitrary one-character word
+/// prefix), so it has a dedicated splitter.
+fn bpe_pretokenize_smollm(text: &str) -> Vec<&str> {
+    let mut segments = Vec::new();
+    let mut partition_start = 0;
+
+    for (byte_start, ch) in text.char_indices() {
+        if !is_smollm_number(ch) {
+            continue;
+        }
+        append_smollm_gpt2_segments(&text[partition_start..byte_start], &mut segments);
+        let byte_end = byte_start + ch.len_utf8();
+        segments.push(&text[byte_start..byte_end]);
+        partition_start = byte_end;
+    }
+    append_smollm_gpt2_segments(&text[partition_start..], &mut segments);
+    segments
+}
+
+fn append_smollm_gpt2_segments<'a>(partition: &'a str, output: &mut Vec<&'a str>) {
+    let mut byte_start = 0;
+    while byte_start < partition.len() {
+        let byte_end = next_smollm_gpt2_segment_end(partition, byte_start);
+        debug_assert!(byte_end > byte_start && byte_end <= partition.len());
+        output.push(&partition[byte_start..byte_end]);
+        byte_start = byte_end;
+    }
+}
+
+fn next_smollm_gpt2_segment_end(text: &str, byte_start: usize) -> usize {
+    if let Some(end) = consume_smollm_contraction(text, byte_start) {
+        return end;
+    }
+    if let Some(end) = consume_smollm_optional_space_letters(text, byte_start) {
+        return end;
+    }
+    if let Some(end) = consume_smollm_optional_space_numbers(text, byte_start) {
+        return end;
+    }
+    if let Some(end) = consume_smollm_optional_space_punctuation(text, byte_start) {
+        return end;
+    }
+
+    let ch = next_char(text, byte_start).expect("byte_start is in-bounds");
+    if is_whitespace(ch) {
+        // This reproduces llama.cpp's custom GPT-2 splitter: for a whitespace
+        // run longer than one followed by nonspace, `\s+(?!\S)` consumes all
+        // but the final whitespace; otherwise the fallback whitespace branch
+        // consumes the run. The latter is present in the pinned custom
+        // implementation even though the source regex list ends at the
+        // negative-lookahead branch.
+        return consume_whitespace_before_nonspace(text, byte_start);
+    }
+    byte_start + ch.len_utf8()
+}
+
+fn consume_smollm_contraction(text: &str, byte_start: usize) -> Option<usize> {
+    ["'s", "'t", "'re", "'ve", "'m", "'ll", "'d"]
+        .into_iter()
+        .find_map(|suffix| {
+            text[byte_start..]
+                .get(..suffix.len())
+                .filter(|candidate| *candidate == suffix)
+                .map(|_| byte_start + suffix.len())
+        })
+}
+
+fn consume_smollm_optional_space_letters(text: &str, byte_start: usize) -> Option<usize> {
+    let first = next_char(text, byte_start)?;
+    let mut cursor = if first == ' ' {
+        byte_start + 1
+    } else {
+        byte_start
+    };
+    if !next_char(text, cursor).is_some_and(is_smollm_letter) {
+        return None;
+    }
+    while cursor < text.len() {
+        let ch = next_char(text, cursor)?;
+        if !is_smollm_letter(ch) {
+            break;
+        }
+        cursor += ch.len_utf8();
+    }
+    Some(cursor)
+}
+
+fn consume_smollm_optional_space_numbers(text: &str, byte_start: usize) -> Option<usize> {
+    let first = next_char(text, byte_start)?;
+    let mut cursor = if first == ' ' {
+        byte_start + 1
+    } else {
+        byte_start
+    };
+    if !next_char(text, cursor).is_some_and(is_smollm_number) {
+        return None;
+    }
+    while cursor < text.len() {
+        let ch = next_char(text, cursor)?;
+        if !is_smollm_number(ch) {
+            break;
+        }
+        cursor += ch.len_utf8();
+    }
+    Some(cursor)
+}
+
+fn consume_smollm_optional_space_punctuation(text: &str, byte_start: usize) -> Option<usize> {
+    let first = next_char(text, byte_start)?;
+    let mut cursor = if first == ' ' {
+        byte_start + 1
+    } else {
+        byte_start
+    };
+    if !next_char(text, cursor).is_some_and(is_smollm_punctuation) {
+        return None;
+    }
+    while cursor < text.len() {
+        let ch = next_char(text, cursor)?;
+        if !is_smollm_punctuation(ch) {
+            break;
+        }
+        cursor += ch.len_utf8();
+    }
+    Some(cursor)
+}
+
+fn is_smollm_letter(ch: char) -> bool {
+    matches!(
+        get_general_category(ch),
+        GeneralCategory::UppercaseLetter
+            | GeneralCategory::LowercaseLetter
+            | GeneralCategory::TitlecaseLetter
+            | GeneralCategory::ModifierLetter
+            | GeneralCategory::OtherLetter
+    )
+}
+
+fn is_smollm_number(ch: char) -> bool {
+    matches!(
+        get_general_category(ch),
+        GeneralCategory::DecimalNumber
+            | GeneralCategory::LetterNumber
+            | GeneralCategory::OtherNumber
+    )
+}
+
+fn is_smollm_punctuation(ch: char) -> bool {
+    !is_whitespace(ch) && !is_smollm_letter(ch) && !is_smollm_number(ch)
+}
+
 fn bpe_pretokenize_with(text: &str, digit_group_max: usize, fold_marks: bool) -> Vec<&str> {
     // GPT-2/BPE pre-tokenizer, mirroring llama.cpp's tiktoken-style regex without
     // pulling in a regex dependency:
@@ -2312,9 +2518,10 @@ fn flush_bytes(bytes: &mut Vec<u8>, text: &mut String) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        bpe_byte_to_char, bpe_pretokenize, bpe_pretokenize_gpt4o, bpe_pretokenize_with,
-        is_chat_control_marker, is_exact_phi4_mini_q4km, is_mark, BpePreTokenizer, BpeRegistry,
-        SpecialTokens, Token, TokenKind, Tokenizer, TokenizerConfig, TokenizerModel, SPM_SPACE,
+        bpe_byte_to_char, bpe_pretokenize, bpe_pretokenize_gpt4o, bpe_pretokenize_smollm,
+        bpe_pretokenize_with, is_chat_control_marker, is_exact_phi4_mini_gpt4o, is_mark,
+        resolve_add_bos, BpePreTokenizer, BpeRegistry, SpecialTokens, Token, TokenKind, Tokenizer,
+        TokenizerConfig, TokenizerModel, SPM_SPACE,
     };
     use std::collections::{BTreeSet, HashMap};
     use std::sync::OnceLock;
@@ -2690,6 +2897,37 @@ mod tests {
     }
 
     #[test]
+    fn bpe_decode_preserves_unicode_control_tokens_when_requested() {
+        let tokens = vec![
+            Token {
+                id: 0,
+                text: "<｜begin▁of▁sentence｜>".to_string(),
+                score: 0.0,
+                kind: TokenKind::Control,
+            },
+            Token {
+                id: 1,
+                text: bpe_byte_to_char(b'A').to_string(),
+                score: 0.0,
+                kind: TokenKind::Normal,
+            },
+        ];
+        let tokenizer = tokenizer_with(
+            TokenizerModel::Gpt2Bpe,
+            tokens,
+            SpecialTokens {
+                bos: Some(0),
+                ..SpecialTokens::default()
+            },
+        );
+        assert_eq!(
+            tokenizer.decode(&[0, 1], false).unwrap(),
+            "<｜begin▁of▁sentence｜>A"
+        );
+        assert_eq!(tokenizer.decode(&[0, 1], true).unwrap(), "A");
+    }
+
+    #[test]
     fn constraint_token_bytes_preserve_fragments_spaces_and_specials() {
         let spm_tokens = vec![
             Token {
@@ -2836,8 +3074,103 @@ mod tests {
     }
 
     #[test]
+    fn smollm_pre_fixture_locks_real_row_alias_and_legacy_two_pass_splitter() {
+        #[derive(serde::Deserialize)]
+        struct Pack {
+            pack_id: String,
+            support_scope: String,
+            artifact: Artifact,
+            oracle: Oracle,
+            legacy_smollm_segment_cases: Vec<Case>,
+            disposition: Disposition,
+        }
+        #[derive(serde::Deserialize)]
+        struct Artifact {
+            repo: String,
+            revision: String,
+            file: String,
+            tokenizer_pre: String,
+            token_count: usize,
+            merge_count: usize,
+        }
+        #[derive(serde::Deserialize)]
+        struct Oracle {
+            revision: String,
+            smaug_regex: String,
+            legacy_smollm_regexes: Vec<String>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Case {
+            id: String,
+            text: String,
+            segments: Vec<String>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Disposition {
+            actual_row: String,
+            legacy_smollm: String,
+            not_claimed: Vec<String>,
+        }
+
+        let raw =
+            include_str!("../../qa/model-qualification/fixtures/smollm3-tokenizer-pre-v1.json");
+        let pack: Pack = serde_json::from_str(raw).expect("parse SmolLM tokenizer-pre fixture");
+        assert_eq!(pack.pack_id, "smollm3-tokenizer-pre-v1");
+        assert_eq!(
+            pack.support_scope,
+            "tokenizer_pre_resolution_and_splitter_only_no_real_row_support"
+        );
+        assert_eq!(pack.artifact.repo, "ggml-org/SmolLM3-3B-GGUF");
+        assert_eq!(
+            pack.artifact.revision,
+            "4965cb60b150737b68a0408c36aeefb65078f894"
+        );
+        assert_eq!(pack.artifact.file, "SmolLM3-Q8_0.gguf");
+        assert_eq!(pack.artifact.tokenizer_pre, "smaug-bpe");
+        assert_eq!(pack.artifact.token_count, 128_256);
+        assert_eq!(pack.artifact.merge_count, 280_147);
+        assert_eq!(pack.oracle.revision, "acd79d603");
+        assert_eq!(
+            pack.oracle.smaug_regex,
+            "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"
+        );
+        assert_eq!(
+            pack.oracle.legacy_smollm_regexes,
+            vec![
+                "\\p{N}",
+                "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)"
+            ]
+        );
+        assert!(pack.disposition.actual_row.contains("exact llama3 alias"));
+        assert!(pack.disposition.legacy_smollm.contains("two-pass splitter"));
+        assert!(pack
+            .disposition
+            .not_claimed
+            .iter()
+            .any(|claim| claim == "real-row support"));
+
+        for case in &pack.legacy_smollm_segment_cases {
+            let actual = bpe_pretokenize_smollm(&case.text);
+            let expected = case.segments.iter().map(String::as_str).collect::<Vec<_>>();
+            assert_eq!(actual, expected, "SmolLM fixture case {} drifted", case.id);
+            assert_eq!(actual.concat(), case.text, "split must be lossless");
+        }
+
+        // These three axes prove the new variant is not an alias in disguise.
+        assert_eq!(bpe_pretokenize_smollm("1234"), vec!["1", "2", "3", "4"]);
+        assert_eq!(bpe_pretokenize_smollm("CAN'T"), vec!["CAN", "'", "T"]);
+        assert_eq!(bpe_pretokenize_smollm("-hello"), vec!["-", "hello"]);
+        assert_eq!(bpe_pretokenize_with("1234", 3, false), vec!["123", "4"]);
+        assert_eq!(bpe_pretokenize_with("CAN'T", 3, false), vec!["CAN", "'T"]);
+        assert_eq!(bpe_pretokenize_with("-hello", 3, false), vec!["-hello"]);
+    }
+
+    #[test]
     fn resolve_gpt2_pre_tokenizer_gates_the_missing_pre_recovery() {
-        use super::{is_exact_phi4_mini_q4km, resolve_gpt2_pre_tokenizer, BpePreTokenizer};
+        use super::{
+            is_exact_phi4_mini_gpt4o, is_pinned_phi4_mini_gpt4o_header, resolve_gpt2_pre_tokenizer,
+            BpePreTokenizer, PHI4_MINI_Q4KM_HEADER_SHA256, PHI4_MINI_Q8_HEADER_SHA256,
+        };
         use crate::gguf::{GgufFile, GgufMetadataValue};
         use std::{collections::BTreeMap, path::PathBuf};
         let mut sig = vec![String::new(); 128_256];
@@ -2855,6 +3188,10 @@ mod tests {
         ));
         assert!(matches!(
             resolve_gpt2_pre_tokenizer(Some("qwen2"), &no_sig, false),
+            Ok(BpePreTokenizer::Qwen2)
+        ));
+        assert!(matches!(
+            resolve_gpt2_pre_tokenizer(Some("deepseek-r1-qwen"), &no_sig, false),
             Ok(BpePreTokenizer::Qwen2)
         ));
         assert!(matches!(
@@ -2891,19 +3228,35 @@ mod tests {
             Ok(BpePreTokenizer::Llama3)
         ));
 
-        // `command-r` is REFUSED, not mapped. BpePreTokenizer::CommandR models it
-        // as llama3-with-3-digit-grouping, but the reference dialect is a different
-        // two-regex form (digits split individually, ` ?\p{L}+` letter branch,
-        // case-sensitive contractions). Accepting it would silently mis-tokenize.
-        assert!(resolve_gpt2_pre_tokenizer(Some("command-r"), &no_sig, false).is_err());
-        assert!(resolve_gpt2_pre_tokenizer(Some("command-r"), &sig, false).is_err());
+        // The pinned real SmolLM3 row carries `smaug-bpe`; llama.cpp maps
+        // SMAUG to the exact Llama3 regex. The legacy `smollm` spelling is a
+        // distinct two-pass dialect and resolves to its dedicated splitter.
+        assert!(matches!(
+            resolve_gpt2_pre_tokenizer(Some("smaug-bpe"), &no_sig, false),
+            Ok(BpePreTokenizer::Llama3)
+        ));
+        assert!(matches!(
+            resolve_gpt2_pre_tokenizer(Some("smollm"), &no_sig, false),
+            Ok(BpePreTokenizer::SmolLm)
+        ));
+
+        // Command R and legacy SmolLM occupy the same pinned two-regex arm.
+        // The distinct enum value preserves provenance while both use the
+        // dedicated two-pass splitter.
+        assert!(matches!(
+            resolve_gpt2_pre_tokenizer(Some("command-r"), &no_sig, false),
+            Ok(BpePreTokenizer::CommandR)
+        ));
+        assert_eq!(
+            bpe_pretokenize_smollm("Hello 123 CAN'T"),
+            vec!["Hello", " ", "1", "2", "3", " CAN", "'", "T"]
+        );
 
         // Dialects that are NOT aliases of anything implemented stay refused: each
         // needs a genuinely different splitter, not another digit-grouping value.
-        //   smollm       -> two-regex GPT-2 form (same arm as command-r)
         //   deepseek-llm -> six-regex list with explicit Unicode range classes
         //   llama4       -> maps to GPT4O upstream, which is sha256-gated here
-        for unsupported in ["smollm", "deepseek-llm", "deepseek-coder", "llama4"] {
+        for unsupported in ["deepseek-llm", "deepseek-coder", "llama4"] {
             assert!(
                 resolve_gpt2_pre_tokenizer(Some(unsupported), &no_sig, false).is_err(),
                 "{unsupported} must stay refused until its splitter exists"
@@ -2921,7 +3274,7 @@ mod tests {
 
         // An explicit-but-unknown pre is refused EVEN WITH the signature — we only
         // rescue an absent key, never override a stated (if unrecognized) dialect.
-        assert!(resolve_gpt2_pre_tokenizer(Some("smaug-bpe"), &sig, false).is_err());
+        assert!(resolve_gpt2_pre_tokenizer(Some("smaug-bpe-v2"), &sig, false).is_err());
 
         let exact = GgufFile {
             path: PathBuf::from("Phi-4-mini-instruct-Q4_K_M.gguf"),
@@ -2942,10 +3295,23 @@ mod tests {
             ]),
             tensors: Vec::new(),
         };
-        assert!(!is_exact_phi4_mini_q4km(&exact));
+        assert!(!is_exact_phi4_mini_gpt4o(&exact));
         let mut renamed = exact.clone();
         renamed.path = PathBuf::from("renamed.gguf");
-        assert!(!is_exact_phi4_mini_q4km(&renamed));
+        assert!(!is_exact_phi4_mini_gpt4o(&renamed));
+
+        assert!(is_pinned_phi4_mini_gpt4o_header(
+            Some("Phi-4-mini-instruct-Q4_K_M.gguf"),
+            PHI4_MINI_Q4KM_HEADER_SHA256,
+        ));
+        assert!(is_pinned_phi4_mini_gpt4o_header(
+            Some("Phi-4-mini-instruct.Q8_0.gguf"),
+            PHI4_MINI_Q8_HEADER_SHA256,
+        ));
+        assert!(!is_pinned_phi4_mini_gpt4o_header(
+            Some("renamed.gguf"),
+            PHI4_MINI_Q8_HEADER_SHA256,
+        ));
     }
 
     // The artifact pin hashes only `[0, data_start_offset)`, so the bounded
@@ -3052,6 +3418,36 @@ mod tests {
                 "token mismatch for {s:?}:\n  missing-pre: {ea:?}\n  reference:   {eb:?}"
             );
         }
+    }
+
+    #[test]
+    fn smaug_bpe_missing_add_bos_defaults_false_without_widening() {
+        // The pinned SmolLM3 row omits tokenizer.ggml.add_bos_token and the
+        // b9632 oracle does not prepend BOS. Both explicit values still win.
+        assert!(!resolve_add_bos("gpt2", Some("smaug-bpe"), None));
+        assert!(resolve_add_bos("gpt2", Some("smaug-bpe"), Some(true)));
+        assert!(!resolve_add_bos("gpt2", Some("smaug-bpe"), Some(false)));
+
+        // No other BPE spelling inherits the SmolLM3-specific omission rule.
+        for tokenizer_pre in [
+            "llama-bpe",
+            "lfm2",
+            "qwen2",
+            "qwen35",
+            "stablelm2",
+            "command-r",
+            "smollm",
+            "tekken",
+        ] {
+            assert!(
+                resolve_add_bos("gpt2", Some(tokenizer_pre), None),
+                "{tokenizer_pre} default changed"
+            );
+        }
+        assert!(resolve_add_bos("gpt2", None, None));
+
+        // Preserve the pre-existing Gemma force-on workaround.
+        assert!(resolve_add_bos("gemma4", None, Some(false)));
     }
 
     #[test]
@@ -3328,7 +3724,7 @@ mod tests {
         assert_eq!(gguf.architecture(), Some("phi3"));
         assert_eq!(gguf.model_name(), Some("Phi 4 Mini Instruct"));
         assert_eq!(gguf.metadata_string("tokenizer.ggml.pre"), Some("gpt-4o"));
-        assert!(is_exact_phi4_mini_q4km(&gguf));
+        assert!(is_exact_phi4_mini_gpt4o(&gguf));
         let tokenizer = Tokenizer::from_gguf(&gguf).expect("load Phi-4-mini tokenizer");
         assert!(
             tokenizer.special.eog.contains(&200_020),

@@ -1,0 +1,22 @@
+{
+  "models_dir": "$CAMELID_MODEL_ROOT/lfm2",
+  "models": [
+    {
+      "filename": "LFM2.5-2.6B-Q8_0.gguf",
+      "size_bytes": 2874779456,
+      "architecture": "lfm2",
+      "quantization": "Q8_0",
+      "tokenizer_kind": "gpt2_bpe",
+      "admitted": true,
+      "admission_reason": null,
+      "oracle_qualified": true,
+      "runnable_receipt_present": false,
+      "chat_capable": true,
+      "embedding_capable": false,
+      "generation_capable": true,
+      "context_length": 128000,
+      "ghost_moe_prepared": false,
+      "lane_class": "supported"
+    }
+  ]
+}

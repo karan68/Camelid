@@ -1,0 +1,195 @@
+{
+  "schema": "camelid.model-qualification-oracle/v1",
+  "generated_at": "2026-08-11T17:19:07.745Z",
+  "row_id": "mistral_7b_instruct_v0_2_q8_0",
+  "scope": "tokenizer_and_raw_greedy_generation",
+  "artifact": {
+    "repo": "TheBloke/Mistral-7B-Instruct-v0.2-GGUF",
+    "revision": "3a6fbf4a41a1d52e415a4958cde6856d34b2db93",
+    "file": "mistral-7b-instruct-v0.2.Q8_0.gguf",
+    "size_bytes": 7695857952,
+    "sha256": "f326f5f4f137f3ad30f8c9cc21d4d39e54476583e8306ee2931d5a022cb85b06"
+  },
+  "oracle": {
+    "engine": "llama.cpp",
+    "build": "b9632",
+    "revision": "acd79d603",
+    "platform": "darwin-arm64",
+    "release": "25.5.0",
+    "llama_tokenize_sha256": "de1b813ddc9ad026d45c4f3f37b1f2052aa4c01b94a66ddcea2e8ac673bcc4ba",
+    "llama_server_sha256": "382096b1dc10da68c2bf0a97e1f0dd36db90531cdea1434760d8c1a70fea1310",
+    "command": [
+      "<llama-tokenize>",
+      "-m",
+      "<artifact>",
+      "-p",
+      "<prompt>",
+      "--ids",
+      "--no-escape",
+      "--log-disable"
+    ]
+  },
+  "raw_prompts": [
+    {
+      "text": "Hello",
+      "prompt_ids": [
+        1,
+        22557
+      ],
+      "generated_ids": [
+        28725,
+        13,
+        13,
+        28737,
+        28742
+      ],
+      "generated_text": ",\n\nI'"
+    },
+    {
+      "text": "The capital of France is",
+      "prompt_ids": [
+        1,
+        415,
+        5565,
+        302,
+        4843,
+        349
+      ],
+      "generated_ids": [
+        5465,
+        28725,
+        304,
+        378,
+        349
+      ],
+      "generated_text": " Paris, and it is"
+    },
+    {
+      "text": "Once upon a time",
+      "prompt_ids": [
+        1,
+        5713,
+        3714,
+        264,
+        727
+      ],
+      "generated_ids": [
+        28725,
+        297,
+        264,
+        2533,
+        2082
+      ],
+      "generated_text": ", in a land far"
+    },
+    {
+      "text": "The quick brown fox",
+      "prompt_ids": [
+        1,
+        415,
+        2936,
+        9060,
+        285,
+        1142
+      ],
+      "generated_ids": [
+        461,
+        10575,
+        754,
+        272,
+        17898
+      ],
+      "generated_text": " jumps over the lazy"
+    },
+    {
+      "text": "2 + 2 =",
+      "prompt_ids": [
+        1,
+        28705,
+        28750,
+        648,
+        28705,
+        28750,
+        327
+      ],
+      "generated_ids": [
+        28705,
+        28781,
+        13,
+        13,
+        28771
+      ],
+      "generated_text": " 4\n\n#"
+    },
+    {
+      "text": "don't stop 12345\nUnicode café 東京 🙂",
+      "prompt_ids": [
+        1,
+        949,
+        28742,
+        28707,
+        2115,
+        28705,
+        28740,
+        28750,
+        28770,
+        28781,
+        28782,
+        13,
+        27977,
+        28345,
+        28705,
+        30366,
+        29936,
+        28705,
+        29340
+      ],
+      "generated_ids": [
+        13,
+        13,
+        28771,
+        28705,
+        243
+      ],
+      "generated_text": "\n\n# �"
+    }
+  ],
+  "chat_templates": [],
+  "does_not_prove": [
+    "Camelid weight load, logits, generation, or greedy-token parity until the independent replay phase passes",
+    "chat-template rendering or prompt-token parity unless a separate exact-row shape pack is cited",
+    "API, WebUI, bounded context, performance, GPU execution, portability, neighboring rows, or broad-family support"
+  ],
+  "greedy_capture": {
+    "captured_at": "2026-08-11T17:51:31.934Z",
+    "endpoint": "/completion",
+    "prompt_input": "pinned_prompt_ids",
+    "max_new_tokens": 5,
+    "temperature": 0,
+    "top_k": 1,
+    "seed": 0,
+    "cache_prompt": false,
+    "samplers": [
+      "top_k"
+    ],
+    "backend": "cpu_reference_f32_kv_no_repack",
+    "llama_server_command": [
+      "<llama-server>",
+      "-m",
+      "<artifact>",
+      "-c",
+      "256",
+      "-ngl",
+      "0",
+      "-ctk",
+      "f32",
+      "-ctv",
+      "f32",
+      "-fa",
+      "off",
+      "--no-repack",
+      "--no-warmup",
+      "--log-disable"
+    ]
+  }
+}

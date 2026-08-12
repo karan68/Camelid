@@ -80,6 +80,26 @@ assert.deepEqual(streamed.usage, { prompt_tokens: 3, completion_tokens: 7, total
 assert.ok(streamEvents.includes('bytes'), 'stream parser should expose first-byte progress before content')
 assert.ok(streamEvents.includes('role'), 'stream parser should expose role-only chunks while waiting for first content token')
 assert.ok(streamEvents.includes('usage'), 'stream parser should expose backend usage chunks before finalizing the assistant row')
+assert.deepEqual(streamEvents.slice(-3), ['finish', 'usage', 'done'], 'terminal stream evidence should preserve finish, usage, then [DONE] ordering')
+
+const reasoningEvents = []
+const reasoningOnly = await readStreamingChatCompletion(new Response(streamFromChunks([
+  'data: {"choices":[{"delta":{"role":"assistant"}}]}\n\n',
+  'data: {"choices":[{"delta":{"reasoning_content":"thinking"}}]}\n\n',
+  'data: {"choices":[{"delta":{},"finish_reason":"length"}]}\n\n',
+  'data: {"choices":[],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}}\n\n',
+  'data: [DONE]\n\n',
+]), {
+  status: 200,
+  headers: { 'content-type': 'text/event-stream' },
+}), () => {}, {
+  onStreamEvent(event) {
+    reasoningEvents.push(event.type)
+  },
+})
+assert.equal(reasoningOnly.content, '', 'reasoning-only streams must not leak hidden reasoning into assistant content')
+assert.ok(reasoningEvents.includes('reasoning'), 'reasoning-only streams should expose forward progress to diagnostics and smoke checks')
+assert.deepEqual(reasoningEvents.slice(-3), ['finish', 'usage', 'done'], 'reasoning-only terminal evidence should preserve finish, usage, then [DONE] ordering')
 
 const multilinePayload = await readStreamingChatCompletion(new Response(streamFromChunks([
   'data: {"choices":[{"delta":{"content":"multi"}}],\n',

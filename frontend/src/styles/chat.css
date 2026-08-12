@@ -200,11 +200,12 @@
 .syntax-token.attr { color: var(--color-spectrum-yellow); }
 
 /* ---- Streaming indicators ---- */
-.streaming-loader { display: inline-flex; align-items: center; padding: var(--space-1) 0; }
+.streaming-loader { display: inline-flex; align-items: center; gap: var(--space-2); padding: var(--space-1) 0; }
 .streaming-loader-track { display: inline-flex; gap: 5px; }
 .streaming-loader-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--color-text-faint); animation: camelidDotBounce 1.2s var(--ease-standard) infinite; }
 .streaming-loader-dot-2 { animation-delay: 0.15s; }
 .streaming-loader-dot-3 { animation-delay: 0.3s; }
+.streaming-loader-label { color: var(--color-text-muted); font-size: var(--text-xs); line-height: var(--leading-tight); }
 .message-live-generation-badge {
   display: inline-flex;
   align-items: center;

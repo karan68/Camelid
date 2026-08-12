@@ -6,6 +6,7 @@
 
 import assert from 'node:assert/strict'
 import {
+  catalogQualification,
   compareByQuality,
   defaultFileIndex,
   fitDetail,
@@ -18,12 +19,121 @@ import {
   isRefusingFit,
   partitionByArchSupport,
   partitionCuratedByFit,
+  predictedLane,
   quantAdvice,
   repoOwner,
   repoTitle,
 } from '../src/lib/catalogBrowse.js'
 
 const GB = 1024 * 1024 * 1024
+
+/* --- host-scoped support lane --------------------------------------------- */
+{
+  const capabilities = {
+    model_compatibility: [
+      {
+        id: 'lfm2_5_2_6b_q8_0',
+        family: 'lfm2_decoder',
+        quantization: 'Q8_0',
+        status: 'supported_exact_row_smoke',
+      },
+    ],
+  }
+  const lfm = {
+    catalog_id: 'lfm2_5_2_6b_q8_0',
+    group: 'curated',
+    name: 'LFM2.5 2.6B Q8_0',
+    filename: 'LFM2.5-2.6B-Q8_0.gguf',
+    quant: 'Q8_0',
+    oracle_qualified: true,
+  }
+
+  assert.equal(
+    predictedLane(lfm, capabilities),
+    'supported',
+    'legacy/static capabilities still identify the exact supported row',
+  )
+  assert.equal(
+    predictedLane({ ...lfm, host_lane_class: 'experimental_implemented' }, capabilities),
+    'compatible',
+    'an explicit unsupported-host verdict cannot be promoted by the static row',
+  )
+  assert.equal(
+    predictedLane({ ...lfm, host_lane_class: 'supported' }, capabilities),
+    'supported',
+    'an eligible host keeps the exact supported lane',
+  )
+  assert.equal(
+    predictedLane({ ...lfm, host_lane_class: 'unsupported' }, capabilities),
+    'not_anchored',
+    'an explicit backend negative always fails closed',
+  )
+  assert.equal(
+    predictedLane({ ...lfm, group: 'experimental', host_lane_class: 'supported' }, capabilities),
+    'not_anchored',
+    'live filename guesses remain advisory even if a malformed response carries a lane',
+  )
+}
+
+/* --- exact-row qualification is not a binary Experimental bucket ---------- */
+{
+  const capabilities = {
+    model_compatibility: [
+      {
+        id: 'gemma2_9b_it_q8_0',
+        family: 'gemma2',
+        quantization: 'Q8_0',
+        status: 'active_validation_api_webui_pass_pending_context',
+        tensors_load: 'validated_real_weight_forward',
+        generation_runs: 'validated_deterministic_greedy',
+        parity_audited: 'pass_exact_greedy_token_ids',
+        frontend_load_path_verified: 'validated_guarded_api_webui_smoke',
+      },
+      {
+        id: 'gemma3_4b_it_q8_0',
+        family: 'gemma3',
+        quantization: 'Q8_0',
+        status: 'runnable_exact_row_numerical_variance',
+        tensors_load: 'validated_real_weight_forward',
+        generation_runs: 'validated_deterministic_greedy',
+        parity_audited: 'failed_exact_greedy_token_ids',
+        frontend_load_path_verified: 'runnable_normal_inspect_and_load_path',
+        full_support_blockers: 'loads and generates; differs from the pinned oracle at generated token index 3',
+      },
+    ],
+  }
+  const gemma2 = {
+    catalog_id: 'gemma2_9b_it_q8_0',
+    group: 'curated',
+    filename: 'gemma-2-9b-it-q8_0.gguf',
+    quant: 'Q8_0',
+    oracle_qualified: false,
+  }
+  const gemma3 = {
+    catalog_id: 'gemma3_4b_it_q8_0',
+    group: 'curated',
+    filename: 'gemma-3-4b-it-Q8_0.gguf',
+    quant: 'Q8_0',
+    oracle_qualified: true,
+  }
+
+  assert.equal(catalogQualification(gemma2, capabilities).label, 'Verified')
+  assert.equal(predictedLane(gemma2, capabilities), 'compatible', 'verified-runnable rows download and start')
+  assert.equal(catalogQualification(gemma3, capabilities).label, 'Runnable')
+  assert.equal(catalogQualification(gemma3, capabilities).kind, 'variance')
+  assert.match(catalogQualification(gemma3, capabilities).detail, /token index 3/)
+  assert.equal(predictedLane(gemma3, capabilities), 'compatible', 'load-and-generate rows auto-start with a disclosed variance warning')
+  assert.equal(
+    catalogQualification({ ...gemma3, host_lane_class: 'runnable_with_variance' }, capabilities).kind,
+    'variance',
+    'the backend exact-artifact verdict preserves the amber runnable lane',
+  )
+  assert.equal(
+    catalogQualification({ ...gemma2, filename: 'neighbor-gemma-2-9b-it-q8_0.gguf' }, capabilities).label,
+    'Not verified',
+    'a same-size neighboring filename cannot inherit exact-row verification',
+  )
+}
 
 function hfFile({ repo = 'unsloth/Phi-4-mini-instruct-GGUF', quant, size, fit = 'unknown', arch = 'phi3', archSupport = 'implemented' }) {
   return {
@@ -249,8 +359,13 @@ function hfFile({ repo = 'unsloth/Phi-4-mini-instruct-GGUF', quant, size, fit = 
     { catalog_id: 'd', fit: 'unknown' },
   ]
   const { runnable, blocked } = partitionCuratedByFit(curated)
-  assert.deepEqual(runnable.map((i) => i.catalog_id), ['a', 'd'], 'unprobed hosts keep their catalog')
-  assert.deepEqual(blocked.map((i) => i.catalog_id), ['b', 'c'])
+  /* Only a PERMANENT refusal folds away. 'c' is insufficient_free_memory: the
+     machine is big enough and the memory is merely busy, which the user can
+     change, so the row stays visible carrying its own amber chip and Re-check
+     button. Folding it away turned a busy machine into a seemingly empty
+     catalog. 'b' is wont_fit, which freeing memory cannot change. */
+  assert.deepEqual(runnable.map((i) => i.catalog_id), ['a', 'c', 'd'], 'a busy machine keeps its catalog visible')
+  assert.deepEqual(blocked.map((i) => i.catalog_id), ['b'], 'only models too big for the machine fold away')
 
   const ghostAlternative = {
     catalog_id: 'ghost',
@@ -268,7 +383,7 @@ function hfFile({ repo = 'unsloth/Phi-4-mini-instruct-GGUF', quant, size, fit = 
   )
   assert.deepEqual(
     partitionCuratedByFit([...curated, ghostAlternative]).runnable.map((i) => i.catalog_id),
-    ['a', 'd', 'ghost'],
+    ['a', 'c', 'd', 'ghost'],
     'a verified Ghost resident set keeps an otherwise-too-large curated model visible as runnable',
   )
   assert.equal(

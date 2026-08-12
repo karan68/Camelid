@@ -1,0 +1,134 @@
+{
+  "schema": "camelid.command-r-attemptability-fixture/v1",
+  "captured_at": "2026-08-10T07:12:24.3186996Z",
+  "target": {
+    "family": "Aya Expanse",
+    "architecture": "command-r",
+    "row_id": "aya_expanse_8b_q4_k_m",
+    "support_posture": "attemptable_exact_header_shape_only_not_supported"
+  },
+  "artifact_source": {
+    "repository": "bartowski/aya-expanse-8b-GGUF",
+    "revision": "f9d62ed0c58e6f2ae17975df990b1b8a4013b596",
+    "file": "aya-expanse-8b-Q4_K_M.gguf",
+    "size_bytes": 5056982720,
+    "lfs_sha256": "9592bad943fe56cf93200286a0a4b00a158cd84a408f227b9978ec5879002fb8",
+    "public": true,
+    "gated": false,
+    "license": "cc-by-nc-4.0",
+    "revision_url": "https://huggingface.co/bartowski/aya-expanse-8b-GGUF/tree/f9d62ed0c58e6f2ae17975df990b1b8a4013b596",
+    "file_url": "https://huggingface.co/bartowski/aya-expanse-8b-GGUF/blob/f9d62ed0c58e6f2ae17975df990b1b8a4013b596/aya-expanse-8b-Q4_K_M.gguf",
+    "identity_method": "Hugging Face model API at the immutable revision with blobs=true; the LFS oid is the exact file SHA-256"
+  },
+  "upstream_base": {
+    "repository": "CohereForAI/aya-expanse-8b",
+    "revision": "5062468bf9bc0c6035fd64e06274333ec127d980",
+    "publisher": "Cohere For AI",
+    "model_type": "cohere",
+    "license": "cc-by-nc-4.0",
+    "repository_gating": "auto",
+    "revision_url": "https://huggingface.co/CohereForAI/aya-expanse-8b/tree/5062468bf9bc0c6035fd64e06274333ec127d980"
+  },
+  "header_observation": {
+    "method": "HTTP Range request for bytes 0-16777215 at the immutable artifact revision, inspected with `camelid inspect-prefix <redacted-temp-prefix> --declared-len 5056982720`",
+    "prefix_size_bytes": 16777216,
+    "inspection_path_redacted": true,
+    "descriptor_bounds_checked_against_declared_full_length": true,
+    "full_artifact_downloaded": false,
+    "full_local_sha256_verified": false,
+    "gguf_version": 3,
+    "metadata_count": 37,
+    "tensor_count": 258,
+    "data_start_offset": 10890944,
+    "metadata": {
+      "general.architecture": "command-r",
+      "general.name": "Aya Expanse 8b",
+      "general.file_type": 15,
+      "general.license": "cc-by-nc-4.0",
+      "command-r.context_length": 8192,
+      "command-r.embedding_length": 4096,
+      "command-r.block_count": 32,
+      "command-r.feed_forward_length": 14336,
+      "command-r.attention.head_count": 32,
+      "command-r.attention.head_count_kv": 8,
+      "command-r.attention.layer_norm_epsilon": 0.00001,
+      "command-r.logit_scale": 0.125,
+      "command-r.rope.freq_base": 10000.0,
+      "command-r.rope.scaling.type": "none",
+      "tokenizer.ggml.model": "gpt2",
+      "tokenizer.ggml.pre": "command-r",
+      "tokenizer.ggml.add_bos_token": true,
+      "tokenizer.ggml.add_eos_token": false,
+      "tokenizer.ggml.bos_token_id": 5,
+      "tokenizer.ggml.eos_token_id": 255001,
+      "tokenizer.ggml.padding_token_id": 0
+    },
+    "tensor_type_distribution": {
+      "F32": 33,
+      "Q4_K": 192,
+      "Q6_K": 33
+    },
+    "descriptor_inventory": {
+      "canonicalization": "Sort all 258 descriptors lexicographically by tensor name, render each as name|dimension0xdimension1|CamelidTensorType with one final LF; 1-D norms omit dimension1 and CamelidTensorType uses Q4K/Q6K spellings.",
+      "line_count": 258,
+      "utf8_size_bytes": 9262,
+      "sha256": "4f265e72a52670e43532c526229210cdf60e4778cf61dd5559a7a976fa00e329",
+      "q6_k_assignments": {
+        "token_embedding": true,
+        "ffn_down_layers": [0, 1, 2, 3, 8, 10, 13, 16, 18, 21, 24, 27, 28, 29, 30, 31],
+        "attn_v_layers": [0, 1, 2, 3, 6, 7, 12, 15, 18, 21, 24, 27, 28, 29, 30, 31]
+      },
+      "remaining_projection_type": "Q4_K",
+      "norm_type": "F32"
+    },
+    "tensor_contract": {
+      "token_embedding": "token_embd.weight [4096, 256000] Q6_K",
+      "output_head": "tied to token_embd.weight; output.weight absent",
+      "output_norm": "output_norm.weight F32",
+      "layers": 32,
+      "per_layer": [
+        "attn_norm.weight F32",
+        "attn_q.weight",
+        "attn_k.weight",
+        "attn_v.weight",
+        "attn_output.weight",
+        "ffn_gate.weight",
+        "ffn_up.weight",
+        "ffn_down.weight"
+      ],
+      "absent_from_this_row": [
+        "blk.*.ffn_norm.weight",
+        "blk.*.attn_q_norm.weight",
+        "blk.*.attn_k_norm.weight",
+        "output.weight"
+      ]
+    }
+  },
+  "reference_graph": {
+    "repository": "ggml-org/llama.cpp",
+    "revision": "acd79d603cb2e1c84c0886137b80f1ad649b6857",
+    "command_r_source": "https://github.com/ggml-org/llama.cpp/blob/acd79d603cb2e1c84c0886137b80f1ad649b6857/src/models/command-r.cpp",
+    "rope_classification_source": "https://github.com/ggml-org/llama.cpp/blob/acd79d603cb2e1c84c0886137b80f1ad649b6857/src/llama-model.cpp",
+    "facts_locked_by_code_tests": [
+      "Command R uses ordinary LayerNorm with attention.layer_norm_epsilon",
+      "attention and SwiGLU FFN consume the same normalized residual input",
+      "the reference residual order is (ffn_out + residual) + attn_out",
+      "32-layer rows omit Q/K norms; the reference creates them only for block_count >= 64",
+      "Command R uses ordinary adjacent/interleaved RoPE pairing, not NEOX split-half",
+      "the final normalized logits are multiplied by command-r.logit_scale",
+      "tokenizer.ggml.pre=command-r selects the pinned two-pass legacy GPT-2 splitter rather than an approximate llama-bpe alias"
+    ]
+  },
+  "rejected_nearby_candidate": {
+    "repository": "bartowski/c4ai-command-r7b-12-2024-GGUF",
+    "reason": "its GGUF architecture is cohere2, not command-r; aliasing it onto the older Command R graph would be unsafe"
+  },
+  "does_not_prove": [
+    "full artifact byte identity on this host",
+    "successful real-weight load or generation",
+    "exact-row tokenizer token-ID parity or chat-template parity",
+    "greedy-token or logit parity",
+    "API, SSE, Models-page, or bounded-context readiness",
+    "support for 64-layer Command R rows, cohere2, Command R7B, or neighboring quantizations"
+  ]
+}

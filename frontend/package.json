@@ -15,12 +15,15 @@
     "smoke:first-run-card": "node scripts/first-run-card-smoke.mjs",
     "smoke:offline-banner": "node scripts/offline-banner-smoke.mjs",
     "smoke:catalog-browse": "node scripts/catalog-browse-smoke.mjs",
+    "smoke:model-families": "node scripts/model-families-smoke.mjs",
     "smoke:catalog-companion": "node scripts/catalog-companion-smoke.mjs",
     "smoke:model-deletion": "node scripts/model-deletion-smoke.mjs",
     "smoke:3b-closure": "node scripts/frontend-3b-closure-smoke.mjs",
     "smoke:ui": "node scripts/ui-regression-smoke.mjs",
     "smoke:ghost-moe-execution": "node scripts/ghost-moe-execution-plan-smoke.mjs",
+    "smoke:lfm2-chat-gate": "node scripts/lfm2-chat-gate-smoke.mjs",
     "smoke:streaming": "node scripts/streaming-parser-smoke.mjs",
+    "smoke:harness": "node scripts/smoke-harness-self-test.mjs",
     "smoke:capability-readiness": "node scripts/capability-readiness-smoke.mjs",
     "smoke:observatory": "node scripts/observatory-smoke.mjs",
     "smoke:workspace": "node scripts/workspace-agent-smoke.mjs",
@@ -31,6 +34,7 @@
     "smoke:contrast": "node scripts/contrast-check.mjs",
     "capture:views": "node scripts/capture-views.mjs",
     "smoke:markdown": "node scripts/markdown-smoke.mjs",
+    "smoke:byte-units": "node scripts/byte-units-smoke.mjs",
     "smoke:flow": "node scripts/flow-visual-smoke.mjs"
   },
   "dependencies": {

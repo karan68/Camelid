@@ -23,7 +23,9 @@ try {
   const { default: ApiView } = await server.ssrLoadModule('/src/views/ApiView.jsx')
   const { default: SystemView } = await server.ssrLoadModule('/src/views/SystemView.jsx')
   const { default: ModelsView } = await server.ssrLoadModule('/src/views/ModelsView.jsx')
+  const { blockerNoteFor } = await server.ssrLoadModule('/src/components/models/UnsupportedBlocker.jsx')
   const { default: TopBar } = await server.ssrLoadModule('/src/components/TopBar.jsx')
+  const { StreamingLoader, streamingStatusLabel } = await server.ssrLoadModule('/src/components/chat/render/StreamingIndicator.jsx')
   const { getChatGateState } = await server.ssrLoadModule('/src/lib/chatGate.js')
   const {
     capabilityRowMatchesSearch,
@@ -32,10 +34,25 @@ try {
     rowSupportNextStepCopy,
     statusContainsSupportedEvidence,
   } = await server.ssrLoadModule('/src/lib/capabilities.js')
-  const { resolveLoadedModelDisplayName } = await server.ssrLoadModule('/src/hooks/useDashboardData.js')
+  const { mergeModelLists, resolveLoadedModelDisplayName } = await server.ssrLoadModule('/src/hooks/useDashboardData.js')
   const { LLAMA32_3B_ACCEPTANCE_TARGET } = await server.ssrLoadModule('/src/lib/acceptanceTargets.js')
 
   const noop = () => {}
+  assert.match(
+    blockerNoteFor({ code: 'model_io_error' }),
+    /could not open this model from the configured storage location/,
+    'storage failures must explain the path problem instead of claiming the architecture is missing',
+  )
+  assert.doesNotMatch(
+    blockerNoteFor({ code: 'model_io_error' }),
+    /architecture is not implemented/,
+    'model_io_error must not borrow unsupported-architecture copy',
+  )
+  assert.match(
+    blockerNoteFor({ code: 'unsupported_model_architecture' }),
+    /architecture is not implemented/,
+    'the architecture-specific note remains reserved for the typed architecture blocker',
+  )
   const readyRuntime = {
     api_base: 'http://127.0.0.1:8181',
     loaded_now: true,
@@ -169,6 +186,138 @@ try {
   }))
   assert.doesNotMatch(textOnlyRendered, /accept="image\/png,image\/jpeg"/, 'text-only runtime must not advertise an image control it cannot serve')
 
+  const loadedButNotRunnableMarkup = renderToStaticMarkup(React.createElement(ChatWorkspace, {
+    selectedConversation: null,
+    selectedModel,
+    selectedModelId: selectedModel.id,
+    setSelectedModelId: noop,
+    models: [selectedModel],
+    runtime: { ...readyRuntime, generation_ready: false },
+    capabilities,
+    pendingConversation: null,
+    composer: 'Keep this draft editable',
+    setComposer: noop,
+    saveToMemory: noop,
+    sendMessage: noop,
+    sending: false,
+    selectedModelRunnable: false,
+    setTab: noop,
+  }))
+  assert.match(loadedButNotRunnableMarkup, /loaded, but this build cannot run it for Chat/, 'a completed fail-closed load must not look like an endless warmup')
+  assert.match(loadedButNotRunnableMarkup, /· Not runnable/, 'the model picker must distinguish a blocked loaded row from an active load')
+  assert.match(loadedButNotRunnableMarkup, /Choose a runnable model; this loaded model is blocked/, 'the composer must give an actionable next step for a permanently blocked load')
+  assert.doesNotMatch(loadedButNotRunnableMarkup, /warming up|· Loading|finishes getting ready/, 'generation_ready=false after a completed load must not masquerade as transient progress')
+
+  const embeddingModel = {
+    id: 'bitnet-embeddings-270m',
+    name: 'Microsoft BitNet Embedding 270M',
+    provider_kind: 'local',
+    status: 'ready',
+    model_path: 'models/bitnet-embeddings-270m-bf16-i2_s.gguf',
+    embedding_capable: true,
+    generation_capable: false,
+    loaded_now: true,
+    generation_ready: false,
+  }
+  const embeddingRuntime = {
+    ...readyRuntime,
+    active_model_id: embeddingModel.id,
+    generation_ready: false,
+    model_family: 'embedding',
+  }
+  const mergedSidecars = mergeModelLists({
+    modelItems: [
+      { id: 'bitnet-embeddings-0.6b-bf16-i2_s.gguf' },
+      { id: 'bitnet-embeddings-270m-bf16-i2_s.gguf' },
+    ],
+    health: readyRuntime,
+    currentModel: { path: selectedModel.model_path },
+    localModels: [
+      {
+        id: 'microsoft-bitnet-embedding-0.6b',
+        name: 'Microsoft BitNet Embedding 0.6B',
+        model_path: 'models/bitnet-embeddings-0.6b-bf16-i2_s.gguf',
+        embedding_capable: true,
+        generation_capable: false,
+      },
+      embeddingModel,
+    ],
+    apiBase: readyRuntime.api_base,
+    localFacts: new Map(),
+  })
+  assert.equal(mergedSidecars.length, 2, 'non-active embedding sidecars should merge into their saved catalog rows without duplicate runtime entries')
+  assert.deepEqual(
+    mergedSidecars.map((model) => model.id).sort(),
+    ['bitnet-embeddings-270m', 'microsoft-bitnet-embedding-0.6b'],
+    'resident filename ids should preserve the saved catalog identities',
+  )
+  assert.ok(mergedSidecars.every((model) => model.loaded_now), 'merged sidecar rows should be marked resident even though neither is the active Chat model')
+  const duplicateFilenameAliases = mergeModelLists({
+    modelItems: [
+      { id: 'runtime-a' },
+      { id: 'shared.gguf' },
+    ],
+    health: readyRuntime,
+    currentModel: { path: 'models/shared.gguf' },
+    localModels: [
+      { id: 'saved-a', runtime_model_name: 'runtime-a', model_path: 'models/shared.gguf' },
+      { id: 'saved-b', runtime_model_name: 'runtime-b', model_path: 'models/shared.gguf' },
+    ],
+    apiBase: readyRuntime.api_base,
+    localFacts: new Map(),
+  })
+  assert.deepEqual(
+    duplicateFilenameAliases.map((model) => model.id).sort(),
+    ['saved-a', 'saved-b'],
+    'resident aliases must claim saved rows one-to-one instead of collapsing onto the first filename match',
+  )
+  const embeddingMarkup = renderToStaticMarkup(React.createElement(ChatWorkspace, {
+    selectedConversation: { id: 'embedding-chat', title: 'Embedding', messages: [] },
+    selectedModel: embeddingModel,
+    selectedModelId: embeddingModel.id,
+    setSelectedModelId: noop,
+    models: [embeddingModel],
+    runtime: embeddingRuntime,
+    capabilities,
+    pendingConversation: null,
+    composer: 'Draft only',
+    setComposer: noop,
+    saveToMemory: noop,
+    sendMessage: noop,
+    sending: false,
+    selectedModelRunnable: false,
+    selectedModelExperimental: false,
+    setTab: noop,
+  }))
+  assert.match(embeddingMarkup, /ready for embeddings and reranking, not Chat/i, 'embedding runtime must render a terminal task-ready state')
+  assert.match(embeddingMarkup, /<optgroup label="Embedding only">/, 'embedding rows remain visible but disabled outside Chat choices')
+  assert.doesNotMatch(embeddingMarkup, /BitNet Embedding 270M · Loading/, 'embedding-only generation_ready=false must never be described as an in-progress Chat load')
+
+  const unloadedEmbedding = { ...embeddingModel, status: 'registered', loaded_now: false }
+  const unloadedEmbeddingGate = getChatGateState(capabilities, unloadedEmbedding, readyRuntime)
+  assert.equal(unloadedEmbeddingGate.embeddingOnly, true)
+  assert.equal(unloadedEmbeddingGate.embeddingReady, false, 'embedding capability alone must not claim runtime readiness')
+  const unloadedEmbeddingMarkup = renderToStaticMarkup(React.createElement(ChatWorkspace, {
+    selectedConversation: { id: 'unloaded-embedding-chat', title: 'Embedding', messages: [] },
+    selectedModel: unloadedEmbedding,
+    selectedModelId: unloadedEmbedding.id,
+    setSelectedModelId: noop,
+    models: [selectedModel, unloadedEmbedding],
+    runtime: readyRuntime,
+    capabilities,
+    pendingConversation: null,
+    composer: 'Draft only',
+    setComposer: noop,
+    saveToMemory: noop,
+    sendMessage: noop,
+    sending: false,
+    selectedModelRunnable: false,
+    selectedModelExperimental: false,
+    setTab: noop,
+  }))
+  assert.match(unloadedEmbeddingMarkup, /embedding model — load it from Models/i)
+  assert.doesNotMatch(unloadedEmbeddingMarkup, /is ready for embeddings and reranking/i)
+
   const wrongArtifactModel = {
     ...selectedModel,
     id: 'llama32_3b_instruct_q8_0_spoof',
@@ -208,23 +357,22 @@ try {
     setTab: noop,
   }))
 
-  /* The composer's readiness copy moved to plain language (2026-08); the
-     invariant is unchanged -- a model whose runtime is up but whose artifact is
-     not verified must be shown as NOT ready to chat, never as ready. */
-  assert.match(blockedWrongArtifactMarkup, /isn(?:&#x27;|')t verified for chat yet/, '3B live chat should show support is still gated while the runtime is up')
+  /* A generation-ready neighboring artifact is allowed to chat, but it must not
+     inherit verification from the canonical row. */
+  assert.match(blockedWrongArtifactMarkup, /Unverified local chat is ready/, '3B neighboring artifact should be runnable with an explicit unverified state')
   assert.doesNotMatch(blockedWrongArtifactMarkup, /is loaded and ready\./, 'an artifact-gated model must never be presented as ready to chat')
   /* The readiness LINE now explains the blocker in the reader's language; the
      exact row id it refers to still travels with the message footer's Evidence
      Chip, which is the surface built to carry it. */
-  assert.match(blockedWrongArtifactMarkup, /Pick a verified model to unlock send/, '3B live chat must explain the artifact blocker and the way out')
+  assert.match(blockedWrongArtifactMarkup, /Unverified/, '3B live chat must expose the weaker evidence state')
   assert.match(blockedWrongArtifactMarkup, /requires the exact Llama-3\.2-3B-Instruct-Q8_0\.gguf artifact/, '3B artifact blocker must name the canonical GGUF filename')
-  assert.match(blockedWrongArtifactMarkup, /data-send-ready="false"/, '3B composer send must stay disabled for a runtime-ready neighboring artifact')
+  assert.match(blockedWrongArtifactMarkup, /data-send-ready="true"/, 'generation-ready neighboring artifacts remain usable without borrowing verification')
   assert.doesNotMatch(blockedWrongArtifactMarkup, /Message Camelid"[^>]*disabled/, '3B draft composer should stay editable while exact-row support is still gated')
   assert.doesNotMatch(blockedWrongArtifactMarkup, /Local chat is ready/, '3B spoofed artifact must not render the supported live-chat state')
   /* "Demo starters" is gone; the empty state now offers prompt STARTERS that only fill the
      composer. Re-pinned to the property that actually mattered: nothing on a gated screen
      may be one click from running -- no send control is ever enabled here. */
-  assert.doesNotMatch(blockedWrongArtifactMarkup, /data-send-ready="true"/, '3B spoofed artifact must not expose runnable demo prompts')
+  assert.doesNotMatch(blockedWrongArtifactMarkup, /Llama 3\.2 3B Instruct Q8_0 · Ready</, '3B spoofed artifact must not borrow the verified picker label')
 
   const streamingMarkup = renderToStaticMarkup(React.createElement(ChatWorkspace, {
     selectedConversation: {
@@ -334,7 +482,19 @@ try {
   // The pre-token phase label is now the reader-facing "Generating response"
   // (StreamingIndicator.FIRST_TOKEN_STREAMING_LABEL); same live status, plain wording.
   assert.match(preTokenMarkup, /Generating response/, 'pre-token streaming should render the active backend-generation live status')
+  assert.match(preTokenMarkup, /streaming-loader-label">Generating response<\/span>/, 'the pre-token status must be visible beside the dots rather than carried only by aria-label')
   assert.match(preTokenMarkup, /streaming-loader-dot-3/, 'pre-token streaming should render the active loader, not a static placeholder')
+
+  const delayedPreTokenLabel = streamingStatusLabel('generating', 20)
+  const delayedPreTokenMarkup = renderToStaticMarkup(React.createElement(StreamingLoader, {
+    label: delayedPreTokenLabel,
+    compact: true,
+  }))
+  assert.match(
+    delayedPreTokenMarkup,
+    /streaming-loader-label">Local response is taking a while<\/span>/,
+    'the delayed-first-token explanation must be visible instead of leaving the user with unexplained dots',
+  )
 
   const completedUnclosedFenceMarkup = renderToStaticMarkup(React.createElement(ChatWorkspace, {
     selectedConversation: {
@@ -559,7 +719,7 @@ try {
   assert.match(modelsMarkup, /Active model/, 'Models view must render the active-model bar zone')
   assert.match(modelsMarkup, /No model loaded/, 'Models view must not fabricate a loaded model before /api/models/current answers')
   assert.match(modelsMarkup, /Supported/, 'Models view must render the Supported zone')
-  assert.match(modelsMarkup, /Experimental/, 'Models view must render the Experimental zone')
+  assert.match(modelsMarkup, /Other local models/, 'Models view must render the evidence-specific non-supported zone')
   assert.match(modelsMarkup, /Get models/, 'Models view must render the Get-models zone')
   assert.match(modelsMarkup, /Diagnostics/, 'Models view must keep the diagnostics disclosure')
   assert.match(modelsMarkup, /Scanning local models…|Local model scan unavailable\./, 'Models view sections must show the honest scan fallback instead of inventing membership')
@@ -712,7 +872,8 @@ try {
   const neighboringQuantPathGate = getChatGateState(capabilities, neighboringQuantPathModel, readyRuntime)
   assert.equal(neighboringQuantPathGate.runtimeReady, true, '3B neighboring-quant guard should still surface runtime readiness when active_model_id matches')
   assert.equal(neighboringQuantPathGate.contractSupported, false, '3B neighboring GGUF quant must not inherit the canonical Q8_0 row from the browser id')
-  assert.equal(neighboringQuantPathGate.chatUnlocked, false, '3B neighboring GGUF quant must keep live chat locked even when runtime loaded_now/generation_ready are green')
+  assert.equal(neighboringQuantPathGate.chatUnlocked, false, '3B neighboring GGUF quant must not inherit the supported gate')
+  assert.equal(neighboringQuantPathGate.experimentalUnlocked, true, 'a generation-ready neighboring quant remains usable on the unverified lane')
 
   const neighboringQuantPathChatMarkup = renderToStaticMarkup(React.createElement(ChatWorkspace, {
     selectedConversation: null,
@@ -738,10 +899,13 @@ try {
      wording, and keep send locked for that reason -- both pinned below. The mismatch
      itself is still asserted structurally on the gate (contractSupported/chatUnlocked
      above), so the invariant keeps its teeth. */
-  assert.match(neighboringQuantPathChatMarkup, /Llama 3\.2 3B Instruct Q8_0 isn(?:&#x27;|')t verified for chat yet\./, '3B neighboring-quant chat UX should expose runtime-green state without claiming support')
-  assert.match(neighboringQuantPathChatMarkup, /data-send-ready="false" title="Choose a verified model to send\."/, '3B neighboring-quant chat UX should name the exact row mismatch instead of showing ready chat')
-  assert.match(neighboringQuantPathChatMarkup, /This model isn(?:&#x27;|')t verified for chat yet\. Pick a verified model to unlock send\./, '3B neighboring-quant chat UX should explain that the loaded artifact quant does not match the support contract row')
-  assert.doesNotMatch(neighboringQuantPathChatMarkup, /Local chat is ready|Message Camelid…|data-send-ready="true"/, '3B neighboring-quant rows must not render the live-chat ready UX')
+  assert.match(neighboringQuantPathChatMarkup, /Unverified local chat is ready/, '3B neighboring-quant chat UX should expose runtime-green state without claiming support')
+  assert.match(neighboringQuantPathChatMarkup, /data-send-ready="true"/, 'a generation-ready neighboring quant should remain usable')
+  /* Restored (2026-08): the quant mismatch names both sides again, so a reader
+     one re-download away is told which build to get instead of just "pick a
+     verified model". */
+  assert.match(neighboringQuantPathChatMarkup, /this build is Q4_0 and the verified build is Q8_0/, '3B neighboring-quant chat UX should name the loaded quant and the verified one')
+  assert.doesNotMatch(neighboringQuantPathChatMarkup, /Llama 3\.2 3B Instruct Q8_0 · Ready</, '3B neighboring-quant rows must not borrow the supported picker label')
 
   const backendReadyButUnsupported3BCapabilities = {
     ...capabilities,
@@ -781,13 +945,10 @@ try {
      the same four meanings the old raw-field copy did: the support-gated hero, the still-green
      runtime (only a loaded + generation-ready model can reach the picker's runnable labels),
      the named model instead of generic load-first copy, and the locked send with its reason. */
-  assert.match(backendReadyButUnsupported3BChatMarkup, /This model isn(?:&#x27;|')t verified for chat yet\. Pick a verified model to unlock send\./, 'runtime-ready 3B rows should render support-gated chat UX when the exact row is downgraded')
-  assert.match(backendReadyButUnsupported3BChatMarkup, /Llama 3\.2 3B Instruct Q8_0 · Experimental ready/, 'support-gated 3B UX should still expose that loaded_now and generation_ready are green')
-  assert.match(backendReadyButUnsupported3BChatMarkup, /Llama 3\.2 3B Instruct Q8_0 isn(?:&#x27;|')t verified for chat yet\./, 'support-gated 3B UX should name the exact unpromoted capabilities row rather than hiding behind generic load-first copy')
-  assert.match(backendReadyButUnsupported3BChatMarkup, /data-send-ready="false" title="Choose a verified model to send\."/, 'support-gated 3B UX should preserve the exact-row frontend readiness rule')
-  assert.match(backendReadyButUnsupported3BChatMarkup, /Draft a prompt while Camelid finishes getting ready/, 'support-gated 3B composer should stay editable while send remains locked behind the exact-row contract')
-  assert.match(backendReadyButUnsupported3BChatMarkup, /data-send-ready="false"/, 'support-gated 3B rows must keep send disabled until the exact-row contract is promoted')
-  assert.doesNotMatch(backendReadyButUnsupported3BChatMarkup, /Local chat is ready|Message Camelid…/, 'support-gated 3B rows must not render the live-chat ready UX')
+  assert.match(backendReadyButUnsupported3BChatMarkup, /Unverified local chat is ready/, 'runtime-ready downgraded rows should remain usable without claiming verification')
+  assert.match(backendReadyButUnsupported3BChatMarkup, /Llama 3\.2 3B Instruct Q8_0 · Unverified ready/, 'downgraded 3B UX should expose both runtime readiness and evidence state')
+  assert.match(backendReadyButUnsupported3BChatMarkup, /data-send-ready="true"/, 'generation-ready downgraded rows should keep send available')
+  assert.doesNotMatch(backendReadyButUnsupported3BChatMarkup, /Llama 3\.2 3B Instruct Q8_0 · Ready</, 'downgraded rows must not borrow the supported picker label')
 
   const experimental3BChatMarkup = renderToStaticMarkup(React.createElement(ChatWorkspace, {
     selectedConversation: null,
@@ -811,8 +972,8 @@ try {
   assert.equal(backendReadyButUnsupported3BGate.chatMode, 'experimental', 'a generation-ready implemented row outside the supported contract should use the explicit experimental lane')
   /* The experimental hero now spells the caveat out instead of using a badge phrase; it
      still reads as ready AND still refuses the verified claim in the same sentence. */
-  assert.match(experimental3BChatMarkup, /Experimental local chat is ready\. Replies are not verified\./, 'the experimental lane should read as ready without borrowing the supported badge')
-  assert.match(experimental3BChatMarkup, /Experimental ready/, 'the model picker should group a runnable experimental row with ready choices')
+  assert.match(experimental3BChatMarkup, /Unverified local chat is ready\. Replies are clearly marked\./, 'the unverified lane should read as ready without borrowing the supported badge')
+  assert.match(experimental3BChatMarkup, /Unverified ready/, 'the model picker should group a runnable unverified row with ready choices')
   assert.match(experimental3BChatMarkup, /data-send-ready="true"/, 'the explicit experimental lane should unlock send')
   assert.match(experimental3BChatMarkup, /Attach one PNG or JPEG for the loaded Prism vision model/, 'vision-ready experimental rows should expose the image picker')
   // Re-pinned to the current blocked-state wording so the assertion still bites.

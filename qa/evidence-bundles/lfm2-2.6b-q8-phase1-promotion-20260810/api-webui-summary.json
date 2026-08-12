@@ -1,0 +1,45 @@
+{
+  "schema": "camelid.model-promotion.scrubbed-summary/v1",
+  "passed": true,
+  "runtime_head": "15ab4ddac5a21ac0f98f6ccba5e3ddff4b51a9b5",
+  "harness_head": "2cd9fa78f8dcaa78e011914076ecd1473ae99d0a",
+  "model": {
+    "id": "lfm2_5_2_6b_q8_0",
+    "path": "<repo>/models/LFM2.5-2.6B-Q8_0.gguf",
+    "filename": "LFM2.5-2.6B-Q8_0.gguf",
+    "size_bytes": 2874779456,
+    "sha256": "36587fdf27bdfc69caf2637273679a0870ec155162161bde6fd16e8c70bdb757",
+    "architecture": "lfm2",
+    "quantization": "Q8_0",
+    "lane_class": "supported"
+  },
+  "contract": {
+    "row_id": "lfm2_5_2_6b_q8_0",
+    "status": "supported_exact_row_smoke",
+    "contract_supported": true,
+    "webui_chat": "enabled"
+  },
+  "nonstreaming_chat": {
+    "passed": true,
+    "prompt_tokens": 11,
+    "completion_tokens": 8,
+    "total_tokens": 19,
+    "finish_reason": "length"
+  },
+  "streaming_chat": {
+    "passed": true,
+    "requested_max_tokens": 128,
+    "finish_reason": "stop",
+    "visible_text": "Hello! How can I help you today?",
+    "usage": {
+      "prompt_tokens": 11,
+      "completion_tokens": 43,
+      "total_tokens": 54
+    },
+    "terminal_order": ["finish", "usage", "done"]
+  },
+  "generation_timings": {
+    "skipped": true,
+    "reason": "the runnable lane does not emit camelid.timings_ms; timing diagnostics are not a support gate"
+  }
+}

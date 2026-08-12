@@ -1,0 +1,636 @@
+{
+  "schema": "camelid.model-qualification-roster/v1",
+  "phase": {
+    "id": 1,
+    "name": "qualify-existing-graphs",
+    "status": "active",
+    "started_on": "2026-08-09",
+    "exit_policy": "Every row receives either an experimental exact-row receipt or a reproducible HOLD; metadata-only success never promotes support."
+  },
+  "defaults": {
+    "models_dir_env": "CAMELID_MODELS_DIR",
+    "token_counts": [
+      1,
+      5,
+      50
+    ],
+    "context_buckets": [
+      512
+    ],
+    "backend": "cpu_reference",
+    "llama_cpp": {
+      "build": "b9632",
+      "revision": "acd79d603",
+      "server_env": "CAMELID_LLAMA_SERVER_BIN",
+      "tokenize_env": "CAMELID_LLAMA_TOKENIZE_BIN"
+    }
+  },
+  "gate_order": [
+    "source",
+    "metadata",
+    "tokenizer",
+    "template",
+    "load_smoke",
+    "parity",
+    "api_webui",
+    "context"
+  ],
+  "rows": [
+    {
+      "priority": 1,
+      "id": "lfm2_5_2_6b_q8_0",
+      "identity": {
+        "family": "lfm2",
+        "architecture": "lfm2",
+        "quantization": "Q8_0",
+        "gguf_filename": "LFM2.5-2.6B-Q8_0.gguf",
+        "size_bytes": 2874779456,
+        "sha256": "36587fdf27bdfc69caf2637273679a0870ec155162161bde6fd16e8c70bdb757"
+      },
+      "source": {
+        "repo": "LiquidAI/LFM2.5-2.6B-GGUF",
+        "file": "LFM2.5-2.6B-Q8_0.gguf",
+        "revision": "b421ad1d549afeda6a0fb2ad3a697cb5a7879adc",
+        "license": "LFM Open License v1.0"
+      },
+      "expected": {
+        "tokenizer_model": "gpt2",
+        "tokenizer_pre": "lfm2",
+        "chat_template": "lfm2_chatml"
+      },
+      "lane": {
+        "serve": "runnable",
+        "env": {}
+      },
+      "probes": {
+        "oracle_fixture": "tests/fixtures/lfm2_parity/lfm2.json",
+        "smoke": "runnable_smoke",
+        "parity": "raw_greedy",
+        "context_buckets": [
+          512
+        ]
+      },
+      "target_tier": "experimental_exact_row",
+      "disposition": "promotion_candidate",
+      "gates": {
+        "source": {
+          "required": true,
+          "status": "pass",
+          "evidence": [
+            "qa/runnable/lfm2-parity.json",
+            "qa/model-qualification/lfm2.5-2.6b-q8-phase1-report.json",
+            "qa/evidence-bundles/lfm2-2.6b-q8-phase1-promotion-20260810/manifest.json"
+          ]
+        },
+        "metadata": {
+          "required": true,
+          "status": "pass",
+          "evidence": [
+            "tests/lfm2_parity.rs",
+            "src/model.rs"
+          ]
+        },
+        "tokenizer": {
+          "required": true,
+          "status": "pass",
+          "evidence": [
+            "tests/lfm2_parity.rs",
+            "tests/fixtures/lfm2_parity/lfm2-chat-template.json"
+          ]
+        },
+        "template": {
+          "required": true,
+          "status": "pass",
+          "evidence": [
+            "tests/fixtures/lfm2_parity/lfm2-chat-template.json",
+            "src/api/mod.rs"
+          ]
+        },
+        "load_smoke": {
+          "required": true,
+          "status": "pass",
+          "evidence": [
+            "qa/runnable/lfm2-serve-smoke.json",
+            "qa/evidence-bundles/lfm2-2.6b-q8-phase1-promotion-20260810/api-webui-summary.json"
+          ]
+        },
+        "parity": {
+          "required": true,
+          "status": "pass",
+          "evidence": [
+            "qa/runnable/lfm2-parity.json",
+            "qa/evidence-bundles/lfm2-2.6b-q8-phase1-promotion-20260810/parity-receipt.json"
+          ]
+        },
+        "api_webui": {
+          "required": true,
+          "status": "pass",
+          "evidence": [
+            "qa/model-qualification/lfm2.5-2.6b-q8-phase1-report.json",
+            "qa/evidence-bundles/lfm2-2.6b-q8-phase1-promotion-20260810/api-webui-summary.json",
+            "qa/evidence-bundles/lfm2-2.6b-q8-phase1-promotion-20260810/frontend-smoke.log"
+          ]
+        },
+        "context": {
+          "required": true,
+          "status": "pass",
+          "evidence": [
+            "qa/model-qualification/lfm2.5-2.6b-q8-phase1-report.json",
+            "qa/evidence-bundles/lfm2-2.6b-q8-phase1-promotion-20260810/context-summary.json",
+            "qa/evidence-bundles/lfm2-2.6b-q8-phase1-promotion-20260810/parity-receipt.json",
+            "qa/evidence-bundles/lfm2-2.6b-q8-phase1-promotion-20260810/verify.log"
+          ]
+        }
+      }
+    },
+    {
+      "priority": 2,
+      "id": "qwen2_5_0_5b_instruct_q8_0",
+      "identity": {
+        "family": "qwen2_5",
+        "architecture": "qwen2",
+        "quantization": "Q8_0",
+        "gguf_filename": "qwen2.5-0.5b-instruct-q8_0.gguf",
+        "size_bytes": 675710816,
+        "sha256": "ca59ca7f13d0e15a8cfa77bd17e65d24f6844b554a7b6c12e07a5f89ff76844e"
+      },
+      "source": {
+        "repo": "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+        "file": "qwen2.5-0.5b-instruct-q8_0.gguf",
+        "revision": "9217f5db79a29953eb74d5343926648285ec7e67",
+        "license": "apache-2.0"
+      },
+      "expected": {
+        "tokenizer_model": "gpt2",
+        "tokenizer_pre": "qwen2",
+        "chat_template": "qwen2_5_chatml"
+      },
+      "lane": {
+        "serve": "cpu_reference",
+        "env": {
+          "CAMELID_GPU": "off",
+          "CAMELID_DETERMINISTIC": "1"
+        }
+      },
+      "probes": {
+        "oracle_fixture": "qa/model-qualification/fixtures/qwen2.5-0.5b-q8-llamacpp-b9632.json",
+        "smoke": "runnable_smoke",
+        "parity": "raw_greedy",
+        "context_buckets": [
+          512
+        ]
+      },
+      "target_tier": "experimental_exact_row",
+      "disposition": "active_validation",
+      "gates": {
+        "source": {
+          "required": true,
+          "status": "pass",
+          "evidence": [
+            "qa/model-qualification/fixtures/qwen2.5-0.5b-q8-llamacpp-b9632.json"
+          ]
+        },
+        "metadata": {
+          "required": true,
+          "status": "pass",
+          "evidence": [
+            "qa/model-qualification/qwen2.5-0.5b-q8-bootstrap-report.json"
+          ]
+        },
+        "tokenizer": {
+          "required": true,
+          "status": "pass",
+          "evidence": [
+            "qa/model-qualification/fixtures/qwen2.5-0.5b-q8-llamacpp-b9632.json",
+            "qa/model-qualification/qwen2.5-0.5b-q8-bootstrap-report.json"
+          ]
+        },
+        "template": {
+          "required": true,
+          "status": "pass",
+          "evidence": [
+            "qa/model-qualification/fixtures/qwen2.5-0.5b-q8-llamacpp-b9632.json",
+            "qa/model-qualification/qwen2.5-0.5b-q8-bootstrap-report.json",
+            "src/api/mod.rs"
+          ]
+        },
+        "load_smoke": {
+          "required": true,
+          "status": "blocked",
+          "evidence": [],
+          "reason": "A real-row Windows CPU run completed, but its pre-hardening receipt sealed only the CAMELID overrides while the child inherited unrecorded host environment variables. Rerun with the hardened privacy-safe effective-environment contract before advancing this gate."
+        },
+        "parity": {
+          "required": true,
+          "status": "fail",
+          "evidence": [
+            "qa/model-qualification/qwen2.5-0.5b-q8-bootstrap-report.json",
+            "qa/model-qualification/qwen2.5-0.5b-q8-parity-localization.json"
+          ],
+          "reason": "Three of four 16-token raw greedy probes match exactly. At the remaining flip, Camelid continuous/fresh-prefix logits are bit-identical and llama.cpp continuous/fresh-prefix logits are independently identical; this is a stable cross-engine numerical frontier, not a KV-cache split. The originating layer/operation is not yet localized, and strict parity remains failed."
+        },
+        "api_webui": {
+          "required": true,
+          "status": "blocked",
+          "evidence": [
+            "qa/model-qualification/qwen2.5-0.5b-q8-bootstrap-report.json"
+          ],
+          "reason": "Current-head health/completion/chat probes pass with an experimental disclosure, but SSE and Models-page/WebUI promotion smoke were not run."
+        },
+        "context": {
+          "required": true,
+          "status": "blocked",
+          "evidence": [],
+          "reason": "A Windows 512-token capture was prepared, but its required verifier transcript is absent from the public Git tree. The gate remains blocked until the exact transcript is force-added with its recorded checksum or the lane is rerun into a complete bundle."
+        }
+      }
+    },
+    {
+      "priority": 3,
+      "id": "phi3_mini_4k_instruct_q8_0",
+      "identity": {
+        "family": "phi3",
+        "architecture": "phi3",
+        "quantization": "Q8_0",
+        "gguf_filename": "Phi-3-mini-4k-instruct-Q8_0.gguf",
+        "size_bytes": 4061221376,
+        "sha256": "0ac8ee48aeebf7d1b354691fd1e29e91c32ad88bbad10ad45ac880dcd4372a47"
+      },
+      "source": {
+        "repo": "bartowski/Phi-3-mini-4k-instruct-GGUF",
+        "file": "Phi-3-mini-4k-instruct-Q8_0.gguf",
+        "revision": "e1447f6da0be91f91683c5d19f938d4f51122d88",
+        "license": "mit"
+      },
+      "expected": {
+        "tokenizer_model": "llama",
+        "tokenizer_pre": "default",
+        "chat_template": "phi3_markers"
+      },
+      "lane": {
+        "serve": "cpu_reference",
+        "env": {
+          "CAMELID_GPU": "off",
+          "CAMELID_DETERMINISTIC": "1"
+        }
+      },
+      "probes": {
+        "oracle_fixture": "qa/muster/phi3-hold-evidence/prompt-token-parity-q8-20260727.json",
+        "smoke": "runnable_smoke",
+        "parity": "raw_greedy",
+        "context_buckets": [
+          512
+        ]
+      },
+      "target_tier": "experimental_exact_row",
+      "disposition": "hold",
+      "gates": {
+        "source": {
+          "required": true,
+          "status": "pass",
+          "evidence": [
+            "MUSTER_ACQUISITION.md"
+          ]
+        },
+        "metadata": {
+          "required": true,
+          "status": "pass",
+          "evidence": [
+            "qa/muster/HOLD-phi3-mini-4k-instruct-q8_0.json"
+          ]
+        },
+        "tokenizer": {
+          "required": true,
+          "status": "pass",
+          "evidence": [
+            "qa/muster/phi3-hold-evidence/prompt-token-parity-q8-20260727.json",
+            "qa/muster/phi3-hold-evidence/chat-prompt-token-parity-q8-20260727.json"
+          ]
+        },
+        "template": {
+          "required": true,
+          "status": "pass",
+          "evidence": [
+            "qa/muster/phi3-hold-evidence/chat-prompt-token-parity-q8-20260727.json"
+          ]
+        },
+        "load_smoke": {
+          "required": true,
+          "status": "pass",
+          "evidence": [
+            "qa/muster/phi3-hold-evidence/nondeterminism-fixed-q8-20260728.json"
+          ]
+        },
+        "parity": {
+          "required": true,
+          "status": "fail",
+          "evidence": [
+            "qa/muster/phi3-hold-evidence/generation-divergence-q8-20260727.json",
+            "qa/model-qualification/phi3-mini-head96-prefill-localization.json"
+          ],
+          "reason": "The exact row still has a fresh-prefill/incremental split. A new head_dim=96 CPU batch-vs-incremental test is bit-identical, ruling out the generic cache stride; the unproven Metal partial 64-row PV tile now fails closed to the f32 fallback, and parity stays failed until the pinned artifact is rerun on Metal."
+        },
+        "api_webui": {
+          "required": true,
+          "status": "blocked",
+          "evidence": [],
+          "reason": "Promotion smoke is downstream of the unresolved generation parity failure."
+        },
+        "context": {
+          "required": true,
+          "status": "blocked",
+          "evidence": [],
+          "reason": "The short-generation parity failure must be isolated before a 512-token claim."
+        }
+      }
+    },
+    {
+      "priority": 4,
+      "id": "gemma2_9b_it_q8_0",
+      "identity": {
+        "family": "gemma2",
+        "architecture": "gemma2",
+        "quantization": "Q8_0",
+        "gguf_filename": "gemma-2-9b-it-q8_0.gguf",
+        "size_bytes": 9827149312,
+        "sha256": "59f2e1125fc3af738c256336fb11095da855050305b3705c6c779730a3a8d84e"
+      },
+      "source": {
+        "repo": "BenevolenceMessiah/gemma-2-9b-it-Q8_0-GGUF",
+        "file": "gemma-2-9b-it-q8_0.gguf",
+        "revision": "eb4741d7b2aece6d8519db62dc31d89029a40af8",
+        "license": "gemma"
+      },
+      "expected": {
+        "tokenizer_model": "llama",
+        "tokenizer_pre": "default",
+        "chat_template": "gemma2_it_exact"
+      },
+      "lane": {
+        "serve": "runnable",
+        "env": {}
+      },
+      "probes": {
+        "oracle_fixture": null,
+        "smoke": "runnable_smoke",
+        "parity": "chat_greedy",
+        "context_buckets": [
+          512
+        ]
+      },
+      "target_tier": "experimental_exact_row",
+      "disposition": "active_validation",
+      "gates": {
+        "source": {
+          "required": true,
+          "status": "pass",
+          "evidence": [
+            "qa/model-qualification/gemma2-9b-it-q8-source-lock.json",
+            "qa/model-qualification/fixtures/gemma2-it-chat-template-v1.json"
+          ]
+        },
+        "metadata": {
+          "required": true,
+          "status": "pass",
+          "evidence": [
+            "qa/model-qualification/gemma2-9b-it-q8-header-tokenizer-parity.json",
+            "src/model.rs"
+          ]
+        },
+        "tokenizer": {
+          "required": true,
+          "status": "pass",
+          "evidence": [
+            "src/tokenizer/mod.rs",
+            "qa/model-qualification/fixtures/gemma2-it-chat-template-v1.json",
+            "qa/model-qualification/gemma2-9b-it-q8-header-tokenizer-parity.json"
+          ]
+        },
+        "template": {
+          "required": true,
+          "status": "pass",
+          "evidence": [
+            "qa/model-qualification/fixtures/gemma2-it-chat-template-v1.json",
+            "src/api/mod.rs"
+          ]
+        },
+        "load_smoke": {
+          "required": true,
+          "status": "blocked",
+          "evidence": [],
+          "reason": "The row is not oracle-qualified and no exact artifact is present."
+        },
+        "parity": {
+          "required": true,
+          "status": "blocked",
+          "evidence": [],
+          "reason": "Source, template, and real-row load gates are prerequisites."
+        },
+        "api_webui": {
+          "required": true,
+          "status": "pending",
+          "evidence": []
+        },
+        "context": {
+          "required": true,
+          "status": "pending",
+          "evidence": []
+        }
+      }
+    },
+    {
+      "priority": 5,
+      "id": "smollm3_3b_q8_0",
+      "identity": {
+        "family": "smollm3",
+        "architecture": "smollm3",
+        "quantization": "Q8_0",
+        "gguf_filename": "SmolLM3-Q8_0.gguf",
+        "size_bytes": 3275574624,
+        "sha256": "8aa8cc74656137174a1988d993b00828e65a86fd68773412b632a75aa1373248"
+      },
+      "source": {
+        "repo": "ggml-org/SmolLM3-3B-GGUF",
+        "file": "SmolLM3-Q8_0.gguf",
+        "revision": "4965cb60b150737b68a0408c36aeefb65078f894",
+        "license": "apache-2.0"
+      },
+      "expected": {
+        "tokenizer_model": "gpt2",
+        "tokenizer_pre": "smaug-bpe",
+        "chat_template": "smollm3_dynamic_chatml"
+      },
+      "lane": {
+        "serve": "cpu_reference",
+        "env": {
+          "CAMELID_GPU": "off"
+        }
+      },
+      "probes": {
+        "oracle_fixture": null,
+        "smoke": "serve",
+        "parity": "chat_greedy",
+        "context_buckets": [
+          512
+        ]
+      },
+      "target_tier": "experimental_exact_row",
+      "disposition": "hold",
+      "gates": {
+        "source": {
+          "required": true,
+          "status": "pass",
+          "evidence": [
+            "qa/model-qualification/smollm3-3b-q8-source-lock.json",
+            "qa/model-qualification/fixtures/smollm3-tokenizer-pre-v1.json"
+          ]
+        },
+        "metadata": {
+          "required": true,
+          "status": "pass",
+          "evidence": [
+            "qa/model-qualification/smollm3-3b-q8-header-tokenizer-parity.json",
+            "src/model.rs",
+            "tests/inference_session.rs"
+          ]
+        },
+        "tokenizer": {
+          "required": true,
+          "status": "pass",
+          "evidence": [
+            "src/tokenizer/mod.rs",
+            "qa/model-qualification/fixtures/smollm3-tokenizer-pre-v1.json",
+            "qa/model-qualification/smollm3-3b-q8-header-tokenizer-parity.json"
+          ]
+        },
+        "template": {
+          "required": true,
+          "status": "blocked",
+          "evidence": [
+            "qa/model-qualification/fixtures/smollm3-tokenizer-pre-v1.json",
+            "qa/prompt-packs/smollm3-chat-template-shapes-v1.json",
+            "qa/model-qualification/fixtures/smollm3-default-thinking-runtime-envelope-v1.json",
+            "scripts/hf-qualification-smollm3-template.mjs",
+            "src/api/mod.rs"
+          ],
+          "reason": "The exact 5,493-byte template now has an architecture-scoped renderer for the bounded default-thinking, text-only user/assistant envelope on /apply-template and chat preparation. The template gate remains blocked because system/custom-instruction/system-override, tools/tool history, explicit no-think, nontext shapes, and full real-artifact HTTP prompt-token parity remain unqualified."
+        },
+        "load_smoke": {
+          "required": true,
+          "status": "blocked",
+          "evidence": [],
+          "reason": "A real-row Windows CPU run completed, but its pre-hardening receipt sealed only the CAMELID overrides while the child inherited unrecorded host environment variables. Rerun with the hardened privacy-safe effective-environment contract before advancing this gate."
+        },
+        "parity": {
+          "required": true,
+          "status": "blocked",
+          "evidence": [],
+          "reason": "Tokenizer and real-artifact gates are prerequisites to NoPE schedule parity."
+        },
+        "api_webui": {
+          "required": true,
+          "status": "pending",
+          "evidence": []
+        },
+        "context": {
+          "required": true,
+          "status": "pending",
+          "evidence": []
+        }
+      }
+    },
+    {
+      "priority": 6,
+      "id": "qwen3_30b_a3b_q8_0",
+      "identity": {
+        "family": "qwen3_moe",
+        "architecture": "qwen3moe",
+        "quantization": "Q8_0",
+        "gguf_filename": "Qwen3-30B-A3B-Q8_0.gguf",
+        "size_bytes": 32483931648,
+        "sha256": "4ad960d180b16f56024f5b704697e5dd5b0837167c2e515ef0569abfc599743c"
+      },
+      "source": {
+        "repo": "Qwen/Qwen3-30B-A3B-GGUF",
+        "file": "Qwen3-30B-A3B-Q8_0.gguf",
+        "revision": "e4d4bafdfb96a411a163846265362aceb0b9c63a",
+        "license": "apache-2.0"
+      },
+      "expected": {
+        "tokenizer_model": "gpt2",
+        "tokenizer_pre": "qwen2",
+        "chat_template": "qwen3_chatml"
+      },
+      "lane": {
+        "serve": "cpu_reference",
+        "env": {
+          "CAMELID_GPU": "off"
+        }
+      },
+      "probes": {
+        "oracle_fixture": null,
+        "smoke": "serve",
+        "parity": "chat_greedy",
+        "context_buckets": [
+          512
+        ]
+      },
+      "target_tier": "experimental_exact_row",
+      "disposition": "hold",
+      "gates": {
+        "source": {
+          "required": true,
+          "status": "pass",
+          "evidence": [
+            "qa/model-qualification/qwen3-30b-a3b-q8-source-report.json"
+          ]
+        },
+        "metadata": {
+          "required": true,
+          "status": "blocked",
+          "evidence": [
+            "src/model.rs",
+            "qa/model-qualification/qwen3-30b-a3b-q8-source-report.json",
+            "qa/model-qualification/qwen3-30b-a3b-q8-header-inspection.json"
+          ],
+          "reason": "A bounded remote prefix confirms the qwen3moe/gpt2/qwen2 metadata and all 579 tensor descriptors against the pinned full length, but the receipt predates tracked-worktree provenance. Rerun from a tracked-clean current HEAD before this gate can pass; the 32.48 GB payload is not local or fully rehashed."
+        },
+        "tokenizer": {
+          "required": true,
+          "status": "pass",
+          "evidence": [
+            "src/tokenizer/mod.rs",
+            "qa/model-qualification/qwen3-30b-a3b-q8-header-tokenizer-parity.json"
+          ]
+        },
+        "template": {
+          "required": true,
+          "status": "pending",
+          "evidence": []
+        },
+        "load_smoke": {
+          "required": true,
+          "status": "blocked",
+          "evidence": [],
+          "reason": "The runnable lane excludes qwen3moe and resident GPU rejects MoE; no exact CPU-row smoke exists."
+        },
+        "parity": {
+          "required": true,
+          "status": "blocked",
+          "evidence": [],
+          "reason": "Audit expert-weight normalization, scale, and gating semantics against a real row before downloading a large artifact."
+        },
+        "api_webui": {
+          "required": true,
+          "status": "pending",
+          "evidence": []
+        },
+        "context": {
+          "required": true,
+          "status": "pending",
+          "evidence": []
+        }
+      }
+    }
+  ]
+}

@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use crate::embedding::{cosine_similarity, NomicBertRuntime};
+use crate::embedding::{cosine_similarity, EmbeddingRuntime};
 
 const MAX_INDEX_FILES: usize = 192;
 const MAX_DISCOVERED_FILES: usize = 4_096;
@@ -46,7 +46,7 @@ struct SemanticIndex {
 pub(crate) struct WorkspaceSemanticRetriever {
     root: PathBuf,
     model_id: String,
-    runtime: Arc<NomicBertRuntime>,
+    runtime: Arc<EmbeddingRuntime>,
     index: Mutex<Option<Arc<SemanticIndex>>>,
 }
 
@@ -69,7 +69,7 @@ impl std::fmt::Debug for WorkspaceSemanticRetriever {
 }
 
 impl WorkspaceSemanticRetriever {
-    pub(crate) fn new(root: PathBuf, model_id: String, runtime: Arc<NomicBertRuntime>) -> Self {
+    pub(crate) fn new(root: PathBuf, model_id: String, runtime: Arc<EmbeddingRuntime>) -> Self {
         Self {
             root,
             model_id,
@@ -95,7 +95,7 @@ impl WorkspaceSemanticRetriever {
         if index.chunks.is_empty() {
             return Ok(None);
         }
-        let query = with_prefix(query, "search_query: ");
+        let query = self.runtime.prepare_retrieval_query(query);
         let query_vector = self
             .runtime
             .embed(&query, None)
@@ -148,10 +148,8 @@ impl WorkspaceSemanticRetriever {
         let documents = chunks
             .iter()
             .map(|chunk| {
-                with_prefix(
-                    &format!("{}\n{}", chunk.path, chunk.text),
-                    "search_document: ",
-                )
+                self.runtime
+                    .prepare_retrieval_document(&format!("{}\n{}", chunk.path, chunk.text))
             })
             .collect::<Vec<_>>();
         let vectors = if documents.is_empty() {
@@ -164,15 +162,6 @@ impl WorkspaceSemanticRetriever {
         let index = Arc::new(SemanticIndex { chunks, vectors });
         *cached = Some(Arc::clone(&index));
         Ok(index)
-    }
-}
-
-fn with_prefix(text: &str, prefix: &str) -> String {
-    let trimmed = text.trim();
-    if trimmed.starts_with("search_query:") || trimmed.starts_with("search_document:") {
-        trimmed.to_string()
-    } else {
-        format!("{prefix}{trimmed}")
     }
 }
 

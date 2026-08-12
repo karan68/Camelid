@@ -1,0 +1,56 @@
+{
+  "schema": "camelid.chat_template_shape_pack/v1",
+  "pack_id": "mistral-7b-v0.2-instruct-shapes-v1",
+  "purpose": "Locks the plain-text branch of the exact Mistral 7B Instruct v0.2 Q8_0 template. User/assistant history alternates, an optional leading system message is folded into the first instruction with one newline, content is preserved verbatim, and tool/nontext requests remain outside scope.",
+  "source_row": {
+    "row_id": "mistral_7b_instruct_v0_2_q8_0",
+    "repo": "TheBloke/Mistral-7B-Instruct-v0.2-GGUF",
+    "revision": "3a6fbf4a41a1d52e415a4958cde6856d34b2db93",
+    "file": "mistral-7b-instruct-v0.2.Q8_0.gguf",
+    "size_bytes": 7695857952,
+    "sha256": "f326f5f4f137f3ad30f8c9cc21d4d39e54476583e8306ee2931d5a022cb85b06",
+    "chat_template_utf8_bytes": 470,
+    "chat_template_sha256": "26a59556925c987317ce5291811ba3b7f32ec4c647c400c6cc7e3a9993007ba7"
+  },
+  "oracle": {
+    "engine": "llama.cpp llama-server /apply-template and /tokenize",
+    "build": "b9632",
+    "revision": "acd79d603",
+    "add_generation_prompt": true,
+    "add_special": true,
+    "parse_special": true
+  },
+  "shapes": [
+    {
+      "id": "single_user",
+      "messages": [{"role": "user", "content": "What is the capital of France?"}],
+      "expected_prompt": "[INST] What is the capital of France? [/INST]",
+      "prompt_ids": [1, 733, 16289, 28793, 1824, 349, 272, 5565, 302, 4843, 28804, 733, 28748, 16289, 28793]
+    },
+    {
+      "id": "system_user",
+      "messages": [
+        {"role": "system", "content": "Be concise."},
+        {"role": "user", "content": "Hello"}
+      ],
+      "expected_prompt": "[INST] Be concise.\nHello [/INST]",
+      "prompt_ids": [1, 733, 16289, 28793, 1739, 3078, 864, 28723, 13, 16230, 733, 28748, 16289, 28793]
+    },
+    {
+      "id": "multi_turn",
+      "messages": [
+        {"role": "user", "content": "Say hello."},
+        {"role": "assistant", "content": "Hello!"},
+        {"role": "user", "content": "Say it again."}
+      ],
+      "expected_prompt": "[INST] Say hello. [/INST]Hello!</s>[INST] Say it again. [/INST]",
+      "prompt_ids": [1, 733, 16289, 28793, 15753, 6312, 28709, 28723, 733, 28748, 16289, 28793, 16230, 28808, 2, 733, 16289, 28793, 15753, 378, 1076, 28723, 733, 28748, 16289, 28793]
+    },
+    {
+      "id": "content_whitespace_is_verbatim",
+      "messages": [{"role": "user", "content": "  keep this spacing  "}],
+      "expected_prompt": "[INST]   keep this spacing   [/INST]",
+      "prompt_ids": [1, 733, 16289, 28793, 259, 1840, 456, 668, 4134, 259, 733, 28748, 16289, 28793]
+    }
+  ]
+}

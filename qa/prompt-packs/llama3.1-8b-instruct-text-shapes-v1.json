@@ -1,0 +1,64 @@
+{
+  "schema": "camelid.chat_template_shape_pack/v1",
+  "pack_id": "llama3.1-8b-instruct-text-shapes-v1",
+  "purpose": "Locks the no-tools text branch of the exact Llama 3.1 8B Instruct template, including its system-local date injection and content trimming.",
+  "source": {
+    "repo": "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF",
+    "revision": "bf5b95e96dac0462e2a09145ec66cae9a3f12067",
+    "file": "Meta-Llama-3.1-8B-Instruct-Q8_0.gguf",
+    "size_bytes": 8540775840,
+    "sha256": "9da71c45c90a821809821244d4971e5e5dfad7eb091f0b8ff0546392393b6283",
+    "chat_template_utf8_bytes": 4613,
+    "chat_template_sha256": "93c0e9aa3629bbd77e68dbc0f5621f6e6b23aa8d74b932595cdb8d64684526d7"
+  },
+  "oracle": {
+    "engine": "llama.cpp llama-server /apply-template and /tokenize",
+    "build": "b9632",
+    "revision": "acd79d603",
+    "captured_local_date": "11 Aug 2026",
+    "add_generation_prompt": true,
+    "add_special": true,
+    "parse_special": true
+  },
+  "shapes": [
+    {
+      "id": "single_user",
+      "messages": [{"role": "user", "content": "What is the capital of France?"}],
+      "expected_prompt": "<|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: 11 Aug 2026\n\n<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nWhat is the capital of France?<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n",
+      "prompt_ids": [128000, 128006, 9125, 128007, 271, 38766, 1303, 33025, 2696, 25, 6790, 220, 2366, 18, 198, 15724, 2696, 25, 220, 806, 5033, 220, 2366, 21, 271, 128009, 128006, 882, 128007, 271, 3923, 374, 279, 6864, 315, 9822, 30, 128009, 128006, 78191, 128007, 271]
+    },
+    {
+      "id": "system_user",
+      "messages": [
+        {"role": "system", "content": "You are a concise assistant."},
+        {"role": "user", "content": "Name the largest ocean."}
+      ],
+      "expected_prompt": "<|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: 11 Aug 2026\n\nYou are a concise assistant.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nName the largest ocean.<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n",
+      "prompt_ids": [128000, 128006, 9125, 128007, 271, 38766, 1303, 33025, 2696, 25, 6790, 220, 2366, 18, 198, 15724, 2696, 25, 220, 806, 5033, 220, 2366, 21, 271, 2675, 527, 264, 64694, 18328, 13, 128009, 128006, 882, 128007, 271, 678, 279, 7928, 18435, 13, 128009, 128006, 78191, 128007, 271]
+    },
+    {
+      "id": "multi_turn",
+      "messages": [
+        {"role": "user", "content": "Hi there."},
+        {"role": "assistant", "content": "Hello! How can I help?"},
+        {"role": "user", "content": "Say hello again."}
+      ],
+      "expected_prompt": "<|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: 11 Aug 2026\n\n<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nHi there.<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\nHello! How can I help?<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nSay hello again.<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n",
+      "prompt_ids": [128000, 128006, 9125, 128007, 271, 38766, 1303, 33025, 2696, 25, 6790, 220, 2366, 18, 198, 15724, 2696, 25, 220, 806, 5033, 220, 2366, 21, 271, 128009, 128006, 882, 128007, 271, 13347, 1070, 13, 128009, 128006, 78191, 128007, 271, 9906, 0, 2650, 649, 358, 1520, 30, 128009, 128006, 882, 128007, 271, 46864, 24748, 1578, 13, 128009, 128006, 78191, 128007, 271]
+    },
+    {
+      "id": "content_trim",
+      "messages": [{"role": "user", "content": "  Keep edges.  "}],
+      "expected_prompt": "<|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: 11 Aug 2026\n\n<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nKeep edges.<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n",
+      "prompt_ids": [128000, 128006, 9125, 128007, 271, 38766, 1303, 33025, 2696, 25, 6790, 220, 2366, 18, 198, 15724, 2696, 25, 220, 806, 5033, 220, 2366, 21, 271, 128009, 128006, 882, 128007, 271, 19999, 13116, 13, 128009, 128006, 78191, 128007, 271]
+    }
+  ],
+  "does_not_prove": [
+    "tools or tool history",
+    "structured or multimodal content",
+    "weight load or generation parity",
+    "API/WebUI readiness",
+    "context",
+    "support"
+  ]
+}

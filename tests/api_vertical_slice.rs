@@ -929,7 +929,7 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(
         body["support_contract"]["current_gate"],
-        "Current exact-row support: TinyLlama Q8_0 current gate; Llama 3.2 1B Instruct Q8_0 has checked bounded 512/1024/2048/4096/8192 packs; Llama 3.2 3B Instruct Q8_0 is supported_exact_row_smoke with the anchored checked bounded 512/1024/2048/4096/8192 raw-decode context ladder on the current canonical GGUF (prior-upload Ubuntu API/WebUI refresh at source head e9f926ed1a65 retained as historical evidence); and Llama 3 8B Instruct Q8_0 has checked bounded 512/1024/2048 packs where row-specific PASS artifacts exist. Mistral 7B Instruct v0.3 Q8_0 is supported_exact_row_smoke: checked tokenizer/template, parity (including GPU-vs-CPU greedy continuations on the exact row), bounded 512/1024/2048/4096/8192 context artifacts, and a support-promotion API/WebUI smoke bundle. Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf has bounded one-token backend MoE runtime evidence only; later 5-token/API/WebUI/RSS promotion-candidate artifacts are superseded by Gate 9A 50-token divergence and a longer-continuation hang, so broad/API/WebUI/frontend readiness remains unsupported. The dense Qwen3 Q8_0 ChatML rows (0.6B/1.7B/4B/8B Instruct, thinking disabled) are supported_exact_row_smoke: qwen2 BPE pre-tokenizer + ChatML renderer, per-head QK-norm + NEOX RoPE, and token+text parity vs llama.cpp at 1/5/50 on macOS/Ubuntu and on Windows x86_64 CPU (cpu_reference + the x86_q8 AVX2 runtime-repack path, bit-identical), and additionally on Windows CUDA: the 0.6B/1.7B/4B rows fully VRAM-resident and the 8B row via the VRAM+host-RAM offload split (RTX 3060 Laptop 6 GB, driver 576.83, CUDA 12.9; GPU decode+single-shot prefill token+text identical to cpu_reference/llama.cpp at 1/5/50); 1.7B additionally has GPU-resident decode+prefill and a 15,373-token single-shot prefill lane on macOS, and thinking-mode is opt-in (leading-trace parity only). The 4B row additionally carries checked bounded-context packs 512/1024/2048/4096/8192, the 1.7B row 512/1024/2048/4096, and the 0.6B row 512/2048/4096/8192 (fully-GPU-resident raw-decode greedy parity vs llama.cpp acd79d603 at 50 tokens; the 1.7B 8192 and 0.6B 1024 buckets are held as documented benign near-ties). These are exact bounded lanes only; no model-native/larger context beyond the checked packs, arbitrary-template behavior, production throughput, portability, neighboring-row, or broad-family support is implied. Seven hash-pinned Prism ML Bonsai Q1_0, Prism Q2_0, and PQ2_0 artifacts are supported_exact_row_smoke on macOS Apple Silicon Metal and Windows x86_64 CUDA after paired text and vision validation; the claim is exact-file and limited to those two GPU platforms, with broader qwen3/qwen35 or quant support, bounded/model-native context, and production throughput still unclaimed. The seven files are mixed-arch: the 4B and 8B rows declare general.architecture=qwen3 (dense), only the 27B rows declare qwen35 (hybrid)."
+        "Current exact-row support: TinyLlama Q8_0 current gate; Llama 3.2 1B Instruct Q8_0 has checked bounded 512/1024/2048/4096/8192 packs; Llama 3.2 3B Instruct Q8_0 is supported_exact_row_smoke with the anchored checked bounded 512/1024/2048/4096/8192 raw-decode context ladder on the current canonical GGUF (prior-upload Ubuntu API/WebUI refresh at source head e9f926ed1a65 retained as historical evidence); and Llama 3 8B Instruct Q8_0 has checked bounded 512/1024/2048 packs where row-specific PASS artifacts exist. Mistral 7B Instruct v0.3 Q8_0 is supported_exact_row_smoke: checked tokenizer/template, parity (including GPU-vs-CPU greedy continuations on the exact row), bounded 512/1024/2048/4096/8192 context artifacts, and a support-promotion API/WebUI smoke bundle. LFM2.5-2.6B Q8_0 is hash-pinned supported_exact_row_smoke only on the Windows x86_64 runnable-CPU lane and one Mac16,10 / Apple M4 / macOS 26.5 arm64 resident-Metal lane after tokenizer/template and 96/96 short greedy parity, native runnable-chat receipts, a checked exact 512-token chat bucket, and the clean d31e5cb0 API/WebUI/SSE smoke; tools, sampling beyond greedy, adjacent files, broader context, CUDA, Linux, other Apple hardware or macOS revisions, and broad portability remain unclaimed. Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf has bounded one-token backend MoE runtime evidence only; later 5-token/API/WebUI/RSS promotion-candidate artifacts are superseded by Gate 9A 50-token divergence and a longer-continuation hang, so broad/API/WebUI/frontend readiness remains unsupported. The dense Qwen3 Q8_0 ChatML rows (0.6B/1.7B/4B/8B Instruct, thinking disabled) are supported_exact_row_smoke: qwen2 BPE pre-tokenizer + ChatML renderer, per-head QK-norm + NEOX RoPE, and token+text parity vs llama.cpp at 1/5/50 on macOS/Ubuntu and on Windows x86_64 CPU (cpu_reference + the x86_q8 AVX2 runtime-repack path, bit-identical), and additionally on Windows CUDA: the 0.6B/1.7B/4B rows fully VRAM-resident and the 8B row via the VRAM+host-RAM offload split (RTX 3060 Laptop 6 GB, driver 576.83, CUDA 12.9; GPU decode+single-shot prefill token+text identical to cpu_reference/llama.cpp at 1/5/50); 1.7B additionally has GPU-resident decode+prefill and a 15,373-token single-shot prefill lane on macOS, and thinking-mode is opt-in (leading-trace parity only). The 4B row additionally carries checked bounded-context packs 512/1024/2048/4096/8192, the 1.7B row 512/1024/2048/4096, and the 0.6B row 512/2048/4096/8192 (fully-GPU-resident raw-decode greedy parity vs llama.cpp acd79d603 at 50 tokens; the 1.7B 8192 and 0.6B 1024 buckets are held as documented benign near-ties). These are exact bounded lanes only; no model-native/larger context beyond the checked packs, arbitrary-template behavior, production throughput, portability, neighboring-row, or broad-family support is implied. Seven hash-pinned Prism ML Bonsai Q1_0, Prism Q2_0, and PQ2_0 artifacts are supported_exact_row_smoke on macOS Apple Silicon Metal and Windows x86_64 CUDA after paired text and vision validation; the claim is exact-file and limited to those two GPU platforms, with broader qwen3/qwen35 or quant support, bounded/model-native context, and production throughput still unclaimed. The seven files are mixed-arch: the 4B and 8B rows declare general.architecture=qwen3 (dense), only the 27B rows declare qwen35 (hybrid)."
     );
     let q8 = body["supported_quantization"]
         .as_array()
@@ -950,7 +950,8 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
     ));
     assert!(q8_notes.contains("where row-specific PASS artifacts exist"));
     assert!(!q8_notes.contains("8B 1024/2048 remain red"));
-    assert!(q8_notes.contains("exact bounded-pack lanes only"));
+    assert!(q8_notes.contains("exact LFM2.5-2.6B Q8_0 adds tokenizer/template"));
+    assert!(q8_notes.contains("exact bounded-pack or checked-smoke lanes only"));
     assert!(!q8_notes.contains("conditional"));
     assert!(!q8_notes.contains("gated"));
     assert!(body["planned_quantization"]
@@ -1010,13 +1011,21 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
                 .as_str()
                 .unwrap()
                 .contains("bounded one-token exact-row MoE runtime evidence")));
-    for id in ["qwen25", "gemma2"] {
-        assert!(body["planned_model_families"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|item| item["id"] == id && item["status"] == "planned_exact_row_candidate"));
-    }
+    assert!(body["planned_model_families"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["id"] == "qwen25" && item["status"] == "planned_exact_row_candidate"));
+    assert!(body["planned_model_families"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["id"] == "gemma2"
+            && item["status"] == "active_validation_api_webui_pass_pending_context"
+            && item["notes"]
+                .as_str()
+                .unwrap()
+                .contains("verified runnable")));
     assert!(body["api_features"].as_array().unwrap().iter().any(|item| {
         item["id"] == "multi_choice_generation"
             && item["status"] == "supported_current_gate_nonstreaming"
@@ -1647,17 +1656,46 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
         assert_eq!(row["latest_checked_result"], "pass");
     }
 
-    for (id, filename) in [
-        ("qwen25_7b_instruct_q8_0", "Qwen2.5-7B-Instruct-Q8_0.gguf"),
-        ("gemma2_9b_it_q8_0", "gemma-2-9b-it-Q8_0.gguf"),
-    ] {
-        let row = compatibility.iter().find(|item| item["id"] == id).unwrap();
-        assert_eq!(row["status"], "planned_exact_row_candidate");
-        assert_eq!(row["generation_runs"], "not_started");
-        assert_eq!(row["frontend_load_path_verified"], "fail_closed_planned");
-        assert_eq!(row["latest_checked_result"], "planning_only");
-        assert!(row["evidence"].as_str().unwrap().contains(filename));
-    }
+    let qwen25_7b = compatibility
+        .iter()
+        .find(|item| item["id"] == "qwen25_7b_instruct_q8_0")
+        .unwrap();
+    assert_eq!(qwen25_7b["status"], "planned_exact_row_candidate");
+    assert_eq!(qwen25_7b["generation_runs"], "not_started");
+    assert_eq!(
+        qwen25_7b["frontend_load_path_verified"],
+        "fail_closed_planned"
+    );
+    assert_eq!(qwen25_7b["latest_checked_result"], "planning_only");
+    assert!(qwen25_7b["evidence"]
+        .as_str()
+        .unwrap()
+        .contains("Qwen2.5-7B-Instruct-Q8_0.gguf"));
+
+    let gemma2_9b = compatibility
+        .iter()
+        .find(|item| item["id"] == "gemma2_9b_it_q8_0")
+        .unwrap();
+    assert_eq!(
+        gemma2_9b["status"],
+        "active_validation_api_webui_pass_pending_context"
+    );
+    assert_eq!(
+        gemma2_9b["generation_runs"],
+        "validated_deterministic_greedy"
+    );
+    assert_eq!(
+        gemma2_9b["frontend_load_path_verified"],
+        "validated_guarded_api_webui_smoke"
+    );
+    assert_eq!(
+        gemma2_9b["latest_checked_result"],
+        "active_validation_api_webui_pass_pending_context"
+    );
+    assert!(gemma2_9b["evidence"]
+        .as_str()
+        .unwrap()
+        .contains("phase2-runtime/gemma2_9b_it_q8_0.json"));
     let planned_quant = compatibility
         .iter()
         .find(|item| item["id"] == "llama_spm_q4_k_q5_k")

@@ -1,0 +1,18 @@
+{
+  "schema": "camelid.lfm2.context-qualification/v1",
+  "row_id": "lfm2_5_2_6b_q8_0",
+  "request_mode": "chat",
+  "endpoint": "/v1/chat/completions",
+  "target_character_heuristic_tokens": 681,
+  "actual_prompt_tokens": 512,
+  "actual_prompt_tokens_gate_pass": true,
+  "projected_kv_bytes": 16777216,
+  "safe_kv_budget_bytes": 3758096384,
+  "verify_mode": "reference-only",
+  "verification_scope": "receipt digest, exact lane identity, and pinned llama.cpp reference rerun; Camelid self-replay is unavailable for runnable-only chat",
+  "generation_parity_pass": true,
+  "generated_tokens": 8,
+  "first_divergent_token_index": -1,
+  "generated_text": "*   Input: A repetitive, slightly",
+  "receipt_id": "e8ce571421e6888c9e634c7aa4d95c3119e7ec013e55814025a368893a51e6d4"
+}

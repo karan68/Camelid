@@ -1,0 +1,77 @@
+{
+  "schema": "camelid.model-qualification-report/v1",
+  "generated_at": "2026-08-10T07:00:00.000Z",
+  "phase": 1,
+  "row_id": "qwen3_30b_a3b_q8_0",
+  "source_head": "e5e8359525071c09eecc6d5e4664d45113cfb73e",
+  "source_dirty": true,
+  "source_inspection": "observed",
+  "host": {
+    "platform": "source-metadata-only",
+    "hostname_redacted": true
+  },
+  "backend": {
+    "serve": "cpu_reference",
+    "env": {
+      "CAMELID_GPU": "off"
+    }
+  },
+  "artifact": {
+    "repo": "Qwen/Qwen3-30B-A3B-GGUF",
+    "revision": "e4d4bafdfb96a411a163846265362aceb0b9c63a",
+    "file": "Qwen3-30B-A3B-Q8_0.gguf",
+    "size_bytes": 32483931648,
+    "sha256": "4ad960d180b16f56024f5b704697e5dd5b0837167c2e515ef0569abfc599743c",
+    "license": "apache-2.0",
+    "local_path_redacted": true
+  },
+  "stages": {
+    "source": {
+      "status": "pass",
+      "evidence": [
+        "official Qwen Hugging Face repository",
+        "immutable Hub revision with file metadata, LFS byte size, and SHA-256"
+      ]
+    },
+    "artifact": {
+      "status": "blocked",
+      "reason": "The exact 32.48 GB artifact is not local; no weights were downloaded during source qualification."
+    },
+    "metadata": {
+      "status": "blocked",
+      "reason": "No exact-row camelid inspect receipt exists without the local artifact."
+    },
+    "tokenizer": {
+      "status": "blocked",
+      "reason": "The expected qwen2 BPE metadata must be checked on the exact GGUF before tokenizer evidence can pass."
+    },
+    "template": {
+      "status": "blocked",
+      "reason": "The generic Qwen3 ChatML route has no exact-row rendered-byte and prompt-token fixture for this artifact."
+    },
+    "load_smoke": {
+      "status": "blocked",
+      "reason": "Qwen3 MoE is excluded from runnable admission and resident GPU execution rejects MoE."
+    },
+    "parity": {
+      "status": "blocked",
+      "reason": "Expert-weight normalization, scale, and gating semantics remain unaudited against the exact row."
+    },
+    "api_webui": {
+      "status": "blocked",
+      "reason": "API and Models-page behavior are downstream of exact-row load and parity."
+    },
+    "context": {
+      "status": "blocked",
+      "reason": "No preflighted 512-token context receipt exists."
+    }
+  },
+  "overall_status": "blocked",
+  "support_decision": "hold_source_anchored_runtime_unverified",
+  "does_not_prove": [
+    "Qwen3 MoE loadability",
+    "expert routing correctness",
+    "tokenizer or template parity",
+    "generation, API, WebUI, context, GPU, or performance readiness"
+  ]
+}

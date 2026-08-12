@@ -1,0 +1,19 @@
+{
+  "schema": "camelid.hf-source-lock/v1",
+  "repo": "BenevolenceMessiah/gemma-2-9b-it-Q8_0-GGUF",
+  "file": "gemma-2-9b-it-q8_0.gguf",
+  "revision": "eb4741d7b2aece6d8519db62dc31d89029a40af8",
+  "size_bytes": 9827149312,
+  "sha256": "59f2e1125fc3af738c256336fb11095da855050305b3705c6c779730a3a8d84e",
+  "license": "gemma",
+  "access": {
+    "gated": false,
+    "private": false,
+    "disabled": false
+  },
+  "row_id": "gemma2_9b_it_q8_0",
+  "resolved_at": "2026-08-10T07:18:15.091Z",
+  "artifact": {
+    "status": "not_checked"
+  }
+}

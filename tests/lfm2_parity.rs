@@ -24,8 +24,10 @@
 //! `Tokenizer::from_gguf` was refusing every LFM2 row outright, because a
 //! frozen-ids test cannot see the tokenizer at all.
 //!
-//! Compute-heavy (CPU f32, 2.6B): run with `--release`. Skips if the model or
-//! the fixtures are absent.
+//! Compute-heavy (2.6B; CPU or resident accelerator according to the runtime
+//! configuration): run with `--release`. This fixture gate does not identify
+//! a backend by itself; backend claims require a separate execution-plan
+//! receipt. Skips if the model or the fixtures are absent.
 
 use std::path::{Path, PathBuf};
 
@@ -205,7 +207,7 @@ fn lfm2_matches_llamacpp_greedy() {
         "max_new": fx.max_new,
         "decode": "greedy/argmax",
         "proves": "lfm2 forward graph (short-conv + rolling conv state + QK-normed GQA + per-layer schedule)",
-        "does_not_prove": "tokenizer parity (both sides are fed the same prompt ids by construction) — gated separately by lfm2_tokenizer_matches_llamacpp; chat-template fidelity — gated by api::tests::lfm2_renderer_matches_llamacpp_applied_template; and end-to-end serve, long context, sampling, tools, other quants, GPU lanes, other LFM2 variants — none of which are gated anywhere yet",
+        "does_not_prove": "tokenizer parity (both sides are fed the same prompt ids by construction) — gated separately by lfm2_tokenizer_matches_llamacpp; chat-template fidelity — gated by api::tests::lfm2_renderer_matches_llamacpp_applied_template; or, by itself, end-to-end serve, long context, sampling, tools, other quants, a particular CPU/GPU execution backend, or other LFM2 variants — backend and context claims require independent lane-specific receipts",
         "result": if all_match { "pass" } else { "fail" },
         "all_greedy_match": all_match,
         "prompts": prompt_records,

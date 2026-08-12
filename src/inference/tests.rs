@@ -36,6 +36,98 @@ fn projection_bias_rejects_a_mismatched_width() {
 }
 
 #[test]
+fn head_dim_96_cpu_attention_batch_matches_incremental_cache_reads() {
+    const ROWS: usize = 7;
+    const HEAD_DIM: usize = 96;
+    const KV_HEADS: usize = 4;
+    const ATTENTION_HEADS: usize = 8;
+
+    for layout in [KvLayout::PositionMajor, KvLayout::HeadMajor] {
+        let plan = LlamaKvCachePlan {
+            max_sequence_length: ROWS,
+            layer_count: 1,
+            kv_head_count: KV_HEADS,
+            head_dim: HEAD_DIM,
+            k_head_dim: HEAD_DIM,
+            v_head_dim: HEAD_DIM,
+            key_shape: vec![1, ROWS, KV_HEADS, HEAD_DIM],
+            value_shape: vec![1, ROWS, KV_HEADS, HEAD_DIM],
+        };
+        let mut cache = LlamaKvCache::new_with_layout(plan, layout).unwrap();
+        cache.ensure_position_capacity(ROWS).unwrap();
+
+        for position in 0..ROWS {
+            for kv_head in 0..KV_HEADS {
+                let key = (0..HEAD_DIM)
+                    .map(|dim| {
+                        let index = position * 17 + kv_head * 11 + dim * 7;
+                        ((index % 37) as f32 - 18.0) * 0.031_25
+                    })
+                    .collect::<Vec<_>>();
+                let value = (0..HEAD_DIM)
+                    .map(|dim| {
+                        let index = position * 13 + kv_head * 19 + dim * 5;
+                        ((index % 41) as f32 - 20.0) * 0.023_437_5
+                    })
+                    .collect::<Vec<_>>();
+                cache.store_kv_head_row(0, position, kv_head, &key, &value);
+            }
+        }
+
+        let query_width = ATTENTION_HEADS * HEAD_DIM;
+        let query_data = (0..ROWS * query_width)
+            .map(|index| ((index * 29 % 53) as f32 - 26.0) * 0.015_625)
+            .collect::<Vec<_>>();
+        let query = CpuTensor::from_f32(
+            "phi3_head_dim_96_query_batch",
+            vec![ROWS, query_width],
+            query_data,
+        )
+        .unwrap();
+        let batched = causal_attention_context_batch(
+            &cache,
+            0,
+            0,
+            &query,
+            ATTENTION_HEADS,
+            KV_HEADS,
+            "phi3_head_dim_96_attention_batch",
+        )
+        .unwrap();
+
+        for row in 0..ROWS {
+            cache.position = row;
+            let row_start = row * query_width;
+            let single_query = CpuTensor::from_f32(
+                "phi3_head_dim_96_query_single",
+                vec![1, query_width],
+                query.data[row_start..row_start + query_width].to_vec(),
+            )
+            .unwrap();
+            let incremental = causal_attention_context(
+                &cache,
+                0,
+                &single_query,
+                ATTENTION_HEADS,
+                KV_HEADS,
+                "phi3_head_dim_96_attention_incremental",
+                false,
+            )
+            .unwrap()
+            .tensor;
+            let batch_row = &batched.data[row_start..row_start + query_width];
+            for (index, (actual, expected)) in incremental.data.iter().zip(batch_row).enumerate() {
+                assert_eq!(
+                    actual.to_bits(),
+                    expected.to_bits(),
+                    "head_dim=96 {layout:?} cache attention diverged at row {row}, index {index}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn resident_parity_forbids_reflects_the_cached_verdict() {
     // A key unlikely to collide with other parallel tests sharing the process-global map.
     let key = 0x5A5A_A5A5_1234_5678_u64;
@@ -128,6 +220,39 @@ fn resident_q8_moe_expert_view_slices_blocks_without_f32_materialization() {
     assert_eq!(shared.as_slice().len(), 2);
     assert_eq!(shared.as_slice()[0].scale, 3.0);
     assert_eq!(shared.as_slice()[1].scale, 4.0);
+}
+
+#[test]
+fn only_merged_q4_moe_experts_use_the_streamed_override() {
+    let desc = crate::gguf::GgufTensorDescriptor {
+        name: "blk.0.ffn_gate_exps.weight".to_string(),
+        dimensions: vec![32, 1, 1],
+        tensor_type: GgufTensorType::Q4_0,
+        relative_offset: 0,
+        absolute_offset: 0,
+        n_bytes: 18,
+    };
+    assert!(merged_moe_expert_set_streams_q4(
+        &LlamaMoeExpertTensors::Merged(desc.clone())
+    ));
+    assert!(!merged_moe_expert_set_streams_q4(
+        &LlamaMoeExpertTensors::Split(vec![desc])
+    ));
+}
+
+#[test]
+fn empty_split_moe_expert_set_fails_closed_before_pipeline_name_indexing() {
+    let empty = LlamaMoeExpertTensors::Split(Vec::new());
+
+    let err = validate_moe_expert_set_nonempty(&empty, "layer 0 gate experts")
+        .expect_err("zero-expert split bindings must not reach descs[0]")
+        .to_string();
+
+    assert!(err.contains("layer 0 gate experts"), "{err}");
+    assert!(
+        err.contains("expert_count must be greater than zero"),
+        "{err}"
+    );
 }
 
 #[test]

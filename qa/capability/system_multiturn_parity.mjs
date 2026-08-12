@@ -29,6 +29,8 @@ import { mkdir, writeFile } from 'node:fs/promises'
 import { dirname, resolve } from 'node:path'
 import { promisify } from 'node:util'
 
+import { sealReceiptArgs } from './context_parity_lib.mjs'
+
 const execFileAsync = promisify(execFile)
 const args = new Map()
 for (let i = 2; i < process.argv.length; i += 1) {
@@ -100,6 +102,9 @@ try {
 }
 const receiptPath = resolve(out, 'parity-receipt.json')
 await writeFile(receiptPath, JSON.stringify(parityReceipt, null, 2) + '\n')
+// Preserve typed JSON-number forms (notably temperature 0.0) that are bound
+// into the native receipt's canonical digest.
+await execFileAsync(camelidExe, sealReceiptArgs(receiptPath), { env })
 summary.checks.camelid_emit = { generated_text: camelidText, prompt_tokens: camelidPromptTokens.length, receipt_id: parityReceipt.receipt_id }
 
 // ---- Phase 2: class-D generation parity via verify-receipt (spawns its own llama-server) ----

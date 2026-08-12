@@ -1,0 +1,508 @@
+{
+  "schema": "camelid.header-tokenizer-parity/v1",
+  "generated_at": "2026-08-10T19:58:07.709Z",
+  "provenance": {
+    "status": "clean_current_head_receipt",
+    "gate_requires_clean_current_head": true,
+    "source_head": "ded8e95b95fadbe2e7ab6a03d48e4d1e9a2c32d6",
+    "source_tracked_dirty": false,
+    "binary_commit_abbrev": "ded8e95b",
+    "binary_reports_dirty": false,
+    "binary_matches_source_head": true,
+    "clean_current_head": true
+  },
+  "row_id": "qwen3_30b_a3b_q8_0",
+  "host": {
+    "platform": "win32-x64",
+    "hostname_redacted": true
+  },
+  "source": {
+    "repo": "Qwen/Qwen3-30B-A3B-GGUF",
+    "file": "Qwen3-30B-A3B-Q8_0.gguf",
+    "revision": "e4d4bafdfb96a411a163846265362aceb0b9c63a",
+    "size_bytes": 32483931648,
+    "sha256": "4ad960d180b16f56024f5b704697e5dd5b0837167c2e515ef0569abfc599743c",
+    "license": "apache-2.0"
+  },
+  "bounded_fetch": {
+    "requested_bytes": 33554432,
+    "received_bytes": 33554432,
+    "content_range": {
+      "start": 0,
+      "end": 33554431,
+      "total": 32483931648
+    },
+    "prefix_sha256": "55c565264523c5862247d983f857b9034c04d762ee14fecfd68a827cdbb2d566",
+    "temporary_paths_redacted": true,
+    "temporary_files_deleted": true,
+    "scope_note": "the prefix hash includes opaque initial tensor payload bytes after data_start_offset; it is not a full payload or full artifact hash"
+  },
+  "grounding": {
+    "header_receipt": "qa/model-qualification/qwen3-30b-a3b-q8-header-inspection.json",
+    "header_receipt_sha256": "293f8dd99f4f31478a0a6a7b3fc9c3e6a1c224a9df0b1dc3253e619d93a2dc33"
+  },
+  "tokenizer_metadata": {
+    "token_count": 151936,
+    "merge_count": 151387,
+    "token_type_count": 151936,
+    "normal_token_count": 151643,
+    "special_token_count": 293,
+    "control_token_count": 20,
+    "user_defined_token_count": 6,
+    "unused_token_count": 267,
+    "bos_token_id": 151643,
+    "eos_token_id": 151645,
+    "padding_token_id": 151643,
+    "declared_add_bos_token": false,
+    "declared_add_eos_token": "absent",
+    "declared_add_space_prefix": "absent",
+    "oracle_resolved_add_bos_token": false,
+    "oracle_resolved_add_eos_token": false,
+    "special_token_ids": {
+      "endoftext": 151643,
+      "im_start": 151644,
+      "im_end": 151645,
+      "tool_call_start": 151657,
+      "tool_call_end": 151658,
+      "tool_response_start": 151665,
+      "tool_response_end": 151666,
+      "think_start": 151667,
+      "think_end": 151668,
+      "unused_first": 151669,
+      "unused_last": 151935
+    },
+    "chat_template_utf8_bytes": 4100,
+    "chat_template_sha256": "57f1fd00f0013a2be96aa79b857391f27e23df5b5f847072b524c897e24d0361"
+  },
+  "camelid": {
+    "version": "camelid v0.6.1-35-gded8e95b",
+    "binary_sha256": "f55721a6fbd66035725f3f67309112e68c9a98cb646a1da9c74a620a4ec2d1f1",
+    "prefix_mode": "tokenize --declared-len"
+  },
+  "oracle": {
+    "project": "ggml-org/llama.cpp",
+    "revision": "acd79d603",
+    "build": 9632,
+    "revision_verification": "parsed from the sibling llama-cli --version output in the same binary package",
+    "companion_executable": "llama-cli.exe",
+    "companion_binary_sha256": "2ec09da0b81d0201ce5b21810caefb4e77fd108f383b30c15ca493c5a70f7731",
+    "executable": "llama-tokenize.exe",
+    "binary_sha256": "a44a4d7e1445d22a4cffb0d38f6efa8f1d81e84ae2c3d481af857c5e331b8c7a",
+    "input": "disposable vocabulary-only derivative of the same immutable GGUF prefix; tensor_count is zeroed so llama-tokenize consumes unchanged tokenizer metadata and ignores the original descriptor region plus opaque partial payload bytes",
+    "derivative": {
+      "original_tensor_count": 579,
+      "metadata_count": 31,
+      "patch": "set fixed-header tensor_count at byte offset 8 to zero; all tokenizer metadata bytes remain unchanged",
+      "patch_offset": 8,
+      "sha256": "39c4ed3e1ec5dbf8b1582bef982b97436e2d83709cf02195255d7908c595a54d",
+      "persisted": false
+    }
+  },
+  "cases": [
+    {
+      "id": "empty_with_add_special",
+      "text_utf8_bytes": 0,
+      "text_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "add_special": true,
+      "parse_special": false,
+      "camelid_ids": [],
+      "llama_cpp_ids": [],
+      "exact_match": true,
+      "camelid_decoded_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "plain_ascii_with_add_special",
+      "text_utf8_bytes": 5,
+      "text_sha256": "185f8db32271fe25f561a6fc938b2e264306ec304eda518007d1764826381969",
+      "add_special": true,
+      "parse_special": false,
+      "camelid_ids": [
+        9707
+      ],
+      "llama_cpp_ids": [
+        9707
+      ],
+      "exact_match": true,
+      "camelid_decoded_sha256": "185f8db32271fe25f561a6fc938b2e264306ec304eda518007d1764826381969"
+    },
+    {
+      "id": "plain_ascii_without_add_special",
+      "text_utf8_bytes": 5,
+      "text_sha256": "185f8db32271fe25f561a6fc938b2e264306ec304eda518007d1764826381969",
+      "add_special": false,
+      "parse_special": false,
+      "camelid_ids": [
+        9707
+      ],
+      "llama_cpp_ids": [
+        9707
+      ],
+      "exact_match": true,
+      "camelid_decoded_sha256": "185f8db32271fe25f561a6fc938b2e264306ec304eda518007d1764826381969"
+    },
+    {
+      "id": "qwen2_unicode_spacing_and_contractions",
+      "text_utf8_bytes": 45,
+      "text_sha256": "ae4a56fcb50a03cd7a4e8ee61dd273effbc6d5b5a1b93e5611bc724dbc191196",
+      "add_special": true,
+      "parse_special": false,
+      "camelid_ids": [
+        220,
+        94880,
+        586,
+        51950,
+        72858,
+        16744,
+        20109,
+        24918,
+        33517,
+        646,
+        944,
+        358,
+        27603,
+        582,
+        4172
+      ],
+      "llama_cpp_ids": [
+        220,
+        94880,
+        586,
+        51950,
+        72858,
+        16744,
+        20109,
+        24918,
+        33517,
+        646,
+        944,
+        358,
+        27603,
+        582,
+        4172
+      ],
+      "exact_match": true,
+      "camelid_decoded_sha256": "ae4a56fcb50a03cd7a4e8ee61dd273effbc6d5b5a1b93e5611bc724dbc191196"
+    },
+    {
+      "id": "qwen2_digits_punctuation_newlines_and_case",
+      "text_utf8_bytes": 28,
+      "text_sha256": "2387665d8e3f87389fa8200715ea83e93531a68efa9cdb17e4068f9db0c9e957",
+      "add_special": true,
+      "parse_special": false,
+      "camelid_ids": [
+        87,
+        220,
+        379,
+        220,
+        16,
+        17,
+        18,
+        19,
+        264,
+        3470,
+        198,
+        41955,
+        17323,
+        582,
+        2299,
+        12069
+      ],
+      "llama_cpp_ids": [
+        87,
+        220,
+        379,
+        220,
+        16,
+        17,
+        18,
+        19,
+        264,
+        3470,
+        198,
+        41955,
+        17323,
+        582,
+        2299,
+        12069
+      ],
+      "exact_match": true,
+      "camelid_decoded_sha256": "2387665d8e3f87389fa8200715ea83e93531a68efa9cdb17e4068f9db0c9e957"
+    },
+    {
+      "id": "single_user_chat_controls",
+      "text_utf8_bytes": 55,
+      "text_sha256": "d9cd4e9d39fa917afdba171d795bac9461fcec0f29437d41026f214b588d49bc",
+      "add_special": true,
+      "parse_special": true,
+      "camelid_ids": [
+        151644,
+        872,
+        198,
+        9707,
+        151645,
+        198,
+        151644,
+        77091,
+        198
+      ],
+      "llama_cpp_ids": [
+        151644,
+        872,
+        198,
+        9707,
+        151645,
+        198,
+        151644,
+        77091,
+        198
+      ],
+      "exact_match": true,
+      "camelid_decoded_sha256": "d9cd4e9d39fa917afdba171d795bac9461fcec0f29437d41026f214b588d49bc"
+    },
+    {
+      "id": "multi_turn_chat_controls",
+      "text_utf8_bytes": 125,
+      "text_sha256": "a3913ec4f86e302f84d11955fd8c8d11f50c9e14d59fb61a824b325bb19048c4",
+      "add_special": true,
+      "parse_special": true,
+      "camelid_ids": [
+        151644,
+        872,
+        198,
+        5338,
+        151645,
+        198,
+        151644,
+        77091,
+        198,
+        3966,
+        151645,
+        198,
+        151644,
+        872,
+        198,
+        15666,
+        151645,
+        198,
+        151644,
+        77091,
+        198
+      ],
+      "llama_cpp_ids": [
+        151644,
+        872,
+        198,
+        5338,
+        151645,
+        198,
+        151644,
+        77091,
+        198,
+        3966,
+        151645,
+        198,
+        151644,
+        872,
+        198,
+        15666,
+        151645,
+        198,
+        151644,
+        77091,
+        198
+      ],
+      "exact_match": true,
+      "camelid_decoded_sha256": "a3913ec4f86e302f84d11955fd8c8d11f50c9e14d59fb61a824b325bb19048c4"
+    },
+    {
+      "id": "chat_controls_as_ordinary_text",
+      "text_utf8_bytes": 33,
+      "text_sha256": "2db1e8b5f8478eb1abab336420ce05e1a4b16f6d605414fc67aa44cd63c668eb",
+      "add_special": true,
+      "parse_special": false,
+      "camelid_ids": [
+        27,
+        91,
+        318,
+        4906,
+        91,
+        29,
+        872,
+        198,
+        9707,
+        27,
+        91,
+        318,
+        6213,
+        91,
+        397
+      ],
+      "llama_cpp_ids": [
+        27,
+        91,
+        318,
+        4906,
+        91,
+        29,
+        872,
+        198,
+        9707,
+        27,
+        91,
+        318,
+        6213,
+        91,
+        397
+      ],
+      "exact_match": true,
+      "camelid_decoded_sha256": "2db1e8b5f8478eb1abab336420ce05e1a4b16f6d605414fc67aa44cd63c668eb"
+    },
+    {
+      "id": "user_defined_tool_tags_with_parse_special",
+      "text_utf8_bytes": 41,
+      "text_sha256": "0411ea549039c9bbfd0467386e6ef9eb0ba246de2c68b8a7eda296d956982681",
+      "add_special": true,
+      "parse_special": true,
+      "camelid_ids": [
+        151657,
+        4913,
+        606,
+        3252,
+        15206,
+        9207,
+        151658
+      ],
+      "llama_cpp_ids": [
+        151657,
+        4913,
+        606,
+        3252,
+        15206,
+        9207,
+        151658
+      ],
+      "exact_match": true,
+      "camelid_decoded_sha256": "0411ea549039c9bbfd0467386e6ef9eb0ba246de2c68b8a7eda296d956982681"
+    },
+    {
+      "id": "user_defined_tool_tags_without_parse_special",
+      "text_utf8_bytes": 41,
+      "text_sha256": "0411ea549039c9bbfd0467386e6ef9eb0ba246de2c68b8a7eda296d956982681",
+      "add_special": true,
+      "parse_special": false,
+      "camelid_ids": [
+        151657,
+        4913,
+        606,
+        3252,
+        15206,
+        9207,
+        151658
+      ],
+      "llama_cpp_ids": [
+        151657,
+        4913,
+        606,
+        3252,
+        15206,
+        9207,
+        151658
+      ],
+      "exact_match": true,
+      "camelid_decoded_sha256": "0411ea549039c9bbfd0467386e6ef9eb0ba246de2c68b8a7eda296d956982681"
+    },
+    {
+      "id": "user_defined_think_tags_with_parse_special",
+      "text_utf8_bytes": 21,
+      "text_sha256": "448392814005e8c96f72f1fda78cafde667741b107fdf9ef2c53510b2478c065",
+      "add_special": true,
+      "parse_special": true,
+      "camelid_ids": [
+        151667,
+        19895,
+        151668
+      ],
+      "llama_cpp_ids": [
+        151667,
+        19895,
+        151668
+      ],
+      "exact_match": true,
+      "camelid_decoded_sha256": "448392814005e8c96f72f1fda78cafde667741b107fdf9ef2c53510b2478c065"
+    },
+    {
+      "id": "unused_pad_with_parse_special",
+      "text_utf8_bytes": 11,
+      "text_sha256": "2eee451e575a83e7f5e16b97489c842ea41bb94dbe907bec2ebc3c20b475b131",
+      "add_special": true,
+      "parse_special": true,
+      "camelid_ids": [
+        42347,
+        1808,
+        16,
+        20,
+        16,
+        21,
+        21,
+        24,
+        60
+      ],
+      "llama_cpp_ids": [
+        42347,
+        1808,
+        16,
+        20,
+        16,
+        21,
+        21,
+        24,
+        60
+      ],
+      "exact_match": true,
+      "camelid_decoded_sha256": "2eee451e575a83e7f5e16b97489c842ea41bb94dbe907bec2ebc3c20b475b131"
+    },
+    {
+      "id": "unused_pad_without_parse_special",
+      "text_utf8_bytes": 11,
+      "text_sha256": "2eee451e575a83e7f5e16b97489c842ea41bb94dbe907bec2ebc3c20b475b131",
+      "add_special": true,
+      "parse_special": false,
+      "camelid_ids": [
+        42347,
+        1808,
+        16,
+        20,
+        16,
+        21,
+        21,
+        24,
+        60
+      ],
+      "llama_cpp_ids": [
+        42347,
+        1808,
+        16,
+        20,
+        16,
+        21,
+        21,
+        24,
+        60
+      ],
+      "exact_match": true,
+      "camelid_decoded_sha256": "2eee451e575a83e7f5e16b97489c842ea41bb94dbe907bec2ebc3c20b475b131"
+    }
+  ],
+  "result": {
+    "case_count": 13,
+    "exact_match_count": 13,
+    "all_token_ids_match": true,
+    "support_decision": "qwen3_moe_exact_row_tokenizer_gate_only"
+  },
+  "does_not_prove": [
+    "full artifact integrity or presence on this host",
+    "weight load, logits, generation, or greedy-token parity",
+    "API, SSE, Models page, WebUI, or context readiness",
+    "sampling, tools, GPU execution, performance, neighboring rows, or broad Qwen3 MoE support"
+  ]
+}

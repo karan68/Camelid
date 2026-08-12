@@ -1,0 +1,19 @@
+{
+  "schema": "camelid.hf-source-lock/v1",
+  "repo": "ggml-org/SmolLM3-3B-GGUF",
+  "file": "SmolLM3-Q8_0.gguf",
+  "revision": "4965cb60b150737b68a0408c36aeefb65078f894",
+  "size_bytes": 3275574624,
+  "sha256": "8aa8cc74656137174a1988d993b00828e65a86fd68773412b632a75aa1373248",
+  "license": "apache-2.0",
+  "access": {
+    "gated": false,
+    "private": false,
+    "disabled": false
+  },
+  "row_id": "smollm3_3b_q8_0",
+  "resolved_at": "2026-08-10T07:18:15.340Z",
+  "artifact": {
+    "status": "not_checked"
+  }
+}

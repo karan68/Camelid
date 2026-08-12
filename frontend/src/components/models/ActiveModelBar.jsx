@@ -3,6 +3,7 @@ import { StatusDot } from '../ui/StatusDot'
 import { EvidenceChip } from '../ui/EvidenceChip'
 import { IconStop } from '../ui/icons'
 import { laneOf } from '../../lib/modelLanes'
+import { isEmbeddingOnlyModel } from '../../lib/modelCapabilities.js'
 
 /* Zone 1 — what is loaded right now, with the one Unload action. The lane chip is
    derived for the loaded file exactly like the section rows are; runtime readiness
@@ -10,9 +11,9 @@ import { laneOf } from '../../lib/modelLanes'
 
 function activeLaneChip(lane) {
   if (lane === 'supported') return <EvidenceChip state="supported" asText size="sm">Supported</EvidenceChip>
-  if (lane === 'compatible') return <EvidenceChip state="runnable" asText size="sm">Experimental</EvidenceChip>
+  if (lane === 'compatible') return <EvidenceChip state="runnable" asText size="sm">Runnable</EvidenceChip>
   if (lane === 'eligible') return <EvidenceChip state="runnable" asText size="sm">Ready to test</EvidenceChip>
-  return <EvidenceChip state="unsupported" asText size="sm">Experimental</EvidenceChip>
+  return <EvidenceChip state="unsupported" asText size="sm">Unverified</EvidenceChip>
 }
 
 export function ActiveModelBar({
@@ -30,12 +31,14 @@ export function ActiveModelBar({
   const online = runtime?.status === 'online'
   const generationReady = Boolean(runtime?.generation_ready)
   const loaded = Boolean(activeFilename)
+  const embeddingOnly = loaded && isEmbeddingOnlyModel(activeEntry || { filename: activeFilename }, runtime)
+  const readyForTask = loaded && (generationReady || embeddingOnly)
   return (
     <section className="models-active-bar" aria-label="Active model">
       <div className="models-active-bar__id">
         <StatusDot
-          tone={online ? (loaded && generationReady ? 'ready' : 'warn') : 'offline'}
-          pulse={loaded && generationReady}
+          tone={online ? (readyForTask ? 'ready' : 'warn') : 'offline'}
+          pulse={readyForTask}
           label=""
         />
         <div className="models-active-bar__name">
@@ -44,7 +47,9 @@ export function ActiveModelBar({
             {!online
               ? 'Runtime offline'
               : loaded
-                ? generationReady
+                ? embeddingOnly
+                  ? 'Ready for embeddings · not a Chat model'
+                  : generationReady
                   ? 'Generation-ready'
                   : 'Loaded, but not generation-ready yet'
                 : 'Load a model below to unlock chat.'}
@@ -53,7 +58,7 @@ export function ActiveModelBar({
       </div>
       <div className="models-active-bar__actions">
         {loaded && activeEntry ? activeLaneChip(laneOf(activeEntry, capabilities)) : null}
-        {loaded && verification?.report?.outcome === 'verified' ? (
+        {loaded && !embeddingOnly && verification?.report?.outcome === 'verified' ? (
           <EvidenceChip
             state="evidence"
             size="sm"
@@ -65,10 +70,10 @@ export function ActiveModelBar({
             Verified on this machine
           </EvidenceChip>
         ) : null}
-        {loaded && verification?.report?.outcome === 'not_verified' ? (
+        {loaded && !embeddingOnly && verification?.report?.outcome === 'not_verified' ? (
           <EvidenceChip state="error" asText size="sm">Not verified</EvidenceChip>
         ) : null}
-        {loaded && verification?.eligible ? (
+        {loaded && !embeddingOnly && verification?.eligible ? (
           <Button variant="outline" size="sm" onClick={onVerify} loading={verificationBusy} disabled={busy}>
             {verification?.report ? 'Verify again' : 'Verify'}
           </Button>

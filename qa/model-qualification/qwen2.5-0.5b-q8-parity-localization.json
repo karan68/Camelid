@@ -1,0 +1,109 @@
+{
+  "schema": "camelid.model-parity-localization/v1",
+  "generated_at": "2026-08-10T06:55:17Z",
+  "row_id": "qwen2_5_0_5b_instruct_q8_0",
+  "artifact": {
+    "file": "qwen2.5-0.5b-instruct-q8_0.gguf",
+    "sha256": "ca59ca7f13d0e15a8cfa77bd17e65d24f6844b554a7b6c12e07a5f89ff76844e"
+  },
+  "camelid": {
+    "binary_build": "v0.6.1-15-g4efe4920-dirty",
+    "backend": "cpu_reference",
+    "gpu": "off",
+    "deterministic": true,
+    "prompt_ids": [785, 3974, 13876, 38835],
+    "forced_prefix_ids_at_divergence": [
+      785,
+      3974,
+      13876,
+      38835,
+      34208,
+      916,
+      264,
+      15678,
+      5562,
+      11
+    ],
+    "continuous_step": {
+      "generated_index": 6,
+      "chosen_id": 323,
+      "top_two": [
+        { "id": 323, "logit": 18.372192 },
+        { "id": 374, "logit": 18.324024 }
+      ],
+      "gap": 0.048168
+    },
+    "fresh_exact_prefix_step": {
+      "chosen_id": 323,
+      "top_two": [
+        { "id": 323, "logit": 18.372192 },
+        { "id": 374, "logit": 18.324024 }
+      ],
+      "bit_identical_to_continuous_step": true
+    }
+  },
+  "oracle": {
+    "engine": "llama.cpp",
+    "build": "b9632",
+    "revision": "acd79d603",
+    "backend": "CPU",
+    "continuous_and_fresh_exact_prefix_are_identical": true,
+    "variants": [
+      {
+        "name": "fixture_reproduction_defaults",
+        "flags": ["-ngl", "0", "-c", "512", "--no-warmup"],
+        "chosen_id": 374,
+        "top_two": [
+          { "id": 374, "logprob": -1.9951506853103638 },
+          { "id": 323, "logprob": -2.002303123474121 }
+        ],
+        "gap": 0.007152438163757324
+      },
+      {
+        "name": "f32_kv_only",
+        "extra_flags": ["-ctk", "f32", "-ctv", "f32"],
+        "chosen_id": 374,
+        "gap": 0.007152438163757324
+      },
+      {
+        "name": "no_repack_only",
+        "extra_flags": ["--no-repack"],
+        "chosen_id": 374,
+        "gap": 0.007152438163757324
+      },
+      {
+        "name": "flash_attention_off",
+        "extra_flags": ["-fa", "off"],
+        "chosen_id": 374,
+        "top_two": [
+          { "id": 374, "logprob": -1.8762142658233643 },
+          { "id": 323, "logprob": -1.9505665302276611 }
+        ],
+        "gap": 0.07435226440429688
+      },
+      {
+        "name": "canonical_cpu_diagnostic",
+        "extra_flags": ["-fa", "off", "-ctk", "f32", "-ctv", "f32", "--no-repack"],
+        "chosen_id": 374,
+        "top_two": [
+          { "id": 374, "logprob": -1.838340163230896 },
+          { "id": 323, "logprob": -1.9774316549301147 }
+        ],
+        "gap": 0.13909149169921875
+      }
+    ]
+  },
+  "finding": {
+    "classification": "stable_cross_engine_numerical_frontier",
+    "cache_or_prefill_split": false,
+    "strict_parity_pass": false,
+    "runtime_fix_applied": false,
+    "reason": "Both engines reproduce their own continuous-decode result bit-for-bit from the exact divergence prefix. All tested llama.cpp CPU variants keep token 374 first, while Camelid keeps token 323 first. Changing the oracle's attention mode changes the margin but not the verdict; without a layer trace this does not identify the originating operation, and there is no evidence for a cache repair, tie override, or token-specific adjustment."
+  },
+  "fixture_reproducibility_note": "The existing oracle fixture pins the binary build and artifact but not the launch flags. Its numbers reproduce under llama.cpp defaults; future promotion evidence must also pin attention, KV-cache, repack, context, and warmup flags.",
+  "proposed_gate_update": {
+    "parity": "fail",
+    "disposition": "remain_experimental_unverified",
+    "next_evidence": "A layer-by-layer hidden-state comparison against one explicitly pinned oracle lane; do not weaken exact greedy parity."
+  }
+}

@@ -1,7 +1,7 @@
 # Camelid SafeTensors Plan
 
 > [!NOTE]
-> This document is a design or recon note, not the public support ledger. For current support truth and release status, use [`COMPATIBILITY.md`](../../COMPATIBILITY.md) and [`STATUS.md`](../../STATUS.md).
+> This document is a design or recon note, not the public support ledger. For current support truth and release status, use [`COMPATIBILITY.md`](../../COMPATIBILITY.md) and [`STATUS.md`](../reference/STATUS.md).
 
 Camelid's active runtime path remains GGUF/TinyLlama parity. SafeTensors support is a parallel architecture lane: design the seams now, avoid GGUF-only assumptions, and do not add loader/runtime churn until the current real-model correctness gate is stable.
 
@@ -189,6 +189,19 @@ Local `main` head `fd894db8a560` now has the first SafeTensors source/readiness 
 The first fixture coverage matches the architecture guardrails from the 09:20 check: complete local HF directory, missing tokenizer, missing shard index, invalid shard index, and unsupported config all assert exact blocker codes. The implementation still performs no network access, no Hugging Face Hub downloads, no SafeTensors weight decode, and no `/api/models/load` behavior change.
 
 Next code slice should stay local/test-first: parse richer HF `config.json` fields into typed Camelid-owned metadata, then add SafeTensors header/tensor-descriptor parsing for tiny fixture shards before any materialization or API exposure.
+
+## 2026-08-10 Tokenizer JSON Readiness Slice
+
+Local Hugging Face inspection now validates `tokenizer.json` content instead of treating file existence as tokenizer readiness. The isolated adapter uses the official Hugging Face `tokenizers` crate pinned to `0.23.1`, with default features disabled and the pure-Rust `fancy-regex` backend selected. This deliberately excludes the default Oniguruma native build, C++ `esaxx` acceleration, progress UI, and Hugging Face Hub/network support from Camelid's cross-platform dependency graph.
+
+The readiness contract is narrow and evidence-oriented:
+
+- Validate that the JSON root, format version, model object, and model type are structurally present.
+- Deserialize the full pipeline with upstream `tokenizers`, require a non-empty vocabulary, and run three stable encode/decode probes with special-token insertion disabled.
+- Record probe inputs, token IDs, token strings, decoded output, and exact-round-trip observations in the source manifest so a later Python/Transformers fixture can compare the same contract.
+- Fail tokenizer readiness with stable typed blocker codes for unreadable/invalid structure, upstream deserialization, empty vocabulary, and encode/decode probe failures.
+
+This is not generation support. `generation_ready` remains false even after tokenizer inspection succeeds: BOS/EOS/PAD semantics, added/control-token parity, `tokenizer_config.json` chat-template rendering, external Transformers parity, tensor orientation, and a one-token dense execution fixture are still required gates.
 
 ## Recommended Rust Crates / APIs
 

@@ -1,0 +1,199 @@
+{
+  "schema": "camelid.qwen3-moe-chat-template-shapes/v1",
+  "pack_id": "qwen3-moe-chat-template-shapes-v1",
+  "row_id": "qwen3_30b_a3b_q8_0",
+  "support_scope": "preparation_only_template_gate_blocked_known_partial_analyzer_evidence",
+  "grounding": {
+    "header_receipt": "qa/model-qualification/qwen3-30b-a3b-q8-header-inspection.json",
+    "header_receipt_sha256": "293f8dd99f4f31478a0a6a7b3fc9c3e6a1c224a9df0b1dc3253e619d93a2dc33",
+    "tokenizer_receipt": "qa/model-qualification/qwen3-30b-a3b-q8-header-tokenizer-parity.json",
+    "tokenizer_receipt_sha256": "021dbe0b4f6a94f7140daa8e02969106dab941e205d184ee60f683d58f13ea37",
+    "template_fixture": "qa/model-qualification/fixtures/qwen3-moe-chat-template-v1.json",
+    "template_fixture_sha256": "d56522fa07d1e5b597d3edd708dfaca6087bc5f14e216702d5a27671f304f427"
+  },
+  "source": {
+    "repo": "Qwen/Qwen3-30B-A3B-GGUF",
+    "file": "Qwen3-30B-A3B-Q8_0.gguf",
+    "revision": "e4d4bafdfb96a411a163846265362aceb0b9c63a",
+    "size_bytes": 32483931648,
+    "sha256": "4ad960d180b16f56024f5b704697e5dd5b0837167c2e515ef0569abfc599743c",
+    "license": "apache-2.0"
+  },
+  "bounded_prefix": {
+    "requested_bytes": 33554432,
+    "received_bytes": 33554432,
+    "prefix_sha256": "55c565264523c5862247d983f857b9034c04d762ee14fecfd68a827cdbb2d566",
+    "content_range": {
+      "start": 0,
+      "end": 33554431,
+      "total": 32483931648
+    },
+    "full_weights_downloaded": false
+  },
+  "source_template": {
+    "utf8_bytes": 4100,
+    "sha256": "57f1fd00f0013a2be96aa79b857391f27e23df5b5f847072b524c897e24d0361",
+    "text": "{%- if tools %}\n    {{- '<|im_start|>system\\n' }}\n    {%- if messages[0].role == 'system' %}\n        {{- messages[0].content + '\\n\\n' }}\n    {%- endif %}\n    {{- \"# Tools\\n\\nYou may call one or more functions to assist with the user query.\\n\\nYou are provided with function signatures within <tools></tools> XML tags:\\n<tools>\" }}\n    {%- for tool in tools %}\n        {{- \"\\n\" }}\n        {{- tool | tojson }}\n    {%- endfor %}\n    {{- \"\\n</tools>\\n\\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\\n<tool_call>\\n{\\\"name\\\": <function-name>, \\\"arguments\\\": <args-json-object>}\\n</tool_call><|im_end|>\\n\" }}\n{%- else %}\n    {%- if messages[0].role == 'system' %}\n        {{- '<|im_start|>system\\n' + messages[0].content + '<|im_end|>\\n' }}\n    {%- endif %}\n{%- endif %}\n{%- set ns = namespace(multi_step_tool=true, last_query_index=messages|length - 1) %}\n{%- for index in range(ns.last_query_index, -1, -1) %}\n    {%- set message = messages[index] %}\n    {%- if ns.multi_step_tool and message.role == \"user\" and not('<tool_response>' in message.content and '</tool_response>' in message.content) %}\n        {%- set ns.multi_step_tool = false %}\n        {%- set ns.last_query_index = index %}\n    {%- endif %}\n{%- endfor %}\n{%- for message in messages %}\n    {%- if (message.role == \"user\") or (message.role == \"system\" and not loop.first) %}\n        {{- '<|im_start|>' + message.role + '\\n' + message.content + '<|im_end|>' + '\\n' }}\n    {%- elif message.role == \"assistant\" %}\n        {%- set content = message.content %}\n        {%- set reasoning_content = '' %}\n        {%- if message.reasoning_content is defined and message.reasoning_content is not none %}\n            {%- set reasoning_content = message.reasoning_content %}\n        {%- else %}\n            {%- if '</think>' in message.content %}\n                {%- set content = message.content.split('</think>')[-1].lstrip('\\n') %}\n                {%- set reasoning_content = message.content.split('</think>')[0].rstrip('\\n').split('<think>')[-1].lstrip('\\n') %}\n            {%- endif %}\n        {%- endif %}\n        {%- if loop.index0 > ns.last_query_index %}\n            {%- if loop.last or (not loop.last and reasoning_content) %}\n                {{- '<|im_start|>' + message.role + '\\n<think>\\n' + reasoning_content.strip('\\n') + '\\n</think>\\n\\n' + content.lstrip('\\n') }}\n            {%- else %}\n                {{- '<|im_start|>' + message.role + '\\n' + content }}\n            {%- endif %}\n        {%- else %}\n            {{- '<|im_start|>' + message.role + '\\n' + content }}\n        {%- endif %}\n        {%- if message.tool_calls %}\n            {%- for tool_call in message.tool_calls %}\n                {%- if (loop.first and content) or (not loop.first) %}\n                    {{- '\\n' }}\n                {%- endif %}\n                {%- if tool_call.function %}\n                    {%- set tool_call = tool_call.function %}\n                {%- endif %}\n                {{- '<tool_call>\\n{\"name\": \"' }}\n                {{- tool_call.name }}\n                {{- '\", \"arguments\": ' }}\n                {%- if tool_call.arguments is string %}\n                    {{- tool_call.arguments }}\n                {%- else %}\n                    {{- tool_call.arguments | tojson }}\n                {%- endif %}\n                {{- '}\\n</tool_call>' }}\n            {%- endfor %}\n        {%- endif %}\n        {{- '<|im_end|>\\n' }}\n    {%- elif message.role == \"tool\" %}\n        {%- if loop.first or (messages[loop.index0 - 1].role != \"tool\") %}\n            {{- '<|im_start|>user' }}\n        {%- endif %}\n        {{- '\\n<tool_response>\\n' }}\n        {{- message.content }}\n        {{- '\\n</tool_response>' }}\n        {%- if loop.last or (messages[loop.index0 + 1].role != \"tool\") %}\n            {{- '<|im_end|>\\n' }}\n        {%- endif %}\n    {%- endif %}\n{%- endfor %}\n{%- if add_generation_prompt %}\n    {{- '<|im_start|>assistant\\n' }}\n    {%- if enable_thinking is defined and enable_thinking is false %}\n        {{- '<think>\\n\\n</think>\\n\\n' }}\n    {%- endif %}\n{%- endif %}"
+  },
+  "inspector": {
+    "version": "camelid v0.6.1-35-gded8e95b",
+    "binary_sha256": "f55721a6fbd66035725f3f67309112e68c9a98cb646a1da9c74a620a4ec2d1f1",
+    "source_head": "ded8e95b95fadbe2e7ab6a03d48e4d1e9a2c32d6",
+    "binary_commit_abbrev": "ded8e95b",
+    "binary_reports_dirty": false,
+    "binary_matches_source_head": true,
+    "clean_current_head_at_grounding": true,
+    "binary_path_redacted": true
+  },
+  "analyzer": {
+    "project": "llama.cpp",
+    "build": 9632,
+    "revision": "acd79d603cb2e1c84c0886137b80f1ad649b6857",
+    "reported_revision": "acd79d603",
+    "analyzer_executable": "llama-template-analysis.exe",
+    "analyzer_binary_sha256": "3ee4a64a2cc3f71cb07f0fe7357b779cab03468fc603f76637bb9d5364a9216c",
+    "companion_executable": "llama-cli.exe",
+    "companion_binary_sha256": "2ec09da0b81d0201ce5b21810caefb4e77fd108f383b30c15ca493c5a70f7731",
+    "platform": "win32-x64",
+    "package_file_count": 51,
+    "package_manifest_bytes": 4682,
+    "package_manifest_sha256": "d70bbe8beb7848396d0993ee533062c200350fd9961e2b92c799b24f94a33e93",
+    "archive_size_bytes": 16899258,
+    "archive_sha256": "b835d5c5155dd2a5ed748a0351debf2ede0dc9f808757e0429f8700a11832dcd",
+    "executable_paths_redacted": true,
+    "mode": "known_partial_failure_not_oracle_success",
+    "result": "known_partial_failure_after_four_of_nine_diff_sections",
+    "exit_code": 0,
+    "completed_banner_observed": true,
+    "expected_diff_section_count": 9,
+    "completed_diff_sections": [
+      "Diff: With vs Without Tools (single user message)",
+      "Diff: With vs Without add_generation_prompt (single user message)",
+      "Diff: With vs Without reasoning_content (user, assistant)",
+      "Diff: With vs Without reasoning_content (user, assistant, user)"
+    ],
+    "unreached_diff_sections": [
+      "Diff: With vs Without tool call (user, assistant)",
+      "Diff: With vs Without tool call (user, assistant, user)",
+      "Diff: One vs Two tool calls (user, assistant)",
+      "Diff: One vs Two tool calls (user, assistant, user)",
+      "Diff: Tool call with vs without reasoning_content (user, assistant)"
+    ],
+    "normalized_transcript": {
+      "normalization": "strip_pinned_sgr_crlf_to_lf_redact_exact_template_path",
+      "capture_requirement": "exact_full_match_after_bounded_strict_prefix_only_retries",
+      "utf8_bytes": 2931,
+      "sha256": "9d213ca1db68779fd424aa3b75eb0b60d5957e5e4f47737a6247e20980873de9",
+      "persisted_in_pack": false
+    },
+    "failure": {
+      "marker": "Analysis failed:",
+      "expression_line": 34,
+      "expression_column": 31,
+      "error": "Cannot perform operation on null values"
+    },
+    "reported_capabilities_before_failure": {
+      "supports_tools": true,
+      "supports_tool_calls": true,
+      "supports_system_role": true,
+      "supports_parallel_tool_calls": true,
+      "supports_typed_content": false,
+      "supports_string_content": true
+    }
+  },
+  "cases": [
+    {
+      "id": "omitted_thinking_single_user_generation_prompt",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Hello, please help me."
+        }
+      ],
+      "tools_present": false,
+      "enable_thinking_input": "omitted_by_pinned_analyzer_case",
+      "add_generation_prompt": true,
+      "prompt": "<|im_start|>user\nHello, please help me.<|im_end|>\n<|im_start|>assistant\n",
+      "prompt_utf8_bytes": 72,
+      "prompt_sha256": "d1247d1ee2c7a1804cfa96ffca35c4d7470b47d7d898d77a531b2899076b0745",
+      "grounding": "exact completed add_generation_prompt diff right reconstruction"
+    },
+    {
+      "id": "omitted_thinking_user_assistant_user_generation_prompt",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Hello, please help me."
+        },
+        {
+          "role": "assistant",
+          "content": "I can help you with that."
+        },
+        {
+          "role": "user",
+          "content": "Thank you."
+        }
+      ],
+      "tools_present": false,
+      "enable_thinking_input": "omitted_by_pinned_analyzer_case",
+      "add_generation_prompt": true,
+      "prompt": "<|im_start|>user\nHello, please help me.<|im_end|>\n<|im_start|>assistant\nI can help you with that.<|im_end|>\n<|im_start|>user\nThank you.<|im_end|>\n<|im_start|>assistant\n",
+      "prompt_utf8_bytes": 168,
+      "prompt_sha256": "5bb69176d20519c59dabf2d9dddad85821298960aa047848761deeedf6a46c82",
+      "grounding": "exact completed user-assistant-user core plus exact isolated generation suffix"
+    }
+  ],
+  "contract": {
+    "evidence_status": "partial_analyzer_failure_expected_and_pinned",
+    "qualified_cases": [
+      "omitted_thinking_single_user_generation_prompt",
+      "omitted_thinking_user_assistant_user_generation_prompt"
+    ],
+    "qualification_granularity": "these_two_exact_no_tools_text_shapes_only",
+    "roles_observed": [
+      "user",
+      "assistant"
+    ],
+    "content_observed": "nonempty_strings_only",
+    "tools_observed": false,
+    "enable_thinking_observed": "omitted_only",
+    "add_generation_prompt_observed": true,
+    "parse_special_for_future_tokenization": true,
+    "add_special_for_future_tokenization": false,
+    "full_analyzer_success": false,
+    "runtime_renderer_qualified": false
+  },
+  "typed_hold_branches": [
+    "all_message_shapes_other_than_the_two_exact_cases",
+    "system_messages",
+    "tools_and_tool_calls",
+    "tool_role_history",
+    "reasoning_content",
+    "explicit_enable_thinking_true",
+    "explicit_enable_thinking_false",
+    "add_generation_prompt_false",
+    "empty_or_nontext_content",
+    "multimodal_content",
+    "runtime_apply_template_and_chat_surfaces"
+  ],
+  "template_gate": {
+    "status": "blocked",
+    "reason": "b9632 exits zero but reports Analysis failed after four of nine diff sections; only two exact pre-failure no-tools omitted-thinking text shapes are retained"
+  },
+  "does_not_prove": [
+    "full_template_oracle_success",
+    "runtime_chat_enablement",
+    "http_apply_template_parity",
+    "full_weight_download_or_hash",
+    "model_load",
+    "generation",
+    "tools_or_tool_calls",
+    "system_messages",
+    "reasoning_content",
+    "explicit_thinking_modes",
+    "tokenization_of_rendered_prompts",
+    "API_SSE_Models_page_WebUI_or_context_readiness",
+    "neighboring_rows_or_broad_Qwen3_MoE_support"
+  ],
+  "support_decision": "no_roster_change_template_preparation_only"
+}

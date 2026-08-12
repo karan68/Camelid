@@ -2,6 +2,26 @@ export function formatCapabilityStatus(value) {
   return (value || '').toString().replace(/_/g, ' ')
 }
 
+/* Human rendering of a contract status, for surfaces where the status is a
+   reassurance rather than the subject.
+
+   formatCapabilityStatus only swaps underscores for spaces, so a status token
+   reaches the screen almost verbatim — and the chip styling uppercases it, so
+   `supported_exact_row_smoke` renders under every chat reply as
+   "SUPPORTED EXACT ROW SMOKE". That is the contract's vocabulary, not the
+   reader's. The Compatibility ledger keeps the raw form on purpose (that view
+   exists to show the contract, and the exact token is the content there); the
+   raw id and status also stay one click away in every chip's popover. */
+export function capabilityStatusLabel(value) {
+  const status = String(value || '').toLowerCase()
+  if (!status) return null
+  if (isSupportedCapabilityStatus(status)) return 'Verified'
+  if (status.startsWith('runnable_exact_row_numerical_variance')) return 'Runnable (reference differs)'
+  if (status.startsWith('active_validation')) return 'Being verified'
+  if (status.startsWith('planned')) return 'Not verified yet'
+  return 'Not verified'
+}
+
 const GGUF_FILE_TYPE_QUANT_LABELS = {
   0: 'F32',
   1: 'F16',
@@ -42,6 +62,22 @@ const GGUF_FILE_TYPE_QUANT_LABELS = {
   // carry tensor type 41 while their file_type is 40; both Prism Q2 block
   // geometries declare file_type 41 and the backend refines the geometry.
   41: 'Q2_0',
+}
+
+/* Quant values travel through normalizeCapabilityKey, which strips separators so
+   "Q4_0" and "q4-0" compare equal — great for matching, wrong for reading, since
+   the key renders as "Q40". Map a key back to its canonical label before showing
+   it to anyone. Values already carrying a separator are passed through. */
+const CANONICAL_QUANT_BY_KEY = new Map(
+  Object.values(GGUF_FILE_TYPE_QUANT_LABELS).map((label) => [label.replace(/[^A-Z0-9]+/g, ''), label]),
+)
+
+export function displayQuantLabel(value) {
+  const raw = String(value || '').trim()
+  if (!raw) return null
+  const upper = raw.toUpperCase()
+  if (upper.includes('_')) return upper
+  return CANONICAL_QUANT_BY_KEY.get(upper.replace(/[^A-Z0-9]+/g, '')) || upper
 }
 
 export function quantLabelFromGgufFileType(fileType) {
@@ -98,6 +134,26 @@ const EXACT_ARTIFACT_GATED_ROWS = {
   llama32_1b_instruct_q8_0: 'Llama-3.2-1B-Instruct-Q8_0.gguf',
   llama32_3b_instruct_q8_0: 'Llama-3.2-3B-Instruct-Q8_0.gguf',
   llama3_8b_instruct_q8_0: 'Meta-Llama-3-8B-Instruct.Q8_0.gguf',
+  lfm2_5_1_2b_instruct_q8_0: 'LFM2.5-1.2B-Instruct-Q8_0.gguf',
+  lfm2_5_1_2b_thinking_q8_0: 'LFM2.5-1.2B-Thinking-Q8_0.gguf',
+  gemma3_270m_it_q8_0: 'gemma-3-270m-it-Q8_0.gguf',
+  gemma3_4b_it_q8_0: 'gemma-3-4b-it-Q8_0.gguf',
+  llama3_1_8b_instruct_q8_0: 'Meta-Llama-3.1-8B-Instruct-Q8_0.gguf',
+  mistral_7b_instruct_v0_2_q8_0: 'mistral-7b-instruct-v0.2.Q8_0.gguf',
+  qwen2_5_0_5b_instruct_q8_0: 'qwen2.5-0.5b-instruct-q8_0.gguf',
+  qwen2_5_1_5b_instruct_q8_0: 'qwen2.5-1.5b-instruct-q8_0.gguf',
+  qwen2_5_coder_1_5b_instruct_q8_0: 'qwen2.5-coder-1.5b-instruct-q8_0.gguf',
+  qwen3_5_0_8b_q8_0: 'Qwen3.5-0.8B-Q8_0.gguf',
+  qwen3_5_2b_q8_0: 'Qwen3.5-2B-Q8_0.gguf',
+  qwen3_5_4b_q8_0: 'Qwen3.5-4B-Q8_0.gguf',
+  qwen3_5_9b_q8_0: 'Qwen3.5-9B-Q8_0.gguf',
+  deepseek_r1_distill_qwen_1_5b_q8_0: 'DeepSeek-R1-Distill-Qwen-1.5B-Q8_0.gguf',
+  deepseek_r1_distill_llama_8b_q8_0: 'DeepSeek-R1-Distill-Llama-8B-Q8_0.gguf',
+  phi3_mini_4k_instruct_q8_0: 'Phi-3-mini-4k-instruct-Q8_0.gguf',
+  phi4_mini_instruct_q8_0: 'Phi-4-mini-instruct.Q8_0.gguf',
+  gemma2_9b_it_q8_0: 'gemma-2-9b-it-q8_0.gguf',
+  smollm3_3b_q8_0: 'SmolLM3-Q8_0.gguf',
+  aya_expanse_8b_q4_k_m: 'aya-expanse-8b-Q4_K_M.gguf',
 }
 
 function pathBasename(value) {
@@ -808,6 +864,57 @@ export function compatibilityHintCopy(hint) {
 
 export function isExactCompatibilityHint(hint) {
   return Boolean(hint?.kind === 'compatibility' && hint.exact === true)
+}
+
+/* A narrower claim than Supported, but materially stronger than "experimental".
+   Phase 2 rows earn this state only after the exact artifact loads, deterministic
+   greedy token IDs match the pinned oracle, and the guarded API/WebUI bundle
+   passes. Missing extended-context/performance/portability evidence keeps the row
+   out of Supported; it does not erase the checks that already passed. */
+export function isVerifiedRunnableCompatibilityTarget(target) {
+  const status = String(target?.status || '').toLowerCase()
+  if (!status || isSupportedCapabilityStatus(status)) return false
+  if (
+    status.includes('blocked')
+    || status.includes('hold')
+    || status.includes('planned')
+    || status.includes('missing')
+    || status.includes('fail_closed')
+    || status.includes('fail-closed')
+  ) return false
+  return statusContainsSupportedEvidence(target?.tensors_load)
+    && statusContainsSupportedEvidence(target?.generation_runs)
+    && statusContainsSupportedEvidence(target?.parity_audited)
+    && statusContainsSupportedEvidence(target?.frontend_load_path_verified)
+}
+
+/* A separate amber lane for exact artifacts that demonstrably load and generate
+   but do not reproduce every pinned greedy token ID. Strict parity still blocks
+   Verified/Supported; it no longer blocks ordinary local use. */
+export function isNumericalVarianceRunnableCompatibilityTarget(target) {
+  const status = String(target?.status || '').toLowerCase()
+  const parity = String(target?.parity_audited || '').toLowerCase()
+  return status === 'runnable_exact_row_numerical_variance'
+    && statusContainsSupportedEvidence(target?.tensors_load)
+    && statusContainsSupportedEvidence(target?.generation_runs)
+    && (parity.includes('failed') || parity.includes('divergence'))
+}
+
+export function exactCompatibilityTargetForModel(capabilities, model, catalogItem) {
+  const hint = findCompatibilityHint(capabilities, model, catalogItem)
+  return isExactCompatibilityHint(hint) ? hint.target : null
+}
+
+export function isCompatibilityVerifiedRunnableForModel(capabilities, model, catalogItem) {
+  return isVerifiedRunnableCompatibilityTarget(
+    exactCompatibilityTargetForModel(capabilities, model, catalogItem),
+  )
+}
+
+export function isCompatibilityNumericalVarianceRunnableForModel(capabilities, model, catalogItem) {
+  return isNumericalVarianceRunnableCompatibilityTarget(
+    exactCompatibilityTargetForModel(capabilities, model, catalogItem),
+  )
 }
 
 export function compatibilityHintMatchesExactTarget(capabilities, model, target, catalogItem) {

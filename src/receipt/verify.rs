@@ -48,6 +48,10 @@ pub struct VerifyOptions {
     pub mode: VerifyMode,
     pub llama_ctx: u32,
     pub llama_port: u16,
+    pub llama_cache_type_k: Option<String>,
+    pub llama_cache_type_v: Option<String>,
+    pub llama_flash_attn: Option<String>,
+    pub llama_no_repack: bool,
     pub threads: Option<usize>,
 }
 
@@ -489,33 +493,15 @@ fn run_isolated_verify_pass(
     pass: IsolatedPass,
 ) -> i32 {
     let mut cmd = Command::new(exe);
-    cmd.arg("verify-receipt")
-        .arg(&options.receipt_path)
-        .arg("--gguf")
-        .arg(&options.gguf);
-    match pass {
-        IsolatedPass::SelfReplay => {
-            cmd.arg("--self-only");
-            // Load the replay's weights as page-aligned mmap wire pages instead
-            // of ~7 GB of anonymous heap blocks: file-backed pages are
-            // reclaimable page cache, so a 7B replay fits on a host with only a
-            // few GB free (the heap path OOMs there). Same GPU kernels, so the
-            // replayed tokens are identical. Ignored on non-macOS / without the
-            // wire stack, where it falls back to the block path.
-            cmd.env("CAMELID_METAL_NOCOPY", "1");
-        }
-        IsolatedPass::Reference { reference_ctx } => {
-            cmd.arg("--reference-only")
-                .arg("--llama-server")
-                .arg(&options.llama_server)
-                .arg("--llama-ctx")
-                .arg(reference_ctx.to_string())
-                .arg("--llama-port")
-                .arg(options.llama_port.to_string());
-        }
-    }
-    if let Some(threads) = options.threads {
-        cmd.arg("--threads").arg(threads.to_string());
+    cmd.args(isolated_verify_args(options, pass));
+    if matches!(pass, IsolatedPass::SelfReplay) {
+        // Load the replay's weights as page-aligned mmap wire pages instead
+        // of ~7 GB of anonymous heap blocks: file-backed pages are
+        // reclaimable page cache, so a 7B replay fits on a host with only a
+        // few GB free (the heap path OOMs there). Same GPU kernels, so the
+        // replayed tokens are identical. Ignored on non-macOS / without the
+        // wire stack, where it falls back to the block path.
+        cmd.env("CAMELID_METAL_NOCOPY", "1");
     }
     // Inherit stdio so each pass's own PASS/FAIL lines stream straight through.
     match cmd.status() {
@@ -525,6 +511,50 @@ fn run_isolated_verify_pass(
             1
         }
     }
+}
+
+/// Build the Camelid CLI arguments for one isolated verifier child. Numerical
+/// options are expressed in Camelid's `verify-receipt` vocabulary here; only
+/// [`start_reference_server`] translates them to llama-server's `-ctk`/`-ctv`/
+/// `-fa` flags. Passing those llama-server flags directly to this child makes
+/// Clap reject the reference pass before the oracle can start.
+fn isolated_verify_args(options: &VerifyOptions, pass: IsolatedPass) -> Vec<std::ffi::OsString> {
+    let mut args = vec![
+        "verify-receipt".into(),
+        options.receipt_path.as_os_str().to_os_string(),
+        "--gguf".into(),
+        options.gguf.as_os_str().to_os_string(),
+    ];
+    match pass {
+        IsolatedPass::SelfReplay => args.push("--self-only".into()),
+        IsolatedPass::Reference { reference_ctx } => {
+            args.extend([
+                "--reference-only".into(),
+                "--llama-server".into(),
+                options.llama_server.clone().into(),
+                "--llama-ctx".into(),
+                reference_ctx.to_string().into(),
+                "--llama-port".into(),
+                options.llama_port.to_string().into(),
+            ]);
+            if let Some(cache_type) = &options.llama_cache_type_k {
+                args.extend(["--llama-cache-type-k".into(), cache_type.clone().into()]);
+            }
+            if let Some(cache_type) = &options.llama_cache_type_v {
+                args.extend(["--llama-cache-type-v".into(), cache_type.clone().into()]);
+            }
+            if let Some(flash_attn) = &options.llama_flash_attn {
+                args.extend(["--llama-flash-attn".into(), flash_attn.clone().into()]);
+            }
+            if options.llama_no_repack {
+                args.push("--llama-no-repack".into());
+            }
+        }
+    }
+    if let Some(threads) = options.threads {
+        args.extend(["--threads".into(), threads.to_string().into()]);
+    }
+    args
 }
 
 /// Map a child pass's exit code back to the orchestrator's outcome. Mirrors
@@ -597,6 +627,27 @@ struct ReferenceServer {
     _child: ChildGuard,
 }
 
+/// Explicit llama.cpp numerical-path flags selected by the verifier caller.
+/// Keeping these absent by default preserves the verifier's historical
+/// behavior; qualification harnesses can pin them when the comparator envelope
+/// requires a specific KV/attention/repacking path.
+fn llama_numeric_args(options: &VerifyOptions) -> Vec<String> {
+    let mut args = Vec::new();
+    if let Some(cache_type) = &options.llama_cache_type_k {
+        args.extend(["-ctk".to_string(), cache_type.clone()]);
+    }
+    if let Some(cache_type) = &options.llama_cache_type_v {
+        args.extend(["-ctv".to_string(), cache_type.clone()]);
+    }
+    if let Some(flash_attn) = &options.llama_flash_attn {
+        args.extend(["-fa".to_string(), flash_attn.clone()]);
+    }
+    if options.llama_no_repack {
+        args.push("--no-repack".to_string());
+    }
+    args
+}
+
 /// Spawn `llama-server` on the receipt's GGUF and wait until it is healthy.
 /// Called before the in-process Camelid replay loads any weights.
 fn start_reference_server(
@@ -621,20 +672,22 @@ fn start_reference_server(
             options.llama_port
         ));
     }
-    let child = Command::new(&options.llama_server)
-        .args([
-            "--host",
-            host,
-            "--port",
-            &options.llama_port.to_string(),
-            "-m",
-            &options.gguf.display().to_string(),
-            "-ngl",
-            "0",
-            "-c",
-            &options.llama_ctx.to_string(),
-            "--no-warmup",
-        ])
+    let mut command = Command::new(&options.llama_server);
+    command.args([
+        "--host",
+        host,
+        "--port",
+        &options.llama_port.to_string(),
+        "-m",
+        &options.gguf.display().to_string(),
+        "-ngl",
+        "0",
+        "-c",
+        &options.llama_ctx.to_string(),
+        "--no-warmup",
+    ]);
+    command.args(llama_numeric_args(options));
+    let child = command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -959,6 +1012,105 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn verifier_options() -> VerifyOptions {
+        VerifyOptions {
+            receipt_path: PathBuf::from("receipt.json"),
+            gguf: PathBuf::from("model.gguf"),
+            llama_server: "llama-server".to_string(),
+            mode: VerifyMode::ReferenceOnly,
+            llama_ctx: 640,
+            llama_port: 8243,
+            llama_cache_type_k: None,
+            llama_cache_type_v: None,
+            llama_flash_attn: None,
+            llama_no_repack: false,
+            threads: None,
+        }
+    }
+
+    #[test]
+    fn llama_numeric_args_are_explicit_and_ordered() {
+        let mut options = verifier_options();
+        assert!(llama_numeric_args(&options).is_empty());
+
+        options.llama_cache_type_k = Some("f32".to_string());
+        options.llama_cache_type_v = Some("f32".to_string());
+        options.llama_flash_attn = Some("off".to_string());
+        options.llama_no_repack = true;
+        assert_eq!(
+            llama_numeric_args(&options),
+            ["-ctk", "f32", "-ctv", "f32", "-fa", "off", "--no-repack"]
+        );
+    }
+
+    #[test]
+    fn isolated_reference_child_uses_verify_cli_numeric_args() {
+        let mut options = verifier_options();
+        options.llama_cache_type_k = Some("f32".to_string());
+        options.llama_cache_type_v = Some("f32".to_string());
+        options.llama_flash_attn = Some("off".to_string());
+        options.llama_no_repack = true;
+        options.threads = Some(6);
+
+        let args = isolated_verify_args(&options, IsolatedPass::Reference { reference_ctx: 640 });
+        let args = args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            [
+                "verify-receipt",
+                "receipt.json",
+                "--gguf",
+                "model.gguf",
+                "--reference-only",
+                "--llama-server",
+                "llama-server",
+                "--llama-ctx",
+                "640",
+                "--llama-port",
+                "8243",
+                "--llama-cache-type-k",
+                "f32",
+                "--llama-cache-type-v",
+                "f32",
+                "--llama-flash-attn",
+                "off",
+                "--llama-no-repack",
+                "--threads",
+                "6",
+            ]
+        );
+        assert!(!args
+            .iter()
+            .any(|arg| matches!(arg.as_str(), "-ctk" | "-ctv" | "-fa")));
+    }
+
+    #[test]
+    fn isolated_self_child_omits_reference_only_options() {
+        let mut options = verifier_options();
+        options.llama_cache_type_k = Some("f32".to_string());
+        options.llama_cache_type_v = Some("q8_0".to_string());
+        options.llama_flash_attn = Some("off".to_string());
+        options.llama_no_repack = true;
+
+        let args = isolated_verify_args(&options, IsolatedPass::SelfReplay)
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            [
+                "verify-receipt",
+                "receipt.json",
+                "--gguf",
+                "model.gguf",
+                "--self-only"
+            ]
+        );
+    }
 
     #[test]
     fn first_divergent_index_matches_harness_semantics() {

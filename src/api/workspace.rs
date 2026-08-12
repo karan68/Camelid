@@ -1860,7 +1860,7 @@ async fn workspace_semantic_retriever(
         .read()
         .await
         .values()
-        .filter(|model| model.gguf.architecture() == Some("nomic-bert"))
+        .filter(|model| super::is_embedding_model(&model.gguf))
         .map(|model| model.id.clone())
         .collect::<Vec<_>>();
     candidates.sort();

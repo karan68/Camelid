@@ -1,0 +1,47 @@
+{
+  "schema": "camelid.chat_template_shape_pack/v1",
+  "pack_id": "qwen3.5-text-chat-template-shapes-v1",
+  "purpose": "Locks the text-only Qwen3.5 template envelope for explicit thinking-enabled and thinking-disabled requests. Image/video content and tools remain outside this pack.",
+  "template": {
+    "utf8_bytes": 7816,
+    "sha256": "7f0e529032c25183bcd66c7f238da2d377f43be754a94e2725a58c4e16d2ed67"
+  },
+  "source_rows": [
+    {"repo": "unsloth/Qwen3.5-0.8B-GGUF", "revision": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0", "file": "Qwen3.5-0.8B-Q8_0.gguf", "size_bytes": 811843840, "sha256": "0ad885ffd4bb022fc4f0d33a3308fa108ef8613159d3b3a67e23abca056b7a6c"},
+    {"repo": "unsloth/Qwen3.5-2B-GGUF", "revision": "f6d5376be1edb4d416d56da11e5397a961aca8ae", "file": "Qwen3.5-2B-Q8_0.gguf", "size_bytes": 2012012800, "sha256": "1b04acba824817554f4ce23639bc8495ff70453b8fcb047900c731521021f2c1"},
+    {"repo": "unsloth/Qwen3.5-4B-GGUF", "revision": "e87f176479d0855a907a41277aca2f8ee7a09523", "file": "Qwen3.5-4B-Q8_0.gguf", "size_bytes": 4482403488, "sha256": "10cc391b403021dd11c614679d2fd92f611c3681d29e29651b717316965d61e1"},
+    {"repo": "unsloth/Qwen3.5-9B-GGUF", "revision": "3885219b6810b007914f3a7950a8d1b469d598a5", "file": "Qwen3.5-9B-Q8_0.gguf", "size_bytes": 9527502048, "sha256": "809626574d0cb43d4becfa56169980da2bb448f2299270f7be443cb89d0a6ae4"}
+  ],
+  "oracle": {"engine": "llama.cpp llama-server /apply-template and /tokenize", "build": "b9632", "revision": "acd79d603", "add_generation_prompt": true, "add_special": false, "parse_special": true},
+  "shapes": [
+    {
+      "id": "single_user_thinking_enabled",
+      "enable_thinking": true,
+      "messages": [{"role": "user", "content": "What is the capital of France?"}],
+      "expected_prompt": "<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n<think>\n",
+      "prompt_ids": [248045, 846, 198, 3710, 369, 279, 6511, 314, 9338, 30, 248046, 198, 248045, 74455, 198, 248068, 198]
+    },
+    {
+      "id": "single_user_thinking_disabled",
+      "enable_thinking": false,
+      "messages": [{"role": "user", "content": "What is the capital of France?"}],
+      "expected_prompt": "<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+      "prompt_ids": [248045, 846, 198, 3710, 369, 279, 6511, 314, 9338, 30, 248046, 198, 248045, 74455, 198, 248068, 271, 248069, 271]
+    },
+    {
+      "id": "system_user_thinking_disabled",
+      "enable_thinking": false,
+      "messages": [{"role": "system", "content": "You are a concise assistant."}, {"role": "user", "content": "Name the largest ocean."}],
+      "expected_prompt": "<|im_start|>system\nYou are a concise assistant.<|im_end|>\n<|im_start|>user\nName the largest ocean.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+      "prompt_ids": [248045, 8678, 198, 2523, 513, 264, 61446, 17313, 13, 248046, 198, 248045, 846, 198, 657, 279, 7526, 17415, 13, 248046, 198, 248045, 74455, 198, 248068, 271, 248069, 271]
+    },
+    {
+      "id": "multi_turn_thinking_disabled",
+      "enable_thinking": false,
+      "messages": [{"role": "user", "content": "Hi there."}, {"role": "assistant", "content": "Hello! How can I help?"}, {"role": "user", "content": "Say hello again."}],
+      "expected_prompt": "<|im_start|>user\nHi there.<|im_end|>\n<|im_start|>assistant\nHello! How can I help?<|im_end|>\n<|im_start|>user\nSay hello again.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+      "prompt_ids": [248045, 846, 198, 12675, 1017, 13, 248046, 198, 248045, 74455, 198, 9419, 0, 2500, 628, 353, 1438, 30, 248046, 198, 248045, 846, 198, 44240, 23066, 1495, 13, 248046, 198, 248045, 74455, 198, 248068, 271, 248069, 271]
+    }
+  ],
+  "does_not_prove": ["multimodal rendering", "tools", "weight load", "generation parity", "API/WebUI readiness", "context", "support"]
+}

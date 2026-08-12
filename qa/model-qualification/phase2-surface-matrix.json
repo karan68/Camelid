@@ -1,0 +1,23 @@
+{
+  "schema": "camelid.phase2-surface-matrix/v1",
+  "generated_utc": "2026-08-11T19:25:00Z",
+  "harness": "scripts/model-promotion-smoke-bundle.mjs",
+  "scope": "real exact-artifact load, non-streaming chat, SSE terminal usage, exact local identity, compatibility-row match, and guarded frontend state",
+  "storage": "full bundles retained on the external qualification volume; this redacted matrix is the repository receipt",
+  "summary": {
+    "parity_candidates": 9,
+    "pass": 9,
+    "not_run_downstream_of_parity_or_load_hold": 11
+  },
+  "rows": [
+    {"id":"lfm2_5_1_2b_instruct_q8_0","status":"pass","bundle_id":"lfm2_5_1_2b_instruct_q8_0-reasoning","notes":"five-token SSE response is reasoning_content-only; parser exposes typed reasoning progress without copying it into answer content"},
+    {"id":"gemma3_270m_it_q8_0","status":"pass","bundle_id":"gemma3_270m_it_q8_0"},
+    {"id":"mistral_7b_instruct_v0_2_q8_0","status":"pass","bundle_id":"mistral_7b_instruct_v0_2_q8_0-lazy","notes":"file-backed Q8_0 linear lane preserves the default 6 GiB CPU materialization safety cap"},
+    {"id":"qwen2_5_coder_1_5b_instruct_q8_0","status":"pass","bundle_id":"qwen2_5_coder_1_5b_instruct_q8_0"},
+    {"id":"qwen3_5_0_8b_q8_0","status":"pass","bundle_id":"qwen3_5_0_8b_q8_0"},
+    {"id":"qwen3_5_2b_q8_0","status":"pass","bundle_id":"qwen3_5_2b_q8_0"},
+    {"id":"deepseek_r1_distill_llama_8b_q8_0","status":"pass","bundle_id":"deepseek_r1_distill_llama_8b_q8_0-lazy"},
+    {"id":"gemma2_9b_it_q8_0","status":"pass","bundle_id":"gemma2_9b_it_q8_0-lazy","notes":"bounded one-token scalar/file-backed lane; deliberately slow, exact row only"},
+    {"id":"smollm3_3b_q8_0","status":"pass","bundle_id":"smollm3_3b_q8_0-bypass","notes":"surface pass is inside the bounded default-thinking envelope; template promotion remains blocked"}
+  ]
+}

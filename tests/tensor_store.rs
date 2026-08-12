@@ -132,25 +132,23 @@ fn mac_q8_repack_loads_attn_q_as_packed_runtime_without_row_major_duplicate() {
 
     let gguf = read_metadata(&path).unwrap();
     let store = TensorStore::open(&path, &gguf);
-    let tensor = store.load_q8_0_file_backed_linear(tensor_name).unwrap();
+    let file_backed_tensor = store.load_q8_0_file_backed_linear(tensor_name).unwrap();
 
     assert!(
-        tensor.data.is_empty(),
-        "{tensor_name} materialized f32 data"
+        file_backed_tensor.data.is_empty(),
+        "{tensor_name} file-backed load materialized f32 data"
     );
     assert!(
-        tensor.q8_0_blocks.is_none(),
-        "{tensor_name} kept q8_0 blocks"
+        file_backed_tensor.q8_0_blocks.is_none(),
+        "{tensor_name} file-backed load kept q8_0 blocks"
     );
     assert!(
-        tensor.q8_0_file_backing.is_none(),
-        "{tensor_name} kept file backing"
+        file_backed_tensor.q8_0_file_backing.is_some(),
+        "{tensor_name} file-backed load ignored its strict residency contract"
     );
-    assert!(tensor.q8_0_packed_rows4_4x4.is_none());
-    assert!(tensor.q8_0_packed_rows4_4x8.is_none());
-    let Q8_0RuntimeStorage::PackedRows4(packed) = tensor.q8_0_runtime_storage.unwrap();
-    assert_eq!(packed.rows, 32, "{tensor_name}");
-    assert_eq!(packed.blocks_per_row, 1, "{tensor_name}");
+    assert!(file_backed_tensor.q8_0_runtime_storage.is_none());
+    assert!(file_backed_tensor.q8_0_packed_rows4_4x4.is_none());
+    assert!(file_backed_tensor.q8_0_packed_rows4_4x8.is_none());
 
     let block_backed_tensor = store.load_q8_0_block_backed_linear(tensor_name).unwrap();
     assert!(
@@ -197,24 +195,22 @@ fn mac_q8_repack_loads_attention_kvo_as_packed_runtime_without_row_major_duplica
 
         let gguf = read_metadata(&path).unwrap();
         let store = TensorStore::open(&path, &gguf);
-        let tensor = store.load_q8_0_file_backed_linear(tensor_name).unwrap();
+        let file_backed_tensor = store.load_q8_0_file_backed_linear(tensor_name).unwrap();
         assert!(
-            tensor.data.is_empty(),
-            "{tensor_name} materialized f32 data"
+            file_backed_tensor.data.is_empty(),
+            "{tensor_name} file-backed load materialized f32 data"
         );
         assert!(
-            tensor.q8_0_blocks.is_none(),
-            "{tensor_name} kept q8_0 blocks"
+            file_backed_tensor.q8_0_blocks.is_none(),
+            "{tensor_name} file-backed load kept q8_0 blocks"
         );
         assert!(
-            tensor.q8_0_file_backing.is_none(),
-            "{tensor_name} kept file backing"
+            file_backed_tensor.q8_0_file_backing.is_some(),
+            "{tensor_name} file-backed load ignored its strict residency contract"
         );
-        assert!(tensor.q8_0_packed_rows4_4x4.is_none());
-        assert!(tensor.q8_0_packed_rows4_4x8.is_none());
-        let Q8_0RuntimeStorage::PackedRows4(packed) = tensor.q8_0_runtime_storage.unwrap();
-        assert_eq!(packed.rows, 32, "{tensor_name}");
-        assert_eq!(packed.blocks_per_row, 1, "{tensor_name}");
+        assert!(file_backed_tensor.q8_0_runtime_storage.is_none());
+        assert!(file_backed_tensor.q8_0_packed_rows4_4x4.is_none());
+        assert!(file_backed_tensor.q8_0_packed_rows4_4x8.is_none());
 
         let block_backed_tensor = store.load_q8_0_block_backed_linear(tensor_name).unwrap();
         assert!(
@@ -259,7 +255,7 @@ fn mac_q8_repack_loads_ffn_gate_as_transposed_packed_runtime_without_row_major_d
     let gguf = read_metadata(&path).unwrap();
     let store = TensorStore::open(&path, &gguf);
     let tensor = store
-        .load_q8_0_file_backed_linear("blk.0.ffn_gate.weight")
+        .load_q8_0_block_backed_linear("blk.0.ffn_gate.weight")
         .unwrap();
 
     assert_eq!(tensor.shape.dims, vec![32, 64]);
@@ -294,7 +290,7 @@ fn mac_q8_repack_loads_ffn_down_as_transposed_packed_runtime_without_row_major_d
     let gguf = read_metadata(&path).unwrap();
     let store = TensorStore::open(&path, &gguf);
     let tensor = store
-        .load_q8_0_file_backed_linear("blk.0.ffn_down.weight")
+        .load_q8_0_block_backed_linear("blk.0.ffn_down.weight")
         .unwrap();
 
     assert_eq!(tensor.shape.dims, vec![64, 32]);
@@ -330,18 +326,16 @@ fn x86_q8_repack_loads_attn_q_as_packed_runtime_without_row_major_duplicate() {
 
     let gguf = read_metadata(&path).unwrap();
     let store = TensorStore::open(&path, &gguf);
-    let tensor = store
+    let file_backed_tensor = store
         .load_q8_0_file_backed_linear("blk.0.attn_q.weight")
         .unwrap();
 
-    assert!(tensor.data.is_empty());
-    assert!(tensor.q8_0_blocks.is_none());
-    assert!(tensor.q8_0_file_backing.is_none());
-    assert!(tensor.q8_0_packed_rows4_4x4.is_none());
-    assert!(tensor.q8_0_packed_rows4_4x8.is_none());
-    let Q8_0RuntimeStorage::PackedRows4(packed) = tensor.q8_0_runtime_storage.unwrap();
-    assert_eq!(packed.rows, 32);
-    assert_eq!(packed.blocks_per_row, 1);
+    assert!(file_backed_tensor.data.is_empty());
+    assert!(file_backed_tensor.q8_0_blocks.is_none());
+    assert!(file_backed_tensor.q8_0_file_backing.is_some());
+    assert!(file_backed_tensor.q8_0_runtime_storage.is_none());
+    assert!(file_backed_tensor.q8_0_packed_rows4_4x4.is_none());
+    assert!(file_backed_tensor.q8_0_packed_rows4_4x8.is_none());
 
     let block_backed_tensor = store
         .load_q8_0_block_backed_linear("blk.0.attn_q.weight")
@@ -382,7 +376,7 @@ fn x86_q8_repack_loads_dense_attention_family_as_packed_runtime() {
 
         let gguf = read_metadata(&path).unwrap();
         let store = TensorStore::open(&path, &gguf);
-        let tensor = store.load_q8_0_file_backed_linear(tensor_name).unwrap();
+        let tensor = store.load_q8_0_block_backed_linear(tensor_name).unwrap();
 
         assert_eq!(tensor.shape.dims, vec![32, 32]);
         assert!(
@@ -433,7 +427,7 @@ fn x86_q8_repack_loads_attention_qkv_as_output_row_packed_runtime() {
 
         let gguf = read_metadata(&path).unwrap();
         let store = TensorStore::open(&path, &gguf);
-        let tensor = store.load_q8_0_file_backed_linear(tensor_name).unwrap();
+        let tensor = store.load_q8_0_block_backed_linear(tensor_name).unwrap();
 
         assert_eq!(tensor.shape.dims, vec![dims[0] as usize, dims[1] as usize]);
         assert!(
@@ -484,7 +478,7 @@ fn x86_q8_repack_loads_dense_ffn_family_as_transposed_packed_runtime() {
 
         let gguf = read_metadata(&path).unwrap();
         let store = TensorStore::open(&path, &gguf);
-        let tensor = store.load_q8_0_file_backed_linear(tensor_name).unwrap();
+        let tensor = store.load_q8_0_block_backed_linear(tensor_name).unwrap();
 
         assert_eq!(tensor.shape.dims, dims.map(|dim| dim as usize).to_vec());
         assert!(
@@ -538,7 +532,13 @@ fn mac_q8_repack_loads_output_projection_as_token_major_packed_runtime() {
     assert!(fallback.q8_0_file_backing.is_some());
 
     std::env::set_var("CAMELID_MAC_Q8_REPACK", "on");
-    let tensor = store.load_q8_0_file_backed_linear("output.weight").unwrap();
+    let strict = store.load_q8_0_file_backed_linear("output.weight").unwrap();
+    assert!(strict.q8_0_runtime_storage.is_none());
+    assert!(strict.q8_0_file_backing.is_some());
+
+    let tensor = store
+        .load_q8_0_block_backed_linear("output.weight")
+        .unwrap();
     assert_eq!(tensor.shape.dims, vec![32, 64]);
     assert!(tensor.data.is_empty());
     assert!(tensor.q8_0_blocks.is_none());
@@ -577,7 +577,13 @@ fn x86_q8_repack_loads_output_projection_as_token_major_packed_runtime() {
     assert!(fallback.q8_0_file_backing.is_some());
 
     std::env::set_var("CAMELID_X86_Q8_REPACK", "on");
-    let tensor = store.load_q8_0_file_backed_linear("output.weight").unwrap();
+    let strict = store.load_q8_0_file_backed_linear("output.weight").unwrap();
+    assert!(strict.q8_0_runtime_storage.is_none());
+    assert!(strict.q8_0_file_backing.is_some());
+
+    let tensor = store
+        .load_q8_0_block_backed_linear("output.weight")
+        .unwrap();
 
     assert_eq!(tensor.shape.dims, vec![32, 64]);
     assert!(tensor.data.is_empty());

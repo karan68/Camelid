@@ -1,7 +1,9 @@
 import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { getChatGateState } from '../lib/chatGate'
-import { exactArtifactFilenameForRow } from '../lib/capabilities'
-import { applyGemma4GhostChatTokenCap, getConfiguredMaxTokens, modelContextLength, validateSendBudget } from '../lib/responseLimits'
+import { displayQuantLabel, exactArtifactFilenameForRow } from '../lib/capabilities'
+import { formatModelLabel } from '../lib/formatters'
+import { isEmbeddingOnlyModel, isGenerationCapableModel } from '../lib/modelCapabilities.js'
+import { applyGemma4GhostChatTokenCap, getConfiguredMaxTokens, isBitNetB158ChatModel, modelContextLength, validateSendBudget } from '../lib/responseLimits'
 import { CamelidMark } from '../components/ui/CamelidMark'
 import { Avatar } from '../components/ui/Avatar'
 import { StatusDot } from '../components/ui/StatusDot'
@@ -147,12 +149,16 @@ export default function ChatWorkspace({
   firstRunActive = false,
   demoMode = false,
 }) {
-  // Chat is allowed on the supported lane (full gate) OR the weaker experimental
-  // lane (implemented-but-unsupported). The supported-specific copy below stays
-  // keyed on `selectedModelRunnable`; the experimental lane gets its own banner and
-  // never borrows the supported badge.
-  const canChat = selectedModelRunnable || selectedModelExperimental
-  const experimentalChatReady = selectedModelExperimental && !selectedModelRunnable
+  // Derive readiness from the shared gate here as well as in the dashboard hook.
+  // This keeps the rendered surface coherent in the first frame after a runtime
+  // transition, before parent props finish refreshing.
+  const selectedChatGate = getChatGateState(capabilities, selectedModel, runtime)
+  const supportedChatReady = selectedChatGate.chatUnlocked
+  const verifiedChatReady = selectedChatGate.chatMode === 'verified'
+  const varianceChatReady = selectedChatGate.chatMode === 'variance'
+  const unverifiedChatReady = selectedChatGate.chatMode === 'experimental'
+  const canChat = supportedChatReady || verifiedChatReady || varianceChatReady || unverifiedChatReady
+  const nonSupportedChatReady = !supportedChatReady && (selectedModelExperimental || verifiedChatReady || varianceChatReady || unverifiedChatReady)
   const visionReady = canChat && Boolean(runtime?.vision_ready)
   const [generationElapsedSeconds, setGenerationElapsedSeconds] = useState(0)
   const [showControls, setShowControls] = useState(false)
@@ -197,17 +203,39 @@ export default function ChatWorkspace({
     : (!pendingPrompt && !awaitingAssistant && !hasStreamingAssistant)
 
   // ----- Gate / readiness derivations (shared exact-row chat gate) -----
-  const selectedChatGate = getChatGateState(capabilities, selectedModel, runtime)
+  const selectedEmbeddingOnly = selectedChatGate.embeddingOnly
+  const selectedEmbeddingReady = selectedChatGate.embeddingReady
+  const selectedBitNetChatModel = isBitNetB158ChatModel(selectedModel, runtime, selectedModelId)
   const apiUnavailable = runtime?.status === 'offline'
   const selectedRuntimeReady = selectedChatGate.runtimeReady
   const selectedModelCapabilitySupported = selectedChatGate.contractSupported
+
+  useEffect(() => {
+    if (selectedBitNetChatModel && thinkingMode && setThinkingMode) setThinkingMode(false)
+  }, [selectedBitNetChatModel, setThinkingMode, thinkingMode])
   const supportBlocked = selectedRuntimeReady && !selectedModelCapabilitySupported
-  /* Only set when the row was matched but the loaded GGUF is not its exact
-     artifact — the one blocked state with a concrete next step. */
-  const blockedArtifactFilename = selectedChatGate.hint?.kind === 'artifact_mismatch'
-    ? exactArtifactFilenameForRow(selectedChatGate.hint.target)
-    : null
+  /* The two blocked states a reader can actually act on, each named concretely.
+     "Pick a verified model" alone leaves someone who is one file away from
+     working guessing at which file that is. */
+  const blockedSpecifics = (() => {
+    const hint = selectedChatGate.hint
+    if (hint?.kind === 'artifact_mismatch') {
+      const filename = exactArtifactFilenameForRow(hint.target)
+      return filename ? `it requires the exact ${filename} artifact` : null
+    }
+    if (hint?.kind === 'quant_mismatch') {
+      // observedQuant is a match key ("Q40"), not something to show a reader.
+      const verified = displayQuantLabel(hint.target?.quantization)
+      const observed = displayQuantLabel(selectedModel?.quant || hint.observedQuant)
+      if (verified && observed) return `this build is ${observed} and the verified build is ${verified}`
+      if (verified) return `only the ${verified} build is verified`
+    }
+    return null
+  })()
   const selectedRuntimeMatchesLoadedModel = Boolean(selectedChatGate.runtimeLoaded)
+  const selectedRuntimeLoadedButNotReady = Boolean(
+    selectedRuntimeMatchesLoadedModel && !selectedChatGate.runtimeGenerationReady,
+  )
   const selectedModelName = selectedModel?.name || selectedModelId || 'No model selected'
   const selectedModelIssue = selectedModel?.load_error || selectedModel?.install_error || ''
 
@@ -215,12 +243,22 @@ export default function ChatWorkspace({
      (send gate, reply cap, local-inference note) folds into the tooltip below. */
   const statusLine = apiUnavailable
     ? 'Not connected — start the local server to chat.'
-    : selectedModelRunnable
-      ? `${selectedModelName} is loaded and ready.`
-      : experimentalChatReady
+    : selectedEmbeddingOnly
+      ? selectedEmbeddingReady
+        ? `${selectedModelName} is ready for embeddings and reranking, not Chat.`
+        : `${selectedModelName} is an embedding model — load it from Models.`
+      : supportedChatReady
+        ? `${selectedModelName} is loaded and ready.`
+      : verifiedChatReady
+        ? `${selectedModelName} is loaded and verified for its checked envelope.`
+      : varianceChatReady
+        ? `${selectedModelName} is loaded and ready; reference output can vary.`
+      : unverifiedChatReady
         ? `${selectedModelName} is ready — replies are not verified.`
       : selectedModelIssue
         ? selectedModelIssue
+        : selectedRuntimeLoadedButNotReady
+          ? `${selectedModelName} is loaded, but this build cannot run it for Chat.`
         : supportBlocked
           ? `${selectedModelName} isn't verified for chat yet.`
           : selectedRuntimeMatchesLoadedModel
@@ -236,18 +274,29 @@ export default function ChatWorkspace({
                   : 'No model loaded — add one above to chat.'
 
   const productHeroTitle = canChat ? 'How can I help?' : "Hi there, let's get into it"
-  const productHeroSummary = selectedModelRunnable
+  const productHeroSummary = supportedChatReady
     ? 'Local chat is ready. Ask anything — responses stay grounded in the loaded model.'
-    : experimentalChatReady
-      ? 'Experimental local chat is ready. Replies are not verified.'
+    : verifiedChatReady
+      ? 'Verified local chat is ready. Extended-context support is still limited.'
+    : varianceChatReady
+      ? 'Local chat is ready. This exact model runs normally, with disclosed reference-output variance.'
+    : unverifiedChatReady
+      ? 'Unverified local chat is ready. Replies are clearly marked.'
     : apiUnavailable
       ? 'Keep writing here. Send unlocks again once the local API responds.'
-      : supportBlocked
-        /* When the blocker is a near-miss GGUF, naming the file the reader
-           actually needs is far more actionable than "pick a verified model" —
-           they are usually one download away, not one decision away. */
-        ? (blockedArtifactFilename
-            ? `This model isn't verified for chat yet: it requires the exact ${blockedArtifactFilename} artifact. Pick a verified model to unlock send.`
+      : selectedEmbeddingOnly
+        ? selectedEmbeddingReady
+          ? 'This model is loaded for embeddings and reranking. Choose a generation model to chat.'
+          : 'This model creates embeddings for search and reranking. Load it from Models, or choose a generation model to chat.'
+        : selectedRuntimeLoadedButNotReady
+          ? 'This model is loaded but not runnable for Chat in this build. Choose another model to continue.'
+        : supportBlocked
+          /* When the blocker is a near miss — wrong file, or the right model at an
+             unverified quantization — naming it is far more actionable than "pick a
+             verified model": they are usually one download away, not one decision
+             away. */
+          ? (blockedSpecifics
+            ? `This model isn't verified for chat yet: ${blockedSpecifics}. Pick a verified model to unlock send.`
             : "This model isn't verified for chat yet. Pick a verified model to unlock send.")
         : selectedModel
           ? 'Your draft is ready now. Send unlocks as soon as this model is ready.'
@@ -257,8 +306,8 @@ export default function ChatWorkspace({
             ? 'Camelid answers with a model running on this machine. Set one up above and this becomes a chat.'
             : 'Pick a local GGUF model first. Camelid will show the readiness path here.'
 
-  const readinessState = canChat ? 'ready' : apiUnavailable ? 'offline' : supportBlocked ? 'blocked' : selectedModel ? 'waiting' : 'idle'
-  const statusTone = selectedModelRunnable ? 'ready' : experimentalChatReady ? 'warn' : apiUnavailable ? 'offline' : supportBlocked ? 'warn' : runtime?.loaded_now ? 'warn' : 'neutral'
+  const readinessState = canChat ? 'ready' : apiUnavailable ? 'offline' : selectedEmbeddingOnly ? 'blocked' : selectedRuntimeLoadedButNotReady || supportBlocked ? 'blocked' : selectedModel ? 'waiting' : 'idle'
+  const statusTone = supportedChatReady || verifiedChatReady ? 'ready' : varianceChatReady || unverifiedChatReady ? 'warn' : apiUnavailable ? 'offline' : selectedEmbeddingReady ? 'ready' : selectedEmbeddingOnly ? 'neutral' : supportBlocked ? 'warn' : runtime?.loaded_now ? 'warn' : 'neutral'
 
   const canSubmit = Boolean(composer.trim()) && canChat && !generationActive
   const sendDisabledReason = canChat
@@ -267,8 +316,12 @@ export default function ChatWorkspace({
       ? 'Wait for the current reply to finish or stop it before sending again.'
       : apiUnavailable
         ? 'Sending unlocks once the connection is back.'
-        : supportBlocked
+        : selectedEmbeddingOnly
+          ? 'Choose a generation model to send this chat.'
+          : supportBlocked
           ? 'Choose a verified model to send.'
+          : selectedRuntimeLoadedButNotReady
+            ? 'Choose a runnable model to send.'
           : selectedModel
             ? 'Sending unlocks once this model is ready.'
             : 'Choose a model before sending.'
@@ -279,7 +332,11 @@ export default function ChatWorkspace({
     ? 'Message Camelid…'
     : apiUnavailable
       ? 'Draft a prompt while the Camelid API comes back'
-      : composerDraftUnlocked
+      : selectedEmbeddingOnly
+        ? 'Choose a generation model to send a chat'
+        : selectedRuntimeLoadedButNotReady
+          ? 'Choose a runnable model; this loaded model is blocked'
+        : composerDraftUnlocked
         ? 'Draft a prompt while Camelid finishes getting ready'
         : firstRunActive
           ? 'Set up the model above, then chat here'
@@ -424,18 +481,27 @@ export default function ChatWorkspace({
   }
 
   // ----- Model picker -----
-  const modelCanChat = (model) => ['supported', 'experimental'].includes(getChatGateState(capabilities, model, runtime).chatMode)
-  const runnableModels = models.filter(modelCanChat)
-  const waitingModels = models.filter((model) => !modelCanChat(model))
-  const selectedPickerModelId = models.some((model) => model.id === selectedModel?.id) ? selectedModel.id : ''
+  const modelCanChat = (model) => ['supported', 'verified', 'variance', 'experimental'].includes(getChatGateState(capabilities, model, runtime).chatMode)
+  const chatModels = models.filter((model) => isGenerationCapableModel(model, runtime))
+  const embeddingModels = models.filter((model) => isEmbeddingOnlyModel(model, runtime))
+  const runnableModels = chatModels.filter(modelCanChat)
+  const waitingModels = chatModels.filter((model) => !modelCanChat(model))
+  const selectedPickerModelId = chatModels.some((model) => model.id === selectedModel?.id) ? selectedModel.id : ''
+  /* The picker sat next to a top bar and message footer that both render clean
+     names, while it showed the raw GGUF filename — one model wearing two names
+     in the same view. formatModelLabel passes display names through untouched. */
   const modelOptionLabel = (model) => {
     const gate = getChatGateState(capabilities, model, runtime)
-    if (gate.chatUnlocked) return `${model.name} · Ready`
-    if (gate.chatMode === 'experimental') return `${model.name} · Experimental ready`
-    if (apiUnavailable) return `${model.name} · Not connected`
-    if (gate.runtimeReady) return `${model.name} · Not verified`
-    if (gate.runtimeLoaded) return `${model.name} · Loading`
-    return `${model.name} · Not loaded`
+    const name = formatModelLabel(model.name)
+    if (gate.embeddingOnly) return `${name} · Embedding only`
+    if (gate.chatUnlocked) return `${name} · Ready`
+    if (gate.chatMode === 'verified') return `${name} · Verified ready`
+    if (gate.chatMode === 'variance') return `${name} · Runnable ready`
+    if (gate.chatMode === 'experimental') return `${name} · Unverified ready`
+    if (apiUnavailable) return `${name} · Not connected`
+    if (gate.runtimeReady) return `${name} · Not verified`
+    if (gate.runtimeLoaded) return `${name} · Not runnable`
+    return `${name} · Not loaded`
   }
 
   /* Send-time budget check: the response limit is an upper bound the backend
@@ -528,7 +594,7 @@ export default function ChatWorkspace({
                   }}
                   disabled={generationActive || Boolean(loadingModelId)}
                 >
-                  {!selectedModel && <option value="">Choose model</option>}
+                  {!selectedPickerModelId && <option value="">Choose chat model</option>}
                   {runnableModels.length > 0 && (
                     <optgroup label="Ready">
                       {runnableModels.map((model) => <option key={model.id} value={model.id}>{modelOptionLabel(model)}</option>)}
@@ -537,6 +603,13 @@ export default function ChatWorkspace({
                   {waitingModels.length > 0 && (
                     <optgroup label="Needs readiness">
                       {waitingModels.map((model) => <option key={model.id} value={model.id}>{modelOptionLabel(model)}</option>)}
+                    </optgroup>
+                  )}
+                  {embeddingModels.length > 0 && (
+                    <optgroup label="Embedding only">
+                      {embeddingModels.map((model) => (
+                        <option key={model.id} value={`embedding:${model.id}`} disabled>{modelOptionLabel(model)}</option>
+                      ))}
                     </optgroup>
                   )}
                 </select>
@@ -578,7 +651,7 @@ export default function ChatWorkspace({
                 <IconReceipt size={16} /> <span className="cxcomposer__tool-label">{receiptMode ? 'Receipt on' : 'Receipt'}</span>
               </button>
             )}
-            {!demoMode && setThinkingMode && (
+            {!demoMode && setThinkingMode && !selectedBitNetChatModel && (
               <button
                 type="button"
                 className={`cxcomposer__tool cxcomposer__tool--collapsible ${thinkingMode ? 'is-on' : ''}`}
@@ -652,7 +725,7 @@ export default function ChatWorkspace({
          in an accessible Tooltip trigger beside it instead of a native title. */}
       <div id={composerReadinessId} className={`cxcomposer__status is-${statusTone}`}>
         <span className="cxcomposer__status-line" role="status" aria-live="polite">
-          <StatusDot tone={statusTone} pulse={selectedModelRunnable} />
+          <StatusDot tone={statusTone} pulse={supportedChatReady || verifiedChatReady || varianceChatReady} />
           <span className="cxcomposer__status-text">{statusLine}</span>
         </span>
         {statusDetail && (
@@ -670,13 +743,32 @@ export default function ChatWorkspace({
     <section className={`cxchat is-${readinessState} ${userScrolledAway ? 'is-user-scrolled' : ''} ${isFreshThread ? 'cxchat--empty' : ''}`} data-view="chat">
       <div className="cxchat__scroll">
         <div className="cxchat__column">
-          {selectedModelExperimental && !selectedModelRunnable && (
+          {verifiedChatReady && (
             <div className="cxchat__experimental-banner" role="note">
-              <EvidenceChip state="unsupported" asText>Experimental</EvidenceChip>
+              <EvidenceChip state="runnable" asText>Verified</EvidenceChip>
               <span>
-                Replies from this model are <strong>not verified</strong>. It can chat, but its
-                output has not been checked against a reference — every reply below is marked
-                experimental.
+                This exact row passed load, deterministic output comparison, and guarded app/API
+                checks. Extended-context and broader portability support remain limited.
+              </span>
+            </div>
+          )}
+          {nonSupportedChatReady && varianceChatReady && (
+            <div className="cxchat__experimental-banner" role="note">
+              <EvidenceChip state="runnable" asText>Runnable</EvidenceChip>
+              <span>
+                This exact model loads and generates normally. Some deterministic token IDs differ
+                from the pinned reference, so it is runnable but not labeled Verified or Supported.
+              </span>
+            </div>
+          )}
+          {nonSupportedChatReady && unverifiedChatReady && (
+            <div className="cxchat__experimental-banner" role="note">
+              <EvidenceChip state="unsupported" asText>Unverified</EvidenceChip>
+              <span>
+                Replies from this model are <strong>not verified</strong>.{' '}
+                {blockedSpecifics
+                  ? `It can chat, but ${blockedSpecifics}; every reply below is marked unverified.`
+                  : 'It can chat, but its output has not been checked against a reference — every reply below is marked unverified.'}
               </span>
             </div>
           )}

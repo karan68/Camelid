@@ -7,7 +7,7 @@
    absence of evidence — fail closed, never default-open.
 
    As of 2026-06-12 the live contract advertises no sampling rows, so every
-   control is guarded; see design-evidence/BACKEND_ASKS.md for the requested
+   control is guarded; see frontend/design-evidence/BACKEND_ASKS.md for the requested
    row shape. */
 
 import { isSupportedCapabilityStatus } from './capabilities.js'

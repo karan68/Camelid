@@ -294,8 +294,9 @@ assert.match(hookSource, /const quantLabel = active \? getLoadedModelQuantLabel\
 assert.match(hookSource, /const quantLabel = active \? getLoadedModelQuantLabel\(currentModel\) : null[\s\S]*const modelPath = active \? getModelPath\(currentModel\) \|\| localRecord\?\.model_path \|\| '' : localRecord\?\.model_path \|\| ''[\s\S]*name: resolveLoadedModelDisplayName\(\{ fallbackName, modelPath, quantLabel \}\)/, 'dashboard backend-row merge must preserve exact 3B loaded-model path and quant metadata even when /v1/models exposes a run-label id')
 assert.match(loadedModelDisplaySource, /ggufFileTypeValueFromLabel[\s\S]*quantLabelFromGgufFileType[\s\S]*LLAMA32_3B_ACCEPTANCE_FILENAME[\s\S]*normalizeQuantLabel\(quantLabel\) === 'Q8_0'/, 'backend 3B display aliasing must stay exact-filename plus decoded Q8_0/file_type 7 gated')
 assert.match(hookSource, /resolveLoadedModelDisplayName/, 'dashboard model merge must use the shared exact-filename plus Q8_0 loaded-model display gate')
-assert.match(chatSource, /modelCanChat\s*=\s*\(model\) => \['supported', 'experimental'\]\.includes\(getChatGateState\(capabilities, model, runtime\)\.chatMode\)/, 'chat model picker must derive supported and experimental lanes from the shared exact-row gate')
-assert.match(chatSource, /runnableModels\s*=\s*models\.filter\(modelCanChat\)/, 'chat model picker must filter through the shared supported-or-experimental lane predicate')
+assert.match(chatSource, /modelCanChat\s*=\s*\(model\) => \['supported', 'verified', 'variance', 'experimental'\]\.includes\(getChatGateState\(capabilities, model, runtime\)\.chatMode\)/, 'chat model picker must derive supported, verified, variance, and unverified runnable lanes from the shared exact-row gate')
+assert.match(chatSource, /chatModels\s*=\s*models\.filter\(\(model\) => isGenerationCapableModel\(model, runtime\)\)/, 'chat model picker must exclude embedding and companion models before applying chat readiness')
+assert.match(chatSource, /runnableModels\s*=\s*chatModels\.filter\(modelCanChat\)/, 'chat model picker must filter generation-capable models through the shared supported-or-experimental lane predicate')
 assert.match(chatSource, /canSubmit\s*=\s*Boolean\(composer\.trim\(\)\) && canChat && !generationActive/, 'composer send button must be blocked unless the chat gate (supported exact row or experimental lane) unlocked')
 /* Redesign (2026-08): the readiness fine print collapsed from a stack of lines
    into one composer status line plus a details tooltip, and its wording moved to
@@ -339,6 +340,7 @@ assert.equal((chatSource.match(/aria-label="Message Camelid"/g) || []).length, 1
 // Row-scoped capability-lane copy stays asserted on the System/API views below.
 const modelLanesSource = readFileSync(new URL('../src/lib/modelLanes.js', import.meta.url), 'utf8')
 const catalogSource = readFileSync(new URL('../src/components/models/CatalogLaneBrowse.jsx', import.meta.url), 'utf8')
+const catalogLaneSource = readFileSync(new URL('../src/lib/catalogBrowse.js', import.meta.url), 'utf8')
 const modelActivationSource = readFileSync(new URL('../src/lib/modelActivation.js', import.meta.url), 'utf8')
 assert.match(modelLanesSource, /isCompatibilitySupportedForModel\(capabilities, matchModel\(entry\)\)/, 'Models lane derivation must ask the shared contract matcher — the supported gate stays the contract voice')
 assert.match(modelsSource, /bucketByLane\(spine\.local\.models, capabilities\)/, 'ModelsView section membership must be derived from the live scan + capabilities at render time')
@@ -350,8 +352,10 @@ assert.match(modelActivationSource, /api\/models\/inspect[\s\S]*blocker[\s\S]*re
 assert.match(modelsSource, /loadLocalModelForChat\(/, 'ModelsView must load through the shared activation protocol')
 assert.doesNotMatch(modelsSource, /api\/models\/load/, 'ModelsView must not hand-roll a second load path')
 assert.doesNotMatch(modelsSource, /runtimeReady\s*=\s*isRunnableModel\(model\)/, 'ModelsView must not label runtime readiness from stale model-only readiness')
-assert.match(catalogSource, /isCompatibilitySupportedForModel\(capabilities, null, item\)/, 'catalog rows must resolve their landing lane through the shared capability matcher')
-assert.match(catalogSource, /if \(item\.group === 'experimental'\) return 'not_anchored'/, 'live Hugging Face rows must never anchor a lane or imply support')
+assert.match(catalogSource, /predictedLane\(item, capabilities\)/, 'catalog rows must delegate lane placement to the shared prediction helper')
+assert.match(catalogLaneSource, /isCompatibilitySupportedForModel\(capabilities, null, item\)/, 'catalog lane prediction must resolve ordinary rows through the shared capability matcher')
+assert.match(catalogLaneSource, /if \(item\?\.group === 'experimental'\)[\s\S]*kind: 'unverified'/, 'live Hugging Face rows must never anchor a lane or imply support')
+assert.match(catalogLaneSource, /if \(item\?\.host_lane_class != null\)[\s\S]*Camelid did not recognize the backend lane reported/, 'an explicit unrecognized host lane must fail closed')
 assert.match(apiSource, /Selected model evidence/, 'API view must surface evidence for the selected model')
 assert.match(apiSource, /selectedChatGate\s*=\s*getChatGateState\(capabilities, selectedModel, runtime\)/, 'API view must use the shared exact-row chat gate for 3B endpoint readiness')
 assert.match(apiSource, /selectedExactRowReady\s*=\s*selectedChatGate\.chatUnlocked/, 'API view must not reimplement 3B endpoint readiness separately from Chat/System')

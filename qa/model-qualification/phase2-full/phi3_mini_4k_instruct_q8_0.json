@@ -1,0 +1,255 @@
+{
+  "schema": "camelid.model-qualification-report/v1",
+  "generated_at": "2026-08-11T17:23:34.176Z",
+  "row_id": "phi3_mini_4k_instruct_q8_0",
+  "source_head": "fcab3e2f1debe4ef1b999b3e7ab193947d978f85",
+  "source_dirty": true,
+  "source_inspection": "observed",
+  "host": {
+    "hostname_redacted": true,
+    "platform": "darwin",
+    "release": "25.5.0",
+    "arch": "arm64",
+    "logical_cpus": 10
+  },
+  "backend": {
+    "serve": "cpu_reference",
+    "env": {
+      "CAMELID_GPU": "off",
+      "CAMELID_DETERMINISTIC": "1"
+    }
+  },
+  "artifact": {
+    "path": "<artifact>",
+    "size_bytes": 4061221376,
+    "sha256": "0ac8ee48aeebf7d1b354691fd1e29e91c32ad88bbad10ad45ac880dcd4372a47",
+    "path_redacted": true
+  },
+  "oracle_fixture": {
+    "path": "qa/model-qualification/fixtures/phase2/phi3_mini_4k_instruct_q8_0-tokenizer-b9632.json",
+    "status": "pass"
+  },
+  "stages": {
+    "source": {
+      "status": "pass",
+      "repo": "bartowski/Phi-3-mini-4k-instruct-GGUF",
+      "revision": "e1447f6da0be91f91683c5d19f938d4f51122d88",
+      "file": "Phi-3-mini-4k-instruct-Q8_0.gguf",
+      "license": "mit"
+    },
+    "artifact": {
+      "status": "pass",
+      "size_bytes": 4061221376,
+      "sha256": "0ac8ee48aeebf7d1b354691fd1e29e91c32ad88bbad10ad45ac880dcd4372a47"
+    },
+    "metadata": {
+      "status": "pass",
+      "command": [
+        "<camelid>",
+        "inspect",
+        "<artifact>"
+      ],
+      "observed": {
+        "architecture": "phi3",
+        "tokenizer_model": "llama",
+        "tokenizer_pre": "default",
+        "headline_quant": "Q8_0",
+        "tensor_count": 195
+      }
+    },
+    "tokenizer": {
+      "status": "pass",
+      "oracle_fixture": "qa/model-qualification/fixtures/phase2/phi3_mini_4k_instruct_q8_0-tokenizer-b9632.json",
+      "probes": [
+        {
+          "text": "Hello",
+          "match": true,
+          "first_divergence": null,
+          "actual_length": 2,
+          "expected_length": 2,
+          "actual_ids": [
+            1,
+            15043
+          ],
+          "expected_ids": [
+            1,
+            15043
+          ]
+        },
+        {
+          "text": "The capital of France is",
+          "match": true,
+          "first_divergence": null,
+          "actual_length": 6,
+          "expected_length": 6,
+          "actual_ids": [
+            1,
+            450,
+            7483,
+            310,
+            3444,
+            338
+          ],
+          "expected_ids": [
+            1,
+            450,
+            7483,
+            310,
+            3444,
+            338
+          ]
+        },
+        {
+          "text": "Once upon a time",
+          "match": true,
+          "first_divergence": null,
+          "actual_length": 5,
+          "expected_length": 5,
+          "actual_ids": [
+            1,
+            9038,
+            2501,
+            263,
+            931
+          ],
+          "expected_ids": [
+            1,
+            9038,
+            2501,
+            263,
+            931
+          ]
+        },
+        {
+          "text": "The quick brown fox",
+          "match": true,
+          "first_divergence": null,
+          "actual_length": 6,
+          "expected_length": 6,
+          "actual_ids": [
+            1,
+            450,
+            4996,
+            17354,
+            1701,
+            29916
+          ],
+          "expected_ids": [
+            1,
+            450,
+            4996,
+            17354,
+            1701,
+            29916
+          ]
+        },
+        {
+          "text": "2 + 2 =",
+          "match": true,
+          "first_divergence": null,
+          "actual_length": 7,
+          "expected_length": 7,
+          "actual_ids": [
+            1,
+            29871,
+            29906,
+            718,
+            29871,
+            29906,
+            353
+          ],
+          "expected_ids": [
+            1,
+            29871,
+            29906,
+            718,
+            29871,
+            29906,
+            353
+          ]
+        },
+        {
+          "text": "don't stop 12345\nUnicode café 東京 🙂",
+          "match": true,
+          "first_divergence": null,
+          "actual_length": 24,
+          "expected_length": 24,
+          "actual_ids": [
+            1,
+            1016,
+            29915,
+            29873,
+            5040,
+            29871,
+            29896,
+            29906,
+            29941,
+            29946,
+            29945,
+            13,
+            2525,
+            12858,
+            274,
+            28059,
+            29871,
+            30591,
+            30675,
+            29871,
+            243,
+            162,
+            156,
+            133
+          ],
+          "expected_ids": [
+            1,
+            1016,
+            29915,
+            29873,
+            5040,
+            29871,
+            29896,
+            29906,
+            29941,
+            29946,
+            29945,
+            13,
+            2525,
+            12858,
+            274,
+            28059,
+            29871,
+            30591,
+            30675,
+            29871,
+            243,
+            162,
+            156,
+            133
+          ]
+        }
+      ],
+      "chat_probes": []
+    },
+    "template": {
+      "status": "blocked",
+      "reason": "template rendering is downstream of the tokenizer fixture gate"
+    },
+    "load_smoke": {
+      "status": "blocked",
+      "reason": "smoke execution was not requested; pass --run-smoke"
+    },
+    "parity": {
+      "status": "blocked",
+      "reason": "greedy generation parity was not requested; pass --run-generation"
+    },
+    "api_webui": {
+      "status": "blocked",
+      "reason": "API/WebUI promotion smoke requires an explicitly started current-head server and frontend; this local file runner does not infer it"
+    },
+    "context": {
+      "status": "blocked",
+      "reason": "no preflighted context receipt captured; required buckets: 512"
+    }
+  },
+  "overall_status": "blocked"
+}

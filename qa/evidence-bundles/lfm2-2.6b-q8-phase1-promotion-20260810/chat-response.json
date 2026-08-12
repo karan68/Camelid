@@ -1,0 +1,48 @@
+{
+  "id": "chatcmpl-runnable",
+  "object": "chat.completion",
+  "created": 1786371925,
+  "model": "lfm2_5_2_6b_q8_0",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "\nThe user says \"hello\". This"
+      },
+      "finish_reason": "length"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 11,
+    "completion_tokens": 8,
+    "total_tokens": 19
+  },
+  "camelid": {
+    "generated_token_ids": [
+      207,
+      597,
+      4695,
+      2997,
+      496,
+      52071,
+      2784,
+      969
+    ],
+    "lane": "runnable",
+    "architecture": "lfm2",
+    "prompt_token_ids": [
+      124894,
+      124899,
+      5922,
+      207,
+      52071,
+      124900,
+      207,
+      124899,
+      63514,
+      207,
+      124901
+    ]
+  }
+}

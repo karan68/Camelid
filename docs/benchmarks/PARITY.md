@@ -149,7 +149,7 @@ That combination is the engineering trust story.
 If you want the shortest serious review path:
 
 1. Read `COMPATIBILITY.md`
-2. Read `STATUS.md`
+2. Read `docs/reference/STATUS.md`
 3. Open the row-specific manifest linked above
 4. Verify the row, source head, prompt-token parity, generated-token parity, and generated-text parity
 5. Confirm the claim in the README does not exceed that artifact
@@ -158,4 +158,4 @@ If you want the shortest serious review path:
 
 This file highlights parity proof only.
 
-It does not widen Camelid's support contract beyond the exact bounded claims in `COMPATIBILITY.md` and `STATUS.md`.
+It does not widen Camelid's support contract beyond the exact bounded claims in `COMPATIBILITY.md` and `docs/reference/STATUS.md`.
