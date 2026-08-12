@@ -512,9 +512,17 @@ pub(crate) struct ResponseStream {
     decoder: ChunkDecoder,
     /// Body bytes that arrived alongside the head, not yet framed.
     pending: Vec<u8>,
+    /// Decoded payload handed to the caller so far, which a declared
+    /// `Content-Length` is measured against.
+    delivered: usize,
     /// How long the node may send nothing at all before it counts as wedged.
     idle_timeout: Duration,
     max_chunk: usize,
+}
+
+/// A body that stopped before its framing said it would.
+fn truncated_body() -> HttpError {
+    HttpError::Malformed("connection closed before the response body completed".to_string())
 }
 
 /// Send a request and read only its head, leaving the body to be streamed.
@@ -576,6 +584,7 @@ pub(crate) fn open_stream(
     Ok(ResponseStream {
         decoder: ChunkDecoder::new(head.chunked),
         pending: raw[split.body_start..].to_vec(),
+        delivered: 0,
         head,
         stream,
         idle_timeout,
@@ -590,19 +599,21 @@ impl ResponseStream {
 
     /// The next piece of decoded body, or `None` once the body is complete.
     ///
-    /// A node that closes mid-body ends the stream rather than raising: the
-    /// status and earlier bytes have already reached the client, so reporting
-    /// a truncated stream as an error could not change what it received.
+    /// A node that dies mid-body raises rather than ending the stream. The
+    /// earlier bytes have already reached the client and cannot be taken back,
+    /// but relaying this as a clean end would frame a half-generation as a whole
+    /// one — the distinction chunked framing exists to carry.
     pub(crate) fn next_chunk(&mut self) -> Result<Option<Vec<u8>>, HttpError> {
         let mut out = Vec::new();
         if !self.pending.is_empty() {
             let pending = std::mem::take(&mut self.pending);
             self.decoder.push(&pending, self.max_chunk, &mut out)?;
             if !out.is_empty() {
+                self.delivered += out.len();
                 return Ok(Some(out));
             }
         }
-        if self.decoder.finished() {
+        if self.complete() == Some(true) {
             return Ok(None);
         }
 
@@ -615,14 +626,16 @@ impl ResponseStream {
                 ));
             }
             match self.stream.read(&mut scratch) {
+                Ok(0) if self.complete() == Some(false) => return Err(truncated_body()),
                 Ok(0) => return Ok(None),
                 Ok(read) => {
                     self.decoder
                         .push(&scratch[..read], self.max_chunk, &mut out)?;
                     if !out.is_empty() {
+                        self.delivered += out.len();
                         return Ok(Some(out));
                     }
-                    if self.decoder.finished() {
+                    if self.complete() == Some(true) {
                         return Ok(None);
                     }
                 }
@@ -638,10 +651,11 @@ impl ResponseStream {
         let mut body = Vec::new();
         let pending = std::mem::take(&mut self.pending);
         self.decoder.push(&pending, self.max_chunk, &mut body)?;
+        self.delivered = body.len();
 
         let deadline = Instant::now() + self.idle_timeout;
         let mut scratch = [0_u8; 8192];
-        while !self.complete(&body) {
+        while self.complete() != Some(true) {
             if Instant::now() >= deadline {
                 return Err(HttpError::Io(
                     "node sent nothing before the idle timeout".to_string(),
@@ -652,6 +666,7 @@ impl ResponseStream {
                 Ok(read) => {
                     self.decoder
                         .push(&scratch[..read], self.max_chunk, &mut body)?;
+                    self.delivered = body.len();
                     if body.len() > max_body {
                         return Err(HttpError::TooLarge(max_body));
                     }
@@ -661,6 +676,11 @@ impl ResponseStream {
             }
         }
 
+        // The one-shot path calls these same bytes malformed; the two readers
+        // must not disagree about whether a half-delivered body is an answer.
+        if self.complete() == Some(false) {
+            return Err(truncated_body());
+        }
         if body.len() > max_body {
             return Err(HttpError::TooLarge(max_body));
         }
@@ -670,15 +690,16 @@ impl ResponseStream {
         })
     }
 
-    /// Whether the body is fully read: the terminal chunk for a chunked body,
-    /// the declared length otherwise. With neither, only EOF ends it.
-    fn complete(&self, body: &[u8]) -> bool {
+    /// Whether the body's own framing says it is complete.
+    ///
+    /// `None` when the response declares no framing at all: the connection
+    /// closing is then the only thing that can end it, so an EOF there is a
+    /// clean end rather than a truncation.
+    fn complete(&self) -> Option<bool> {
         if self.head.chunked {
-            return self.decoder.finished();
+            return Some(self.decoder.finished());
         }
-        self.head
-            .content_length
-            .is_some_and(|len| body.len() >= len)
+        self.head.content_length.map(|len| self.delivered >= len)
     }
 }
 
@@ -1067,5 +1088,115 @@ mod tests {
             matches!(error, HttpError::Resolve(_)),
             "unexpected: {error:?}"
         );
+    }
+
+    /// Answer one connection with canned bytes and hang up, so a frame that
+    /// stops early can be exercised without a stub node.
+    fn canned_node(raw: &'static [u8]) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("has an address").port();
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut scratch = [0_u8; 4096];
+            let _ = stream.read(&mut scratch);
+            let _ = stream.write_all(raw);
+        });
+        port
+    }
+
+    fn stream_from(port: u16) -> ResponseStream {
+        open_stream(
+            "127.0.0.1",
+            port,
+            "POST",
+            "/v1/chat/completions",
+            Some(b"{}"),
+            None,
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+            LIMIT,
+        )
+        .expect("the canned node answers")
+    }
+
+    /// `parse_response` calls a chunked body that stops early malformed. The
+    /// streaming reader must not disagree with it about the same bytes: ending
+    /// the relay cleanly would frame a half-generation as a whole one.
+    #[test]
+    fn a_stream_cut_off_before_its_terminal_chunk_is_reported_not_ended_cleanly() {
+        // `data: one\n\n` is 11 bytes = 0xb. No terminal chunk follows it.
+        let port = canned_node(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+              Transfer-Encoding: chunked\r\n\r\nb\r\ndata: one\n\n\r\n",
+        );
+        let mut stream = stream_from(port);
+
+        assert_eq!(
+            stream.next_chunk().expect("the first event arrives"),
+            Some(b"data: one\n\n".to_vec())
+        );
+        let error = stream
+            .next_chunk()
+            .expect_err("the node died before the body was complete");
+        assert!(matches!(error, HttpError::Malformed(_)), "{error:?}");
+    }
+
+    /// The control for the test above: a stream that does reach its terminal
+    /// chunk still ends without an error, so the refusal is not blanket.
+    #[test]
+    fn a_stream_that_reaches_its_terminal_chunk_ends_cleanly() {
+        let port = canned_node(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+              Transfer-Encoding: chunked\r\n\r\nb\r\ndata: one\n\n\r\n0\r\n\r\n",
+        );
+        let mut stream = stream_from(port);
+
+        assert_eq!(
+            stream.next_chunk().expect("the first event arrives"),
+            Some(b"data: one\n\n".to_vec())
+        );
+        assert_eq!(stream.next_chunk().expect("the body is complete"), None);
+    }
+
+    /// With neither chunked framing nor a declared length, the close *is* the
+    /// framing, so EOF must stay a clean end.
+    #[test]
+    fn a_close_delimited_stream_still_ends_at_eof() {
+        let port = canned_node(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+              Connection: close\r\n\r\ndata: one\n\n",
+        );
+        let mut stream = stream_from(port);
+
+        assert_eq!(
+            stream.next_chunk().expect("the event arrives"),
+            Some(b"data: one\n\n".to_vec())
+        );
+        assert_eq!(stream.next_chunk().expect("the close ends it"), None);
+    }
+
+    #[test]
+    fn a_buffered_body_shorter_than_its_declared_length_is_refused() {
+        let port = canned_node(
+            b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\n\
+              Content-Length: 99\r\n\r\n{\"error\":",
+        );
+        let error = stream_from(port)
+            .into_buffered(LIMIT)
+            .expect_err("the declared body never arrived");
+        assert!(matches!(error, HttpError::Malformed(_)), "{error:?}");
+    }
+
+    #[test]
+    fn a_buffered_body_that_matches_its_declared_length_is_returned() {
+        let port = canned_node(
+            b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\n\
+              Content-Length: 2\r\n\r\n{}",
+        );
+        let response = stream_from(port).into_buffered(LIMIT).expect("complete");
+        assert_eq!(response.status, 503);
+        assert_eq!(response.body, b"{}");
     }
 }

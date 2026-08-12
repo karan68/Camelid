@@ -139,9 +139,13 @@ async fn chat_completions(
         .get("model")
         .and_then(Value::as_str)
         .map(str::to_string);
+    // A blank value is not a node name: taking it would silently switch this
+    // request to affinity and then report affinity lost to a node called "".
     let sticky = headers
         .get(STICKY_HEADER)
         .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|label| !label.is_empty())
         .map(str::to_string);
     let request = OwnedRequest { model, sticky };
 
@@ -159,7 +163,15 @@ struct OwnedRequest {
 }
 
 impl OwnedRequest {
-    fn as_route(&self, mode: RouteMode) -> RouteRequest<'_> {
+    /// A client that names a node is asking for affinity to it, so the header
+    /// settles the mode for its own request. Without this the header would be
+    /// dead under the throughput default, since placement only consults a
+    /// sticky label in [`RouteMode::Affinity`].
+    fn as_route(&self, default_mode: RouteMode) -> RouteRequest<'_> {
+        let mode = match self.sticky {
+            Some(_) => RouteMode::Affinity,
+            None => default_mode,
+        };
         RouteRequest::new(mode)
             .with_model(self.model.as_deref())
             .with_sticky(self.sticky.as_deref())
@@ -553,5 +565,33 @@ mod tests {
     fn a_non_loopback_listener_starts_once_the_risk_is_acknowledged() {
         refuse_unauthenticated_remote("0.0.0.0:8282".parse().unwrap(), true)
             .expect("the operator accepted the exposure");
+    }
+
+    /// The sticky header is documented as working whatever default the proxy
+    /// was started with, and placement only reads a sticky label in affinity
+    /// mode — so the header has to settle the mode for its own request.
+    #[test]
+    fn naming_a_node_asks_for_affinity_whatever_the_default_mode_is() {
+        let pinned = OwnedRequest {
+            model: None,
+            sticky: Some("warm".to_string()),
+        };
+        let route = pinned.as_route(RouteMode::Throughput);
+        assert_eq!(route.mode, RouteMode::Affinity);
+        assert_eq!(route.sticky, Some("warm"));
+
+        // Without one, the proxy's configured default is what stands.
+        let plain = OwnedRequest {
+            model: None,
+            sticky: None,
+        };
+        assert_eq!(
+            plain.as_route(RouteMode::Throughput).mode,
+            RouteMode::Throughput
+        );
+        assert_eq!(
+            plain.as_route(RouteMode::Affinity).mode,
+            RouteMode::Affinity
+        );
     }
 }
