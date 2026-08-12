@@ -49,6 +49,9 @@ struct StubConfig {
     /// Gap left between events. A test that measures arrival times uses it to
     /// tell a relayed stream from one that was buffered and released at the end.
     stream_gap: Duration,
+    /// Hang up after the events instead of writing the terminal chunk, which is
+    /// what a node that dies mid-generation leaves on the wire.
+    stream_truncated: bool,
     /// Events actually written to the socket. It stops advancing once the peer
     /// has gone, which is how a cancellation test observes the hang-up.
     events_written: Arc<AtomicUsize>,
@@ -70,6 +73,7 @@ impl StubConfig {
             required_key: None,
             stream_events: Vec::new(),
             stream_gap: Duration::ZERO,
+            stream_truncated: false,
             events_written: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -80,6 +84,15 @@ impl StubConfig {
             stream_events: events.iter().map(|event| (*event).to_string()).collect(),
             stream_gap: gap,
             ..Self::ready(model, 0)
+        }
+    }
+
+    /// A node that dies part-way through a stream: the events it managed to
+    /// produce, then a hang-up with no terminal chunk.
+    fn dying_mid_stream(model: &str, events: &[&str], gap: Duration) -> Self {
+        Self {
+            stream_truncated: true,
+            ..Self::streaming(model, events, gap)
         }
     }
 
@@ -247,6 +260,9 @@ fn serve_event_stream(stream: &mut TcpStream, config: &StubConfig) {
             return;
         }
         config.events_written.fetch_add(1, Ordering::SeqCst);
+    }
+    if config.stream_truncated {
+        return;
     }
     let _ = stream.write_all(b"0\r\n\r\n");
     let _ = stream.flush();
@@ -562,8 +578,9 @@ async fn post_chat_streaming(
     let mut pieces: Vec<Piece> = Vec::new();
     let mut delivered = 0_usize;
 
-    loop {
-        let read = stream.read(&mut scratch).await.expect("read response");
+    // A read error rather than a clean close is how an aborted body reaches the
+    // client, and that abort is itself the thing a truncation test reads.
+    while let Ok(read) = stream.read(&mut scratch).await {
         if read == 0 {
             break;
         }
@@ -645,6 +662,79 @@ async fn a_streamed_body_reaches_the_client_verbatim() {
 
     let body: String = pieces.iter().map(|piece| piece.text.as_str()).collect();
     assert_eq!(dechunk(&body), events.concat());
+    // The control for the truncation test below: a stream the node finished is
+    // framed as finished, and that is the only thing that says so.
+    assert!(
+        body.ends_with("0\r\n\r\n"),
+        "a completed stream must end with the terminal chunk: {body:?}"
+    );
+}
+
+/// A node that dies mid-generation must not reach the client looking like a
+/// stream that finished. Chunked framing is what carries that distinction: a
+/// complete body ends with the terminal chunk, an aborted one does not. The
+/// proxy used to read the node's EOF as the end of the body and then frame its
+/// own response as complete, so a half answer arrived indistinguishable from a
+/// whole one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_dying_mid_stream_is_not_relayed_as_a_completed_one() {
+    // The gap matters: it makes the proxy flush the head and the early events
+    // before the node dies, which is what a real generation does. Without it
+    // everything would still be in one write buffer and the whole response
+    // would be discarded, which is a different (also safe) outcome.
+    let events = ["data: one\n\n", "data: two\n\n"];
+    let node = StubNode::start(StubConfig::dying_mid_stream(
+        "m",
+        &events,
+        Duration::from_millis(150),
+    ));
+    let fabric = fabric_of(vec![node.spec("only")]);
+    let addr = start_proxy(fabric, RouteMode::Throughput).await;
+
+    let (status, _headers, pieces) =
+        post_chat_streaming(addr, &serde_json::json!({ "model": "m", "stream": true })).await;
+
+    // The head was already sent before the node died, so the status stands.
+    assert_eq!(status, 200);
+    let body: String = pieces.iter().map(|piece| piece.text.as_str()).collect();
+    // What the node did produce still reaches the client; only the claim that
+    // this was all of it is withheld.
+    assert!(
+        dechunk(&body).starts_with("data: one\n\n"),
+        "the events the node did produce must still arrive: {body:?}"
+    );
+    assert!(
+        !body.ends_with("0\r\n\r\n"),
+        "a truncated stream was framed as complete: {body:?}"
+    );
+}
+
+/// The proxy's contract is that a client can ask for a specific node whatever
+/// default mode the proxy was started with. Both nodes are idle and `alpha`
+/// sorts first, so throughput placement takes `alpha` — the answer coming from
+/// `beta` can only mean the header was honoured.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_client_can_pin_a_node_even_when_the_proxy_defaults_to_throughput() {
+    let alpha = StubNode::start(StubConfig::ready("shared", 0));
+    let beta = StubNode::start(StubConfig::ready("shared", 0));
+    let fabric = fabric_of(vec![alpha.spec("alpha"), beta.spec("beta")]);
+    let addr = start_proxy(fabric, RouteMode::Throughput).await;
+
+    let body = serde_json::json!({ "model": "shared" });
+    let (status, _body, headers) =
+        post_chat(addr, &body, &[("x-camelid-fabric-sticky", "beta")]).await;
+
+    assert_eq!(status, 200);
+    assert_eq!(header(&headers, "x-camelid-fabric-node"), Some("beta"));
+    assert_eq!(
+        header(&headers, "x-camelid-fabric-reason"),
+        Some("Affinity")
+    );
+
+    // Same proxy, same nodes, no header: the configured default still decides.
+    let (status, _body, headers) = post_chat(addr, &body, &[]).await;
+    assert_eq!(status, 200);
+    assert_eq!(header(&headers, "x-camelid-fabric-node"), Some("alpha"));
 }
 
 /// The load-bearing property: the proxy must relay events as they are produced.
