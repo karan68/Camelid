@@ -25727,12 +25727,11 @@ mod tests {
                 supported_artifact_identity_matches(filename, sha256),
                 "{filename} must retain its certified byte identity independently of host scope"
             );
-            let expected_lane =
-                if *filename == LFM2_5_2_6B_Q8_0_FILENAME && !lfm2_supported_on_current_host() {
-                    ModelLaneClass::ExperimentalImplemented
-                } else {
-                    ModelLaneClass::Supported
-                };
+            let expected_lane = if supported_exact_row_host_eligible(filename) {
+                ModelLaneClass::Supported
+            } else {
+                ModelLaneClass::ExperimentalImplemented
+            };
             assert_eq!(
                 classify_loaded_model_identity(Some("llama"), filename, sha256),
                 expected_lane,
