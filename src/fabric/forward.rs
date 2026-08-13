@@ -5,9 +5,11 @@
 //! once per request rather than once per token, so a node's own generation loop
 //! never waits on the network.
 //!
-//! Streaming is deliberately out of scope for this path. An SSE response is a
-//! different response shape and a different cancellation story; rather than
-//! half-support it, a streaming request is refused with a reason.
+//! There are two shapes of answer. [`forward`] reads a complete JSON body and is
+//! what the one-shot CLI wants. [`forward_streaming`] reads only the response
+//! head and then relays the body as it arrives, which is what a real client
+//! asking for `stream: true` needs; it never parses the event payload, so it
+//! cannot mangle a field it does not know about.
 
 use std::time::{Duration, Instant};
 
@@ -66,12 +68,16 @@ impl std::fmt::Display for ForwardError {
 
 impl std::error::Error for ForwardError {}
 
-/// Refuse a streaming request rather than mis-parse an SSE body as JSON. Pure.
+/// Refuse a streaming request on the one-shot path. Pure.
+///
+/// [`forward`] returns one complete JSON body, so it cannot carry a stream.
+/// The resident proxy takes the [`forward_streaming`] path instead.
 pub fn reject_streaming(body: &Value) -> Result<(), ForwardError> {
-    if body.get("stream").and_then(Value::as_bool) == Some(true) {
+    if wants_streaming(body) {
         return Err(ForwardError::Unsupported(
-            "the fabric does not forward streaming requests yet; \
-             send the request without `stream: true`"
+            "`fabric run` returns one complete answer and cannot relay a streaming \
+             response; drop `stream: true`, or point a client at `fabric serve`, \
+             which does relay it"
                 .to_string(),
         ));
     }
@@ -161,6 +167,126 @@ pub fn forward(
         body: parsed,
         elapsed,
     })
+}
+
+/// Whether the client asked for a server-sent event stream. Pure.
+pub fn wants_streaming(body: &Value) -> bool {
+    body.get("stream").and_then(Value::as_bool) == Some(true)
+}
+
+/// A node's answer to a streaming request, still arriving.
+///
+/// The payload is relayed verbatim. Nothing here parses server-sent events, so
+/// a field this fabric has never heard of reaches the client unaltered.
+pub struct Streaming {
+    pub label: String,
+    pub status: u16,
+    /// The node's `Content-Type`, so the client is told what it is reading.
+    pub content_type: Option<String>,
+    stream: http::ResponseStream,
+}
+
+impl std::fmt::Debug for Streaming {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Streaming")
+            .field("label", &self.label)
+            .field("status", &self.status)
+            .field("content_type", &self.content_type)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Streaming {
+    /// The next piece of the body, or `None` at the end of the stream.
+    pub fn next_chunk(&mut self) -> Result<Option<Vec<u8>>, ForwardError> {
+        self.stream
+            .next_chunk()
+            .map_err(|error| ForwardError::Transport {
+                label: self.label.clone(),
+                detail: error.to_string(),
+            })
+    }
+}
+
+/// What a node did with a streaming request.
+#[derive(Debug)]
+pub enum StreamOutcome {
+    /// The node is streaming; relay it.
+    Streaming(Streaming),
+    /// The node answered with a complete body instead — typically a refusal.
+    /// Buffered so the reason reaches the client as a readable answer rather
+    /// than as an empty stream.
+    Buffered(Forwarded),
+}
+
+/// Send a streaming request to one node and read as far as its response head.
+///
+/// `head_timeout` bounds the wait for that head, which covers the node's whole
+/// prefill and can legitimately take minutes. `idle_timeout` then bounds how
+/// long the node may send *nothing further*: a healthy stream resets it with
+/// every token, so a long generation is never cut short, while a wedged node
+/// still fails on schedule.
+pub fn forward_streaming(
+    spec: &NodeSpec,
+    path: &str,
+    body: &Value,
+    bearer: Option<&str>,
+    head_timeout: Duration,
+    idle_timeout: Duration,
+) -> Result<StreamOutcome, ForwardError> {
+    let encoded = serde_json::to_vec(body).map_err(|error| ForwardError::Json {
+        label: spec.label.clone(),
+        detail: format!("request body could not be encoded: {error}"),
+    })?;
+
+    let transport = |error: HttpError| ForwardError::Transport {
+        label: spec.label.clone(),
+        detail: error.to_string(),
+    };
+
+    let started = Instant::now();
+    let stream = http::open_stream(
+        &spec.host,
+        spec.port,
+        "POST",
+        path,
+        Some(&encoded),
+        bearer,
+        head_timeout,
+        idle_timeout,
+        MAX_RESPONSE_BYTES,
+    )
+    .map_err(transport)?;
+
+    let head = stream.head().clone();
+    // A node that refused, or answered with something other than a stream, has
+    // said something worth reading. Buffer it and hand it back as an answer.
+    if !(200..300).contains(&head.status) || !head.is_event_stream() {
+        let response = stream
+            .into_buffered(MAX_RESPONSE_BYTES)
+            .map_err(transport)?;
+        let parsed = if response.body.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice::<Value>(&response.body).map_err(|error| ForwardError::Json {
+                label: spec.label.clone(),
+                detail: error.to_string(),
+            })?
+        };
+        return Ok(StreamOutcome::Buffered(Forwarded {
+            label: spec.label.clone(),
+            status: response.status,
+            body: parsed,
+            elapsed: started.elapsed(),
+        }));
+    }
+
+    Ok(StreamOutcome::Streaming(Streaming {
+        label: spec.label.clone(),
+        status: head.status,
+        content_type: head.content_type,
+        stream,
+    }))
 }
 
 #[cfg(test)]

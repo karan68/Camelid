@@ -7,10 +7,10 @@
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -21,13 +21,14 @@ use camelid::fabric::{Fabric, NodeSpec, RouteMode};
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const FORWARD_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// One request a stub received: enough to say which route it was and what
-/// credential the proxy presented on it.
+/// One request a stub received: enough to say which route it was, what
+/// credential the proxy presented on it, and what it asked for.
 #[derive(Debug, Clone)]
 struct Received {
     path: String,
     /// The `Authorization` header verbatim, or `None` if the request carried none.
     authorization: Option<String>,
+    body: String,
 }
 
 #[derive(Clone)]
@@ -42,6 +43,18 @@ struct StubConfig {
     /// carries exactly this bearer token — the arrangement a node started with
     /// `CAMELID_API_KEY` actually presents to the proxy.
     required_key: Option<String>,
+    /// Server-sent events answered to a request carrying `"stream": true`,
+    /// instead of one JSON body.
+    stream_events: Vec<String>,
+    /// Gap left between events. A test that measures arrival times uses it to
+    /// tell a relayed stream from one that was buffered and released at the end.
+    stream_gap: Duration,
+    /// Hang up after the events instead of writing the terminal chunk, which is
+    /// what a node that dies mid-generation leaves on the wire.
+    stream_truncated: bool,
+    /// Events actually written to the socket. It stops advancing once the peer
+    /// has gone, which is how a cancellation test observes the hang-up.
+    events_written: Arc<AtomicUsize>,
 }
 
 impl StubConfig {
@@ -58,6 +71,28 @@ impl StubConfig {
             completion_status: 200,
             completion_delay: Duration::ZERO,
             required_key: None,
+            stream_events: Vec::new(),
+            stream_gap: Duration::ZERO,
+            stream_truncated: false,
+            events_written: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// A node that answers a streaming request with server-sent events.
+    fn streaming(model: &str, events: &[&str], gap: Duration) -> Self {
+        Self {
+            stream_events: events.iter().map(|event| (*event).to_string()).collect(),
+            stream_gap: gap,
+            ..Self::ready(model, 0)
+        }
+    }
+
+    /// A node that dies part-way through a stream: the events it managed to
+    /// produce, then a hang-up with no terminal chunk.
+    fn dying_mid_stream(model: &str, events: &[&str], gap: Duration) -> Self {
+        Self {
+            stream_truncated: true,
+            ..Self::streaming(model, events, gap)
         }
     }
 
@@ -165,6 +200,17 @@ fn serve_once(stream: &mut TcpStream, config: &StubConfig, requests: &Mutex<Vec<
         None => true,
     };
 
+    let asked_to_stream = serde_json::from_str::<Value>(&received.body)
+        .ok()
+        .and_then(|body| body.get("stream").and_then(Value::as_bool))
+        .unwrap_or(false);
+
+    if authorized && asked_to_stream && !config.stream_events.is_empty() {
+        requests.lock().expect("stub lock").push(received);
+        serve_event_stream(stream, config);
+        return;
+    }
+
     let (status, body) = match received.path.as_str() {
         _ if !authorized => (
             401_u16,
@@ -192,6 +238,36 @@ fn serve_once(stream: &mut TcpStream, config: &StubConfig, requests: &Mutex<Vec<
     let _ = stream.flush();
 }
 
+/// Answer with chunked `text/event-stream`, one HTTP chunk per event, exactly
+/// as an axum `Sse` response reaches the wire.
+fn serve_event_stream(stream: &mut TcpStream, config: &StubConfig) {
+    let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                Cache-Control: no-cache\r\nTransfer-Encoding: chunked\r\n\
+                Connection: close\r\n\r\n";
+    if stream.write_all(head.as_bytes()).is_err() {
+        return;
+    }
+    let _ = stream.flush();
+
+    for event in &config.stream_events {
+        if !config.stream_gap.is_zero() {
+            std::thread::sleep(config.stream_gap);
+        }
+        let frame = format!("{:x}\r\n{event}\r\n", event.len());
+        // A failed write is the peer having gone; stop rather than keep
+        // generating for nobody, which is what a real node's channel does.
+        if stream.write_all(frame.as_bytes()).is_err() || stream.flush().is_err() {
+            return;
+        }
+        config.events_written.fetch_add(1, Ordering::SeqCst);
+    }
+    if config.stream_truncated {
+        return;
+    }
+    let _ = stream.write_all(b"0\r\n\r\n");
+    let _ = stream.flush();
+}
+
 fn read_request(stream: &mut TcpStream) -> Option<Received> {
     stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
     let mut raw = Vec::new();
@@ -213,9 +289,12 @@ fn read_request(stream: &mut TcpStream) -> Option<Received> {
             if raw.len() >= header_end + 4 + expected {
                 let mut parts = head.lines().next()?.split_whitespace();
                 parts.next()?; // method
+                let body_start = header_end + 4;
                 return Some(Received {
                     path: parts.next()?.to_string(),
                     authorization: authorization(&head),
+                    body: String::from_utf8_lossy(&raw[body_start..body_start + expected])
+                        .to_string(),
                 });
             }
         }
@@ -443,9 +522,9 @@ async fn no_eligible_node_answers_503_with_a_fabric_error_shape() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_streaming_request_is_refused_by_the_proxy_before_any_node_is_touched() {
-    // Port 9 is a dead node; a 400 (not a 502/503) proves the proxy refused
-    // before it ever tried to route the request.
+async fn a_streaming_request_is_routed_rather_than_refused() {
+    // Port 9 is a dead node. A 503 (a placement failure) rather than a 400
+    // proves the proxy tried to route the stream instead of rejecting it.
     let fabric = fabric_of(vec![NodeSpec {
         label: "dead".to_string(),
         host: "127.0.0.1".to_string(),
@@ -460,8 +539,327 @@ async fn a_streaming_request_is_refused_by_the_proxy_before_any_node_is_touched(
     )
     .await;
 
-    assert_eq!(status, 400);
+    assert_eq!(status, 503);
     assert_eq!(body["error"]["type"], "fabric_error");
+}
+
+/// One piece of a streamed body, with how long after the request it arrived.
+struct Piece {
+    at: Duration,
+    text: String,
+}
+
+/// Send a streaming POST and read the body as it arrives, timing each piece.
+///
+/// Deliberately does not reuse [`post_chat`]: that reads to EOF before looking
+/// at anything, which would make a buffered response indistinguishable from a
+/// streamed one — the exact thing these tests exist to tell apart.
+async fn post_chat_streaming(
+    addr: SocketAddr,
+    body: &Value,
+) -> (u16, Vec<(String, String)>, Vec<Piece>) {
+    let mut stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("connect to proxy");
+    let payload = body.to_string();
+    let request = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+        payload.len()
+    );
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write request");
+
+    let started = Instant::now();
+    let mut raw = Vec::new();
+    let mut scratch = [0_u8; 4096];
+    let mut head_end = None;
+    let mut pieces: Vec<Piece> = Vec::new();
+    let mut delivered = 0_usize;
+
+    // A read error rather than a clean close is how an aborted body reaches the
+    // client, and that abort is itself the thing a truncation test reads.
+    while let Ok(read) = stream.read(&mut scratch).await {
+        if read == 0 {
+            break;
+        }
+        raw.extend_from_slice(&scratch[..read]);
+        if head_end.is_none() {
+            head_end = raw
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .map(|at| at + 4);
+            delivered = head_end.unwrap_or(0);
+        }
+        if let Some(start) = head_end {
+            if raw.len() > delivered.max(start) {
+                let fresh = String::from_utf8_lossy(&raw[delivered..]).to_string();
+                delivered = raw.len();
+                pieces.push(Piece {
+                    at: started.elapsed(),
+                    text: fresh,
+                });
+            }
+        }
+    }
+
+    let head_end = head_end.expect("header terminator");
+    let head = String::from_utf8_lossy(&raw[..head_end - 4]).to_string();
+    let mut lines = head.lines();
+    let status: u16 = lines
+        .next()
+        .expect("status line")
+        .split_whitespace()
+        .nth(1)
+        .expect("status code")
+        .parse()
+        .expect("numeric status");
+    let headers = lines
+        .filter_map(|line| line.split_once(": "))
+        .map(|(name, value)| (name.to_ascii_lowercase(), value.to_string()))
+        .collect();
+    (status, headers, pieces)
+}
+
+/// Strip HTTP chunk framing that hyper adds on the way back out to the client.
+fn dechunk(raw: &str) -> String {
+    let mut out = String::new();
+    let mut rest = raw;
+    loop {
+        let Some((size_line, tail)) = rest.split_once("\r\n") else {
+            return out;
+        };
+        let Ok(size) = usize::from_str_radix(size_line.trim(), 16) else {
+            return out;
+        };
+        if size == 0 || tail.len() < size {
+            return out;
+        }
+        out.push_str(&tail[..size]);
+        rest = tail[size..].strip_prefix("\r\n").unwrap_or("");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_streamed_body_reaches_the_client_verbatim() {
+    let events = [
+        "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\n",
+        "data: [DONE]\n\n",
+    ];
+    let node = StubNode::start(StubConfig::streaming("m", &events, Duration::ZERO));
+    let fabric = fabric_of(vec![node.spec("only")]);
+    let addr = start_proxy(fabric, RouteMode::Throughput).await;
+
+    let (status, headers, pieces) =
+        post_chat_streaming(addr, &serde_json::json!({ "model": "m", "stream": true })).await;
+
+    assert_eq!(status, 200);
+    assert_eq!(header(&headers, "content-type"), Some("text/event-stream"));
+    // Placement is still reported, exactly as on a buffered answer.
+    assert_eq!(header(&headers, "x-camelid-fabric-node"), Some("only"));
+
+    let body: String = pieces.iter().map(|piece| piece.text.as_str()).collect();
+    assert_eq!(dechunk(&body), events.concat());
+    // The control for the truncation test below: a stream the node finished is
+    // framed as finished, and that is the only thing that says so.
+    assert!(
+        body.ends_with("0\r\n\r\n"),
+        "a completed stream must end with the terminal chunk: {body:?}"
+    );
+}
+
+/// A node that dies mid-generation must not reach the client looking like a
+/// stream that finished. Chunked framing is what carries that distinction: a
+/// complete body ends with the terminal chunk, an aborted one does not. The
+/// proxy used to read the node's EOF as the end of the body and then frame its
+/// own response as complete, so a half answer arrived indistinguishable from a
+/// whole one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_dying_mid_stream_is_not_relayed_as_a_completed_one() {
+    // The gap matters: it makes the proxy flush the head and the early events
+    // before the node dies, which is what a real generation does. Without it
+    // everything would still be in one write buffer and the whole response
+    // would be discarded, which is a different (also safe) outcome.
+    let events = ["data: one\n\n", "data: two\n\n"];
+    let node = StubNode::start(StubConfig::dying_mid_stream(
+        "m",
+        &events,
+        Duration::from_millis(150),
+    ));
+    let fabric = fabric_of(vec![node.spec("only")]);
+    let addr = start_proxy(fabric, RouteMode::Throughput).await;
+
+    let (status, _headers, pieces) =
+        post_chat_streaming(addr, &serde_json::json!({ "model": "m", "stream": true })).await;
+
+    // The head was already sent before the node died, so the status stands.
+    assert_eq!(status, 200);
+    let body: String = pieces.iter().map(|piece| piece.text.as_str()).collect();
+    // What the node did produce still reaches the client; only the claim that
+    // this was all of it is withheld.
+    assert!(
+        dechunk(&body).starts_with("data: one\n\n"),
+        "the events the node did produce must still arrive: {body:?}"
+    );
+    assert!(
+        !body.ends_with("0\r\n\r\n"),
+        "a truncated stream was framed as complete: {body:?}"
+    );
+}
+
+/// The proxy's contract is that a client can ask for a specific node whatever
+/// default mode the proxy was started with. Both nodes are idle and `alpha`
+/// sorts first, so throughput placement takes `alpha` — the answer coming from
+/// `beta` can only mean the header was honoured.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_client_can_pin_a_node_even_when_the_proxy_defaults_to_throughput() {
+    let alpha = StubNode::start(StubConfig::ready("shared", 0));
+    let beta = StubNode::start(StubConfig::ready("shared", 0));
+    let fabric = fabric_of(vec![alpha.spec("alpha"), beta.spec("beta")]);
+    let addr = start_proxy(fabric, RouteMode::Throughput).await;
+
+    let body = serde_json::json!({ "model": "shared" });
+    let (status, _body, headers) =
+        post_chat(addr, &body, &[("x-camelid-fabric-sticky", "beta")]).await;
+
+    assert_eq!(status, 200);
+    assert_eq!(header(&headers, "x-camelid-fabric-node"), Some("beta"));
+    assert_eq!(
+        header(&headers, "x-camelid-fabric-reason"),
+        Some("Affinity")
+    );
+
+    // Same proxy, same nodes, no header: the configured default still decides.
+    let (status, _body, headers) = post_chat(addr, &body, &[]).await;
+    assert_eq!(status, 200);
+    assert_eq!(header(&headers, "x-camelid-fabric-node"), Some("alpha"));
+}
+
+/// The load-bearing property: the proxy must relay events as they are produced.
+/// If it buffered the body and released it at the end, every piece would arrive
+/// at once, after the whole generation.
+#[tokio::test(flavor = "multi_thread")]
+async fn events_reach_the_client_as_they_are_produced_not_at_the_end() {
+    let gap = Duration::from_millis(200);
+    let events = ["data: one\n\n", "data: two\n\n", "data: [DONE]\n\n"];
+    let node = StubNode::start(StubConfig::streaming("m", &events, gap));
+    let fabric = fabric_of(vec![node.spec("only")]);
+    let addr = start_proxy(fabric, RouteMode::Throughput).await;
+
+    let (status, _headers, pieces) =
+        post_chat_streaming(addr, &serde_json::json!({ "model": "m", "stream": true })).await;
+    assert_eq!(status, 200);
+
+    let carrying: Vec<&Piece> = pieces
+        .iter()
+        .filter(|piece| piece.text.contains("data:"))
+        .collect();
+    assert!(
+        carrying.len() >= 2,
+        "expected several separately delivered pieces, got {}",
+        carrying.len()
+    );
+
+    // The stub finishes at ~3 * 200ms. A buffered proxy would hand everything
+    // over at that point, so a first piece well before it can only mean the
+    // bytes were relayed while the node was still generating.
+    let first = carrying[0].at;
+    assert!(
+        first < gap * 2,
+        "first event arrived after {first:?}; it looks buffered rather than relayed"
+    );
+    let last = carrying[carrying.len() - 1].at;
+    assert!(
+        last - first > gap / 2,
+        "every piece arrived within {:?} of the first; that is a buffered body",
+        last - first
+    );
+}
+
+/// A node that refuses a streaming request answers with JSON, not with events.
+/// That reason has to reach the client as a readable body rather than as an
+/// empty stream, or an operator has nothing to act on.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_refusing_a_stream_is_relayed_as_a_readable_answer() {
+    let events = ["data: never sent\n\n"];
+    let mut config = StubConfig::streaming("m", &events, Duration::ZERO);
+    config.required_key = Some("expected-key".to_string());
+    let node = StubNode::start(config);
+    // The fabric holds no bearer, so the node answers 401 to the forward.
+    let fabric = fabric_of(vec![node.spec("only")]);
+    let addr = start_proxy(fabric, RouteMode::Throughput).await;
+
+    let (status, body, headers) = post_chat(
+        addr,
+        &serde_json::json!({ "model": "m", "stream": true }),
+        &[],
+    )
+    .await;
+
+    assert_eq!(status, 401);
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("Authorization")),
+        "the node's own reason must survive: {body}"
+    );
+    assert_eq!(header(&headers, "x-camelid-fabric-node"), Some("only"));
+}
+
+/// A client that hangs up mid-stream must take the node's work with it.
+/// The buffered path cannot do this — blocking socket I/O is not cancellable —
+/// so this is a property the streaming path adds rather than inherits.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_client_hanging_up_stops_the_node_generating() {
+    let gap = Duration::from_millis(100);
+    let events: Vec<String> = (0..40).map(|i| format!("data: {i}\n\n")).collect();
+    let borrowed: Vec<&str> = events.iter().map(String::as_str).collect();
+    let config = StubConfig::streaming("m", &borrowed, gap);
+    let written = Arc::clone(&config.events_written);
+    let node = StubNode::start(config);
+    let fabric = fabric_of(vec![node.spec("only")]);
+    let addr = start_proxy(fabric, RouteMode::Throughput).await;
+
+    let mut stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("connect to proxy");
+    let payload = serde_json::json!({ "model": "m", "stream": true }).to_string();
+    let request = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+        payload.len()
+    );
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write request");
+
+    // Read enough to know the stream is genuinely running, then hang up.
+    let mut scratch = [0_u8; 1024];
+    let _ = stream.read(&mut scratch).await.expect("read head");
+    tokio::time::sleep(gap * 3).await;
+    drop(stream);
+
+    // A hang-up only surfaces once a write to the client round-trips, so a few
+    // more events can escape first. What must be true is that generation then
+    // *stops*: settle past that window, then check the count is still moving.
+    tokio::time::sleep(gap * 5).await;
+    let settled = written.load(Ordering::SeqCst);
+    tokio::time::sleep(gap * 10).await;
+    let later = written.load(Ordering::SeqCst);
+
+    assert_eq!(
+        settled,
+        later,
+        "the node was still generating {} events after the client left",
+        later - settled
+    );
+    assert!(
+        later < events.len(),
+        "the node wrote all {} events despite the client leaving",
+        events.len()
+    );
 }
 
 /// `Fabric::dispatch` is synchronous socket I/O that can legitimately run for

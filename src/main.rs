@@ -1166,9 +1166,10 @@ enum FabricAction {
     /// Run a resident HTTP proxy in front of the fabric.
     ///
     /// Every request to `/v1/chat/completions` is placed and forwarded through
-    /// the same `Fabric::dispatch` path `fabric run` uses, so a client can point
-    /// at one address instead of the operator invoking the CLI per request.
-    /// Streaming is refused with 400, the same as the CLI path.
+    /// the same placement `fabric run` uses, so a client can point at one
+    /// address instead of the operator invoking the CLI per request. A request
+    /// asking for `stream: true` is relayed as server-sent events, so a stock
+    /// OpenAI client works against this address unchanged.
     ///
     /// The proxy has no authentication of its own, so it binds loopback by
     /// default and refuses a routable address unless the exposure is
@@ -1190,7 +1191,10 @@ enum FabricAction {
         /// Per-node health probe budget.
         #[arg(long, default_value_t = 2000)]
         timeout_ms: u64,
-        /// Budget for the generation itself, which can legitimately take minutes.
+        /// Budget for the generation itself, which can legitimately take
+        /// minutes. On a streaming request it bounds the wait for the node's
+        /// response head and any later gap in which the node sends nothing;
+        /// every event resets the second, so a long stream is never cut short.
         #[arg(long, default_value_t = 300)]
         forward_timeout_s: u64,
         /// Explicitly permit an unauthenticated non-loopback listener. Without
