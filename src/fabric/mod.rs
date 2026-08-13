@@ -29,7 +29,7 @@ pub mod probe;
 pub mod server;
 
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
@@ -44,7 +44,7 @@ pub use policy::{
     route, route_reserved, Reservations, RouteDecision, RouteError, RouteMode, RouteReason,
     RouteRequest,
 };
-pub use probe::{probe_fabric, probe_node, ProbeError, DEFAULT_PROBE_TIMEOUT};
+pub use probe::{probe_fabric, probe_node, Observation, ProbeError, DEFAULT_PROBE_TIMEOUT};
 
 /// A configured set of nodes.
 #[derive(Clone)]
@@ -58,6 +58,13 @@ pub struct Fabric {
     /// every request, and they have to be counting into the same place or they
     /// cannot see each other.
     reserved: Arc<Mutex<Reservations>>,
+    /// The most recent observation, reused while it is fresh enough.
+    ///
+    /// Shared across clones for the same reason as `reserved`: an observation
+    /// only one clone can see would be re-taken by every other one.
+    observed: Arc<Mutex<Option<Observation>>>,
+    /// How stale a reused observation may be. Zero means never reuse one.
+    max_observation_age: Duration,
 }
 
 /// Hand-written so a token can never reach a log through a derived `Debug`,
@@ -68,6 +75,7 @@ impl std::fmt::Debug for Fabric {
             .field("specs", &self.specs)
             .field("timeout", &self.timeout)
             .field("bearer", &self.bearer.as_ref().map(|_| "[REDACTED]"))
+            .field("max_observation_age", &self.max_observation_age)
             .finish()
     }
 }
@@ -79,11 +87,24 @@ impl Fabric {
             timeout: DEFAULT_PROBE_TIMEOUT,
             bearer: None,
             reserved: Arc::new(Mutex::new(Reservations::none())),
+            observed: Arc::new(Mutex::new(None)),
+            max_observation_age: Duration::ZERO,
         }
     }
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    /// Reuse an observation for up to `max_age` instead of probing again.
+    ///
+    /// A process that makes one request and exits wants the default of zero:
+    /// it has nothing to reuse, and paying for the freshest possible view is
+    /// free. A resident proxy is the opposite — without a bound it probes every
+    /// node on every request. See [`Observation`].
+    pub fn with_max_observation_age(mut self, max_age: Duration) -> Self {
+        self.max_observation_age = max_age;
         self
     }
 
@@ -105,18 +126,61 @@ impl Fabric {
         self.specs.is_empty()
     }
 
-    /// Observe every node once.
+    /// Observe every node.
+    ///
+    /// Probes unless a previous observation is still inside
+    /// [`Fabric::with_max_observation_age`], which defaults to zero — so this
+    /// probes every time until a caller asks for something else.
     pub fn observe(&self) -> Vec<NodeSnapshot> {
+        if self.max_observation_age.is_zero() {
+            return self.probe();
+        }
+
+        // Refreshing under the lock makes concurrent callers wait for one probe
+        // rather than each starting their own. Without that, a burst arriving
+        // on an expired observation would reproduce exactly the per-request
+        // probing this bound exists to remove.
+        let mut observed = lock(&self.observed);
+        if let Some(observation) = observed.as_ref() {
+            if observation.is_fresh_at(Instant::now(), self.max_observation_age) {
+                return observation.snapshots().to_vec();
+            }
+        }
+        let snapshots = self.probe();
+        *observed = Some(Observation::taken_at(snapshots.clone(), Instant::now()));
+        snapshots
+    }
+
+    /// Probe every node, whatever was observed before.
+    fn probe(&self) -> Vec<NodeSnapshot> {
         probe_fabric(&self.specs, self.bearer.as_deref(), self.timeout)
     }
 
-    /// Observe every node once and choose one for a request.
+    /// Drop the current observation, so the next one is taken fresh.
+    fn forget_observation(&self) {
+        *lock(&self.observed) = None;
+    }
+
+    /// A node that did not answer may be gone, and an observation that has
+    /// already proved wrong must not be reused for the rest of its window.
+    ///
+    /// This is what keeps the freshness bound honest: a node dying inside the
+    /// window costs the one request that discovers it, not every request until
+    /// the observation expires.
+    fn forget_observation_if_node_vanished(&self, error: &ForwardError) {
+        if matches!(error, ForwardError::Transport { .. }) {
+            self.forget_observation();
+        }
+    }
+
+    /// Observe the fabric and choose a node for a request.
     ///
     /// The returned [`Placement`] counts the request against the chosen node
     /// until it is dropped, so a placement running concurrently can see it.
     pub fn place(&self, request: &RouteRequest<'_>) -> Result<Placement, RouteError> {
-        // Probing is socket I/O against every node. It stays outside the lock:
-        // holding one across it would serialise placement on the slowest node.
+        // Observing is socket I/O against every node. It stays outside the
+        // reservation lock: holding that across it would serialise placement on
+        // the slowest node, and would deadlock a `Placement` being dropped.
         let snapshots = self.observe();
 
         // Deciding and recording are one step. Split them and two concurrent
@@ -166,7 +230,8 @@ impl Fabric {
             body,
             self.bearer.as_deref(),
             forward_timeout,
-        )?;
+        )
+        .inspect_err(|error| self.forget_observation_if_node_vanished(error))?;
         Ok((placement.decision.clone(), answer))
     }
 
@@ -196,15 +261,16 @@ impl Fabric {
             self.bearer.as_deref(),
             head_timeout,
             idle_timeout,
-        )?;
+        )
+        .inspect_err(|error| self.forget_observation_if_node_vanished(error))?;
         Ok((outcome, placement))
     }
 }
 
-/// A poisoned counter is not a corrupted one: some other request panicked while
-/// holding the lock. Recover the map rather than spreading the panic.
-fn lock(reserved: &Mutex<Reservations>) -> std::sync::MutexGuard<'_, Reservations> {
-    reserved
+/// A poisoned lock is not corrupted state: some other request panicked while
+/// holding it. Recover the value rather than spreading the panic.
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }

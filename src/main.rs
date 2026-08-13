@@ -1191,6 +1191,14 @@ enum FabricAction {
         /// Per-node health probe budget.
         #[arg(long, default_value_t = 2000)]
         timeout_ms: u64,
+        /// How long a fabric observation may be reused before the nodes are
+        /// probed again.
+        ///
+        /// Without a bound this probes every node on every request, and one
+        /// node that black-holes adds the whole probe budget to all of them.
+        /// Set 0 to probe on every request.
+        #[arg(long, default_value_t = 500)]
+        observation_max_age_ms: u64,
         /// Budget for the generation itself, which can legitimately take
         /// minutes. On a streaming request it bounds the wait for the node's
         /// response head and any later gap in which the node sends nothing;
@@ -2969,6 +2977,7 @@ async fn main() -> anyhow::Result<()> {
                 mode,
                 bearer,
                 timeout_ms,
+                observation_max_age_ms,
                 forward_timeout_s,
                 allow_unauthenticated_remote,
             } => {
@@ -2978,7 +2987,10 @@ async fn main() -> anyhow::Result<()> {
                     .map_err(|error| anyhow::anyhow!("{error}"))?;
                 let fabric = camelid::fabric::Fabric::new(specs)
                     .with_timeout(std::time::Duration::from_millis(timeout_ms))
-                    .with_bearer(bearer.as_deref());
+                    .with_bearer(bearer.as_deref())
+                    .with_max_observation_age(std::time::Duration::from_millis(
+                        observation_max_age_ms,
+                    ));
 
                 // Bind before announcing, so a refused or already-taken address
                 // never prints a listening line it did not earn.
