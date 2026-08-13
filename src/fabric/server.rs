@@ -15,13 +15,24 @@
 //! The bound is set by whoever builds the [`Fabric`]; see
 //! [`Fabric::with_max_observation_age`].
 //!
+//! # Two credentials, in opposite directions
+//!
+//! [`ClientAuth`] is what a client must present to *this* proxy. The bearer the
+//! [`Fabric`] was built with is what this proxy presents to *its nodes*. They
+//! are configured separately and are not interchangeable: a fabric whose nodes
+//! share one key must not thereby accept that key from the network.
+//!
+//! The check itself is [`crate::api::authenticate`] — the engine's, not a
+//! second one. A client sees the same 401 whichever of the two it is talking
+//! to, and there is only one constant-time comparison in the crate to get right.
+//!
 //! # Limits an operator has to know about
 //!
-//! * There is no authentication layer. Anything that can reach this address can
-//!   drive every node in the fabric, so [`bind`] refuses a non-loopback address
-//!   unless the risk is acknowledged explicitly.
-//! * The token this proxy presents to its nodes is the one the fabric was built
-//!   with; it authenticates the proxy to the nodes, never a client to the proxy.
+//! * Without a [`ClientAuth`], anything that can reach this address can drive
+//!   every node in the fabric, so [`bind`] refuses a non-loopback address
+//!   unless a key is configured or the risk is acknowledged explicitly.
+//! * Authentication is all-or-nothing: there is one key, it is not per-client,
+//!   and nothing here revokes or rotates it while the proxy is running.
 //! * A node that becomes ready, or loads a different model, is routed to only
 //!   once the current observation expires. A node that *stops* answering is not
 //!   waited on: the failed forward drops the observation immediately.
@@ -31,6 +42,7 @@
 //!   does notice: its next send fails and the node's socket is dropped with it.
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -41,15 +53,57 @@ use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::{middleware, Json, Router};
 use serde_json::Value;
 
 use super::policy::{RouteDecision, RouteError, RouteMode, RouteRequest};
 use super::{self as fabric, DispatchError, Fabric, ForwardError, StreamOutcome};
-use crate::api::DEFAULT_MAX_REQUEST_BODY_BYTES;
+use crate::api::{ApiAuth, DEFAULT_MAX_REQUEST_BODY_BYTES};
 
 /// Optional header a client sends to request affinity to a specific node.
 const STICKY_HEADER: &str = "x-camelid-fabric-sticky";
+
+/// The credential a client must present to this proxy.
+///
+/// Wraps the engine's own [`ApiAuth`] so a key is validated, and later compared,
+/// by exactly the rules the engine applies to its own.
+#[derive(Clone, Debug)]
+pub struct ClientAuth {
+    inner: ApiAuth,
+}
+
+impl ClientAuth {
+    /// Accept every client. Safe only on a loopback listener, which is why
+    /// [`bind`] refuses anything else without an acknowledgement.
+    pub fn none() -> Self {
+        Self {
+            inner: ApiAuth::new(None),
+        }
+    }
+
+    /// Require a key, read from a value or a file.
+    ///
+    /// Fails rather than starting unauthenticated: a proxy that silently
+    /// ignored an unreadable key file would be open to whatever can reach it.
+    pub fn resolve(
+        api_key: Option<String>,
+        api_key_file: Option<PathBuf>,
+    ) -> std::io::Result<Self> {
+        Ok(Self {
+            inner: ApiAuth::new(crate::api::resolve_api_key(api_key, api_key_file)?),
+        })
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.inner.enabled()
+    }
+}
+
+impl Default for ClientAuth {
+    fn default() -> Self {
+        Self::none()
+    }
+}
 
 /// Everything a request needs beyond which nodes exist.
 #[derive(Debug, Clone)]
@@ -64,6 +118,8 @@ pub struct ServeConfig {
     /// node sends nothing. A healthy stream resets the second with every token,
     /// so a long generation is never cut short by it.
     pub forward_timeout: Duration,
+    /// What a client must present to be served at all.
+    pub auth: ClientAuth,
 }
 
 #[derive(Clone)]
@@ -76,6 +132,9 @@ struct ServerState {
 
 /// Build the router without binding a socket, so tests can drive it directly.
 pub fn router(fabric: Fabric, config: ServeConfig) -> Router {
+    // Applied last, so it is the outermost layer: an unauthenticated request is
+    // refused before anything here reads its body or observes the fabric.
+    let auth = config.auth.inner.clone();
     Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/models", get(models))
@@ -86,6 +145,10 @@ pub fn router(fabric: Fabric, config: ServeConfig) -> Router {
             fabric: Arc::new(fabric),
             config,
         })
+        .layer(middleware::from_fn_with_state(
+            auth,
+            crate::api::authenticate,
+        ))
 }
 
 /// Bind `addr` for the proxy, refusing an exposure the operator did not ask for.
@@ -94,30 +157,32 @@ pub fn router(fabric: Fabric, config: ServeConfig) -> Router {
 /// directly so the guard cannot be skipped by forgetting to call it.
 pub async fn bind(
     addr: SocketAddr,
+    auth: &ClientAuth,
     allow_unauthenticated_remote: bool,
 ) -> std::io::Result<tokio::net::TcpListener> {
-    refuse_unauthenticated_remote(addr, allow_unauthenticated_remote)?;
+    refuse_unauthenticated_remote(addr, auth.is_enabled(), allow_unauthenticated_remote)?;
     tokio::net::TcpListener::bind(addr).await
 }
 
 /// Refuse an unauthenticated listener that the network can reach. Pure.
 ///
-/// This proxy has no auth layer at all, so a routable bind exposes every node
-/// in the fabric, not just this process. `crate::api::server` refuses the same
-/// shape of listener; this mirrors that refusal and its escape hatch.
+/// An unauthenticated routable bind exposes every node in the fabric, not just
+/// this process. `crate::api::server` refuses the same shape of listener on the
+/// same three conditions; this mirrors that refusal and its escape hatch.
 fn refuse_unauthenticated_remote(
     addr: SocketAddr,
+    authenticated: bool,
     allow_unauthenticated_remote: bool,
 ) -> std::io::Result<()> {
-    if addr.ip().is_loopback() || allow_unauthenticated_remote {
+    if addr.ip().is_loopback() || authenticated || allow_unauthenticated_remote {
         return Ok(());
     }
     Err(std::io::Error::new(
         std::io::ErrorKind::PermissionDenied,
         format!(
-            "refusing unauthenticated non-loopback listener {addr}; the fabric proxy has no \
-             authentication of its own, so this would expose every configured node to the \
-             network. Bind a loopback address, or explicitly acknowledge the risk with \
+            "refusing unauthenticated non-loopback listener {addr}; this would expose every \
+             configured node to the network. Bind a loopback address, configure \
+             --api-key/--api-key-file, or explicitly acknowledge the risk with \
              --allow-unauthenticated-remote"
         ),
     ))
@@ -509,14 +574,18 @@ mod tests {
             .expect("valid request")
     }
 
+    /// A proxy that accepts every client. Authentication has its own tests;
+    /// everything else here is about what the proxy does once a request is in.
+    fn open_config() -> ServeConfig {
+        ServeConfig {
+            mode: RouteMode::Throughput,
+            forward_timeout: Duration::from_millis(200),
+            auth: ClientAuth::none(),
+        }
+    }
+
     fn proxy(fabric: Fabric) -> Router {
-        router(
-            fabric,
-            ServeConfig {
-                mode: RouteMode::Throughput,
-                forward_timeout: Duration::from_millis(200),
-            },
-        )
+        router(fabric, open_config())
     }
 
     /// A client points at one address, so that address has to answer what it
@@ -699,13 +768,7 @@ mod tests {
     #[tokio::test]
     async fn an_empty_fabric_answers_503_not_a_hang() {
         let fabric = Fabric::new(Vec::new());
-        let router = router(
-            fabric,
-            ServeConfig {
-                mode: RouteMode::Throughput,
-                forward_timeout: Duration::from_millis(200),
-            },
-        );
+        let router = router(fabric, open_config());
         let response = router
             .oneshot(request(serde_json::json!({ "model": "m" })))
             .await
@@ -729,13 +792,7 @@ mod tests {
             host: "127.0.0.1".to_string(),
             port: 1,
         }]);
-        let router = router(
-            fabric,
-            ServeConfig {
-                mode: RouteMode::Throughput,
-                forward_timeout: Duration::from_millis(200),
-            },
-        );
+        let router = router(fabric, open_config());
         let response = router
             .oneshot(request(serde_json::json!({ "model": "m", "stream": true })))
             .await
@@ -748,13 +805,7 @@ mod tests {
     #[tokio::test]
     async fn a_malformed_body_is_rejected_before_it_reaches_the_fabric() {
         let fabric = Fabric::new(Vec::new());
-        let router = router(
-            fabric,
-            ServeConfig {
-                mode: RouteMode::Throughput,
-                forward_timeout: Duration::from_millis(200),
-            },
-        );
+        let router = router(fabric, open_config());
         let bad = axum::http::Request::builder()
             .method("POST")
             .uri("/v1/chat/completions")
@@ -776,13 +827,7 @@ mod tests {
     #[tokio::test]
     async fn a_body_over_the_axum_default_still_reaches_the_fabric() {
         let fabric = Fabric::new(Vec::new());
-        let router = router(
-            fabric,
-            ServeConfig {
-                mode: RouteMode::Throughput,
-                forward_timeout: Duration::from_millis(200),
-            },
-        );
+        let router = router(fabric, open_config());
         let body = serde_json::json!({ "model": "m", "pad": "x".repeat(4 * 1024 * 1024) });
         let response = router.oneshot(request(body)).await.expect("router answers");
         let (status, body) = read_json(response).await;
@@ -795,13 +840,7 @@ mod tests {
     #[tokio::test]
     async fn a_body_over_the_proxy_limit_is_refused_in_the_fabric_error_shape() {
         let fabric = Fabric::new(Vec::new());
-        let router = router(
-            fabric,
-            ServeConfig {
-                mode: RouteMode::Throughput,
-                forward_timeout: Duration::from_millis(200),
-            },
-        );
+        let router = router(fabric, open_config());
         let oversize = crate::api::DEFAULT_MAX_REQUEST_BODY_BYTES + 1024;
         let body = serde_json::json!({ "model": "m", "pad": "x".repeat(oversize) });
         let response = router.oneshot(request(body)).await.expect("router answers");
@@ -812,15 +851,15 @@ mod tests {
 
     #[test]
     fn a_loopback_listener_needs_no_acknowledgement() {
-        refuse_unauthenticated_remote("127.0.0.1:8282".parse().unwrap(), false)
+        refuse_unauthenticated_remote("127.0.0.1:8282".parse().unwrap(), false, false)
             .expect("loopback is not exposed");
-        refuse_unauthenticated_remote("[::1]:8282".parse().unwrap(), false)
+        refuse_unauthenticated_remote("[::1]:8282".parse().unwrap(), false, false)
             .expect("loopback is not exposed");
     }
 
     #[test]
     fn an_unauthenticated_non_loopback_listener_is_refused_by_default() {
-        let error = refuse_unauthenticated_remote("0.0.0.0:8282".parse().unwrap(), false)
+        let error = refuse_unauthenticated_remote("0.0.0.0:8282".parse().unwrap(), false, false)
             .expect_err("every node in the fabric would be exposed");
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
         // The refusal has to name the way out of it, or it is a dead end.
@@ -828,12 +867,44 @@ mod tests {
             error.to_string().contains("--allow-unauthenticated-remote"),
             "{error}"
         );
+        // ...including the way out that does not give up authentication.
+        assert!(error.to_string().contains("--api-key"), "{error}");
     }
 
     #[test]
     fn a_non_loopback_listener_starts_once_the_risk_is_acknowledged() {
-        refuse_unauthenticated_remote("0.0.0.0:8282".parse().unwrap(), true)
+        refuse_unauthenticated_remote("0.0.0.0:8282".parse().unwrap(), false, true)
             .expect("the operator accepted the exposure");
+    }
+
+    /// Requiring a key is what the acknowledgement is an alternative to, so a
+    /// key has to satisfy the guard on its own.
+    #[test]
+    fn a_key_lets_a_non_loopback_listener_start_without_acknowledging_anything() {
+        refuse_unauthenticated_remote("0.0.0.0:8282".parse().unwrap(), true, false)
+            .expect("the listener is authenticated");
+    }
+
+    #[test]
+    fn a_resolved_key_reports_itself_as_enabled() {
+        assert!(!ClientAuth::none().is_enabled());
+        assert!(!ClientAuth::resolve(None, None)
+            .expect("no key is not an error")
+            .is_enabled());
+        assert!(ClientAuth::resolve(Some("k".to_string()), None)
+            .expect("a key resolves")
+            .is_enabled());
+    }
+
+    /// A key that cannot be read has to stop the process, not quietly leave the
+    /// proxy open to whatever can reach it.
+    #[test]
+    fn an_unusable_key_is_an_error_rather_than_an_open_proxy() {
+        ClientAuth::resolve(Some(" ".to_string()), None).expect_err("blank is not a key");
+        ClientAuth::resolve(None, Some(PathBuf::from("no-such-key-file")))
+            .expect_err("an unreadable file is not a key");
+        ClientAuth::resolve(Some("k".to_string()), Some(PathBuf::from("f")))
+            .expect_err("two sources is ambiguous");
     }
 
     /// The sticky header is documented as working whatever default the proxy

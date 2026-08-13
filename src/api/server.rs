@@ -99,6 +99,13 @@ impl fmt::Debug for ApiAuth {
 }
 
 impl ApiAuth {
+    /// Require `key`, or accept every request when it is `None`.
+    pub(crate) fn new(key: Option<String>) -> Self {
+        Self {
+            key: key.map(|key| Arc::<[u8]>::from(key.into_bytes())),
+        }
+    }
+
     pub(crate) fn enabled(&self) -> bool {
         self.key.is_some()
     }
@@ -171,25 +178,7 @@ impl ServerPolicy {
         validate_positive("max generation tokens", options.max_generation_tokens)?;
         validate_positive("max download bytes", options.max_download_bytes)?;
 
-        if options.api_key.is_some() && options.api_key_file.is_some() {
-            return Err(invalid(
-                "--api-key and --api-key-file are mutually exclusive",
-            ));
-        }
-        let key = match (options.api_key, options.api_key_file) {
-            (Some(key), None) => Some(validate_api_key(key)?),
-            (None, Some(path)) => {
-                let key = std::fs::read_to_string(&path).map_err(|error| {
-                    Error::new(
-                        error.kind(),
-                        format!("could not read API key file {}: {error}", path.display()),
-                    )
-                })?;
-                Some(validate_api_key(key)?)
-            }
-            (None, None) => None,
-            (Some(_), Some(_)) => unreachable!("conflict handled above"),
-        };
+        let key = resolve_api_key(options.api_key, options.api_key_file)?;
 
         if !addr.ip().is_loopback() && key.is_none() && !options.allow_unauthenticated_remote {
             return Err(Error::new(
@@ -218,9 +207,7 @@ impl ServerPolicy {
             .collect::<Result<Vec<_>>>()?;
 
         Ok(Self {
-            auth: ApiAuth {
-                key: key.map(|key| Arc::<[u8]>::from(key.into_bytes())),
-            },
+            auth: ApiAuth::new(key),
             limits: ServerLimits {
                 max_request_body_bytes: options.max_request_body_bytes,
                 max_prompt_tokens: options.max_prompt_tokens,
@@ -324,6 +311,33 @@ fn validate_api_key(key: String) -> Result<String> {
         return Err(invalid("API key must not contain control characters"));
     }
     Ok(key)
+}
+
+/// Resolve the key clients must present, from a value or a file.
+///
+/// Shared with the fabric proxy: two front doors validating the same kind of
+/// secret by two sets of rules is how they end up disagreeing about what a
+/// valid key is.
+pub(crate) fn resolve_api_key(
+    api_key: Option<String>,
+    api_key_file: Option<PathBuf>,
+) -> Result<Option<String>> {
+    match (api_key, api_key_file) {
+        (Some(_), Some(_)) => Err(invalid(
+            "--api-key and --api-key-file are mutually exclusive",
+        )),
+        (Some(key), None) => Ok(Some(validate_api_key(key)?)),
+        (None, Some(path)) => {
+            let key = std::fs::read_to_string(&path).map_err(|error| {
+                Error::new(
+                    error.kind(),
+                    format!("could not read API key file {}: {error}", path.display()),
+                )
+            })?;
+            Ok(Some(validate_api_key(key)?))
+        }
+        (None, None) => Ok(None),
+    }
 }
 
 fn parse_origin(origin: &str) -> Result<HeaderValue> {
