@@ -55,6 +55,11 @@ struct StubConfig {
     /// Events actually written to the socket. It stops advancing once the peer
     /// has gone, which is how a cancellation test observes the hang-up.
     events_written: Arc<AtomicUsize>,
+    /// When set, `/v1/health` reports this live count rather than a fixed one,
+    /// and a completion holds it up for its whole duration. A real engine's
+    /// `engine_queue_depth` behaves this way, and a placement test is only
+    /// meaningful against a node whose reported load actually moves.
+    live_in_flight: Option<Arc<AtomicUsize>>,
 }
 
 impl StubConfig {
@@ -75,6 +80,17 @@ impl StubConfig {
             stream_gap: Duration::ZERO,
             stream_truncated: false,
             events_written: Arc::new(AtomicUsize::new(0)),
+            live_in_flight: None,
+        }
+    }
+
+    /// A node that reports the load it is really carrying, and takes `delay`
+    /// to answer a completion.
+    fn reporting_live_load(model: &str, delay: Duration) -> Self {
+        Self {
+            completion_delay: delay,
+            live_in_flight: Some(Arc::new(AtomicUsize::new(0))),
+            ..Self::ready(model, 0)
         }
     }
 
@@ -217,10 +233,18 @@ fn serve_once(stream: &mut TcpStream, config: &StubConfig, requests: &Mutex<Vec<
             r#"{"error":{"message":"provide Authorization: Bearer <key> or X-API-Key"}}"#
                 .to_string(),
         ),
-        "/v1/health" => (200_u16, config.health.clone()),
+        "/v1/health" => (200_u16, health_body(config)),
         "/v1/chat/completions" => {
+            // Counted for exactly as long as the node is working on it.
+            let busy = config.live_in_flight.as_ref().map(|count| {
+                count.fetch_add(1, Ordering::SeqCst);
+                Arc::clone(count)
+            });
             if !config.completion_delay.is_zero() {
                 std::thread::sleep(config.completion_delay);
+            }
+            if let Some(count) = busy {
+                count.fetch_sub(1, Ordering::SeqCst);
             }
             (config.completion_status, config.completion.clone())
         }
@@ -236,6 +260,21 @@ fn serve_once(stream: &mut TcpStream, config: &StubConfig, requests: &Mutex<Vec<
     );
     let _ = stream.write_all(response.as_bytes());
     let _ = stream.flush();
+}
+
+/// What `/v1/health` answers: the configured body, or one carrying the load the
+/// node is really under when it is tracking that.
+fn health_body(config: &StubConfig) -> String {
+    match &config.live_in_flight {
+        None => config.health.clone(),
+        Some(count) => {
+            let depth = count.load(Ordering::SeqCst);
+            config.health.replace(
+                "\"engine_queue_depth\":0",
+                &format!("\"engine_queue_depth\":{depth}"),
+            )
+        }
+    }
 }
 
 /// Answer with chunked `text/event-stream`, one HTTP chunk per event, exactly
@@ -859,6 +898,69 @@ async fn a_client_hanging_up_stops_the_node_generating() {
         later < events.len(),
         "the node wrote all {} events despite the client leaving",
         events.len()
+    );
+}
+
+/// A burst of requests for one model must spread across the nodes serving it.
+///
+/// `/v1/health` reports what a node has already accepted, so a request still on
+/// its way is invisible there. Without the fabric counting its own outstanding
+/// placements, every request in a burst observes the same idle fabric and the
+/// label tie-break sends all of them to whichever node sorts first — measured at
+/// 10 / 2 / 0 across three nodes, with one node never used at all.
+///
+/// The nodes here report the load they are really under, which is the only way
+/// this test means anything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_burst_of_requests_spreads_across_the_nodes_serving_the_model() {
+    const REQUESTS: usize = 12;
+    let labels = ["node-a", "node-b", "node-c"];
+    let nodes: Vec<StubNode> = labels
+        .iter()
+        .map(|_| {
+            StubNode::start(StubConfig::reporting_live_load(
+                "shared-model",
+                Duration::from_millis(300),
+            ))
+        })
+        .collect();
+    let specs = nodes
+        .iter()
+        .enumerate()
+        .map(|(i, node)| node.spec(labels[i]))
+        .collect();
+    let addr = start_proxy(fabric_of(specs), RouteMode::Throughput).await;
+
+    let body = serde_json::json!({ "model": "shared-model" });
+    let results =
+        futures_util::future::join_all((0..REQUESTS).map(|_| post_chat(addr, &body, &[]))).await;
+    for (status, _, _) in &results {
+        assert_eq!(*status, 200);
+    }
+
+    let served: Vec<usize> = nodes
+        .iter()
+        .map(|node| {
+            node.received()
+                .iter()
+                .filter(|r| r.path == "/v1/chat/completions")
+                .count()
+        })
+        .collect();
+    let total: usize = served.iter().sum();
+    assert_eq!(total, REQUESTS, "every request must reach a node");
+
+    // Deliberately not asserting an exact split: probes race, so an occasional
+    // request lands a place either way. What must hold is that the work is
+    // shared rather than piled onto whichever label sorts first.
+    let busiest = served.iter().max().copied().unwrap_or(0);
+    assert!(
+        busiest <= REQUESTS / 2,
+        "one node took {busiest} of {REQUESTS}: {served:?}"
+    );
+    assert!(
+        served.iter().all(|count| *count > 0),
+        "a node serving the model was never used: {served:?}"
     );
 }
 

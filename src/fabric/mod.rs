@@ -28,6 +28,7 @@ pub mod policy;
 pub mod probe;
 pub mod server;
 
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::Value;
@@ -39,7 +40,10 @@ pub use node::{
     parse_fabric, parse_node_spec, NodeReady, NodeSnapshot, NodeSpec, NodeSpecParseError,
     NodeStatus, DEFAULT_NODE_PORT,
 };
-pub use policy::{route, RouteDecision, RouteError, RouteMode, RouteReason, RouteRequest};
+pub use policy::{
+    route, route_reserved, Reservations, RouteDecision, RouteError, RouteMode, RouteReason,
+    RouteRequest,
+};
 pub use probe::{probe_fabric, probe_node, ProbeError, DEFAULT_PROBE_TIMEOUT};
 
 /// A configured set of nodes.
@@ -48,6 +52,12 @@ pub struct Fabric {
     specs: Vec<NodeSpec>,
     timeout: Duration,
     bearer: Option<String>,
+    /// Requests this fabric has placed and not yet finished.
+    ///
+    /// Shared across clones on purpose: the resident proxy hands a `Fabric` to
+    /// every request, and they have to be counting into the same place or they
+    /// cannot see each other.
+    reserved: Arc<Mutex<Reservations>>,
 }
 
 /// Hand-written so a token can never reach a log through a derived `Debug`,
@@ -68,6 +78,7 @@ impl Fabric {
             specs,
             timeout: DEFAULT_PROBE_TIMEOUT,
             bearer: None,
+            reserved: Arc::new(Mutex::new(Reservations::none())),
         }
     }
 
@@ -101,19 +112,36 @@ impl Fabric {
 
     /// Observe every node once and choose one for a request.
     ///
-    /// The chosen node's snapshot comes back with the decision so a caller can
-    /// read what that node is already serving before it builds a request body.
-    pub fn place(
-        &self,
-        request: &RouteRequest<'_>,
-    ) -> Result<(RouteDecision, NodeSnapshot), RouteError> {
+    /// The returned [`Placement`] counts the request against the chosen node
+    /// until it is dropped, so a placement running concurrently can see it.
+    pub fn place(&self, request: &RouteRequest<'_>) -> Result<Placement, RouteError> {
+        // Probing is socket I/O against every node. It stays outside the lock:
+        // holding one across it would serialise placement on the slowest node.
         let snapshots = self.observe();
-        let decision = route(&snapshots, request)?;
-        let chosen = snapshots
+
+        // Deciding and recording are one step. Split them and two concurrent
+        // placements both decide before either records, which is the pile-up
+        // this reservation exists to prevent.
+        let mut reserved = lock(&self.reserved);
+        let decision = route_reserved(&snapshots, request, &reserved)?;
+        reserved.take(&decision.label);
+        drop(reserved);
+
+        let node = snapshots
             .into_iter()
             .find(|snapshot| snapshot.label() == decision.label)
             .expect("placement returns a label it was given");
-        Ok((decision, chosen))
+        Ok(Placement {
+            decision,
+            node,
+            reserved: Arc::clone(&self.reserved),
+        })
+    }
+
+    /// What this fabric currently believes it has outstanding, for tests and
+    /// for reporting. A copy, so reading it holds the lock no longer than that.
+    pub fn reserved(&self) -> Reservations {
+        lock(&self.reserved).clone()
     }
 
     /// Observe, place, and send — the whole path a caller actually wants.
@@ -130,15 +158,16 @@ impl Fabric {
         // Refuse an unsupported request before spending any probes on it.
         forward::reject_streaming(body)?;
 
-        let (decision, chosen) = self.place(request)?;
+        // Held until this function returns, which is when the request is over.
+        let placement = self.place(request)?;
         let answer = forward::forward(
-            &chosen.spec,
+            &placement.node.spec,
             path,
             body,
             self.bearer.as_deref(),
             forward_timeout,
         )?;
-        Ok((decision, answer))
+        Ok((placement.decision.clone(), answer))
     }
 
     /// Observe, place, and start a streaming request.
@@ -147,6 +176,10 @@ impl Fabric {
     /// [`Fabric::place`] — but the answer is read as it arrives instead of all
     /// at once. Returns once the node's response head is in, so a caller knows
     /// the status and which node it came from before relaying a single byte.
+    ///
+    /// The [`Placement`] comes back rather than being dropped here because the
+    /// request outlives this call: the node is busy until the last event is
+    /// read, so whoever pumps the stream must hold it for that long.
     pub fn dispatch_streaming(
         &self,
         path: &str,
@@ -154,17 +187,64 @@ impl Fabric {
         request: &RouteRequest<'_>,
         head_timeout: Duration,
         idle_timeout: Duration,
-    ) -> Result<(RouteDecision, StreamOutcome), DispatchError> {
-        let (decision, chosen) = self.place(request)?;
+    ) -> Result<(StreamOutcome, Placement), DispatchError> {
+        let placement = self.place(request)?;
         let outcome = forward::forward_streaming(
-            &chosen.spec,
+            &placement.node.spec,
             path,
             body,
             self.bearer.as_deref(),
             head_timeout,
             idle_timeout,
         )?;
-        Ok((decision, outcome))
+        Ok((outcome, placement))
+    }
+}
+
+/// A poisoned counter is not a corrupted one: some other request panicked while
+/// holding the lock. Recover the map rather than spreading the panic.
+fn lock(reserved: &Mutex<Reservations>) -> std::sync::MutexGuard<'_, Reservations> {
+    reserved
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// A node chosen for one request, and the fabric's record that it is busy.
+///
+/// The chosen node counts this request until this value is dropped, so hold it
+/// for exactly as long as the request runs. Dropping it early tells the fabric
+/// the node is free when it is not, and the next placement will pile onto it.
+#[must_use = "dropping a Placement releases the node it reserved"]
+pub struct Placement {
+    decision: RouteDecision,
+    node: NodeSnapshot,
+    reserved: Arc<Mutex<Reservations>>,
+}
+
+impl Placement {
+    pub fn decision(&self) -> &RouteDecision {
+        &self.decision
+    }
+
+    /// The chosen node as it was observed, so a caller can read what it is
+    /// already serving before building a request body for it.
+    pub fn node(&self) -> &NodeSnapshot {
+        &self.node
+    }
+}
+
+impl std::fmt::Debug for Placement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Placement")
+            .field("decision", &self.decision)
+            .field("node", &self.node.label())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for Placement {
+    fn drop(&mut self) {
+        lock(&self.reserved).release(&self.decision.label);
     }
 }
 

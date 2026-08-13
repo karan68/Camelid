@@ -254,25 +254,30 @@ async fn stream_completion(state: ServerState, body: Value, request: OwnedReques
             state.config.forward_timeout,
         );
 
-        let mut streaming = match outcome {
+        let (mut streaming, _placement) = match outcome {
             Err(error) => {
                 let _ = start_tx.send(StreamStart::Failed(error));
                 return;
             }
-            Ok((decision, StreamOutcome::Buffered(answer))) => {
-                let _ = start_tx.send(StreamStart::Buffered { decision, answer });
+            Ok((StreamOutcome::Buffered(answer), placement)) => {
+                let _ = start_tx.send(StreamStart::Buffered {
+                    decision: placement.decision().clone(),
+                    answer,
+                });
                 return;
             }
-            Ok((decision, StreamOutcome::Streaming(streaming))) => {
+            Ok((StreamOutcome::Streaming(streaming), placement)) => {
                 let start = StreamStart::Streaming {
-                    decision,
+                    decision: placement.decision().clone(),
                     status: streaming.status,
                     content_type: streaming.content_type.clone(),
                 };
                 if start_tx.send(start).is_err() {
                     return;
                 }
-                streaming
+                // Bound alongside the stream so the node stays reserved until
+                // the last event is read — however this loop ends.
+                (streaming, placement)
             }
         };
 

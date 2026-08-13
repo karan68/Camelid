@@ -135,16 +135,90 @@ impl std::fmt::Display for RouteError {
 
 impl std::error::Error for RouteError {}
 
+/// Requests this fabric has placed on each node and not yet finished.
+///
+/// `/v1/health` reports what a node has *accepted*. A request already on its way
+/// to a node is invisible there until it arrives, so without this a burst of
+/// concurrent requests all observe the same idle fabric, and the label
+/// tie-break sends every one of them to the same node.
+///
+/// Pure and self-contained: the arithmetic is tested here, without threads.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Reservations(std::collections::BTreeMap<String, usize>);
+
+impl Reservations {
+    /// What a dry run holds: nothing is in flight, so nothing is reserved.
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    pub fn get(&self, label: &str) -> usize {
+        self.0.get(label).copied().unwrap_or(0)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Record one more request placed on `label`.
+    pub fn take(&mut self, label: &str) {
+        *self.0.entry(label.to_string()).or_insert(0) += 1;
+    }
+
+    /// Record that one request on `label` has finished.
+    ///
+    /// A label that reaches zero is removed rather than left at zero, so the map
+    /// stays a statement of what is actually outstanding.
+    pub fn release(&mut self, label: &str) {
+        if let Some(count) = self.0.get_mut(label) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.0.remove(label);
+            }
+        }
+    }
+}
+
 /// One eligible node reduced to the fields selection actually uses.
 struct Candidate<'a> {
     label: &'a str,
-    in_flight: usize,
+    load: usize,
 }
 
-/// Choose a node for one request.
+/// What a node is carrying, as far as this fabric can tell. Pure.
+///
+/// A request this fabric placed is either not yet accepted by the node — and so
+/// missing from `observed` — or already accepted and counted in it. The truth is
+/// therefore somewhere in `[max(observed, reserved), observed + reserved]`, and
+/// `max` is the tighter end.
+///
+/// Adding them instead would double-count for most of a request's life, and
+/// would do so asymmetrically: a node busy with this fabric's work would be
+/// ranked worse than a node equally busy with somebody else's.
+fn load_of(observed: usize, reserved: usize) -> usize {
+    observed.max(reserved)
+}
+
+/// Choose a node for one request, ignoring anything already in flight.
+///
+/// This is what a dry run does, and what `fabric route` reports: given only what
+/// the nodes say about themselves, which one would take the request.
 pub fn route(
     snapshots: &[NodeSnapshot],
     request: &RouteRequest<'_>,
+) -> Result<RouteDecision, RouteError> {
+    route_reserved(snapshots, request, &Reservations::none())
+}
+
+/// Choose a node for one request, counting what this fabric already placed.
+///
+/// Still pure: `reserved` is a snapshot of the fabric's own bookkeeping, so the
+/// decision remains a function of its arguments and a dry run with an empty
+/// `reserved` reproduces [`route`] exactly.
+pub fn route_reserved(
+    snapshots: &[NodeSnapshot],
+    request: &RouteRequest<'_>,
+    reserved: &Reservations,
 ) -> Result<RouteDecision, RouteError> {
     if snapshots.is_empty() {
         return Err(RouteError::NoNodesConfigured);
@@ -198,7 +272,7 @@ pub fn route(
         .filter_map(|snapshot| {
             snapshot.status.ready().map(|ready| Candidate {
                 label: snapshot.label(),
-                in_flight: ready.in_flight,
+                load: load_of(ready.in_flight, reserved.get(snapshot.label())),
             })
         })
         .collect();
@@ -225,11 +299,7 @@ pub fn route(
     // Ties break on label so a dry run predicts the real decision.
     let chosen = candidates
         .iter()
-        .min_by(|a, b| {
-            a.in_flight
-                .cmp(&b.in_flight)
-                .then_with(|| a.label.cmp(b.label))
-        })
+        .min_by(|a, b| a.load.cmp(&b.load).then_with(|| a.label.cmp(b.label)))
         .expect("candidates is non-empty");
 
     let reason = if candidates.len() == 1 {
@@ -303,6 +373,114 @@ mod tests {
             route(&[], &RouteRequest::new(RouteMode::Throughput)),
             Err(RouteError::NoNodesConfigured)
         );
+    }
+
+    #[test]
+    fn reserving_and_releasing_returns_to_nothing_outstanding() {
+        let mut reserved = Reservations::none();
+        assert_eq!(reserved.get("a"), 0);
+        reserved.take("a");
+        reserved.take("a");
+        assert_eq!(reserved.get("a"), 2);
+        reserved.release("a");
+        assert_eq!(reserved.get("a"), 1);
+        reserved.release("a");
+        assert_eq!(reserved.get("a"), 0);
+        // Back to genuinely empty, not a lingering zero.
+        assert!(reserved.is_empty());
+    }
+
+    #[test]
+    fn releasing_more_than_was_taken_cannot_underflow() {
+        let mut reserved = Reservations::none();
+        reserved.release("a");
+        reserved.take("a");
+        reserved.release("a");
+        reserved.release("a");
+        assert_eq!(reserved.get("a"), 0);
+    }
+
+    /// The defect this exists to fix: with every node idle, `in_flight` is 0
+    /// everywhere, so the label tie-break sends a whole burst to one node.
+    /// Reservations make the second request see the first.
+    #[test]
+    fn a_request_already_placed_moves_the_next_one_along() {
+        let nodes = vec![
+            ready("a", Some("m"), 0),
+            ready("b", Some("m"), 0),
+            ready("c", Some("m"), 0),
+        ];
+        let request = RouteRequest::new(RouteMode::Throughput);
+
+        let mut reserved = Reservations::none();
+        let mut chosen = Vec::new();
+        for _ in 0..6 {
+            let decision = route_reserved(&nodes, &request, &reserved).expect("routes");
+            reserved.take(&decision.label);
+            chosen.push(decision.label);
+        }
+        // Without reservations every one of these is "a".
+        assert_eq!(chosen, vec!["a", "b", "c", "a", "b", "c"]);
+    }
+
+    /// A node's own report and this fabric's bookkeeping describe overlapping
+    /// work, not separate work. Summing them would rank a node carrying this
+    /// fabric's request below an equally busy node carrying someone else's.
+    #[test]
+    fn a_nodes_own_load_and_our_reservation_are_not_added_together() {
+        // `a` is busy with the one request we placed; `b` is equally busy with
+        // traffic from elsewhere. They are carrying the same amount, so the tie
+        // must break on label.
+        let nodes = vec![ready("a", Some("m"), 1), ready("b", Some("m"), 1)];
+        let mut reserved = Reservations::none();
+        reserved.take("a");
+
+        let request = RouteRequest::new(RouteMode::Throughput);
+        let decision = route_reserved(&nodes, &request, &reserved).expect("routes");
+        assert_eq!(
+            decision.label, "a",
+            "adding load to a reservation would have made `a` look twice as busy"
+        );
+    }
+
+    #[test]
+    fn an_empty_reservation_set_reproduces_the_dry_run_exactly() {
+        let nodes = vec![ready("a", Some("m"), 3), ready("b", Some("m"), 1)];
+        let request = RouteRequest::new(RouteMode::Throughput);
+        assert_eq!(
+            route_reserved(&nodes, &request, &Reservations::none()),
+            route(&nodes, &request)
+        );
+    }
+
+    /// A reservation ranks a node, it never disqualifies one: a single reserved
+    /// node is still the only candidate rather than becoming no candidate.
+    #[test]
+    fn reservations_never_make_a_fabric_unroutable() {
+        let nodes = vec![ready("only", Some("m"), 0)];
+        let mut reserved = Reservations::none();
+        for _ in 0..50 {
+            reserved.take("only");
+        }
+        let decision = route_reserved(&nodes, &RouteRequest::new(RouteMode::Throughput), &reserved)
+            .expect("a reserved node is still eligible");
+        assert_eq!(decision.label, "only");
+        assert_eq!(decision.reason, RouteReason::OnlyCandidate);
+    }
+
+    /// Affinity is a deliberate request for one node; a reservation on it is
+    /// not a reason to send the session somewhere cold.
+    #[test]
+    fn affinity_still_wins_over_a_reservation() {
+        let nodes = vec![ready("warm", Some("m"), 0), ready("cold", Some("m"), 0)];
+        let mut reserved = Reservations::none();
+        reserved.take("warm");
+        reserved.take("warm");
+
+        let request = RouteRequest::new(RouteMode::Affinity).with_sticky(Some("warm"));
+        let decision = route_reserved(&nodes, &request, &reserved).expect("routes");
+        assert_eq!(decision.label, "warm");
+        assert_eq!(decision.reason, RouteReason::Affinity);
     }
 
     /// These strings reach clients over HTTP and in `--json` output, so they

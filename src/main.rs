@@ -2893,9 +2893,13 @@ async fn main() -> anyhow::Result<()> {
                 let request = camelid::fabric::RouteRequest::new(mode)
                     .with_model(model.as_deref())
                     .with_sticky(sticky.as_deref());
-                let (decision, chosen) = fabric
+                // Held until the forward below returns: the node is busy for
+                // exactly that long.
+                let placement = fabric
                     .place(&request)
                     .map_err(|error| anyhow::anyhow!("{error}"))?;
+                let decision = placement.decision();
+                let chosen = placement.node();
 
                 // The request must name a model. Prefer the operator's choice,
                 // otherwise use whatever the chosen node has loaded.
