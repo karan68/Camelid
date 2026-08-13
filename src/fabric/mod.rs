@@ -132,8 +132,17 @@ impl Fabric {
     /// [`Fabric::with_max_observation_age`], which defaults to zero — so this
     /// probes every time until a caller asks for something else.
     pub fn observe(&self) -> Vec<NodeSnapshot> {
+        self.observe_reporting_reuse().0
+    }
+
+    /// Observe, and say whether the answer came from a previous observation.
+    ///
+    /// Placement needs that second fact: a refusal decided from a reused
+    /// observation is a statement about the fabric as it was, and some
+    /// refusals are reported to clients as permanent.
+    fn observe_reporting_reuse(&self) -> (Vec<NodeSnapshot>, bool) {
         if self.max_observation_age.is_zero() {
-            return self.probe();
+            return (self.probe(), false);
         }
 
         // Refreshing under the lock makes concurrent callers wait for one probe
@@ -143,12 +152,12 @@ impl Fabric {
         let mut observed = lock(&self.observed);
         if let Some(observation) = observed.as_ref() {
             if observation.is_fresh_at(Instant::now(), self.max_observation_age) {
-                return observation.snapshots().to_vec();
+                return (observation.snapshots().to_vec(), true);
             }
         }
         let snapshots = self.probe();
         *observed = Some(Observation::taken_at(snapshots.clone(), Instant::now()));
-        snapshots
+        (snapshots, false)
     }
 
     /// Probe every node, whatever was observed before.
@@ -181,8 +190,30 @@ impl Fabric {
         // Observing is socket I/O against every node. It stays outside the
         // reservation lock: holding that across it would serialise placement on
         // the slowest node, and would deadlock a `Placement` being dropped.
-        let snapshots = self.observe();
+        let (snapshots, reused) = self.observe_reporting_reuse();
 
+        match self.place_observed(snapshots, request) {
+            // Refusing on a reused observation would settle from memory a
+            // question the caller asked about now — and the proxy reports
+            // `ModelUnavailable` as a 404 a client is told never to retry. A
+            // node that has loaded a model since must not be refused that way,
+            // so look again before saying no. This costs a probe only on a
+            // request that was about to fail.
+            Err(_) if reused => {
+                self.forget_observation();
+                let (fresh, _) = self.observe_reporting_reuse();
+                self.place_observed(fresh, request)
+            }
+            settled => settled,
+        }
+    }
+
+    /// Choose a node from an observation already taken, and reserve it.
+    fn place_observed(
+        &self,
+        snapshots: Vec<NodeSnapshot>,
+        request: &RouteRequest<'_>,
+    ) -> Result<Placement, RouteError> {
         // Deciding and recording are one step. Split them and two concurrent
         // placements both decide before either records, which is the pile-up
         // this reservation exists to prevent.

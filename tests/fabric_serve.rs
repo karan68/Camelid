@@ -60,6 +60,9 @@ struct StubConfig {
     /// `engine_queue_depth` behaves this way, and a placement test is only
     /// meaningful against a node whose reported load actually moves.
     live_in_flight: Option<Arc<AtomicUsize>>,
+    /// When set, `/v1/health` reports this model rather than the fixed one, so
+    /// a test can load a different model while the proxy is running.
+    live_model: Option<Arc<Mutex<String>>>,
 }
 
 impl StubConfig {
@@ -81,6 +84,7 @@ impl StubConfig {
             stream_truncated: false,
             events_written: Arc::new(AtomicUsize::new(0)),
             live_in_flight: None,
+            live_model: None,
         }
     }
 
@@ -90,6 +94,15 @@ impl StubConfig {
         Self {
             completion_delay: delay,
             live_in_flight: Some(Arc::new(AtomicUsize::new(0))),
+            ..Self::ready(model, 0)
+        }
+    }
+
+    /// A node whose active model can be changed while the proxy is running, the
+    /// way an operator loading a different model changes it.
+    fn with_switchable_model(model: &str) -> Self {
+        Self {
+            live_model: Some(Arc::new(Mutex::new(model.to_string()))),
             ..Self::ready(model, 0)
         }
     }
@@ -262,19 +275,17 @@ fn serve_once(stream: &mut TcpStream, config: &StubConfig, requests: &Mutex<Vec<
     let _ = stream.flush();
 }
 
-/// What `/v1/health` answers: the configured body, or one carrying the load the
-/// node is really under when it is tracking that.
+/// What `/v1/health` answers: the configured body, carrying whatever load and
+/// model the node is really reporting when it is tracking those.
 fn health_body(config: &StubConfig) -> String {
-    match &config.live_in_flight {
-        None => config.health.clone(),
-        Some(count) => {
-            let depth = count.load(Ordering::SeqCst);
-            config.health.replace(
-                "\"engine_queue_depth\":0",
-                &format!("\"engine_queue_depth\":{depth}"),
-            )
-        }
+    let mut body: Value = serde_json::from_str(&config.health).expect("stub health is json");
+    if let Some(count) = &config.live_in_flight {
+        body["engine_queue_depth"] = count.load(Ordering::SeqCst).into();
     }
+    if let Some(model) = &config.live_model {
+        body["active_model_id"] = Value::String(model.lock().expect("stub model lock").clone());
+    }
+    body.to_string()
 }
 
 /// Answer with chunked `text/event-stream`, one HTTP chunk per event, exactly
@@ -1187,4 +1198,37 @@ async fn a_node_that_stops_answering_drops_the_observation_that_named_it() {
          observes the fabric again and finds nothing to route to"
     );
     assert_eq!(refusal["error"]["type"], "fabric_error");
+}
+
+/// Reusing an observation may delay routing to a newly loaded model. It must
+/// not turn that delay into a *permanent* refusal: `/v1/chat/completions`
+/// answers 404 `model_not_found` for a model no node serves, and a 404 tells an
+/// OpenAI SDK to stop retrying. Issued from a reused observation, that verdict
+/// is about the fabric as it was, so the fabric has to look again before it
+/// refuses rather than settle the question from memory.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_model_loaded_since_the_observation_is_not_refused_as_permanently_absent() {
+    let config = StubConfig::with_switchable_model("old-model");
+    let model = Arc::clone(config.live_model.as_ref().expect("a switchable node"));
+    let node = StubNode::start(config);
+    // Far longer than the test runs, so nothing here depends on it expiring.
+    let addr = start_proxy(
+        fabric_reusing_observations(vec![node.spec("only")], Duration::from_secs(30)),
+        RouteMode::Throughput,
+    )
+    .await;
+
+    let (served, _, _) = post_chat(addr, &serde_json::json!({ "model": "old-model" }), &[]).await;
+    assert_eq!(served, 200, "the first request takes the observation");
+
+    // The operator loads something else, exactly as `/api/models/load` does.
+    *model.lock().expect("stub model lock") = "new-model".to_string();
+
+    let (status, body, _) =
+        post_chat(addr, &serde_json::json!({ "model": "new-model" }), &[]).await;
+    assert_ne!(
+        status, 404,
+        "a permanent refusal was settled from a stale observation: {body}"
+    );
+    assert_eq!(status, 200, "{body}");
 }
