@@ -14,6 +14,7 @@
     "smoke:first-run": "node scripts/first-run-activation-smoke.mjs",
     "smoke:first-run-card": "node scripts/first-run-card-smoke.mjs",
     "smoke:offline-banner": "node scripts/offline-banner-smoke.mjs",
+    "smoke:desktop-storage": "node scripts/desktop-storage-smoke.mjs",
     "smoke:catalog-browse": "node scripts/catalog-browse-smoke.mjs",
     "smoke:model-families": "node scripts/model-families-smoke.mjs",
     "smoke:catalog-companion": "node scripts/catalog-companion-smoke.mjs",

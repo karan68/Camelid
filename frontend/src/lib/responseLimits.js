@@ -7,6 +7,7 @@
    UI renders those indicators ABSENT, never estimated client-side. */
 
 import { findCompatibilityHint, isExactCompatibilityHint } from './capabilities.js'
+import { appStorage } from './appStorage.js'
 
 export const MAX_RESPONSE_TOKENS = 1000000
 export const MIN_RESPONSE_TOKENS = 1
@@ -209,21 +210,21 @@ const MAX_TOKENS_KEY = 'camelid.maxTokens'
 
 export function hasExplicitMaxTokensSetting(modelId = '') {
   if (typeof window === 'undefined' || !modelId) return false
-  const value = Number.parseInt(window.localStorage.getItem(`${MAX_TOKENS_KEY}.${modelId}`) || '', 10)
+  const value = Number.parseInt(appStorage.getItem(`${MAX_TOKENS_KEY}.${modelId}`) || '', 10)
   return Number.isFinite(value) && value >= MIN_RESPONSE_TOKENS
 }
 
 export function getConfiguredMaxTokens(modelId = '') {
   if (typeof window === 'undefined') return 8192
-  const perModel = modelId ? Number.parseInt(window.localStorage.getItem(`${MAX_TOKENS_KEY}.${modelId}`) || '', 10) : NaN
+  const perModel = modelId ? Number.parseInt(appStorage.getItem(`${MAX_TOKENS_KEY}.${modelId}`) || '', 10) : NaN
   if (Number.isFinite(perModel) && perModel >= MIN_RESPONSE_TOKENS) return perModel
-  const legacy = Number.parseInt(window.localStorage.getItem(MAX_TOKENS_KEY) || '', 10)
+  const legacy = Number.parseInt(appStorage.getItem(MAX_TOKENS_KEY) || '', 10)
   return Number.isFinite(legacy) && legacy >= 256 ? legacy : 8192
 }
 
 export function setConfiguredMaxTokens(modelId, value) {
   if (typeof window === 'undefined') return
   const clamped = Math.min(Math.max(Math.round(value), MIN_RESPONSE_TOKENS), MAX_RESPONSE_TOKENS)
-  if (modelId) window.localStorage.setItem(`${MAX_TOKENS_KEY}.${modelId}`, String(clamped))
-  else window.localStorage.setItem(MAX_TOKENS_KEY, String(clamped))
+  if (modelId) appStorage.setItem(`${MAX_TOKENS_KEY}.${modelId}`, String(clamped))
+  else appStorage.setItem(MAX_TOKENS_KEY, String(clamped))
 }

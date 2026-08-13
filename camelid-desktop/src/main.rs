@@ -10,6 +10,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod engine;
+mod ui_storage;
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -17,6 +18,7 @@ use tauri::{Emitter, Manager, State};
 use tauri_plugin_dialog::DialogExt;
 
 use engine::Engine;
+use ui_storage::UiStorageState;
 
 const MODELS_DIRECTORY_PREFERENCE_FILE: &str = "models-directory.json";
 
@@ -270,11 +272,15 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .manage(EngineState::default())
         .manage(StartupState::default())
+        .manage(UiStorageState::default())
         .invoke_handler(tauri::generate_handler![
             startup_snapshot,
             retry_startup,
             choose_models_directory,
-            reset_models_directory
+            reset_models_directory,
+            ui_storage::read_ui_storage,
+            ui_storage::set_ui_storage_value,
+            ui_storage::replace_ui_storage
         ])
         .setup(|app| {
             let handle = app.handle().clone();

@@ -23,6 +23,9 @@ fn main() {
             "retry_startup",
             "choose_models_directory",
             "reset_models_directory",
+            "read_ui_storage",
+            "set_ui_storage_value",
+            "replace_ui_storage",
         ]));
     tauri_build::try_build(attributes).expect("failed to run tauri-build");
 }

@@ -7,6 +7,7 @@ import { loadLocalModelForChat, modelFilenameFromPath } from '../lib/modelActiva
 import { readStreamingChatCompletion } from '../lib/chatCompletionStream'
 import { NEW_CHAT_SENTINEL, resolveSelectedConversation, shouldCreateConversationForSend } from '../lib/chatState'
 import { normalizeStoredConversations } from '../lib/conversationStorage.js'
+import { appStorage } from '../lib/appStorage.js'
 import { getRuntimeRequestModelId, isExternalModel, modelRuntimeIdMatches } from '../lib/modelState'
 import { contractSamplingOverrides } from '../lib/samplingContract'
 import { executionRuntimeFields } from '../lib/executionPlan'
@@ -44,23 +45,23 @@ const DEFAULT_API_BASE = defaultApiBase()
 
 function getInitialTab() {
   if (typeof window === 'undefined') return 'chat'
-  const saved = window.localStorage.getItem(TAB_STORAGE_KEY)
+  const saved = appStorage.getItem(TAB_STORAGE_KEY)
   return saved && VALID_TABS.has(saved) ? saved : 'chat'
 }
 
 function getInitialConversationId() {
   if (typeof window === 'undefined') return null
-  return window.localStorage.getItem(SELECTED_CONVERSATION_STORAGE_KEY) || null
+  return appStorage.getItem(SELECTED_CONVERSATION_STORAGE_KEY) || null
 }
 
 function getInitialModelId() {
   if (typeof window === 'undefined') return ''
-  return window.localStorage.getItem(SELECTED_MODEL_STORAGE_KEY) || ''
+  return appStorage.getItem(SELECTED_MODEL_STORAGE_KEY) || ''
 }
 
 function getApiBase() {
   if (typeof window === 'undefined') return DEFAULT_API_BASE
-  return window.localStorage.getItem(API_BASE_STORAGE_KEY) || DEFAULT_API_BASE
+  return appStorage.getItem(API_BASE_STORAGE_KEY) || DEFAULT_API_BASE
 }
 
 function normalizeApiBase(value) {
@@ -70,10 +71,10 @@ function normalizeApiBase(value) {
 function readJsonStorage(key, fallback) {
   if (typeof window === 'undefined') return fallback
   try {
-    const saved = window.localStorage.getItem(key)
+    const saved = appStorage.getItem(key)
     return saved ? JSON.parse(saved) : fallback
   } catch {
-    window.localStorage.removeItem(key)
+    appStorage.removeItem(key)
     return fallback
   }
 }
@@ -81,7 +82,7 @@ function readJsonStorage(key, fallback) {
 function writeJsonStorage(key, value) {
   if (typeof window === 'undefined') return
   try {
-    window.localStorage.setItem(key, JSON.stringify(value))
+    appStorage.setItem(key, JSON.stringify(value))
   } catch {
     // Image attachments can exhaust a browser's small localStorage quota.
     // Keep the live in-memory conversation and request working; persistence
@@ -139,7 +140,7 @@ const DEFAULT_CHAT_MAX_TOKENS = 8192
 
 function getConfiguredMaxTokens() {
   if (typeof window === 'undefined') return DEFAULT_CHAT_MAX_TOKENS
-  const value = Number.parseInt(window.localStorage.getItem(MAX_TOKENS_STORAGE_KEY) || '', 10)
+  const value = Number.parseInt(appStorage.getItem(MAX_TOKENS_STORAGE_KEY) || '', 10)
   return Number.isFinite(value) && value >= 256 ? value : DEFAULT_CHAT_MAX_TOKENS
 }
 
@@ -153,7 +154,7 @@ const SYSTEM_PROMPT_STORAGE_KEY = 'camelid.systemPrompt'
 
 function getConfiguredSystemPrompt() {
   if (typeof window === 'undefined') return ''
-  return String(window.localStorage.getItem(SYSTEM_PROMPT_STORAGE_KEY) || '').trim()
+  return String(appStorage.getItem(SYSTEM_PROMPT_STORAGE_KEY) || '').trim()
 }
 
 function applyLocalChatPolicy(messages) {
@@ -886,19 +887,19 @@ export function useDashboardData({ showNotice, clearNotice }) {
 
   useEffect(() => {
     if (typeof window === 'undefined' || !VALID_TABS.has(tab)) return
-    window.localStorage.setItem(TAB_STORAGE_KEY, tab)
+    appStorage.setItem(TAB_STORAGE_KEY, tab)
   }, [tab])
 
   useEffect(() => {
     if (typeof window === 'undefined') return
-    if (!selectedConversationId) window.localStorage.removeItem(SELECTED_CONVERSATION_STORAGE_KEY)
-    else window.localStorage.setItem(SELECTED_CONVERSATION_STORAGE_KEY, selectedConversationId)
+    if (!selectedConversationId) appStorage.removeItem(SELECTED_CONVERSATION_STORAGE_KEY)
+    else appStorage.setItem(SELECTED_CONVERSATION_STORAGE_KEY, selectedConversationId)
   }, [selectedConversationId])
 
   useEffect(() => {
     if (typeof window === 'undefined') return
-    if (!selectedModelId) window.localStorage.removeItem(SELECTED_MODEL_STORAGE_KEY)
-    else window.localStorage.setItem(SELECTED_MODEL_STORAGE_KEY, selectedModelId)
+    if (!selectedModelId) appStorage.removeItem(SELECTED_MODEL_STORAGE_KEY)
+    else appStorage.setItem(SELECTED_MODEL_STORAGE_KEY, selectedModelId)
   }, [selectedModelId])
 
   const conversations = localConversations.length ? localConversations : dashboard?.conversations || []
@@ -1888,7 +1889,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
     setApiBase: (value) => {
       const next = normalizeApiBase(value)
       setApiBaseState(next)
-      if (typeof window !== 'undefined') window.localStorage.setItem(API_BASE_STORAGE_KEY, next)
+      if (typeof window !== 'undefined') appStorage.setItem(API_BASE_STORAGE_KEY, next)
     },
   }
 }
