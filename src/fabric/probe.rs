@@ -181,6 +181,48 @@ pub fn probe_fabric(
     })
 }
 
+/// A fabric observation, and the moment it was taken.
+///
+/// [`super::Fabric::place`] needs an observation before every request. Probing
+/// for each one is exactly right for a CLI invocation, which makes one request
+/// and exits. For the resident proxy it is a `/v1/health` per node per request,
+/// and while any node is black-holing it is the whole probe budget on every
+/// request — measured at 2.0 s each against nodes that answer in 2 ms.
+///
+/// Reusing an observation trades freshness for that cost, so how stale a reused
+/// one may be is a stated bound rather than an implicit one. Pure, so the
+/// decision is tested without sockets and without sleeping.
+///
+/// `taken` is when the probe *completed*. Stamping it at the start would make
+/// an observation that waited out a black-holing node be born already expired,
+/// which is precisely the case this exists for; the price is that the oldest
+/// fact in an observation can be one probe budget older than the bound alone
+/// suggests.
+#[derive(Debug, Clone)]
+pub struct Observation {
+    snapshots: Vec<NodeSnapshot>,
+    taken: Instant,
+}
+
+impl Observation {
+    pub fn taken_at(snapshots: Vec<NodeSnapshot>, taken: Instant) -> Self {
+        Self { snapshots, taken }
+    }
+
+    pub fn snapshots(&self) -> &[NodeSnapshot] {
+        &self.snapshots
+    }
+
+    /// Whether this observation may still be used at `now`.
+    ///
+    /// The bound is exclusive, so a `max_age` of zero reuses nothing. That is
+    /// what a caller wanting the fabric as it is right now asks for, and it is
+    /// the default.
+    pub fn is_fresh_at(&self, now: Instant, max_age: Duration) -> bool {
+        now.saturating_duration_since(self.taken) < max_age
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -293,5 +335,30 @@ mod tests {
             unreachable_reason(&ProbeError::Transport("cannot connect".to_string())),
             "cannot connect"
         );
+    }
+
+    /// Built by adding to an instant rather than subtracting from `now`, so the
+    /// test states an elapsed time exactly instead of racing the clock.
+    fn observation_aged(elapsed: Duration) -> (Observation, Instant) {
+        let taken = Instant::now();
+        (Observation::taken_at(Vec::new(), taken), taken + elapsed)
+    }
+
+    #[test]
+    fn an_observation_inside_the_bound_is_reusable() {
+        let (observation, now) = observation_aged(Duration::from_millis(499));
+        assert!(observation.is_fresh_at(now, Duration::from_millis(500)));
+    }
+
+    #[test]
+    fn an_observation_at_the_bound_is_not_reusable() {
+        let (observation, now) = observation_aged(Duration::from_millis(500));
+        assert!(!observation.is_fresh_at(now, Duration::from_millis(500)));
+    }
+
+    #[test]
+    fn a_zero_bound_reuses_nothing_not_even_an_observation_just_taken() {
+        let (observation, now) = observation_aged(Duration::ZERO);
+        assert!(!observation.is_fresh_at(now, Duration::ZERO));
     }
 }
