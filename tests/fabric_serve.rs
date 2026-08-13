@@ -60,6 +60,9 @@ struct StubConfig {
     /// `engine_queue_depth` behaves this way, and a placement test is only
     /// meaningful against a node whose reported load actually moves.
     live_in_flight: Option<Arc<AtomicUsize>>,
+    /// When set, `/v1/health` reports this model rather than the fixed one, so
+    /// a test can load a different model while the proxy is running.
+    live_model: Option<Arc<Mutex<String>>>,
 }
 
 impl StubConfig {
@@ -81,6 +84,7 @@ impl StubConfig {
             stream_truncated: false,
             events_written: Arc::new(AtomicUsize::new(0)),
             live_in_flight: None,
+            live_model: None,
         }
     }
 
@@ -90,6 +94,15 @@ impl StubConfig {
         Self {
             completion_delay: delay,
             live_in_flight: Some(Arc::new(AtomicUsize::new(0))),
+            ..Self::ready(model, 0)
+        }
+    }
+
+    /// A node whose active model can be changed while the proxy is running, the
+    /// way an operator loading a different model changes it.
+    fn with_switchable_model(model: &str) -> Self {
+        Self {
+            live_model: Some(Arc::new(Mutex::new(model.to_string()))),
             ..Self::ready(model, 0)
         }
     }
@@ -262,19 +275,17 @@ fn serve_once(stream: &mut TcpStream, config: &StubConfig, requests: &Mutex<Vec<
     let _ = stream.flush();
 }
 
-/// What `/v1/health` answers: the configured body, or one carrying the load the
-/// node is really under when it is tracking that.
+/// What `/v1/health` answers: the configured body, carrying whatever load and
+/// model the node is really reporting when it is tracking those.
 fn health_body(config: &StubConfig) -> String {
-    match &config.live_in_flight {
-        None => config.health.clone(),
-        Some(count) => {
-            let depth = count.load(Ordering::SeqCst);
-            config.health.replace(
-                "\"engine_queue_depth\":0",
-                &format!("\"engine_queue_depth\":{depth}"),
-            )
-        }
+    let mut body: Value = serde_json::from_str(&config.health).expect("stub health is json");
+    if let Some(count) = &config.live_in_flight {
+        body["engine_queue_depth"] = count.load(Ordering::SeqCst).into();
     }
+    if let Some(model) = &config.live_model {
+        body["active_model_id"] = Value::String(model.lock().expect("stub model lock").clone());
+    }
+    body.to_string()
 }
 
 /// Answer with chunked `text/event-stream`, one HTTP chunk per event, exactly
@@ -353,6 +364,37 @@ fn authorization(head: &str) -> Option<String> {
 
 fn fabric_of(specs: Vec<NodeSpec>) -> Fabric {
     Fabric::new(specs).with_timeout(PROBE_TIMEOUT)
+}
+
+/// A fabric that reuses an observation, as `fabric serve` builds one.
+fn fabric_reusing_observations(specs: Vec<NodeSpec>, max_age: Duration) -> Fabric {
+    fabric_of(specs).with_max_observation_age(max_age)
+}
+
+/// Health probes every node saw. The whole point of a freshness bound is that
+/// this stops growing with the number of client requests.
+fn health_probes(nodes: &[StubNode]) -> usize {
+    nodes
+        .iter()
+        .map(|node| {
+            node.received()
+                .iter()
+                .filter(|received| received.path == "/v1/health")
+                .count()
+        })
+        .sum()
+}
+
+fn completions_served(nodes: &[StubNode]) -> Vec<usize> {
+    nodes
+        .iter()
+        .map(|node| {
+            node.received()
+                .iter()
+                .filter(|received| received.path == "/v1/chat/completions")
+                .count()
+        })
+        .collect()
 }
 
 /// Bind the real proxy on an OS-assigned port and start serving it in the
@@ -1140,4 +1182,189 @@ async fn a_proxy_without_a_key_serves_an_anonymous_client() {
     let (status, _, _) =
         post_chat(addr, &serde_json::json!({ "model": "shared-model" }), &[]).await;
     assert_eq!(status, 200);
+}
+
+/// The proxy observes the fabric before every placement. Without a freshness
+/// bound that is a `/v1/health` per node per request: measured at exactly 2 per
+/// request against two nodes, and 2.0 s per request when one node black-holes,
+/// against nodes answering in 2 ms.
+#[tokio::test(flavor = "multi_thread")]
+async fn requests_inside_the_freshness_window_share_one_observation() {
+    let nodes = vec![
+        StubNode::start(StubConfig::ready("shared-model", 0)),
+        StubNode::start(StubConfig::ready("shared-model", 0)),
+    ];
+    let specs = vec![nodes[0].spec("node-a"), nodes[1].spec("node-b")];
+    let addr = start_proxy(
+        fabric_reusing_observations(specs, Duration::from_secs(30)),
+        RouteMode::Throughput,
+    )
+    .await;
+
+    let body = serde_json::json!({ "model": "shared-model" });
+    for _ in 0..4 {
+        let (status, _, _) = post_chat(addr, &body, &[]).await;
+        assert_eq!(status, 200);
+    }
+
+    assert_eq!(
+        health_probes(&nodes),
+        nodes.len(),
+        "four requests should share one observation, one probe per node"
+    );
+    assert_eq!(
+        completions_served(&nodes).iter().sum::<usize>(),
+        4,
+        "every request must still reach a node"
+    );
+}
+
+/// The bound is a bound, not a cache that never expires. Two requests either
+/// side of it must each take their own observation.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_observation_past_the_bound_is_taken_again() {
+    let max_age = Duration::from_millis(50);
+    let nodes = vec![StubNode::start(StubConfig::ready("shared-model", 0))];
+    let specs = vec![nodes[0].spec("node-a")];
+    let addr = start_proxy(
+        fabric_reusing_observations(specs, max_age),
+        RouteMode::Throughput,
+    )
+    .await;
+
+    let body = serde_json::json!({ "model": "shared-model" });
+    let (first, _, _) = post_chat(addr, &body, &[]).await;
+    assert_eq!(first, 200);
+    tokio::time::sleep(max_age * 4).await;
+    let (second, _, _) = post_chat(addr, &body, &[]).await;
+    assert_eq!(second, 200);
+
+    assert_eq!(
+        health_probes(&nodes),
+        2,
+        "a request after the bound must observe the fabric again"
+    );
+}
+
+/// Reusing an observation must not undo the placement fix: these nodes report a
+/// fixed load, so the observation is identical for every request in the burst
+/// and the spreading can only come from the reservations the fabric keeps
+/// itself. Without those, the label tie-break sends the whole burst to one node.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_burst_still_spreads_while_one_observation_is_reused() {
+    const REQUESTS: usize = 12;
+    let labels = ["node-a", "node-b", "node-c"];
+    let nodes: Vec<StubNode> = labels
+        .iter()
+        .map(|_| StubNode::start(StubConfig::slow("shared-model", Duration::from_millis(300))))
+        .collect();
+    let specs = nodes
+        .iter()
+        .enumerate()
+        .map(|(i, node)| node.spec(labels[i]))
+        .collect();
+    let addr = start_proxy(
+        fabric_reusing_observations(specs, Duration::from_secs(30)),
+        RouteMode::Throughput,
+    )
+    .await;
+
+    let body = serde_json::json!({ "model": "shared-model" });
+    let results =
+        futures_util::future::join_all((0..REQUESTS).map(|_| post_chat(addr, &body, &[]))).await;
+    for (status, _, _) in &results {
+        assert_eq!(*status, 200);
+    }
+
+    assert_eq!(
+        health_probes(&nodes),
+        nodes.len(),
+        "the burst must have been placed from a single observation, \
+         or this proves nothing about spreading without a fresh one"
+    );
+
+    let served = completions_served(&nodes);
+    assert_eq!(
+        served.iter().sum::<usize>(),
+        REQUESTS,
+        "every request must reach a node"
+    );
+    let busiest = served.iter().max().copied().unwrap_or(0);
+    assert!(
+        busiest <= REQUESTS / 2,
+        "one node took {busiest} of {REQUESTS}: {served:?}"
+    );
+    assert!(
+        served.iter().all(|count| *count > 0),
+        "a node serving the model was never used: {served:?}"
+    );
+}
+
+/// A node can die inside the freshness window, and an observation naming it as
+/// ready is then wrong. The failed forward must drop that observation, so the
+/// node is refused as unroutable rather than chosen again for the rest of the
+/// window: the request after the failure is a routing refusal (503), not a
+/// second failed forward (502).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_that_stops_answering_drops_the_observation_that_named_it() {
+    let node = StubNode::start(StubConfig::ready("shared-model", 0));
+    let specs = vec![node.spec("node-a")];
+    let addr = start_proxy(
+        fabric_reusing_observations(specs, Duration::from_secs(30)),
+        RouteMode::Throughput,
+    )
+    .await;
+
+    let body = serde_json::json!({ "model": "shared-model" });
+    let (served, _, _) = post_chat(addr, &body, &[]).await;
+    assert_eq!(served, 200, "the node answers while it is up");
+
+    drop(node);
+
+    let (after_death, _, _) = post_chat(addr, &body, &[]).await;
+    assert_eq!(
+        after_death, 502,
+        "the observation still named the node, so this request is spent on it"
+    );
+
+    let (next, refusal, _) = post_chat(addr, &body, &[]).await;
+    assert_eq!(
+        next, 503,
+        "the failed forward must have dropped the observation, so this request \
+         observes the fabric again and finds nothing to route to"
+    );
+    assert_eq!(refusal["error"]["type"], "fabric_error");
+}
+
+/// Reusing an observation may delay routing to a newly loaded model. It must
+/// not turn that delay into a *permanent* refusal: `/v1/chat/completions`
+/// answers 404 `model_not_found` for a model no node serves, and a 404 tells an
+/// OpenAI SDK to stop retrying. Issued from a reused observation, that verdict
+/// is about the fabric as it was, so the fabric has to look again before it
+/// refuses rather than settle the question from memory.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_model_loaded_since_the_observation_is_not_refused_as_permanently_absent() {
+    let config = StubConfig::with_switchable_model("old-model");
+    let model = Arc::clone(config.live_model.as_ref().expect("a switchable node"));
+    let node = StubNode::start(config);
+    // Far longer than the test runs, so nothing here depends on it expiring.
+    let addr = start_proxy(
+        fabric_reusing_observations(vec![node.spec("only")], Duration::from_secs(30)),
+        RouteMode::Throughput,
+    )
+    .await;
+
+    let (served, _, _) = post_chat(addr, &serde_json::json!({ "model": "old-model" }), &[]).await;
+    assert_eq!(served, 200, "the first request takes the observation");
+
+    // The operator loads something else, exactly as `/api/models/load` does.
+    *model.lock().expect("stub model lock") = "new-model".to_string();
+
+    let (status, body, _) =
+        post_chat(addr, &serde_json::json!({ "model": "new-model" }), &[]).await;
+    assert_ne!(
+        status, 404,
+        "a permanent refusal was settled from a stale observation: {body}"
+    );
+    assert_eq!(status, 200, "{body}");
 }

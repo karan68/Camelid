@@ -10,6 +10,11 @@
 //! `stream: true` the node's server-sent events are forwarded byte for byte, so
 //! an event field this proxy has never heard of reaches the client unaltered.
 //!
+//! Unlike the CLI, this process serves many requests, so it reuses a fabric
+//! observation for a bounded time instead of probing every node on every one.
+//! The bound is set by whoever builds the [`Fabric`]; see
+//! [`Fabric::with_max_observation_age`].
+//!
 //! # Two credentials, in opposite directions
 //!
 //! [`ClientAuth`] is what a client must present to *this* proxy. The bearer the
@@ -28,6 +33,9 @@
 //!   unless a key is configured or the risk is acknowledged explicitly.
 //! * Authentication is all-or-nothing: there is one key, it is not per-client,
 //!   and nothing here revokes or rotates it while the proxy is running.
+//! * A node that becomes ready, or loads a different model, is routed to only
+//!   once the current observation expires. A node that *stops* answering is not
+//!   waited on: the failed forward drops the observation immediately.
 //! * A non-streaming dispatch runs on a blocking thread and blocking socket I/O
 //!   is not cancellable, so a client that hangs up leaves its dispatch running
 //!   until the node answers or `forward_timeout` expires. A streaming dispatch
