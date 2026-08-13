@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { backendProcStatus, launchBackend, stopBackend } from '../lib/devBackend'
+import { appStorage } from '../lib/appStorage.js'
 
 const CMD_KEY = 'camelid.launchCommand'
 // Bare values that don't resolve on most PATHs — treat as "auto-detect" instead of a real override.
@@ -7,9 +8,9 @@ const NON_OVERRIDES = new Set(['', 'camelid', 'camelid serve'])
 
 function readCommand() {
   if (typeof window === 'undefined') return ''
-  const saved = (window.localStorage.getItem(CMD_KEY) || '').trim()
+  const saved = (appStorage.getItem(CMD_KEY) || '').trim()
   if (NON_OVERRIDES.has(saved)) {
-    if (saved) window.localStorage.removeItem(CMD_KEY) // migrate the old broken default
+    if (saved) appStorage.removeItem(CMD_KEY) // migrate the old broken default
     return ''
   }
   return saved
@@ -37,8 +38,8 @@ export function useBackendLauncher({ showNotice, loadDashboard } = {}) {
   const setCommand = useCallback((value) => {
     setCommandState(value)
     if (typeof window === 'undefined') return
-    if (value.trim()) window.localStorage.setItem(CMD_KEY, value)
-    else window.localStorage.removeItem(CMD_KEY)
+    if (value.trim()) appStorage.setItem(CMD_KEY, value)
+    else appStorage.removeItem(CMD_KEY)
   }, [])
 
   const start = useCallback(async () => {

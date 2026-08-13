@@ -46,6 +46,11 @@ camelid-desktop ──spawns──▶ camelid serve --addr 127.0.0.1:<ephemeral>
 On window close the sidecar is terminated cleanly. On Windows, a **job object** with
 `KILL_ON_JOB_CLOSE` also prevents a desktop crash from orphaning a `camelid` process.
 
+The sidecar receives a new ephemeral port on each launch, so browser-origin storage cannot be
+the desktop app's durable authority. Before React starts, the shell hydrates Camelid-owned UI
+state from `ui-storage-v1.json` in the per-user application-data directory. Writes are mirrored
+there through scoped commands; the regular browser build continues to use `localStorage`.
+
 ## Windows in-place upgrades
 
 The NSIS installer overwrites the files it ships but, like any overwrite-only installer, cannot
@@ -219,5 +224,6 @@ v1 deliberately keeps the native shell thin and ships the engine's real UI as-is
   all chat metrics (e.g. tokens/sec) come from the embedded UI rendering the engine's real
   generation/telemetry events. Nothing in this crate computes or smooths a metric.
 - **Native tray / arbitrary GGUF file-picker are deferred.** The loopback-origin page receives
-  only a scoped native folder chooser for configuring model storage; it does not receive broad
-  filesystem access. Local/catalog model loading still goes through the engine's existing API.
+  a scoped native folder chooser plus Camelid-keyed UI-state commands confined to the app-data
+  directory; it does not receive broad filesystem access. Local/catalog model loading still
+  goes through the engine's existing API.

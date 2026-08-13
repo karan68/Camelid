@@ -8,6 +8,7 @@ import { ConfirmDialog } from './components/ui/ConfirmDialog'
 import { isFirstRunHost } from './lib/firstRunActivation'
 import { formatPreview, formatSidebarDate } from './lib/formatters'
 import { hasOverlayTitleBar } from './lib/desktopShell'
+import { appStorage } from './lib/appStorage.js'
 import { useDashboardData } from './hooks/useDashboardData'
 import { useBackendLauncher } from './hooks/useBackendLauncher'
 import { useNotice } from './hooks/useNotice'
@@ -43,7 +44,7 @@ function App() {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
     if (DEMO_UI) return true
     if (typeof window === 'undefined') return false
-    return window.localStorage.getItem('camelid.sidebarCollapsed') === 'true'
+    return appStorage.getItem('camelid.sidebarCollapsed') === 'true'
   })
   const [mobileNavOpen, setMobileNavOpen] = useState(false)
   const [isMobile, setIsMobile] = useState(
@@ -91,7 +92,7 @@ function App() {
 
   useEffect(() => {
     if (typeof window === 'undefined') return
-    window.localStorage.setItem('camelid.sidebarCollapsed', String(sidebarCollapsed))
+    appStorage.setItem('camelid.sidebarCollapsed', String(sidebarCollapsed))
   }, [sidebarCollapsed])
 
   // Deep-link the active tab via the URL hash (e.g. #library) — shareable and
@@ -136,8 +137,8 @@ function App() {
     const executable = runtime?.executable
     if (!executable || typeof window === 'undefined') return
     try {
-      window.localStorage.setItem(ENGINE_PATH_STORAGE_KEY, executable)
-      if (runtime?.listen_addr) window.localStorage.setItem(ENGINE_ADDR_STORAGE_KEY, runtime.listen_addr)
+      appStorage.setItem(ENGINE_PATH_STORAGE_KEY, executable)
+      if (runtime?.listen_addr) appStorage.setItem(ENGINE_ADDR_STORAGE_KEY, runtime.listen_addr)
     } catch { /* private mode */ }
   }, [runtime?.executable, runtime?.listen_addr])
 

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react'
 import { findCompatibilityHint } from '../lib/capabilities'
+import { appStorage } from '../lib/appStorage.js'
 import {
   browseWorkspaceFolders,
   cancelWorkspaceSession,
@@ -56,7 +57,7 @@ const SPLITTER_PX = 10
 const MAX_RENDERED_TURNS = 100
 
 function initialSetupPercent() {
-  const saved = Number.parseFloat(window.localStorage.getItem('camelid.workspaceSetupPercent') || '')
+  const saved = Number.parseFloat(appStorage.getItem('camelid.workspaceSetupPercent') || '')
   return Number.isFinite(saved) ? saved : DEFAULT_SETUP_PERCENT
 }
 
@@ -284,7 +285,7 @@ function ContextInspector({ budget, timing, runtimeContext, compaction, busy, di
 }
 
 export default function WorkspaceView({ apiBase, capabilities, selectedModel, runtime, setTab }) {
-  const [workspacePath, setWorkspacePath] = useState(() => window.localStorage.getItem('camelid.workspacePath') || '')
+  const [workspacePath, setWorkspacePath] = useState(() => appStorage.getItem('camelid.workspacePath') || '')
   const [goal, setGoal] = useState('')
   const [followUp, setFollowUp] = useState('')
   const [savedThreads, setSavedThreads] = useState([])
@@ -415,7 +416,7 @@ export default function WorkspaceView({ apiBase, capabilities, selectedModel, ru
   }, [apiBase, workspacePath, selectedThreadId, session])
 
   useEffect(() => {
-    if (workspacePath) window.localStorage.setItem('camelid.workspacePath', workspacePath)
+    if (workspacePath) appStorage.setItem('camelid.workspacePath', workspacePath)
   }, [workspacePath])
 
   useEffect(() => {
@@ -424,7 +425,7 @@ export default function WorkspaceView({ apiBase, capabilities, selectedModel, ru
   }, [apiBase, session])
 
   useEffect(() => {
-    window.localStorage.setItem('camelid.workspaceSetupPercent', String(setupPercent))
+    appStorage.setItem('camelid.workspaceSetupPercent', String(setupPercent))
   }, [setupPercent])
 
   useEffect(() => {

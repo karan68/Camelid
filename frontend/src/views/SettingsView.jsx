@@ -10,6 +10,7 @@ import { IconPlay, IconStop, IconCopy, IconCheck, IconServer, IconSettings, Icon
 import { copyText } from '../lib/markdown'
 import { getConfiguredMaxTokens, setConfiguredMaxTokens } from '../lib/responseLimits'
 import { getStoredApiKey, setStoredApiKey } from '../lib/apiAuth'
+import { appStorage } from '../lib/appStorage.js'
 import { ResponseLengthControl } from '../components/settings/ResponseLengthControl'
 
 const THEME_OPTS = [
@@ -106,7 +107,7 @@ export default function SettingsView({
     setMaxTokens(value)
     setConfiguredMaxTokens(selectedModel?.id || '', value)
     // keep the legacy global key as the fallback for other models
-    if (typeof window !== 'undefined') window.localStorage.setItem('camelid.maxTokens', String(value))
+    if (typeof window !== 'undefined') appStorage.setItem('camelid.maxTokens', String(value))
   }
 
   const statusTone = online ? 'ready' : status.running ? 'warn' : 'offline'

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
+import { appStorage } from '../lib/appStorage.js'
 
 const STORAGE_KEY = 'camelid-theme'
 const VALID = new Set(['system', 'light', 'dark'])
@@ -10,7 +11,7 @@ export const THEME_ORDER = ['dark', 'light', 'system']
    'system' and 'light' remain one toggle away. */
 function readPreference() {
   if (typeof window === 'undefined') return 'dark'
-  const saved = window.localStorage.getItem(STORAGE_KEY)
+  const saved = appStorage.getItem(STORAGE_KEY)
   return saved && VALID.has(saved) ? saved : 'dark'
 }
 
@@ -64,7 +65,7 @@ export function useTheme() {
   useEffect(() => {
     applyPreference(preference)
     if (typeof window !== 'undefined') {
-      window.localStorage.setItem(STORAGE_KEY, preference)
+      appStorage.setItem(STORAGE_KEY, preference)
     }
     if (preference !== 'system') {
       setResolved(preference)

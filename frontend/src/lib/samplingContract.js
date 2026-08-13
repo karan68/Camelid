@@ -10,6 +10,8 @@
    control is guarded; see frontend/design-evidence/BACKEND_ASKS.md for the requested
    row shape. */
 
+import { appStorage } from './appStorage.js'
+
 import { isSupportedCapabilityStatus } from './capabilities.js'
 
 export const SAMPLING_PARAMS = [
@@ -37,7 +39,7 @@ const PARAM_STORAGE_PREFIX = 'camelid.samplingParams.'
 export function loadSavedSamplingParams(modelId) {
   if (typeof window === 'undefined' || !modelId) return {}
   try {
-    const saved = window.localStorage.getItem(`${PARAM_STORAGE_PREFIX}${modelId}`)
+    const saved = appStorage.getItem(`${PARAM_STORAGE_PREFIX}${modelId}`)
     return saved ? JSON.parse(saved) : {}
   } catch {
     return {}
@@ -46,7 +48,7 @@ export function loadSavedSamplingParams(modelId) {
 
 export function saveSamplingParams(modelId, params) {
   if (typeof window === 'undefined' || !modelId) return
-  window.localStorage.setItem(`${PARAM_STORAGE_PREFIX}${modelId}`, JSON.stringify(params || {}))
+  appStorage.setItem(`${PARAM_STORAGE_PREFIX}${modelId}`, JSON.stringify(params || {}))
 }
 
 /* Request overrides: only parameters whose exact contract row is supported

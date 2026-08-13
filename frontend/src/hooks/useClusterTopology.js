@@ -4,6 +4,7 @@ import {
   specsToNodePatch, summarizeCluster, validateTopology,
 } from '../lib/clusterModel'
 import { discoverDevices, fetchNodeTelemetry, probeNode } from '../lib/devCluster'
+import { appStorage } from '../lib/appStorage.js'
 
 const DEFAULT_PORT = { ssh: 22, winrm: 5985, agent: 8181, manual: null }
 
@@ -44,11 +45,11 @@ export function useClusterTopology({ showNotice } = {}) {
         // Accept a single import object or an array of them (each tracked by import_id).
         const imports = Array.isArray(data) ? data : (Array.isArray(data.imports) ? data.imports : [data])
         let done = []
-        try { done = JSON.parse(window.localStorage.getItem('camelid.clusterImports') || '[]') } catch { /* noop */ }
+        try { done = JSON.parse(appStorage.getItem('camelid.clusterImports') || '[]') } catch { /* noop */ }
         const fresh = imports.filter((imp) => imp && imp.import_id && !done.includes(imp.import_id))
         if (!fresh.length) return
         setTopology((prev) => fresh.reduce((acc, imp) => mergeImport(acc, imp), prev))
-        try { window.localStorage.setItem('camelid.clusterImports', JSON.stringify([...done, ...fresh.map((i) => i.import_id)])) } catch { /* noop */ }
+        try { appStorage.setItem('camelid.clusterImports', JSON.stringify([...done, ...fresh.map((i) => i.import_id)])) } catch { /* noop */ }
         const added = fresh.reduce((n, imp) => n + (imp.nodes?.length || 0), 0)
         pushEvent('ok', `Applied ${fresh.length} cluster import(s) — ${added} node entr${added === 1 ? 'y' : 'ies'}.`)
       })

@@ -10,11 +10,20 @@ import '@fontsource/ibm-plex-mono/500.css'
 import '@fontsource/ibm-plex-mono/600.css'
 import './styles.css'
 import { installApiAuthFetch } from './lib/apiAuth'
+import { hydrateAppStorage } from './lib/appStorage.js'
 
-installApiAuthFetch()
+async function startApp() {
+  // Camelid Desktop serves this UI from a new loopback port after each restart.
+  // Restore the app-owned storage document before any hook reads origin-scoped
+  // localStorage; the regular browser build resolves this immediately.
+  await hydrateAppStorage()
+  installApiAuthFetch()
 
-ReactDOM.createRoot(document.getElementById('root')).render(
-  <React.StrictMode>
-    <App />
-  </React.StrictMode>,
-)
+  ReactDOM.createRoot(document.getElementById('root')).render(
+    <React.StrictMode>
+      <App />
+    </React.StrictMode>,
+  )
+}
+
+startApp()

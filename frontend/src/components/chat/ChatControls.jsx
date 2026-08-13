@@ -6,19 +6,20 @@ import {
   loadSavedSamplingParams,
   saveSamplingParams,
 } from '../../lib/samplingContract'
+import { appStorage } from '../../lib/appStorage.js'
 
 const SYSTEM_PROMPT_STORAGE_KEY = 'camelid.systemPrompt'
 const SYSTEM_PROMPT_PRESETS_KEY = 'camelid.systemPromptPresets'
 
 const readStoredPrompt = () => {
   if (typeof window === 'undefined') return ''
-  return window.localStorage.getItem(SYSTEM_PROMPT_STORAGE_KEY) || ''
+  return appStorage.getItem(SYSTEM_PROMPT_STORAGE_KEY) || ''
 }
 
 const readPresets = () => {
   if (typeof window === 'undefined') return []
   try {
-    const saved = JSON.parse(window.localStorage.getItem(SYSTEM_PROMPT_PRESETS_KEY) || '[]')
+    const saved = JSON.parse(appStorage.getItem(SYSTEM_PROMPT_PRESETS_KEY) || '[]')
     return Array.isArray(saved) ? saved.filter((p) => p?.name && typeof p.content === 'string') : []
   } catch {
     return []
@@ -49,11 +50,11 @@ export function ChatControls({ capabilities, modelId, onClose }) {
 
   const persistPrompt = (value) => {
     setSystemPrompt(value)
-    if (typeof window !== 'undefined') window.localStorage.setItem(SYSTEM_PROMPT_STORAGE_KEY, value)
+    if (typeof window !== 'undefined') appStorage.setItem(SYSTEM_PROMPT_STORAGE_KEY, value)
   }
   const persistPresets = (next) => {
     setPresets(next)
-    if (typeof window !== 'undefined') window.localStorage.setItem(SYSTEM_PROMPT_PRESETS_KEY, JSON.stringify(next))
+    if (typeof window !== 'undefined') appStorage.setItem(SYSTEM_PROMPT_PRESETS_KEY, JSON.stringify(next))
   }
   const savePreset = () => {
     const name = presetName.trim()

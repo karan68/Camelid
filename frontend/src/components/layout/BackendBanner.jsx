@@ -4,6 +4,7 @@ import { StatusDot } from '../ui/StatusDot'
 import { IconPlay, IconCopy, IconCheck, IconRefresh, IconSettings } from '../ui/icons'
 import { copyText } from '../../lib/markdown'
 import { isDesktopShell } from '../../lib/desktopShell'
+import { appStorage } from '../../lib/appStorage.js'
 
 /* Shown on the copy button when the engine never told us where it lives.
 
@@ -27,7 +28,7 @@ const DEFAULT_ADDR = '127.0.0.1:8181'
 function readStored(key) {
   if (typeof window === 'undefined') return ''
   try {
-    return (window.localStorage.getItem(key) || '').trim()
+    return (appStorage.getItem(key) || '').trim()
   } catch {
     return ''
   }

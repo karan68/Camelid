@@ -3,6 +3,8 @@
    future backend. Persisted client-side (localStorage), like conversations and
    memories. Local-only: machines sharing compute/memory/workers/model-serving. */
 
+import { appStorage } from './appStorage.js'
+
 export const STORAGE_KEY = 'camelid.clusterTopology'
 
 export const NODE_TYPES = [
@@ -134,7 +136,7 @@ export function normalizeTopology(raw) {
 export function loadTopology() {
   if (typeof window === 'undefined') return emptyTopology()
   try {
-    const raw = window.localStorage.getItem(STORAGE_KEY)
+    const raw = appStorage.getItem(STORAGE_KEY)
     return raw ? normalizeTopology(JSON.parse(raw)) : emptyTopology()
   } catch {
     return emptyTopology()
@@ -144,7 +146,7 @@ export function loadTopology() {
 export function saveTopology(topology) {
   if (typeof window === 'undefined') return
   try {
-    window.localStorage.setItem(STORAGE_KEY, JSON.stringify({ ...topology, updated_at: nowIso() }))
+    appStorage.setItem(STORAGE_KEY, JSON.stringify({ ...topology, updated_at: nowIso() }))
   } catch { /* quota / private mode — keep in-memory */ }
 }
 

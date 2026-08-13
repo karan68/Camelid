@@ -8,6 +8,7 @@ import { getChatGateState } from '../lib/chatGate'
 import { EvidenceChip } from '../components/ui/EvidenceChip'
 import { IconChevronRight, IconObservatory } from '../components/ui/icons'
 import { fmtMs, fmtRate } from '../components/observatory/format'
+import { appStorage } from '../lib/appStorage.js'
 
 /* Observatory (Phase 6.1 — "The Flow Bench"): inference rendered as liquid.
    The centerpiece canvas and the instrument rail consume the SAME lifecycle
@@ -23,7 +24,7 @@ const RENDERERS = ['flowbench', 'neuralfield']
 
 function initialRenderer() {
   try {
-    const stored = window.localStorage.getItem(RENDERER_KEY)
+    const stored = appStorage.getItem(RENDERER_KEY)
     return RENDERERS.includes(stored) ? stored : 'neuralfield'
   } catch {
     return 'neuralfield'
@@ -43,7 +44,7 @@ export default function InferenceObservatoryView({ apiBase, runtime = null, sele
   const pickRenderer = (mode) => {
     setRenderer(mode)
     try {
-      window.localStorage.setItem(RENDERER_KEY, mode)
+      appStorage.setItem(RENDERER_KEY, mode)
     } catch { /* persistence is best-effort */ }
   }
 

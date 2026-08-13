@@ -122,6 +122,12 @@ async function openBanner({ clipboard = 'ok', storage = {}, platform = null, des
       window.__TAURI__ = {
         core: {
           invoke: (cmd) => {
+            if (cmd === 'read_ui_storage') {
+              return Promise.resolve({ version: 1, initialized: false, values: {} })
+            }
+            if (cmd === 'replace_ui_storage' || cmd === 'set_ui_storage_value') {
+              return Promise.resolve()
+            }
             window.__invoked.push(cmd)
             return desktopShell === 'failing' ? Promise.reject(new Error('nope')) : Promise.resolve()
           },
