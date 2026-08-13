@@ -306,6 +306,24 @@ impl FabricSummary {
     }
 }
 
+/// Every model the fabric can serve right now, deduplicated and ordered.
+///
+/// Only ready nodes count. A node that is unreachable, or that has no model
+/// loaded, cannot serve one — listing its model would advertise something the
+/// fabric would then refuse.
+///
+/// Kept pure so the listing is covered by a unit test rather than by starting a
+/// server, the same way [`render_status`] is.
+pub fn servable_models(snapshots: &[NodeSnapshot]) -> Vec<String> {
+    let mut models: Vec<String> = snapshots
+        .iter()
+        .filter_map(|snapshot| snapshot.active_model_id().map(str::to_string))
+        .collect();
+    models.sort();
+    models.dedup();
+    models
+}
+
 /// Render a fabric observation as fixed-width text.
 ///
 /// Kept pure so the CLI's output is covered by a unit test rather than by
@@ -410,6 +428,50 @@ mod tests {
             in_flight: 1,
             waiting: 0,
         })
+    }
+
+    #[test]
+    fn the_servable_list_is_the_union_of_ready_nodes() {
+        let snapshots = vec![
+            snapshot("b", ready_status("zeta")),
+            snapshot("a", ready_status("alpha")),
+            // The same model on a second node is one entry, not two.
+            snapshot("c", ready_status("alpha")),
+        ];
+        assert_eq!(servable_models(&snapshots), vec!["alpha", "zeta"]);
+    }
+
+    #[test]
+    fn a_node_that_cannot_serve_is_not_advertised() {
+        let blank = NodeStatus::Ready(NodeReady {
+            active_model_id: None,
+            backend: "llama".to_string(),
+            version: "0.5.4".to_string(),
+            in_flight: 0,
+            waiting: 0,
+        });
+        let snapshots = vec![
+            snapshot("a", ready_status("alpha")),
+            snapshot(
+                "dead",
+                NodeStatus::Unreachable {
+                    reason: "connection refused".to_string(),
+                },
+            ),
+            snapshot(
+                "empty",
+                NodeStatus::NotReady {
+                    reason: "no model loaded".to_string(),
+                },
+            ),
+            snapshot("blank", blank),
+        ];
+        assert_eq!(servable_models(&snapshots), vec!["alpha"]);
+    }
+
+    #[test]
+    fn nothing_ready_lists_nothing_rather_than_failing() {
+        assert!(servable_models(&[]).is_empty());
     }
 
     #[test]

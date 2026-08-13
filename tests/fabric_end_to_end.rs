@@ -308,9 +308,15 @@ fn an_unserved_model_is_refused_naming_what_the_fabric_does_serve() {
     .expect_err("nothing serves it");
 
     match error {
-        RouteError::ModelUnavailable { model, serving } => {
+        RouteError::ModelUnavailable {
+            model,
+            serving,
+            unobserved,
+        } => {
             assert_eq!(model, "model-absent");
             assert_eq!(serving, vec!["model-alpha".to_string()]);
+            // Every configured node answered, so this refusal is final.
+            assert_eq!(unobserved, 0);
         }
         other => panic!("expected ModelUnavailable, got {other:?}"),
     }
