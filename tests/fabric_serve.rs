@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use camelid::fabric::server::{serve_on, ServeConfig};
+use camelid::fabric::server::{serve_on, ClientAuth, ServeConfig};
 use camelid::fabric::{Fabric, NodeSpec, RouteMode};
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
@@ -358,6 +358,10 @@ fn fabric_of(specs: Vec<NodeSpec>) -> Fabric {
 /// Bind the real proxy on an OS-assigned port and start serving it in the
 /// background, returning the address a client should connect to.
 async fn start_proxy(fabric: Fabric, mode: RouteMode) -> SocketAddr {
+    start_proxy_with_auth(fabric, mode, ClientAuth::none()).await
+}
+
+async fn start_proxy_with_auth(fabric: Fabric, mode: RouteMode, auth: ClientAuth) -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind proxy");
@@ -365,6 +369,7 @@ async fn start_proxy(fabric: Fabric, mode: RouteMode) -> SocketAddr {
     let config = ServeConfig {
         mode,
         forward_timeout: FORWARD_TIMEOUT,
+        auth,
     };
     tokio::spawn(async move {
         let _ = serve_on(listener, fabric, config).await;
@@ -1004,4 +1009,135 @@ async fn concurrent_slow_requests_do_not_serialize_on_the_single_worker_thread()
         "four concurrent slow requests took {elapsed:?}; \
          they appear to have serialized on the async runtime"
     );
+}
+
+/// Send one GET over a real socket and return (status, raw body).
+async fn get_raw(addr: SocketAddr, path: &str, extra_headers: &[(&str, &str)]) -> (u16, String) {
+    let mut stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("connect to proxy");
+    let mut request = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n");
+    for (name, value) in extra_headers {
+        request.push_str(&format!("{name}: {value}\r\n"));
+    }
+    request.push_str("\r\n");
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write request");
+
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).await.expect("read response");
+    let text = String::from_utf8_lossy(&raw).into_owned();
+    let header_end = text.find("\r\n\r\n").expect("header terminator");
+    let status: u16 = text[..header_end]
+        .lines()
+        .next()
+        .expect("status line")
+        .split_whitespace()
+        .nth(1)
+        .expect("status code")
+        .parse()
+        .expect("numeric status");
+    (status, text[header_end + 4..].to_string())
+}
+
+fn authenticated(key: &str) -> ClientAuth {
+    ClientAuth::resolve(Some(key.to_string()), None).expect("a key resolves")
+}
+
+/// The whole point of the credential is that an unauthenticated caller cannot
+/// reach the fabric at all. Refusing after placement would still have spent a
+/// probe on every node, and told the caller which of them are up.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unauthenticated_request_never_reaches_a_node() {
+    let node = StubNode::start(StubConfig::ready("shared-model", 0));
+    let addr = start_proxy_with_auth(
+        fabric_of(vec![node.spec("node-a")]),
+        RouteMode::Throughput,
+        authenticated("s3cret"),
+    )
+    .await;
+
+    let (status, body, _) =
+        post_chat(addr, &serde_json::json!({ "model": "shared-model" }), &[]).await;
+    assert_eq!(status, 401);
+    assert_eq!(body["error"]["type"], "authentication_error");
+    assert!(
+        node.received().is_empty(),
+        "the node was touched by a request that was never authenticated: {:?}",
+        node.received()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn either_header_the_engine_accepts_is_accepted_here() {
+    let node = StubNode::start(StubConfig::ready("shared-model", 0));
+    let addr = start_proxy_with_auth(
+        fabric_of(vec![node.spec("node-a")]),
+        RouteMode::Throughput,
+        authenticated("s3cret"),
+    )
+    .await;
+    let body = serde_json::json!({ "model": "shared-model" });
+
+    let (bearer, _, _) = post_chat(addr, &body, &[("Authorization", "Bearer s3cret")]).await;
+    assert_eq!(bearer, 200, "Authorization: Bearer must be accepted");
+
+    let (api_key, _, _) = post_chat(addr, &body, &[("X-API-Key", "s3cret")]).await;
+    assert_eq!(api_key, 200, "X-API-Key must be accepted");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wrong_key_is_refused_like_no_key_at_all() {
+    let node = StubNode::start(StubConfig::ready("shared-model", 0));
+    let addr = start_proxy_with_auth(
+        fabric_of(vec![node.spec("node-a")]),
+        RouteMode::Throughput,
+        authenticated("s3cret"),
+    )
+    .await;
+
+    let (status, _, _) = post_chat(
+        addr,
+        &serde_json::json!({ "model": "shared-model" }),
+        &[("Authorization", "Bearer wrong")],
+    )
+    .await;
+    assert_eq!(status, 401);
+    assert!(node.received().is_empty(), "{:?}", node.received());
+}
+
+/// Discovery is behind the key too: an unauthenticated caller must not learn
+/// which models the fabric is serving.
+#[tokio::test(flavor = "multi_thread")]
+async fn discovery_does_not_answer_an_unauthenticated_caller() {
+    let node = StubNode::start(StubConfig::ready("private-model", 0));
+    let addr = start_proxy_with_auth(
+        fabric_of(vec![node.spec("node-a")]),
+        RouteMode::Throughput,
+        authenticated("s3cret"),
+    )
+    .await;
+
+    let (refused, body) = get_raw(addr, "/v1/models", &[]).await;
+    assert_eq!(refused, 401);
+    assert!(!body.contains("private-model"), "{body}");
+
+    let (served, listing) =
+        get_raw(addr, "/v1/models", &[("Authorization", "Bearer s3cret")]).await;
+    assert_eq!(served, 200);
+    assert!(listing.contains("private-model"), "{listing}");
+}
+
+/// A proxy started without a key is unchanged: this is what every other test in
+/// this file relies on, and what a loopback operator gets by default.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_proxy_without_a_key_serves_an_anonymous_client() {
+    let node = StubNode::start(StubConfig::ready("shared-model", 0));
+    let addr = start_proxy(fabric_of(vec![node.spec("node-a")]), RouteMode::Throughput).await;
+
+    let (status, _, _) =
+        post_chat(addr, &serde_json::json!({ "model": "shared-model" }), &[]).await;
+    assert_eq!(status, 200);
 }

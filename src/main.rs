@@ -1188,6 +1188,17 @@ enum FabricAction {
         /// answers every forwarded request with 401.
         #[arg(long, value_name = "TOKEN")]
         bearer: Option<String>,
+        /// Require this key from clients of the proxy. This is the opposite
+        /// direction to --bearer, and deliberately does NOT read CAMELID_API_KEY:
+        /// on this command that variable already names the token sent to nodes,
+        /// so one value would silently configure both directions.
+        #[arg(long, value_name = "KEY", conflicts_with = "api_key_file")]
+        api_key: Option<String>,
+        /// Read the client key from a text file (surrounding whitespace is
+        /// ignored). Prefer this on a shared machine, so the secret is not in
+        /// the process command line.
+        #[arg(long, value_name = "PATH")]
+        api_key_file: Option<PathBuf>,
         /// Per-node health probe budget.
         #[arg(long, default_value_t = 2000)]
         timeout_ms: u64,
@@ -2968,12 +2979,15 @@ async fn main() -> anyhow::Result<()> {
                 addr,
                 mode,
                 bearer,
+                api_key,
+                api_key_file,
                 timeout_ms,
                 forward_timeout_s,
                 allow_unauthenticated_remote,
             } => {
                 let mode = route_mode(&mode)?;
                 let bearer = fabric_bearer(bearer);
+                let auth = camelid::fabric::server::ClientAuth::resolve(api_key, api_key_file)?;
                 let specs = camelid::fabric::parse_fabric(&nodes)
                     .map_err(|error| anyhow::anyhow!("{error}"))?;
                 let fabric = camelid::fabric::Fabric::new(specs)
@@ -2983,7 +2997,8 @@ async fn main() -> anyhow::Result<()> {
                 // Bind before announcing, so a refused or already-taken address
                 // never prints a listening line it did not earn.
                 let listener =
-                    camelid::fabric::server::bind(addr, allow_unauthenticated_remote).await?;
+                    camelid::fabric::server::bind(addr, &auth, allow_unauthenticated_remote)
+                        .await?;
                 println!("fabric serve listening on {}", listener.local_addr()?);
                 camelid::fabric::server::serve_on(
                     listener,
@@ -2991,6 +3006,7 @@ async fn main() -> anyhow::Result<()> {
                     camelid::fabric::server::ServeConfig {
                         mode,
                         forward_timeout: std::time::Duration::from_secs(forward_timeout_s),
+                        auth,
                     },
                 )
                 .await?;
