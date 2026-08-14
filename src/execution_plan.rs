@@ -449,7 +449,9 @@ pub fn plan_for_model_with_platform_and_env(
     let has_tensor = |t: GgufTensorType| gguf.tensors.iter().any(|tensor| tensor.tensor_type == t);
     let has_q8_0_tensors = has_tensor(GgufTensorType::Q8_0);
     let has_i2_s_tensors = has_tensor(GgufTensorType::I2S);
-    let has_kquant_tensors = has_tensor(GgufTensorType::Q4K) || has_tensor(GgufTensorType::Q6K);
+    let has_kquant_tensors = has_tensor(GgufTensorType::Q4K)
+        || has_tensor(GgufTensorType::Q5K)
+        || has_tensor(GgufTensorType::Q6K);
     let has_prism_low_bit_tensors = has_tensor(GgufTensorType::Q1_0)
         || has_tensor(GgufTensorType::Q2_0G64)
         || has_tensor(GgufTensorType::Q2_0G128)
@@ -476,7 +478,9 @@ pub fn plan_for_model_with_platform_and_env(
         matches!(
             tensor.tensor_type,
             GgufTensorType::Q4K
+                | GgufTensorType::Q5K
                 | GgufTensorType::Q6K
+                | GgufTensorType::Q8_0
                 | GgufTensorType::F32
                 | GgufTensorType::F16
                 | GgufTensorType::BF16
@@ -696,6 +700,8 @@ pub fn plan_for_model_with_platform_and_env(
             "runnable_cpu_decode_fallback",
         )
     } else if has_q8_0_tensors
+        && !has_kquant_tensors
+        && metal_kquant_tensor_mix_supported
         && gguf.architecture() == Some("qwen35")
         && platform.operating_system == "macos"
         && platform.architecture == "aarch64"
@@ -832,10 +838,10 @@ pub fn plan_for_model_with_platform_and_env(
         // `generate_qwen35_streaming` consults neither, and gating on them would
         // reintroduce the latch defect.
         reasons.push(
-            "qwen35 K-quant resident Metal lane selected; Q4_K/Q6_K super-blocks stay \
-             resident at wire size and attention, gated-delta recurrence, FFN and logits \
-             run on device (opt-out CAMELID_QWEN35_METAL=0; CPU hybrid on resident-build \
-             error)"
+            "qwen35 K-quant resident Metal lane selected; Q4_K/Q5_K/Q6_K super-blocks \
+             (plus any Q8_0 or bf16 tensors the quant recipe kept) stay resident at wire \
+             size and attention, gated-delta recurrence, FFN and logits run on device \
+             (opt-out CAMELID_QWEN35_METAL=0; CPU hybrid on resident-build error)"
                 .into(),
         );
         (
@@ -2695,12 +2701,26 @@ mod tests {
         }
         env::remove_var("CAMELID_QWEN35_METAL");
 
-        // Q5_K has no Metal kernel: routing declines, so disclosure must decline.
+        // Q5_K now has `q5k_linear_simd`/`q5k_linear_tiled` and is mapped by
+        // `resident_metal_format`, so routing serves it and disclosure must say so.
+        // This assertion was `assert_ne!` while the kernel did not exist; it flips
+        // WITH the kernel, which is the point of gating disclosure on the same
+        // predicate the loader uses rather than on a hand-maintained list.
         let q5k = qwen35_kquant_fixture("Ornith 1.0 9B", &[GgufTensorType::Q5K]);
-        assert_ne!(
+        assert_eq!(
             plan_for(&q5k, metal()).plan.selected_backend,
             "metal_resident_qwen35_kquant_runtime",
-            "a q5_K tensor makes prism_metal_weight error — disclosure must not claim Metal"
+            "a q5_K tensor is served by the resident Metal graph — disclose it"
+        );
+
+        // Q3_K still has no Metal kernel, so it remains the fail-closed case:
+        // `resident_metal_format` maps it to None, `prism_metal_weight` errors, and
+        // the graph declines to the CPU hybrid. Disclosure must decline with it.
+        let q3k = qwen35_kquant_fixture("Ornith 1.0 9B", &[GgufTensorType::Q3K]);
+        assert_ne!(
+            plan_for(&q3k, metal()).plan.selected_backend,
+            "metal_resident_qwen35_kquant_runtime",
+            "a q3_K tensor makes prism_metal_weight error — disclosure must not claim Metal"
         );
 
         // Not on hosts where the resident graph cannot run.
@@ -3964,13 +3984,16 @@ mod tests {
             "kquant_cpu_block_dot_reference_path"
         );
 
+        // Q3_K, not Q5_K: Q5_K gained `q5k_linear_simd`/`q5k_linear_tiled` and is
+        // now mapped by `resident_metal_format`, so it is no longer an example of an
+        // unsupported mix. Q3_K still maps to None and must still fall closed.
         let unsupported = quant_fixture(
             "Llama 3.2 3B Instruct",
-            Some(17),
-            &[GgufTensorType::Q5K, GgufTensorType::Q6K],
+            Some(12),
+            &[GgufTensorType::Q3K, GgufTensorType::Q6K],
         );
         let fallback = plan_for_model_with_platform(
-            &PathBuf::from("/tmp/Llama-3.2-3B-Instruct-Q5_K_M.gguf"),
+            &PathBuf::from("/tmp/Llama-3.2-3B-Instruct-Q3_K_M.gguf"),
             &unsupported,
             Some(10),
             metal_platform("macos", "aarch64", &["dotprod", "i8mm"]),
