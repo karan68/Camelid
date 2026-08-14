@@ -1668,8 +1668,9 @@ impl ModelDriver for LiveDriver {
         self.last_step_metrics = None;
         self.last_prompt_tokens = None;
         let tool_defs = tools_to_json(tools);
-        // TUI lane: stream the model's output live, then parse tool calls from the
-        // accumulated raw content (the structured-tool_calls path is non-streaming).
+        // TUI lane: stream the model's output live. Tool calls come off the
+        // stream's structured `tool_calls` deltas, with text parsing as the
+        // fallback — the same two-source rule the blocking path below uses.
         if self.on_delta.is_some() {
             return self.step_streamed(history, &tool_defs);
         }
@@ -1789,10 +1790,15 @@ impl LiveDriver {
     }
 
     /// Streaming step (TUI lane): stream the model's raw output, forwarding each
-    /// delta to the installed sink, then parse tool calls from the full content.
-    /// The structured `tool_calls` field is non-streaming, so this path relies on
-    /// `tool_parse` — which covers every supported family — exactly like the
-    /// blocking path's content fallback.
+    /// delta to the installed sink, then take the turn's tool calls from the
+    /// stream's structured `tool_calls` — falling back to `tool_parse` over the
+    /// content for any path that carries the call as text.
+    ///
+    /// The structured field is NOT optional here. A tool-enabled stream holds
+    /// back every content delta until the turn is classified and then emits
+    /// EITHER content OR `tool_calls`, so on a tool turn the accumulated content
+    /// is empty; parsing that alone yields no calls and ends the turn with a
+    /// blank answer. Same contract the blocking path already honors in `step`.
     fn step_streamed(
         &mut self,
         history: &[AgentMsg],
@@ -1825,6 +1831,17 @@ impl LiveDriver {
             // run_loop re-checks the cancel flag right after step and aborts; the
             // partial text is discarded there.
             return Ok(ModelStep::Text(content));
+        }
+        if !stats.tool_calls.is_empty() {
+            let calls = stats
+                .tool_calls
+                .into_iter()
+                .map(|tc| ToolCall {
+                    name: tc.name,
+                    args: super::tool_parse::json_args_lenient(&tc.arguments),
+                })
+                .collect();
+            return Ok(ModelStep::Calls(calls));
         }
         let calls = super::tool_parse::parse(&content, &self.family);
         Ok(if calls.is_empty() {

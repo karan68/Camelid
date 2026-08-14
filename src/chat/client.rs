@@ -130,6 +130,76 @@ pub struct StreamStats {
     /// when the request opted in via `stream_options.include_usage` (the agent
     /// lane's calibration signal); `None` otherwise.
     pub prompt_tokens: Option<u32>,
+    /// Structured tool calls lifted from `delta.tool_calls` (OpenAI shape).
+    ///
+    /// A tool-enabled stream HOLDS BACK every content delta until the turn is
+    /// classified, then emits EITHER one content delta OR these — never both.
+    /// So on a tool turn the forwarded content is empty and this is the only
+    /// carrier of the call: a caller that reads content alone sees a blank
+    /// answer and runs nothing. `chat_turn` documents the same contract for the
+    /// blocking path.
+    pub tool_calls: Vec<ToolCallOut>,
+}
+
+/// Running state folded out of one `/v1/chat/completions` SSE stream.
+#[derive(Default)]
+struct StreamAccumulator {
+    tool_calls: Vec<ToolCallOut>,
+    prompt_tokens: Option<u32>,
+}
+
+impl StreamAccumulator {
+    /// Fold one decoded `data:` payload, returning the content delta to forward
+    /// (if this chunk carried one).
+    ///
+    /// Tool calls accumulate BY `index` and append their `arguments`, which is
+    /// the OpenAI streaming contract: a call may arrive whole (what this server
+    /// does today — one delta per completed call) or split across chunks. The
+    /// by-index fold handles both, so the client does not depend on the server
+    /// choosing to emit calls in a single event.
+    fn absorb<'a>(&mut self, chunk: &'a Value) -> Option<&'a str> {
+        if let Some(items) = chunk
+            .pointer("/choices/0/delta/tool_calls")
+            .and_then(Value::as_array)
+        {
+            for (ordinal, item) in items.iter().enumerate() {
+                let index = item
+                    .get("index")
+                    .and_then(Value::as_u64)
+                    .map(|i| i as usize)
+                    .unwrap_or(ordinal);
+                if self.tool_calls.len() <= index {
+                    self.tool_calls.resize_with(index + 1, ToolCallOut::default);
+                }
+                let slot = &mut self.tool_calls[index];
+                if let Some(name) = item.pointer("/function/name").and_then(Value::as_str) {
+                    slot.name.push_str(name);
+                }
+                if let Some(args) = item.pointer("/function/arguments").and_then(Value::as_str) {
+                    slot.arguments.push_str(args);
+                }
+            }
+        }
+        if let Some(pt) = chunk
+            .pointer("/usage/prompt_tokens")
+            .and_then(Value::as_u64)
+        {
+            self.prompt_tokens = Some(pt as u32);
+        }
+        chunk
+            .pointer("/choices/0/delta/content")
+            .and_then(Value::as_str)
+            .filter(|content| !content.is_empty())
+    }
+
+    /// The calls worth reporting. A slot with no name never got a `function.name`
+    /// (a malformed or reserved index), and dispatching it would fail anyway.
+    fn into_tool_calls(self) -> Vec<ToolCallOut> {
+        self.tool_calls
+            .into_iter()
+            .filter(|call| !call.name.is_empty())
+            .collect()
+    }
 }
 
 #[derive(Clone)]
@@ -478,6 +548,7 @@ impl Client {
                 total_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
                 ttft_ms: None,
                 prompt_tokens: None,
+                tool_calls: Vec::new(),
             });
         }
         if reader.status != 200 {
@@ -487,9 +558,9 @@ impl Client {
 
         let mut deltas: u32 = 0;
         let mut ttft_ms = None;
-        // From the terminal usage chunk, when the request opted in via
-        // stream_options.include_usage (agent lane); absent otherwise.
-        let mut prompt_tokens: Option<u32> = None;
+        // Tool calls, plus prompt tokens from the terminal usage chunk when the
+        // request opted in via stream_options.include_usage (agent lane).
+        let mut acc = StreamAccumulator::default();
         let end = reader.stream(cancel, deadline, |line| {
             if let Some(payload) = line.strip_prefix("data:") {
                 let payload = payload.trim();
@@ -497,34 +568,25 @@ impl Client {
                     return SseControl::Done;
                 }
                 if let Ok(chunk) = serde_json::from_str::<Value>(payload) {
-                    if let Some(content) = chunk
-                        .pointer("/choices/0/delta/content")
-                        .and_then(Value::as_str)
-                    {
-                        if !content.is_empty() {
-                            ttft_ms.get_or_insert_with(|| {
-                                started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
-                            });
-                            deltas += 1;
-                            on_delta(content);
-                        }
-                    }
-                    if let Some(pt) = chunk
-                        .pointer("/usage/prompt_tokens")
-                        .and_then(Value::as_u64)
-                    {
-                        prompt_tokens = Some(pt as u32);
+                    if let Some(content) = acc.absorb(&chunk) {
+                        ttft_ms.get_or_insert_with(|| {
+                            started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+                        });
+                        deltas += 1;
+                        on_delta(content);
                     }
                 }
             }
             SseControl::Continue
         })?;
+        let prompt_tokens = acc.prompt_tokens;
         Ok(StreamStats {
             end,
             deltas,
             total_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
             ttft_ms,
             prompt_tokens,
+            tool_calls: acc.into_tool_calls(),
         })
     }
 
@@ -610,6 +672,7 @@ pub struct ChatTurn {
 }
 
 /// One structured tool call (OpenAI shape): a name + a JSON-encoded args string.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ToolCallOut {
     pub name: String,
     pub arguments: String,
@@ -1042,6 +1105,114 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::mpsc;
 
+    /// Drive a canned SSE transcript through the production chunk decoder and
+    /// the production [`StreamAccumulator`], returning what the caller of
+    /// `chat_stream_timed_with_timeout` would observe: forwarded content and
+    /// lifted tool calls.
+    fn replay_sse(events: &[&str]) -> (String, Vec<ToolCallOut>) {
+        let mut wire = String::new();
+        for event in events {
+            wire.push_str(&format!("{:x}\r\n{event}\r\n", event.len()));
+        }
+        wire.push_str("0\r\n\r\n");
+        let mut decoder = ChunkDecoder::new(true);
+        let mut line_acc = Vec::new();
+        let mut acc = StreamAccumulator::default();
+        let mut content = String::new();
+        for slice in wire.as_bytes().chunks(9) {
+            let finished = SseReader::feed(slice, &mut decoder, &mut line_acc, &mut |line| {
+                if let Some(payload) = line.strip_prefix("data:") {
+                    let payload = payload.trim();
+                    if payload == "[DONE]" {
+                        return SseControl::Done;
+                    }
+                    if let Ok(chunk) = serde_json::from_str::<Value>(payload) {
+                        if let Some(delta) = acc.absorb(&chunk) {
+                            content.push_str(delta);
+                        }
+                    }
+                }
+                SseControl::Continue
+            });
+            if finished {
+                break;
+            }
+        }
+        (content, acc.into_tool_calls())
+    }
+
+    /// The regression this exists for: a tool-enabled stream emits NO content
+    /// deltas and carries the call only in `delta.tool_calls`. Reading content
+    /// alone yielded an empty turn, so the agent loop ended with a blank answer
+    /// and never dispatched a tool. Transcript shape mirrors the server's
+    /// `chat_tool_call_delta_uses_openai_stream_shape` assertion in `api`.
+    #[test]
+    fn stream_lifts_tool_calls_when_content_is_held_back() {
+        let (content, calls) = replay_sse(&[
+            "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_0\",\
+             \"type\":\"function\",\"function\":{\"name\":\"read_file\",\
+             \"arguments\":\"{\\\"path\\\":\\\"src/main.rs\\\"}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1234}}\n\n",
+            "data: [DONE]\n\n",
+        ]);
+        assert_eq!(content, "", "a tool turn streams no content deltas");
+        assert_eq!(
+            calls,
+            vec![ToolCallOut {
+                name: "read_file".into(),
+                arguments: r#"{"path":"src/main.rs"}"#.into(),
+            }],
+            "the call must survive as structured output"
+        );
+    }
+
+    /// Two calls in one turn keep their order and stay separate.
+    #[test]
+    fn stream_lifts_multiple_tool_calls_by_index() {
+        let (_, calls) = replay_sse(&[
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[\
+             {\"index\":0,\"function\":{\"name\":\"list_dir\",\"arguments\":\"{}\"}},\
+             {\"index\":1,\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"p\\\":1}\"}}\
+             ]}}]}\n\n",
+            "data: [DONE]\n\n",
+        ]);
+        let names: Vec<&str> = calls.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["list_dir", "read_file"]);
+        assert_eq!(calls[1].arguments, r#"{"p":1}"#);
+    }
+
+    /// The OpenAI contract allows a call to arrive in fragments. This server
+    /// emits each call whole today, so the by-index fold is what keeps the
+    /// client from depending on that choice.
+    #[test]
+    fn stream_folds_fragmented_tool_call_arguments() {
+        let (_, calls) = replay_sse(&[
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\
+             \"function\":{\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\":\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\
+             \"function\":{\"arguments\":\"\\\"a.txt\\\"}\"}}]}}]}\n\n",
+            "data: [DONE]\n\n",
+        ]);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "write_file");
+        assert_eq!(calls[0].arguments, r#"{"path":"a.txt"}"#);
+    }
+
+    /// A plain answer is unaffected: content still streams and no call is
+    /// invented.
+    #[test]
+    fn stream_without_tool_calls_still_yields_content() {
+        let (content, calls) = replay_sse(&[
+            "data: {\"choices\":[{\"delta\":{\"content\":\"all \"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        ]);
+        assert_eq!(content, "all done");
+        assert!(calls.is_empty());
+    }
+
     #[test]
     fn workspace_request_encodes_bearer_without_browser_headers() {
         let token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -1222,6 +1393,58 @@ mod tests {
         }
         assert!(done_seen, "stream must terminate on [DONE]");
         assert_eq!(collected, "Certainly");
+    }
+
+    /// End-to-end over a real socket: the whole `chat_stream_timed_with_timeout`
+    /// path, not just the fold. Proves the lifted calls actually reach the
+    /// caller through `StreamStats`, which is what the agent loop reads.
+    #[test]
+    fn chat_stream_surfaces_tool_calls_over_a_socket() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = Client::new(listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            // Drain the request head so the client's write completes.
+            let mut buf = [0u8; 4096];
+            let _ = std::io::Read::read(&mut stream, &mut buf);
+            let body = concat!(
+                "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,",
+                "\"id\":\"call_0\",\"type\":\"function\",\"function\":{\"name\":\"list_dir\",",
+                "\"arguments\":\"{\\\"path\\\":\\\".\\\"}\"}}]}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                "data: [DONE]\n\n",
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                 Content-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = std::io::Write::write_all(&mut stream, response.as_bytes());
+            let _ = std::io::Write::flush(&mut stream);
+        });
+
+        let mut forwarded = String::new();
+        let stats = client
+            .chat_stream_timed_with_timeout(
+                &json!({"stream": true}),
+                &AtomicBool::new(false),
+                Some(Duration::from_secs(5)),
+                |delta| forwarded.push_str(delta),
+            )
+            .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(stats.end, StreamEnd::Done);
+        assert_eq!(forwarded, "", "a tool turn forwards no content deltas");
+        assert_eq!(stats.deltas, 0);
+        assert_eq!(
+            stats.tool_calls,
+            vec![ToolCallOut {
+                name: "list_dir".into(),
+                arguments: r#"{"path":"."}"#.into(),
+            }],
+        );
     }
 
     #[test]
