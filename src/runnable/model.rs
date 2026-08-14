@@ -111,7 +111,17 @@ fn resident_metal_format(tt: GgufTensorType) -> Option<crate::metal::ResidentWei
         // `attn_v` and 16 `ffn_down`, and `prism_metal_weight` hard-errors on an
         // unmapped type, so admitting only Q4K yields no resident graph at all.
         GgufTensorType::Q4K => Some(crate::metal::ResidentWeightFormat::Q4K),
+        // Q5_K (176B per 256 values) is Q4_K plus a `qh` high-bit plane. Admitted
+        // alongside Q6_K for the same PAIR reason: a Q5_K_M/Q5_K_L mix carries Q6_K
+        // on some `attn_qkv`/`attn_v`/`ffn_down` and Q8_0 on the embed/output heads,
+        // so admitting Q5_K alone would still yield no resident graph.
+        GgufTensorType::Q5K => Some(crate::metal::ResidentWeightFormat::Q5K),
         GgufTensorType::Q6K => Some(crate::metal::ResidentWeightFormat::Q6K),
+        // bf16 survives some quant recipes on the tiny `ssm_alpha`/`ssm_beta`
+        // projections (48 tensors, ~6M params). Widening to f32 is a bit shift, so
+        // the dense bf16 kernel reads the wire bytes in place — no conversion pass
+        // and no second copy. NOT mapped to DenseF16: different exponent width.
+        GgufTensorType::BF16 => Some(crate::metal::ResidentWeightFormat::DenseBF16),
         _ => None,
     }
 }
@@ -5662,6 +5672,15 @@ mod resident_format_admission_tests {
             // (vs 9917 MB for the Q8_0 row).
             (GgufTensorType::Q4K, ResidentWeightFormat::Q4K),
             (GgufTensorType::Q6K, ResidentWeightFormat::Q6K),
+            // Q5_K joined the pair once `q5k_linear_simd`/`q5k_linear_tiled` landed
+            // (bit-exact vs `q5_k_wire_row_dot` in the Metal K-quant parity gate). A
+            // Q5_K_L mix is Q5_K 144 / Q6_K 32 / Q8_0 26 / BF16 48 / F32 177, so it
+            // needs the whole set admitted or it gets no resident graph at all.
+            (GgufTensorType::Q5K, ResidentWeightFormat::Q5K),
+            // bf16 `ssm_alpha`/`ssm_beta` (48 tensors) ride the dense bf16 kernel.
+            // Widening bf16 to f32 is a bit shift, so the wire bytes are read in
+            // place — this is NOT DenseF16, whose exponent width differs.
+            (GgufTensorType::BF16, ResidentWeightFormat::DenseBF16),
         ] {
             assert_eq!(resident_metal_format(tt), Some(want), "{tt:?} must map");
             assert!(wants_page_backing(tt), "{tt:?} must load into WirePages");
@@ -5675,14 +5694,16 @@ mod resident_format_admission_tests {
 
     #[test]
     fn unadmitted_types_neither_map_nor_page_back() {
-        // Page-backing costs a page per tensor, so it stays opt-in. Note Q5_K is absent
-        // from the admitted table on purpose: there is no `q5k` Metal kernel, so an
-        // ornith Q3_K_M (which carries q5_K tensors) must keep failing closed to CPU.
+        // Page-backing costs a page per tensor, so it stays opt-in. Q3_K is the
+        // fail-closed case now that Q5_K has a kernel: an ornith Q3_K_M carries BOTH
+        // q3_K and q5_K, and q3_K still maps to None, so that file must keep failing
+        // closed to the CPU hybrid. Shipping only a q5k kernel would not have moved it.
         for tt in [
             GgufTensorType::F32,
             GgufTensorType::F16,
             GgufTensorType::Q4_0,
-            GgufTensorType::Q5K,
+            GgufTensorType::Q3K,
+            GgufTensorType::Q2K,
         ] {
             assert_eq!(resident_metal_format(tt), None, "{tt:?} must not admit");
             assert!(!wants_page_backing(tt), "{tt:?} must stay Owned");

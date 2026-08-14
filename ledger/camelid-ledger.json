@@ -1,7 +1,7 @@
 {
   "ledger_version": "camelid.ledger/v1",
   "provenance": {
-    "source_head": "e4bf87d7",
+    "source_head": "7c299238",
     "note": "Derived from the static CapabilitiesResponse literal in src/api/mod.rs and API_CONFORMANCE_CASES in src/api/contract.rs by scripts/extract-capabilities-to-ledger.mjs. Contract fields are byte-faithful (plain serde Serialize, no renames). Per CAIRN Amendment 1, the CODE is the contract source of truth; this ledger is its derived canonical form, and scripts/check-ledger-drift.mjs re-derives from code and fails CI if code and ledger disagree (provenance excluded)."
   },
   "capabilities": {
@@ -371,6 +371,56 @@
         "latest_checked_output": "camelid.agent_eval/v1 PASS (full 3-case battery)",
         "evidence": "qwen35 (Ornith-1.0-9B) Q4_K_M fully GPU-resident (CAMELID_QWEN35_CUDA=1): 5-prompt greedy parity vs the pinned llama.cpp acd79d6 CUDA oracle PASSES under the cross-backend tolerance policy — 2/5 token-identical at n=64 and every flip probed and attributed to soft positions with <=0.33-nat top-2 gaps where the oracle's own CPU-vs-CUDA backends also flip (qa/ornith/constrained-vram/RECEIPT_ITEM2_qwen35_parity_cuda.json, probes + oracle/camelid internal-variance controls committed alongside). The full read_file/list_dir/write_file agent battery passes on this exact file with a committed camelid.agent_eval/v1 PASS receipt (qa/agent-eval/ornith-1.0-9b-Q4_K_M-1783019779-PASS.json); tool_capable earned ONLY by that receipt. Decode throughput 18.8 tok/s median via the device-side decode loop (qa/ornith/constrained-vram profile CSVs). NOT model-native/larger context, NOT broader templates, NOT multi-session throughput claims.",
         "next_step": "preserve the CUDA parity + agent capability for this exact row; NOTE a macOS resident Metal lane now accepts qwen35 K-quant files by default (opt-out CAMELID_QWEN35_METAL=0) and would serve THESE bytes on Apple Silicon with no receipt covering them — the only Metal K-quant parity evidence is qa/ornith/G-PARITY-qwen35-kquant-metal-macos.md, taken on a DIFFERENT artifact (sha256 5720d1f6, the HuggingFace imatrix quant, not this row's 2711bf1e); a Metal receipt on these exact bytes, context-pack coverage, the frontend picker load path, and a normalized full-support bundle remain before any broader claim"
+      }
+    },
+    {
+      "identity": {
+        "id": "ornith_1_0_9b_uncensored_q5_k_l",
+        "family": "ornith",
+        "quantization": "Q5_K_L",
+        "gguf_filename": "Ornith-1.0-9B-Uncensored-Q5_K_L-imat.gguf"
+      },
+      "contract": {
+        "id": "ornith_1_0_9b_uncensored_q5_k_l",
+        "tool_capable": true,
+        "family": "ornith",
+        "quantization": "Q5_K_L",
+        "status": "active_validation_exact_row_smoke",
+        "support_scope": "exact_row_smoke_only",
+        "full_support_status": "blocked_generation_parity",
+        "full_support_blockers": "no side-by-side external-oracle parity receipt exists on these bytes; context beyond short single-session prompts, broader templates, portability off this one Apple Silicon host, and durable repeated current-head bundles are all untested",
+        "metadata_parses": "validated",
+        "tokenizer_works": "validated_qwen35_bpe_mark_folding_deferred",
+        "tensors_load": "validated_all_427_qwen35_tensors_resident_metal_q5k_q6k_q8_0_bf16",
+        "generation_runs": "runnable_serve_chat_plus_agent_eval_validated",
+        "parity_audited": "not_compared_no_external_oracle_receipt_on_these_bytes",
+        "performance_measured": "macos_metal_resident_decode_10_7_toks_differenced_measured",
+        "frontend_load_path_verified": "not_promoted",
+        "frontend_readiness_gate": "green only when this exact qwen35 Q5_K_L row (Ornith-1.0-9B-Uncensored-Q5_K_L-imat.gguf, sha256 7cf7e2cf...) is loaded_now=true, generation_ready=true, matching active_model_id, and served on macOS aarch64 with the qwen35 resident Metal lane (on by default; opt-out CAMELID_QWEN35_METAL=0)",
+        "tested_context": "short_serve_smoke_plus_agent_eval_read_list_write",
+        "chat_template_renderer": "ornith-chatml-native",
+        "chat_template_shape_pack": "not_promoted",
+        "chat_template_shape_pack_id": "not_selected",
+        "bounded_context_512_pack": "not_promoted",
+        "bounded_context_512_pack_id": "not_selected",
+        "bounded_context_window": 512,
+        "bounded_context_1024_pack": "not_promoted",
+        "bounded_context_1024_pack_id": "not_selected",
+        "bounded_context_1024_window": 1024,
+        "bounded_context_2048_pack": "not_promoted",
+        "bounded_context_2048_pack_id": "not_selected",
+        "bounded_context_2048_window": 2048,
+        "bounded_context_4096_pack": "not_promoted",
+        "bounded_context_4096_pack_id": "not_selected",
+        "bounded_context_4096_window": 4096,
+        "bounded_context_8192_pack": "not_promoted",
+        "bounded_context_8192_pack_id": "not_selected",
+        "bounded_context_8192_window": 8192,
+        "latest_checked_bucket": "macos_metal_q5k_agent_battery",
+        "latest_checked_result": "pass",
+        "latest_checked_output": "read_file/list_dir/write_file all dispatched and answered; decode 10.7 tok/s",
+        "evidence": "qwen35 (Ornith-1.0-9B-Uncensored, a third-party abliterated fine-tune — NOT the certified deepreinforce-ai weights) Q5_K_L, sha256 7cf7e2cf..., 7.25 GB. First file to exercise the Q5_K Metal path: its 427 tensors are Q5_K 144 / Q6_K 32 / Q8_0 26 / BF16 48 / F32 177, and Q5_K plus BF16 both had no resident Metal mapping before this change. Runs fully on the macOS aarch64 qwen35 resident Metal graph (selected_backend=metal_resident_qwen35_kquant_runtime, verified live on /v1/health). The q5k_linear_simd/q5k_linear_tiled kernels are BIT-EXACT against the CPU wire oracle q5_k_wire_row_dot across n_sb 2/11/16/48 x 1 and 5 tokens (metal_kquant_resident_projection_matches_cpu_oracles). Decode 10.7 tok/s measured by differencing two same-prompt generations so prefill cancels; prefill ~101 ms/token. The full read_file/list_dir/write_file agent battery passes with a committed camelid.agent_eval/v1 PASS receipt (qa/agent-eval/Ornith-1.0-9B-Uncensored-Q5_K_L-imat-1786671974-PASS.json); tool_capable earned ONLY by that receipt. NOT parity-checked against any external oracle on these bytes. NOTE this file needs ~7.6 GB of estimated footprint: on a 16 GB host the fit guard refuses it unless ~8 GB is free (CAMELID_SKIP_FIT_CHECK=1 was used for the agent battery, after a plain serve load had already succeeded).",
+        "next_step": "mint a side-by-side external-oracle greedy parity receipt on these exact bytes to move off active_validation, then context-pack coverage and a second host for portability"
       }
     },
     {

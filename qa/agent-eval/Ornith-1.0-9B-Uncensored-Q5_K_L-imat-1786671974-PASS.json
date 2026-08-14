@@ -1,0 +1,66 @@
+{
+  "schema": "camelid.agent_eval/v1",
+  "outcome": "PASS",
+  "model_id": "Ornith 1.0 9B Uncensored",
+  "gguf": "/Volumes/Untitled/models/ornith-uncensored/Ornith-1.0-9B-Uncensored-Q5_K_L-imat.gguf",
+  "gguf_bytes": 7254975488,
+  "quantization": "unknown",
+  "note": "battery complete",
+  "cases": [
+    {
+      "case": "read_and_count",
+      "goal": "Read the file notes.txt and tell me how many lines it has. Use the read_file tool, then give the count.",
+      "loop_end": "Answered",
+      "tool_calls": [
+        "read_file(notes.txt, start_line=1, max_lines=all)"
+      ],
+      "tool_results": [
+        {
+          "tool": "read_file",
+          "ok": true,
+          "output": "alpha\nbeta\ngamma\n"
+        }
+      ],
+      "final_answer": "The file `notes.txt` has **4 lines**:\n\n1. `alpha`\n2. `beta`\n3. `gamma`\n4. (an empty line at the end)",
+      "passed": true
+    },
+    {
+      "case": "list_dir_find",
+      "goal": "List the entries of the current directory '.' with the list_dir tool, then tell me the name of the text file you find there.",
+      "loop_end": "Answered",
+      "tool_calls": [
+        "list_dir(., offset=0, limit=all)"
+      ],
+      "tool_results": [
+        {
+          "tool": "list_dir",
+          "ok": true,
+          "output": "notes.txt"
+        }
+      ],
+      "final_answer": "The text file in the current directory is **notes.txt**.",
+      "passed": true
+    },
+    {
+      "case": "write_greeting",
+      "goal": "Create a file named greeting.txt whose exact contents are: hello there\nUse the write_file tool ONCE, then reply in words that you created it. Do not call any further tools and do not read the file back.",
+      "loop_end": "Answered",
+      "tool_calls": [
+        "write_file(greeting.txt, 11 bytes)"
+      ],
+      "tool_results": [
+        {
+          "tool": "write_file",
+          "ok": true,
+          "output": "wrote 11 bytes to /private/var/folders/pc/q79_2lmn5q75s4d26p64c48h0000gn/T/camelid-agent-eval-16313/greeting.txt"
+        }
+      ],
+      "final_answer": "I created the file `greeting.txt` with the contents \"hello there\".",
+      "passed": true
+    }
+  ],
+  "host_loadavg_1m": 4.078125,
+  "timestamp_unix": 1786671974,
+  "promotion_eligible": true,
+  "receipt_id": "e067a9f1e60cf166c657be9fb0ee3d81c297b39aead40636bfdfd9d0f52c0bcf"
+}

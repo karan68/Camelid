@@ -106,13 +106,16 @@ struct MetalLinearKernel {
     gemma4_q4_expert_down_reduce_turbo_pipeline: Option<ComputePipelineState>,
     q6k_linear_turbo_pipeline: Option<ComputePipelineState>,
     q4k_linear_simd_pipeline: ComputePipelineState,
+    q5k_linear_simd_pipeline: ComputePipelineState,
     q6k_linear_simd_pipeline: ComputePipelineState,
     q4k_linear_tiled_pipeline: ComputePipelineState,
+    q5k_linear_tiled_pipeline: ComputePipelineState,
     q6k_linear_tiled_pipeline: ComputePipelineState,
     q1_0_linear_pipeline: ComputePipelineState,
     q2_0_g64_linear_pipeline: ComputePipelineState,
     q2_0_g128_linear_pipeline: ComputePipelineState,
     embed_row_gather_q4k_pipeline: ComputePipelineState,
+    embed_row_gather_q5k_pipeline: ComputePipelineState,
     embed_row_gather_q6k_pipeline: ComputePipelineState,
     embed_row_gather_q1_0_pipeline: ComputePipelineState,
     embed_row_gather_q2_0_g64_pipeline: ComputePipelineState,
@@ -122,6 +125,7 @@ struct MetalLinearKernel {
     residual_add_pipeline: ComputePipelineState,
     multiply_pipeline: ComputePipelineState,
     dense_f16_linear_pipeline: ComputePipelineState,
+    dense_bf16_linear_pipeline: ComputePipelineState,
     dense_f32_linear_pipeline: ComputePipelineState,
     bitnet_i2_s_linear_pipeline: ComputePipelineState,
     silu_mul_pipeline: ComputePipelineState,
@@ -1865,6 +1869,27 @@ inline int q4k_code(device const uchar* block, uint index) {
     return int(local < 32 ? (byte & 0x0fu) : (byte >> 4));
 }
 
+// Q5_K is Q4_K plus a fifth bit per weight. The 176-byte super-block is
+// d(f16) | dmin(f16) | scales[12] | qh[32] | qs[128] — the same packed 6-bit
+// scale/min block as Q4_K at the same offset (so `q4k_scale_min` is reused
+// verbatim), with `qh` inserted at 16 and the low nibbles pushed to 48.
+//
+// `qh` is indexed by the position WITHIN the 32-value half (0..31) and reused
+// across all four 64-value groups, one bit per half: bit 2g for the low nibble
+// of group g, bit 2g+1 for the high nibble. That reuse is the trap — the byte
+// index does not advance with the group the way `qs` does. Mirrors
+// `inference::q5_k_wire_row_dot`, the CPU oracle these kernels are gated on.
+inline int q5k_code(device const uchar* block, uint index) {
+    const uint group = index >> 6;
+    const uint local = index & 63u;
+    const uint p = local & 31u;
+    const uint byte = uint(block[48 + group * 32 + p]);
+    const uint high = uint(block[16 + p]);
+    const uint bit = local < 32 ? (2u * group) : (2u * group + 1u);
+    const int base = int(local < 32 ? (byte & 0x0fu) : (byte >> 4));
+    return base + (((high >> bit) & 1u) != 0u ? 16 : 0);
+}
+
 kernel void q4k_linear_tiled(
     device const float* input_scales [[buffer(0)]],
     device const char* input_quants [[buffer(1)]],
@@ -2066,6 +2091,148 @@ kernel void q4k_linear_simd(
     }
 }
 
+// Q5_K siblings of the two Q4_K kernels. Structurally identical — same lane
+// partition, same 8-lane integer accumulator, same mins side (which touches only
+// activations and mins, so the fifth bit does not enter it), and the same
+// per-super-block f32 tail. The deltas are exactly three: the 176-byte stride,
+// the qs base at 48, and `q5k_code` folding in the `qh` bit.
+kernel void q5k_linear_tiled(
+    device const float* input_scales [[buffer(0)]],
+    device const char* input_quants [[buffer(1)]],
+    device const uchar* weight_blocks [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& n_sb [[buffer(4)]],
+    constant uint& rows [[buffer(5)]],
+    constant uint& n_tokens [[buffer(6)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    constexpr uint TILE_T = 4;
+    const uint tiles = (n_tokens + TILE_T - 1) / TILE_T;
+    const uint row = gid / tiles;
+    const uint tile = gid - row * tiles;
+    if (row >= rows) return;
+    const uint t0 = tile * TILE_T;
+    const uint tn = min(uint(TILE_T), n_tokens - t0);
+    float sums[TILE_T][8];
+    float sumf[TILE_T];
+    for (uint t = 0; t < TILE_T; ++t) {
+        sumf[t] = 0.0f;
+        for (uint l = 0; l < 8; ++l) sums[t][l] = 0.0f;
+    }
+    for (uint b = 0; b < n_sb; ++b) {
+        device const uchar* block = weight_blocks + (row * n_sb + b) * 176;
+        const float dw = float(*reinterpret_cast<device const half*>(block));
+        const float dm = float(*reinterpret_cast<device const half*>(block + 2));
+        uchar sc[8], mn[8];
+        q4k_scale_min(block, sc, mn);
+        for (uint t = 0; t < tn; ++t) {
+            const uint qb = (t0 + t) * n_sb * 256 + b * 256;
+            int aux[8] = {0,0,0,0,0,0,0,0};
+            int sumi = 0;
+            for (uint j = 0; j < 16; ++j) {
+                int bsum = 0;
+                for (uint i = 0; i < 16; ++i) bsum += int(input_quants[qb + j * 16 + i]);
+                sumi += bsum * int(mn[j >> 1]);
+            }
+            for (uint j = 0; j < 8; ++j) {
+                const int scale = int(sc[j]);
+                for (uint k = 0; k < 4; ++k) {
+                    const uint off = j * 32 + k * 8;
+                    for (uint l = 0; l < 8; ++l) {
+                        const uint idx = off + l;
+                        aux[l] += scale * int(input_quants[qb + idx]) * q5k_code(block, idx);
+                    }
+                }
+            }
+            const float da = input_scales[(t0 + t) * n_sb + b];
+            const float dd = dw * da;
+            for (uint l = 0; l < 8; ++l) sums[t][l] += dd * float(aux[l]);
+            sumf[t] -= dm * da * float(sumi);
+        }
+    }
+    for (uint t = 0; t < tn; ++t) {
+        float main = 0.0f;
+        for (uint l = 0; l < 8; ++l) main += sums[t][l];
+        output[(t0 + t) * rows + row] = sumf[t] + main;
+    }
+}
+
+kernel void q5k_linear_simd(
+    device const float* input_scales [[buffer(0)]],
+    device const char* input_quants [[buffer(1)]],
+    device const uchar* weight_blocks [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& n_sb [[buffer(4)]],
+    constant uint& rows [[buffer(5)]],
+    threadgroup int* scratch [[threadgroup(0)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    if (row >= rows) return;
+    const uint units = n_sb * 4;
+    for (uint u0 = 0; u0 < units; u0 += 32) {
+        const uint u = u0 + lane;
+        const bool active = u < units;
+        const uint sb = u >> 2;
+        const uint g = u & 3u;
+        int aux[8] = {0,0,0,0,0,0,0,0};
+        int sumi = 0;
+        if (active) {
+            device const uchar* block = weight_blocks + (row * n_sb + sb) * 176;
+            device const char* y = input_quants + sb * 256;
+            uchar sc[8], mn[8];
+            q4k_scale_min(block, sc, mn);
+            int sumlo = 0;
+            int sumhi = 0;
+            for (uint k = 0; k < 4; ++k) {
+                for (uint l = 0; l < 8; ++l) {
+                    const uint p = k * 8 + l;
+                    const uint packed = uint(block[48 + g * 32 + p]);
+                    const uint high = uint(block[16 + p]);
+                    const int wlo = int(packed & 0x0fu)
+                        + (((high >> (2u * g)) & 1u) != 0u ? 16 : 0);
+                    const int whi = int(packed >> 4)
+                        + (((high >> (2u * g + 1u)) & 1u) != 0u ? 16 : 0);
+                    const int ylo = int(y[g * 64 + p]);
+                    const int yhi = int(y[g * 64 + 32 + p]);
+                    aux[l] += int(sc[2 * g]) * ylo * wlo;
+                    aux[l] += int(sc[2 * g + 1]) * yhi * whi;
+                    sumlo += ylo;
+                    sumhi += yhi;
+                }
+            }
+            sumi = int(mn[2 * g]) * sumlo + int(mn[2 * g + 1]) * sumhi;
+        }
+        for (uint off = 2; off >= 1; off >>= 1) {
+            for (uint l = 0; l < 8; ++l) {
+                aux[l] += simd_shuffle_down(aux[l], off);
+            }
+            sumi += simd_shuffle_down(sumi, off);
+        }
+        if (active && g == 0) {
+            for (uint l = 0; l < 8; ++l) scratch[sb * 9 + l] = aux[l];
+            scratch[sb * 9 + 8] = sumi;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane == 0) {
+        float sums[8] = {0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f};
+        float sumf = 0.0f;
+        for (uint sb = 0; sb < n_sb; ++sb) {
+            device const uchar* block = weight_blocks + (row * n_sb + sb) * 176;
+            const float dw = float(*reinterpret_cast<device const half*>(block));
+            const float dm = float(*reinterpret_cast<device const half*>(block + 2));
+            const float da = input_scales[sb];
+            const float dd = dw * da;
+            for (uint l = 0; l < 8; ++l) sums[l] += dd * float(scratch[sb * 9 + l]);
+            sumf -= dm * da * float(scratch[sb * 9 + 8]);
+        }
+        float main = 0.0f;
+        for (uint l = 0; l < 8; ++l) main += sums[l];
+        output[row] = sumf + main;
+    }
+}
+
 // Q6_K sibling of q4k_linear_simd. Four lanes partition each raw 210-byte
 // super-block into the same 64-value quarters as the CUDA parity kernel.
 kernel void q6k_linear_simd(
@@ -2156,6 +2323,31 @@ kernel void embed_row_gather_q4k(
     const float d = float(*reinterpret_cast<device const half*>(block));
     const float dm = float(*reinterpret_cast<device const half*>(block + 2));
     embedding[gid] = d * float(sc[group]) * float(q4k_code(block, i))
+        - dm * float(mn[group]);
+}
+
+// Q5_K token-embedding gather. Written even though the quant mixes we ship today
+// carry Q8_0 or Q4_K on `token_embd`: `resident_metal_format` now admits Q5_K, and
+// without this the gather match would have to `unreachable!()` on a Q5_K embedding
+// table — a panic on a file we would otherwise have accepted, rather than a
+// refusal. Cheaper to be complete than to fail closed in a second place.
+kernel void embed_row_gather_q5k(
+    device const uchar* weights [[buffer(0)]],
+    device const uint* selected_id [[buffer(1)]],
+    device float* embedding [[buffer(2)]],
+    constant uint& n_sb [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    const uint width = n_sb * 256;
+    if (gid >= width) return;
+    device const uchar* block = weights + ((*selected_id) * n_sb + gid / 256) * 176;
+    uchar sc[8], mn[8];
+    q4k_scale_min(block, sc, mn);
+    const uint i = gid & 255u;
+    const uint group = i >> 5;
+    const float d = float(*reinterpret_cast<device const half*>(block));
+    const float dm = float(*reinterpret_cast<device const half*>(block + 2));
+    embedding[gid] = d * float(sc[group]) * float(q5k_code(block, i))
         - dm * float(mn[group]);
 }
 
@@ -3226,6 +3418,39 @@ kernel void dense_f16_linear_f32(
     const device half* w = weight + ulong(row) * input_width;
     float partial = 0.0f;
     for (uint i = lane; i < input_width; i += 32) partial += x[i] * float(w[i]);
+    const float sum = simd_sum(partial);
+    if (lane == 0) output[ulong(token) * rows + row] = sum;
+}
+
+// bf16 is exactly the high 16 bits of an f32, so widening is a shift — lossless,
+// and NOT interchangeable with `half`: the two have different exponent widths, so
+// feeding bf16 bytes to the f16 kernel above would silently read garbage.
+inline float bf16_to_f32(ushort bits) {
+    return as_type<float>(uint(bits) << 16);
+}
+
+// BF16 sibling of dense_f16_linear_f32, for qwen35 quant mixes that keep the tiny
+// `ssm_alpha` / `ssm_beta` projections at bf16 (48 tensors, ~6M params) while the
+// rest of the model is K-quantized. Same lane partition and same `simd_sum`
+// reduction as the f16 kernel, so it carries the identical (non-sequential)
+// accumulation order that lane already documents.
+kernel void dense_bf16_linear_f32(
+    device const float* input [[buffer(0)]],
+    device const ushort* weight [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& input_width [[buffer(3)]],
+    constant uint& rows [[buffer(4)]],
+    constant uint& tokens [[buffer(5)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]]
+) {
+    const uint row = group.x;
+    const uint token = group.y;
+    if (row >= rows || token >= tokens) return;
+    const device float* x = input + ulong(token) * input_width;
+    const device ushort* w = weight + ulong(row) * input_width;
+    float partial = 0.0f;
+    for (uint i = lane; i < input_width; i += 32) partial += x[i] * bf16_to_f32(w[i]);
     const float sum = simd_sum(partial);
     if (lane == 0) output[ulong(token) * rows + row] = sum;
 }
@@ -7166,6 +7391,12 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
             let dense_f16_linear_pipeline = device
                 .new_compute_pipeline_state_with_function(&dense_f16_linear_function)
                 .ok()?;
+            let dense_bf16_linear_function = elementwise_library
+                .get_function("dense_bf16_linear_f32", None)
+                .ok()?;
+            let dense_bf16_linear_pipeline = device
+                .new_compute_pipeline_state_with_function(&dense_bf16_linear_function)
+                .ok()?;
             let dense_f32_linear_function = elementwise_library
                 .get_function("dense_f32_linear_f32", None)
                 .ok()?;
@@ -7763,6 +7994,10 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
             let q4k_linear_simd_pipeline = device
                 .new_compute_pipeline_state_with_function(&q4k_linear_simd_function)
                 .ok()?;
+            let q5k_linear_simd_function = library.get_function("q5k_linear_simd", None).ok()?;
+            let q5k_linear_simd_pipeline = device
+                .new_compute_pipeline_state_with_function(&q5k_linear_simd_function)
+                .ok()?;
             let q6k_linear_simd_function = library.get_function("q6k_linear_simd", None).ok()?;
             let q6k_linear_simd_pipeline = device
                 .new_compute_pipeline_state_with_function(&q6k_linear_simd_function)
@@ -7770,6 +8005,10 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
             let q4k_linear_tiled_function = library.get_function("q4k_linear_tiled", None).ok()?;
             let q4k_linear_tiled_pipeline = device
                 .new_compute_pipeline_state_with_function(&q4k_linear_tiled_function)
+                .ok()?;
+            let q5k_linear_tiled_function = library.get_function("q5k_linear_tiled", None).ok()?;
+            let q5k_linear_tiled_pipeline = device
+                .new_compute_pipeline_state_with_function(&q5k_linear_tiled_function)
                 .ok()?;
             let q6k_linear_tiled_function = library.get_function("q6k_linear_tiled", None).ok()?;
             let q6k_linear_tiled_pipeline = device
@@ -7793,6 +8032,11 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 library.get_function("embed_row_gather_q4k", None).ok()?;
             let embed_row_gather_q4k_pipeline = device
                 .new_compute_pipeline_state_with_function(&embed_row_gather_q4k_function)
+                .ok()?;
+            let embed_row_gather_q5k_function =
+                library.get_function("embed_row_gather_q5k", None).ok()?;
+            let embed_row_gather_q5k_pipeline = device
+                .new_compute_pipeline_state_with_function(&embed_row_gather_q5k_function)
                 .ok()?;
             let embed_row_gather_q6k_function =
                 library.get_function("embed_row_gather_q6k", None).ok()?;
@@ -7852,13 +8096,16 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 gemma4_q4_expert_down_reduce_turbo_pipeline,
                 q6k_linear_turbo_pipeline,
                 q4k_linear_simd_pipeline,
+                q5k_linear_simd_pipeline,
                 q6k_linear_simd_pipeline,
                 q4k_linear_tiled_pipeline,
+                q5k_linear_tiled_pipeline,
                 q6k_linear_tiled_pipeline,
                 q1_0_linear_pipeline,
                 q2_0_g64_linear_pipeline,
                 q2_0_g128_linear_pipeline,
                 embed_row_gather_q4k_pipeline,
+                embed_row_gather_q5k_pipeline,
                 embed_row_gather_q6k_pipeline,
                 embed_row_gather_q1_0_pipeline,
                 embed_row_gather_q2_0_g64_pipeline,
@@ -7868,6 +8115,7 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 residual_add_pipeline,
                 multiply_pipeline,
                 dense_f16_linear_pipeline,
+                dense_bf16_linear_pipeline,
                 dense_f32_linear_pipeline,
                 bitnet_i2_s_linear_pipeline,
                 silu_mul_pipeline,
@@ -12333,17 +12581,19 @@ fn encode_resident_matmul_f32(
     n_tokens: usize,
 ) {
     match weight.format {
-        ResidentWeightFormat::DenseF32 | ResidentWeightFormat::DenseF16 => {
+        ResidentWeightFormat::DenseF32
+        | ResidentWeightFormat::DenseF16
+        | ResidentWeightFormat::DenseBF16 => {
             unsafe {
                 let p = scalar.contents() as *mut u32;
                 *p = input_width as u32;
                 *p.add(1) = rows as u32;
                 *p.add(2) = n_tokens as u32;
             }
-            let pipeline = if weight.format == ResidentWeightFormat::DenseF16 {
-                &k.dense_f16_linear_pipeline
-            } else {
-                &k.dense_f32_linear_pipeline
+            let pipeline = match weight.format {
+                ResidentWeightFormat::DenseF16 => &k.dense_f16_linear_pipeline,
+                ResidentWeightFormat::DenseBF16 => &k.dense_bf16_linear_pipeline,
+                _ => &k.dense_f32_linear_pipeline,
             };
             e.set_compute_pipeline_state(pipeline);
             e.set_buffer(0, Some(y), 0);
@@ -12387,7 +12637,7 @@ fn encode_resident_matmul_f32(
                 encode_q8_matmul_f32y_batched(e, k, y, &weight.buffer, out, scalar, rows, n_tokens);
             }
         }
-        ResidentWeightFormat::Q4K | ResidentWeightFormat::Q6K => {
+        ResidentWeightFormat::Q4K | ResidentWeightFormat::Q5K | ResidentWeightFormat::Q6K => {
             let n_sb = input_width / 256;
             let scales = pool_get(k, (n_tokens * n_sb * 4) as u64);
             let quants = pool_get(k, (n_tokens * input_width) as u64);
@@ -12759,12 +13009,15 @@ fn encode_resident_kquant_matmul_f32(
 
     let pipeline = match (weight.format, n_tokens == 1) {
         (ResidentWeightFormat::Q4K, true) => &k.q4k_linear_simd_pipeline,
+        (ResidentWeightFormat::Q5K, true) => &k.q5k_linear_simd_pipeline,
         (ResidentWeightFormat::Q6K, true) => &k.q6k_linear_simd_pipeline,
         (ResidentWeightFormat::Q4K, false) => &k.q4k_linear_tiled_pipeline,
+        (ResidentWeightFormat::Q5K, false) => &k.q5k_linear_tiled_pipeline,
         (ResidentWeightFormat::Q6K, false) => &k.q6k_linear_tiled_pipeline,
         (ResidentWeightFormat::Q8_0, _)
         | (ResidentWeightFormat::DenseF32, _)
         | (ResidentWeightFormat::DenseF16, _)
+        | (ResidentWeightFormat::DenseBF16, _)
         | (ResidentWeightFormat::Q1_0, _)
         | (ResidentWeightFormat::Q2_0G64, _)
         | (ResidentWeightFormat::Q2_0G128, _) => unreachable!(),
@@ -12780,11 +13033,12 @@ fn encode_resident_kquant_matmul_f32(
     if n_tokens == 1 {
         let scratch_ints = n_sb
             * match weight.format {
-                ResidentWeightFormat::Q4K => 9,
+                ResidentWeightFormat::Q4K | ResidentWeightFormat::Q5K => 9,
                 ResidentWeightFormat::Q6K => 8,
                 ResidentWeightFormat::Q8_0
                 | ResidentWeightFormat::DenseF32
                 | ResidentWeightFormat::DenseF16
+                | ResidentWeightFormat::DenseBF16
                 | ResidentWeightFormat::Q1_0
                 | ResidentWeightFormat::Q2_0G64
                 | ResidentWeightFormat::Q2_0G128 => unreachable!(),
@@ -20753,8 +21007,10 @@ pub struct ResidentLayerWeights<'a> {
 pub enum ResidentWeightFormat {
     DenseF32,
     DenseF16,
+    DenseBF16,
     Q8_0,
     Q4K,
+    Q5K,
     Q6K,
     Q1_0,
     Q2_0G64,
@@ -20765,9 +21021,9 @@ impl ResidentWeightFormat {
     #[cfg(target_os = "macos")]
     fn values_per_block(self) -> usize {
         match self {
-            Self::DenseF32 | Self::DenseF16 => 1,
+            Self::DenseF32 | Self::DenseF16 | Self::DenseBF16 => 1,
             Self::Q8_0 => 32,
-            Self::Q4K | Self::Q6K => 256,
+            Self::Q4K | Self::Q5K | Self::Q6K => 256,
             Self::Q1_0 | Self::Q2_0G128 => 128,
             Self::Q2_0G64 => 64,
         }
@@ -20776,9 +21032,10 @@ impl ResidentWeightFormat {
     fn wire_bytes_per_block(self) -> usize {
         match self {
             Self::DenseF32 => 4,
-            Self::DenseF16 => 2,
+            Self::DenseF16 | Self::DenseBF16 => 2,
             Self::Q8_0 => 34,
             Self::Q4K => 144,
+            Self::Q5K => 176,
             Self::Q6K => 210,
             Self::Q1_0 => 18,
             Self::Q2_0G64 => 18,
@@ -20807,7 +21064,9 @@ impl ResidentWeightFormat {
             // dense kernel consumes its canonical row-major GGUF bytes directly,
             // so the hybrid bridge can keep that head page-backed and resident.
             Self::DenseF16 | Self::Q1_0 | Self::Q2_0G64 | Self::Q2_0G128 => true,
-            Self::DenseF32 | Self::Q8_0 | Self::Q4K | Self::Q6K => false,
+            Self::DenseF32 | Self::DenseBF16 | Self::Q8_0 | Self::Q4K | Self::Q5K | Self::Q6K => {
+                false
+            }
         }
     }
 }
@@ -22231,12 +22490,16 @@ impl ResidentDecodeState {
                     let p = eg_scalar.contents() as *mut u8;
                     *(p as *mut u32) = match eb.format {
                         ResidentWeightFormat::Q8_0 => self.hidden / 32,
-                        ResidentWeightFormat::Q4K | ResidentWeightFormat::Q6K => self.hidden / 256,
+                        ResidentWeightFormat::Q4K
+                        | ResidentWeightFormat::Q5K
+                        | ResidentWeightFormat::Q6K => self.hidden / 256,
                         ResidentWeightFormat::Q1_0 | ResidentWeightFormat::Q2_0G128 => {
                             self.hidden / 128
                         }
                         ResidentWeightFormat::Q2_0G64 => self.hidden / 64,
-                        ResidentWeightFormat::DenseF32 | ResidentWeightFormat::DenseF16 => {
+                        ResidentWeightFormat::DenseF32
+                        | ResidentWeightFormat::DenseF16
+                        | ResidentWeightFormat::DenseBF16 => {
                             unreachable!("dense weights are not token embeddings")
                         }
                     } as u32;
@@ -22285,11 +22548,14 @@ impl ResidentDecodeState {
                 let gather_pipeline = match eb.format {
                     ResidentWeightFormat::Q8_0 => &k.embed_row_gather_q8_wire_pipeline,
                     ResidentWeightFormat::Q4K => &k.embed_row_gather_q4k_pipeline,
+                    ResidentWeightFormat::Q5K => &k.embed_row_gather_q5k_pipeline,
                     ResidentWeightFormat::Q6K => &k.embed_row_gather_q6k_pipeline,
                     ResidentWeightFormat::Q1_0 => &k.embed_row_gather_q1_0_pipeline,
                     ResidentWeightFormat::Q2_0G64 => &k.embed_row_gather_q2_0_g64_pipeline,
                     ResidentWeightFormat::Q2_0G128 => &k.embed_row_gather_q2_0_g128_pipeline,
-                    ResidentWeightFormat::DenseF32 | ResidentWeightFormat::DenseF16 => {
+                    ResidentWeightFormat::DenseF32
+                    | ResidentWeightFormat::DenseF16
+                    | ResidentWeightFormat::DenseBF16 => {
                         unreachable!("dense weights are not token embeddings")
                     }
                 };
@@ -22742,6 +23008,7 @@ impl ResidentDecodeState {
             match w.format {
                 ResidentWeightFormat::DenseF32
                 | ResidentWeightFormat::DenseF16
+                | ResidentWeightFormat::DenseBF16
                 | ResidentWeightFormat::Q8_0
                 | ResidentWeightFormat::Q1_0
                 | ResidentWeightFormat::Q2_0G64
@@ -22757,7 +23024,9 @@ impl ResidentDecodeState {
                     rows,
                     n_tokens,
                 ),
-                ResidentWeightFormat::Q4K | ResidentWeightFormat::Q6K => {
+                ResidentWeightFormat::Q4K
+                | ResidentWeightFormat::Q5K
+                | ResidentWeightFormat::Q6K => {
                     let (scales, quants) = kquant_scratch.entry(input_width).or_insert_with(|| {
                         let n_sb = input_width / 256;
                         (
@@ -27762,7 +28031,11 @@ mod tests {
                     }
                 }
 
-                for format in [ResidentWeightFormat::Q4K, ResidentWeightFormat::Q6K] {
+                for format in [
+                    ResidentWeightFormat::Q4K,
+                    ResidentWeightFormat::Q5K,
+                    ResidentWeightFormat::Q6K,
+                ] {
                     let wire_bytes = format.wire_bytes_per_block();
                     let mut wire = vec![0u8; rows * n_sb * wire_bytes];
                     for row in 0..rows {
@@ -27782,6 +28055,26 @@ mod tests {
                                         *byte = ((row * 43 + sb * 19 + i * 37 + 11) & 0xff) as u8;
                                     }
                                 }
+                                ResidentWeightFormat::Q5K => {
+                                    // 176B: d | dmin | scales[12] | qh[32] | qs[128].
+                                    // qh is deliberately dense (not all-zero and not
+                                    // all-ones) so every one of the 8 per-half bit
+                                    // positions is exercised — an all-zero qh would
+                                    // make this kernel indistinguishable from Q4_K.
+                                    let d = 0.011 + row as f32 * 0.0006 + sb as f32 * 0.0002;
+                                    let dm = 0.0035 + row as f32 * 0.00018;
+                                    block[0..2].copy_from_slice(&f32_to_f16_bits(d).to_le_bytes());
+                                    block[2..4].copy_from_slice(&f32_to_f16_bits(dm).to_le_bytes());
+                                    for (i, byte) in block[4..16].iter_mut().enumerate() {
+                                        *byte = ((row * 29 + sb * 23 + i * 19 + 5) & 0xff) as u8;
+                                    }
+                                    for (i, byte) in block[16..48].iter_mut().enumerate() {
+                                        *byte = ((row * 53 + sb * 31 + i * 17 + 13) & 0xff) as u8;
+                                    }
+                                    for (i, byte) in block[48..176].iter_mut().enumerate() {
+                                        *byte = ((row * 41 + sb * 23 + i * 29 + 9) & 0xff) as u8;
+                                    }
+                                }
                                 ResidentWeightFormat::Q6K => {
                                     for (i, byte) in block[..192].iter_mut().enumerate() {
                                         *byte = ((row * 47 + sb * 13 + i * 41 + 7) & 0xff) as u8;
@@ -27799,6 +28092,7 @@ mod tests {
                                 ResidentWeightFormat::Q8_0
                                 | ResidentWeightFormat::DenseF32
                                 | ResidentWeightFormat::DenseF16
+                                | ResidentWeightFormat::DenseBF16
                                 | ResidentWeightFormat::Q1_0
                                 | ResidentWeightFormat::Q2_0G64
                                 | ResidentWeightFormat::Q2_0G128 => unreachable!(),
@@ -27828,12 +28122,16 @@ mod tests {
                                 ResidentWeightFormat::Q4K => {
                                     crate::inference::q4_k_wire_row_dot(row_wire, &q8)
                                 }
+                                ResidentWeightFormat::Q5K => {
+                                    crate::inference::q5_k_wire_row_dot(row_wire, &q8)
+                                }
                                 ResidentWeightFormat::Q6K => {
                                     crate::inference::q6_k_wire_row_dot(row_wire, &q8)
                                 }
                                 ResidentWeightFormat::Q8_0
                                 | ResidentWeightFormat::DenseF32
                                 | ResidentWeightFormat::DenseF16
+                                | ResidentWeightFormat::DenseBF16
                                 | ResidentWeightFormat::Q1_0
                                 | ResidentWeightFormat::Q2_0G64
                                 | ResidentWeightFormat::Q2_0G128 => unreachable!(),
