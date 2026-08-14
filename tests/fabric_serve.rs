@@ -43,6 +43,9 @@ struct StubConfig {
     /// carries exactly this bearer token — the arrangement a node started with
     /// `CAMELID_API_KEY` actually presents to the proxy.
     required_key: Option<String>,
+    /// Hang up on `/v1/chat/completions` after reading the request instead of
+    /// answering it. The node has the request, so nothing may re-send it.
+    hangs_up_on_completion: bool,
     /// Server-sent events answered to a request carrying `"stream": true`,
     /// instead of one JSON body.
     stream_events: Vec<String>,
@@ -79,6 +82,7 @@ impl StubConfig {
             completion_status: 200,
             completion_delay: Duration::ZERO,
             required_key: None,
+            hangs_up_on_completion: false,
             stream_events: Vec::new(),
             stream_gap: Duration::ZERO,
             stream_truncated: false,
@@ -147,6 +151,15 @@ impl StubConfig {
             ..Self::ready(model, 0)
         }
     }
+
+    /// A node that takes the request and then dies without answering, which is
+    /// what a node crashing mid-generation leaves on the wire.
+    fn hanging_up_on_completion(model: &str) -> Self {
+        Self {
+            hangs_up_on_completion: true,
+            ..Self::ready(model, 0)
+        }
+    }
 }
 
 /// A stand-in Camelid node on loopback, identical in shape to the one in
@@ -202,15 +215,23 @@ impl StubNode {
     fn received(&self) -> Vec<Received> {
         self.requests.lock().expect("stub lock").clone()
     }
-}
 
-impl Drop for StubNode {
-    fn drop(&mut self) {
+    /// Stop accepting, releasing the port so it refuses connections the way a
+    /// machine that has gone does. What it already recorded stays readable.
+    fn stop_listening(&mut self) {
         self.shutdown.store(true, Ordering::SeqCst);
+        // Unblocks the accept loop so it observes the flag and drops the
+        // listener; the connection itself is never served.
         let _ = TcpStream::connect(("127.0.0.1", self.port));
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+    }
+}
+
+impl Drop for StubNode {
+    fn drop(&mut self) {
+        self.stop_listening();
     }
 }
 
@@ -237,6 +258,13 @@ fn serve_once(stream: &mut TcpStream, config: &StubConfig, requests: &Mutex<Vec<
     if authorized && asked_to_stream && !config.stream_events.is_empty() {
         requests.lock().expect("stub lock").push(received);
         serve_event_stream(stream, config);
+        return;
+    }
+
+    if authorized && config.hangs_up_on_completion && received.path == "/v1/chat/completions" {
+        // Recorded first: the point of this stub is that the node did get the
+        // request, whatever the caller ends up seeing.
+        requests.lock().expect("stub lock").push(received);
         return;
     }
 
@@ -1367,4 +1395,279 @@ async fn a_model_loaded_since_the_observation_is_not_refused_as_permanently_abse
         "a permanent refusal was settled from a stale observation: {body}"
     );
     assert_eq!(status, 200, "{body}");
+}
+
+// ---------------------------------------------------------------------------
+// Failing over to another node
+//
+// A node can go between being observed and being sent to. Placement then names
+// a machine that is not there, and without failover the request dies against it
+// even when a sibling is serving the same model. These tests are built on a
+// reused observation because that is the arrangement `fabric serve` runs in,
+// and the window where the fabric's view can be wrong by construction.
+// ---------------------------------------------------------------------------
+
+/// A fabric as `fabric serve` builds one, with an explicit attempt budget so a
+/// test can turn failover off without changing anything else.
+fn fabric_with_attempts(specs: Vec<NodeSpec>, attempts: usize) -> Fabric {
+    fabric_reusing_observations(specs, Duration::from_secs(30)).with_max_forward_attempts(attempts)
+}
+
+/// Two nodes, both serving the model, and a proxy holding one observation of
+/// them. `node-a` wins the label tie-break, so it is where the next request
+/// goes; stopping it is what makes that observation wrong.
+async fn two_nodes_one_of_which_will_vanish(
+    attempts: usize,
+) -> (StubNode, StubNode, SocketAddr, Value) {
+    let a = StubNode::start(StubConfig::ready("shared-model", 0));
+    let b = StubNode::start(StubConfig::ready("shared-model", 0));
+    let specs = vec![a.spec("node-a"), b.spec("node-b")];
+    let addr = start_proxy(fabric_with_attempts(specs, attempts), RouteMode::Throughput).await;
+    let body = serde_json::json!({ "model": "shared-model" });
+
+    let (status, _, headers) = post_chat(addr, &body, &[]).await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        header(&headers, "x-camelid-fabric-node"),
+        Some("node-a"),
+        "the tie-break must settle on node-a, or stopping it proves nothing"
+    );
+    (a, b, addr, body)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_vanished_node_does_not_fail_a_request_another_node_can_serve() {
+    let (mut a, _b, addr, body) = two_nodes_one_of_which_will_vanish(2).await;
+    let before = completions_served(std::slice::from_ref(&a))[0];
+    a.stop_listening();
+
+    let (status, answer, headers) = post_chat(addr, &body, &[]).await;
+    assert_eq!(status, 200, "a sibling serves the same model: {answer}");
+    assert_eq!(
+        header(&headers, "x-camelid-fabric-node"),
+        Some("node-b"),
+        "the answer must come from the node that is still there"
+    );
+    assert_eq!(
+        header(&headers, "x-camelid-fabric-attempts"),
+        Some("2"),
+        "a failover must be visible to the client that was served by one"
+    );
+    assert_eq!(
+        completions_served(std::slice::from_ref(&a))[0],
+        before,
+        "the vanished node must not have been sent the request twice"
+    );
+}
+
+/// The ablation, run as a test: the same fabric with the budget at one is the
+/// behaviour this change replaces, and it fails the request.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_budget_of_one_fails_the_request_the_way_it_did_before() {
+    let (mut a, b, addr, body) = two_nodes_one_of_which_will_vanish(1).await;
+    a.stop_listening();
+
+    let (status, refusal, _) = post_chat(addr, &body, &[]).await;
+    assert_eq!(status, 502, "{refusal}");
+    assert_eq!(
+        completions_served(std::slice::from_ref(&b))[0],
+        0,
+        "with failover off the sibling must never be asked"
+    );
+}
+
+/// The line the whole design rests on. This node reads the request and then
+/// hangs up, so it may already be generating; that is a different failure from
+/// never having been reached, and it must not be sent anywhere else.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_that_took_the_request_is_not_asked_to_run_it_again_elsewhere() {
+    let a = StubNode::start(StubConfig::hanging_up_on_completion("shared-model"));
+    let b = StubNode::start(StubConfig::ready("shared-model", 0));
+    let specs = vec![a.spec("node-a"), b.spec("node-b")];
+    let addr = start_proxy(fabric_with_attempts(specs, 2), RouteMode::Throughput).await;
+
+    let (status, refusal, headers) =
+        post_chat(addr, &serde_json::json!({ "model": "shared-model" }), &[]).await;
+
+    assert_eq!(status, 502, "{refusal}");
+    assert_eq!(header(&headers, "x-camelid-fabric-node"), None);
+    assert_eq!(
+        completions_served(std::slice::from_ref(&a))[0],
+        1,
+        "the node did receive the request, which is why it may not be re-sent"
+    );
+    assert_eq!(
+        completions_served(std::slice::from_ref(&b))[0],
+        0,
+        "a request that may already be running was sent to a second node"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn failover_stops_at_the_attempt_budget_rather_than_walking_the_fabric() {
+    let labels = ["node-a", "node-b", "node-c"];
+    let mut nodes: Vec<StubNode> = labels
+        .iter()
+        .map(|_| StubNode::start(StubConfig::ready("shared-model", 0)))
+        .collect();
+    let specs: Vec<NodeSpec> = nodes
+        .iter()
+        .enumerate()
+        .map(|(index, node)| node.spec(labels[index]))
+        .collect();
+
+    // Both proxies take their observation while all three nodes are up, so the
+    // only difference between them is the budget.
+    let bounded = start_proxy(
+        fabric_with_attempts(specs.clone(), 2),
+        RouteMode::Throughput,
+    )
+    .await;
+    let generous = start_proxy(fabric_with_attempts(specs, 3), RouteMode::Throughput).await;
+    let body = serde_json::json!({ "model": "shared-model" });
+    for proxy in [bounded, generous] {
+        let (status, _, headers) = post_chat(proxy, &body, &[]).await;
+        assert_eq!(status, 200);
+        assert_eq!(header(&headers, "x-camelid-fabric-node"), Some("node-a"));
+    }
+
+    // Two of the three go, leaving a node that only a third attempt reaches.
+    nodes[0].stop_listening();
+    nodes[1].stop_listening();
+    let served_by_c = completions_served(&nodes[2..])[0];
+
+    let (status, refusal, _) = post_chat(bounded, &body, &[]).await;
+    assert_eq!(
+        status, 502,
+        "two attempts must not silently become three: {refusal}"
+    );
+    assert_eq!(
+        completions_served(&nodes[2..])[0],
+        served_by_c,
+        "the third node is beyond the budget and must not have been asked"
+    );
+
+    // The positive control: the same situation with room for a third attempt
+    // does reach it, so the refusal above is the budget and not the exclusion.
+    let (status, answer, headers) = post_chat(generous, &body, &[]).await;
+    assert_eq!(status, 200, "{answer}");
+    assert_eq!(header(&headers, "x-camelid-fabric-node"), Some("node-c"));
+    assert_eq!(header(&headers, "x-camelid-fabric-attempts"), Some("3"));
+}
+
+/// A failover proves the observation is wrong, so it must not survive the
+/// request that discovered it — even though that request succeeded. Otherwise
+/// every request in the rest of the window pays the same dial to the same
+/// absent node before being served.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_served_failover_still_drops_the_observation_that_named_the_vanished_node() {
+    let (mut a, b, addr, body) = two_nodes_one_of_which_will_vanish(2).await;
+    a.stop_listening();
+
+    let (status, _, headers) = post_chat(addr, &body, &[]).await;
+    assert_eq!(status, 200);
+    assert_eq!(header(&headers, "x-camelid-fabric-attempts"), Some("2"));
+
+    let probes_before = completions_served(std::slice::from_ref(&b))[0];
+    let (status, _, headers) = post_chat(addr, &body, &[]).await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        header(&headers, "x-camelid-fabric-attempts"),
+        Some("1"),
+        "the next request must be placed from a fresh observation, which no \
+         longer names the node that is gone"
+    );
+    assert_eq!(
+        header(&headers, "x-camelid-fabric-node"),
+        Some("node-b"),
+        "and it must go straight to the node that is there"
+    );
+    assert_eq!(
+        completions_served(std::slice::from_ref(&b))[0],
+        probes_before + 1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_vanished_node_does_not_fail_a_streaming_request() {
+    let events = ["data: one\n\n", "data: [DONE]\n\n"];
+    let mut a = StubNode::start(StubConfig::streaming(
+        "shared-model",
+        &events,
+        Duration::ZERO,
+    ));
+    let b = StubNode::start(StubConfig::streaming(
+        "shared-model",
+        &events,
+        Duration::ZERO,
+    ));
+    let specs = vec![a.spec("node-a"), b.spec("node-b")];
+    let addr = start_proxy(fabric_with_attempts(specs, 2), RouteMode::Throughput).await;
+    let body = serde_json::json!({ "model": "shared-model", "stream": true });
+
+    let (status, headers, _) = post_chat_streaming(addr, &body).await;
+    assert_eq!(status, 200);
+    assert_eq!(header(&headers, "x-camelid-fabric-node"), Some("node-a"));
+
+    a.stop_listening();
+
+    let (status, headers, pieces) = post_chat_streaming(addr, &body).await;
+    assert_eq!(status, 200, "the sibling can still stream");
+    assert_eq!(header(&headers, "x-camelid-fabric-node"), Some("node-b"));
+    assert_eq!(header(&headers, "x-camelid-fabric-attempts"), Some("2"));
+    let framed: String = pieces.iter().map(|piece| piece.text.as_str()).collect();
+    assert_eq!(
+        dechunk(&framed),
+        events.concat(),
+        "the failover must relay the sibling's stream verbatim"
+    );
+}
+
+/// The streaming half of the safety rule. Once the head is relayed the client
+/// has been committed to one node's answer, so a node that dies part-way
+/// through must end that stream rather than start a second one somewhere else.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_dying_mid_stream_is_not_replayed_on_another_node() {
+    // Two events with a gap, exactly as `a_node_dying_mid_stream_is_not_relayed
+    // _as_a_completed_one` uses: it is what makes the proxy flush the head and
+    // the first event before the node dies, so the client really is committed
+    // to node-a's answer by the time it fails.
+    let gap = Duration::from_millis(150);
+    let a = StubNode::start(StubConfig::dying_mid_stream(
+        "shared-model",
+        &["data: one\n\n", "data: two\n\n"],
+        gap,
+    ));
+    let b = StubNode::start(StubConfig::streaming(
+        "shared-model",
+        &["data: elsewhere\n\n"],
+        gap,
+    ));
+    let specs = vec![a.spec("node-a"), b.spec("node-b")];
+    let addr = start_proxy(fabric_with_attempts(specs, 2), RouteMode::Throughput).await;
+
+    let (status, headers, pieces) = post_chat_streaming(
+        addr,
+        &serde_json::json!({ "model": "shared-model", "stream": true }),
+    )
+    .await;
+
+    assert_eq!(status, 200, "the head arrived before the node died");
+    assert_eq!(header(&headers, "x-camelid-fabric-node"), Some("node-a"));
+    assert_eq!(header(&headers, "x-camelid-fabric-attempts"), Some("1"));
+    let framed: String = pieces.iter().map(|piece| piece.text.as_str()).collect();
+    assert!(
+        dechunk(&framed).starts_with("data: one\n\n"),
+        "what the node did produce must still arrive: {framed:?}"
+    );
+    assert!(
+        !framed.ends_with("0\r\n\r\n"),
+        "a truncated stream must not be framed as complete: {framed:?}"
+    );
+    assert_eq!(
+        completions_served(std::slice::from_ref(&b))[0],
+        0,
+        "the request was replayed on a second node after the client had already \
+         been given part of the first node's answer"
+    );
 }

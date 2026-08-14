@@ -35,7 +35,12 @@
 //!   and nothing here revokes or rotates it while the proxy is running.
 //! * A node that becomes ready, or loads a different model, is routed to only
 //!   once the current observation expires. A node that *stops* answering is not
-//!   waited on: the failed forward drops the observation immediately.
+//!   waited on: the request that finds it gone is placed on another node
+//!   serving the same model, and the observation that named it is dropped.
+//!   That second placement only happens when the first node was never reached;
+//!   a node that took the request and then failed ends it, because this proxy
+//!   cannot know whether it started generating. See
+//!   [`super::DEFAULT_MAX_FORWARD_ATTEMPTS`].
 //! * A non-streaming dispatch runs on a blocking thread and blocking socket I/O
 //!   is not cancellable, so a client that hangs up leaves its dispatch running
 //!   until the node answers or `forward_timeout` expires. A streaming dispatch
@@ -309,10 +314,15 @@ async fn buffered_completion(state: ServerState, body: Value, request: OwnedRequ
     .await;
 
     match outcome {
-        Ok(Ok((decision, answer))) => {
-            let status = StatusCode::from_u16(answer.status).unwrap_or(StatusCode::BAD_GATEWAY);
-            let mut response = (status, Json(answer.body)).into_response();
-            tag(response.headers_mut(), &decision);
+        Ok(Ok(dispatched)) => {
+            let status =
+                StatusCode::from_u16(dispatched.answer.status).unwrap_or(StatusCode::BAD_GATEWAY);
+            let mut response = (status, Json(dispatched.answer.body)).into_response();
+            tag(
+                response.headers_mut(),
+                &dispatched.decision,
+                dispatched.attempts,
+            );
             response
         }
         Ok(Err(DispatchError::Route(error))) => route_error(error),
@@ -331,12 +341,14 @@ async fn buffered_completion(state: ServerState, body: Value, request: OwnedRequ
 enum StreamStart {
     Streaming {
         decision: RouteDecision,
+        attempts: usize,
         status: u16,
         content_type: Option<String>,
     },
     /// The node answered outright instead of streaming.
     Buffered {
         decision: RouteDecision,
+        attempts: usize,
         answer: fabric::Forwarded,
     },
     Failed(DispatchError),
@@ -372,25 +384,33 @@ async fn stream_completion(state: ServerState, body: Value, request: OwnedReques
                 let _ = start_tx.send(StreamStart::Failed(error));
                 return;
             }
-            Ok((StreamOutcome::Buffered(answer), placement)) => {
-                let _ = start_tx.send(StreamStart::Buffered {
-                    decision: placement.decision().clone(),
-                    answer,
-                });
-                return;
-            }
-            Ok((StreamOutcome::Streaming(streaming), placement)) => {
-                let start = StreamStart::Streaming {
-                    decision: placement.decision().clone(),
-                    status: streaming.status,
-                    content_type: streaming.content_type.clone(),
-                };
-                if start_tx.send(start).is_err() {
-                    return;
+            Ok(dispatched) => {
+                let decision = dispatched.placement.decision().clone();
+                let attempts = dispatched.attempts;
+                match dispatched.outcome {
+                    StreamOutcome::Buffered(answer) => {
+                        let _ = start_tx.send(StreamStart::Buffered {
+                            decision,
+                            attempts,
+                            answer,
+                        });
+                        return;
+                    }
+                    StreamOutcome::Streaming(streaming) => {
+                        let start = StreamStart::Streaming {
+                            decision,
+                            attempts,
+                            status: streaming.status,
+                            content_type: streaming.content_type.clone(),
+                        };
+                        if start_tx.send(start).is_err() {
+                            return;
+                        }
+                        // Bound alongside the stream so the node stays reserved
+                        // until the last event is read — however this loop ends.
+                        (streaming, dispatched.placement)
+                    }
                 }
-                // Bound alongside the stream so the node stays reserved until
-                // the last event is read — however this loop ends.
-                (streaming, placement)
             }
         };
 
@@ -423,20 +443,25 @@ async fn stream_completion(state: ServerState, body: Value, request: OwnedReques
         }
     };
 
-    let (decision, status, content_type) = match start {
+    let (decision, attempts, status, content_type) = match start {
         StreamStart::Failed(DispatchError::Route(error)) => return route_error(error),
         StreamStart::Failed(DispatchError::Forward(error)) => return forward_error(error),
-        StreamStart::Buffered { decision, answer } => {
+        StreamStart::Buffered {
+            decision,
+            attempts,
+            answer,
+        } => {
             let status = StatusCode::from_u16(answer.status).unwrap_or(StatusCode::BAD_GATEWAY);
             let mut response = (status, Json(answer.body)).into_response();
-            tag(response.headers_mut(), &decision);
+            tag(response.headers_mut(), &decision, attempts);
             return response;
         }
         StreamStart::Streaming {
             decision,
+            attempts,
             status,
             content_type,
-        } => (decision, status, content_type),
+        } => (decision, attempts, status, content_type),
     };
 
     let stream = async_stream::stream! {
@@ -456,14 +481,17 @@ async fn stream_completion(state: ServerState, body: Value, request: OwnedReques
         insert(out, CONTENT_TYPE, content_type);
     }
     insert(out, CACHE_CONTROL, "no-cache");
-    tag(out, &decision);
+    tag(out, &decision, attempts);
     response
 }
 
 /// Record which node served a request and why, on any answer shape.
-fn tag(headers: &mut HeaderMap, decision: &RouteDecision) {
+fn tag(headers: &mut HeaderMap, decision: &RouteDecision, attempts: usize) {
     insert(headers, "x-camelid-fabric-node", &decision.label);
     insert(headers, "x-camelid-fabric-reason", decision.reason.as_str());
+    // Always sent, so a client reads a failover off the header rather than
+    // inferring one from a header that is only there sometimes.
+    insert(headers, "x-camelid-fabric-attempts", &attempts.to_string());
     if let Some(previous) = &decision.affinity_lost {
         insert(headers, "x-camelid-fabric-affinity-lost", previous);
     }
@@ -530,7 +558,9 @@ fn forward_error(error: ForwardError) -> Response {
     // caller's mistake, not the upstream's, so it is a 400 not a 502/503.
     let status = match &error {
         ForwardError::Unsupported(_) => StatusCode::BAD_REQUEST,
-        ForwardError::Transport { .. } | ForwardError::Json { .. } => StatusCode::BAD_GATEWAY,
+        ForwardError::Unreachable { .. }
+        | ForwardError::Transport { .. }
+        | ForwardError::Json { .. } => StatusCode::BAD_GATEWAY,
     };
     error_response(status, &error.to_string())
 }

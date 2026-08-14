@@ -438,7 +438,7 @@ fn dispatch_places_and_sends_in_one_call() {
     let beta = StubNode::start(StubConfig::ready("model-beta", 0));
     let fabric = fabric_of(vec![alpha.spec("alpha"), beta.spec("beta")]);
 
-    let (decision, answer) = fabric
+    let dispatched = fabric
         .dispatch(
             "/v1/chat/completions",
             &forward::chat_request("model-beta", "ping", 8),
@@ -447,10 +447,14 @@ fn dispatch_places_and_sends_in_one_call() {
         )
         .expect("beta serves model-beta");
 
-    assert_eq!(decision.label, "beta");
-    assert_eq!(answer.label, "beta");
+    assert_eq!(dispatched.decision.label, "beta");
+    assert_eq!(dispatched.answer.label, "beta");
     assert_eq!(
-        forward::completion_text(&answer.body),
+        dispatched.attempts, 1,
+        "a node that answers first time is one attempt"
+    );
+    assert_eq!(
+        forward::completion_text(&dispatched.answer.body),
         Some("served by model-beta")
     );
     // The request must not have touched the node that does not hold the model.
@@ -487,7 +491,7 @@ fn a_fabric_carrying_the_key_is_served_by_an_authenticated_node() {
     let alpha = StubNode::start(StubConfig::requiring_key("model-alpha", "s3cret"));
     let fabric = fabric_of(vec![alpha.spec("alpha")]).with_bearer(Some("s3cret"));
 
-    let (decision, answer) = fabric
+    let dispatched = fabric
         .dispatch(
             "/v1/chat/completions",
             &forward::chat_request("model-alpha", "ping", 8),
@@ -496,10 +500,10 @@ fn a_fabric_carrying_the_key_is_served_by_an_authenticated_node() {
         )
         .expect("the node accepts our key");
 
-    assert_eq!(decision.label, "alpha");
-    assert_eq!(answer.status, 200);
+    assert_eq!(dispatched.decision.label, "alpha");
+    assert_eq!(dispatched.answer.status, 200);
     assert_eq!(
-        forward::completion_text(&answer.body),
+        forward::completion_text(&dispatched.answer.body),
         Some("served by model-alpha")
     );
 
@@ -556,6 +560,7 @@ fn a_missing_or_wrong_key_arrives_as_a_401_answer_not_a_transport_failure() {
                 &RouteRequest::new(RouteMode::Throughput),
                 FORWARD_TIMEOUT,
             )
+            .map(|dispatched| (dispatched.decision, dispatched.answer))
             .expect("a 401 is the node's answer, not a forwarding failure");
 
         assert_eq!(answer.status, 401);

@@ -34,6 +34,25 @@ pub(crate) enum HttpError {
     InvalidRequest(String),
 }
 
+impl HttpError {
+    /// Whether the peer provably never received any part of the request.
+    ///
+    /// Only resolution and dialling qualify. Every other variant is raised at or
+    /// after the first write, and `write_all` does not say how many bytes left
+    /// the socket, so the request may already be running on the peer. Answering
+    /// "it may have arrived" whenever that is possible is what lets a caller
+    /// re-send elsewhere without risking a second execution.
+    ///
+    /// [`HttpError::InvalidRequest`] is deliberately excluded: nothing was sent,
+    /// but the request is malformed, so another peer would refuse it identically.
+    pub(crate) fn peer_never_received_it(&self) -> bool {
+        match self {
+            Self::Resolve(_) | Self::Connect(_) => true,
+            Self::Io(_) | Self::Malformed(_) | Self::TooLarge(_) | Self::InvalidRequest(_) => false,
+        }
+    }
+}
+
 impl std::fmt::Display for HttpError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -728,6 +747,36 @@ mod tests {
         let error = connect_any(&[dead, dead], Instant::now() + Duration::from_secs(1))
             .expect_err("nothing is listening");
         assert!(matches!(error, HttpError::Connect(_)), "{error:?}");
+    }
+
+    #[test]
+    fn only_a_failure_before_the_first_write_counts_as_never_received() {
+        // Exhaustive on purpose: a new variant must be classified deliberately,
+        // because answering "never received" wrongly permits a second execution.
+        for error in [
+            HttpError::Resolve("no such host".to_string()),
+            HttpError::Connect("refused".to_string()),
+        ] {
+            assert!(error.peer_never_received_it(), "{error:?}");
+        }
+        for error in [
+            HttpError::Io("reset".to_string()),
+            HttpError::Malformed("truncated".to_string()),
+            HttpError::TooLarge(1),
+            HttpError::InvalidRequest("bad token".to_string()),
+        ] {
+            assert!(!error.peer_never_received_it(), "{error:?}");
+        }
+    }
+
+    #[test]
+    fn a_dial_failure_from_a_real_socket_is_classified_as_never_received() {
+        // Not a hand-built variant: this is the error the dialling path actually
+        // produces against a closed port, which is the case failover turns on.
+        let dead = SocketAddr::from(([127, 0, 0, 1], 1));
+        let error = connect_any(&[dead], Instant::now() + Duration::from_secs(1))
+            .expect_err("nothing is listening");
+        assert!(error.peer_never_received_it(), "{error:?}");
     }
 
     #[test]

@@ -46,6 +46,14 @@ pub use policy::{
 };
 pub use probe::{probe_fabric, probe_node, Observation, ProbeError, DEFAULT_PROBE_TIMEOUT};
 
+/// How many nodes one request may be sent to before it fails.
+///
+/// Two means one retry. A request that finds its node gone is still served, and
+/// a fabric where several nodes have gone still fails after a bounded number of
+/// dials rather than walking every node it has. Raise it for a large fabric
+/// where more of that walk is worth paying for; one turns failover off.
+pub const DEFAULT_MAX_FORWARD_ATTEMPTS: usize = 2;
+
 /// A configured set of nodes.
 #[derive(Clone)]
 pub struct Fabric {
@@ -65,6 +73,8 @@ pub struct Fabric {
     observed: Arc<Mutex<Option<Observation>>>,
     /// How stale a reused observation may be. Zero means never reuse one.
     max_observation_age: Duration,
+    /// How many nodes one request may be sent to. One never fails over.
+    max_forward_attempts: usize,
 }
 
 /// Hand-written so a token can never reach a log through a derived `Debug`,
@@ -76,6 +86,7 @@ impl std::fmt::Debug for Fabric {
             .field("timeout", &self.timeout)
             .field("bearer", &self.bearer.as_ref().map(|_| "[REDACTED]"))
             .field("max_observation_age", &self.max_observation_age)
+            .field("max_forward_attempts", &self.max_forward_attempts)
             .finish()
     }
 }
@@ -89,6 +100,7 @@ impl Fabric {
             reserved: Arc::new(Mutex::new(Reservations::none())),
             observed: Arc::new(Mutex::new(None)),
             max_observation_age: Duration::ZERO,
+            max_forward_attempts: DEFAULT_MAX_FORWARD_ATTEMPTS,
         }
     }
 
@@ -105,6 +117,16 @@ impl Fabric {
     /// node on every request. See [`Observation`].
     pub fn with_max_observation_age(mut self, max_age: Duration) -> Self {
         self.max_observation_age = max_age;
+        self
+    }
+
+    /// How many nodes one request may be sent to before it fails.
+    ///
+    /// See [`DEFAULT_MAX_FORWARD_ATTEMPTS`]. One disables failover entirely and
+    /// is the exact behaviour of a fabric that has never heard of it. Zero is
+    /// meaningless — a request must be sent somewhere — and is read as one.
+    pub fn with_max_forward_attempts(mut self, attempts: usize) -> Self {
+        self.max_forward_attempts = attempts.max(1);
         self
     }
 
@@ -177,7 +199,10 @@ impl Fabric {
     /// window costs the one request that discovers it, not every request until
     /// the observation expires.
     fn forget_observation_if_node_vanished(&self, error: &ForwardError) {
-        if matches!(error, ForwardError::Transport { .. }) {
+        if matches!(
+            error,
+            ForwardError::Transport { .. } | ForwardError::Unreachable { .. }
+        ) {
             self.forget_observation();
         }
     }
@@ -187,22 +212,40 @@ impl Fabric {
     /// The returned [`Placement`] counts the request against the chosen node
     /// until it is dropped, so a placement running concurrently can see it.
     pub fn place(&self, request: &RouteRequest<'_>) -> Result<Placement, RouteError> {
+        self.place_excluding(request, &[])
+    }
+
+    /// Choose a node for a request, ignoring nodes already found gone.
+    ///
+    /// `excluded` holds labels this request has already been sent to and could
+    /// not reach. They are dropped from the observation rather than from the
+    /// policy, so placement stays the one pure decision it was.
+    fn place_excluding(
+        &self,
+        request: &RouteRequest<'_>,
+        excluded: &[String],
+    ) -> Result<Placement, RouteError> {
         // Observing is socket I/O against every node. It stays outside the
         // reservation lock: holding that across it would serialise placement on
         // the slowest node, and would deadlock a `Placement` being dropped.
         let (snapshots, reused) = self.observe_reporting_reuse();
 
-        match self.place_observed(snapshots, request) {
+        match self.place_observed(snapshots, request, excluded) {
             // Refusing on a reused observation would settle from memory a
             // question the caller asked about now — and the proxy reports
             // `ModelUnavailable` as a 404 a client is told never to retry. A
             // node that has loaded a model since must not be refused that way,
             // so look again before saying no. This costs a probe only on a
             // request that was about to fail.
-            Err(_) if reused => {
+            //
+            // Not once anything is excluded: by then the caller already holds a
+            // forwarding failure, and that failure — not this refusal — is what
+            // it will report, so a fresh look would buy nothing and would pay a
+            // whole probe round against a node just found to be gone.
+            Err(_) if reused && excluded.is_empty() => {
                 self.forget_observation();
                 let (fresh, _) = self.observe_reporting_reuse();
-                self.place_observed(fresh, request)
+                self.place_observed(fresh, request, excluded)
             }
             settled => settled,
         }
@@ -213,7 +256,13 @@ impl Fabric {
         &self,
         snapshots: Vec<NodeSnapshot>,
         request: &RouteRequest<'_>,
+        excluded: &[String],
     ) -> Result<Placement, RouteError> {
+        let snapshots: Vec<NodeSnapshot> = snapshots
+            .into_iter()
+            .filter(|snapshot| !excluded.iter().any(|label| label == snapshot.label()))
+            .collect();
+
         // Deciding and recording are one step. Split them and two concurrent
         // placements both decide before either records, which is the pile-up
         // this reservation exists to prevent.
@@ -242,28 +291,27 @@ impl Fabric {
     /// Observe, place, and send — the whole path a caller actually wants.
     ///
     /// Returns the placement alongside the answer so a caller can record which
-    /// node served the request and whether affinity held.
+    /// node served the request and whether affinity held. A node that turns out
+    /// to be gone does not fail the request while another can serve it; see
+    /// [`DEFAULT_MAX_FORWARD_ATTEMPTS`].
     pub fn dispatch(
         &self,
         path: &str,
         body: &Value,
         request: &RouteRequest<'_>,
         forward_timeout: Duration,
-    ) -> Result<(RouteDecision, Forwarded), DispatchError> {
+    ) -> Result<Dispatched, DispatchError> {
         // Refuse an unsupported request before spending any probes on it.
         forward::reject_streaming(body)?;
 
-        // Held until this function returns, which is when the request is over.
-        let placement = self.place(request)?;
-        let answer = forward::forward(
-            &placement.node.spec,
-            path,
-            body,
-            self.bearer.as_deref(),
-            forward_timeout,
-        )
-        .inspect_err(|error| self.forget_observation_if_node_vanished(error))?;
-        Ok((placement.decision.clone(), answer))
+        let sent = self.send_until_a_node_takes_it(request, |spec| {
+            forward::forward(spec, path, body, self.bearer.as_deref(), forward_timeout)
+        })?;
+        Ok(Dispatched {
+            decision: sent.placement.decision.clone(),
+            answer: sent.value,
+            attempts: sent.attempts,
+        })
     }
 
     /// Observe, place, and start a streaming request.
@@ -283,19 +331,134 @@ impl Fabric {
         request: &RouteRequest<'_>,
         head_timeout: Duration,
         idle_timeout: Duration,
-    ) -> Result<(StreamOutcome, Placement), DispatchError> {
-        let placement = self.place(request)?;
-        let outcome = forward::forward_streaming(
-            &placement.node.spec,
-            path,
-            body,
-            self.bearer.as_deref(),
-            head_timeout,
-            idle_timeout,
-        )
-        .inspect_err(|error| self.forget_observation_if_node_vanished(error))?;
-        Ok((outcome, placement))
+    ) -> Result<DispatchedStream, DispatchError> {
+        let sent = self.send_until_a_node_takes_it(request, |spec| {
+            forward::forward_streaming(
+                spec,
+                path,
+                body,
+                self.bearer.as_deref(),
+                head_timeout,
+                idle_timeout,
+            )
+        })?;
+        Ok(DispatchedStream {
+            outcome: sent.value,
+            placement: sent.placement,
+            attempts: sent.attempts,
+        })
     }
+
+    /// Place the request and send it, moving on while a node turns out to be
+    /// gone.
+    ///
+    /// `send` must not have told anyone anything on the strength of an attempt
+    /// it reports as failed: this calls it again against another node, which is
+    /// only safe while nothing has been said and — per
+    /// [`ForwardError::node_never_received_it`] — the failed node cannot have
+    /// started the work.
+    fn send_until_a_node_takes_it<T>(
+        &self,
+        request: &RouteRequest<'_>,
+        mut send: impl FnMut(&NodeSpec) -> Result<T, ForwardError>,
+    ) -> Result<Sent<T>, DispatchError> {
+        let mut gone: Vec<String> = Vec::new();
+        let mut first_failure: Option<ForwardError> = None;
+
+        for attempt in 1..=self.max_forward_attempts.max(1) {
+            let placement = match self.place_excluding(request, &gone) {
+                Ok(placement) => placement,
+                // Placement can only run out of nodes on a later attempt
+                // because this request excluded the ones it just found gone.
+                // That first failure is the story worth telling; a refusal
+                // derived from an exclusion this request invented is not.
+                Err(refusal) => {
+                    return Err(self.abandon(first_failure, DispatchError::Route(refusal)))
+                }
+            };
+
+            match send(&placement.node.spec) {
+                Ok(value) => {
+                    // A node this request could not reach was named by the
+                    // current observation, so that observation must not outlive
+                    // the request even though the request itself succeeded.
+                    if !gone.is_empty() {
+                        self.forget_observation();
+                    }
+                    return Ok(Sent {
+                        value,
+                        placement,
+                        attempts: attempt,
+                    });
+                }
+                Err(error) if error.node_never_received_it() => {
+                    gone.push(placement.decision.label.clone());
+                    first_failure.get_or_insert(error);
+                }
+                Err(error) => {
+                    return Err(self.abandon(first_failure, DispatchError::Forward(error)))
+                }
+            }
+        }
+
+        // The budget ran out with nodes possibly still untried. Say so with the
+        // failure that started it, not with a count.
+        let exhausted = first_failure.expect("the budget can only run out after a failure");
+        self.forget_observation();
+        Err(DispatchError::Forward(exhausted))
+    }
+
+    /// Settle on the failure to report once a request has run out of road.
+    ///
+    /// A request that reached this point after finding a node gone reports that
+    /// finding, and its observation is dropped whichever way it ended: the
+    /// observation named a node that is not there.
+    fn abandon(
+        &self,
+        first_failure: Option<ForwardError>,
+        otherwise: DispatchError,
+    ) -> DispatchError {
+        match first_failure {
+            Some(error) => {
+                self.forget_observation();
+                DispatchError::Forward(error)
+            }
+            None => {
+                if let DispatchError::Forward(error) = &otherwise {
+                    self.forget_observation_if_node_vanished(error);
+                }
+                otherwise
+            }
+        }
+    }
+}
+
+/// A request that a node took, and what it cost to get there.
+struct Sent<T> {
+    value: T,
+    placement: Placement,
+    attempts: usize,
+}
+
+/// A complete answer from the node that served the request.
+#[derive(Debug)]
+pub struct Dispatched {
+    pub decision: RouteDecision,
+    pub answer: Forwarded,
+    /// Nodes this request was sent to, the one that answered included. More
+    /// than one means a node was found gone and the request was placed again.
+    pub attempts: usize,
+}
+
+/// A streaming answer, still arriving from the node that took the request.
+#[derive(Debug)]
+pub struct DispatchedStream {
+    pub outcome: StreamOutcome,
+    /// Holds the node reserved; keep it until the last event is read.
+    pub placement: Placement,
+    /// As on [`Dispatched`]. Settled before the first byte is relayed, so it
+    /// can be reported in the response head.
+    pub attempts: usize,
 }
 
 /// A poisoned lock is not corrupted state: some other request panicked while
@@ -701,6 +864,55 @@ mod tests {
                 DispatchError::Route(RouteError::AllNodesUnavailable { .. })
             ),
             "got {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_request_is_never_placed_on_a_node_it_has_already_failed_against() {
+        let fabric = Fabric::new(Vec::new());
+        let snapshots = vec![
+            snapshot("a", ready_status("m")),
+            snapshot("b", ready_status("m")),
+        ];
+        let request = RouteRequest::new(RouteMode::Throughput);
+
+        // Ties break on label, so an unconstrained placement picks `a`; the
+        // exclusion is what moves it, not a difference between the nodes.
+        let first = fabric
+            .place_observed(snapshots.clone(), &request, &[])
+            .expect("a is eligible");
+        assert_eq!(first.decision().label, "a");
+        drop(first);
+
+        let second = fabric
+            .place_observed(snapshots, &request, &["a".to_string()])
+            .expect("b is still eligible");
+        assert_eq!(second.decision().label, "b");
+    }
+
+    #[test]
+    fn excluding_every_node_refuses_rather_than_placing_on_one_anyway() {
+        let fabric = Fabric::new(Vec::new());
+        let snapshots = vec![snapshot("a", ready_status("m"))];
+        let error = fabric
+            .place_observed(
+                snapshots,
+                &RouteRequest::new(RouteMode::Throughput),
+                &["a".to_string()],
+            )
+            .expect_err("nothing is left to place on");
+        assert_eq!(error, RouteError::NoNodesConfigured);
+    }
+
+    #[test]
+    fn a_request_must_always_be_sendable_somewhere() {
+        // Zero attempts would mean a request that is never sent at all, so the
+        // budget floor is part of the contract rather than a caller's problem.
+        let fabric = Fabric::new(Vec::new()).with_max_forward_attempts(0);
+        assert_eq!(fabric.max_forward_attempts, 1);
+        assert_eq!(
+            Fabric::new(Vec::new()).max_forward_attempts,
+            DEFAULT_MAX_FORWARD_ATTEMPTS
         );
     }
 }
