@@ -10,6 +10,14 @@
 //! `stream: true` the node's server-sent events are forwarded byte for byte, so
 //! an event field this proxy has never heard of reaches the client unaltered.
 //!
+//! # What it serves
+//!
+//! The engine's stateless inference routes ([`PLACED_ROUTES`]) plus discovery
+//! over the whole fabric. A route earns its place there by being answerable by
+//! any node serving the model the request names — which the Responses and
+//! Conversations APIs are not, so they are refused with a reason rather than
+//! placed. Anything else is a 404 that names what is served.
+//!
 //! Unlike the CLI, this process serves many requests, so it reuses a fabric
 //! observation for a bounded time instead of probing every node on every one.
 //! The bound is set by whoever builds the [`Fabric`]; see
@@ -68,16 +76,16 @@ use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{ConnectInfo, DefaultBodyLimit, Request, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Request, State};
 use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{any, get, post};
 use axum::{middleware, Json, Router};
 use serde_json::Value;
 
-use super::policy::{RouteDecision, RouteError, RouteMode, RouteRequest};
+use super::policy::{route, RouteDecision, RouteError, RouteMode, RouteRequest};
 use super::{self as fabric, DispatchError, Fabric, ForwardError, StreamOutcome};
 use crate::api::{ApiAuth, DEFAULT_MAX_REQUEST_BODY_BYTES};
 
@@ -89,6 +97,40 @@ const REQUEST_ID_HEADER: &str = "x-request-id";
 
 /// Longest inbound request id this proxy will adopt as its own.
 const MAX_REQUEST_ID_LEN: usize = 128;
+
+/// The engine routes this proxy places on a node.
+///
+/// Every one of them is a pure function of its own request body and the model
+/// that body names: nothing in the answer depends on which node produced it, so
+/// any node serving that model may. That is what makes placing them legitimate,
+/// and it is the property a route has to have to be added here.
+///
+/// This list is the single source of truth. The router is built from it, and so
+/// is the refusal a client gets for a route that is not on it, so the two cannot
+/// drift apart.
+const PLACED_ROUTES: [&str; 5] = [
+    "/v1/chat/completions",
+    "/v1/completions",
+    "/v1/embeddings",
+    "/v1/rerank",
+    "/v1/reranking",
+];
+
+/// Engine routes that answer from state held by one node.
+///
+/// The Responses and Conversations APIs keep their items in a SQLite store on
+/// the node that served the request. Placing them would appear to work and then
+/// lose a conversation the moment a follow-up landed on a different node, so
+/// they are refused here rather than half-supported. A client that needs them
+/// can talk to a node directly, where they work exactly as documented.
+const NODE_LOCAL_ROUTES: [&str; 6] = [
+    "/v1/responses",
+    "/v1/responses/:id",
+    "/v1/conversations",
+    "/v1/conversations/:id",
+    "/v1/conversations/:id/items",
+    "/v1/conversations/:id/items/:item_id",
+];
 
 /// The credential a client must present to this proxy.
 ///
@@ -169,10 +211,32 @@ struct ServerState {
 /// Build the router without binding a socket, so tests can drive it directly.
 pub fn router(fabric: Fabric, config: ServeConfig) -> Router {
     let auth = config.auth.inner.clone();
-    Router::new()
-        .route("/v1/chat/completions", post(chat_completions))
+
+    let placed = PLACED_ROUTES.iter().fold(Router::new(), |router, path| {
+        let path = *path;
+        router.route(
+            path,
+            post(
+                move |state: State<ServerState>,
+                      headers: HeaderMap,
+                      payload: std::result::Result<Json<Value>, JsonRejection>| async move {
+                    place_and_forward(state, path, headers, payload).await
+                },
+            ),
+        )
+    });
+    let refusals = NODE_LOCAL_ROUTES
+        .iter()
+        .fold(placed, |router, path| router.route(path, any(node_local)));
+
+    refusals
         .route("/v1/models", get(models))
+        .route("/v1/models/:model", get(model))
         .route("/v1/health", get(health))
+        // A client that reaches an address it was told is OpenAI-compatible has
+        // to be able to tell "wrong route" from "wrong model", and axum's own
+        // 404 carries no body at all.
+        .fallback(unknown_route)
         // Without this, axum's 2 MiB default would refuse conversations the
         // node behind the proxy accepts.
         .layer(DefaultBodyLimit::max(DEFAULT_MAX_REQUEST_BODY_BYTES))
@@ -582,21 +646,89 @@ async fn models(State(state): State<ServerState>) -> Response {
 
     let data: Vec<Value> = super::servable_models(&snapshots)
         .into_iter()
-        .map(|id| {
-            serde_json::json!({
-                "id": id,
-                "object": "model",
-                "created": 0,
-                "owned_by": "camelid",
-            })
-        })
+        .map(|id| model_object(&id))
         .collect();
 
     Json(serde_json::json!({ "object": "list", "data": data })).into_response()
 }
 
-async fn chat_completions(
+/// Answer for one model id, the way an SDK's `models.retrieve` asks.
+///
+/// The verdict comes from placement itself rather than from a second rule about
+/// what is servable: a model is retrievable here exactly when a request naming
+/// it would be placed. That also inherits the distinction placement already
+/// makes — a model no ready node serves is a settled 404, but only once every
+/// node has been consulted; while any is unaccounted for the refusal can still
+/// clear, so it stays a retryable 503.
+async fn model(Path(id): Path<String>, State(state): State<ServerState>) -> Response {
+    let fabric = Arc::clone(&state.fabric);
+    let snapshots = match tokio::task::spawn_blocking(move || fabric.observe()).await {
+        Ok(snapshots) => snapshots,
+        Err(join_error) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("could not observe the fabric: {join_error}"),
+            )
+        }
+    };
+
+    match route(
+        &snapshots,
+        &RouteRequest::new(RouteMode::Throughput).with_model(Some(&id)),
+    ) {
+        Ok(_) => Json(model_object(&id)).into_response(),
+        Err(error) => route_error(error),
+    }
+}
+
+/// One model, in the shape a node answers with. Pure.
+fn model_object(id: &str) -> Value {
+    serde_json::json!({
+        "id": id,
+        "object": "model",
+        "created": 0,
+        "owned_by": "camelid",
+    })
+}
+
+/// Refuse a route whose answer lives on one node.
+///
+/// A 501 rather than a 404: the route exists and a node implements it, so
+/// "not here" with the reason is more use to a client than "no such thing".
+async fn node_local() -> Response {
+    error_response(
+        StatusCode::NOT_IMPLEMENTED,
+        "the Responses and Conversations APIs keep their state on the node that served the \
+         request, so this proxy does not place them: a follow-up could land on another node and \
+         find nothing. Send these to a node directly. This proxy serves the stateless routes and \
+         model discovery",
+    )
+}
+
+/// Answer a route this proxy does not serve, naming the ones it does.
+async fn unknown_route() -> Response {
+    error_response(
+        StatusCode::NOT_FOUND,
+        &format!(
+            "this fabric proxy does not serve that route; it serves {}, and GET /v1/models, \
+             GET /v1/models/{{model}} and GET /v1/health",
+            PLACED_ROUTES
+                .iter()
+                .map(|path| format!("POST {path}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    )
+}
+
+/// Place one request on a node and relay its answer.
+///
+/// `path` is the matched route, not anything taken from the request line, so
+/// what reaches a node is one of [`PLACED_ROUTES`] and nothing a client can
+/// steer. The body is relayed unread beyond the two fields placement needs.
+async fn place_and_forward(
     State(state): State<ServerState>,
+    path: &'static str,
     headers: HeaderMap,
     payload: std::result::Result<Json<Value>, JsonRejection>,
 ) -> Response {
@@ -618,10 +750,13 @@ async fn chat_completions(
         .map(str::to_string);
     let request = OwnedRequest { model, sticky };
 
+    // Asked for by the request, not by the route: `stream: true` is meaningful
+    // on the generation routes and meaningless on the rest, and a node that has
+    // nothing to stream answers with a body, which the streaming path relays.
     if fabric::wants_streaming(&body) {
-        return stream_completion(state, body, request).await;
+        return stream_completion(state, path, body, request).await;
     }
-    buffered_completion(state, body, request).await
+    buffered_completion(state, path, body, request).await
 }
 
 /// The parts of a [`RouteRequest`] that outlive the borrow of the request body,
@@ -647,7 +782,12 @@ impl OwnedRequest {
     }
 }
 
-async fn buffered_completion(state: ServerState, body: Value, request: OwnedRequest) -> Response {
+async fn buffered_completion(
+    state: ServerState,
+    path: &'static str,
+    body: Value,
+    request: OwnedRequest,
+) -> Response {
     // Fabric::dispatch is synchronous socket I/O (probes every node, then
     // forwards) and can legitimately run for the whole forward_timeout — up to
     // minutes for a real generation. Running it directly on an async worker
@@ -656,7 +796,7 @@ async fn buffered_completion(state: ServerState, body: Value, request: OwnedRequ
     // tokio's much larger blocking pool instead.
     let outcome = tokio::task::spawn_blocking(move || {
         state.fabric.dispatch(
-            "/v1/chat/completions",
+            path,
             &body,
             &request.as_route(state.config.mode),
             state.config.forward_timeout,
@@ -712,7 +852,12 @@ enum StreamStart {
 /// generation in memory.
 const STREAM_CHANNEL_DEPTH: usize = 32;
 
-async fn stream_completion(state: ServerState, body: Value, request: OwnedRequest) -> Response {
+async fn stream_completion(
+    state: ServerState,
+    path: &'static str,
+    body: Value,
+    request: OwnedRequest,
+) -> Response {
     let (start_tx, start_rx) = tokio::sync::oneshot::channel::<StreamStart>();
     let (chunk_tx, mut chunk_rx) =
         tokio::sync::mpsc::channel::<Result<Vec<u8>, String>>(STREAM_CHANNEL_DEPTH);
@@ -723,7 +868,7 @@ async fn stream_completion(state: ServerState, body: Value, request: OwnedReques
     // there, and the socket to the node is dropped as soon as it is not.
     tokio::task::spawn_blocking(move || {
         let outcome = state.fabric.dispatch_streaming(
-            "/v1/chat/completions",
+            path,
             &body,
             &request.as_route(state.config.mode),
             state.config.forward_timeout,
@@ -1439,6 +1584,87 @@ mod tests {
         assert_eq!(body["service"], serde_json::json!("camelid-fabric"));
     }
 
+    /// The 404 is built from the route table, so this can only fail if the two
+    /// are ever allowed to drift — which is the whole reason the table exists.
+    #[tokio::test]
+    async fn an_unserved_route_names_every_route_that_is_served() {
+        let response = proxy(Fabric::new(Vec::new()))
+            .oneshot(get_request("/v1/no-such-thing"))
+            .await
+            .expect("router answers");
+        let (status, body) = read_json(response).await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"]["type"], "fabric_error");
+        let message = body["error"]["message"].as_str().expect("a message");
+        for path in PLACED_ROUTES {
+            assert!(
+                message.contains(path),
+                "`{path}` is missing from: {message}"
+            );
+        }
+        assert!(message.contains("/v1/models"), "{message}");
+        assert!(message.contains("/v1/health"), "{message}");
+    }
+
+    /// A route is either placed or refused as node-local, never both: the two
+    /// tables are what axum builds its router from, and registering one path
+    /// twice is a panic at startup rather than a test failure here.
+    #[test]
+    fn no_route_is_both_placed_and_node_local() {
+        for placed in PLACED_ROUTES {
+            assert!(
+                !NODE_LOCAL_ROUTES.contains(&placed),
+                "`{placed}` is in both tables"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_node_local_route_is_refused_with_its_reason_rather_than_placed() {
+        // An empty fabric: a placed route would refuse with a routing error, so
+        // a 501 here proves the refusal happens before any placement at all.
+        let response = proxy(Fabric::new(Vec::new()))
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/responses")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::new(
+                        serde_json::json!({ "model": "m" }).to_string(),
+                    ))
+                    .expect("valid request"),
+            )
+            .await
+            .expect("router answers");
+        let (status, body) = read_json(response).await;
+
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(body["error"]["type"], "fabric_error");
+        let message = body["error"]["message"].as_str().expect("a message");
+        assert!(
+            message.contains("state") && message.contains("node"),
+            "the refusal has to say why, not just no: {message}"
+        );
+    }
+
+    /// Every method, not just the one an SDK happens to use first: a GET of a
+    /// stored response is as node-local as the POST that created it.
+    #[tokio::test]
+    async fn a_node_local_route_is_refused_on_every_method() {
+        for uri in ["/v1/responses/resp_1", "/v1/conversations/conv_1/items"] {
+            let response = proxy(Fabric::new(Vec::new()))
+                .oneshot(get_request(uri))
+                .await
+                .expect("router answers");
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_IMPLEMENTED,
+                "GET {uri} should be refused as node-local"
+            );
+        }
+    }
+
     /// A client points at one address, so that address has to answer what it
     /// can serve. This used to 404, which left every model picker empty.
     #[tokio::test]
@@ -1477,6 +1703,72 @@ mod tests {
         assert_eq!(data[0]["id"], "llama-3b");
         assert_eq!(data[0]["object"], "model");
         assert_eq!(data[0]["owned_by"], "camelid");
+    }
+
+    /// `models.retrieve` on an SDK. The answer is the same object the list
+    /// carries, so a client that found a model in one can look it up in the
+    /// other and get something it recognises.
+    #[tokio::test]
+    async fn a_served_model_can_be_retrieved_on_its_own() {
+        let node = StubModelNode::start("llama-3b");
+        let fabric = Fabric::new(vec![node.spec("only")]).with_timeout(Duration::from_secs(2));
+        let response = proxy(fabric)
+            .oneshot(get_request("/v1/models/llama-3b"))
+            .await
+            .expect("router answers");
+        let (status, body) = read_json(response).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["id"], "llama-3b");
+        assert_eq!(body["object"], "model");
+        assert_eq!(body["owned_by"], "camelid");
+    }
+
+    /// Retrieval and placement must not be able to disagree: a model this
+    /// answers 200 for is one a request naming it would be placed on, because
+    /// both ask the same question of the same observation.
+    #[tokio::test]
+    async fn retrieving_an_unserved_model_refuses_exactly_as_placing_it_would() {
+        let node = StubModelNode::start("llama-3b");
+        let fabric = Fabric::new(vec![node.spec("only")]).with_timeout(Duration::from_secs(2));
+        let response = proxy(fabric)
+            .oneshot(get_request("/v1/models/no-such-model"))
+            .await
+            .expect("router answers");
+        let (status, body) = read_json(response).await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"]["code"], "model_not_found");
+        assert_eq!(body["error"]["param"], "model");
+        let message = body["error"]["message"].as_str().expect("a message");
+        assert!(message.contains("llama-3b"), "{message}");
+    }
+
+    /// And it inherits the other half of that distinction too: while a node is
+    /// unaccounted for, "not found" is not settled and must stay retryable.
+    #[tokio::test]
+    async fn retrieving_a_model_while_a_node_is_down_stays_retryable() {
+        let node = StubModelNode::start("llama-3b");
+        let fabric = Fabric::new(vec![
+            node.spec("up"),
+            // Port 1 is closed, so this node is observed as unreachable.
+            NodeSpec {
+                label: "down".to_string(),
+                host: "127.0.0.1".to_string(),
+                port: 1,
+            },
+        ])
+        .with_timeout(Duration::from_millis(500));
+        let response = proxy(fabric)
+            .oneshot(get_request("/v1/models/no-such-model"))
+            .await
+            .expect("router answers");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a node that could not be consulted may be the one that owns it"
+        );
     }
 
     /// A model this fabric does not serve will not appear by asking again, and
