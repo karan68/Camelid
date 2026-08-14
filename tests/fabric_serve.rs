@@ -1671,3 +1671,44 @@ async fn a_node_dying_mid_stream_is_not_replayed_on_another_node() {
          been given part of the first node's answer"
     );
 }
+
+/// Failing over past a gone node is a recovery, not the reason a request ends.
+/// When the node it moves on to fails it for real, that second failure is what
+/// the operator has to act on: reporting the first sends them to a node the
+/// fabric already routed around, and says nothing about the one that is
+/// actually broken.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_failure_that_ended_the_request_is_the_one_reported() {
+    let a = StubNode::start(StubConfig::ready("shared-model", 0));
+    // `node-b` is reachable and answers, but with a body that is not JSON, so
+    // it fails the request in a way failover must not move past.
+    let b = StubNode::start(StubConfig {
+        completion: "<html>gateway timeout</html>".to_string(),
+        ..StubConfig::ready("shared-model", 0)
+    });
+    let specs = vec![a.spec("node-a"), b.spec("node-b")];
+    let addr = start_proxy(fabric_with_attempts(specs, 2), RouteMode::Throughput).await;
+    let body = serde_json::json!({ "model": "shared-model" });
+
+    let (status, _, headers) = post_chat(addr, &body, &[]).await;
+    assert_eq!(status, 200);
+    assert_eq!(header(&headers, "x-camelid-fabric-node"), Some("node-a"));
+
+    let mut a = a;
+    a.stop_listening();
+
+    let (status, refusal, _) = post_chat(addr, &body, &[]).await;
+    assert_eq!(status, 502);
+    let message = refusal["error"]["message"]
+        .as_str()
+        .expect("a message an operator can act on");
+    assert!(
+        message.contains("node-b"),
+        "the node that actually failed the request must be named: {message}"
+    );
+    assert!(
+        !message.contains("node-a"),
+        "node-a was routed around successfully; naming it points at the wrong \
+         node: {message}"
+    );
+}

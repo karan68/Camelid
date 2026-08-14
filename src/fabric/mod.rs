@@ -368,13 +368,7 @@ impl Fabric {
         for attempt in 1..=self.max_forward_attempts.max(1) {
             let placement = match self.place_excluding(request, &gone) {
                 Ok(placement) => placement,
-                // Placement can only run out of nodes on a later attempt
-                // because this request excluded the ones it just found gone.
-                // That first failure is the story worth telling; a refusal
-                // derived from an exclusion this request invented is not.
-                Err(refusal) => {
-                    return Err(self.abandon(first_failure, DispatchError::Route(refusal)))
-                }
+                Err(refusal) => return Err(self.ran_out_of_nodes(first_failure, refusal)),
             };
 
             match send(&placement.node.spec) {
@@ -395,8 +389,20 @@ impl Fabric {
                     gone.push(placement.decision.label.clone());
                     first_failure.get_or_insert(error);
                 }
+                // The node that took the request is the one that ended it, so
+                // that is what gets reported. An earlier node found gone was
+                // survived — naming it would send an operator to the node the
+                // fabric successfully routed around, and say nothing about the
+                // one actually failing requests.
                 Err(error) => {
-                    return Err(self.abandon(first_failure, DispatchError::Forward(error)))
+                    if gone.is_empty() {
+                        self.forget_observation_if_node_vanished(&error);
+                    } else {
+                        // An observation that named a node now gone must not
+                        // outlive this request, however the request ended.
+                        self.forget_observation();
+                    }
+                    return Err(DispatchError::Forward(error));
                 }
             }
         }
@@ -408,27 +414,23 @@ impl Fabric {
         Err(DispatchError::Forward(exhausted))
     }
 
-    /// Settle on the failure to report once a request has run out of road.
+    /// Settle on the failure to report when placement runs out of nodes.
     ///
-    /// A request that reached this point after finding a node gone reports that
-    /// finding, and its observation is dropped whichever way it ended: the
-    /// observation named a node that is not there.
-    fn abandon(
+    /// Placement can only run out on a later attempt, because this request
+    /// excluded the nodes it just found gone. That finding is the story worth
+    /// telling; a refusal derived from an exclusion this request invented is
+    /// not. The observation is dropped with it: it named a node that is gone.
+    fn ran_out_of_nodes(
         &self,
         first_failure: Option<ForwardError>,
-        otherwise: DispatchError,
+        refusal: RouteError,
     ) -> DispatchError {
         match first_failure {
             Some(error) => {
                 self.forget_observation();
                 DispatchError::Forward(error)
             }
-            None => {
-                if let DispatchError::Forward(error) = &otherwise {
-                    self.forget_observation_if_node_vanished(error);
-                }
-                otherwise
-            }
+            None => DispatchError::Route(refusal),
         }
     }
 }
