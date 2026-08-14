@@ -1404,9 +1404,44 @@ mod tests {
         let client = Client::new(listener.local_addr().unwrap());
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            // Drain the request head so the client's write completes.
-            let mut buf = [0u8; 4096];
-            let _ = std::io::Read::read(&mut stream, &mut buf);
+            // Drain the ENTIRE request — head AND body — before responding.
+            //
+            // The sibling socket tests here stop at `\r\n\r\n` because their
+            // requests are bodyless GETs. This one POSTs JSON, so stopping at the
+            // head leaves the body sitting unread in the receive queue. Closing a
+            // socket with unread data is what makes Windows send an abortive RST
+            // instead of a FIN, and the client then fails the read with
+            // `os error 10054` rather than seeing a clean end of stream. It is a
+            // race — whether the reset beats the client's last read — so it passed
+            // on one CI run and failed on the next with no code change.
+            //
+            // A single `read` is also wrong on its own terms: it can return a
+            // partial request regardless of buffer size.
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            let mut expected_len: Option<usize> = None;
+            loop {
+                let read = stream.read(&mut buffer).unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if expected_len.is_none() {
+                    if let Some(head_end) = find(&request, b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&request[..head_end]).to_lowercase();
+                        let body_len = head
+                            .split("content-length:")
+                            .nth(1)
+                            .and_then(|rest| rest.split("\r\n").next())
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        expected_len = Some(head_end + 4 + body_len);
+                    }
+                }
+                if expected_len.is_some_and(|need| request.len() >= need) {
+                    break;
+                }
+            }
             let body = concat!(
                 "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n",
                 "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,",
@@ -1417,7 +1452,7 @@ mod tests {
             );
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
-                 Content-Length: {}\r\n\r\n{body}",
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
             );
             let _ = std::io::Write::write_all(&mut stream, response.as_bytes());
