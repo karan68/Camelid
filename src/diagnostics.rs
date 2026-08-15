@@ -47,7 +47,8 @@
 //! A `session_start` with no matching `session_exit` means the process did not
 //! leave through that path. Be precise about what that does and does not say:
 //! `camelid serve` installs no signal handler (there is no `ctrl_c` or
-//! `with_graceful_shutdown` anywhere in the engine), so an ordinary Ctrl-C ends
+//! `with_graceful_shutdown` in its path — `fabric serve` has one, but that is a
+//! different command in a different process), so an ordinary Ctrl-C ends
 //! the process exactly as abruptly as an out-of-memory kill, and the two are
 //! recorded identically — which is to say, not at all. Read a missing exit
 //! record as "did not fail on the way out", never as evidence of a kill.
