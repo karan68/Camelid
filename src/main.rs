@@ -3012,6 +3012,10 @@ async fn main() -> anyhow::Result<()> {
                     camelid::fabric::server::bind(addr, &auth, allow_unauthenticated_remote)
                         .await?;
                 println!("fabric serve listening on {}", listener.local_addr()?);
+                // Nothing is being served yet, so this probe costs no request, and
+                // it is the only chance to tell the operator about a node that is
+                // not there before a client discovers it for them.
+                print!("{}", camelid::fabric::startup_report(&fabric.observe()));
                 camelid::fabric::server::serve_on(
                     listener,
                     fabric,
