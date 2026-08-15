@@ -16,7 +16,7 @@ use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use camelid::fabric::server::{serve_on, ClientAuth, ServeConfig};
-use camelid::fabric::{Fabric, NodeSpec, RouteMode};
+use camelid::fabric::{Fabric, NodeSpec, RouteMode, ENGINE_QUEUE_FULL_CODE};
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const FORWARD_TIMEOUT: Duration = Duration::from_secs(5);
@@ -98,6 +98,30 @@ impl StubConfig {
         Self {
             completion_delay: delay,
             live_in_flight: Some(Arc::new(AtomicUsize::new(0))),
+            ..Self::ready(model, 0)
+        }
+    }
+
+    /// A node answering exactly what a real engine answers once its bounded
+    /// queue turns a request away: the typed code, the `runtime_unavailable`
+    /// envelope a 503 carries, and the message naming the bound.
+    fn queue_full(model: &str) -> Self {
+        Self::refusing_with(
+            model,
+            ENGINE_QUEUE_FULL_CODE,
+            "the generation queue is full; retry shortly (depth is bounded by CAMELID_QUEUE_DEPTH)",
+        )
+    }
+
+    /// A node refusing with a 503 that is *not* backpressure. A node with no
+    /// model loaded answers one of these, and sending that request on would
+    /// spend another node's time reaching the same refusal.
+    fn refusing_with(model: &str, code: &str, message: &str) -> Self {
+        Self {
+            completion_status: 503,
+            completion: format!(
+                r#"{{"error":{{"message":"{message}","type":"runtime_unavailable","code":"{code}"}}}}"#
+            ),
             ..Self::ready(model, 0)
         }
     }
@@ -1710,5 +1734,142 @@ async fn the_failure_that_ended_the_request_is_the_one_reported() {
         !message.contains("node-a"),
         "node-a was routed around successfully; naming it points at the wrong \
          node: {message}"
+    );
+}
+
+/// A node at its queue bound rejected the request rather than running it, so
+/// another node can still take it. Until now the client got that 503 while a
+/// sibling sat idle — one busy node undoing the reason the fabric exists.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_saturated_node_hands_the_request_to_one_that_is_not() {
+    let nodes = vec![
+        StubNode::start(StubConfig::queue_full("shared-model")),
+        StubNode::start(StubConfig::ready("shared-model", 0)),
+    ];
+    // `a-full` sorts first, so deterministic placement reaches it first.
+    let specs = vec![nodes[0].spec("a-full"), nodes[1].spec("b-ready")];
+    let addr = start_proxy(fabric_with_attempts(specs, 2), RouteMode::Throughput).await;
+
+    let (status, body, headers) =
+        post_chat(addr, &serde_json::json!({ "model": "shared-model" }), &[]).await;
+
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(header(&headers, "x-camelid-fabric-node"), Some("b-ready"));
+    assert_eq!(header(&headers, "x-camelid-fabric-attempts"), Some("2"));
+    assert_eq!(
+        completions_served(&nodes),
+        vec![1, 1],
+        "the full node was asked once, then the ready one"
+    );
+}
+
+/// Every node full is a real answer, not a proxy failure. The client gets a
+/// node's own refusal, with the code and message it sent, rather than
+/// something this proxy invented on its behalf.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fabric_that_is_entirely_saturated_returns_a_node_s_own_refusal() {
+    let nodes = vec![
+        StubNode::start(StubConfig::queue_full("shared-model")),
+        StubNode::start(StubConfig::queue_full("shared-model")),
+    ];
+    let specs = vec![nodes[0].spec("a-full"), nodes[1].spec("b-full")];
+    let addr = start_proxy(fabric_with_attempts(specs, 2), RouteMode::Throughput).await;
+
+    let (status, body, headers) =
+        post_chat(addr, &serde_json::json!({ "model": "shared-model" }), &[]).await;
+
+    assert_eq!(status, 503);
+    assert_eq!(body["error"]["code"], ENGINE_QUEUE_FULL_CODE);
+    assert_ne!(
+        body["error"]["type"], "fabric_error",
+        "a node answered, so the node's answer is what stands: {body}"
+    );
+    assert_eq!(header(&headers, "x-camelid-fabric-attempts"), Some("2"));
+    assert_eq!(completions_served(&nodes), vec![1, 1]);
+}
+
+/// The switch that turns off failover turns this off too: one attempt means
+/// the first node's answer is the answer.
+#[tokio::test(flavor = "multi_thread")]
+async fn one_attempt_returns_the_refusal_without_asking_another_node() {
+    let nodes = vec![
+        StubNode::start(StubConfig::queue_full("shared-model")),
+        StubNode::start(StubConfig::ready("shared-model", 0)),
+    ];
+    let specs = vec![nodes[0].spec("a-full"), nodes[1].spec("b-ready")];
+    let addr = start_proxy(fabric_with_attempts(specs, 1), RouteMode::Throughput).await;
+
+    let (status, body, headers) =
+        post_chat(addr, &serde_json::json!({ "model": "shared-model" }), &[]).await;
+
+    assert_eq!(status, 503, "{body}");
+    assert_eq!(header(&headers, "x-camelid-fabric-attempts"), Some("1"));
+    assert_eq!(
+        completions_served(&nodes),
+        vec![1, 0],
+        "the ready node must not be asked when failover is off"
+    );
+}
+
+/// Only backpressure is re-placed. A node refusing for any other reason has
+/// answered the request; asking a second node would spend its time reaching
+/// the same refusal, and turn one node's 503 into two.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refusal_that_is_not_backpressure_is_relayed_untouched() {
+    let nodes = vec![
+        StubNode::start(StubConfig::refusing_with(
+            "shared-model",
+            "model_unavailable",
+            "no model is loaded",
+        )),
+        StubNode::start(StubConfig::ready("shared-model", 0)),
+    ];
+    let specs = vec![nodes[0].spec("a-refusing"), nodes[1].spec("b-ready")];
+    let addr = start_proxy(fabric_with_attempts(specs, 2), RouteMode::Throughput).await;
+
+    let (status, body, headers) =
+        post_chat(addr, &serde_json::json!({ "model": "shared-model" }), &[]).await;
+
+    assert_eq!(status, 503);
+    assert_eq!(body["error"]["message"], "no model is loaded");
+    assert_eq!(header(&headers, "x-camelid-fabric-attempts"), Some("1"));
+    assert_eq!(
+        completions_served(&nodes),
+        vec![1, 0],
+        "a refusal that is not backpressure must not be sent on"
+    );
+}
+
+/// A streaming request gets the same treatment, because the refusal arrives
+/// buffered — before one event has been relayed, so nothing has been said.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_saturated_node_hands_a_streaming_request_on_as_well() {
+    let events = [
+        "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}",
+        "data: [DONE]",
+    ];
+    let nodes = [
+        StubNode::start(StubConfig::queue_full("shared-model")),
+        StubNode::start(StubConfig::streaming(
+            "shared-model",
+            &events,
+            Duration::ZERO,
+        )),
+    ];
+    let specs = vec![nodes[0].spec("a-full"), nodes[1].spec("b-ready")];
+    let addr = start_proxy(fabric_with_attempts(specs, 2), RouteMode::Throughput).await;
+
+    let (status, headers, pieces) = post_chat_streaming(
+        addr,
+        &serde_json::json!({ "model": "shared-model", "stream": true }),
+    )
+    .await;
+
+    assert_eq!(status, 200);
+    assert_eq!(header(&headers, "x-camelid-fabric-node"), Some("b-ready"));
+    assert_eq!(header(&headers, "x-camelid-fabric-attempts"), Some("2"));
+    assert!(
+        !pieces.is_empty(),
+        "the replacement node's events must arrive"
     );
 }

@@ -42,6 +42,55 @@ impl Forwarded {
     }
 }
 
+/// The engine's typed code for a request its bounded queue turned away.
+///
+/// This mirrors the literal `crate::api` uses when it maps its queue-full post
+/// error onto the error envelope. It is duplicated rather than shared because
+/// that module's bytes are pinned by the model-qualification provenance check,
+/// and one constant is not worth reopening it.
+///
+/// Nothing in this crate can catch the two drifting apart — a test would only
+/// be comparing this literal with itself. Only a real engine refusing a real
+/// request can, which is what this was measured against; if the engine ever
+/// renames the code, a saturated fabric silently stops handing work on.
+pub const ENGINE_QUEUE_FULL_CODE: &str = "engine_queue_full";
+
+/// An answer a node gave, which the fabric looks inside before it treats the
+/// request as finished.
+pub trait NodeAnswer {
+    /// The node turned this request away at its queue boundary, so it never
+    /// started the work.
+    ///
+    /// This is the same property [`ForwardError::node_never_received_it`]
+    /// carries for a failure — "another node can safely be asked instead" —
+    /// except that it arrives as a *successful* forward, because a node that
+    /// answers 503 has answered. Nothing else about a 503 implies it: a node
+    /// with no model loaded also refuses with one, and re-sending that would
+    /// just spend another node's time on the same refusal.
+    fn refused_for_backpressure(&self) -> bool;
+}
+
+impl NodeAnswer for Forwarded {
+    fn refused_for_backpressure(&self) -> bool {
+        self.status == 503
+            && self.body.pointer("/error/code").and_then(Value::as_str)
+                == Some(ENGINE_QUEUE_FULL_CODE)
+    }
+}
+
+impl NodeAnswer for StreamOutcome {
+    fn refused_for_backpressure(&self) -> bool {
+        match self {
+            // A refusal arrives buffered, before one event has been relayed, so
+            // the request can still be placed somewhere else.
+            Self::Buffered(answer) => answer.refused_for_backpressure(),
+            // Once the node is streaming it has started generating, and the
+            // head is already on its way to the client.
+            Self::Streaming(_) => false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ForwardError {
     /// The node was never reached, so it cannot have run the request.
@@ -343,6 +392,83 @@ mod tests {
             host: "127.0.0.1".to_string(),
             port,
         }
+    }
+
+    fn answered(status: u16, body: Value) -> Forwarded {
+        Forwarded {
+            label: "node-a".to_string(),
+            status,
+            body,
+            elapsed: Duration::from_millis(1),
+        }
+    }
+
+    /// The exact envelope a real engine sends when its bounded queue turns a
+    /// request away: a 503 whose typed code names the queue, not the model.
+    #[test]
+    fn a_queue_full_refusal_is_backpressure() {
+        let answer = answered(
+            503,
+            serde_json::json!({
+                "error": {
+                    "message": "the generation queue is full; retry shortly",
+                    "type": "runtime_unavailable",
+                    "code": ENGINE_QUEUE_FULL_CODE,
+                }
+            }),
+        );
+        assert!(answer.refused_for_backpressure());
+    }
+
+    /// The status alone must not decide it. A node with no model loaded also
+    /// answers 503, and it will answer the same way however many times it is
+    /// asked — re-sending that request costs a second node its time and turns
+    /// one refusal into two.
+    #[test]
+    fn another_kind_of_503_is_not_backpressure() {
+        let answer = answered(
+            503,
+            serde_json::json!({
+                "error": {
+                    "message": "no model is loaded",
+                    "type": "runtime_unavailable",
+                    "code": "model_unavailable",
+                }
+            }),
+        );
+        assert!(!answer.refused_for_backpressure());
+    }
+
+    #[test]
+    fn a_body_without_an_error_is_not_backpressure() {
+        assert!(!answered(503, Value::Null).refused_for_backpressure());
+        assert!(!answered(503, serde_json::json!({ "error": "full" })).refused_for_backpressure());
+        assert!(!answered(503, serde_json::json!({})).refused_for_backpressure());
+    }
+
+    /// A served answer is never re-placed, whatever it happens to contain.
+    #[test]
+    fn a_successful_answer_is_not_backpressure() {
+        let answer = answered(
+            200,
+            serde_json::json!({ "error": { "code": ENGINE_QUEUE_FULL_CODE } }),
+        );
+        assert!(!answer.refused_for_backpressure());
+    }
+
+    /// A streaming request refused this way never became a stream: the node
+    /// answered with one body, so nothing has been relayed and the request can
+    /// still go elsewhere.
+    #[test]
+    fn a_buffered_refusal_on_a_streaming_request_is_backpressure() {
+        let outcome = StreamOutcome::Buffered(answered(
+            503,
+            serde_json::json!({ "error": { "code": ENGINE_QUEUE_FULL_CODE } }),
+        ));
+        assert!(outcome.refused_for_backpressure());
+
+        let served = StreamOutcome::Buffered(answered(200, serde_json::json!({ "choices": [] })));
+        assert!(!served.refused_for_backpressure());
     }
 
     #[test]
