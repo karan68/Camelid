@@ -33,6 +33,10 @@
 //!   unless a key is configured or the risk is acknowledged explicitly.
 //! * Authentication is all-or-nothing: there is one key, it is not per-client,
 //!   and nothing here revokes or rotates it while the proxy is running.
+//! * Every request is recorded through `tracing` at INFO, and a failure at
+//!   WARN, which means nothing is written unless `RUST_LOG` asks for it — the
+//!   same as the rest of this binary. `RUST_LOG=camelid=info` is the whole
+//!   access log; `RUST_LOG=camelid=warn` narrows it to what failed.
 //! * A node that becomes ready, or loads a different model, is routed to only
 //!   once the current observation expires. A node that *stops* answering is not
 //!   waited on: the request that finds it gone is placed on another node
@@ -49,13 +53,14 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{DefaultBodyLimit, State};
+use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{middleware, Json, Router};
@@ -137,8 +142,6 @@ struct ServerState {
 
 /// Build the router without binding a socket, so tests can drive it directly.
 pub fn router(fabric: Fabric, config: ServeConfig) -> Router {
-    // Applied last, so it is the outermost layer: an unauthenticated request is
-    // refused before anything here reads its body or observes the fabric.
     let auth = config.auth.inner.clone();
     Router::new()
         .route("/v1/chat/completions", post(chat_completions))
@@ -150,10 +153,87 @@ pub fn router(fabric: Fabric, config: ServeConfig) -> Router {
             fabric: Arc::new(fabric),
             config,
         })
+        // Wraps every route: an unauthenticated request is refused before
+        // anything below reads its body or observes the fabric.
         .layer(middleware::from_fn_with_state(
             auth,
             crate::api::authenticate,
         ))
+        // Outermost, so a request refused above is still recorded.
+        .layer(middleware::from_fn(access_log))
+}
+
+/// Record one line per request, whatever the outcome.
+///
+/// The proxy announced its address and then said nothing ever again, so an
+/// operator could not answer "is anything reaching this", "which machine served
+/// that", or "what is failing" without a packet capture.
+///
+/// `TraceLayer`, which the engine's router uses, is not enough on its own here:
+/// it can only see HTTP, so it cannot say which node answered — the one fact
+/// this process exists to decide — and it records at DEBUG, below the level an
+/// operator runs.
+///
+/// The placement facts are read back off the response rather than threaded out
+/// of dispatch, because [`tag`] already puts them there for the client, and one
+/// fact with two sources drifts.
+///
+/// Applied outside the authentication layer deliberately: a refused request is
+/// exactly the one worth having a record of, and inside the layer it would be
+/// invisible.
+///
+/// Never recorded: request and response bodies, and every request header — one
+/// of them is the client's key. The query string is dropped for the same
+/// reason, since the path alone identifies the route.
+///
+/// On a streaming answer this measures time to the response head, not to the
+/// final event: the middleware returns once the head is ready while the body is
+/// still being relayed.
+async fn access_log(request: Request, next: Next) -> Response {
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
+    let started = Instant::now();
+
+    let response = next.run(request).await;
+
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    let status = response.status();
+    let node = tagged(&response, "x-camelid-fabric-node");
+    let reason = tagged(&response, "x-camelid-fabric-reason");
+
+    if status.is_server_error() {
+        tracing::warn!(
+            %method,
+            %path,
+            status = status.as_u16(),
+            node,
+            reason,
+            elapsed_ms,
+            "fabric request failed"
+        );
+    } else {
+        tracing::info!(
+            %method,
+            %path,
+            status = status.as_u16(),
+            node,
+            reason,
+            elapsed_ms,
+            "fabric request"
+        );
+    }
+
+    response
+}
+
+/// One of this proxy's own response headers, or `-` when the answer never got
+/// far enough to have one.
+fn tagged<'a>(response: &'a Response, name: &str) -> &'a str {
+    response
+        .headers()
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("-")
 }
 
 /// Bind `addr` for the proxy, refusing an exposure the operator did not ask for.
@@ -577,6 +657,7 @@ fn error_response(status: StatusCode, message: &str) -> Response {
 mod tests {
     use super::*;
     use crate::fabric::node::NodeSpec;
+    use crate::fabric::policy::RouteReason;
     use tower::ServiceExt;
 
     fn request(body: Value) -> axum::http::Request<axum::body::Body> {
@@ -616,6 +697,177 @@ mod tests {
 
     fn proxy(fabric: Fabric) -> Router {
         router(fabric, open_config())
+    }
+
+    /// Collects formatted log output, so these tests assert on what was
+    /// actually written rather than on whether a function was reached.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl Captured {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().expect("log buffer")).into_owned()
+        }
+    }
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log buffer").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Drive one request and return what was logged while it ran.
+    ///
+    /// The subscriber is thread-local, so these tests run on the default
+    /// current-thread runtime: on a multi-threaded one the task can resume on a
+    /// thread that never had the subscriber installed and capture nothing.
+    async fn logged(app: Router, request: axum::http::Request<axum::body::Body>) -> String {
+        logged_at(tracing::Level::INFO, app, request).await
+    }
+
+    async fn logged_at(
+        level: tracing::Level,
+        app: Router,
+        request: axum::http::Request<axum::body::Body>,
+    ) -> String {
+        let captured = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_max_level(level)
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        let _ = app.oneshot(request).await.expect("router answers");
+        drop(guard);
+        captured.text()
+    }
+
+    /// A router whose answer carries whatever the fabric would have tagged, so
+    /// the middleware can be tested without placing anything.
+    fn answering(status: StatusCode, node: Option<&'static str>) -> Router {
+        Router::new()
+            .route(
+                "/v1/chat/completions",
+                post(move || async move {
+                    let mut response = (status, "body").into_response();
+                    if let Some(label) = node {
+                        let decision = RouteDecision {
+                            label: label.to_string(),
+                            reason: RouteReason::LeastLoaded,
+                            affinity_lost: None,
+                        };
+                        tag(response.headers_mut(), &decision);
+                    }
+                    response
+                }),
+            )
+            .layer(middleware::from_fn(access_log))
+    }
+
+    /// The proxy announced its address and then said nothing ever again.
+    #[tokio::test]
+    async fn a_request_is_recorded_with_its_method_path_and_status() {
+        let written = logged(proxy(Fabric::new(Vec::new())), get_request("/v1/models")).await;
+        assert!(written.contains("fabric request"), "{written}");
+        assert!(written.contains("method=GET"), "{written}");
+        assert!(written.contains("path=/v1/models"), "{written}");
+        assert!(written.contains("status=200"), "{written}");
+        assert!(written.contains("elapsed_ms"), "{written}");
+    }
+
+    /// Which machine served a request is the one fact a generic HTTP layer
+    /// cannot know, and the only reason this proxy exists.
+    #[tokio::test]
+    async fn the_node_that_served_a_request_is_recorded() {
+        let written = logged(
+            answering(StatusCode::OK, Some("mac-studio")),
+            request(serde_json::json!({ "model": "m" })),
+        )
+        .await;
+        assert!(written.contains("mac-studio"), "{written}");
+        assert!(written.contains("LeastLoaded"), "{written}");
+    }
+
+    /// An answer that never reached a node still gets a line; it just has no
+    /// node to name, and an empty field would read like a missing one.
+    #[tokio::test]
+    async fn an_answer_that_reached_no_node_records_a_dash() {
+        let written = logged(
+            answering(StatusCode::OK, None),
+            request(serde_json::json!({ "model": "m" })),
+        )
+        .await;
+        assert!(written.contains("node=\"-\""), "{written}");
+        assert!(written.contains("reason=\"-\""), "{written}");
+    }
+
+    /// The log layer sits outside authentication on purpose: a refused request
+    /// is exactly the one worth having a record of.
+    #[tokio::test]
+    async fn a_refused_request_is_still_recorded() {
+        let config = ServeConfig {
+            auth: ClientAuth::resolve(Some("s3cret".to_string()), None).expect("a key resolves"),
+            ..open_config()
+        };
+        let written = logged(
+            router(Fabric::new(Vec::new()), config),
+            get_request("/v1/models"),
+        )
+        .await;
+        assert!(written.contains("status=401"), "{written}");
+        // The credential itself must never reach the log.
+        assert!(!written.contains("s3cret"), "{written}");
+    }
+
+    /// An operator narrowing to failures must still see them, and must not have
+    /// every healthy request in the way.
+    #[tokio::test]
+    async fn a_failure_is_recorded_at_warn_and_a_success_is_not() {
+        let failed = logged_at(
+            tracing::Level::WARN,
+            answering(StatusCode::BAD_GATEWAY, Some("node-a")),
+            request(serde_json::json!({ "model": "m" })),
+        )
+        .await;
+        assert!(failed.contains("fabric request failed"), "{failed}");
+        assert!(failed.contains("status=502"), "{failed}");
+
+        let served = logged_at(
+            tracing::Level::WARN,
+            answering(StatusCode::OK, Some("node-a")),
+            request(serde_json::json!({ "model": "m" })),
+        )
+        .await;
+        assert!(
+            served.is_empty(),
+            "a served request must not warn: {served}"
+        );
+    }
+
+    /// A query string can carry anything a client puts there, and the path
+    /// alone already identifies the route.
+    #[tokio::test]
+    async fn a_query_string_is_not_recorded() {
+        let written = logged(
+            proxy(Fabric::new(Vec::new())),
+            get_request("/v1/models?token=s3cret&x=1"),
+        )
+        .await;
+        assert!(written.contains("path=/v1/models"), "{written}");
+        assert!(!written.contains("s3cret"), "{written}");
     }
 
     /// A client points at one address, so that address has to answer what it
