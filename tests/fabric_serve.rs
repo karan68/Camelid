@@ -464,6 +464,7 @@ async fn start_proxy_with_auth(fabric: Fabric, mode: RouteMode, auth: ClientAuth
         mode,
         forward_timeout: FORWARD_TIMEOUT,
         auth,
+        bound: addr,
     };
     tokio::spawn(async move {
         let _ = serve_on(listener, fabric, config).await;
@@ -1328,6 +1329,7 @@ async fn a_stop_finishes_the_work_in_flight_and_accepts_no_more() {
         mode: RouteMode::Throughput,
         forward_timeout: FORWARD_TIMEOUT,
         auth: ClientAuth::none(),
+        bound: addr,
     };
 
     let (stop, stop_asked) = tokio::sync::oneshot::channel::<()>();
@@ -1383,6 +1385,133 @@ async fn a_proxy_without_a_key_serves_an_anonymous_client() {
     let (status, _, _) =
         post_chat(addr, &serde_json::json!({ "model": "shared-model" }), &[]).await;
     assert_eq!(status, 200);
+}
+
+/// A load balancer needs one address to ask whether to send traffic here. Until
+/// this route existed the answer was a bodyless 404 whatever the fabric was
+/// doing, so nothing could tell a working proxy from a useless one.
+#[tokio::test(flavor = "multi_thread")]
+async fn health_reports_ready_while_a_node_can_serve() {
+    let node = StubNode::start(StubConfig::ready("shared-model", 0));
+    let addr = start_proxy(fabric_of(vec![node.spec("node-a")]), RouteMode::Throughput).await;
+
+    let (status, body) = get_raw(addr, "/v1/health", &[]).await;
+    assert_eq!(status, 200, "{body}");
+    let parsed: Value = serde_json::from_str(&body).expect("json body");
+    assert_eq!(parsed["ok"], serde_json::json!(true));
+    assert_eq!(parsed["ready"], serde_json::json!(true));
+    assert_eq!(parsed["nodes"]["ready"], serde_json::json!(1));
+    assert_eq!(parsed["models"], serde_json::json!(["shared-model"]));
+    // The test binds loopback, so the fabric may be named.
+    assert_eq!(parsed["node_detail"][0]["spec"]["label"], "node-a");
+}
+
+/// A spec for a port nothing listens on. Binding and dropping proves the port
+/// was free and is now closed; a hardcoded number proves neither.
+async fn closed_port_spec(label: &str) -> NodeSpec {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind a free port");
+    let addr = listener.local_addr().expect("port");
+    drop(listener);
+    NodeSpec {
+        label: label.to_string(),
+        host: addr.ip().to_string(),
+        port: addr.port(),
+    }
+}
+
+/// Ready is "some request can be served", not "every node is well". A fabric
+/// with one node down still takes traffic, and a proxy that reported itself
+/// unhealthy here would take a whole fabric out of rotation over one node.
+#[tokio::test(flavor = "multi_thread")]
+async fn health_stays_ready_while_any_node_can_serve() {
+    let node = StubNode::start(StubConfig::ready("shared-model", 0));
+    let specs = vec![node.spec("node-a"), closed_port_spec("node-gone").await];
+    let addr = start_proxy(fabric_of(specs), RouteMode::Throughput).await;
+
+    let (status, body) = get_raw(addr, "/v1/health", &[]).await;
+    assert_eq!(status, 200, "{body}");
+    let parsed: Value = serde_json::from_str(&body).expect("json body");
+    assert_eq!(parsed["ready"], serde_json::json!(true));
+    assert_eq!(parsed["nodes"]["ready"], serde_json::json!(1));
+    assert_eq!(parsed["nodes"]["unreachable"], serde_json::json!(1));
+}
+
+/// The status code has to change, not just a field in the body: a load balancer
+/// acts on the code alone. A proxy with nothing behind it must stop inviting
+/// traffic it can only refuse.
+#[tokio::test(flavor = "multi_thread")]
+async fn health_stops_inviting_traffic_when_no_node_answers() {
+    let specs = vec![closed_port_spec("node-gone").await];
+    let addr = start_proxy(fabric_of(specs), RouteMode::Throughput).await;
+
+    let (status, body) = get_raw(addr, "/v1/health", &[]).await;
+    assert_eq!(status, 503, "{body}");
+    let parsed: Value = serde_json::from_str(&body).expect("json body");
+    assert_eq!(parsed["ready"], serde_json::json!(false));
+    // Liveness is unchanged: this process is fine, its fabric is not, and
+    // restarting this process would not bring a node back.
+    assert_eq!(parsed["ok"], serde_json::json!(true));
+    assert_eq!(parsed["nodes"]["unreachable"], serde_json::json!(1));
+    assert_eq!(parsed["models"], serde_json::json!([]));
+}
+
+/// Health needs no key even on a proxy that requires one everywhere else: the
+/// engine's shared `authenticate` keeps `/v1/health` public so a probe can run
+/// without credentials, and this proxy reuses that check rather than writing a
+/// second one. `/v1/models` stays behind the key, and the contrast is the point
+/// — it is why the health body withholds the fabric's detail off-box, which the
+/// unit tests cover because this test can only bind loopback.
+#[tokio::test(flavor = "multi_thread")]
+async fn health_answers_a_probe_that_carries_no_key() {
+    let node = StubNode::start(StubConfig::ready("private-model", 0));
+    let addr = start_proxy_with_auth(
+        fabric_of(vec![node.spec("node-a")]),
+        RouteMode::Throughput,
+        authenticated("s3cret"),
+    )
+    .await;
+
+    let (health, body) = get_raw(addr, "/v1/health", &[]).await;
+    assert_eq!(health, 200, "a probe with no key must still get an answer");
+    let parsed: Value = serde_json::from_str(&body).expect("json body");
+    assert_eq!(parsed["ready"], serde_json::json!(true));
+
+    let (models, listing) = get_raw(addr, "/v1/models", &[]).await;
+    assert_eq!(models, 401, "discovery stays behind the key");
+    assert!(!listing.contains("private-model"), "{listing}");
+
+    let (chat, _, _) = post_chat(addr, &serde_json::json!({ "model": "private-model" }), &[]).await;
+    assert_eq!(chat, 401, "generation stays behind the key");
+}
+
+/// A load balancer polls this route forever. If each poll re-probed the fabric,
+/// adding a health check would multiply node traffic by the polling rate, which
+/// is exactly the cost the freshness bound exists to remove.
+#[tokio::test(flavor = "multi_thread")]
+async fn repeated_health_checks_share_one_observation() {
+    let nodes = vec![
+        StubNode::start(StubConfig::ready("shared-model", 0)),
+        StubNode::start(StubConfig::ready("shared-model", 0)),
+    ];
+    let specs = vec![nodes[0].spec("node-a"), nodes[1].spec("node-b")];
+    let addr = start_proxy(
+        fabric_reusing_observations(specs, Duration::from_secs(30)),
+        RouteMode::Throughput,
+    )
+    .await;
+
+    for _ in 0..5 {
+        let (status, _) = get_raw(addr, "/v1/health", &[]).await;
+        assert_eq!(status, 200);
+    }
+
+    assert_eq!(
+        health_probes(&nodes),
+        nodes.len(),
+        "five health checks should share one observation, one probe per node"
+    );
 }
 
 /// The proxy observes the fabric before every placement. Without a freshness

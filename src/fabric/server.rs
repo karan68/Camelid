@@ -43,6 +43,11 @@
 //! * A stop (Ctrl-C, or SIGTERM where there is one) closes the listener and
 //!   lets the requests already in flight finish, bounded by `forward_timeout`.
 //!   A kill still drops them: this covers being asked to stop, not being shot.
+//! * `/v1/health` answers readiness, not liveness — a 503 from it means "no
+//!   node is ready", never "restart me". It is also the one route a client
+//!   reaches without a key, because the engine's shared `authenticate` keeps
+//!   `/v1/health` public; it therefore names the fabric's nodes and models only
+//!   when this proxy is bound to loopback.
 //! * A node that becomes ready, or loads a different model, is routed to only
 //!   once the current observation expires. A node that *stops* answering is not
 //!   waited on: the request that finds it gone is placed on another node
@@ -142,6 +147,15 @@ pub struct ServeConfig {
     pub forward_timeout: Duration,
     /// What a client must present to be served at all.
     pub auth: ClientAuth,
+    /// The address this proxy listens on.
+    ///
+    /// Read only to decide whether `/v1/health` may name the fabric's members:
+    /// a loopback listener cannot be reached from off the machine.
+    /// [`serve_on_until`] overwrites this with the address the listener
+    /// actually bound, so the value the disclosure rule sees can never be a
+    /// caller's guess. It is set there rather than in [`serve_on`] because
+    /// every serving path goes through it, including the injected-stop seam.
+    pub bound: SocketAddr,
 }
 
 #[derive(Clone)]
@@ -158,6 +172,7 @@ pub fn router(fabric: Fabric, config: ServeConfig) -> Router {
     Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/models", get(models))
+        .route("/v1/health", get(health))
         // Without this, axum's 2 MiB default would refuse conversations the
         // node behind the proxy accepts.
         .layer(DefaultBodyLimit::max(DEFAULT_MAX_REQUEST_BODY_BYTES))
@@ -361,9 +376,14 @@ pub async fn serve_on(
 pub async fn serve_on_until(
     listener: tokio::net::TcpListener,
     fabric: Fabric,
-    config: ServeConfig,
+    mut config: ServeConfig,
     stop: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
+    // The listener is the only authority on what was actually bound, and the
+    // health disclosure rule turns on it. It is set here rather than in
+    // `serve_on` so that a caller entering through this seam cannot skip it.
+    config.bound = listener.local_addr()?;
+
     let drain = config.forward_timeout;
     // The peer address is only available to a service built this way, and the
     // access log is the only thing that reads it.
@@ -422,6 +442,110 @@ async fn stop_requested() {
         () = interrupt => {}
         () = terminate => {}
     }
+}
+
+/// Report whether this proxy can route a request right now.
+///
+/// A load balancer needs one address to ask "should I send you traffic", and
+/// the proxy had none: `/v1/health` matched no route, so a probe got a bodyless
+/// 404 whatever the fabric was actually doing.
+///
+/// **This is readiness, not liveness.** It answers 503 while no node is ready,
+/// which is the right answer to "send me traffic" and the wrong one to "should
+/// I restart you" — restarting a proxy cannot bring a node back. Wire it to a
+/// readiness probe. Liveness is the `ok` in the body, which is true whenever
+/// this code runs at all.
+///
+/// The answer comes from the same observation placement uses, so a probe every
+/// second does not become a probe of every node every second: inside the
+/// freshness window a health check costs the fabric no traffic.
+async fn health(State(state): State<ServerState>) -> Response {
+    let fabric = Arc::clone(&state.fabric);
+    // Observing is blocking socket I/O against every node, same as a dispatch.
+    let snapshots = match tokio::task::spawn_blocking(move || fabric.observe()).await {
+        Ok(snapshots) => snapshots,
+        Err(join_error) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("could not observe the fabric: {join_error}"),
+            )
+        }
+    };
+
+    let (status, body) = health_report(&snapshots, state.config.bound.ip().is_loopback());
+    (status, Json(body)).into_response()
+}
+
+/// Build the health answer.
+///
+/// Ready means at least one node is ready, which is exactly what placement
+/// needs: with one, some request can be served; with none, every request is
+/// refused, and saying otherwise would invite traffic this proxy cannot serve.
+///
+/// `disclose_detail` decides whether anything beyond that verdict is included,
+/// and is false unless the listener is loopback. This route is **not** behind
+/// [`ClientAuth`]: the engine's shared `authenticate` keeps `/v1/health` public
+/// so a probe needs no credential, and reusing that check means inheriting the
+/// rule. An anonymous caller can therefore read whatever is here, which makes
+/// the contents a disclosure decision rather than a formatting one:
+///
+/// * the node list is every label and address in the fabric;
+/// * the model list is the answer `/v1/models` gives, and that route *is*
+///   behind the key, so publishing it here would hand it out through a side
+///   door;
+/// * off-box callers get the verdict and nothing else, which is all a load
+///   balancer reads anyway.
+///
+/// [`crate::api`] withholds its own `executable` and `listen_addr` on the same
+/// fact, for the same reason.
+///
+/// Deliberately not shaped like a node's health: there is no `engine` field and
+/// the service name differs, so nothing can mistake a proxy for something that
+/// generates. A proxy has no single `active_model_id` to report anyway.
+///
+/// Kept pure so both rules are covered by unit tests rather than by starting a
+/// server and guessing which branch ran.
+fn health_report(snapshots: &[fabric::NodeSnapshot], disclose_detail: bool) -> (StatusCode, Value) {
+    let summary = fabric::FabricSummary::of(snapshots);
+    let ready = summary.ready > 0;
+
+    let mut body = serde_json::json!({
+        "ok": true,
+        "service": "camelid-fabric",
+        "version": env!("CARGO_PKG_VERSION"),
+        "build": crate::receipt::camelid_version(),
+        "ready": ready,
+    });
+
+    if disclose_detail {
+        if let Some(object) = body.as_object_mut() {
+            object.insert(
+                "nodes".to_string(),
+                serde_json::json!({
+                    "total": summary.total(),
+                    "ready": summary.ready,
+                    "not_ready": summary.not_ready,
+                    "unreachable": summary.unreachable,
+                }),
+            );
+            object.insert(
+                "models".to_string(),
+                serde_json::json!(fabric::servable_models(snapshots)),
+            );
+            // The shape `fabric status --json` already prints, so an operator
+            // reading both is not learning two vocabularies for one fact.
+            if let Ok(detail) = serde_json::to_value(snapshots) {
+                object.insert("node_detail".to_string(), detail);
+            }
+        }
+    }
+
+    let status = if ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (status, body)
 }
 
 /// List every model the fabric can currently route to.
@@ -804,7 +928,7 @@ fn error_response(status: StatusCode, message: &str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fabric::node::NodeSpec;
+    use crate::fabric::node::{NodeReady, NodeSnapshot, NodeSpec, NodeStatus};
     use crate::fabric::policy::RouteReason;
     use tower::ServiceExt;
 
@@ -840,7 +964,39 @@ mod tests {
             mode: RouteMode::Throughput,
             forward_timeout: Duration::from_millis(200),
             auth: ClientAuth::none(),
+            bound: "127.0.0.1:8490".parse().expect("loopback address"),
         }
+    }
+
+    /// A proxy on an address the network can reach. Integration tests always
+    /// bind loopback, so this is the only place the redacted branch is reached.
+    fn exposed_config() -> ServeConfig {
+        ServeConfig {
+            bound: "203.0.113.7:8490".parse().expect("routable address"),
+            ..open_config()
+        }
+    }
+
+    fn snapshot(label: &str, status: NodeStatus) -> NodeSnapshot {
+        NodeSnapshot {
+            spec: NodeSpec {
+                label: label.to_string(),
+                host: "192.0.2.10".to_string(),
+                port: 8181,
+            },
+            status,
+            latency: Some(Duration::from_millis(3)),
+        }
+    }
+
+    fn ready_status(model: &str) -> NodeStatus {
+        NodeStatus::Ready(NodeReady {
+            active_model_id: Some(model.to_string()),
+            backend: "llama".to_string(),
+            version: "0.6.1".to_string(),
+            in_flight: 0,
+            waiting: 0,
+        })
     }
 
     fn proxy(fabric: Fabric) -> Router {
@@ -1156,6 +1312,123 @@ mod tests {
         let written = logged(proxy(Fabric::new(Vec::new())), get_request("/v1/models")).await;
         assert!(written.contains("fabric request"), "{written}");
         assert!(written.contains("client=\"-\""), "{written}");
+    }
+
+    /// Ready means "placement can succeed", which is exactly one ready node.
+    #[test]
+    fn health_is_ready_when_one_node_can_serve() {
+        let snapshots = vec![
+            snapshot("a", ready_status("llama-3b")),
+            snapshot(
+                "b",
+                NodeStatus::Unreachable {
+                    reason: "cannot connect".to_string(),
+                },
+            ),
+        ];
+        let (status, body) = health_report(&snapshots, true);
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], serde_json::json!(true));
+        assert_eq!(body["ready"], serde_json::json!(true));
+        assert_eq!(body["nodes"]["total"], serde_json::json!(2));
+        assert_eq!(body["nodes"]["ready"], serde_json::json!(1));
+        assert_eq!(body["nodes"]["unreachable"], serde_json::json!(1));
+        assert_eq!(body["models"], serde_json::json!(["llama-3b"]));
+    }
+
+    /// A proxy with nothing to route to must not invite traffic. `ok` stays
+    /// true through it: the process is fine, its fabric is not, and restarting
+    /// this process would fix nothing.
+    #[test]
+    fn health_refuses_traffic_when_no_node_is_ready() {
+        let snapshots = vec![snapshot(
+            "a",
+            NodeStatus::NotReady {
+                reason: "no model loaded".to_string(),
+            },
+        )];
+        let (status, body) = health_report(&snapshots, true);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["ok"], serde_json::json!(true));
+        assert_eq!(body["ready"], serde_json::json!(false));
+        assert_eq!(body["models"], serde_json::json!([]));
+    }
+
+    /// The verdict itself does not depend on who is asking; only the detail does.
+    #[test]
+    fn the_readiness_verdict_is_the_same_off_box() {
+        let snapshots = vec![snapshot("a", ready_status("llama-3b"))];
+        let (disclosed, _) = health_report(&snapshots, true);
+        let (withheld, body) = health_report(&snapshots, false);
+        assert_eq!(disclosed, withheld);
+        assert_eq!(body["ready"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn a_loopback_listener_may_name_the_fabric() {
+        let snapshots = vec![snapshot("a", ready_status("llama-3b"))];
+        let (_, body) = health_report(&snapshots, true);
+        let detail = body["node_detail"].as_array().expect("node detail");
+        assert_eq!(detail.len(), 1);
+        assert_eq!(detail[0]["spec"]["label"], serde_json::json!("a"));
+        assert_eq!(detail[0]["spec"]["host"], serde_json::json!("192.0.2.10"));
+    }
+
+    /// This route needs no key, because the engine's shared `authenticate`
+    /// keeps `/v1/health` public. So an exposed proxy answers anyone, and what
+    /// it answers must not include every node's address.
+    #[test]
+    fn an_exposed_listener_does_not_name_the_fabric() {
+        let snapshots = vec![snapshot("a", ready_status("llama-3b"))];
+        let (_, body) = health_report(&snapshots, false);
+        assert!(body.get("node_detail").is_none(), "{body}");
+        assert!(body.get("nodes").is_none(), "{body}");
+        assert!(!body.to_string().contains("192.0.2.10"), "{body}");
+    }
+
+    /// `/v1/models` is behind the key and has a test saying an unauthenticated
+    /// caller must not learn what is served. Health needs no key, so listing
+    /// models here off-box would give that same answer away through a side door.
+    #[test]
+    fn an_exposed_listener_does_not_list_the_models() {
+        let snapshots = vec![snapshot("a", ready_status("private-model"))];
+        let (_, body) = health_report(&snapshots, false);
+        assert!(body.get("models").is_none(), "{body}");
+        assert!(!body.to_string().contains("private-model"), "{body}");
+    }
+
+    /// Proves the route reads the bound address rather than merely that the
+    /// pure function can redact. Integration tests all bind loopback, so the
+    /// exposed branch has no other end-to-end coverage.
+    #[tokio::test]
+    async fn only_a_loopback_listener_names_the_fabric_on_the_route() {
+        let exposed = router(Fabric::new(Vec::new()), exposed_config())
+            .oneshot(get_request("/v1/health"))
+            .await
+            .expect("router answers");
+        let (_, exposed_body) = read_json(exposed).await;
+        assert!(exposed_body.get("node_detail").is_none(), "{exposed_body}");
+
+        let loopback = proxy(Fabric::new(Vec::new()))
+            .oneshot(get_request("/v1/health"))
+            .await
+            .expect("router answers");
+        let (_, loopback_body) = read_json(loopback).await;
+        assert_eq!(loopback_body["node_detail"], serde_json::json!([]));
+    }
+
+    /// An empty fabric is not a broken proxy, but it cannot take traffic.
+    #[tokio::test]
+    async fn the_health_route_refuses_an_empty_fabric() {
+        let response = proxy(Fabric::new(Vec::new()))
+            .oneshot(get_request("/v1/health"))
+            .await
+            .expect("router answers");
+        let (status, body) = read_json(response).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["ready"], serde_json::json!(false));
+        assert_eq!(body["nodes"]["total"], serde_json::json!(0));
+        assert_eq!(body["service"], serde_json::json!("camelid-fabric"));
     }
 
     /// A client points at one address, so that address has to answer what it
