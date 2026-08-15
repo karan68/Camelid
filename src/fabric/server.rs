@@ -456,9 +456,17 @@ async fn stop_requested() {
 /// readiness probe. Liveness is the `ok` in the body, which is true whenever
 /// this code runs at all.
 ///
-/// The answer comes from the same observation placement uses, so a probe every
-/// second does not become a probe of every node every second: inside the
-/// freshness window a health check costs the fabric no traffic.
+/// The answer comes from the same observation placement uses, so a health check
+/// taken inside the freshness window costs the fabric no traffic at all.
+/// Outside it this probes every node, exactly as any other request would: at the
+/// 500 ms default a once-a-second check is always past the window and re-probes
+/// every time. A deployment that polls this route therefore wants
+/// `--observation-max-age-ms` at or above its polling interval, or the health
+/// check itself becomes the node traffic that bound exists to remove.
+///
+/// That bound is also the only thing pacing this route, because it is
+/// deliberately outside [`ClientAuth`]: the caller decides how often it is
+/// asked, and with `--observation-max-age-ms 0` every ask probes every node.
 async fn health(State(state): State<ServerState>) -> Response {
     let fabric = Arc::clone(&state.fabric);
     // Observing is blocking socket I/O against every node, same as a dispatch.

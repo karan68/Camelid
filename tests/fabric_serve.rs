@@ -1514,6 +1514,36 @@ async fn repeated_health_checks_share_one_observation() {
     );
 }
 
+/// The other half of that bound, and the half an operator actually has to set
+/// something for: reuse lasts exactly as long as the window. A deployment
+/// polling this route more slowly than `--observation-max-age-ms` re-probes
+/// every node on every check — at the 500 ms default, a once-a-second probe
+/// does that every time.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_health_check_past_the_window_observes_the_fabric_again() {
+    let nodes = vec![StubNode::start(StubConfig::ready("shared-model", 0))];
+    let specs = vec![nodes[0].spec("node-a")];
+    let addr = start_proxy(
+        fabric_reusing_observations(specs, Duration::from_millis(50)),
+        RouteMode::Throughput,
+    )
+    .await;
+
+    let (first, _) = get_raw(addr, "/v1/health", &[]).await;
+    assert_eq!(first, 200);
+    let after_first = health_probes(&nodes);
+
+    // Comfortably past the window, so this is not a race with the clock.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let (second, _) = get_raw(addr, "/v1/health", &[]).await;
+    assert_eq!(second, 200);
+    assert!(
+        health_probes(&nodes) > after_first,
+        "an expired observation must be taken again rather than reused"
+    );
+}
+
 /// The proxy observes the fabric before every placement. Without a freshness
 /// bound that is a `/v1/health` per node per request: measured at exactly 2 per
 /// request against two nodes, and 2.0 s per request when one node black-holes,
