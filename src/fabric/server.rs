@@ -634,6 +634,7 @@ fn route_error(error: RouteError) -> Response {
 }
 
 fn forward_error(error: ForwardError) -> Response {
+    let message = error.to_string();
     // The node was reachable but refused unsupported input: that is the
     // caller's mistake, not the upstream's, so it is a 400 not a 502/503.
     let status = match &error {
@@ -642,7 +643,15 @@ fn forward_error(error: ForwardError) -> Response {
         | ForwardError::Transport { .. }
         | ForwardError::Json { .. } => StatusCode::BAD_GATEWAY,
     };
-    error_response(status, &error.to_string())
+    let label = error.label().map(str::to_string);
+    let mut response = error_response(status, &message);
+    // The node that failed rides on the answer for the same reason [`tag`] puts
+    // the node that served there: placement is read back off the response, so a
+    // failure that does not carry its node is one nobody can attribute.
+    if let Some(label) = label {
+        insert(response.headers_mut(), "x-camelid-fabric-node", &label);
+    }
+    response
 }
 
 fn error_response(status: StatusCode, message: &str) -> Response {
@@ -769,7 +778,7 @@ mod tests {
                             reason: RouteReason::LeastLoaded,
                             affinity_lost: None,
                         };
-                        tag(response.headers_mut(), &decision);
+                        tag(response.headers_mut(), &decision, 1);
                     }
                     response
                 }),
@@ -822,13 +831,17 @@ mod tests {
             auth: ClientAuth::resolve(Some("s3cret".to_string()), None).expect("a key resolves"),
             ..open_config()
         };
-        let written = logged(
-            router(Fabric::new(Vec::new()), config),
-            get_request("/v1/models"),
-        )
-        .await;
+        let mut refused = get_request("/v1/models");
+        // Actually presented, so the assertion below is about a credential that
+        // reached the middleware rather than one that was never sent.
+        refused.headers_mut().insert(
+            "authorization",
+            HeaderValue::from_static("Bearer presented-9f3a"),
+        );
+        let written = logged(router(Fabric::new(Vec::new()), config), refused).await;
         assert!(written.contains("status=401"), "{written}");
-        // The credential itself must never reach the log.
+        // No request header reaches the log, and one of them is the client's key.
+        assert!(!written.contains("presented-9f3a"), "{written}");
         assert!(!written.contains("s3cret"), "{written}");
     }
 
@@ -855,6 +868,34 @@ mod tests {
             served.is_empty(),
             "a served request must not warn: {served}"
         );
+    }
+
+    /// A node that could not be reached is the failure most worth attributing,
+    /// and it is the one an operator is reading WARN to find. The error already
+    /// carries the label, so a line that cannot name the node is a line that
+    /// sends them to a packet capture anyway.
+    #[tokio::test]
+    async fn a_failure_to_reach_a_node_records_which_node() {
+        let app = Router::new()
+            .route(
+                "/v1/chat/completions",
+                post(|| async {
+                    forward_error(ForwardError::Transport {
+                        label: "node-a".to_string(),
+                        detail: "connection refused".to_string(),
+                    })
+                }),
+            )
+            .layer(middleware::from_fn(access_log));
+
+        let written = logged_at(
+            tracing::Level::WARN,
+            app,
+            request(serde_json::json!({ "model": "m" })),
+        )
+        .await;
+        assert!(written.contains("status=502"), "{written}");
+        assert!(written.contains("node=\"node-a\""), "{written}");
     }
 
     /// A query string can carry anything a client puts there, and the path
