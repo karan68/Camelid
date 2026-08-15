@@ -369,8 +369,10 @@ impl Fabric {
     /// [`Fabric::with_max_observation_age`] exists to remove.
     ///
     /// If nowhere else can take it, the node's own refusal is returned rather
-    /// than an error this proxy invented. A client is owed the real answer,
-    /// including its `Retry-After`.
+    /// than an error this proxy invented: the client gets the status and body
+    /// the node sent, its code and message included. Not its headers, though —
+    /// [`Forwarded`] carries none, so the node's `Retry-After` does not survive
+    /// the hop.
     fn send_until_a_node_takes_it<T: NodeAnswer>(
         &self,
         request: &RouteRequest<'_>,
@@ -380,20 +382,22 @@ impl Fabric {
         let mut saturated: Vec<String> = Vec::new();
         let mut first_failure: Option<ForwardError> = None;
         let mut refused: Option<(T, Placement)> = None;
-        let mut attempts = 0;
+        // Nodes actually asked, which is not the attempt number: placement can
+        // run out before an attempt reaches one.
+        let mut asked = 0;
 
         for attempt in 1..=self.max_forward_attempts.max(1) {
-            attempts = attempt;
             let excluded: Vec<String> = gone.iter().chain(saturated.iter()).cloned().collect();
             let placement = match self.place_excluding(request, &excluded) {
                 Ok(placement) => placement,
                 Err(refusal) => {
                     if let Some((value, placement)) = refused {
-                        return Ok(self.settle_for_the_refusal(value, placement, attempts, &gone));
+                        return Ok(self.settle_for_the_refusal(value, placement, asked, &gone));
                     }
                     return Err(self.ran_out_of_nodes(first_failure, refusal));
                 }
             };
+            asked = attempt;
 
             match send(&placement.node.spec) {
                 Ok(value) if value.refused_for_backpressure() => {
@@ -440,7 +444,7 @@ impl Fabric {
         }
 
         if let Some((value, placement)) = refused {
-            return Ok(self.settle_for_the_refusal(value, placement, attempts, &gone));
+            return Ok(self.settle_for_the_refusal(value, placement, asked, &gone));
         }
 
         // The budget ran out with nodes possibly still untried. Say so with the
@@ -507,7 +511,8 @@ pub struct Dispatched {
     pub decision: RouteDecision,
     pub answer: Forwarded,
     /// Nodes this request was sent to, the one that answered included. More
-    /// than one means a node was found gone and the request was placed again.
+    /// than one means a node was found gone, or full, and the request was
+    /// placed again.
     pub attempts: usize,
 }
 

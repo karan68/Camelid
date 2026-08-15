@@ -1788,6 +1788,29 @@ async fn a_fabric_that_is_entirely_saturated_returns_a_node_s_own_refusal() {
     assert_eq!(completions_served(&nodes), vec![1, 1]);
 }
 
+/// The count of nodes asked has to be the count of nodes asked. With one node
+/// and a budget of two, placement runs out before a second node is reached, so
+/// reporting the budget sends an operator looking for a node that was never
+/// contacted.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lone_saturated_node_is_one_attempt_not_two() {
+    let nodes = vec![StubNode::start(StubConfig::queue_full("shared-model"))];
+    let specs = vec![nodes[0].spec("a-full")];
+    let addr = start_proxy(fabric_with_attempts(specs, 2), RouteMode::Throughput).await;
+
+    let (status, body, headers) =
+        post_chat(addr, &serde_json::json!({ "model": "shared-model" }), &[]).await;
+
+    assert_eq!(status, 503, "{body}");
+    assert_eq!(body["error"]["code"], ENGINE_QUEUE_FULL_CODE);
+    assert_eq!(completions_served(&nodes), vec![1]);
+    assert_eq!(
+        header(&headers, "x-camelid-fabric-attempts"),
+        Some("1"),
+        "one node was asked, so the answer must not claim two"
+    );
+}
+
 /// The switch that turns off failover turns this off too: one attempt means
 /// the first node's answer is the answer.
 #[tokio::test(flavor = "multi_thread")]
