@@ -1514,7 +1514,9 @@ async fn a_node_that_took_the_request_is_not_asked_to_run_it_again_elsewhere() {
         post_chat(addr, &serde_json::json!({ "model": "shared-model" }), &[]).await;
 
     assert_eq!(status, 502, "{refusal}");
-    assert_eq!(header(&headers, "x-camelid-fabric-node"), None);
+    // The refusal names the node it happened against, so an operator can act on
+    // the one that is actually broken.
+    assert_eq!(header(&headers, "x-camelid-fabric-node"), Some("node-a"));
     assert_eq!(
         completions_served(std::slice::from_ref(&a))[0],
         1,
