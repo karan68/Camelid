@@ -8,14 +8,14 @@
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use camelid::fabric::server::{serve_on, ClientAuth, ServeConfig};
+use camelid::fabric::server::{serve_on, serve_on_until, ClientAuth, ServeConfig};
 use camelid::fabric::{Fabric, NodeSpec, RouteMode, ENGINE_QUEUE_FULL_CODE};
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
@@ -1222,6 +1222,155 @@ async fn discovery_does_not_answer_an_unauthenticated_caller() {
         get_raw(addr, "/v1/models", &[("Authorization", "Bearer s3cret")]).await;
     assert_eq!(served, 200);
     assert!(listing.contains("private-model"), "{listing}");
+}
+
+/// A `tracing` sink a test can read back, so the access log can be asserted as
+/// an operator actually reads it rather than by calling the middleware directly.
+#[derive(Clone)]
+struct AccessLog(Arc<Mutex<Vec<u8>>>);
+
+impl AccessLog {
+    /// The line mentioning `needle`. Every test in this binary shares one sink,
+    /// so a caller has to look for something only it could have sent.
+    fn line_mentioning(&self, needle: &str) -> Option<String> {
+        let captured = self.0.lock().expect("access log");
+        String::from_utf8_lossy(&captured)
+            .lines()
+            .find(|line| line.contains(needle))
+            .map(str::to_string)
+    }
+}
+
+impl Write for AccessLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("access log").extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Install the capturing subscriber, once: a global default can only be set
+/// once per process, and these tests share one.
+fn access_log() -> AccessLog {
+    static CAPTURED: OnceLock<AccessLog> = OnceLock::new();
+    CAPTURED
+        .get_or_init(|| {
+            let sink = AccessLog(Arc::new(Mutex::new(Vec::new())));
+            let writer = sink.clone();
+            tracing_subscriber::fmt()
+                .with_writer(move || writer.clone())
+                .with_max_level(tracing::Level::INFO)
+                // Both off so the assertions match on the text an operator
+                // greps, not on escape codes or a timestamp.
+                .with_ansi(false)
+                .without_time()
+                .init();
+            sink
+        })
+        .clone()
+}
+
+/// The access log is the only place this proxy says who called and which
+/// request it was. Both are supplied by the serving stack rather than by the
+/// middleware, so neither is proven by calling the middleware directly.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_is_logged_with_the_caller_and_the_id_it_was_given() {
+    let recorded = access_log();
+    let node = StubNode::start(StubConfig::ready("shared-model", 0));
+    let addr = start_proxy(fabric_of(vec![node.spec("node-a")]), RouteMode::Throughput).await;
+
+    let mine = "only-this-test-sends-this-id";
+    let body = serde_json::json!({ "model": "shared-model" });
+    let (status, answered, headers) = post_chat(addr, &body, &[("x-request-id", mine)]).await;
+
+    assert_eq!(status, 200, "{answered}");
+    assert_eq!(
+        header(&headers, "x-request-id"),
+        Some(mine),
+        "the id a client sent must come back to it, or it cannot quote it"
+    );
+
+    let line = recorded
+        .line_mentioning(mine)
+        .expect("the request must be logged under the id it was given");
+    assert!(
+        line.contains("127.0.0.1:"),
+        "the line must name the caller, not `-`: {line}"
+    );
+}
+
+/// Being asked to stop is not the same as being killed. A proxy holds other
+/// people's requests, and dropping them on a deploy turns a routine restart
+/// into a client-visible failure.
+///
+/// The load-bearing claim is an *ordering* one: the stop must not complete
+/// until the work in flight has. Asserting only that the request got its answer
+/// would prove nothing here, because a connection axum has already accepted is
+/// served on its own task and finishes either way while this process lives — it
+/// is the caller returning early, and the process exiting under it, that loses
+/// the request. So this measures how long the stop took to report itself done.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stop_finishes_the_work_in_flight_and_accepts_no_more() {
+    let generating = Duration::from_millis(600);
+    let node = StubNode::start(StubConfig {
+        completion_delay: generating,
+        ..StubConfig::ready("shared-model", 0)
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind proxy");
+    let addr = listener.local_addr().expect("proxy addr");
+    let fabric = fabric_of(vec![node.spec("node-a")]);
+    let config = ServeConfig {
+        mode: RouteMode::Throughput,
+        forward_timeout: FORWARD_TIMEOUT,
+        auth: ClientAuth::none(),
+    };
+
+    let (stop, stop_asked) = tokio::sync::oneshot::channel::<()>();
+    let serving = tokio::spawn(async move {
+        serve_on_until(listener, fabric, config, async move {
+            let _ = stop_asked.await;
+        })
+        .await
+    });
+
+    let body = serde_json::json!({ "model": "shared-model" });
+    let inflight = tokio::spawn(async move { post_chat(addr, &body, &[]).await });
+
+    // Long enough for the request to be on the node, short enough that it is
+    // still there when the stop arrives.
+    let settle = Duration::from_millis(200);
+    tokio::time::sleep(settle).await;
+    let asked_at = Instant::now();
+    let _ = stop.send(());
+
+    serving
+        .await
+        .expect("the server joins")
+        .expect("a stop is not a failure");
+    let took = asked_at.elapsed();
+
+    // The request still had most of its generation left when the stop landed.
+    let still_owed = generating - settle;
+    assert!(
+        took >= still_owed / 2,
+        "the proxy called itself stopped after {took:?}, while it still owed a \
+         request about {still_owed:?} of work"
+    );
+
+    let (status, answered, _) = inflight.await.expect("the in-flight request joins");
+    assert_eq!(
+        status, 200,
+        "a request already on a node must be finished, not dropped: {answered}"
+    );
+    assert!(
+        tokio::net::TcpStream::connect(addr).await.is_err(),
+        "a stopped proxy must not still be taking work"
+    );
 }
 
 /// A proxy started without a key is unchanged: this is what every other test in

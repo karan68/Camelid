@@ -36,7 +36,13 @@
 //! * Every request is recorded through `tracing` at INFO, and a failure at
 //!   WARN, which means nothing is written unless `RUST_LOG` asks for it — the
 //!   same as the rest of this binary. `RUST_LOG=camelid=info` is the whole
-//!   access log; `RUST_LOG=camelid=warn` narrows it to what failed.
+//!   access log; `RUST_LOG=camelid=warn` narrows it to what failed. Each line
+//!   carries the client it came from and an `x-request-id`, which is also
+//!   answered to the client — the node does not log that id, so it correlates
+//!   a complaint with this proxy's line, not with the node's own.
+//! * A stop (Ctrl-C, or SIGTERM where there is one) closes the listener and
+//!   lets the requests already in flight finish, bounded by `forward_timeout`.
+//!   A kill still drops them: this covers being asked to stop, not being shot.
 //! * A node that becomes ready, or loads a different model, is routed to only
 //!   once the current observation expires. A node that *stops* answering is not
 //!   waited on: the request that finds it gone is placed on another node
@@ -57,7 +63,7 @@ use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{DefaultBodyLimit, Request, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Request, State};
 use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::Next;
@@ -72,6 +78,12 @@ use crate::api::{ApiAuth, DEFAULT_MAX_REQUEST_BODY_BYTES};
 
 /// Optional header a client sends to request affinity to a specific node.
 const STICKY_HEADER: &str = "x-camelid-fabric-sticky";
+
+/// The header a request id arrives on, and is answered with.
+const REQUEST_ID_HEADER: &str = "x-request-id";
+
+/// Longest inbound request id this proxy will adopt as its own.
+const MAX_REQUEST_ID_LEN: usize = 128;
 
 /// The credential a client must present to this proxy.
 ///
@@ -192,9 +204,15 @@ pub fn router(fabric: Fabric, config: ServeConfig) -> Router {
 async fn access_log(request: Request, next: Next) -> Response {
     let method = request.method().clone();
     let path = request.uri().path().to_string();
+    let client = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(peer)| peer.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let request_id = correlation_id(request.headers());
     let started = Instant::now();
 
-    let response = next.run(request).await;
+    let mut response = next.run(request).await;
 
     let elapsed_ms = started.elapsed().as_millis() as u64;
     let status = response.status();
@@ -209,6 +227,8 @@ async fn access_log(request: Request, next: Next) -> Response {
             node,
             reason,
             elapsed_ms,
+            client,
+            request_id,
             "fabric request failed"
         );
     } else {
@@ -219,11 +239,46 @@ async fn access_log(request: Request, next: Next) -> Response {
             node,
             reason,
             elapsed_ms,
+            client,
+            request_id,
             "fabric request"
         );
     }
 
+    // Returned so a client that reports a slow or failed call can name the line
+    // that recorded it, without an operator having to guess from a timestamp.
+    insert(response.headers_mut(), REQUEST_ID_HEADER, &request_id);
     response
+}
+
+/// The id this request is known by, in the log and in the client's answer.
+///
+/// An inbound id is honoured so one assigned upstream survives the hop — but
+/// only after it is checked, because it is written into a log line a client
+/// does not otherwise control. HTTP framing rejects a raw CR or LF before this
+/// sees it, so the reachable problems are the quieter ones: a tab or DEL that
+/// makes a line hard to parse, and a length nothing bounds.
+///
+/// Anything that fails the check gets a fresh id rather than a cleaned-up one.
+/// A sanitised id is no longer the caller's id, so it would correlate with
+/// nothing while still looking as though it did.
+fn correlation_id(headers: &HeaderMap) -> String {
+    headers
+        .get(REQUEST_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| is_usable_request_id(value))
+        .map(str::to_string)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
+}
+
+/// Pure: non-empty, printable, and short enough to belong in a log line.
+///
+/// `is_ascii_graphic` excludes space and every control character, so a value
+/// that passes cannot break the line it is written on.
+fn is_usable_request_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_REQUEST_ID_LEN
+        && value.bytes().all(|byte| byte.is_ascii_graphic())
 }
 
 /// One of this proxy's own response headers, or `-` when the answer never got
@@ -273,16 +328,100 @@ fn refuse_unauthenticated_remote(
     ))
 }
 
-/// Serve on an already-bound listener.
+/// Serve on an already-bound listener, until the operator asks it to stop.
 ///
 /// Split from [`bind`] so a caller can read back the real port — which matters
 /// when it asked for port 0 — before it starts serving.
+///
+/// A stop is not a kill. The listener closes so no new request is accepted,
+/// and the ones already in flight are given until `forward_timeout` to finish,
+/// because that is already this proxy's answer to "how long may a request
+/// legitimately take".
+///
+/// That bound is a backstop, and it is worth knowing which requests it is for.
+/// A buffered request cannot outlive it — the same value bounds the forward, so
+/// the request ends first either way. A *stream* can: its idle timeout resets
+/// with every event, so a client reading slowly could otherwise hold the
+/// process open for as long as it kept reading. An orchestrator's own grace
+/// period is usually shorter than either and simply wins.
 pub async fn serve_on(
     listener: tokio::net::TcpListener,
     fabric: Fabric,
     config: ServeConfig,
 ) -> std::io::Result<()> {
-    axum::serve(listener, router(fabric, config)).await
+    serve_on_until(listener, fabric, config, stop_requested()).await
+}
+
+/// [`serve_on`], with the stop supplied rather than taken from the OS.
+///
+/// The signal itself cannot be exercised by a test — a test that raised
+/// SIGTERM would stop the test runner — so what a stop *does* is separated
+/// here from what asks for one. Everything below this line is covered; only
+/// [`stop_requested`] is not, and it is the part with no logic in it.
+pub async fn serve_on_until(
+    listener: tokio::net::TcpListener,
+    fabric: Fabric,
+    config: ServeConfig,
+    stop: impl std::future::Future<Output = ()> + Send + 'static,
+) -> std::io::Result<()> {
+    let drain = config.forward_timeout;
+    // The peer address is only available to a service built this way, and the
+    // access log is the only thing that reads it.
+    let service = router(fabric, config).into_make_service_with_connect_info::<SocketAddr>();
+
+    let (draining, drain_started) = tokio::sync::oneshot::channel();
+    let serving = axum::serve(listener, service).with_graceful_shutdown(async move {
+        stop.await;
+        tracing::info!("stopping: no longer accepting requests, finishing the ones in flight");
+        let _ = draining.send(());
+    });
+
+    tokio::select! {
+        served = serving => served,
+        // The clock starts when the stop is asked for, not when serving began.
+        () = async move {
+            let _ = drain_started.await;
+            tokio::time::sleep(drain).await;
+        } => {
+            tracing::warn!(
+                drain_seconds = drain.as_secs(),
+                "in-flight requests did not finish in time; stopping without them"
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Resolves when the operator asks this process to stop.
+///
+/// Ctrl-C is the interactive stop. SIGTERM is what an orchestrator sends first,
+/// and it is the one that matters for a proxy holding other people's in-flight
+/// requests: without a handler it is an immediate kill, and every request being
+/// served at that moment dies with it. Windows has no SIGTERM, and there
+/// `ctrl_c` also covers the console being closed.
+async fn stop_requested() {
+    let interrupt = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            // Nothing to wait for, but Ctrl-C must still work, so this arm just
+            // never completes rather than resolving and stopping the server.
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        () = interrupt => {}
+        () = terminate => {}
+    }
 }
 
 /// List every model the fabric can currently route to.
@@ -752,6 +891,22 @@ mod tests {
         app: Router,
         request: axum::http::Request<axum::body::Body>,
     ) -> String {
+        logged_answer_at(level, app, request).await.0
+    }
+
+    /// The log and the answer together, for the fields that appear in both.
+    async fn logged_answer(
+        app: Router,
+        request: axum::http::Request<axum::body::Body>,
+    ) -> (String, Response) {
+        logged_answer_at(tracing::Level::INFO, app, request).await
+    }
+
+    async fn logged_answer_at(
+        level: tracing::Level,
+        app: Router,
+        request: axum::http::Request<axum::body::Body>,
+    ) -> (String, Response) {
         let captured = Captured::default();
         let subscriber = tracing_subscriber::fmt()
             .with_writer(captured.clone())
@@ -759,9 +914,9 @@ mod tests {
             .with_ansi(false)
             .finish();
         let guard = tracing::subscriber::set_default(subscriber);
-        let _ = app.oneshot(request).await.expect("router answers");
+        let response = app.oneshot(request).await.expect("router answers");
         drop(guard);
-        captured.text()
+        (captured.text(), response)
     }
 
     /// A router whose answer carries whatever the fabric would have tagged, so
@@ -909,6 +1064,98 @@ mod tests {
         .await;
         assert!(written.contains("path=/v1/models"), "{written}");
         assert!(!written.contains("s3cret"), "{written}");
+    }
+
+    /// An id assigned upstream has to survive the hop, or the two sides of a
+    /// load balancer describe the same request by different names.
+    #[tokio::test]
+    async fn an_id_the_client_supplied_is_the_one_used() {
+        let mut request = get_request("/v1/models");
+        request
+            .headers_mut()
+            .insert(REQUEST_ID_HEADER, HeaderValue::from_static("abc-123"));
+
+        let (written, response) = logged_answer(proxy(Fabric::new(Vec::new())), request).await;
+        assert!(written.contains("request_id=\"abc-123\""), "{written}");
+        assert_eq!(
+            response.headers().get(REQUEST_ID_HEADER).unwrap(),
+            "abc-123",
+            "the client has to be told which id its request was recorded under"
+        );
+    }
+
+    /// Without one there is nothing to quote in a complaint, so the proxy makes
+    /// one rather than logging a dash.
+    #[tokio::test]
+    async fn a_request_with_no_id_is_given_one() {
+        let (written, response) =
+            logged_answer(proxy(Fabric::new(Vec::new())), get_request("/v1/models")).await;
+        let issued = response
+            .headers()
+            .get(REQUEST_ID_HEADER)
+            .expect("an id is always answered")
+            .to_str()
+            .expect("printable");
+        assert!(!issued.is_empty() && issued != "-", "{issued}");
+        assert!(
+            written.contains(issued),
+            "the answer's id must be the logged one: {written}"
+        );
+    }
+
+    /// The id is written into a line the client does not otherwise control, so
+    /// an unusable one is replaced outright — not trimmed into something that
+    /// still looks like the caller's id but no longer is.
+    #[tokio::test]
+    async fn an_unusable_id_is_replaced_rather_than_cleaned_up() {
+        let mut request = get_request("/v1/models");
+        request.headers_mut().insert(
+            REQUEST_ID_HEADER,
+            HeaderValue::from_static("has space and\ttab"),
+        );
+
+        let (written, response) = logged_answer(proxy(Fabric::new(Vec::new())), request).await;
+        assert!(!written.contains("has space"), "{written}");
+        assert!(
+            !written.contains('\t'),
+            "a tab would break the line: {written}"
+        );
+        let issued = response.headers().get(REQUEST_ID_HEADER).expect("an id");
+        assert_ne!(issued, "has space and\ttab");
+    }
+
+    #[test]
+    fn what_counts_as_a_usable_id() {
+        assert!(is_usable_request_id("9f3a-1b2c"));
+        assert!(is_usable_request_id(&"a".repeat(MAX_REQUEST_ID_LEN)));
+
+        assert!(!is_usable_request_id(""), "nothing to correlate on");
+        assert!(!is_usable_request_id(&"a".repeat(MAX_REQUEST_ID_LEN + 1)));
+        assert!(!is_usable_request_id("has space"));
+        assert!(!is_usable_request_id("has\ttab"));
+        assert!(!is_usable_request_id("has\u{7f}del"));
+    }
+
+    /// Who made the request is half of an access log. The service that supplies
+    /// it is only built in [`serve_on_until`], so the middleware has to keep
+    /// working without it — every test that drives the router directly, and
+    /// every one of them would otherwise fail.
+    #[tokio::test]
+    async fn the_client_is_recorded_when_the_service_supplies_one() {
+        let mut request = get_request("/v1/models");
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([192, 0, 2, 10], 51234))));
+
+        let written = logged(proxy(Fabric::new(Vec::new())), request).await;
+        assert!(written.contains("client=\"192.0.2.10:51234\""), "{written}");
+    }
+
+    #[tokio::test]
+    async fn a_request_with_no_client_information_still_records_a_line() {
+        let written = logged(proxy(Fabric::new(Vec::new())), get_request("/v1/models")).await;
+        assert!(written.contains("fabric request"), "{written}");
+        assert!(written.contains("client=\"-\""), "{written}");
     }
 
     /// A client points at one address, so that address has to answer what it
