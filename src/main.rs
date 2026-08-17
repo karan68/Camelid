@@ -1210,6 +1210,14 @@ enum FabricAction {
         /// Set 0 to probe on every request.
         #[arg(long, default_value_t = 500)]
         observation_max_age_ms: u64,
+        /// How many nodes one request may be sent to.
+        ///
+        /// A request placed on a node that has gone since it was last observed
+        /// is placed again on another node that serves the same model, as long
+        /// as that node was never reached, so it cannot have started the work.
+        /// Set 1 to fail the request instead.
+        #[arg(long, default_value_t = camelid::fabric::DEFAULT_MAX_FORWARD_ATTEMPTS)]
+        max_forward_attempts: usize,
         /// Budget for the generation itself, which can legitimately take
         /// minutes. On a streaming request it bounds the wait for the node's
         /// response head and any later gap in which the node sends nothing;
@@ -2991,6 +2999,7 @@ async fn main() -> anyhow::Result<()> {
                 api_key_file,
                 timeout_ms,
                 observation_max_age_ms,
+                max_forward_attempts,
                 forward_timeout_s,
                 allow_unauthenticated_remote,
             } => {
@@ -3004,7 +3013,8 @@ async fn main() -> anyhow::Result<()> {
                     .with_bearer(bearer.as_deref())
                     .with_max_observation_age(std::time::Duration::from_millis(
                         observation_max_age_ms,
-                    ));
+                    ))
+                    .with_max_forward_attempts(max_forward_attempts);
 
                 // Bind before announcing, so a refused or already-taken address
                 // never prints a listening line it did not earn.

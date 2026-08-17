@@ -44,7 +44,13 @@ impl Forwarded {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ForwardError {
-    /// The request never completed against that node.
+    /// The node was never reached, so it cannot have run the request.
+    ///
+    /// Held apart from [`ForwardError::Transport`] because that is the whole
+    /// difference between "safe to send somewhere else" and "may already be
+    /// generating"; see [`ForwardError::node_never_received_it`].
+    Unreachable { label: String, detail: String },
+    /// The request never completed against that node, and may have reached it.
     Transport { label: String, detail: String },
     /// The node answered, but not with JSON.
     Json { label: String, detail: String },
@@ -52,9 +58,44 @@ pub enum ForwardError {
     Unsupported(String),
 }
 
+impl ForwardError {
+    /// Whether the node provably never received the request.
+    ///
+    /// Only a caller that has said nothing to its own client on the strength of
+    /// this attempt may act on it: re-sending is safe because the node cannot
+    /// have started, not because the request is idempotent.
+    pub fn node_never_received_it(&self) -> bool {
+        matches!(self, Self::Unreachable { .. })
+    }
+
+    /// Which node failed, when the failure is attributable to one.
+    pub fn label(&self) -> Option<&str> {
+        match self {
+            Self::Unreachable { label, .. }
+            | Self::Transport { label, .. }
+            | Self::Json { label, .. } => Some(label),
+            Self::Unsupported(_) => None,
+        }
+    }
+}
+
+/// Tag an HTTP failure with the node it happened against, keeping the one
+/// distinction a retry depends on.
+fn dial_or_transport(label: &str, error: HttpError) -> ForwardError {
+    let (label, detail) = (label.to_string(), error.to_string());
+    if error.peer_never_received_it() {
+        ForwardError::Unreachable { label, detail }
+    } else {
+        ForwardError::Transport { label, detail }
+    }
+}
+
 impl std::fmt::Display for ForwardError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Unreachable { label, detail } => {
+                write!(f, "node `{label}` could not be reached: {detail}")
+            }
             Self::Transport { label, detail } => {
                 write!(f, "node `{label}` did not answer: {detail}")
             }
@@ -144,10 +185,7 @@ pub fn forward(
         timeout,
         MAX_RESPONSE_BYTES,
     )
-    .map_err(|error: HttpError| ForwardError::Transport {
-        label: spec.label.clone(),
-        detail: error.to_string(),
-    })?;
+    .map_err(|error| dial_or_transport(&spec.label, error))?;
     let elapsed = started.elapsed();
 
     // An empty body is legal for some statuses; represent it as null rather than
@@ -198,6 +236,9 @@ impl std::fmt::Debug for Streaming {
 
 impl Streaming {
     /// The next piece of the body, or `None` at the end of the stream.
+    ///
+    /// Always a `Transport` failure, never `Unreachable`: the node answered to
+    /// get here, so the request cannot be sent anywhere else.
     pub fn next_chunk(&mut self) -> Result<Option<Vec<u8>>, ForwardError> {
         self.stream
             .next_chunk()
@@ -239,6 +280,9 @@ pub fn forward_streaming(
         detail: format!("request body could not be encoded: {error}"),
     })?;
 
+    // Only opening the stream can fail before the node has the request. Once a
+    // head is in, the node is generating, so everything below is `Transport`
+    // whatever the underlying cause was.
     let transport = |error: HttpError| ForwardError::Transport {
         label: spec.label.clone(),
         detail: error.to_string(),
@@ -256,7 +300,7 @@ pub fn forward_streaming(
         idle_timeout,
         MAX_RESPONSE_BYTES,
     )
-    .map_err(transport)?;
+    .map_err(|error| dial_or_transport(&spec.label, error))?;
 
     let head = stream.head().clone();
     // A node that refused, or answered with something other than a stream, has
@@ -373,11 +417,53 @@ mod tests {
         )
         .expect_err("port 1 is closed");
         match &error {
-            ForwardError::Transport { label, .. } => assert_eq!(label, "windows"),
-            other => panic!("expected Transport, got {other:?}"),
+            ForwardError::Unreachable { label, .. } => assert_eq!(label, "windows"),
+            other => panic!("expected Unreachable, got {other:?}"),
         }
         // The message must name the node, or an operator cannot act on it.
         assert!(error.to_string().contains("windows"), "{error}");
+        assert_eq!(error.label(), Some("windows"));
+    }
+
+    #[test]
+    fn a_node_that_was_never_dialled_is_distinguished_from_one_that_was() {
+        // The distinction the whole retry path rests on, taken from the real
+        // dialling code rather than a hand-built variant.
+        let unreached = forward(
+            &spec("gone", 1),
+            "/v1/chat/completions",
+            &chat_request("m", "hi", 4),
+            None,
+            Duration::from_millis(400),
+        )
+        .expect_err("port 1 is closed");
+        assert!(unreached.node_never_received_it(), "{unreached:?}");
+
+        let interrupted = ForwardError::Transport {
+            label: "gone".to_string(),
+            detail: "connection reset".to_string(),
+        };
+        assert!(!interrupted.node_never_received_it());
+
+        // A refusal that never named a node cannot be blamed on one either.
+        let refused = reject_streaming(&json!({ "model": "m", "stream": true }))
+            .expect_err("streaming is unsupported");
+        assert!(!refused.node_never_received_it());
+        assert_eq!(refused.label(), None);
+    }
+
+    #[test]
+    fn a_streaming_open_against_a_closed_port_is_also_never_received() {
+        let error = forward_streaming(
+            &spec("gone", 1),
+            "/v1/chat/completions",
+            &json!({ "model": "m", "stream": true }),
+            None,
+            Duration::from_millis(400),
+            Duration::from_millis(400),
+        )
+        .expect_err("port 1 is closed");
+        assert!(error.node_never_received_it(), "{error:?}");
     }
 
     #[test]

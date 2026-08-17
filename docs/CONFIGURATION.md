@@ -107,16 +107,29 @@ target/release/camelid fabric serve \
 
 Two limits are deliberate and worth knowing before you deploy it:
 
-- The proxy has no key of its own, so it authenticates no client. The acknowledgement flag is the
-  only way to bind it to a routable address, and it should only be used behind something that does
-  authenticate.
+- `--api-key` (or `--api-key-file`) is the key the proxy requires *from its clients*, and having one
+  satisfies the bind guard on its own. It deliberately reads no environment variable: on this command
+  `CAMELID_API_KEY` already names the token sent to nodes, and one value must not silently configure
+  both directions. Without a key, `--allow-unauthenticated-remote` is the only way to bind a routable
+  address, and it should only be used behind something that does authenticate.
 - `--bearer` (or `CAMELID_API_KEY`) is the token the proxy presents *to its nodes*, the same as
   `fabric status|route|run`. A node started with `--api-key` needs it: `/v1/health` is exempt from
   that node's auth, so without a token the node observes as ready and then answers every forwarded
   request with 401.
 
-Request bodies are bounded at the same 16 MiB default the node itself uses, and streaming requests
-are refused with 400 rather than half-supported.
+The proxy re-probes its nodes at most once per `--observation-max-age-ms` (500 by default) rather
+than once per request. Inside that window its view can be wrong, so a request placed on a node that
+has gone since is placed again on another node serving the same model, up to `--max-forward-attempts`
+(2 by default) nodes in all. A request is only ever sent twice when the first node was never reached
+and so cannot have started it: a node that accepted the request and then failed, or that failed
+part-way through a stream, ends the request with 502 rather than risking a second generation. Set
+`--max-forward-attempts 1` to fail on the first node instead. Every answer carries
+`x-camelid-fabric-node`, `x-camelid-fabric-reason` and `x-camelid-fabric-attempts`, so a client can
+tell a first-choice placement from a failover.
+
+Request bodies are bounded at the same 16 MiB default the node itself uses. A streaming request is
+relayed as it arrives; `fabric run`, which returns one complete answer, refuses `stream: true` with
+400 instead.
 
 ## Mixtral diagnostic gate
 
