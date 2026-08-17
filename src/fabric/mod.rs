@@ -34,7 +34,8 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 pub use forward::{
-    wants_streaming, ForwardError, Forwarded, StreamOutcome, Streaming, DEFAULT_FORWARD_TIMEOUT,
+    wants_streaming, ForwardError, Forwarded, NodeAnswer, StreamOutcome, Streaming,
+    DEFAULT_FORWARD_TIMEOUT, ENGINE_QUEUE_FULL_CODE,
 };
 pub use node::{
     parse_fabric, parse_node_spec, NodeReady, NodeSnapshot, NodeSpec, NodeSpecParseError,
@@ -350,28 +351,63 @@ impl Fabric {
     }
 
     /// Place the request and send it, moving on while a node turns out to be
-    /// gone.
+    /// gone or too busy to take it.
     ///
     /// `send` must not have told anyone anything on the strength of an attempt
     /// it reports as failed: this calls it again against another node, which is
     /// only safe while nothing has been said and — per
     /// [`ForwardError::node_never_received_it`] — the failed node cannot have
     /// started the work.
-    fn send_until_a_node_takes_it<T>(
+    ///
+    /// A node that answers with a queue-full refusal gets the same treatment
+    /// for the same reason ([`NodeAnswer::refused_for_backpressure`]): it
+    /// rejected the request at its queue boundary rather than running it, so
+    /// another node can be asked. The two are tracked apart because only one of
+    /// them says the observation was wrong — a saturated node is exactly where
+    /// the observation said it was, and re-probing on every refusal would spend
+    /// a probe per request under load, which is the cost
+    /// [`Fabric::with_max_observation_age`] exists to remove.
+    ///
+    /// If nowhere else can take it, the node's own refusal is returned rather
+    /// than an error this proxy invented: the client gets the status and body
+    /// the node sent, its code and message included. Not its headers, though —
+    /// [`Forwarded`] carries none, so the node's `Retry-After` does not survive
+    /// the hop.
+    fn send_until_a_node_takes_it<T: NodeAnswer>(
         &self,
         request: &RouteRequest<'_>,
         mut send: impl FnMut(&NodeSpec) -> Result<T, ForwardError>,
     ) -> Result<Sent<T>, DispatchError> {
         let mut gone: Vec<String> = Vec::new();
+        let mut saturated: Vec<String> = Vec::new();
         let mut first_failure: Option<ForwardError> = None;
+        let mut refused: Option<(T, Placement)> = None;
+        // Nodes actually asked, which is not the attempt number: placement can
+        // run out before an attempt reaches one.
+        let mut asked = 0;
 
         for attempt in 1..=self.max_forward_attempts.max(1) {
-            let placement = match self.place_excluding(request, &gone) {
+            let excluded: Vec<String> = gone.iter().chain(saturated.iter()).cloned().collect();
+            let placement = match self.place_excluding(request, &excluded) {
                 Ok(placement) => placement,
-                Err(refusal) => return Err(self.ran_out_of_nodes(first_failure, refusal)),
+                Err(refusal) => {
+                    if let Some((value, placement)) = refused {
+                        return Ok(self.settle_for_the_refusal(value, placement, asked, &gone));
+                    }
+                    return Err(self.ran_out_of_nodes(first_failure, refusal));
+                }
             };
+            asked = attempt;
 
             match send(&placement.node.spec) {
+                Ok(value) if value.refused_for_backpressure() => {
+                    saturated.push(placement.decision.label.clone());
+                    // The first refusal is the one a client would have received
+                    // before this existed, so it is the one to fall back to.
+                    if refused.is_none() {
+                        refused = Some((value, placement));
+                    }
+                }
                 Ok(value) => {
                     // A node this request could not reach was named by the
                     // current observation, so that observation must not outlive
@@ -407,6 +443,10 @@ impl Fabric {
             }
         }
 
+        if let Some((value, placement)) = refused {
+            return Ok(self.settle_for_the_refusal(value, placement, asked, &gone));
+        }
+
         // The budget ran out with nodes possibly still untried. Say so with the
         // failure that started it, not with a count.
         let exhausted = first_failure.expect("the budget can only run out after a failure");
@@ -420,6 +460,29 @@ impl Fabric {
     /// excluded the nodes it just found gone. That finding is the story worth
     /// telling; a refusal derived from an exclusion this request invented is
     /// not. The observation is dropped with it: it named a node that is gone.
+    /// Hand back a node's own refusal, the alternatives having been tried.
+    ///
+    /// The observation is dropped only for a node found *gone*, never for a
+    /// saturated one: a full node is exactly where the observation said it was,
+    /// so forgetting here would re-probe the whole fabric once per request for
+    /// as long as it stays busy.
+    fn settle_for_the_refusal<T>(
+        &self,
+        value: T,
+        placement: Placement,
+        attempts: usize,
+        gone: &[String],
+    ) -> Sent<T> {
+        if !gone.is_empty() {
+            self.forget_observation();
+        }
+        Sent {
+            value,
+            placement,
+            attempts,
+        }
+    }
+
     fn ran_out_of_nodes(
         &self,
         first_failure: Option<ForwardError>,
@@ -448,7 +511,8 @@ pub struct Dispatched {
     pub decision: RouteDecision,
     pub answer: Forwarded,
     /// Nodes this request was sent to, the one that answered included. More
-    /// than one means a node was found gone and the request was placed again.
+    /// than one means a node was found gone, or full, and the request was
+    /// placed again.
     pub attempts: usize,
 }
 
