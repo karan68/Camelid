@@ -4271,16 +4271,18 @@ impl TensorStore {
         }
         let expected_elements = shape.element_count()?;
         let bytes = self.tensor_bytes(source_name)?;
+        let blocks = decode_q8_0_blocks(source_name, &bytes, expected_elements)?;
         if let Some(Q8_0RuntimeStorage::PackedRows4(packed)) =
             q8_0_runtime_packed_rows4_for_tensor(tensor_name, &shape, &bytes)?
         {
-            return Ok(CpuTensor::q8_0_runtime_packed_rows4_linear(
+            let mut tensor = CpuTensor::q8_0_runtime_packed_rows4_linear(
                 tensor_name,
                 shape,
                 packed,
-            ));
+            );
+            tensor.q8_0_blocks = Some(blocks);
+            return Ok(tensor);
         }
-        let blocks = decode_q8_0_blocks(source_name, &bytes, expected_elements)?;
         CpuTensor::from_q8_0_blocks(tensor_name, shape, blocks)
     }
 
