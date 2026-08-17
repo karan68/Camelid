@@ -501,6 +501,59 @@ pub fn render_status(snapshots: &[NodeSnapshot]) -> String {
     out
 }
 
+/// What a starting proxy tells its operator about the fabric behind it.
+///
+/// A proxy that cannot reach a node still starts: the node may be booting, and a
+/// fabric that refuses to come up because one member is late is less available
+/// than the member it is waiting for. But starting silently is worse — with only
+/// a listening line to go on, a node whose name never resolves leaves the proxy
+/// serving at reduced capacity forever with nothing said, and the first symptom
+/// is a latency graph nobody can explain.
+///
+/// So: report, never refuse. Every node that cannot take work is named, with the
+/// address that was tried and the reason it failed, because "which of my nodes,
+/// and why" is the whole question an operator has at that moment.
+///
+/// Kept pure so the wording is covered by a unit test rather than by starting a
+/// server, the same way [`render_status`] is.
+pub fn startup_report(snapshots: &[NodeSnapshot]) -> String {
+    if snapshots.is_empty() {
+        return "fabric: no nodes configured\n".to_string();
+    }
+
+    let summary = FabricSummary::of(snapshots);
+    let models = servable_models(snapshots);
+    let mut out = format!(
+        "fabric: {} of {} nodes ready",
+        summary.ready,
+        summary.total()
+    );
+    if models.is_empty() {
+        out.push_str("; no model is being served\n");
+    } else {
+        out.push_str(&format!("; serving {}\n", models.join(", ")));
+    }
+
+    for snapshot in snapshots {
+        let (state, reason) = match &snapshot.status {
+            NodeStatus::Ready(_) => continue,
+            NodeStatus::NotReady { reason } => ("not ready", reason),
+            NodeStatus::Unreachable { reason } => ("unreachable", reason),
+        };
+        out.push_str(&format!(
+            "  {} ({}) {state}: {reason}\n",
+            snapshot.label(),
+            snapshot.spec.authority(),
+        ));
+    }
+
+    if summary.ready == 0 {
+        out.push_str("fabric: every request will be refused until a node becomes ready\n");
+    }
+
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -617,6 +670,98 @@ mod tests {
         assert!(rendered.contains("LOAD"), "{rendered}");
         assert!(rendered.contains("cannot connect: refused"), "{rendered}");
         assert!(rendered.contains("2 node(s): 1 ready"), "{rendered}");
+    }
+
+    #[test]
+    fn the_startup_report_names_a_node_it_cannot_reach() {
+        let snapshots = vec![
+            snapshot("windows", ready_status("llama-3b")),
+            snapshot(
+                "mac",
+                NodeStatus::Unreachable {
+                    reason: "cannot resolve host: No such host is known. (os error 11001)"
+                        .to_string(),
+                },
+            ),
+        ];
+        let report = startup_report(&snapshots);
+        assert!(report.contains("1 of 2 nodes ready"), "{report}");
+        assert!(report.contains("serving llama-3b"), "{report}");
+        // The label, the address that was tried, and the reason: an operator
+        // cannot act on any two of those three.
+        assert!(
+            report.contains("mac (127.0.0.1:8181) unreachable"),
+            "{report}"
+        );
+        assert!(report.contains("os error 11001"), "{report}");
+        // A node that is doing its job is not worth a line of its own.
+        assert!(!report.contains("windows"), "{report}");
+    }
+
+    #[test]
+    fn a_healthy_fabric_reports_one_line_and_names_no_node() {
+        let snapshots = vec![
+            snapshot("a", ready_status("llama-3b")),
+            snapshot("b", ready_status("llama-3b")),
+        ];
+        assert_eq!(
+            startup_report(&snapshots),
+            "fabric: 2 of 2 nodes ready; serving llama-3b\n"
+        );
+    }
+
+    #[test]
+    fn a_startup_report_says_when_nothing_can_be_served_at_all() {
+        let snapshots = vec![
+            snapshot(
+                "a",
+                NodeStatus::Unreachable {
+                    reason: "cannot connect".to_string(),
+                },
+            ),
+            snapshot(
+                "b",
+                NodeStatus::Unreachable {
+                    reason: "cannot connect".to_string(),
+                },
+            ),
+        ];
+        let report = startup_report(&snapshots);
+        assert!(report.contains("0 of 2 nodes ready"), "{report}");
+        assert!(report.contains("no model is being served"), "{report}");
+        assert!(
+            report.contains("every request will be refused until a node becomes ready"),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn a_startup_report_separates_answering_late_from_not_answering() {
+        // These are different operator problems: one node is booting, the other
+        // is not there. Collapsing them into "down" sends you to the wrong box.
+        let snapshots = vec![
+            snapshot(
+                "warming",
+                NodeStatus::NotReady {
+                    reason: "no model loaded".to_string(),
+                },
+            ),
+            snapshot(
+                "gone",
+                NodeStatus::Unreachable {
+                    reason: "cannot connect".to_string(),
+                },
+            ),
+        ];
+        let report = startup_report(&snapshots);
+        assert!(
+            report.contains("warming (127.0.0.1:8181) not ready: no model loaded"),
+            "{report}"
+        );
+        assert!(
+            report.contains("gone (127.0.0.1:8181) unreachable: cannot connect"),
+            "{report}"
+        );
     }
 
     #[test]
