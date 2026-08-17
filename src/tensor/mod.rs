@@ -4275,11 +4275,8 @@ impl TensorStore {
         if let Some(Q8_0RuntimeStorage::PackedRows4(packed)) =
             q8_0_runtime_packed_rows4_for_tensor(tensor_name, &shape, &bytes)?
         {
-            let mut tensor = CpuTensor::q8_0_runtime_packed_rows4_linear(
-                tensor_name,
-                shape,
-                packed,
-            );
+            let mut tensor =
+                CpuTensor::q8_0_runtime_packed_rows4_linear(tensor_name, shape, packed);
             tensor.q8_0_blocks = Some(blocks);
             return Ok(tensor);
         }
