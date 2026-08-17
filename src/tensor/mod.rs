@@ -112,6 +112,7 @@ pub struct Q8_0Block {
     pub quants: [i8; 32],
 }
 
+#[allow(dead_code)]
 pub(crate) fn q8_0_blocks_as_bytes(blocks: &[Q8_0Block]) -> &[u8] {
     debug_assert_eq!(std::mem::size_of::<Q8_0Block>(), 36);
     unsafe {
@@ -582,6 +583,7 @@ impl Q8_0PackedRows4 {
         })
     }
 
+    #[allow(dead_code)]
     pub fn to_q8_0_bytes(&self) -> Vec<u8> {
         let block_len = self.interleave.block_len();
         let chunks = Q8_0_BLOCK_VALUES / block_len;
@@ -1970,6 +1972,7 @@ impl CpuTensor {
         })
     }
 
+    #[allow(dead_code)]
     pub(crate) fn q8_0_raw_bytes(&self) -> Option<std::borrow::Cow<'_, [u8]>> {
         if let Some(blocks) = self.q8_0_block_slice() {
             return Some(std::borrow::Cow::Borrowed(q8_0_blocks_as_bytes(blocks)));
