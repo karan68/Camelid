@@ -185,6 +185,39 @@ fabric: could not reload client keys: <why>. The previous set of 2 clients is st
 revocation written here has NOT taken effect.
 ```
 
+### Adding and removing a machine while it runs
+
+`--node` is read once at startup, so changing the fabric means restarting the proxy — which drops
+whatever everyone else has in flight. `--nodes-file <PATH>` puts the set in a file instead and
+re-reads it as it changes:
+
+```
+# the machines I place on
+desktop=192.0.2.10:8181
+laptop=192.0.2.11:8181
+```
+
+One `LABEL=HOST[:PORT]` per line, exactly the syntax `--node` takes, parsed by the same code. Blank
+lines and whole-line `#` comments are ignored, so a machine can be taken out for an hour by
+commenting it rather than deleting what you wrote. It conflicts with `--node`, because "which
+machines am I placing on" must have one answer.
+
+Adding a line makes that machine placeable; removing one stops it being placed on. Neither restarts
+the proxy, and **neither disturbs a request already running on the machine you removed** — that
+request is answered by the node it was placed on, and only new placements see the new set.
+
+The file is re-read at most once a second, and only when its size or modification time has changed.
+A change is only acted on if the set actually differs, so saving the file without editing it costs
+nothing.
+
+Two refusals are deliberate. A file that cannot be read, is not valid, or **names no nodes at all**
+is refused at startup rather than started on an empty fabric, which would answer every request with
+503 while looking as though it had started. And if a *re-read* fails the same way, the previous set
+stays in force and a warning is logged — a file is usually replaced by writing a new one and renaming
+it over the old, so a read landing mid-swap sees a partial or empty file, and emptying the fabric on
+that would turn an ordinary edit into a total outage. The cost is that a change written into a broken
+file has not taken effect, and the warning is the only thing that says so.
+
 The proxy re-probes its nodes at most once per `--observation-max-age-ms` (500 by default) rather
 than once per request. Inside that window its view can be wrong, so a request placed on a node that
 has gone since is placed again on another node serving the same model, up to `--max-forward-attempts`

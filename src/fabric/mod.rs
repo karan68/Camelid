@@ -25,6 +25,7 @@ pub(crate) mod client_keys;
 pub mod forward;
 pub(crate) mod http;
 pub mod node;
+pub(crate) mod nodes;
 pub mod policy;
 pub mod probe;
 pub mod server;
@@ -42,6 +43,7 @@ pub use node::{
     parse_fabric, parse_node_spec, NodeReady, NodeSnapshot, NodeSpec, NodeSpecParseError,
     NodeStatus, DEFAULT_NODE_PORT,
 };
+use nodes::NodeSet;
 pub use policy::{
     route, route_reserved, Reservations, RouteDecision, RouteError, RouteMode, RouteReason,
     RouteRequest,
@@ -59,7 +61,12 @@ pub const DEFAULT_MAX_FORWARD_ATTEMPTS: usize = 2;
 /// A configured set of nodes.
 #[derive(Clone)]
 pub struct Fabric {
-    specs: Vec<NodeSpec>,
+    /// The machines this fabric places on.
+    ///
+    /// Shared across clones for the same reason as `reserved`, and one reason
+    /// more: two clones that disagreed about which machines exist would place
+    /// against different fabrics.
+    nodes: NodeSet,
     timeout: Duration,
     bearer: Option<String>,
     /// Requests this fabric has placed and not yet finished.
@@ -68,11 +75,12 @@ pub struct Fabric {
     /// every request, and they have to be counting into the same place or they
     /// cannot see each other.
     reserved: Arc<Mutex<Reservations>>,
-    /// The most recent observation, reused while it is fresh enough.
+    /// The most recent observation, with the node-set generation it was taken
+    /// over, reused while it is fresh enough *and* still describes the set.
     ///
     /// Shared across clones for the same reason as `reserved`: an observation
     /// only one clone can see would be re-taken by every other one.
-    observed: Arc<Mutex<Option<Observation>>>,
+    observed: Arc<Mutex<Option<(u64, Observation)>>>,
     /// How stale a reused observation may be. Zero means never reuse one.
     max_observation_age: Duration,
     /// How many nodes one request may be sent to. One never fails over.
@@ -84,7 +92,7 @@ pub struct Fabric {
 impl std::fmt::Debug for Fabric {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Fabric")
-            .field("specs", &self.specs)
+            .field("nodes", &self.nodes)
             .field("timeout", &self.timeout)
             .field("bearer", &self.bearer.as_ref().map(|_| "[REDACTED]"))
             .field("max_observation_age", &self.max_observation_age)
@@ -95,8 +103,28 @@ impl std::fmt::Debug for Fabric {
 
 impl Fabric {
     pub fn new(specs: Vec<NodeSpec>) -> Self {
+        Self::over(NodeSet::fixed(specs))
+    }
+
+    /// Place on the machines named by a file, re-read as it changes.
+    ///
+    /// Fails rather than starting on an empty fabric: a proxy that silently
+    /// ignored an unreadable node file would refuse every request while
+    /// looking as though it had started correctly.
+    pub fn from_node_file(path: std::path::PathBuf) -> std::io::Result<Self> {
+        Ok(Self::over(NodeSet::from_file(path)?))
+    }
+
+    /// [`Self::from_node_file`] with the staleness bound supplied, so a test
+    /// does not have to wait one out.
+    #[cfg(test)]
+    fn from_node_file_every(path: std::path::PathBuf, interval: Duration) -> std::io::Result<Self> {
+        Ok(Self::over(NodeSet::from_file_every(path, interval)?))
+    }
+
+    fn over(nodes: NodeSet) -> Self {
         Self {
-            specs,
+            nodes,
             timeout: DEFAULT_PROBE_TIMEOUT,
             bearer: None,
             reserved: Arc::new(Mutex::new(Reservations::none())),
@@ -142,12 +170,18 @@ impl Fabric {
         self
     }
 
-    pub fn specs(&self) -> &[NodeSpec] {
-        &self.specs
+    /// The machines this fabric places on, as they stand right now.
+    pub fn specs(&self) -> Vec<NodeSpec> {
+        self.nodes.current().0.to_vec()
+    }
+
+    /// Whether the node set changes without a restart.
+    pub fn is_reloadable(&self) -> bool {
+        self.nodes.is_reloadable()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.specs.is_empty()
+        self.nodes.current().0.is_empty()
     }
 
     /// Observe every node.
@@ -165,8 +199,13 @@ impl Fabric {
     /// observation is a statement about the fabric as it was, and some
     /// refusals are reported to clients as permanent.
     fn observe_reporting_reuse(&self) -> (Vec<NodeSnapshot>, bool) {
+        // Resolved first, and its lock released before the observation lock is
+        // taken: the order is nodes -> observed -> reserved, and no two are
+        // ever held together.
+        let (specs, generation) = self.nodes.current();
+
         if self.max_observation_age.is_zero() {
-            return (self.probe(), false);
+            return (self.probe(&specs), false);
         }
 
         // Refreshing under the lock makes concurrent callers wait for one probe
@@ -174,19 +213,29 @@ impl Fabric {
         // on an expired observation would reproduce exactly the per-request
         // probing this bound exists to remove.
         let mut observed = lock(&self.observed);
-        if let Some(observation) = observed.as_ref() {
-            if observation.is_fresh_at(Instant::now(), self.max_observation_age) {
+        if let Some((taken_over, observation)) = observed.as_ref() {
+            // The generation is checked before the clock. An observation of a
+            // set that has since gained or lost a machine is not stale, it is
+            // about something else: reusing it would place on a node that has
+            // gone, or refuse to place on one that has just arrived, for the
+            // whole of the freshness window.
+            if *taken_over == generation
+                && observation.is_fresh_at(Instant::now(), self.max_observation_age)
+            {
                 return (observation.snapshots().to_vec(), true);
             }
         }
-        let snapshots = self.probe();
-        *observed = Some(Observation::taken_at(snapshots.clone(), Instant::now()));
+        let snapshots = self.probe(&specs);
+        *observed = Some((
+            generation,
+            Observation::taken_at(snapshots.clone(), Instant::now()),
+        ));
         (snapshots, false)
     }
 
-    /// Probe every node, whatever was observed before.
-    fn probe(&self) -> Vec<NodeSnapshot> {
-        probe_fabric(&self.specs, self.bearer.as_deref(), self.timeout)
+    /// Probe every node in `specs`, whatever was observed before.
+    fn probe(&self, specs: &[NodeSpec]) -> Vec<NodeSnapshot> {
+        probe_fabric(specs, self.bearer.as_deref(), self.timeout)
     }
 
     /// Drop the current observation, so the next one is taken fresh.
@@ -1077,6 +1126,104 @@ mod tests {
             ),
             "got {error:?}"
         );
+    }
+
+    /// The whole point of a node file: a machine the operator adds is placed
+    /// on, and one they take away stops being placed on, without a restart.
+    ///
+    /// The observation window here is an hour. That is deliberate — if a
+    /// changed set did not invalidate the observation taken over the old one,
+    /// this fabric would go on describing the old machines for that hour.
+    #[test]
+    fn a_changed_node_set_is_not_answered_from_the_observation_of_the_old_one() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("nodes");
+        // Port 1 is never listening, so every probe settles as Unreachable.
+        // Which labels come back is the whole question; whether they were
+        // reachable is not.
+        std::fs::write(&path, "a=127.0.0.1:1\n").expect("write");
+
+        let fabric = Fabric::from_node_file_every(path.clone(), Duration::ZERO)
+            .expect("load")
+            .with_timeout(Duration::from_millis(50))
+            .with_max_observation_age(Duration::from_secs(3600));
+
+        let labels = |snapshots: &[NodeSnapshot]| -> Vec<String> {
+            snapshots.iter().map(|s| s.label().to_string()).collect()
+        };
+
+        assert_eq!(labels(&fabric.observe()), vec!["a"]);
+
+        std::fs::write(&path, "b=127.0.0.1:1\n").expect("rewrite");
+
+        assert_eq!(
+            labels(&fabric.observe()),
+            vec!["b"],
+            "an observation of the node set as it was must not survive the set changing"
+        );
+    }
+
+    /// A set that has not changed must keep its observation, or every look at
+    /// the file would cost a probe of every node.
+    #[test]
+    fn an_unchanged_node_file_keeps_the_observation_it_already_has() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("nodes");
+        std::fs::write(&path, "a=127.0.0.1:1\n").expect("write");
+
+        let fabric = Fabric::from_node_file_every(path.clone(), Duration::ZERO)
+            .expect("load")
+            .with_timeout(Duration::from_millis(50))
+            .with_max_observation_age(Duration::from_secs(3600));
+
+        let first = fabric.observe();
+        // Rewritten with identical content: the stamp moves, the set does not.
+        std::fs::write(&path, "a=127.0.0.1:1\n").expect("identical rewrite");
+        let second = fabric.observe();
+
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1);
+        assert_eq!(
+            first[0].label(),
+            second[0].label(),
+            "an identical rewrite must not invalidate the observation"
+        );
+    }
+
+    /// Taking a machine away must not disturb what is already running on it:
+    /// reservations are counted by label and released when the placement is
+    /// dropped, whether or not the node is still in the set.
+    #[test]
+    fn removing_a_node_leaves_the_requests_already_placed_on_it_alone() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("nodes");
+        std::fs::write(&path, "a=127.0.0.1:1\nb=127.0.0.1:1\n").expect("write");
+        let fabric = Fabric::from_node_file_every(path.clone(), Duration::ZERO).expect("load");
+
+        // Reserved by hand: placement needs a ready node, and this test is
+        // about the bookkeeping, not about probing.
+        lock(&fabric.reserved).take("a");
+        assert_eq!(fabric.reserved().get("a"), 1);
+
+        std::fs::write(&path, "b=127.0.0.1:1\n").expect("remove a");
+        assert_eq!(fabric.specs().len(), 1, "the set really did shrink");
+
+        assert_eq!(
+            fabric.reserved().get("a"),
+            1,
+            "a request in flight on a removed node must still be counted"
+        );
+        lock(&fabric.reserved).release("a");
+        assert_eq!(
+            fabric.reserved().get("a"),
+            0,
+            "and must still release when it finishes"
+        );
+    }
+
+    #[test]
+    fn a_fixed_fabric_does_not_claim_to_be_reloadable() {
+        assert!(!Fabric::new(Vec::new()).is_reloadable());
     }
 
     #[test]
