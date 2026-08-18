@@ -21,6 +21,7 @@
 //! * [`policy`] — pure placement decisions; the correctness of the fabric.
 //! * [`forward`] — sending a placed request to the node that will serve it.
 
+pub(crate) mod client_keys;
 pub mod forward;
 pub(crate) mod http;
 pub mod node;

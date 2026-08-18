@@ -102,7 +102,7 @@ separate risks, and answering one does not answer the other:
 | | anonymous | authenticated |
 |---|---|---|
 | **cleartext** | refused: needs both acknowledgements | refused: needs `--tls-cert`/`--tls-key` or `--allow-cleartext-remote` |
-| **TLS** | refused: needs `--api-key` or `--allow-unauthenticated-remote` | serves |
+| **TLS** | refused: needs `--api-key`, `--client-keys`, or `--allow-unauthenticated-remote` | serves |
 
 Loopback is unaffected and needs neither.
 
@@ -130,11 +130,11 @@ that terminates TLS itself.
 
 Three limits are deliberate and worth knowing before you deploy it:
 
-- `--api-key` (or `--api-key-file`) is the key the proxy requires *from its clients*. It deliberately
-  reads no environment variable: on this command `CAMELID_API_KEY` already names the token sent to
-  nodes, and one value must not silently configure both directions. Without a key,
-  `--allow-unauthenticated-remote` is the only way to bind a routable address, and it should only be
-  used behind something that does authenticate.
+- `--api-key` (or `--api-key-file`, or `--client-keys` below) is the key the proxy requires *from its
+  clients*. It deliberately reads no environment variable: on this command `CAMELID_API_KEY` already
+  names the token sent to nodes, and one value must not silently configure both directions. Without
+  one of them, `--allow-unauthenticated-remote` is the only way to bind a routable address, and it
+  should only be used behind something that does authenticate.
 - `--bearer` (or `CAMELID_API_KEY`) is the token the proxy presents *to its nodes*, the same as
   `fabric status|route|run`. A node started with `--api-key` needs it: `/v1/health` is exempt from
   that node's auth, so without a token the node observes as ready and then answers every forwarded
@@ -143,6 +143,47 @@ Three limits are deliberate and worth knowing before you deploy it:
   listener speaks, and the proxy has no way to speak TLS to one. On a fabric whose nodes are not
   loopback, the bearer above and every prompt and completion still cross that network unencrypted,
   whatever the proxy presents to its own clients. Keep those hops on a trusted link.
+
+### Naming clients, and cutting one off
+
+`--api-key` gives every client the same secret, so the access log can only say that *someone*
+authenticated, and withdrawing access from one client means changing the key for all of them and
+restarting. `--client-keys <PATH>` replaces it with a set of named clients:
+
+```json
+{"clients": [
+  {"name": "laptop", "key": "..."},
+  {"name": "ci",     "key": "..."}
+]}
+```
+
+It conflicts with `--api-key` and `--api-key-file`, because two different answers to "who may call"
+must not be configurable at once. A set answers the *authentication* question in the table above
+exactly as a single key does, and like a single key it answers only that one: an exposed proxy still
+needs a certificate or `--allow-cleartext-remote` as well.
+
+Each key is validated by exactly the rules `--api-key` applies, and a presented credential is read
+from the same two headers (`Authorization: Bearer` or `X-API-Key`) and compared the same way. A set
+is refused at startup — rather than started open — if it is unreadable, is not valid JSON, lists no
+clients, names a client twice, or gives two clients the same key.
+
+The name, never the key, is written to every access-log line that client causes, as `client_name`.
+
+Deleting an entry revokes that client without a restart and without disturbing anyone else. The file
+is re-read at most once a second, and only when its size or modification time has changed, so this
+costs nothing per request. If a re-read fails — which is what the moment of an atomic replace looks
+like — the previous set stays in force, so an ordinary edit cannot become an outage.
+
+That fallback has a cost worth stating plainly: **a revocation written into a file that does not
+parse, or deleting the key file altogether, does not revoke anybody.** The previously loaded set goes
+on being served until the file is readable again or the proxy is restarted — and a restart refuses to
+come up at all while the file is unusable. So the proxy prints to stderr when a re-read starts
+failing, and again when it recovers, rather than relying on `RUST_LOG` being set:
+
+```
+fabric: could not reload client keys: <why>. The previous set of 2 clients is still in force, so a
+revocation written here has NOT taken effect.
+```
 
 The proxy re-probes its nodes at most once per `--observation-max-age-ms` (500 by default) rather
 than once per request. Inside that window its view can be wrong, so a request placed on a node that
