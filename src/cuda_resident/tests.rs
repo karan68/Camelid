@@ -3545,7 +3545,8 @@ fn sample_gumbel_filtered_matches_min_p_threshold() {
         let mut expected = 0usize;
         for (idx, &l) in logits.iter().enumerate() {
             if l >= threshold {
-                let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15u64.wrapping_mul(idx as u64 + 1));
+                let mut z =
+                    seed.wrapping_add(0x9E37_79B9_7F4A_7C15u64.wrapping_mul(idx as u64 + 1));
                 z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
                 z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
                 z ^= z >> 31;

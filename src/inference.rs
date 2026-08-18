@@ -3322,7 +3322,9 @@ impl LlamaInferenceSession {
                 self.copy_resident_cuda_kv_to_host(&slot.engine, n_layers, n, n_kv, head_dim)
             {
                 if trace {
-                    eprintln!("[resident-cuda] KV readback to host failed ({e}); using CPU prefill");
+                    eprintln!(
+                        "[resident-cuda] KV readback to host failed ({e}); using CPU prefill"
+                    );
                 }
                 slot.engine.set_filled(0);
                 return Ok(false);
