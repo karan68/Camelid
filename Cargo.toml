@@ -156,6 +156,14 @@ alloc-gate = []
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 tempfile = "3"
+# Test-only, and all three already resolve to versions the TLS build pulls in:
+# these let the fabric TLS tests mint a throwaway certificate and speak real
+# HTTPS to the proxy, rather than committing a private key or trusting that an
+# untested branch serves what it claims.
+rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "pem"] }
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
+rustls-pki-types = "1"
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs"] }
 
 [lints.rust]
 # The objc crate's msg_send!/sel_impl! macros (used for Metal command-buffer GPU

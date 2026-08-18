@@ -24,6 +24,8 @@ use axum::{
 };
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
+use crate::tls_pair::{resolve_tls, TlsFiles};
+
 pub(crate) const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) const DEFAULT_MAX_PROMPT_TOKENS: usize = 131_072;
 pub(crate) const DEFAULT_MAX_GENERATION_TOKENS: u32 = 8_192;
@@ -141,12 +143,6 @@ pub(crate) struct ServerLimits {
     pub(crate) max_download_bytes: u64,
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct TlsFiles {
-    pub(crate) cert: PathBuf,
-    pub(crate) key: PathBuf,
-}
-
 #[derive(Clone)]
 pub(crate) struct ServerPolicy {
     pub(crate) auth: ApiAuth,
@@ -191,15 +187,7 @@ impl ServerPolicy {
             ));
         }
 
-        let tls = match (options.tls_cert, options.tls_key) {
-            (Some(cert), Some(key)) => Some(TlsFiles { cert, key }),
-            (None, None) => None,
-            _ => {
-                return Err(invalid(
-                    "--tls-cert and --tls-key must be provided together",
-                ))
-            }
-        };
+        let tls = resolve_tls(options.tls_cert, options.tls_key)?;
         let cors_origins = options
             .cors_origins
             .iter()
