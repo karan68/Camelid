@@ -69,6 +69,15 @@
 //!   a node that took the request and then failed ends it, because this proxy
 //!   cannot know whether it started generating. See
 //!   [`super::DEFAULT_MAX_FORWARD_ATTEMPTS`].
+//! * A client that hangs up takes its request's work with it. A dispatch runs
+//!   on a blocking thread and cannot be aborted, so it is told instead: the
+//!   frame that owns the request holds a [`Cancel`], dropping that frame is
+//!   what a client leaving looks like to axum, and the dispatch stops at its
+//!   next socket-operation boundary and hangs up on the node. A node that sees
+//!   its caller go stops generating within one decode step, so this gives back
+//!   the generation slot rather than merely a thread here. What it does not
+//!   cover is a probe round already in flight, which is bounded by `--timeout-ms`
+//!   and costs a node a health read rather than its generation slot.
 //! * A non-streaming dispatch runs on a blocking thread and blocking socket I/O
 //!   is not cancellable, so a client that hangs up leaves its dispatch running
 //!   until the node answers or `forward_timeout` expires. A streaming dispatch
@@ -96,7 +105,7 @@ use serde_json::Value;
 
 use super::client_keys::Admission;
 use super::policy::{route, RouteDecision, RouteError, RouteMode, RouteRequest};
-use super::{self as fabric, DispatchError, Fabric, ForwardError, StreamOutcome};
+use super::{self as fabric, Cancel, DispatchError, Fabric, ForwardError, StreamOutcome};
 use crate::api::{ApiAuth, DEFAULT_MAX_REQUEST_BODY_BYTES};
 use crate::tls_pair::resolve_tls;
 
@@ -108,6 +117,17 @@ const REQUEST_ID_HEADER: &str = "x-request-id";
 
 /// Longest inbound request id this proxy will adopt as its own.
 const MAX_REQUEST_ID_LEN: usize = 128;
+
+/// What a request that lost its client is answered with.
+///
+/// Not an IANA code: 499 is nginx's, and it is here for the reason nginx has it
+/// — every standard code would claim either that the request succeeded or that
+/// something upstream failed, and neither happened. Nothing on the network
+/// reads it, because the client it describes has gone; what it protects is the
+/// reader of a log or a test, who must not be told a healthy node failed.
+fn client_closed_request() -> StatusCode {
+    StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_GATEWAY)
+}
 
 /// The engine routes this proxy places on a node.
 ///
@@ -953,6 +973,23 @@ struct OwnedRequest {
     sticky: Option<String>,
 }
 
+/// Fires a request's [`Cancel`] when the frame holding it is dropped.
+///
+/// That drop is the only signal this proxy gets that a client has gone: axum
+/// drops the handler future when the connection does, measured here at ~16 ms
+/// after the client's socket closes. Holding one of these for exactly as long
+/// as a client could still read the answer therefore turns "nobody is waiting"
+/// into something the blocking dispatch can see.
+///
+/// It also fires on the way out of a request that was *served*, which costs
+/// nothing: by then the dispatch has already returned its answer.
+struct CancelOnDrop(Cancel);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
 impl OwnedRequest {
     /// A client that names a node is asking for affinity to it, so the header
     /// settles the mode for its own request. Without this the header would be
@@ -975,6 +1012,13 @@ async fn buffered_completion(
     body: Value,
     request: OwnedRequest,
 ) -> Response {
+    let cancel = Cancel::new();
+    // Bound to this frame, which axum drops when the client hangs up. Nothing
+    // else can stop the task below: dropping the `JoinHandle` the await holds
+    // detaches a blocking task rather than aborting it. Named, because binding
+    // to `_` would drop it here and cancel the request before it started.
+    let _client = CancelOnDrop(cancel.clone());
+
     // Fabric::dispatch is synchronous socket I/O (probes every node, then
     // forwards) and can legitimately run for the whole forward_timeout — up to
     // minutes for a real generation. Running it directly on an async worker
@@ -987,6 +1031,7 @@ async fn buffered_completion(
             &body,
             &request.as_route(state.config.mode),
             state.config.forward_timeout,
+            &cancel,
         )
     })
     .await;
@@ -1049,6 +1094,15 @@ async fn stream_completion(
     let (chunk_tx, mut chunk_rx) =
         tokio::sync::mpsc::channel::<Result<Vec<u8>, String>>(STREAM_CHANNEL_DEPTH);
 
+    let cancel = Cancel::new();
+    // Held by this frame only until the head is in; the streaming arm below
+    // moves it into the response body, because that is where the client can
+    // still be lost from. Until then a client leaving is invisible to the
+    // channel below — nothing has been sent on it yet — and the wait for a head
+    // is a whole prefill long.
+    let client = CancelOnDrop(cancel.clone());
+    let dispatch_cancel = cancel.clone();
+
     // Same reasoning as the buffered path: this is blocking socket I/O for the
     // whole life of the generation, so it belongs on the blocking pool. It also
     // owns cancellation — every send below reports whether the client is still
@@ -1060,6 +1114,7 @@ async fn stream_completion(
             &request.as_route(state.config.mode),
             state.config.forward_timeout,
             state.config.forward_timeout,
+            &dispatch_cancel,
         );
 
         let (mut streaming, _placement) = match outcome {
@@ -1148,6 +1203,11 @@ async fn stream_completion(
     };
 
     let stream = async_stream::stream! {
+        // Moved in, so it lives exactly as long as the response body does. A
+        // client that leaves mid-stream is a dropped body, and the guard is
+        // part of the stream's captured state from the moment it is built, so
+        // a body dropped before it is ever polled still fires it.
+        let _client = client;
         while let Some(chunk) = chunk_rx.recv().await {
             yield chunk;
         }
@@ -1242,6 +1302,11 @@ fn forward_error(error: ForwardError) -> Response {
     // caller's mistake, not the upstream's, so it is a 400 not a 502/503.
     let status = match &error {
         ForwardError::Unsupported(_) => StatusCode::BAD_REQUEST,
+        // Nobody is left to read this. It is answered rather than invented as a
+        // gateway failure so that the one thing that *can* still read it — a
+        // test, or a caller of this function that is not the network — is not
+        // told a healthy node failed.
+        ForwardError::Cancelled { .. } => client_closed_request(),
         ForwardError::Unreachable { .. }
         | ForwardError::Transport { .. }
         | ForwardError::Json { .. } => StatusCode::BAD_GATEWAY,
@@ -2344,5 +2409,66 @@ mod tests {
             plain.as_route(RouteMode::Affinity).mode,
             RouteMode::Affinity
         );
+    }
+
+    /// The guard is what turns a dropped frame into something a blocking
+    /// dispatch can see, so its own contract is worth pinning: dropping it
+    /// fires, and holding it does not.
+    #[test]
+    fn dropping_the_guard_is_what_gives_up_on_the_request() {
+        let cancel = Cancel::new();
+        let guard = CancelOnDrop(cancel.clone());
+        assert!(!cancel.is_cancelled(), "holding it must not give up");
+
+        drop(guard);
+        assert!(cancel.is_cancelled());
+    }
+
+    /// The streaming path moves its guard into the response body, so the body's
+    /// lifetime is the request's. A body can be dropped without ever being
+    /// polled — a client that leaves between the head and the first read — and
+    /// a guard created *inside* the generator rather than moved into it would
+    /// never exist to fire. This pins the distinction, which is invisible in
+    /// the source.
+    #[test]
+    fn a_response_body_dropped_before_it_is_read_still_gives_up_on_the_request() {
+        let cancel = Cancel::new();
+        let guard = CancelOnDrop(cancel.clone());
+        let stream = async_stream::stream! {
+            let _client = guard;
+            yield Ok::<Vec<u8>, String>(Vec::new());
+        };
+
+        assert!(!cancel.is_cancelled(), "building it must not give up");
+        drop(stream);
+        assert!(
+            cancel.is_cancelled(),
+            "a body nobody read left the node generating"
+        );
+    }
+
+    /// A client leaving must not be logged, reported, or acted on as a node
+    /// that failed: [`forward_error`] is what the access log reads placement
+    /// back off, and 502 there would blame a healthy machine.
+    #[test]
+    fn a_request_whose_client_left_is_not_answered_as_a_node_failure() {
+        let abandoned = forward_error(ForwardError::Cancelled {
+            label: "node-a".to_string(),
+        });
+        assert_eq!(abandoned.status().as_u16(), 499);
+        assert_eq!(
+            abandoned
+                .headers()
+                .get("x-camelid-fabric-node")
+                .and_then(|value| value.to_str().ok()),
+            Some("node-a")
+        );
+
+        // The control: a node that really did fail still answers 502.
+        let failed = forward_error(ForwardError::Transport {
+            label: "node-a".to_string(),
+            detail: "connection reset".to_string(),
+        });
+        assert_eq!(failed.status(), StatusCode::BAD_GATEWAY);
     }
 }

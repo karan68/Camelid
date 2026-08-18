@@ -9,10 +9,19 @@
 //! `chat`, is keyed on a resolved `SocketAddr` where fabric members are named
 //! hosts, and carries SSE, bearer auth and tool-call handling that neither a
 //! health probe nor a request forward should depend on.
+//!
+//! Every loop here that can wait on a peer consults its caller's [`Cancel`]
+//! beside its own deadline, and cancellation is checked first, so a request
+//! nobody wants any more is reported as abandoned rather than as a node that
+//! ran out of time. That is what makes a blocking exchange stoppable at all:
+//! the socket is dropped on the way out, which is the only thing that tells a
+//! node to stop generating.
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::time::{Duration, Instant};
+
+use super::cancel::Cancel;
 
 /// Never spend the whole budget dialling; a forward budget is minutes long and
 /// a node that has not accepted in five seconds is not about to.
@@ -32,6 +41,8 @@ pub(crate) enum HttpError {
     TooLarge(usize),
     /// The request could not be written safely; refused before any socket work.
     InvalidRequest(String),
+    /// The caller stopped wanting the answer before it arrived.
+    Cancelled,
 }
 
 impl HttpError {
@@ -45,10 +56,17 @@ impl HttpError {
     ///
     /// [`HttpError::InvalidRequest`] is deliberately excluded: nothing was sent,
     /// but the request is malformed, so another peer would refuse it identically.
+    /// [`HttpError::Cancelled`] is excluded for a different reason again — it
+    /// can be raised before the first write, but re-sending would produce an
+    /// answer for a caller that has already stopped waiting for one.
     pub(crate) fn peer_never_received_it(&self) -> bool {
         match self {
             Self::Resolve(_) | Self::Connect(_) => true,
-            Self::Io(_) | Self::Malformed(_) | Self::TooLarge(_) | Self::InvalidRequest(_) => false,
+            Self::Io(_)
+            | Self::Malformed(_)
+            | Self::TooLarge(_)
+            | Self::InvalidRequest(_)
+            | Self::Cancelled => false,
         }
     }
 }
@@ -62,6 +80,7 @@ impl std::fmt::Display for HttpError {
             Self::Malformed(detail) => write!(f, "malformed HTTP response: {detail}"),
             Self::TooLarge(limit) => write!(f, "response exceeded {limit} bytes"),
             Self::InvalidRequest(detail) => write!(f, "cannot build request: {detail}"),
+            Self::Cancelled => write!(f, "the answer was no longer wanted"),
         }
     }
 }
@@ -337,9 +356,16 @@ pub(crate) fn parse_response(raw: &[u8], max_body: usize) -> Result<HttpResponse
 /// resolves to several addresses — typically an AAAA ahead of an A. Trying only
 /// the first would report a healthy node as offline whenever its leading address
 /// is unroutable, so every address gets a turn until the deadline runs out.
-fn connect_any(addrs: &[SocketAddr], deadline: Instant) -> Result<TcpStream, HttpError> {
+fn connect_any(
+    addrs: &[SocketAddr],
+    deadline: Instant,
+    cancel: &Cancel,
+) -> Result<TcpStream, HttpError> {
     let mut last: Option<String> = None;
     for (index, addr) in addrs.iter().enumerate() {
+        if cancel.is_cancelled() {
+            return Err(HttpError::Cancelled);
+        }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             break;
@@ -418,7 +444,14 @@ fn connect_and_send(
     bearer: Option<&str>,
     deadline: Instant,
     write_timeout: Duration,
+    cancel: &Cancel,
 ) -> Result<TcpStream, HttpError> {
+    // Before resolving, which is itself a blocking call: a caller that has
+    // already given up costs its node nothing at all, not even a connection.
+    if cancel.is_cancelled() {
+        return Err(HttpError::Cancelled);
+    }
+
     let authority = format!("{host}:{port}");
     // Built before resolving, so a request that cannot be written safely is
     // refused without touching the network.
@@ -434,7 +467,7 @@ fn connect_and_send(
         ));
     }
 
-    let mut stream = connect_any(&addrs, deadline)?;
+    let mut stream = connect_any(&addrs, deadline, cancel)?;
     // Short socket reads keep the caller's loop responsive to its own deadline;
     // one long read timeout would overshoot it on a stalled peer.
     stream
@@ -462,6 +495,9 @@ fn connect_and_send(
 ///
 /// `bearer` is sent as `Authorization: Bearer`, which is what a node started
 /// with an API key requires on every route but `/v1/health`.
+///
+/// `cancel` ends the exchange early and drops the socket with it. Pass
+/// [`Cancel::never`] where there is no client that can go away.
 // One more parameter than clippy's threshold; every one of them is a distinct
 // property of a single round trip, so bundling them would only move the list.
 #[allow(clippy::too_many_arguments)]
@@ -474,6 +510,7 @@ pub(crate) fn request(
     bearer: Option<&str>,
     timeout: Duration,
     max_body: usize,
+    cancel: &Cancel,
 ) -> Result<HttpResponse, HttpError> {
     let deadline = Instant::now() + timeout;
     let mut stream = connect_and_send(
@@ -486,11 +523,17 @@ pub(crate) fn request(
         bearer,
         deadline,
         timeout,
+        cancel,
     )?;
 
     let mut raw = Vec::new();
     let mut chunk = [0_u8; 8192];
     loop {
+        // Before the deadline, so an abandoned request is reported as abandoned
+        // rather than as a node that was too slow.
+        if cancel.is_cancelled() {
+            return Err(HttpError::Cancelled);
+        }
         if Instant::now() >= deadline {
             return Err(HttpError::Io("request exceeded its deadline".to_string()));
         }
@@ -537,6 +580,9 @@ pub(crate) struct ResponseStream {
     /// How long the node may send nothing at all before it counts as wedged.
     idle_timeout: Duration,
     max_chunk: usize,
+    /// Carried rather than passed per call: the stream outlives the call that
+    /// opened it, and every read it does afterwards belongs to the same client.
+    cancel: Cancel,
 }
 
 /// A body that stopped before its framing said it would.
@@ -545,6 +591,9 @@ fn truncated_body() -> HttpError {
 }
 
 /// Send a request and read only its head, leaving the body to be streamed.
+///
+/// `cancel` bounds the wait for that head and is kept by the returned stream,
+/// so it bounds every later read too.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn open_stream(
     host: &str,
@@ -556,6 +605,7 @@ pub(crate) fn open_stream(
     head_timeout: Duration,
     idle_timeout: Duration,
     max_chunk: usize,
+    cancel: &Cancel,
 ) -> Result<ResponseStream, HttpError> {
     let deadline = Instant::now() + head_timeout;
     let mut stream = connect_and_send(
@@ -568,6 +618,7 @@ pub(crate) fn open_stream(
         bearer,
         deadline,
         head_timeout,
+        cancel,
     )?;
 
     let mut raw = Vec::new();
@@ -578,6 +629,11 @@ pub(crate) fn open_stream(
         }
         if raw.len() > MAX_HEAD_BYTES {
             return Err(HttpError::TooLarge(MAX_HEAD_BYTES));
+        }
+        // A head can be a whole prefill away, which is the longest a client is
+        // ever left with nothing to read; leaving is exactly what it does then.
+        if cancel.is_cancelled() {
+            return Err(HttpError::Cancelled);
         }
         if Instant::now() >= deadline {
             return Err(HttpError::Io(
@@ -608,6 +664,7 @@ pub(crate) fn open_stream(
         stream,
         idle_timeout,
         max_chunk,
+        cancel: cancel.clone(),
     })
 }
 
@@ -639,6 +696,9 @@ impl ResponseStream {
         let deadline = Instant::now() + self.idle_timeout;
         let mut scratch = [0_u8; 8192];
         loop {
+            if self.cancel.is_cancelled() {
+                return Err(HttpError::Cancelled);
+            }
             if Instant::now() >= deadline {
                 return Err(HttpError::Io(
                     "node sent nothing before the idle timeout".to_string(),
@@ -675,6 +735,9 @@ impl ResponseStream {
         let deadline = Instant::now() + self.idle_timeout;
         let mut scratch = [0_u8; 8192];
         while self.complete() != Some(true) {
+            if self.cancel.is_cancelled() {
+                return Err(HttpError::Cancelled);
+            }
             if Instant::now() >= deadline {
                 return Err(HttpError::Io(
                     "node sent nothing before the idle timeout".to_string(),
@@ -736,16 +799,24 @@ mod tests {
         // Port 1 is closed; it stands in for an unroutable AAAA ahead of the A.
         let dead = SocketAddr::from(([127, 0, 0, 1], 1));
 
-        let stream = connect_any(&[dead, live], Instant::now() + Duration::from_secs(2))
-            .expect("the second address accepts");
+        let stream = connect_any(
+            &[dead, live],
+            Instant::now() + Duration::from_secs(2),
+            &Cancel::never(),
+        )
+        .expect("the second address accepts");
         assert_eq!(stream.peer_addr().expect("connected"), live);
     }
 
     #[test]
     fn every_address_failing_reports_the_last_failure() {
         let dead = SocketAddr::from(([127, 0, 0, 1], 1));
-        let error = connect_any(&[dead, dead], Instant::now() + Duration::from_secs(1))
-            .expect_err("nothing is listening");
+        let error = connect_any(
+            &[dead, dead],
+            Instant::now() + Duration::from_secs(1),
+            &Cancel::never(),
+        )
+        .expect_err("nothing is listening");
         assert!(matches!(error, HttpError::Connect(_)), "{error:?}");
     }
 
@@ -764,6 +835,10 @@ mod tests {
             HttpError::Malformed("truncated".to_string()),
             HttpError::TooLarge(1),
             HttpError::InvalidRequest("bad token".to_string()),
+            // Cancelling can happen before the first write, so this one is not
+            // classified by what the peer saw: re-sending would spend another
+            // node on an answer nobody is waiting for.
+            HttpError::Cancelled,
         ] {
             assert!(!error.peer_never_received_it(), "{error:?}");
         }
@@ -774,8 +849,12 @@ mod tests {
         // Not a hand-built variant: this is the error the dialling path actually
         // produces against a closed port, which is the case failover turns on.
         let dead = SocketAddr::from(([127, 0, 0, 1], 1));
-        let error = connect_any(&[dead], Instant::now() + Duration::from_secs(1))
-            .expect_err("nothing is listening");
+        let error = connect_any(
+            &[dead],
+            Instant::now() + Duration::from_secs(1),
+            &Cancel::never(),
+        )
+        .expect_err("nothing is listening");
         assert!(error.peer_never_received_it(), "{error:?}");
     }
 
@@ -1093,6 +1172,7 @@ mod tests {
             Some("bad\r\ntoken"),
             Duration::from_millis(500),
             LIMIT,
+            &Cancel::never(),
         )
         .expect_err("refused");
         assert!(
@@ -1112,6 +1192,7 @@ mod tests {
             None,
             Duration::from_millis(500),
             LIMIT,
+            &Cancel::never(),
         )
         .expect_err("port 1 is closed");
         assert!(
@@ -1131,6 +1212,7 @@ mod tests {
             None,
             Duration::from_millis(500),
             LIMIT,
+            &Cancel::never(),
         )
         .expect_err("`.invalid` never resolves");
         assert!(
@@ -1193,8 +1275,185 @@ mod tests {
             Duration::from_secs(10),
             Duration::from_secs(10),
             LIMIT,
+            &Cancel::never(),
         )
         .expect("the canned node answers")
+    }
+
+    /// Accept one connection, consume the whole request, then answer `prelude`
+    /// and say nothing more — a node that has taken the work and is still doing
+    /// it. The connection is held open, so a reader that gives up early can only
+    /// have done so because it chose to.
+    fn working_node(prelude: &'static [u8]) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("has an address").port();
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut request = Vec::new();
+            let mut scratch = [0_u8; 1024];
+            while !request_complete(&request) {
+                match stream.read(&mut scratch) {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => request.extend_from_slice(&scratch[..read]),
+                }
+            }
+            if !prelude.is_empty() {
+                let _ = stream.write_all(prelude);
+            }
+            // Far longer than any deadline these tests give a reader, so a
+            // reader returning early is never this node giving up.
+            std::thread::sleep(Duration::from_secs(30));
+        });
+        port
+    }
+
+    /// Fire `cancel` shortly, the way a client hanging up mid-request does.
+    fn cancel_shortly(cancel: &Cancel) {
+        let cancel = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            cancel.cancel();
+        });
+    }
+
+    /// The whole point of the mechanism: a node's answer can legitimately be
+    /// minutes away, so waiting out the deadline is not a bounded cost.
+    #[test]
+    fn a_cancelled_request_stops_reading_rather_than_waiting_out_its_deadline() {
+        let port = working_node(b"");
+        let cancel = Cancel::new();
+        cancel_shortly(&cancel);
+
+        let started = Instant::now();
+        let error = request(
+            "127.0.0.1",
+            port,
+            "POST",
+            "/v1/chat/completions",
+            Some(b"{}"),
+            None,
+            Duration::from_secs(30),
+            LIMIT,
+            &cancel,
+        )
+        .expect_err("the node never answers");
+        let waited = started.elapsed();
+
+        assert_eq!(error, HttpError::Cancelled);
+        assert!(
+            waited < Duration::from_secs(2),
+            "waited {waited:?} of a 30s budget after the client had gone"
+        );
+    }
+
+    /// A caller that has already gone must not cost its node even a connection,
+    /// let alone the generation slot accepting one would commit.
+    #[test]
+    fn a_request_already_given_up_on_never_opens_a_socket() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("has an address").port();
+        let cancel = Cancel::new();
+        cancel.cancel();
+
+        let error = request(
+            "127.0.0.1",
+            port,
+            "POST",
+            "/v1/chat/completions",
+            Some(b"{}"),
+            None,
+            Duration::from_secs(30),
+            LIMIT,
+            &cancel,
+        )
+        .expect_err("the caller had already gone");
+
+        assert_eq!(error, HttpError::Cancelled);
+        listener
+            .set_nonblocking(true)
+            .expect("the listener can be polled");
+        assert!(
+            listener.accept().is_err(),
+            "a connection was opened on behalf of a caller that had gone"
+        );
+    }
+
+    /// The head of a streaming answer is a whole prefill away, which is the
+    /// longest a client is ever left with nothing at all to read.
+    #[test]
+    fn a_head_that_has_not_arrived_is_given_up_on_with_its_client() {
+        let port = working_node(b"");
+        let cancel = Cancel::new();
+        cancel_shortly(&cancel);
+
+        let started = Instant::now();
+        let opened = open_stream(
+            "127.0.0.1",
+            port,
+            "POST",
+            "/v1/chat/completions",
+            Some(b"{}"),
+            None,
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            LIMIT,
+            &cancel,
+        );
+        let waited = started.elapsed();
+
+        // `ResponseStream` owns a socket rather than describing one, so it has
+        // no `Debug` for `expect_err` to print.
+        let Err(error) = opened else {
+            panic!("the node never sent a head, so no stream can have opened");
+        };
+        assert_eq!(error, HttpError::Cancelled);
+        assert!(
+            waited < Duration::from_secs(2),
+            "waited {waited:?} of a 30s budget after the client had gone"
+        );
+    }
+
+    /// Relaying already stops when a send to the client fails, but only once
+    /// the node produces something to send. Between two tokens there is nothing
+    /// to fail on, and that gap is the whole idle timeout wide.
+    #[test]
+    fn a_stream_whose_client_has_gone_stops_between_events() {
+        // `data: one\n\n` is 11 bytes = 0xb; nothing follows it on the wire.
+        let port = working_node(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+              Transfer-Encoding: chunked\r\n\r\nb\r\ndata: one\n\n\r\n",
+        );
+        let cancel = Cancel::new();
+        let mut stream = open_stream(
+            "127.0.0.1",
+            port,
+            "POST",
+            "/v1/chat/completions",
+            Some(b"{}"),
+            None,
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            LIMIT,
+            &cancel,
+        )
+        .expect("the head arrives");
+        assert_eq!(
+            stream.next_chunk().expect("the first event arrives"),
+            Some(b"data: one\n\n".to_vec())
+        );
+
+        cancel.cancel();
+        let started = Instant::now();
+        let error = stream.next_chunk().expect_err("the client has gone");
+        let waited = started.elapsed();
+
+        assert_eq!(error, HttpError::Cancelled);
+        assert!(
+            waited < Duration::from_secs(2),
+            "waited {waited:?} of a 30s idle budget after the client had gone"
+        );
     }
 
     /// `parse_response` calls a chunked body that stops early malformed. The

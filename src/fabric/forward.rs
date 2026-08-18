@@ -17,6 +17,7 @@ use serde_json::{json, Value};
 
 use super::http::{self, HttpError};
 use super::node::NodeSpec;
+use super::Cancel;
 
 /// Generation can legitimately take minutes, so this is far longer than a probe
 /// budget. It exists to bound a wedged node, not to bound a slow model.
@@ -105,6 +106,12 @@ pub enum ForwardError {
     Json { label: String, detail: String },
     /// Refused before sending; see [`reject_streaming`].
     Unsupported(String),
+    /// Nobody is waiting for this answer any more, so it was not finished.
+    ///
+    /// Held apart from every other variant because it is not a fault of the
+    /// node at all: the observation that placed the request stays good, and
+    /// re-placing it would only produce an answer for a caller that has gone.
+    Cancelled { label: String },
 }
 
 impl ForwardError {
@@ -122,15 +129,22 @@ impl ForwardError {
         match self {
             Self::Unreachable { label, .. }
             | Self::Transport { label, .. }
-            | Self::Json { label, .. } => Some(label),
+            | Self::Json { label, .. }
+            | Self::Cancelled { label } => Some(label),
             Self::Unsupported(_) => None,
         }
     }
 }
 
-/// Tag an HTTP failure with the node it happened against, keeping the one
-/// distinction a retry depends on.
-fn dial_or_transport(label: &str, error: HttpError) -> ForwardError {
+/// Tag an HTTP failure with the node it happened against, keeping the two
+/// distinctions the rest of the fabric acts on: whether the request may be
+/// re-sent, and whether the node is implicated at all.
+fn attribute(label: &str, error: HttpError) -> ForwardError {
+    if matches!(error, HttpError::Cancelled) {
+        return ForwardError::Cancelled {
+            label: label.to_string(),
+        };
+    }
     let (label, detail) = (label.to_string(), error.to_string());
     if error.peer_never_received_it() {
         ForwardError::Unreachable { label, detail }
@@ -152,6 +166,10 @@ impl std::fmt::Display for ForwardError {
                 write!(f, "node `{label}` returned an unreadable body: {detail}")
             }
             Self::Unsupported(detail) => write!(f, "{detail}"),
+            Self::Cancelled { label } => write!(
+                f,
+                "the client that asked for this request had gone, so node `{label}` was not waited for"
+            ),
         }
     }
 }
@@ -209,12 +227,16 @@ pub fn error_message(body: &Value) -> Option<&str> {
 /// `bearer` is required by any node started with an API key: `/v1/health` is
 /// exempt from the server's auth but `/v1/chat/completions` is not, so without
 /// it this is the call that comes back 401.
+///
+/// `cancel` ends the exchange and hangs up on the node, which is what stops it
+/// generating; pass [`Cancel::never`] where nothing can ask for that.
 pub fn forward(
     spec: &NodeSpec,
     path: &str,
     body: &Value,
     bearer: Option<&str>,
     timeout: Duration,
+    cancel: &Cancel,
 ) -> Result<Forwarded, ForwardError> {
     reject_streaming(body)?;
 
@@ -233,8 +255,9 @@ pub fn forward(
         bearer,
         timeout,
         MAX_RESPONSE_BYTES,
+        cancel,
     )
-    .map_err(|error| dial_or_transport(&spec.label, error))?;
+    .map_err(|error| attribute(&spec.label, error))?;
     let elapsed = started.elapsed();
 
     // An empty body is legal for some statuses; represent it as null rather than
@@ -286,15 +309,27 @@ impl std::fmt::Debug for Streaming {
 impl Streaming {
     /// The next piece of the body, or `None` at the end of the stream.
     ///
-    /// Always a `Transport` failure, never `Unreachable`: the node answered to
-    /// get here, so the request cannot be sent anywhere else.
+    /// Never `Unreachable`: the node answered to get here, so the request
+    /// cannot be sent anywhere else. A failure to read is therefore `Transport`
+    /// whatever caused it — except a cancellation, which says nothing about the
+    /// node and must not be recorded against it.
     pub fn next_chunk(&mut self) -> Result<Option<Vec<u8>>, ForwardError> {
         self.stream
             .next_chunk()
-            .map_err(|error| ForwardError::Transport {
-                label: self.label.clone(),
-                detail: error.to_string(),
-            })
+            .map_err(|error| after_the_head(&self.label, error))
+    }
+}
+
+/// Classify a failure raised once a node has already answered with a head.
+fn after_the_head(label: &str, error: HttpError) -> ForwardError {
+    match error {
+        HttpError::Cancelled => ForwardError::Cancelled {
+            label: label.to_string(),
+        },
+        error => ForwardError::Transport {
+            label: label.to_string(),
+            detail: error.to_string(),
+        },
     }
 }
 
@@ -323,19 +358,12 @@ pub fn forward_streaming(
     bearer: Option<&str>,
     head_timeout: Duration,
     idle_timeout: Duration,
+    cancel: &Cancel,
 ) -> Result<StreamOutcome, ForwardError> {
     let encoded = serde_json::to_vec(body).map_err(|error| ForwardError::Json {
         label: spec.label.clone(),
         detail: format!("request body could not be encoded: {error}"),
     })?;
-
-    // Only opening the stream can fail before the node has the request. Once a
-    // head is in, the node is generating, so everything below is `Transport`
-    // whatever the underlying cause was.
-    let transport = |error: HttpError| ForwardError::Transport {
-        label: spec.label.clone(),
-        detail: error.to_string(),
-    };
 
     let started = Instant::now();
     let stream = http::open_stream(
@@ -348,8 +376,9 @@ pub fn forward_streaming(
         head_timeout,
         idle_timeout,
         MAX_RESPONSE_BYTES,
+        cancel,
     )
-    .map_err(|error| dial_or_transport(&spec.label, error))?;
+    .map_err(|error| attribute(&spec.label, error))?;
 
     let head = stream.head().clone();
     // A node that refused, or answered with something other than a stream, has
@@ -357,7 +386,7 @@ pub fn forward_streaming(
     if !(200..300).contains(&head.status) || !head.is_event_stream() {
         let response = stream
             .into_buffered(MAX_RESPONSE_BYTES)
-            .map_err(transport)?;
+            .map_err(|error| after_the_head(&spec.label, error))?;
         let parsed = if response.body.is_empty() {
             Value::Null
         } else {
@@ -494,6 +523,7 @@ mod tests {
             &body,
             None,
             Duration::from_millis(200),
+            &Cancel::never(),
         )
         .expect_err("refused");
         assert!(
@@ -540,6 +570,7 @@ mod tests {
             &chat_request("m", "hi", 4),
             None,
             Duration::from_millis(400),
+            &Cancel::never(),
         )
         .expect_err("port 1 is closed");
         match &error {
@@ -561,6 +592,7 @@ mod tests {
             &chat_request("m", "hi", 4),
             None,
             Duration::from_millis(400),
+            &Cancel::never(),
         )
         .expect_err("port 1 is closed");
         assert!(unreached.node_never_received_it(), "{unreached:?}");
@@ -587,9 +619,42 @@ mod tests {
             None,
             Duration::from_millis(400),
             Duration::from_millis(400),
+            &Cancel::never(),
         )
         .expect_err("port 1 is closed");
         assert!(error.node_never_received_it(), "{error:?}");
+    }
+
+    /// A client leaving is not the node's doing, and the difference is acted on
+    /// twice over: the request is not placed again, and the observation that
+    /// chose the node is kept rather than thrown away as proved wrong.
+    #[test]
+    fn a_request_its_client_gave_up_on_is_not_recorded_against_the_node() {
+        let cancel = Cancel::new();
+        cancel.cancel();
+
+        let error = forward(
+            &spec("windows", 1),
+            "/v1/chat/completions",
+            &chat_request("m", "hi", 4),
+            None,
+            Duration::from_millis(400),
+            &cancel,
+        )
+        .expect_err("the client had gone");
+
+        assert!(
+            matches!(error, ForwardError::Cancelled { .. }),
+            "a client hanging up must not read as a node failure, got {error:?}"
+        );
+        assert!(
+            !error.node_never_received_it(),
+            "re-placing it would answer a client that has gone"
+        );
+        // Named for the same reason every other failure here is: it says which
+        // node just got its generation slot back.
+        assert_eq!(error.label(), Some("windows"));
+        assert!(error.to_string().contains("windows"), "{error}");
     }
 
     #[test]

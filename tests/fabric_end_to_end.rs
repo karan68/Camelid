@@ -17,8 +17,8 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use camelid::fabric::{
-    forward, parse_node_spec, route, Fabric, NodeSpec, RouteError, RouteMode, RouteReason,
-    RouteRequest,
+    forward, parse_node_spec, route, Cancel, DispatchError, Fabric, ForwardError, NodeSpec,
+    RouteError, RouteMode, RouteReason, RouteRequest,
 };
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
@@ -385,8 +385,15 @@ fn forwarding_sends_a_well_formed_request_and_returns_the_answer() {
     let spec = alpha.spec("alpha");
 
     let body = forward::chat_request("model-alpha", "ping", 8);
-    let answer = forward::forward(&spec, "/v1/chat/completions", &body, None, FORWARD_TIMEOUT)
-        .expect("stub answers");
+    let answer = forward::forward(
+        &spec,
+        "/v1/chat/completions",
+        &body,
+        None,
+        FORWARD_TIMEOUT,
+        &Cancel::never(),
+    )
+    .expect("stub answers");
 
     assert!(answer.is_success());
     assert_eq!(answer.label, "alpha");
@@ -421,6 +428,7 @@ fn an_engine_refusal_is_the_nodes_answer_not_a_transport_failure() {
         &forward::chat_request("model-alpha", "ping", 8),
         None,
         FORWARD_TIMEOUT,
+        &Cancel::never(),
     )
     .expect("a 503 is an answer, not an error");
 
@@ -444,6 +452,7 @@ fn dispatch_places_and_sends_in_one_call() {
             &forward::chat_request("model-beta", "ping", 8),
             &RouteRequest::new(RouteMode::Throughput).with_model(Some("model-beta")),
             FORWARD_TIMEOUT,
+            &Cancel::never(),
         )
         .expect("beta serves model-beta");
 
@@ -478,6 +487,7 @@ fn dispatch_refuses_streaming_before_touching_the_network() {
             &serde_json::json!({ "model": "m", "stream": true }),
             &RouteRequest::new(RouteMode::Throughput),
             Duration::from_millis(300),
+            &Cancel::never(),
         )
         .expect_err("streaming is unsupported");
     assert!(
@@ -497,6 +507,7 @@ fn a_fabric_carrying_the_key_is_served_by_an_authenticated_node() {
             &forward::chat_request("model-alpha", "ping", 8),
             &RouteRequest::new(RouteMode::Throughput),
             FORWARD_TIMEOUT,
+            &Cancel::never(),
         )
         .expect("the node accepts our key");
 
@@ -559,6 +570,7 @@ fn a_missing_or_wrong_key_arrives_as_a_401_answer_not_a_transport_failure() {
                 &forward::chat_request("model-alpha", "ping", 8),
                 &RouteRequest::new(RouteMode::Throughput),
                 FORWARD_TIMEOUT,
+                &Cancel::never(),
             )
             .map(|dispatched| (dispatched.decision, dispatched.answer))
             .expect("a 401 is the node's answer, not a forwarding failure");
@@ -585,6 +597,7 @@ fn an_unauthenticated_fabric_sends_no_authorization_header_at_all() {
             &forward::chat_request("model-alpha", "ping", 8),
             &RouteRequest::new(RouteMode::Throughput),
             FORWARD_TIMEOUT,
+            &Cancel::never(),
         )
         .expect("an open node answers");
 
@@ -607,4 +620,75 @@ fn an_operator_node_string_drives_a_real_placement() {
     let decision = route(&fabric.observe(), &RouteRequest::new(RouteMode::Throughput))
         .expect("the parsed node serves");
     assert_eq!(decision.label, "alpha");
+}
+
+/// Health probes a node has answered. A freshness bound exists so that this
+/// stops growing with the number of client requests.
+fn health_probes(node: &StubNode) -> usize {
+    node.received()
+        .iter()
+        .filter(|received| received.path == "/v1/health")
+        .count()
+}
+
+/// A client hanging up says nothing about the node its request was placed on.
+///
+/// The fabric drops an observation that has proved wrong, which is what keeps
+/// a freshness bound honest. Counting a cancellation as proof would invert
+/// that: on a fabric working perfectly, every client that leaves would make the
+/// *next* request pay a whole probe round.
+#[test]
+fn a_cancelled_request_leaves_the_observation_that_placed_it_in_force() {
+    let alpha = StubNode::start(StubConfig::ready("model-alpha", 0));
+    let fabric =
+        fabric_of(vec![alpha.spec("alpha")]).with_max_observation_age(Duration::from_secs(30));
+    let body = forward::chat_request("model-alpha", "ping", 8);
+    let request = RouteRequest::new(RouteMode::Throughput);
+
+    fabric
+        .dispatch(
+            "/v1/chat/completions",
+            &body,
+            &request,
+            FORWARD_TIMEOUT,
+            &Cancel::never(),
+        )
+        .expect("the node serves");
+    let after_the_first = health_probes(&alpha);
+    assert!(after_the_first > 0, "the fabric observed the node at all");
+
+    let gone = Cancel::new();
+    gone.cancel();
+    let error = fabric
+        .dispatch(
+            "/v1/chat/completions",
+            &body,
+            &request,
+            FORWARD_TIMEOUT,
+            &gone,
+        )
+        .expect_err("the client had gone");
+    assert!(
+        matches!(
+            error,
+            DispatchError::Forward(ForwardError::Cancelled { .. })
+        ),
+        "got {error:?}"
+    );
+
+    fabric
+        .dispatch(
+            "/v1/chat/completions",
+            &body,
+            &request,
+            FORWARD_TIMEOUT,
+            &Cancel::never(),
+        )
+        .expect("the node still serves");
+
+    assert_eq!(
+        health_probes(&alpha),
+        after_the_first,
+        "the fabric re-probed because a client hung up"
+    );
 }

@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
+use super::cancel::Cancel;
 use super::http::{self, HttpError};
 use super::node::{NodeReady, NodeSnapshot, NodeSpec, NodeStatus};
 
@@ -104,6 +105,10 @@ fn read_health(
         bearer,
         timeout,
         MAX_HEALTH_BYTES,
+        // A probe round is already bounded by `timeout` and costs a node a
+        // health read, not a generation slot, so there is nothing here worth
+        // the noise of making cancellable.
+        &Cancel::never(),
     )?;
     if response.status != 200 {
         return Err(ProbeError::Status(response.status));

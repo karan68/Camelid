@@ -20,7 +20,9 @@
 //! * [`probe`] — turning `/v1/health` into a routing fact.
 //! * [`policy`] — pure placement decisions; the correctness of the fabric.
 //! * [`forward`] — sending a placed request to the node that will serve it.
+//! * [`cancel`] — telling that send it is no longer wanted.
 
+pub mod cancel;
 pub(crate) mod client_keys;
 pub mod forward;
 pub(crate) mod http;
@@ -35,6 +37,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
+pub use cancel::Cancel;
 pub use forward::{
     wants_streaming, ForwardError, Forwarded, NodeAnswer, StreamOutcome, Streaming,
     DEFAULT_FORWARD_TIMEOUT, ENGINE_QUEUE_FULL_CODE,
@@ -249,6 +252,11 @@ impl Fabric {
     /// This is what keeps the freshness bound honest: a node dying inside the
     /// window costs the one request that discovers it, not every request until
     /// the observation expires.
+    ///
+    /// A cancelled request is deliberately not one of those: it says nothing
+    /// about the node it was placed on, and dropping the observation for it
+    /// would make every client that hangs up cost the *next* request a full
+    /// probe round.
     fn forget_observation_if_node_vanished(&self, error: &ForwardError) {
         if matches!(
             error,
@@ -351,12 +359,20 @@ impl Fabric {
         body: &Value,
         request: &RouteRequest<'_>,
         forward_timeout: Duration,
+        cancel: &Cancel,
     ) -> Result<Dispatched, DispatchError> {
         // Refuse an unsupported request before spending any probes on it.
         forward::reject_streaming(body)?;
 
         let sent = self.send_until_a_node_takes_it(request, |spec| {
-            forward::forward(spec, path, body, self.bearer.as_deref(), forward_timeout)
+            forward::forward(
+                spec,
+                path,
+                body,
+                self.bearer.as_deref(),
+                forward_timeout,
+                cancel,
+            )
         })?;
         Ok(Dispatched {
             decision: sent.placement.decision.clone(),
@@ -382,6 +398,7 @@ impl Fabric {
         request: &RouteRequest<'_>,
         head_timeout: Duration,
         idle_timeout: Duration,
+        cancel: &Cancel,
     ) -> Result<DispatchedStream, DispatchError> {
         let sent = self.send_until_a_node_takes_it(request, |spec| {
             forward::forward_streaming(
@@ -391,6 +408,7 @@ impl Fabric {
                 self.bearer.as_deref(),
                 head_timeout,
                 idle_timeout,
+                cancel,
             )
         })?;
         Ok(DispatchedStream {
@@ -423,6 +441,10 @@ impl Fabric {
     /// the node sent, its code and message included. Not its headers, though —
     /// [`Forwarded`] carries none, so the node's `Retry-After` does not survive
     /// the hop.
+    ///
+    /// A cancelled attempt ends the whole dispatch on the spot. It is not a
+    /// node failure, so it is neither re-placed nor recorded against the node:
+    /// there is no longer anybody to hand a second node's answer to.
     fn send_until_a_node_takes_it<T: NodeAnswer>(
         &self,
         request: &RouteRequest<'_>,
@@ -1079,6 +1101,7 @@ mod tests {
                 &body,
                 &RouteRequest::new(RouteMode::Throughput),
                 Duration::from_millis(200),
+                &Cancel::never(),
             )
             .expect_err("streaming is unsupported");
         assert!(
@@ -1096,6 +1119,7 @@ mod tests {
                 &serde_json::json!({ "model": "m" }),
                 &RouteRequest::new(RouteMode::Throughput),
                 Duration::from_millis(200),
+                &Cancel::never(),
             )
             .expect_err("no nodes");
         assert_eq!(error, DispatchError::Route(RouteError::NoNodesConfigured));
@@ -1117,6 +1141,7 @@ mod tests {
                 &serde_json::json!({ "model": "m" }),
                 &RouteRequest::new(RouteMode::Throughput),
                 Duration::from_millis(300),
+                &Cancel::never(),
             )
             .expect_err("node is dead");
         assert!(
