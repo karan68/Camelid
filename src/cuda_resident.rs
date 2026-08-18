@@ -14000,10 +14000,7 @@ impl CudaResidentDecode {
                         k,
                     )
                     .map_err(map)?;
-                    if flash_ok
-                        && flash_prefill_enabled()
-                        && q_width == n_heads * head_dim
-                    {
+                    if flash_ok && flash_prefill_enabled() && q_width == n_heads * head_dim {
                         launch_attention_flash_prefill(
                             &s,
                             &self.k,
