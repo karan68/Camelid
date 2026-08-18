@@ -172,9 +172,18 @@ The name, never the key, is written to every access-log line that client causes,
 Deleting an entry revokes that client without a restart and without disturbing anyone else. The file
 is re-read at most once a second, and only when its size or modification time has changed, so this
 costs nothing per request. If a re-read fails — which is what the moment of an atomic replace looks
-like — the previous set stays in force and a warning is logged, so an ordinary edit cannot become an
-outage. The cost of that choice is real and worth stating: a revocation written into a file that
-does not parse has *not* taken effect, and the warning is the only thing that says so.
+like — the previous set stays in force, so an ordinary edit cannot become an outage.
+
+That fallback has a cost worth stating plainly: **a revocation written into a file that does not
+parse, or deleting the key file altogether, does not revoke anybody.** The previously loaded set goes
+on being served until the file is readable again or the proxy is restarted — and a restart refuses to
+come up at all while the file is unusable. So the proxy prints to stderr when a re-read starts
+failing, and again when it recovers, rather than relying on `RUST_LOG` being set:
+
+```
+fabric: could not reload client keys: <why>. The previous set of 2 clients is still in force, so a
+revocation written here has NOT taken effect.
+```
 
 The proxy re-probes its nodes at most once per `--observation-max-age-ms` (500 by default) rather
 than once per request. Inside that window its view can be wrong, so a request placed on a node that

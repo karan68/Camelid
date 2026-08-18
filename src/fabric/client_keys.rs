@@ -74,9 +74,12 @@ struct KeyFileEntry {
 
 /// What the file looked like when it was last read.
 ///
-/// Modification time alone is not enough: a file rewritten within the same
-/// timestamp tick would be missed, and on a revocation that means a key that
-/// should have stopped working keeps working.
+/// Length as well as modification time, because a revocation usually shortens
+/// the file and mtime alone can be too coarse to notice a rewrite within one
+/// tick. It narrows that window rather than closing it: a key swapped for one
+/// of the same length inside a single tick still looks unchanged. Closing it
+/// would mean reading the file every interval, which is the cost this exists
+/// to avoid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FileStamp {
     modified: Option<SystemTime>,
@@ -97,6 +100,9 @@ struct ReloadState {
     clients: Arc<[ClientKey]>,
     stamp: Option<FileStamp>,
     last_checked: Option<Instant>,
+    /// Whether the last re-read failed, so the notice below is printed once
+    /// per transition rather than once per request.
+    stale: bool,
 }
 
 enum Source {
@@ -175,6 +181,7 @@ impl ClientAuth {
                     clients,
                     stamp,
                     last_checked: Some(Instant::now()),
+                    stale: false,
                 }),
             })),
         })
@@ -264,31 +271,67 @@ fn current_clients(
 
     match load_key_file(path) {
         Ok(clients) => {
-            if clients.len() != state.clients.len() {
-                tracing::info!(
-                    clients = clients.len(),
-                    path = %path.display(),
-                    "client key set reloaded"
+            tracing::info!(
+                clients = clients.len(),
+                path = %path.display(),
+                "client key set reloaded"
+            );
+            if state.stale {
+                eprintln!(
+                    "fabric: client keys reloaded from {}; now serving {}",
+                    path.display(),
+                    clients_phrase(clients.len())
                 );
             }
             state.clients = clients;
             state.stamp = stamp;
+            state.stale = false;
         }
         Err(error) => {
             // The previous set is kept on purpose. A key file is often replaced
             // by writing a new one and renaming it over the old, so a read that
             // lands mid-swap sees a partial or missing file; refusing every
             // client on that would turn an ordinary edit into an outage. The
-            // cost is that a revocation written into a *broken* file does not
-            // take effect, which is why this is loud rather than silent.
+            // cost is that a revocation written into a broken or deleted file
+            // has not taken effect, so the operator has to hear about it.
             tracing::warn!(
                 path = %path.display(),
                 %error,
                 "could not reload client keys; the previous set is still in force"
             );
+            // Printed, not only traced: `RUST_LOG` is unset on a stock proxy,
+            // so a revocation that has silently not happened would otherwise
+            // be invisible to the operator who just wrote it. Once per
+            // transition, so a file left broken does not fill the terminal.
+            if !state.stale {
+                eprintln!("{}", stale_key_set_notice(&error, state.clients.len()));
+            }
+            state.stale = true;
         }
     }
     Arc::clone(&state.clients)
+}
+
+/// What an operator is told when a re-read fails. Pure, so it is tested rather
+/// than eyeballed.
+///
+/// It has to say the revocation did not happen, because that is the whole
+/// consequence: the file on disk and the set being enforced no longer agree,
+/// and the file is the one the operator is looking at.
+fn stale_key_set_notice(error: &Error, clients: usize) -> String {
+    format!(
+        "fabric: could not reload client keys: {error}. The previous set of {} \
+         is still in force, so a revocation written here has NOT taken effect.",
+        clients_phrase(clients)
+    )
+}
+
+fn clients_phrase(count: usize) -> String {
+    if count == 1 {
+        "1 client".to_string()
+    } else {
+        format!("{count} clients")
+    }
 }
 
 /// Read and validate a key set.
@@ -376,8 +419,8 @@ fn validate_client_name(name: &str, path: &Path) -> Result<String> {
             ErrorKind::InvalidData,
             format!(
                 "client key file {} has a name that is empty, longer than \
-                 {MAX_CLIENT_NAME_BYTES} bytes, or not printable ASCII; the \
-                 name is written to every log line that client causes",
+                 {MAX_CLIENT_NAME_BYTES} bytes, or not printable ASCII without \
+                 spaces; the name is written to every log line that client causes",
                 path.display()
             ),
         ));
@@ -485,6 +528,26 @@ mod tests {
         // ...and a file that becomes valid again is picked up.
         fs::write(&path, r#"{"clients":[{"name":"ci","key":"ci-secret"}]}"#).expect("restore");
         assert_eq!(auth.admit(&bearer("laptop-secret")), Admission::Refused);
+    }
+
+    /// The previous set staying in force is only safe if the operator is told,
+    /// and `RUST_LOG` is unset on a stock proxy, so the notice is printed. It
+    /// has to say the revocation did not happen; "could not reload" alone
+    /// reads like a retry that will sort itself out.
+    #[test]
+    fn the_notice_says_the_revocation_has_not_taken_effect() {
+        let error = Error::new(ErrorKind::InvalidData, "clients.json is not valid JSON");
+        let notice = stale_key_set_notice(&error, 2);
+        assert!(
+            notice.contains("clients.json is not valid JSON"),
+            "{notice}"
+        );
+        assert!(notice.contains("previous set of 2 clients"), "{notice}");
+        assert!(notice.contains("NOT taken effect"), "{notice}");
+        assert!(
+            stale_key_set_notice(&error, 1).contains("previous set of 1 client "),
+            "one client is not '1 clients'"
+        );
     }
 
     /// The set is only re-read once the bound has passed, so a busy proxy is
