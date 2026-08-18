@@ -758,8 +758,14 @@ fn env_flag_disabled(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(target_os = "macos")]
 fn mac_q8_repack_enabled() -> bool {
     env_flag_enabled("CAMELID_MAC_Q8_REPACK")
+}
+
+#[cfg(not(target_os = "macos"))]
+fn mac_q8_repack_enabled() -> bool {
+    false
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
