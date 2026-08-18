@@ -18334,7 +18334,7 @@ fn run_stream_step(
     // Temperature-only sampling: draw the next token on the GPU (Gumbel-max)
     // instead of copying the full logits row to the host and sorting it on the
     // CPU (~7 ms/token). Other sampler shapes fall through to the CPU path.
-    if !collect_dense_diagnostics && input.len() == 1 {
+    if !collect_dense_diagnostics {
         if let LlamaSampler::Sampling(cfg) = &sampler {
             if let Some((id, forward_us)) = session
                 .generate_next_token_sampled_resident(input[0], cfg)
