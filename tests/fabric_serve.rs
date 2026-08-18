@@ -1471,6 +1471,137 @@ async fn a_request_is_logged_with_the_caller_and_the_id_it_was_given() {
     );
 }
 
+/// A key set lives in a file, so these tests write one and hand over its path.
+fn client_keys(dir: &tempfile::TempDir, body: &str) -> std::path::PathBuf {
+    let path = dir.path().join("clients.json");
+    std::fs::write(&path, body).expect("write client key file");
+    path
+}
+
+const TWO_CLIENTS: &str = r#"{"clients":[
+    {"name":"laptop","key":"laptop-secret"},
+    {"name":"ci","key":"ci-secret"}
+]}"#;
+
+/// How long a revocation is given to take effect before the test calls it
+/// broken. Generous against the one-second reload the proxy ships with, so a
+/// loaded machine does not fail this for being slow.
+const REVOCATION_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn chat_requests(node: &StubNode) -> usize {
+    node.received()
+        .iter()
+        .filter(|request| request.path == "/v1/chat/completions")
+        .count()
+}
+
+/// One key could only tell an operator that *someone* authenticated. A named
+/// set says which client, in the one place they already read.
+#[tokio::test(flavor = "multi_thread")]
+async fn each_client_is_served_and_logged_under_its_own_name() {
+    let recorded = access_log();
+    let dir = tempfile::tempdir().expect("temp dir");
+    let node = StubNode::start(StubConfig::ready("shared-model", 0));
+    let addr = start_proxy_with_auth(
+        fabric_of(vec![node.spec("node-a")]),
+        RouteMode::Throughput,
+        ClientAuth::from_key_file(client_keys(&dir, TWO_CLIENTS)).expect("load key set"),
+    )
+    .await;
+    let body = serde_json::json!({ "model": "shared-model" });
+
+    for (client, key, id) in [
+        ("laptop", "laptop-secret", "only-this-test-names-laptop"),
+        ("ci", "ci-secret", "only-this-test-names-ci"),
+    ] {
+        let bearer = format!("Bearer {key}");
+        let (status, answered, _) = post_chat(
+            addr,
+            &body,
+            &[("Authorization", &bearer), ("x-request-id", id)],
+        )
+        .await;
+        assert_eq!(status, 200, "{client} was not served: {answered}");
+
+        let line = recorded
+            .line_mentioning(id)
+            .unwrap_or_else(|| panic!("{client}'s request was not logged"));
+        assert!(
+            line.contains(&format!("client_name=\"{client}\"")),
+            "the line must name the client that called: {line}"
+        );
+        assert!(
+            !line.contains(key),
+            "the line must never carry the key itself: {line}"
+        );
+    }
+}
+
+/// The reason for naming clients at all: one of them stops being served, and
+/// nothing else does.
+///
+/// This runs against the reload interval the proxy actually ships with, not a
+/// test-only one, because the claim being made is about the binary an operator
+/// runs. Nothing is restarted between the two halves of this test — the same
+/// listener that served the laptop goes on serving CI after refusing it.
+#[tokio::test(flavor = "multi_thread")]
+async fn revoking_one_client_stops_it_without_a_restart_or_disturbing_the_rest() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = client_keys(&dir, TWO_CLIENTS);
+    let node = StubNode::start(StubConfig::ready("shared-model", 0));
+    let addr = start_proxy_with_auth(
+        fabric_of(vec![node.spec("node-a")]),
+        RouteMode::Throughput,
+        ClientAuth::from_key_file(path.clone()).expect("load key set"),
+    )
+    .await;
+    let body = serde_json::json!({ "model": "shared-model" });
+    let laptop = [("Authorization", "Bearer laptop-secret")];
+    let ci = [("Authorization", "Bearer ci-secret")];
+
+    assert_eq!(post_chat(addr, &body, &laptop).await.0, 200);
+    assert_eq!(post_chat(addr, &body, &ci).await.0, 200);
+    assert_eq!(
+        chat_requests(&node),
+        2,
+        "both clients should have reached the node before the revocation"
+    );
+
+    std::fs::write(&path, r#"{"clients":[{"name":"ci","key":"ci-secret"}]}"#).expect("revoke");
+
+    let started = Instant::now();
+    loop {
+        if post_chat(addr, &body, &laptop).await.0 == 401 {
+            break;
+        }
+        assert!(
+            started.elapsed() < REVOCATION_TIMEOUT,
+            "a revoked client was still being served {:?} after the key file \
+             stopped listing it",
+            started.elapsed()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Refused, and refused early: the point of the credential is that the
+    // fabric is never touched on behalf of a caller it does not serve.
+    let settled = chat_requests(&node);
+    let (status, refused, _) = post_chat(addr, &body, &laptop).await;
+    assert_eq!(status, 401, "{refused}");
+    assert_eq!(refused["error"]["type"], "authentication_error");
+    assert_eq!(
+        chat_requests(&node),
+        settled,
+        "a revoked client still reached a node"
+    );
+
+    let (still_served, answered, _) = post_chat(addr, &body, &ci).await;
+    assert_eq!(
+        still_served, 200,
+        "revoking one client cut off another: {answered}"
+    );
+}
+
 /// Being asked to stop is not the same as being killed. A proxy holds other
 /// people's requests, and dropping them on a deploy turns a routine restart
 /// into a client-visible failure.

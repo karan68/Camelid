@@ -43,7 +43,7 @@ pub use server::ServeOptions;
 pub(crate) use server::DEFAULT_MAX_REQUEST_BODY_BYTES;
 /// Re-exported so another front door authenticates its clients with this
 /// server's check rather than a second implementation of one.
-pub(crate) use server::{authenticate, resolve_api_key, ApiAuth};
+pub(crate) use server::{resolve_api_key, ApiAuth};
 
 use crate::{
     embedding::{

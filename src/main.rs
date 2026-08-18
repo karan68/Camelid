@@ -1245,6 +1245,14 @@ enum FabricAction {
         /// and every prompt would cross the network unencrypted.
         #[arg(long, env = "CAMELID_ALLOW_CLEARTEXT_REMOTE", default_value_t = false)]
         allow_cleartext_remote: bool,
+        /// JSON file naming the clients this proxy serves, of the form
+        /// {"clients":[{"name":"...","key":"..."}]}.
+        ///
+        /// Each client gets its own key, and the name is what the access log
+        /// records. Removing an entry revokes that client without a restart
+        /// and without disturbing the others.
+        #[arg(long, value_name = "PATH", conflicts_with_all = ["api_key", "api_key_file"])]
+        client_keys: Option<PathBuf>,
     },
 }
 
@@ -1325,6 +1333,57 @@ mod fabric_command_tests {
                     other => panic!("expected a fabric command, got {other:?}"),
                 };
                 assert_eq!(bearer.as_deref(), Some("s3cret"), "{argv:?}");
+            }
+        });
+    }
+
+    /// Two answers to "who may call" must not be configurable at once. A key
+    /// set is the one that can revoke, so silently letting a stray `--api-key`
+    /// win would leave an operator believing a client had been cut off.
+    #[test]
+    fn a_client_key_set_cannot_be_combined_with_a_single_key() {
+        on_cli_test_stack(|| {
+            for conflicting in [
+                vec!["--api-key", "s3cret"],
+                vec!["--api-key-file", "some.key"],
+            ] {
+                let mut argv = vec![
+                    "camelid",
+                    "fabric",
+                    "serve",
+                    "--node",
+                    "a=127.0.0.1",
+                    "--client-keys",
+                    "clients.json",
+                ];
+                argv.extend(conflicting.iter().copied());
+                Cli::try_parse_from(&argv)
+                    .err()
+                    .unwrap_or_else(|| panic!("{argv:?} was accepted"));
+            }
+
+            // Each on its own still parses, so the guard is the combination.
+            for argv in [
+                vec![
+                    "camelid",
+                    "fabric",
+                    "serve",
+                    "--node",
+                    "a=127.0.0.1",
+                    "--client-keys",
+                    "clients.json",
+                ],
+                vec![
+                    "camelid",
+                    "fabric",
+                    "serve",
+                    "--node",
+                    "a=127.0.0.1",
+                    "--api-key",
+                    "s3cret",
+                ],
+            ] {
+                Cli::try_parse_from(&argv).unwrap_or_else(|_| panic!("{argv:?} must parse"));
             }
         });
     }
@@ -3017,10 +3076,14 @@ async fn main() -> anyhow::Result<()> {
                 tls_cert,
                 tls_key,
                 allow_cleartext_remote,
+                client_keys,
             } => {
                 let mode = route_mode(&mode)?;
                 let bearer = fabric_bearer(bearer);
-                let auth = camelid::fabric::server::ClientAuth::resolve(api_key, api_key_file)?;
+                let auth = match client_keys {
+                    Some(path) => camelid::fabric::server::ClientAuth::from_key_file(path)?,
+                    None => camelid::fabric::server::ClientAuth::resolve(api_key, api_key_file)?,
+                };
                 // Loaded here, before anything is bound, announced or probed:
                 // a certificate that cannot be read is a refusal, and a refusal
                 // must not arrive after the operator has been told the proxy is
@@ -3051,6 +3114,16 @@ async fn main() -> anyhow::Result<()> {
                 let bound = listener.local_addr()?;
                 let scheme = if tls.is_some() { "https" } else { "http" };
                 println!("fabric serve listening on {scheme}://{bound}");
+                // A key set is the only thing here an operator can get subtly
+                // wrong without being told: a file that parsed but named one
+                // client when they meant three looks exactly like success.
+                if auth.is_reloadable() {
+                    println!(
+                        "serving {} named clients; editing the key file revokes \
+                         a client without a restart",
+                        auth.client_count()
+                    );
+                }
                 // Nothing is being served yet, so this probe costs no request, and
                 // it is the only chance to tell the operator about a node that is
                 // not there before a client discovers it for them.

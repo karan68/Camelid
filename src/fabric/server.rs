@@ -94,6 +94,7 @@ use axum_server::tls_rustls::RustlsConfig;
 use axum_server::Handle;
 use serde_json::Value;
 
+use super::client_keys::Admission;
 use super::policy::{route, RouteDecision, RouteError, RouteMode, RouteRequest};
 use super::{self as fabric, DispatchError, Fabric, ForwardError, StreamOutcome};
 use crate::api::{ApiAuth, DEFAULT_MAX_REQUEST_BODY_BYTES};
@@ -144,45 +145,10 @@ const NODE_LOCAL_ROUTES: [&str; 6] = [
 
 /// The credential a client must present to this proxy.
 ///
-/// Wraps the engine's own [`ApiAuth`] so a key is validated, and later compared,
-/// by exactly the rules the engine applies to its own.
-#[derive(Clone, Debug)]
-pub struct ClientAuth {
-    inner: ApiAuth,
-}
-
-impl ClientAuth {
-    /// Accept every client. Safe only on a loopback listener, which is why
-    /// [`bind`] refuses anything else without an acknowledgement.
-    pub fn none() -> Self {
-        Self {
-            inner: ApiAuth::new(None),
-        }
-    }
-
-    /// Require a key, read from a value or a file.
-    ///
-    /// Fails rather than starting unauthenticated: a proxy that silently
-    /// ignored an unreadable key file would be open to whatever can reach it.
-    pub fn resolve(
-        api_key: Option<String>,
-        api_key_file: Option<PathBuf>,
-    ) -> std::io::Result<Self> {
-        Ok(Self {
-            inner: ApiAuth::new(crate::api::resolve_api_key(api_key, api_key_file)?),
-        })
-    }
-
-    pub fn is_enabled(&self) -> bool {
-        self.inner.enabled()
-    }
-}
-
-impl Default for ClientAuth {
-    fn default() -> Self {
-        Self::none()
-    }
-}
+/// Re-exported from [`super::client_keys`], which owns what a key set is and
+/// when it is re-read; this module only decides what a refusal looks like on
+/// the wire.
+pub use super::client_keys::ClientAuth;
 
 /// The certificate this proxy presents to its clients.
 ///
@@ -284,7 +250,7 @@ struct ServerState {
 
 /// Build the router without binding a socket, so tests can drive it directly.
 pub fn router(fabric: Fabric, config: ServeConfig) -> Router {
-    let auth = config.auth.inner.clone();
+    let auth = config.auth.clone();
 
     let placed = PLACED_ROUTES.iter().fold(Router::new(), |router, path| {
         let path = *path;
@@ -320,13 +286,50 @@ pub fn router(fabric: Fabric, config: ServeConfig) -> Router {
         })
         // Wraps every route: an unauthenticated request is refused before
         // anything below reads its body or observes the fabric.
-        .layer(middleware::from_fn_with_state(
-            auth,
-            crate::api::authenticate,
-        ))
+        .layer(middleware::from_fn_with_state(auth, client_auth))
         // Outermost, so a request refused above is still recorded.
         .layer(middleware::from_fn(access_log))
 }
+
+/// Refuse a request that presents no key this proxy knows, and name the client
+/// that presented one it does.
+///
+/// The proxy has its own layer rather than the engine's `authenticate` because
+/// it now holds a *set* of keys, and a single-key middleware cannot say which
+/// of them answered. Everything security-bearing is still the engine's: the
+/// header parsing and constant-time comparison come from [`ApiAuth`], the
+/// exemption for the health routes from [`ApiAuth::route_requires_auth`], and
+/// the refusal itself from [`ApiAuth::unauthorized`], so a refusal here is
+/// word-for-word the one the engine gives.
+///
+/// The admitted name is attached to the *response* rather than the request,
+/// because the only thing that reads it — [`access_log`] — wraps this layer and
+/// has already given the request away by the time an answer exists.
+async fn client_auth(State(auth): State<ClientAuth>, request: Request, next: Next) -> Response {
+    let exempt = request.method() == axum::http::Method::OPTIONS
+        || !ApiAuth::route_requires_auth(request.uri().path());
+
+    let admitted = if exempt {
+        None
+    } else {
+        match auth.admit(request.headers()) {
+            Admission::Refused => return ApiAuth::unauthorized(),
+            Admission::Open => None,
+            Admission::Client(name) => Some(name),
+        }
+    };
+
+    let mut response = next.run(request).await;
+    if let Some(name) = admitted {
+        response.extensions_mut().insert(AdmittedClient(name));
+    }
+    response
+}
+
+/// The name of the client a request was admitted under, carried from the
+/// authentication layer out to the access log.
+#[derive(Clone)]
+struct AdmittedClient(Arc<str>);
 
 /// Record one line per request, whatever the outcome.
 ///
@@ -371,6 +374,13 @@ async fn access_log(request: Request, next: Next) -> Response {
     let status = response.status();
     let node = tagged(&response, "x-camelid-fabric-node");
     let reason = tagged(&response, "x-camelid-fabric-reason");
+    // The name, never the key. "-" covers both an unauthenticated proxy and a
+    // request that was refused, which the status already tells them apart.
+    let client_name = response
+        .extensions()
+        .get::<AdmittedClient>()
+        .map_or("-", |AdmittedClient(name)| name.as_ref())
+        .to_string();
 
     if status.is_server_error() {
         tracing::warn!(
@@ -381,6 +391,7 @@ async fn access_log(request: Request, next: Next) -> Response {
             reason,
             elapsed_ms,
             client,
+            client_name,
             request_id,
             "fabric request failed"
         );
@@ -393,6 +404,7 @@ async fn access_log(request: Request, next: Next) -> Response {
             reason,
             elapsed_ms,
             client,
+            client_name,
             request_id,
             "fabric request"
         );

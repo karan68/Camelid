@@ -118,7 +118,7 @@ impl ApiAuth {
         Some(format!("Authorization: Bearer {key}\r\n"))
     }
 
-    fn accepts(&self, headers: &axum::http::HeaderMap) -> bool {
+    pub(crate) fn accepts(&self, headers: &axum::http::HeaderMap) -> bool {
         let Some(expected) = self.key.as_deref() else {
             return true;
         };
@@ -132,6 +132,41 @@ impl ApiAuth {
         bearer
             .or(api_key)
             .is_some_and(|candidate| constant_time_eq(expected, candidate.as_bytes()))
+    }
+
+    /// Whether `path` is behind the key at all.
+    ///
+    /// An associated function rather than a free one so that anything reusing
+    /// [`ApiAuth`] — the fabric proxy does — applies the same exemptions. The
+    /// health routes are public on purpose: a load balancer has to be able to
+    /// probe a server it holds no credential for.
+    pub(crate) fn route_requires_auth(path: &str) -> bool {
+        !matches!(path, "/health" | "/v1/health" | "/" | "/index.html")
+            && !path.starts_with("/assets/")
+            && !path.starts_with("/favicon")
+    }
+
+    /// The refusal a caller without a usable key gets.
+    ///
+    /// Built here so every front door refuses in the same words, with the same
+    /// challenge header, and none of them names which key would have worked.
+    pub(crate) fn unauthorized() -> Response {
+        let mut response = (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "error": {
+                    "code": "unauthorized",
+                    "message": "provide Authorization: Bearer <key> or X-API-Key",
+                    "type": "authentication_error"
+                }
+            })),
+        )
+            .into_response();
+        response.headers_mut().insert(
+            WWW_AUTHENTICATE,
+            HeaderValue::from_static("Bearer realm=\"camelid\""),
+        );
+        response
     }
 }
 
@@ -239,34 +274,13 @@ pub(crate) async fn authenticate(
     next: Next,
 ) -> Response {
     if request.method() == Method::OPTIONS
-        || !route_requires_auth(request.uri().path())
+        || !ApiAuth::route_requires_auth(request.uri().path())
         || auth.accepts(request.headers())
     {
         return next.run(request).await;
     }
 
-    let mut response = (
-        StatusCode::UNAUTHORIZED,
-        Json(serde_json::json!({
-            "error": {
-                "code": "unauthorized",
-                "message": "provide Authorization: Bearer <key> or X-API-Key",
-                "type": "authentication_error"
-            }
-        })),
-    )
-        .into_response();
-    response.headers_mut().insert(
-        WWW_AUTHENTICATE,
-        HeaderValue::from_static("Bearer realm=\"camelid\""),
-    );
-    response
-}
-
-fn route_requires_auth(path: &str) -> bool {
-    !matches!(path, "/health" | "/v1/health" | "/" | "/index.html")
-        && !path.starts_with("/assets/")
-        && !path.starts_with("/favicon")
+    ApiAuth::unauthorized()
 }
 
 fn parse_bearer(value: &str) -> Option<&str> {
