@@ -19,6 +19,13 @@
 //! waiting for a node to answer, and within one dial attempt while connecting.
 //! Nothing here interrupts a syscall already in progress.
 //!
+//! One window is deliberately not covered: a *write* to the node uses the
+//! whole forward budget as its timeout, so a peer that accepts the connection
+//! and then stops reading can hold a send for far longer than either bound
+//! above. It takes a pathological node to reach — request bodies are capped at
+//! 16 MiB and a node reads its request promptly — and shortening it would mean
+//! chunking every write to poll a flag between the pieces.
+//!
 //! Cancelling is not a failure of the node it was placed on, and the rest of
 //! the fabric treats it accordingly: the observation the request was placed
 //! from is kept, and the request is never sent to a second node, because there

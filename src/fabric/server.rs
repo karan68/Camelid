@@ -75,13 +75,12 @@
 //!   what a client leaving looks like to axum, and the dispatch stops at its
 //!   next socket-operation boundary and hangs up on the node. A node that sees
 //!   its caller go stops generating within one decode step, so this gives back
-//!   the generation slot rather than merely a thread here. What it does not
-//!   cover is a probe round already in flight, which is bounded by `--timeout-ms`
-//!   and costs a node a health read rather than its generation slot.
-//! * A non-streaming dispatch runs on a blocking thread and blocking socket I/O
-//!   is not cancellable, so a client that hangs up leaves its dispatch running
-//!   until the node answers or `forward_timeout` expires. A streaming dispatch
-//!   does notice: its next send fails and the node's socket is dropped with it.
+//!   the generation slot rather than merely a thread here. Mid-relay a stream
+//!   already noticed on its own — its next send to the client fails — so what
+//!   this adds there is the idle gap between two events, and everywhere else
+//!   it is the only mechanism. What it does not cover is a probe round already
+//!   in flight, which is bounded by `--timeout-ms` and costs a node a health
+//!   read rather than its generation slot.
 
 use std::fmt;
 use std::net::SocketAddr;
@@ -123,8 +122,10 @@ const MAX_REQUEST_ID_LEN: usize = 128;
 /// Not an IANA code: 499 is nginx's, and it is here for the reason nginx has it
 /// — every standard code would claim either that the request succeeded or that
 /// something upstream failed, and neither happened. Nothing on the network
-/// reads it, because the client it describes has gone; what it protects is the
-/// reader of a log or a test, who must not be told a healthy node failed.
+/// reads it, because the client it describes has gone, and nor does the access
+/// log, whose own future is dropped with the handler's. What it protects is a
+/// test, and any future caller of [`forward_error`] that is not the network,
+/// from being told a healthy node failed.
 fn client_closed_request() -> StatusCode {
     StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_GATEWAY)
 }
