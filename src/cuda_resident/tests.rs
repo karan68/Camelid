@@ -6890,10 +6890,10 @@ fn flash_attention_prefill_tiled_parity() {
                 let out_offset = (t * n_heads + h) * head_dim;
                 for d in 0..head_dim {
                     let mut acc = 0.0f32;
-                    for p in 0..=global_q_pos {
+                    for (p, &exp_score) in exp_scores.iter().enumerate().take(global_q_pos + 1) {
                         let v_offset = (kv_h * max_pos + p) * head_dim;
                         let v_val = crate::inference::f16_bits_to_f32(cache_v_bits[v_offset + d]);
-                        acc += exp_scores[p] * v_val;
+                        acc += exp_score * v_val;
                     }
                     expected[out_offset + d] = acc * inv_sum;
                 }
