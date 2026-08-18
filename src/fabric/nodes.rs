@@ -28,9 +28,12 @@ pub(crate) const DEFAULT_NODE_RELOAD_INTERVAL: Duration = Duration::from_secs(1)
 
 /// What the file looked like when it was last read.
 ///
-/// Modification time alone is not enough: a file rewritten within the same
-/// timestamp tick would be missed, and on a removal that means a node that
-/// should have stopped being placed on keeps being placed on.
+/// Length as well as modification time, because adding or removing a machine
+/// changes the length and mtime alone can be too coarse to notice a rewrite
+/// within one tick. It narrows that window rather than closing it: an edit of
+/// the same length inside a single tick still looks unchanged. Closing it would
+/// mean reading the file every interval, which is the cost this exists to
+/// avoid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FileStamp {
     modified: Option<SystemTime>,
@@ -61,6 +64,9 @@ struct State {
     specs: Arc<[NodeSpec]>,
     stamp: Option<FileStamp>,
     last_checked: Option<Instant>,
+    /// Whether the last re-read failed, so the notice below is printed once
+    /// per transition rather than once per interval for as long as it lasts.
+    stale: bool,
 }
 
 struct Inner {
@@ -93,6 +99,7 @@ impl NodeSet {
                     specs: Arc::from(specs),
                     stamp: None,
                     last_checked: None,
+                    stale: false,
                 }),
                 generation: AtomicU64::new(0),
             }),
@@ -120,6 +127,7 @@ impl NodeSet {
                     specs: Arc::from(specs),
                     stamp,
                     last_checked: Some(Instant::now()),
+                    stale: false,
                 }),
                 generation: AtomicU64::new(0),
             }),
@@ -183,6 +191,14 @@ impl NodeSet {
                     state.specs = Arc::from(specs);
                     self.inner.generation.fetch_add(1, Ordering::SeqCst);
                 }
+                if state.stale {
+                    eprintln!(
+                        "fabric: node file {} is readable again; placing on {}",
+                        path.display(),
+                        nodes_phrase(state.specs.len())
+                    );
+                }
+                state.stale = false;
             }
             Err(error) => {
                 // The previous set is kept on purpose. A file is often replaced
@@ -190,13 +206,23 @@ impl NodeSet {
                 // that lands mid-swap sees a partial, empty or missing file;
                 // emptying the fabric on that would turn an ordinary edit into
                 // a total outage, because a fabric with no nodes refuses every
-                // request. The cost is that a change written into a *broken*
-                // file does not take effect, which is why this is loud.
+                // request. The cost is that a change written into a broken or
+                // deleted file does not take effect, so the operator has to
+                // hear about it.
                 tracing::warn!(
                     path = %path.display(),
                     %error,
                     "could not reload the node set; the previous one is still in force"
                 );
+                // Printed, not only traced: `RUST_LOG` is unset on a stock
+                // proxy, so a machine the operator meant to take out would go
+                // on being placed on with nothing said. Once per transition,
+                // because this is re-attempted every interval and a file left
+                // broken would otherwise emit a line a second indefinitely.
+                if !state.stale {
+                    eprintln!("{}", stale_node_set_notice(&error, state.specs.len()));
+                }
+                state.stale = true;
             }
         }
         (
@@ -266,6 +292,28 @@ fn load_node_file(path: &Path) -> Result<Vec<NodeSpec>> {
         ));
     }
     Ok(specs)
+}
+
+/// What an operator is told when a re-read fails. Pure, so it is tested rather
+/// than eyeballed.
+///
+/// It has to say the change did not happen: the file and the set being placed
+/// on no longer agree, and the file is the one the operator is looking at. A
+/// machine they meant to take out is still taking requests.
+fn stale_node_set_notice(error: &Error, nodes: usize) -> String {
+    format!(
+        "fabric: could not reload the node file: {error}. The previous set of {} \
+         is still being placed on, so a change written here has NOT taken effect.",
+        nodes_phrase(nodes)
+    )
+}
+
+fn nodes_phrase(count: usize) -> String {
+    if count == 1 {
+        "1 machine".to_string()
+    } else {
+        format!("{count} machines")
+    }
 }
 
 /// A poisoned lock is not corrupted state: some other request panicked while
@@ -391,6 +439,24 @@ mod tests {
 
         assert_eq!(labels(&specs), vec!["a", "b"]);
         assert_eq!(before, after, "an identical rewrite is not a change");
+    }
+
+    /// Keeping the previous set is only safe if the operator is told, and
+    /// `RUST_LOG` is unset on a stock proxy, so the notice is printed. It has
+    /// to say the change did not happen: a machine they meant to take out is
+    /// still taking requests, and "could not reload" alone reads like a retry
+    /// that will sort itself out.
+    #[test]
+    fn the_notice_says_the_change_has_not_taken_effect() {
+        let error = Error::new(ErrorKind::InvalidData, "nodes: needs a label");
+        let notice = stale_node_set_notice(&error, 2);
+        assert!(notice.contains("nodes: needs a label"), "{notice}");
+        assert!(notice.contains("previous set of 2 machines"), "{notice}");
+        assert!(notice.contains("NOT taken effect"), "{notice}");
+        assert!(
+            stale_node_set_notice(&error, 1).contains("previous set of 1 machine "),
+            "one machine is not '1 machines'"
+        );
     }
 
     #[test]

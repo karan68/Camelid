@@ -213,10 +213,24 @@ nothing.
 Two refusals are deliberate. A file that cannot be read, is not valid, or **names no nodes at all**
 is refused at startup rather than started on an empty fabric, which would answer every request with
 503 while looking as though it had started. And if a *re-read* fails the same way, the previous set
-stays in force and a warning is logged — a file is usually replaced by writing a new one and renaming
-it over the old, so a read landing mid-swap sees a partial or empty file, and emptying the fabric on
-that would turn an ordinary edit into a total outage. The cost is that a change written into a broken
-file has not taken effect, and the warning is the only thing that says so.
+stays in force — a file is usually replaced by writing a new one and renaming it over the old, so a
+read landing mid-swap sees a partial or empty file, and emptying the fabric on that would turn an
+ordinary edit into a total outage.
+
+That fallback has a cost worth stating plainly: **a change written into a file that does not parse,
+or deleting the node file altogether, does not change anything.** The previously loaded set goes on
+being placed on until the file is readable again or the proxy is restarted — and a restart refuses to
+come up at all while the file is unusable. A machine you meant to take out is still taking requests.
+So the proxy prints to stderr when a re-read starts failing, and again when it recovers, rather than
+relying on `RUST_LOG` being set:
+
+```
+fabric: could not reload the node file: <why>. The previous set of 2 machines is still being
+placed on, so a change written here has NOT taken effect.
+```
+
+It is printed once each way, not once per re-read, so a file left broken does not emit a line a
+second for as long as it stays that way.
 
 The proxy re-probes its nodes at most once per `--observation-max-age-ms` (500 by default) rather
 than once per request. Inside that window its view can be wrong, so a request placed on a node that
