@@ -21,6 +21,18 @@ use camelid::fabric::{Fabric, NodeSpec, RouteMode, ENGINE_QUEUE_FULL_CODE};
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const FORWARD_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// The routes the proxy places, which a node therefore has to answer. Repeated
+/// here rather than imported: these tests are a client's view of the proxy, and
+/// a test that read the same constant the router is built from could not notice
+/// a route quietly leaving it.
+const PLACED_ROUTES: [&str; 5] = [
+    "/v1/chat/completions",
+    "/v1/completions",
+    "/v1/embeddings",
+    "/v1/rerank",
+    "/v1/reranking",
+];
+
 /// One request a stub received: enough to say which route it was, what
 /// credential the proxy presented on it, and what it asked for.
 #[derive(Debug, Clone)]
@@ -299,7 +311,7 @@ fn serve_once(stream: &mut TcpStream, config: &StubConfig, requests: &Mutex<Vec<
                 .to_string(),
         ),
         "/v1/health" => (200_u16, health_body(config)),
-        "/v1/chat/completions" => {
+        path if PLACED_ROUTES.contains(&path) => {
             // Counted for exactly as long as the node is working on it.
             let busy = config.live_in_flight.as_ref().map(|count| {
                 count.fetch_add(1, Ordering::SeqCst);
@@ -437,16 +449,21 @@ fn health_probes(nodes: &[StubNode]) -> usize {
         .sum()
 }
 
-fn completions_served(nodes: &[StubNode]) -> Vec<usize> {
+/// Requests each node received on one route.
+fn served_on(nodes: &[StubNode], path: &str) -> Vec<usize> {
     nodes
         .iter()
         .map(|node| {
             node.received()
                 .iter()
-                .filter(|received| received.path == "/v1/chat/completions")
+                .filter(|received| received.path == path)
                 .count()
         })
         .collect()
+}
+
+fn completions_served(nodes: &[StubNode]) -> Vec<usize> {
+    served_on(nodes, "/v1/chat/completions")
 }
 
 /// Bind the real proxy on an OS-assigned port and start serving it in the
@@ -478,12 +495,22 @@ async fn post_chat(
     body: &Value,
     extra_headers: &[(&str, &str)],
 ) -> (u16, Value, Vec<(String, String)>) {
+    post_to(addr, "/v1/chat/completions", body, extra_headers).await
+}
+
+/// The same, on any route, for the ones that are not chat.
+async fn post_to(
+    addr: SocketAddr,
+    path: &str,
+    body: &Value,
+    extra_headers: &[(&str, &str)],
+) -> (u16, Value, Vec<(String, String)>) {
     let mut stream = tokio::net::TcpStream::connect(addr)
         .await
         .expect("connect to proxy");
     let payload = body.to_string();
     let mut request = format!(
-        "POST /v1/chat/completions HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
+        "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
         payload.len()
     );
     for (name, value) in extra_headers {
@@ -697,12 +724,20 @@ async fn post_chat_streaming(
     addr: SocketAddr,
     body: &Value,
 ) -> (u16, Vec<(String, String)>, Vec<Piece>) {
+    post_streaming(addr, "/v1/chat/completions", body).await
+}
+
+async fn post_streaming(
+    addr: SocketAddr,
+    path: &str,
+    body: &Value,
+) -> (u16, Vec<(String, String)>, Vec<Piece>) {
     let mut stream = tokio::net::TcpStream::connect(addr)
         .await
         .expect("connect to proxy");
     let payload = body.to_string();
     let request = format!(
-        "POST /v1/chat/completions HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+        "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
         payload.len()
     );
     stream
@@ -2205,4 +2240,276 @@ async fn a_saturated_node_hands_a_streaming_request_on_as_well() {
         !pieces.is_empty(),
         "the replacement node's events must arrive"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The routes the proxy serves
+//
+// A client pointed at this address expects an OpenAI-compatible surface, not
+// only chat. These tests are that client's view: what reaches a node, what is
+// refused and why, and what an unauthenticated caller is allowed to learn.
+// ---------------------------------------------------------------------------
+
+/// A body that is recognisably this route's, so the assertion that the node got
+/// it back cannot pass on a body some other route sent.
+fn body_for(path: &str) -> Value {
+    let marker = format!("body for {path}");
+    match path {
+        "/v1/chat/completions" => {
+            serde_json::json!({ "model": "shared-model", "messages": [{ "role": "user", "content": marker }] })
+        }
+        "/v1/embeddings" => serde_json::json!({ "model": "shared-model", "input": marker }),
+        "/v1/rerank" | "/v1/reranking" => {
+            serde_json::json!({ "model": "shared-model", "query": marker, "documents": ["a", "b"] })
+        }
+        _ => serde_json::json!({ "model": "shared-model", "prompt": marker }),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn every_placed_route_reaches_a_node_with_its_path_and_body_intact() {
+    let node = StubNode::start(StubConfig::ready("shared-model", 0));
+    let addr = start_proxy(fabric_of(vec![node.spec("only")]), RouteMode::Throughput).await;
+
+    for path in PLACED_ROUTES {
+        let sent = body_for(path);
+        let (status, _, headers) = post_to(addr, path, &sent, &[]).await;
+        assert_eq!(status, 200, "{path} was not served");
+        assert_eq!(
+            header(&headers, "x-camelid-fabric-node"),
+            Some("only"),
+            "{path} was answered without being placed"
+        );
+
+        let arrived: Vec<Received> = node
+            .received()
+            .into_iter()
+            .filter(|received| received.path == path)
+            .collect();
+        assert_eq!(
+            arrived.len(),
+            1,
+            "{path} did not reach the node exactly once"
+        );
+        // Byte-for-byte: the proxy reads `model` and `stream` out of the body
+        // and must relay everything else, including fields it has never heard
+        // of, exactly as the client wrote them.
+        assert_eq!(
+            serde_json::from_str::<Value>(&arrived[0].body).expect("json body"),
+            sent,
+            "{path} arrived with a body the client did not send"
+        );
+    }
+}
+
+/// Placement is model-scoped on every route, not just the one it was written
+/// for: a node that does not hold the model must never see the request.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_placed_route_other_than_chat_is_still_scoped_to_the_serving_node() {
+    let alpha = StubNode::start(StubConfig::ready("model-alpha", 0));
+    let beta = StubNode::start(StubConfig::ready("model-beta", 0));
+    let addr = start_proxy(
+        fabric_of(vec![alpha.spec("alpha"), beta.spec("beta")]),
+        RouteMode::Throughput,
+    )
+    .await;
+
+    let (status, _, headers) = post_to(
+        addr,
+        "/v1/embeddings",
+        &serde_json::json!({ "model": "model-beta", "input": "hello" }),
+        &[],
+    )
+    .await;
+
+    assert_eq!(status, 200);
+    assert_eq!(header(&headers, "x-camelid-fabric-node"), Some("beta"));
+    assert!(
+        alpha
+            .received()
+            .iter()
+            .all(|received| received.path == "/v1/health"),
+        "alpha holds a different model and should only have been probed: {:?}",
+        alpha.received()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_completions_stream_is_relayed_like_a_chat_one() {
+    let events = ["data: one\n\n", "data: [DONE]\n\n"];
+    let node = StubNode::start(StubConfig::streaming(
+        "shared-model",
+        &events,
+        Duration::ZERO,
+    ));
+    let addr = start_proxy(fabric_of(vec![node.spec("only")]), RouteMode::Throughput).await;
+
+    let (status, headers, pieces) = post_streaming(
+        addr,
+        "/v1/completions",
+        &serde_json::json!({ "model": "shared-model", "prompt": "hi", "stream": true }),
+    )
+    .await;
+
+    assert_eq!(status, 200);
+    assert_eq!(header(&headers, "x-camelid-fabric-node"), Some("only"));
+    assert_eq!(header(&headers, "content-type"), Some("text/event-stream"));
+    let framed: String = pieces.iter().map(|piece| piece.text.as_str()).collect();
+    assert_eq!(dechunk(&framed), events.concat());
+    assert_eq!(
+        served_on(std::slice::from_ref(&node), "/v1/completions")[0],
+        1
+    );
+}
+
+/// `stream: true` is a property of the request, not of the route. A route that
+/// has nothing to stream answers with a body instead, and that answer has to
+/// reach the client as an answer rather than as an empty stream.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_route_that_cannot_stream_still_answers_a_client_that_asks_it_to() {
+    let node = StubNode::start(StubConfig::ready("shared-model", 0));
+    let addr = start_proxy(fabric_of(vec![node.spec("only")]), RouteMode::Throughput).await;
+
+    let (status, body, headers) = post_to(
+        addr,
+        "/v1/embeddings",
+        &serde_json::json!({ "model": "shared-model", "input": "hi", "stream": true }),
+        &[],
+    )
+    .await;
+
+    assert_eq!(status, 200);
+    assert_eq!(header(&headers, "x-camelid-fabric-node"), Some("only"));
+    assert!(
+        body.get("choices").is_some(),
+        "the node's complete answer must reach the client verbatim: {body}"
+    );
+}
+
+/// Refused before placement, so the fabric is not even observed: this proxy
+/// declines these routes on principle, not because no node could take them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_local_route_is_refused_without_touching_a_node() {
+    let node = StubNode::start(StubConfig::ready("shared-model", 0));
+    let addr = start_proxy(fabric_of(vec![node.spec("only")]), RouteMode::Throughput).await;
+
+    let (status, body, _) = post_to(
+        addr,
+        "/v1/responses",
+        &serde_json::json!({ "model": "shared-model", "input": "hi" }),
+        &[],
+    )
+    .await;
+
+    assert_eq!(status, 501, "{body}");
+    assert_eq!(body["error"]["type"], "fabric_error");
+    assert!(
+        node.received().is_empty(),
+        "a refusal on principle must not cost a probe: {:?}",
+        node.received()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unserved_route_is_refused_with_the_ones_that_are_served() {
+    let node = StubNode::start(StubConfig::ready("shared-model", 0));
+    let addr = start_proxy(fabric_of(vec![node.spec("only")]), RouteMode::Throughput).await;
+
+    let (status, body, _) = post_to(
+        addr,
+        "/v1/audio/speech",
+        &serde_json::json!({ "model": "shared-model" }),
+        &[],
+    )
+    .await;
+
+    assert_eq!(status, 404, "{body}");
+    assert_eq!(body["error"]["type"], "fabric_error");
+    let message = body["error"]["message"].as_str().expect("a message");
+    assert!(message.contains("/v1/embeddings"), "{message}");
+    assert!(message.contains("/v1/health"), "{message}");
+    assert!(node.received().is_empty(), "{:?}", node.received());
+}
+
+/// The route table is not public. An unauthenticated caller learns that it is
+/// unauthenticated and nothing else — the same reasoning that keeps model names
+/// out of a 401 from `/v1/models`.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unauthenticated_caller_is_refused_before_learning_the_route_table() {
+    let node = StubNode::start(StubConfig::ready("shared-model", 0));
+    let addr = start_proxy_with_auth(
+        fabric_of(vec![node.spec("only")]),
+        RouteMode::Throughput,
+        authenticated("s3cret"),
+    )
+    .await;
+
+    let (unknown, body) = get_raw(addr, "/v1/audio/speech", &[]).await;
+    assert_eq!(unknown, 401);
+    assert!(
+        !body.contains("/v1/embeddings"),
+        "the 401 leaked the route table: {body}"
+    );
+
+    let (refused, _, _) = post_to(
+        addr,
+        "/v1/embeddings",
+        &serde_json::json!({ "model": "shared-model", "input": "hi" }),
+        &[],
+    )
+    .await;
+    assert_eq!(refused, 401, "every placed route is behind the key");
+    assert!(node.received().is_empty(), "{:?}", node.received());
+
+    let (served, _, _) = post_to(
+        addr,
+        "/v1/embeddings",
+        &serde_json::json!({ "model": "shared-model", "input": "hi" }),
+        &[("Authorization", "Bearer s3cret")],
+    )
+    .await;
+    assert_eq!(served, 200, "the key still opens the new routes");
+}
+
+/// The body limit and the JSON rejection shape are properties of the handler
+/// every placed route shares, so they must hold on a route that was added
+/// after they were written.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_malformed_body_on_a_new_route_is_refused_in_the_fabric_shape() {
+    let node = StubNode::start(StubConfig::ready("shared-model", 0));
+    let addr = start_proxy(fabric_of(vec![node.spec("only")]), RouteMode::Throughput).await;
+
+    let mut stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("connect to proxy");
+    let payload = "this is not json";
+    let request = format!(
+        "POST /v1/rerank HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+        payload.len()
+    );
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write request");
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).await.expect("read response");
+    let text = String::from_utf8_lossy(&raw);
+
+    assert!(text.starts_with("HTTP/1.1 400"), "{text}");
+    assert!(text.contains("fabric_error"), "{text}");
+    assert!(node.received().is_empty(), "{:?}", node.received());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_model_can_be_retrieved_by_id_through_the_proxy() {
+    let node = StubNode::start(StubConfig::ready("shared-model", 0));
+    let addr = start_proxy(fabric_of(vec![node.spec("only")]), RouteMode::Throughput).await;
+
+    let (found, body) = get_raw(addr, "/v1/models/shared-model", &[]).await;
+    assert_eq!(found, 200, "{body}");
+    assert!(body.contains("\"id\":\"shared-model\""), "{body}");
+
+    let (missing, refusal) = get_raw(addr, "/v1/models/other-model", &[]).await;
+    assert_eq!(missing, 404, "{refusal}");
+    assert!(refusal.contains("model_not_found"), "{refusal}");
 }

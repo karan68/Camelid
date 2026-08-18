@@ -131,6 +131,31 @@ Request bodies are bounded at the same 16 MiB default the node itself uses. A st
 relayed as it arrives; `fabric run`, which returns one complete answer, refuses `stream: true` with
 400 instead.
 
+### What the proxy serves
+
+It places the engine's stateless inference routes, and answers discovery for the whole fabric:
+
+| Route | Behaviour |
+| --- | --- |
+| `POST /v1/chat/completions` | Placed on a node serving the model named in the body. |
+| `POST /v1/completions` | Same. |
+| `POST /v1/embeddings` | Same. |
+| `POST /v1/rerank`, `POST /v1/reranking` | Same. |
+| `GET /v1/models` | The union of what every ready node is serving. |
+| `GET /v1/models/{model}` | 200 exactly when a request naming that model would be placed. |
+
+A route is placed only if any node serving the named model could answer it, because the client cannot
+tell which node it reached and must not need to. That rules out the Responses and Conversations APIs:
+they keep their items in a SQLite store on the node that served the request, so a follow-up landing on
+another node would find nothing. Those routes are refused with **501** and a reason rather than
+half-supported — send them to a node directly, where they work as documented. Any other route is a
+**404** naming what is served, so a client can tell a wrong route from a wrong model. Both refusals
+are behind the client key, if one is configured: an unauthenticated caller gets a 401 and learns
+nothing about the fabric.
+
+`stream: true` is read from the request rather than assumed from the route, so a client that sets it
+on a route with nothing to stream still gets that route's complete answer instead of an empty stream.
+
 ## Mixtral diagnostic gate
 
 The checked Mixtral 8×7B Q8 row has one-token evidence, but its longer continuation parity gate is
