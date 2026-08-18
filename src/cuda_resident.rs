@@ -9838,13 +9838,6 @@ pub struct CudaResidentDecode {
     d_sk_chunkmax: CudaSlice<f32>, // n_heads * SPLITK_MAX
     d_sk_lsum: CudaSlice<f32>,     // n_heads * SPLITK_MAX
     d_sk_acc: CudaSlice<f32>,      // n_heads * SPLITK_MAX * head_dim
-    // SIROCCO Phase P M1 flash prefill scratch: k_tokens-major (flat (t*n_heads+head)), sized for
-    // MAX_VERIFY_K query tokens so attn_sk_combine reuses these with n_heads = k*n_heads. Only
-    // allocated/used when CAMELID_FLASH_PREFILL is on.
-    d_flash_scores: CudaSlice<f32>, // MAX_VERIFY_K * n_heads * max_pos
-    d_flash_chunkmax: CudaSlice<f32>, // MAX_VERIFY_K * n_heads * SPLITK_MAX
-    d_flash_lsum: CudaSlice<f32>,   // MAX_VERIFY_K * n_heads * SPLITK_MAX
-    d_flash_acc: CudaSlice<f32>,    // MAX_VERIFY_K * n_heads * SPLITK_MAX * head_dim
     d_proj: CudaSlice<f32>,
     /// Holds a projection's output AFTER a gemma3 sandwich post-norm and before
     /// its residual add. A top-level field rather than one inside `Gemma3Gpu` so
@@ -10391,27 +10384,6 @@ impl CudaResidentDecode {
             d_sk_chunkmax: alloc_f(n_heads * SPLITK_MAX)?,
             d_sk_lsum: alloc_f(n_heads * SPLITK_MAX)?,
             d_sk_acc: alloc_f(n_heads * SPLITK_MAX * head_dim)?,
-            // Flash-prefill scratch: k_tokens-major, allocated only when opt-in (else 1-elem stub).
-            d_flash_scores: alloc_f(if flash_prefill_enabled() {
-                MAX_VERIFY_K * n_heads * max_pos
-            } else {
-                1
-            })?,
-            d_flash_chunkmax: alloc_f(if flash_prefill_enabled() {
-                MAX_VERIFY_K * n_heads * SPLITK_MAX
-            } else {
-                1
-            })?,
-            d_flash_lsum: alloc_f(if flash_prefill_enabled() {
-                MAX_VERIFY_K * n_heads * SPLITK_MAX
-            } else {
-                1
-            })?,
-            d_flash_acc: alloc_f(if flash_prefill_enabled() {
-                MAX_VERIFY_K * n_heads * SPLITK_MAX * head_dim
-            } else {
-                1
-            })?,
             d_proj: alloc_f(hidden)?,
             d_post: alloc_f(hidden)?,
             d_gate: alloc_f(ffn_dim)?,
