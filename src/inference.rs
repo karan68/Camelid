@@ -3160,7 +3160,7 @@ impl LlamaInferenceSession {
             return Ok(false);
         }
         if self.resident_paths_disabled
-            || token_ids.len() < 2
+            || token_ids.is_empty()
             || token_ids.len() > 16384
             || self.kv_cache.position != 0
             || self.weights.layer_range.is_some()
@@ -5384,7 +5384,7 @@ impl LlamaInferenceSession {
             });
         }
         let resident_prefill_started = Instant::now();
-        if prefill_count > 1 && self.try_resident_prefill(&token_ids[..prefill_count])? {
+        if prefill_count > 0 && self.try_resident_prefill(&token_ids[..prefill_count])? {
             // Whole prompt prefilled on the GPU in one command buffer; the last prompt
             // token below decodes through the resident session. The wall-clock covers
             // session setup + the command buffer; per-stage GPU splits aren't available.
