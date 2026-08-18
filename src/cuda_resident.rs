@@ -4072,6 +4072,75 @@ extern "C" __global__ void sample_gumbel(
     if (tid == 0) out_idx[0] = (unsigned int)sidx[0];
 }
 
+extern "C" __global__ void sample_gumbel_filtered(
+    const float* __restrict__ logits, int n, float inv_temp, float min_p,
+    unsigned long long seed, unsigned int* __restrict__ out_idx
+) {
+    extern __shared__ float sh[];
+    float* sval = sh;
+    int* sidx = (int*)(sh + blockDim.x);
+    int tid = threadIdx.x;
+
+    // Pass 1: Find maximum logit across all n elements
+    float local_max = -3.4e38f;
+    for (int i = tid; i < n; i += blockDim.x) {
+        float l = logits[i];
+        if (l > local_max) local_max = l;
+    }
+    sval[tid] = local_max;
+    __syncthreads();
+
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (tid < s) {
+            if (sval[tid + s] > sval[tid]) {
+                sval[tid] = sval[tid + s];
+            }
+        }
+        __syncthreads();
+    }
+    float global_max = sval[0];
+    __syncthreads();
+
+    // Compute min_p logit threshold:
+    // Any token with exp(logit - global_max) < min_p is filtered out.
+    // In logit space: logit < global_max + ln(min_p).
+    float min_p_threshold = (min_p > 0.0f && min_p <= 1.0f) ? (global_max + logf(min_p)) : -3.4e38f;
+
+    // Pass 2: Gumbel draw over logits that clear the threshold
+    float best = -3.4e38f;
+    int besti = 0;
+    for (int i = tid; i < n; i += blockDim.x) {
+        float l = logits[i];
+        if (l >= min_p_threshold) {
+            float u = splitmix_uniform(seed, (unsigned int)i);
+            float g = -logf(-logf(u));
+            float v = l * inv_temp + g;
+            if (v > best) {
+                best = v;
+                besti = i;
+            }
+        }
+    }
+    sval[tid] = best;
+    sidx[tid] = besti;
+    __syncthreads();
+
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (tid < s) {
+            float ov = sval[tid + s];
+            int oi = sidx[tid + s];
+            if (ov > sval[tid] || (ov == sval[tid] && oi < sidx[tid])) {
+                sval[tid] = ov;
+                sidx[tid] = oi;
+            }
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        out_idx[0] = (unsigned int)sidx[0];
+    }
+}
+
 // ---- Batched (K-token) variants for the speculative-verify forward ----------
 // Each processes K tokens laid out [token][...] in one launch. Elementwise
 // kernels (quantize/silu/residual) are batched just by launching over K x the
@@ -5712,6 +5781,7 @@ pub struct CudaResidentKernels {
     pub(crate) moe_weighted_sum_routed: CudaFunction,
     pub(crate) argmax: CudaFunction,
     pub(crate) sample_gumbel: CudaFunction,
+    pub(crate) sample_gumbel_filtered: CudaFunction,
     pub(crate) gemm_batched: CudaFunction,
     pub(crate) rms_norm_batched: CudaFunction,
     pub(crate) prism_rms_norm_q8_batched: CudaFunction,
@@ -5912,6 +5982,7 @@ impl CudaResidentKernels {
             moe_weighted_sum_routed: f("moe_weighted_sum_routed")?,
             argmax: f("argmax_f32")?,
             sample_gumbel: f("sample_gumbel")?,
+            sample_gumbel_filtered: f("sample_gumbel_filtered")?,
             gemm_batched: f("q8_gemm_batched")?,
             rms_norm_batched: f("rms_norm_batched")?,
             prism_rms_norm_q8_batched: f("prism_rms_norm_q8_batched")?,
@@ -9199,6 +9270,34 @@ pub(crate) fn launch_sample_gumbel(
     b.arg(logits)
         .arg(&n_i)
         .arg(&inv_temp)
+        .arg(&seed)
+        .arg(out_idx);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn launch_sample_gumbel_filtered(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    logits: &CudaSlice<f32>,
+    n: usize,
+    inv_temp: f32,
+    min_p: f32,
+    seed: u64,
+    out_idx: &mut CudaSlice<u32>,
+) -> Result<(), cudarc::driver::DriverError> {
+    let block = 256u32;
+    let cfg = LaunchConfig {
+        grid_dim: (1, 1, 1),
+        block_dim: (block, 1, 1),
+        shared_mem_bytes: block * 8,
+    };
+    let n_i = n as i32;
+    let mut b = s.launch_builder(f);
+    b.arg(logits)
+        .arg(&n_i)
+        .arg(&inv_temp)
+        .arg(&min_p)
         .arg(&seed)
         .arg(out_idx);
     unsafe { b.launch(cfg) }.map(|_| ())
@@ -13201,11 +13300,11 @@ impl CudaResidentDecode {
         Ok(logits)
     }
 
-    /// Temperature sampling decode entirely on the GPU: full forward, then a
-    /// Gumbel-max draw over the logits (one pass, no softmax/sort/host copy).
+    /// Temperature and min-p sampling decode entirely on the GPU: full forward, then a
+    /// Gumbel-max draw over the (optionally min-p thresholded) logits (one pass, no host copy).
     /// Returns the sampled token id. `inv_temp` is `1.0 / temperature`; `seed`
-    /// varies the draw per token. One device sync. Used for the default chat
-    /// case (temperature only); top-k / top-p / penalties stay on the CPU path.
+    /// varies the draw per token. One device sync. Used for GPU-native sampling;
+    /// top-p / penalties stay on the CPU path.
     #[allow(clippy::too_many_arguments)]
     pub fn forward_token_sample(
         &mut self,
@@ -13215,21 +13314,36 @@ impl CudaResidentDecode {
         position: usize,
         scale: f32,
         inv_temp: f32,
+        min_p: Option<f32>,
         seed: u64,
     ) -> Result<u32, String> {
         let map = |e: cudarc::driver::DriverError| format!("cuda forward: {e}");
         let s = self.k.stream.clone();
         self.forward_pass(embedding, cos, sin, position, scale, true, false, false)?;
-        launch_sample_gumbel(
-            &s,
-            &self.k.sample_gumbel,
-            &self.d_logits,
-            self.vocab,
-            inv_temp,
-            seed,
-            &mut self.d_sampled,
-        )
-        .map_err(map)?;
+        if let Some(mp) = min_p.filter(|p| *p > 0.0) {
+            launch_sample_gumbel_filtered(
+                &s,
+                &self.k.sample_gumbel_filtered,
+                &self.d_logits,
+                self.vocab,
+                inv_temp,
+                mp,
+                seed,
+                &mut self.d_sampled,
+            )
+            .map_err(map)?;
+        } else {
+            launch_sample_gumbel(
+                &s,
+                &self.k.sample_gumbel,
+                &self.d_logits,
+                self.vocab,
+                inv_temp,
+                seed,
+                &mut self.d_sampled,
+            )
+            .map_err(map)?;
+        }
         let mut out = [0u32; 1];
         s.memcpy_dtoh(&self.d_sampled, &mut out).map_err(map)?;
         self.k.ctx.synchronize().map_err(map)?;

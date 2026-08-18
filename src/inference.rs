@@ -3314,20 +3314,19 @@ impl LlamaInferenceSession {
             return Ok(false);
         }
         slot.engine.set_filled(n);
-        // The GPU prefill only fills the GPU KV cache. Copy it back so the CPU-side
-        // KV cache is authoritative too: otherwise any later forward that takes the
-        // CPU path (dense diagnostics, a GPU-decode fallback, or a KV rollback) reads
-        // an all-zero history and generation degenerates. The copy is a few MB of
-        // device->host transfer ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â negligible next to the prefill compute it follows,
-        // and it keeps both backends in lockstep.
-        if let Err(e) =
-            self.copy_resident_cuda_kv_to_host(&slot.engine, n_layers, n, n_kv, head_dim)
-        {
-            if trace {
-                eprintln!("[resident-cuda] KV readback to host failed ({e}); using CPU prefill");
+        // The GPU prefill fills the GPU KV cache. Lazy recovery (recover_cpu_kv_from_cuda_resident)
+        // mirrors back to the CPU cache on-demand if a CPU fallback or prompt-prefix cache store occurs.
+        // If eager mirroring is explicitly requested via env, perform the sync copy now.
+        if std::env::var_os("CAMELID_CUDA_EAGER_KV_MIRROR").is_some() {
+            if let Err(e) =
+                self.copy_resident_cuda_kv_to_host(&slot.engine, n_layers, n, n_kv, head_dim)
+            {
+                if trace {
+                    eprintln!("[resident-cuda] KV readback to host failed ({e}); using CPU prefill");
+                }
+                slot.engine.set_filled(0);
+                return Ok(false);
             }
-            slot.engine.set_filled(0);
-            return Ok(false);
         }
         drop(guard);
         self.kv_cache.position = n;
@@ -3442,7 +3441,7 @@ impl LlamaInferenceSession {
             || slot.range != range
             || !slot.engine.weights_ready()
             || slot.engine.n_layers() != range.len()
-            || slot.engine.filled() != position
+            || slot.engine.filled() < position
         {
             return Ok(false);
         }
@@ -3535,7 +3534,7 @@ impl LlamaInferenceSession {
             || config.temperature <= 0.0
             || config.top_k.is_some()
             || config.top_p.is_some_and(|p| p < 1.0)
-            || config.min_p.is_some_and(|p| p > 0.0)
+            || (metal_sampling && config.min_p.is_some_and(|p| p > 0.0))
             || config.presence_penalty != 0.0
             || config.frequency_penalty != 0.0
             || config.repeat_penalty != 1.0
@@ -3561,7 +3560,12 @@ impl LlamaInferenceSession {
         } else {
             let seed =
                 base ^ 0x9E37_79B9_7F4A_7C15u64.wrapping_mul(self.kv_cache.position as u64 + 1);
-            self.try_resident_decode_forward_cuda(&embedding, true, None, Some((inv_temp, seed)))?
+            self.try_resident_decode_forward_cuda(
+                &embedding,
+                true,
+                None,
+                Some((inv_temp, seed, config.min_p)),
+            )?
         };
         match forward {
             Some(ResidentForward::Sampled(id)) => {
@@ -3892,7 +3896,7 @@ impl LlamaInferenceSession {
         embedding: &CpuTensor,
         compute_logits: bool,
         gpu_sample_token: Option<u32>,
-        sample: Option<(f32, u64)>,
+        sample: Option<(f32, u64, Option<f32>)>,
     ) -> Result<Option<ResidentForward>> {
         if !self.resident_decode_eligible(compute_logits)? {
             return Ok(None);
@@ -4233,7 +4237,7 @@ impl LlamaInferenceSession {
                     return Ok(None);
                 }
             }
-        } else if let Some((inv_temp, seed)) = sample {
+        } else if let Some((inv_temp, seed, min_p)) = sample {
             match slot.engine.forward_token_sample(
                 embedding_data,
                 &tables.cos,
@@ -4241,6 +4245,7 @@ impl LlamaInferenceSession {
                 position,
                 scale,
                 inv_temp,
+                min_p,
                 seed,
             ) {
                 Ok(id) => ResidentForward::Sampled(id),
@@ -4306,7 +4311,7 @@ impl LlamaInferenceSession {
         embedding: &CpuTensor,
         compute_logits: bool,
         gpu_sample_token: Option<u32>,
-        sample: Option<(f32, u64)>,
+        sample: Option<(f32, u64, Option<f32>)>,
     ) -> Result<Option<ResidentForward>> {
         Ok(None)
     }

@@ -3525,6 +3525,73 @@ fn gumbel_sampler_matches_stateless_reference() {
 
 #[test]
 #[ignore = "requires a CUDA device"]
+fn sample_gumbel_filtered_matches_min_p_threshold() {
+    let Some(k) = kernels() else {
+        return;
+    };
+    let n = 1000usize;
+    // Logits: linearly increasing so max logit is at index 999
+    let logits: Vec<f32> = (0..n).map(|i| i as f32 * 0.05).collect();
+    let max_logit = logits[n - 1];
+    let min_p = 0.1f32;
+    let threshold = max_logit + min_p.ln();
+    let dl = k.stream.memcpy_stod(&logits).unwrap();
+    let mut didx = k.stream.alloc_zeros::<u32>(1).unwrap();
+
+    let mut sampled = Vec::new();
+    for seed in 1u64..30 {
+        // Calculate CPU expected: argmax over all i where logits[i] >= threshold
+        let mut best_val = f32::NEG_INFINITY;
+        let mut expected = 0usize;
+        for (idx, &l) in logits.iter().enumerate() {
+            if l >= threshold {
+                let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15u64.wrapping_mul(idx as u64 + 1));
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                z ^= z >> 31;
+                let uniform = ((z >> 40) as u32 as f32 + 0.5f32) / 16777216.0f32;
+                let g = -(-uniform.ln()).ln();
+                let v = l * 1.0 + g;
+                if v > best_val {
+                    best_val = v;
+                    expected = idx;
+                }
+            }
+        }
+        super::launch_sample_gumbel_filtered(
+            &k.stream,
+            &k.sample_gumbel_filtered,
+            &dl,
+            n,
+            1.0,
+            min_p,
+            seed,
+            &mut didx,
+        )
+        .unwrap();
+        let mut got = [0u32; 1];
+        k.stream.memcpy_dtoh(&didx, &mut got).unwrap();
+        k.ctx.synchronize().unwrap();
+        assert!(
+            logits[got[0] as usize] >= threshold,
+            "Sampled token {} with logit {} below min_p threshold {}",
+            got[0],
+            logits[got[0] as usize],
+            threshold
+        );
+        assert_eq!(got[0] as usize, expected, "seed {seed}");
+        sampled.push(got[0]);
+    }
+    sampled.sort_unstable();
+    sampled.dedup();
+    assert!(
+        sampled.len() > 1,
+        "different seeds should draw diverse tokens among allowed min_p set"
+    );
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
 fn attention_decode_matches_cpu() {
     let Some(k) = kernels() else {
         return;
