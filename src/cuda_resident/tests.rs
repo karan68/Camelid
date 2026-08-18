@@ -3535,7 +3535,7 @@ fn sample_gumbel_filtered_matches_min_p_threshold() {
     let max_logit = logits[n - 1];
     let min_p = 0.1f32;
     let threshold = max_logit + min_p.ln();
-    let dl = k.stream.memcpy_stod(&logits).unwrap();
+    let dl = k.stream.clone_htod(&logits).unwrap();
     let mut didx = k.stream.alloc_zeros::<u32>(1).unwrap();
 
     let mut sampled = Vec::new();
