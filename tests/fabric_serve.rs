@@ -529,6 +529,7 @@ async fn start_tls_proxy(fabric: Fabric, auth: ClientAuth) -> (SocketAddr, TestC
         Some(certificate.cert_path.clone()),
         Some(certificate.key_path.clone()),
     )
+    .await
     .expect("a complete pair resolves")
     .expect("a pair was given");
 
@@ -2712,53 +2713,46 @@ async fn a_tls_request_is_logged_with_the_caller_it_came_from() {
     );
 }
 
-/// Half a pair, or a certificate that is not there, has to stop the proxy
-/// rather than quietly serve the cleartext the operator was avoiding.
+/// A certificate that cannot be read, or cannot be parsed, has to be refused
+/// before anything is bound or announced. Refusing later is not good enough:
+/// `fabric serve` prints its listening line and probes every node between
+/// binding and serving, so an operator would be told the proxy is listening on
+/// an `https://` address it is about to fail to open.
+///
+/// That a configured certificate can never degrade to cleartext is then
+/// structural rather than tested: `ServeConfig.tls` can only be `Some` once the
+/// certificate has loaded.
 #[tokio::test(flavor = "multi_thread")]
-async fn an_unreadable_certificate_refuses_to_serve_rather_than_falling_back() {
+async fn an_unreadable_certificate_refuses_before_anything_is_bound_or_announced() {
     let missing = std::path::PathBuf::from("no-such-certificate");
-    let tls = ProxyTls::resolve(Some(missing.clone()), Some(missing))
-        .expect("a complete pair resolves")
-        .expect("a pair was given");
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    let absent = ProxyTls::resolve(Some(missing.clone()), Some(missing))
         .await
-        .expect("bind proxy");
-    let addr = listener.local_addr().expect("proxy addr");
-    // Bounded: the stop below never fires, so a proxy that serves anyway rather
-    // than refusing would hang this test instead of failing it.
-    let error = tokio::time::timeout(
-        TLS_STEP_TIMEOUT,
-        serve_on_until(
-            listener,
-            fabric_of(Vec::new()),
-            ServeConfig {
-                mode: RouteMode::Throughput,
-                forward_timeout: FORWARD_TIMEOUT,
-                auth: ClientAuth::none(),
-                tls: Some(tls),
-                bound: addr,
-            },
-            std::future::pending::<()>(),
-        ),
-    )
-    .await
-    .expect("serving must refuse an unreadable certificate rather than run")
-    .expect_err("an unreadable certificate cannot serve");
-
-    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
-    assert!(error.to_string().contains("TLS certificate/key"), "{error}");
-    // Nothing may be listening on that port once serving refused to start.
+        .expect_err("a certificate that is not there cannot be served");
+    assert_eq!(absent.kind(), std::io::ErrorKind::InvalidInput);
     assert!(
-        tokio::net::TcpStream::connect(addr).await.is_err(),
-        "the proxy kept the port open after refusing to serve"
+        absent.to_string().contains("TLS certificate/key"),
+        "{absent}"
+    );
+
+    // The likelier operator mistake: files that exist and are not a PEM pair.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let junk = dir.path().join("certificate-chain");
+    std::fs::write(&junk, b"this is not a certificate\n").expect("write junk");
+    let unparseable = ProxyTls::resolve(Some(junk.clone()), Some(junk))
+        .await
+        .expect_err("a file that is not a PEM pair cannot be served");
+    assert_eq!(unparseable.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(
+        unparseable.to_string().contains("TLS certificate/key"),
+        "{unparseable}"
     );
 }
 
-/// A stop still drains in-flight work when the listener is a TLS one, which is
-/// a different crate's shutdown path than the cleartext test covers.
+/// A stop still drains in-flight work when the listener is a TLS one, and still
+/// stops taking new work. Both halves are a different crate's accept loop and
+/// shutdown here than the cleartext twin covers, so neither carries over.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_tls_stop_finishes_the_work_in_flight() {
+async fn a_tls_stop_finishes_the_work_in_flight_and_accepts_no_more() {
     let generating = Duration::from_millis(600);
     let node = StubNode::start(StubConfig {
         completion_delay: generating,
@@ -2769,6 +2763,7 @@ async fn a_tls_stop_finishes_the_work_in_flight() {
         Some(certificate.cert_path.clone()),
         Some(certificate.key_path.clone()),
     )
+    .await
     .expect("a complete pair resolves")
     .expect("a pair was given");
 
@@ -2823,5 +2818,9 @@ async fn a_tls_stop_finishes_the_work_in_flight() {
         drained_for >= generating - Duration::from_millis(200),
         "the proxy called itself stopped after {drained_for:?} while it still owed \
          a request about {generating:?} of work"
+    );
+    assert!(
+        tokio::net::TcpStream::connect(addr).await.is_err(),
+        "a stopped proxy must not still be taking work"
     );
 }

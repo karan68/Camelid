@@ -74,6 +74,7 @@
 //!   until the node answers or `forward_timeout` expires. A streaming dispatch
 //!   does notice: its next send fails and the node's socket is dropped with it.
 
+use std::fmt;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -96,7 +97,7 @@ use serde_json::Value;
 use super::policy::{route, RouteDecision, RouteError, RouteMode, RouteRequest};
 use super::{self as fabric, DispatchError, Fabric, ForwardError, StreamOutcome};
 use crate::api::{ApiAuth, DEFAULT_MAX_REQUEST_BODY_BYTES};
-use crate::tls_pair::{resolve_tls, TlsFiles};
+use crate::tls_pair::resolve_tls;
 
 /// Optional header a client sends to request affinity to a specific node.
 const STICKY_HEADER: &str = "x-camelid-fabric-sticky";
@@ -185,17 +186,45 @@ impl Default for ClientAuth {
 
 /// The certificate this proxy presents to its clients.
 ///
-/// Wraps the engine's own [`crate::api::TlsFiles`] so a pair is resolved, and
-/// later loaded, by exactly the rules the engine applies to its own listener.
-#[derive(Debug, Clone)]
+/// Holds the loaded certificate rather than the paths it came from. Reading it
+/// is what tells you whether it can be served at all, and that has to happen
+/// before an address is bound, announced or a node is probed — otherwise the
+/// operator is told the proxy is listening on `https://` moments before it
+/// exits. So `Some` here means a certificate that will actually be presented,
+/// which is also what lets [`bind`] treat it as an answer to the cleartext
+/// guard.
+#[derive(Clone)]
 pub struct ProxyTls {
-    inner: TlsFiles,
+    config: RustlsConfig,
+}
+
+impl fmt::Debug for ProxyTls {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProxyTls").finish_non_exhaustive()
+    }
 }
 
 impl ProxyTls {
-    /// Resolve a certificate/key pair, refusing half a pair.
-    pub fn resolve(cert: Option<PathBuf>, key: Option<PathBuf>) -> std::io::Result<Option<Self>> {
-        Ok(resolve_tls(cert, key)?.map(|inner| Self { inner }))
+    /// Resolve a certificate/key pair and load it, refusing half a pair.
+    ///
+    /// The half-a-pair rule is `crate::tls_pair`'s, shared with the engine's
+    /// own listener so the two front doors cannot answer it differently.
+    pub async fn resolve(
+        cert: Option<PathBuf>,
+        key: Option<PathBuf>,
+    ) -> std::io::Result<Option<Self>> {
+        let Some(files) = resolve_tls(cert, key)? else {
+            return Ok(None);
+        };
+        let config = RustlsConfig::from_pem_file(&files.cert, &files.key)
+            .await
+            .map_err(|error| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("could not load TLS certificate/key: {error}"),
+                )
+            })?;
+        Ok(Some(Self { config }))
     }
 }
 
@@ -572,6 +601,10 @@ async fn serve_cleartext(
 /// — the same crate, and the same `RustlsConfig::from_pem_file`, the engine's
 /// own listener uses. That crate owns the drain itself via [`Handle`], so the
 /// bound is expressed by handing it `drain` rather than by racing a sleep.
+///
+/// The certificate arrived loaded, so there is nothing here that can fail on
+/// account of it and quietly leave the operator on the cleartext they were
+/// avoiding.
 async fn serve_tls(
     listener: tokio::net::TcpListener,
     service: IntoMakeServiceWithConnectInfo<Router, SocketAddr>,
@@ -579,15 +612,6 @@ async fn serve_tls(
     drain: Duration,
     stopping: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
-    let rustls = RustlsConfig::from_pem_file(&tls.inner.cert, &tls.inner.key)
-        .await
-        .map_err(|error| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("could not load TLS certificate/key: {error}"),
-            )
-        })?;
-
     // `axum_server` drives the accept loop itself, so it needs the listener
     // back as a std one. Non-blocking is set explicitly rather than inherited,
     // matching what the engine does before handing its own listener over.
@@ -604,7 +628,7 @@ async fn serve_tls(
         stopper.graceful_shutdown(Some(drain));
     });
 
-    let served = axum_server::from_tcp_rustls(listener, rustls)?
+    let served = axum_server::from_tcp_rustls(listener, tls.config)?
         .handle(handle)
         .serve(service)
         .await;
@@ -2239,24 +2263,22 @@ mod tests {
     }
 
     /// Half a pair is a mistake, and serving cleartext because of it would be
-    /// the one outcome the operator plainly did not ask for.
-    #[test]
-    fn a_certificate_needs_its_key_and_a_key_needs_its_certificate() {
+    /// the one outcome the operator plainly did not ask for. Refused before
+    /// either file is read, so it reads the same whether or not they exist.
+    #[tokio::test]
+    async fn a_certificate_needs_its_key_and_a_key_needs_its_certificate() {
         assert!(ProxyTls::resolve(None, None)
+            .await
             .expect("no certificate is not an error")
             .is_none());
-        assert!(ProxyTls::resolve(
-            Some(PathBuf::from("certificate-chain")),
-            Some(PathBuf::from("private-key"))
-        )
-        .expect("a complete pair resolves")
-        .is_some());
 
         for half in [
             (Some(PathBuf::from("certificate-chain")), None),
             (None, Some(PathBuf::from("private-key"))),
         ] {
-            let error = ProxyTls::resolve(half.0, half.1).expect_err("half a pair is refused");
+            let error = ProxyTls::resolve(half.0, half.1)
+                .await
+                .expect_err("half a pair is refused");
             assert!(error.to_string().contains("--tls-cert"), "{error}");
             assert!(error.to_string().contains("--tls-key"), "{error}");
         }

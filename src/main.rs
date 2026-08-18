@@ -3021,7 +3021,11 @@ async fn main() -> anyhow::Result<()> {
                 let mode = route_mode(&mode)?;
                 let bearer = fabric_bearer(bearer);
                 let auth = camelid::fabric::server::ClientAuth::resolve(api_key, api_key_file)?;
-                let tls = camelid::fabric::server::ProxyTls::resolve(tls_cert, tls_key)?;
+                // Loaded here, before anything is bound, announced or probed:
+                // a certificate that cannot be read is a refusal, and a refusal
+                // must not arrive after the operator has been told the proxy is
+                // listening on an https address.
+                let tls = camelid::fabric::server::ProxyTls::resolve(tls_cert, tls_key).await?;
                 let specs = camelid::fabric::parse_fabric(&nodes)
                     .map_err(|error| anyhow::anyhow!("{error}"))?;
                 let fabric = camelid::fabric::Fabric::new(specs)
