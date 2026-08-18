@@ -96,8 +96,15 @@ and CUDA VRAM. It contains no model-path, prompt, API-key, or per-user labels.
 ## Fabric proxy policy
 
 `camelid fabric serve` puts one HTTP address in front of several independent nodes. It defaults to
-`127.0.0.1:8282` and, like `camelid serve`, refuses a non-loopback address unless the exposure is
-acknowledged with `--allow-unauthenticated-remote` (or `CAMELID_ALLOW_UNAUTHENTICATED_REMOTE`):
+`127.0.0.1:8282`. A non-loopback address has to answer two separate questions, because they are two
+separate risks, and answering one does not answer the other:
+
+| | anonymous | authenticated |
+|---|---|---|
+| **cleartext** | refused: needs both acknowledgements | refused: needs `--tls-cert`/`--tls-key` or `--allow-cleartext-remote` |
+| **TLS** | refused: needs `--api-key` or `--allow-unauthenticated-remote` | serves |
+
+Loopback is unaffected and needs neither.
 
 ```bash
 target/release/camelid fabric serve \
@@ -105,17 +112,37 @@ target/release/camelid fabric serve \
   --addr 127.0.0.1:8282
 ```
 
-Two limits are deliberate and worth knowing before you deploy it:
+An exposed proxy therefore looks like this:
 
-- `--api-key` (or `--api-key-file`) is the key the proxy requires *from its clients*, and having one
-  satisfies the bind guard on its own. It deliberately reads no environment variable: on this command
-  `CAMELID_API_KEY` already names the token sent to nodes, and one value must not silently configure
-  both directions. Without a key, `--allow-unauthenticated-remote` is the only way to bind a routable
-  address, and it should only be used behind something that does authenticate.
+```bash
+target/release/camelid fabric serve \
+  --node a=host-a --node b=host-b \
+  --addr 0.0.0.0:8282 \
+  --api-key-file ./camelid-proxy.key \
+  --tls-cert ./proxy-cert-chain \
+  --tls-key ./proxy-private-key
+```
+
+The certificate is read while the arguments are still being resolved, so one that is missing or is
+not a PEM pair stops the proxy before it binds or announces anything. `--allow-cleartext-remote`
+(or `CAMELID_ALLOW_CLEARTEXT_REMOTE`) serves without one, and should only be used behind something
+that terminates TLS itself.
+
+Three limits are deliberate and worth knowing before you deploy it:
+
+- `--api-key` (or `--api-key-file`) is the key the proxy requires *from its clients*. It deliberately
+  reads no environment variable: on this command `CAMELID_API_KEY` already names the token sent to
+  nodes, and one value must not silently configure both directions. Without a key,
+  `--allow-unauthenticated-remote` is the only way to bind a routable address, and it should only be
+  used behind something that does authenticate.
 - `--bearer` (or `CAMELID_API_KEY`) is the token the proxy presents *to its nodes*, the same as
   `fabric status|route|run`. A node started with `--api-key` needs it: `/v1/health` is exempt from
   that node's auth, so without a token the node observes as ready and then answers every forwarded
   request with 401.
+- **TLS covers the client's hop only.** What the proxy speaks to a node is whatever that node's
+  listener speaks, and the proxy has no way to speak TLS to one. On a fabric whose nodes are not
+  loopback, the bearer above and every prompt and completion still cross that network unencrypted,
+  whatever the proxy presents to its own clients. Keep those hops on a trusted link.
 
 The proxy re-probes its nodes at most once per `--observation-max-age-ms` (500 by default) rather
 than once per request. Inside that window its view can be wrong, so a request placed on a node that

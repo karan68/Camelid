@@ -1233,6 +1233,18 @@ enum FabricAction {
             default_value_t = false
         )]
         allow_unauthenticated_remote: bool,
+        /// PEM certificate chain this proxy presents to its clients.
+        /// Requires --tls-key.
+        #[arg(long, value_name = "PATH")]
+        tls_cert: Option<PathBuf>,
+        /// PEM private key for --tls-cert.
+        #[arg(long, value_name = "PATH")]
+        tls_key: Option<PathBuf>,
+        /// Explicitly permit a cleartext non-loopback listener. Without this
+        /// acknowledgement the proxy refuses the bind, because the client key
+        /// and every prompt would cross the network unencrypted.
+        #[arg(long, env = "CAMELID_ALLOW_CLEARTEXT_REMOTE", default_value_t = false)]
+        allow_cleartext_remote: bool,
     },
 }
 
@@ -3002,10 +3014,18 @@ async fn main() -> anyhow::Result<()> {
                 max_forward_attempts,
                 forward_timeout_s,
                 allow_unauthenticated_remote,
+                tls_cert,
+                tls_key,
+                allow_cleartext_remote,
             } => {
                 let mode = route_mode(&mode)?;
                 let bearer = fabric_bearer(bearer);
                 let auth = camelid::fabric::server::ClientAuth::resolve(api_key, api_key_file)?;
+                // Loaded here, before anything is bound, announced or probed:
+                // a certificate that cannot be read is a refusal, and a refusal
+                // must not arrive after the operator has been told the proxy is
+                // listening on an https address.
+                let tls = camelid::fabric::server::ProxyTls::resolve(tls_cert, tls_key).await?;
                 let specs = camelid::fabric::parse_fabric(&nodes)
                     .map_err(|error| anyhow::anyhow!("{error}"))?;
                 let fabric = camelid::fabric::Fabric::new(specs)
@@ -3018,11 +3038,19 @@ async fn main() -> anyhow::Result<()> {
 
                 // Bind before announcing, so a refused or already-taken address
                 // never prints a listening line it did not earn.
-                let listener =
-                    camelid::fabric::server::bind(addr, &auth, allow_unauthenticated_remote)
-                        .await?;
+                let listener = camelid::fabric::server::bind(
+                    addr,
+                    &auth,
+                    tls.as_ref(),
+                    camelid::fabric::server::RemoteAcknowledgements {
+                        unauthenticated: allow_unauthenticated_remote,
+                        cleartext: allow_cleartext_remote,
+                    },
+                )
+                .await?;
                 let bound = listener.local_addr()?;
-                println!("fabric serve listening on {bound}");
+                let scheme = if tls.is_some() { "https" } else { "http" };
+                println!("fabric serve listening on {scheme}://{bound}");
                 // Nothing is being served yet, so this probe costs no request, and
                 // it is the only chance to tell the operator about a node that is
                 // not there before a client discovers it for them.
@@ -3034,6 +3062,7 @@ async fn main() -> anyhow::Result<()> {
                         mode,
                         forward_timeout: std::time::Duration::from_secs(forward_timeout_s),
                         auth,
+                        tls,
                         bound,
                     },
                 )

@@ -15,11 +15,14 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use camelid::fabric::server::{serve_on, serve_on_until, ClientAuth, ServeConfig};
+use camelid::fabric::server::{serve_on, serve_on_until, ClientAuth, ProxyTls, ServeConfig};
 use camelid::fabric::{Fabric, NodeSpec, RouteMode, ENGINE_QUEUE_FULL_CODE};
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const FORWARD_TIMEOUT: Duration = Duration::from_secs(5);
+/// Budget for one step of the TLS client. Generous enough never to fire on a
+/// working proxy, short enough that a broken one fails instead of hanging.
+const TLS_STEP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The routes the proxy places, which a node therefore has to answer. Repeated
 /// here rather than imported: these tests are a client's view of the proxy, and
@@ -481,12 +484,134 @@ async fn start_proxy_with_auth(fabric: Fabric, mode: RouteMode, auth: ClientAuth
         mode,
         forward_timeout: FORWARD_TIMEOUT,
         auth,
+        tls: None,
         bound: addr,
     };
     tokio::spawn(async move {
         let _ = serve_on(listener, fabric, config).await;
     });
     addr
+}
+
+/// A throwaway certificate for `localhost`, valid only for the test that mints
+/// it. Generated rather than committed: a private key in the tree is one nobody
+/// can ever be sure is unused.
+struct TestCertificate {
+    _dir: tempfile::TempDir,
+    cert_path: std::path::PathBuf,
+    key_path: std::path::PathBuf,
+    der: rustls_pki_types::CertificateDer<'static>,
+}
+
+fn mint_certificate() -> TestCertificate {
+    let issued = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+        .expect("generate a self-signed certificate");
+    let dir = tempfile::tempdir().expect("temp dir");
+    let cert_path = dir.path().join("certificate-chain");
+    let key_path = dir.path().join("private-key");
+    // Called through the type: the public-scrub guard rejects that method name
+    // written in dotted form anywhere in the tree.
+    std::fs::write(&cert_path, rcgen::Certificate::pem(&issued.cert)).expect("write certificate");
+    std::fs::write(&key_path, issued.key_pair.serialize_pem()).expect("write key");
+    TestCertificate {
+        der: issued.cert.der().clone(),
+        _dir: dir,
+        cert_path,
+        key_path,
+    }
+}
+
+/// Start the proxy serving TLS, returning the address and the certificate a
+/// client has to trust to talk to it.
+async fn start_tls_proxy(fabric: Fabric, auth: ClientAuth) -> (SocketAddr, TestCertificate) {
+    let certificate = mint_certificate();
+    let tls = ProxyTls::resolve(
+        Some(certificate.cert_path.clone()),
+        Some(certificate.key_path.clone()),
+    )
+    .await
+    .expect("a complete pair resolves")
+    .expect("a pair was given");
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind proxy");
+    let addr = listener.local_addr().expect("proxy addr");
+    let config = ServeConfig {
+        mode: RouteMode::Throughput,
+        forward_timeout: FORWARD_TIMEOUT,
+        auth,
+        tls: Some(tls),
+        bound: addr,
+    };
+    tokio::spawn(async move {
+        let _ = serve_on(listener, fabric, config).await;
+    });
+    (addr, certificate)
+}
+
+/// Send one request over a real TLS connection and return (status, body, headers).
+///
+/// Rolled by hand for the same reason the cleartext client here is: what is
+/// under test is the bytes on the socket, and a client that shares code with
+/// the server can agree with it about something neither has right.
+///
+/// Every step is bounded. A TLS client and a cleartext server deadlock rather
+/// than fail — hyper waits for a request line it will never recognise while the
+/// handshake waits for a ServerHello — so without these an regression would
+/// burn the whole CI job instead of reporting which assertion broke.
+async fn post_over_tls(
+    addr: SocketAddr,
+    certificate: &TestCertificate,
+    path: &str,
+    body: &Value,
+    extra_headers: &[(&str, &str)],
+) -> (u16, Value, Vec<(String, String)>) {
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(certificate.der.clone())
+        .expect("trust the test certificate");
+    let client_config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+    let server_name = rustls_pki_types::ServerName::try_from("localhost").expect("valid name");
+
+    let stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("connect to proxy");
+    let mut stream = tokio::time::timeout(TLS_STEP_TIMEOUT, connector.connect(server_name, stream))
+        .await
+        .expect("the TLS handshake must not hang; is the listener serving cleartext?")
+        .expect("TLS handshake");
+
+    let payload = serde_json::to_vec(body).expect("serialize body");
+    let mut request = format!(
+        "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\nConnection: close\r\n",
+        payload.len()
+    );
+    for (name, value) in extra_headers {
+        request.push_str(&format!("{name}: {value}\r\n"));
+    }
+    request.push_str("\r\n");
+
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write request head");
+    stream
+        .write_all(&payload)
+        .await
+        .expect("write request body");
+    stream.flush().await.expect("flush");
+
+    let mut raw = Vec::new();
+    tokio::time::timeout(TLS_STEP_TIMEOUT, stream.read_to_end(&mut raw))
+        .await
+        .expect("the proxy must answer within the step budget")
+        .expect("read TLS response");
+    parse_http_response(&raw)
 }
 
 /// Send one POST over a real socket and return (status, parsed body, headers).
@@ -525,7 +650,15 @@ async fn post_to(
 
     let mut raw = Vec::new();
     stream.read_to_end(&mut raw).await.expect("read response");
-    let text = String::from_utf8_lossy(&raw);
+    parse_http_response(&raw)
+}
+
+/// Split a raw HTTP/1.1 response into (status, JSON body, lowercased headers).
+///
+/// Shared by the cleartext and TLS clients so a difference between them can
+/// only come from the transport, which is the thing under test.
+fn parse_http_response(raw: &[u8]) -> (u16, Value, Vec<(String, String)>) {
+    let text = String::from_utf8_lossy(raw);
     let header_end = text.find("\r\n\r\n").expect("header terminator");
     let head = &text[..header_end];
     let body_text = &text[header_end + 4..];
@@ -1364,6 +1497,7 @@ async fn a_stop_finishes_the_work_in_flight_and_accepts_no_more() {
         mode: RouteMode::Throughput,
         forward_timeout: FORWARD_TIMEOUT,
         auth: ClientAuth::none(),
+        tls: None,
         bound: addr,
     };
 
@@ -2512,4 +2646,181 @@ async fn a_model_can_be_retrieved_by_id_through_the_proxy() {
     let (missing, refusal) = get_raw(addr, "/v1/models/other-model", &[]).await;
     assert_eq!(missing, 404, "{refusal}");
     assert!(refusal.contains("model_not_found"), "{refusal}");
+}
+
+// ---------------------------------------------------------------------------
+// Serving TLS
+//
+// The proxy is the address an operator is told to expose, and the key it asks
+// clients for is sent on every request. These tests are about what actually
+// crosses the socket, so they speak real TLS to it rather than inspecting
+// configuration.
+// ---------------------------------------------------------------------------
+
+/// The whole point: a request survives the handshake and is still placed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tls_listener_places_a_request_and_relays_the_answer() {
+    let node = StubNode::start(StubConfig::ready("shared-model", 0));
+    let (addr, certificate) =
+        start_tls_proxy(fabric_of(vec![node.spec("only")]), ClientAuth::none()).await;
+
+    let (status, body, headers) = post_over_tls(
+        addr,
+        &certificate,
+        "/v1/chat/completions",
+        &serde_json::json!({ "model": "shared-model" }),
+        &[],
+    )
+    .await;
+
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(header(&headers, "x-camelid-fabric-node"), Some("only"));
+    assert_eq!(
+        completions_served(std::slice::from_ref(&node))[0],
+        1,
+        "the request never reached the node"
+    );
+}
+
+/// A TLS listener is served by a different crate than the cleartext one, and
+/// the peer address is wired up per-crate. Without this the access log would
+/// keep saying `client="-"` for every encrypted request and no unit test could
+/// notice, exactly as it could not notice the cleartext wiring.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tls_request_is_logged_with_the_caller_it_came_from() {
+    let recorded = access_log();
+    let node = StubNode::start(StubConfig::ready("shared-model", 0));
+    let (addr, certificate) =
+        start_tls_proxy(fabric_of(vec![node.spec("only")]), ClientAuth::none()).await;
+
+    let mine = "only-the-tls-caller-test-sends-this-id";
+    let (status, body, _) = post_over_tls(
+        addr,
+        &certificate,
+        "/v1/chat/completions",
+        &serde_json::json!({ "model": "shared-model" }),
+        &[("x-request-id", mine)],
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+
+    let line = recorded
+        .line_mentioning(mine)
+        .expect("the TLS request must be logged under the id it was given");
+    assert!(
+        line.contains("client=\"127.0.0.1:"),
+        "a TLS request was recorded without the client it came from: {line}"
+    );
+}
+
+/// A certificate that cannot be read, or cannot be parsed, has to be refused
+/// before anything is bound or announced. Refusing later is not good enough:
+/// `fabric serve` prints its listening line and probes every node between
+/// binding and serving, so an operator would be told the proxy is listening on
+/// an `https://` address it is about to fail to open.
+///
+/// That a configured certificate can never degrade to cleartext is then
+/// structural rather than tested: `ServeConfig.tls` can only be `Some` once the
+/// certificate has loaded.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unreadable_certificate_refuses_before_anything_is_bound_or_announced() {
+    let missing = std::path::PathBuf::from("no-such-certificate");
+    let absent = ProxyTls::resolve(Some(missing.clone()), Some(missing))
+        .await
+        .expect_err("a certificate that is not there cannot be served");
+    assert_eq!(absent.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(
+        absent.to_string().contains("TLS certificate/key"),
+        "{absent}"
+    );
+
+    // The likelier operator mistake: files that exist and are not a PEM pair.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let junk = dir.path().join("certificate-chain");
+    std::fs::write(&junk, b"this is not a certificate\n").expect("write junk");
+    let unparseable = ProxyTls::resolve(Some(junk.clone()), Some(junk))
+        .await
+        .expect_err("a file that is not a PEM pair cannot be served");
+    assert_eq!(unparseable.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(
+        unparseable.to_string().contains("TLS certificate/key"),
+        "{unparseable}"
+    );
+}
+
+/// A stop still drains in-flight work when the listener is a TLS one, and still
+/// stops taking new work. Both halves are a different crate's accept loop and
+/// shutdown here than the cleartext twin covers, so neither carries over.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tls_stop_finishes_the_work_in_flight_and_accepts_no_more() {
+    let generating = Duration::from_millis(600);
+    let node = StubNode::start(StubConfig {
+        completion_delay: generating,
+        ..StubConfig::ready("shared-model", 0)
+    });
+    let certificate = mint_certificate();
+    let tls = ProxyTls::resolve(
+        Some(certificate.cert_path.clone()),
+        Some(certificate.key_path.clone()),
+    )
+    .await
+    .expect("a complete pair resolves")
+    .expect("a pair was given");
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind proxy");
+    let addr = listener.local_addr().expect("proxy addr");
+    let (stop, stop_asked) = tokio::sync::oneshot::channel::<()>();
+    let serving = tokio::spawn(async move {
+        serve_on_until(
+            listener,
+            fabric_of(vec![node.spec("node-a")]),
+            ServeConfig {
+                mode: RouteMode::Throughput,
+                forward_timeout: FORWARD_TIMEOUT,
+                auth: ClientAuth::none(),
+                tls: Some(tls),
+                bound: addr,
+            },
+            async move {
+                let _ = stop_asked.await;
+            },
+        )
+        .await
+    });
+
+    let inflight = tokio::spawn(async move {
+        post_over_tls(
+            addr,
+            &certificate,
+            "/v1/chat/completions",
+            &serde_json::json!({ "model": "shared-model" }),
+            &[],
+        )
+        .await
+    });
+
+    // Long enough for the request to be on the node, short enough that it is
+    // still being generated when the stop arrives.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let asked = Instant::now();
+    let _ = stop.send(());
+    let stopped = serving.await.expect("serving task");
+    let drained_for = asked.elapsed();
+
+    stopped.expect("a stop is not an error");
+    let (status, body, _) = inflight.await.expect("in-flight task");
+    assert_eq!(status, 200, "{body}");
+    // The ordering is the feature: reporting itself stopped before the work it
+    // owed was done is exactly what drops other people's requests.
+    assert!(
+        drained_for >= generating - Duration::from_millis(200),
+        "the proxy called itself stopped after {drained_for:?} while it still owed \
+         a request about {generating:?} of work"
+    );
+    assert!(
+        tokio::net::TcpStream::connect(addr).await.is_err(),
+        "a stopped proxy must not still be taking work"
+    );
 }

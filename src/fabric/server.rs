@@ -41,6 +41,11 @@
 //!   unless a key is configured or the risk is acknowledged explicitly.
 //! * Authentication is all-or-nothing: there is one key, it is not per-client,
 //!   and nothing here revokes or rotates it while the proxy is running.
+//! * A [`ProxyTls`] pair encrypts what clients send. It is a separate refusal
+//!   from the one above and neither stands in for the other: a key sent over
+//!   cleartext is a key given away, and TLS says nothing about who may drive
+//!   the fabric. What crosses the wire *to the nodes* is a different question
+//!   again — that hop is whatever the node's own listener speaks.
 //! * Every request is recorded through `tracing` at INFO, and a failure at
 //!   WARN, which means nothing is written unless `RUST_LOG` asks for it — the
 //!   same as the rest of this binary. `RUST_LOG=camelid=info` is the whole
@@ -69,12 +74,14 @@
 //!   until the node answers or `forward_timeout` expires. A streaming dispatch
 //!   does notice: its next send fails and the node's socket is dropped with it.
 
+use std::fmt;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
+use axum::extract::connect_info::IntoMakeServiceWithConnectInfo;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Request, State};
 use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE};
@@ -83,11 +90,14 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
 use axum::{middleware, Json, Router};
+use axum_server::tls_rustls::RustlsConfig;
+use axum_server::Handle;
 use serde_json::Value;
 
 use super::policy::{route, RouteDecision, RouteError, RouteMode, RouteRequest};
 use super::{self as fabric, DispatchError, Fabric, ForwardError, StreamOutcome};
 use crate::api::{ApiAuth, DEFAULT_MAX_REQUEST_BODY_BYTES};
+use crate::tls_pair::resolve_tls;
 
 /// Optional header a client sends to request affinity to a specific node.
 const STICKY_HEADER: &str = "x-camelid-fabric-sticky";
@@ -174,6 +184,64 @@ impl Default for ClientAuth {
     }
 }
 
+/// The certificate this proxy presents to its clients.
+///
+/// Holds the loaded certificate rather than the paths it came from. Reading it
+/// is what tells you whether it can be served at all, and that has to happen
+/// before an address is bound, announced or a node is probed — otherwise the
+/// operator is told the proxy is listening on `https://` moments before it
+/// exits. So `Some` here means a certificate that will actually be presented,
+/// which is also what lets [`bind`] treat it as an answer to the cleartext
+/// guard.
+#[derive(Clone)]
+pub struct ProxyTls {
+    config: RustlsConfig,
+}
+
+impl fmt::Debug for ProxyTls {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProxyTls").finish_non_exhaustive()
+    }
+}
+
+impl ProxyTls {
+    /// Resolve a certificate/key pair and load it, refusing half a pair.
+    ///
+    /// The half-a-pair rule is `crate::tls_pair`'s, shared with the engine's
+    /// own listener so the two front doors cannot answer it differently.
+    pub async fn resolve(
+        cert: Option<PathBuf>,
+        key: Option<PathBuf>,
+    ) -> std::io::Result<Option<Self>> {
+        let Some(files) = resolve_tls(cert, key)? else {
+            return Ok(None);
+        };
+        let config = RustlsConfig::from_pem_file(&files.cert, &files.key)
+            .await
+            .map_err(|error| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("could not load TLS certificate/key: {error}"),
+                )
+            })?;
+        Ok(Some(Self { config }))
+    }
+}
+
+/// What the operator has explicitly accepted about exposing this proxy.
+///
+/// Two separate acknowledgements because they are two separate risks: one is
+/// "anyone who can reach this drives my fabric", the other is "the credential
+/// and every prompt cross the network in the clear". A single flag for both
+/// would let acknowledging one silently accept the other.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RemoteAcknowledgements {
+    /// Serve a routable address with no client credential.
+    pub unauthenticated: bool,
+    /// Serve a routable address without TLS.
+    pub cleartext: bool,
+}
+
 /// Everything a request needs beyond which nodes exist.
 #[derive(Debug, Clone)]
 pub struct ServeConfig {
@@ -189,6 +257,12 @@ pub struct ServeConfig {
     pub forward_timeout: Duration,
     /// What a client must present to be served at all.
     pub auth: ClientAuth,
+    /// The certificate this proxy presents, or `None` to serve cleartext.
+    ///
+    /// Set on the config rather than passed to [`serve_on_until`] so that the
+    /// same value decides both what is served and whether [`bind`] considers
+    /// a routable address safe to open.
+    pub tls: Option<ProxyTls>,
     /// The address this proxy listens on.
     ///
     /// Read only to decide whether `/v1/health` may name the fabric's members:
@@ -377,9 +451,11 @@ fn tagged<'a>(response: &'a Response, name: &str) -> &'a str {
 pub async fn bind(
     addr: SocketAddr,
     auth: &ClientAuth,
-    allow_unauthenticated_remote: bool,
+    tls: Option<&ProxyTls>,
+    acknowledged: RemoteAcknowledgements,
 ) -> std::io::Result<tokio::net::TcpListener> {
-    refuse_unauthenticated_remote(addr, auth.is_enabled(), allow_unauthenticated_remote)?;
+    refuse_unauthenticated_remote(addr, auth.is_enabled(), acknowledged.unauthenticated)?;
+    refuse_cleartext_remote(addr, tls.is_some(), acknowledged.cleartext)?;
     tokio::net::TcpListener::bind(addr).await
 }
 
@@ -403,6 +479,33 @@ fn refuse_unauthenticated_remote(
              configured node to the network. Bind a loopback address, configure \
              --api-key/--api-key-file, or explicitly acknowledge the risk with \
              --allow-unauthenticated-remote"
+        ),
+    ))
+}
+
+/// Refuse a cleartext listener that the network can reach. Pure.
+///
+/// The key this proxy asks its clients for is sent on every request. Without
+/// TLS it crosses the network in the clear, so the flag that is supposed to
+/// protect a routable bind is the very thing the bind gives away — along with
+/// every prompt and completion. Refusing here rather than warning keeps the
+/// insecure case deliberate, which is the same call `--api-key` already makes
+/// for the unauthenticated one.
+fn refuse_cleartext_remote(
+    addr: SocketAddr,
+    tls_enabled: bool,
+    allow_cleartext_remote: bool,
+) -> std::io::Result<()> {
+    if addr.ip().is_loopback() || tls_enabled || allow_cleartext_remote {
+        return Ok(());
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        format!(
+            "refusing cleartext non-loopback listener {addr}; the client key and every \
+             prompt would cross the network unencrypted. Bind a loopback address, configure \
+             --tls-cert/--tls-key, or explicitly acknowledge the risk with \
+             --allow-cleartext-remote"
         ),
     ))
 }
@@ -449,14 +552,33 @@ pub async fn serve_on_until(
     config.bound = listener.local_addr()?;
 
     let drain = config.forward_timeout;
+    let tls = config.tls.clone();
     // The peer address is only available to a service built this way, and the
-    // access log is the only thing that reads it.
+    // access log is the only thing that reads it. Both serving paths below take
+    // the same service, so a TLS listener records the client too.
     let service = router(fabric, config).into_make_service_with_connect_info::<SocketAddr>();
 
-    let (draining, drain_started) = tokio::sync::oneshot::channel();
-    let serving = axum::serve(listener, service).with_graceful_shutdown(async move {
+    let stopping = async move {
         stop.await;
         tracing::info!("stopping: no longer accepting requests, finishing the ones in flight");
+    };
+
+    match tls {
+        Some(tls) => serve_tls(listener, service, tls, drain, stopping).await,
+        None => serve_cleartext(listener, service, drain, stopping).await,
+    }
+}
+
+/// Serve cleartext until `stopping` resolves, then drain within `drain`.
+async fn serve_cleartext(
+    listener: tokio::net::TcpListener,
+    service: IntoMakeServiceWithConnectInfo<Router, SocketAddr>,
+    drain: Duration,
+    stopping: impl std::future::Future<Output = ()> + Send + 'static,
+) -> std::io::Result<()> {
+    let (draining, drain_started) = tokio::sync::oneshot::channel();
+    let serving = axum::serve(listener, service).with_graceful_shutdown(async move {
+        stopping.await;
         let _ = draining.send(());
     });
 
@@ -467,13 +589,66 @@ pub async fn serve_on_until(
             let _ = drain_started.await;
             tokio::time::sleep(drain).await;
         } => {
-            tracing::warn!(
-                drain_seconds = drain.as_secs(),
-                "in-flight requests did not finish in time; stopping without them"
-            );
+            warn_drain_expired(drain);
             Ok(())
         }
     }
+}
+
+/// Serve TLS until `stopping` resolves, then drain within `drain`.
+///
+/// `axum::serve` cannot present a certificate, so the TLS path is `axum_server`
+/// — the same crate, and the same `RustlsConfig::from_pem_file`, the engine's
+/// own listener uses. That crate owns the drain itself via [`Handle`], so the
+/// bound is expressed by handing it `drain` rather than by racing a sleep.
+///
+/// The certificate arrived loaded, so there is nothing here that can fail on
+/// account of it and quietly leave the operator on the cleartext they were
+/// avoiding.
+async fn serve_tls(
+    listener: tokio::net::TcpListener,
+    service: IntoMakeServiceWithConnectInfo<Router, SocketAddr>,
+    tls: ProxyTls,
+    drain: Duration,
+    stopping: impl std::future::Future<Output = ()> + Send + 'static,
+) -> std::io::Result<()> {
+    // `axum_server` drives the accept loop itself, so it needs the listener
+    // back as a std one. Non-blocking is set explicitly rather than inherited,
+    // matching what the engine does before handing its own listener over.
+    let listener = listener.into_std()?;
+    listener.set_nonblocking(true)?;
+
+    let handle = Handle::new();
+    let stopper = handle.clone();
+    let started = std::sync::Arc::new(std::sync::Mutex::new(None::<Instant>));
+    let stamped = std::sync::Arc::clone(&started);
+    tokio::spawn(async move {
+        stopping.await;
+        *stamped.lock().expect("drain clock") = Some(Instant::now());
+        stopper.graceful_shutdown(Some(drain));
+    });
+
+    let served = axum_server::from_tcp_rustls(listener, tls.config)?
+        .handle(handle)
+        .serve(service)
+        .await;
+
+    // A drain that ran the full budget is one that was cut short, which is the
+    // same thing the cleartext path reports when its own sleep wins the race.
+    if let Some(asked) = *started.lock().expect("drain clock") {
+        if asked.elapsed() >= drain {
+            warn_drain_expired(drain);
+        }
+    }
+    served
+}
+
+/// One wording for "the drain bound ran out", shared by both serving paths.
+fn warn_drain_expired(drain: Duration) {
+    tracing::warn!(
+        drain_seconds = drain.as_secs(),
+        "in-flight requests did not finish in time; stopping without them"
+    );
 }
 
 /// Resolves when the operator asks this process to stop.
@@ -1117,6 +1292,7 @@ mod tests {
             mode: RouteMode::Throughput,
             forward_timeout: Duration::from_millis(200),
             auth: ClientAuth::none(),
+            tls: None,
             bound: "127.0.0.1:8490".parse().expect("loopback address"),
         }
     }
@@ -2026,6 +2202,86 @@ mod tests {
     fn a_key_lets_a_non_loopback_listener_start_without_acknowledging_anything() {
         refuse_unauthenticated_remote("0.0.0.0:8282".parse().unwrap(), true, false)
             .expect("the listener is authenticated");
+    }
+
+    #[test]
+    fn a_loopback_listener_may_serve_cleartext() {
+        refuse_cleartext_remote("127.0.0.1:8282".parse().unwrap(), false, false)
+            .expect("loopback never reaches the network");
+        refuse_cleartext_remote("[::1]:8282".parse().unwrap(), false, false)
+            .expect("loopback never reaches the network");
+    }
+
+    #[test]
+    fn a_cleartext_non_loopback_listener_is_refused_by_default() {
+        let error = refuse_cleartext_remote("0.0.0.0:8282".parse().unwrap(), false, false)
+            .expect_err("the key and every prompt would cross the network in the clear");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        // The refusal has to name the way out of it, or it is a dead end.
+        assert!(
+            error.to_string().contains("--allow-cleartext-remote"),
+            "{error}"
+        );
+        // ...including the way out that does not give up encryption.
+        assert!(error.to_string().contains("--tls-cert"), "{error}");
+    }
+
+    #[test]
+    fn a_certificate_lets_a_non_loopback_listener_start_without_acknowledging_anything() {
+        refuse_cleartext_remote("0.0.0.0:8282".parse().unwrap(), true, false)
+            .expect("the listener presents a certificate");
+    }
+
+    #[test]
+    fn a_cleartext_listener_starts_once_the_risk_is_acknowledged() {
+        refuse_cleartext_remote("0.0.0.0:8282".parse().unwrap(), false, true)
+            .expect("the operator accepted the exposure");
+    }
+
+    /// The two guards protect against different things, so neither may stand in
+    /// for the other. A key over cleartext is the case this whole change exists
+    /// for: the credential is sent on every request, so the flag that is meant
+    /// to protect the bind is exactly what the bind gives away.
+    #[test]
+    fn neither_guard_satisfies_the_other() {
+        let exposed: SocketAddr = "0.0.0.0:8282".parse().unwrap();
+
+        // Authenticated, but still cleartext.
+        refuse_unauthenticated_remote(exposed, true, false).expect("a key answers the auth guard");
+        refuse_cleartext_remote(exposed, false, false)
+            .expect_err("a key does not encrypt itself on the wire");
+
+        // Encrypted, but still unauthenticated.
+        refuse_cleartext_remote(exposed, true, false).expect("a certificate answers the TLS guard");
+        refuse_unauthenticated_remote(exposed, false, false)
+            .expect_err("TLS does not decide who may drive the fabric");
+
+        // And acknowledging one does not acknowledge the other.
+        refuse_unauthenticated_remote(exposed, false, true).expect("auth risk accepted");
+        refuse_cleartext_remote(exposed, false, false)
+            .expect_err("accepting anonymity is not accepting cleartext");
+    }
+
+    /// Half a pair is a mistake, and serving cleartext because of it would be
+    /// the one outcome the operator plainly did not ask for. Refused before
+    /// either file is read, so it reads the same whether or not they exist.
+    #[tokio::test]
+    async fn a_certificate_needs_its_key_and_a_key_needs_its_certificate() {
+        assert!(ProxyTls::resolve(None, None)
+            .await
+            .expect("no certificate is not an error")
+            .is_none());
+
+        for half in [
+            (Some(PathBuf::from("certificate-chain")), None),
+            (None, Some(PathBuf::from("private-key"))),
+        ] {
+            let error = ProxyTls::resolve(half.0, half.1)
+                .await
+                .expect_err("half a pair is refused");
+            assert!(error.to_string().contains("--tls-cert"), "{error}");
+            assert!(error.to_string().contains("--tls-key"), "{error}");
+        }
     }
 
     #[test]

@@ -45,6 +45,7 @@ pub mod runtime_config;
 pub mod runtime_manifest;
 pub mod telemetry;
 pub mod tensor;
+pub(crate) mod tls_pair;
 pub mod tokenizer;
 pub mod verify;
 pub mod web_ui;
