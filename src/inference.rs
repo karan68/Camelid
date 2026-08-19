@@ -3242,7 +3242,7 @@ impl LlamaInferenceSession {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let need_build = guard
             .as_ref()
-            .is_none_or(|slot| slot.key != key || !slot.engine.weights_ready());
+            .is_none_or(|slot| slot.key != key || !slot.engine.weights_ready() || slot.engine.kv_quant != self.config.kv_quant);
         if need_build {
             // Switching/rebuilding the resident engine: free any prior engine and
             // return its VRAM to the driver BEFORE the new engine's fit probe. cudarc's
@@ -3270,6 +3270,7 @@ impl LlamaInferenceSession {
                 tables.split_half_pairing,
                 self.is_drafter,
                 self.config.gemma3.as_ref(),
+                self.config.kv_quant,
             ) {
                 Some(engine) => {
                     // Prefill is whole-model only (`layer_range.is_some()` bails above), so
@@ -4035,7 +4036,7 @@ impl LlamaInferenceSession {
         let need_build = windowed_mismatch
             || guard
                 .as_ref()
-                .is_none_or(|slot| slot.key != key || !slot.engine.weights_ready());
+                .is_none_or(|slot| slot.key != key || !slot.engine.weights_ready() || slot.engine.kv_quant != self.config.kv_quant);
         if trace && need_build {
             match guard.as_ref() {
                 None => eprintln!("[resident-cuda] need_build: cache EMPTY (key={key:#x})"),
@@ -4073,6 +4074,7 @@ impl LlamaInferenceSession {
                 tables.split_half_pairing,
                 self.is_drafter,
                 self.config.gemma3.as_ref(),
+                self.config.kv_quant,
             ) {
                 Some(engine) => {
                     *guard = Some(ResidentCudaSlot {
@@ -13183,6 +13185,7 @@ fn build_resident_cuda_engine(
     // the schedule is keyed to the SAME parsed metadata the CPU oracle and the
     // Metal lane use.
     gemma3: Option<&crate::model::Gemma3Metadata>,
+    kv_quant: crate::model::KvCacheQuantization,
 ) -> Option<crate::cuda_resident::CudaResidentDecode> {
     use crate::cuda_resident::ProjQuant;
     // The resident upload byte source for a projection: CPU Q8_0 36-byte blocks,
@@ -13267,8 +13270,11 @@ fn build_resident_cuda_engine(
     //   to a long context. If even the floor (256) cannot fit, return None so the
     //   caller runs the model on the CPU path rather than oversubscribing VRAM.
     const MIN_RESIDENT_CONTEXT: usize = 256;
-    // f16 KV: 2 bytes per element (K and V), see cuda_resident's u16 cache.
-    let kv_bytes_per_pos = (n_layers * n_kv * head_dim * 2 * 2) as u64;
+    let kv_bytes_per_elem: u64 = match kv_quant {
+        crate::model::KvCacheQuantization::Q8_0 => ((head_dim / 32) * 34) as u64,
+        _ => (head_dim * 2) as u64,
+    };
+    let kv_bytes_per_pos = (n_layers * n_kv * 2) as u64 * kv_bytes_per_elem;
     let weights_bytes: u64 = weights.layers[range.clone()]
         .iter()
         .flat_map(|l| {
@@ -13516,7 +13522,7 @@ fn build_resident_cuda_engine(
             return None;
         }
     }
-    let mut engine = crate::cuda_resident::CudaResidentDecode::new(
+    let mut engine = crate::cuda_resident::CudaResidentDecode::new_with_kv_quant(
         n_layers,
         n_heads,
         n_kv,
@@ -13528,6 +13534,7 @@ fn build_resident_cuda_engine(
         vocab,
         rms_eps,
         split_half_pairing,
+        kv_quant,
     )
     .ok()?;
     for (idx, l) in weights.layers[range.clone()].iter().enumerate() {

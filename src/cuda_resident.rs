@@ -3711,6 +3711,208 @@ extern "C" __global__ void attention_decode_sw(
     }
 }
 
+// ---- Quantized Q8_0 KV-cache block structure (34 bytes per 32 elements) ----
+struct __align__(2) block_q8_0 {
+    unsigned short scale; // f16 scale
+    signed char qs[32];   // 32 int8 quantized values
+};
+
+// ---- KV scatter (Q8_0): quantize and store current position's K (or V) -----
+extern "C" __global__ void kv_scatter_q8_0(
+    const float* __restrict__ src, block_q8_0* __restrict__ cache,
+    const int* __restrict__ position_ptr, int n_kv_heads, int head_dim, int max_pos
+) {
+    int position = position_ptr[0];
+    int slot = position % max_pos;
+    int blocks_per_head = head_dim / 32;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_kv_heads * blocks_per_head) return;
+    int kv_head = idx / blocks_per_head;
+    int b = idx % blocks_per_head;
+
+    const float* chunk = src + ((long)kv_head * head_dim + b * 32);
+    float amax = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 32; i++) {
+        float v = fabsf(chunk[i]);
+        if (v > amax) amax = v;
+    }
+    float d = amax / 127.0f;
+    float id = (d != 0.0f) ? (1.0f / d) : 0.0f;
+
+    block_q8_0 blk;
+    blk.scale = f32_to_f16_bits(d);
+    #pragma unroll
+    for (int i = 0; i < 32; i++) {
+        float val = roundf(chunk[i] * id);
+        if (val < -127.0f) val = -127.0f;
+        if (val > 127.0f) val = 127.0f;
+        blk.qs[i] = (signed char)val;
+    }
+    cache[((long)kv_head * max_pos + slot) * blocks_per_head + b] = blk;
+}
+
+// ---- Attention decode (Q8_0): per query head, GQA, scale, softmax, weighted V -----
+extern "C" __global__ void attention_decode_q8_0(
+    const float* __restrict__ q, const block_q8_0* __restrict__ cache_k,
+    const block_q8_0* __restrict__ cache_v, float* __restrict__ out,
+    int n_heads, int n_kv_heads, int head_dim, const int* __restrict__ position_ptr,
+    int max_pos, float scale
+) {
+    int position_count = position_ptr[0] + 1;
+    int head = blockIdx.x;
+    if (head >= n_heads) return;
+    int repeats = n_heads / n_kv_heads;
+    int kv_head = head / repeats;
+    const float* qh = q + (long)head * head_dim;
+    int blocks_per_head = head_dim / 32;
+    const block_q8_0* kbase = cache_k + (long)kv_head * max_pos * blocks_per_head;
+    const block_q8_0* vbase = cache_v + (long)kv_head * max_pos * blocks_per_head;
+
+    extern __shared__ float shared[];
+    int tid = threadIdx.x;
+    int G = blockDim.x / head_dim;
+    float* qsh = shared;
+    float* vpart = shared + head_dim;
+    float* scores = shared + head_dim + (long)G * head_dim;
+    for (int d = tid; d < head_dim; d += blockDim.x) qsh[d] = qh[d];
+    __syncthreads();
+
+    for (int p = tid; p < position_count; p += blockDim.x) {
+        const block_q8_0* kp = kbase + (long)p * blocks_per_head;
+        float dot = 0.0f;
+        for (int b = 0; b < blocks_per_head; b++) {
+            float d = f16_bits_to_f32(kp[b].scale);
+            float sum = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < 32; i++) {
+                sum += qsh[b * 32 + i] * (float)kp[b].qs[i];
+            }
+            dot += sum * d;
+        }
+        scores[p] = dot * scale;
+    }
+    __syncthreads();
+
+    __shared__ float s_max, s_sum;
+    if (tid == 0) {
+        float m = scores[0];
+        for (int p = 1; p < position_count; p++) if (scores[p] > m) m = scores[p];
+        s_max = m;
+    }
+    __syncthreads();
+    for (int p = tid; p < position_count; p += blockDim.x) scores[p] = expf(scores[p] - s_max);
+    __syncthreads();
+    if (tid == 0) {
+        float sum = 0.0f;
+        for (int p = 0; p < position_count; p++) sum += scores[p];
+        s_sum = sum;
+    }
+    __syncthreads();
+    float inv = 1.0f / s_sum;
+
+    int gid = tid / head_dim;
+    int did = tid % head_dim;
+    int b = did / 32;
+    int bi = did % 32;
+    int p_lo = (int)((long)gid * position_count / G);
+    int p_hi = (int)((long)(gid + 1) * position_count / G);
+    float acc = 0.0f;
+    for (int p = p_lo; p < p_hi; p++) {
+        const block_q8_0* vp = vbase + ((long)p * blocks_per_head + b);
+        float d = f16_bits_to_f32(vp->scale);
+        acc += (scores[p] * inv) * (d * (float)vp->qs[bi]);
+    }
+    vpart[(long)did * G + gid] = acc;
+    __syncthreads();
+    if (gid == 0) {
+        float sum = 0.0f;
+        for (int g = 0; g < G; g++) sum += vpart[(long)did * G + g];
+        out[(long)head * head_dim + did] = sum;
+    }
+}
+
+// ---- Sliding-window attention decode (Q8_0) ---------------------------------
+extern "C" __global__ void attention_decode_sw_q8_0(
+    const float* __restrict__ q, const block_q8_0* __restrict__ cache_k,
+    const block_q8_0* __restrict__ cache_v, float* __restrict__ out,
+    int n_heads, int n_kv_heads, int head_dim, const int* __restrict__ position_ptr,
+    int max_pos, float scale, int window
+) {
+    int position_count = position_ptr[0] + 1;
+    int start = (window > 0 && position_count > window) ? (position_count - window) : 0;
+    int head = blockIdx.x;
+    if (head >= n_heads) return;
+    int repeats = n_heads / n_kv_heads;
+    int kv_head = head / repeats;
+    const float* qh = q + (long)head * head_dim;
+    int blocks_per_head = head_dim / 32;
+    const block_q8_0* kbase = cache_k + (long)kv_head * max_pos * blocks_per_head;
+    const block_q8_0* vbase = cache_v + (long)kv_head * max_pos * blocks_per_head;
+
+    extern __shared__ float shared_sw[];
+    int tid = threadIdx.x;
+    int G = blockDim.x / head_dim;
+    float* qsh = shared_sw;
+    float* vpart = shared_sw + head_dim;
+    float* scores = shared_sw + head_dim + (long)G * head_dim;
+    for (int d = tid; d < head_dim; d += blockDim.x) qsh[d] = qh[d];
+    __syncthreads();
+
+    for (int p = start + tid; p < position_count; p += blockDim.x) {
+        const block_q8_0* kp = kbase + (long)(p % max_pos) * blocks_per_head;
+        float dot = 0.0f;
+        for (int b = 0; b < blocks_per_head; b++) {
+            float d = f16_bits_to_f32(kp[b].scale);
+            float sum = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < 32; i++) {
+                sum += qsh[b * 32 + i] * (float)kp[b].qs[i];
+            }
+            dot += sum * d;
+        }
+        scores[p] = dot * scale;
+    }
+    __syncthreads();
+
+    __shared__ float s_max_sw, s_sum_sw;
+    if (tid == 0) {
+        float m = scores[start];
+        for (int p = start + 1; p < position_count; p++) if (scores[p] > m) m = scores[p];
+        s_max_sw = m;
+    }
+    __syncthreads();
+    for (int p = start + tid; p < position_count; p += blockDim.x) scores[p] = expf(scores[p] - s_max_sw);
+    __syncthreads();
+    if (tid == 0) {
+        float sum = 0.0f;
+        for (int p = start; p < position_count; p++) sum += scores[p];
+        s_sum_sw = sum;
+    }
+    __syncthreads();
+    float inv = 1.0f / s_sum_sw;
+    int gid = tid / head_dim;
+    int did = tid % head_dim;
+    int b = did / 32;
+    int bi = did % 32;
+    int active = position_count - start;
+    int p_lo = start + (int)((long)gid * active / G);
+    int p_hi = start + (int)((long)(gid + 1) * active / G);
+    float acc = 0.0f;
+    for (int p = p_lo; p < p_hi; p++) {
+        const block_q8_0* vp = vbase + ((long)(p % max_pos) * blocks_per_head + b);
+        float d = f16_bits_to_f32(vp->scale);
+        acc += (scores[p] * inv) * (d * (float)vp->qs[bi]);
+    }
+    vpart[(long)did * G + gid] = acc;
+    __syncthreads();
+    if (gid == 0) {
+        float sum = 0.0f;
+        for (int g = 0; g < G; g++) sum += vpart[(long)did * G + g];
+        out[(long)head * head_dim + did] = sum;
+    }
+}
+
 // ---- SwiGLU: out[i] = silu(gate[i]) * up[i], silu(x)=x/(1+exp(-x)) ---------
 extern "C" __global__ void silu_mul(
     const float* __restrict__ gate, const float* __restrict__ up, float* __restrict__ out, int n
@@ -4536,6 +4738,329 @@ extern "C" __global__ void attention_tree_batched(
     }
 }
 
+// Scatter K tokens' K/V into the cache in Q8_0 format at consecutive positions base..base+K-1.
+extern "C" __global__ void kv_scatter_batched_q8_0(
+    const float* __restrict__ src, block_q8_0* __restrict__ cache, int base_position,
+    int n_kv_heads, int head_dim, int max_pos, int per_token_dim, int k_tokens
+) {
+    int blocks_per_head = head_dim / 32;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = k_tokens * n_kv_heads * blocks_per_head;
+    if (idx >= total) return;
+    int t = idx / (n_kv_heads * blocks_per_head);
+    int rem = idx % (n_kv_heads * blocks_per_head);
+    int kv_head = rem / blocks_per_head;
+    int b = rem % blocks_per_head;
+    int position = base_position + t;
+
+    const float* chunk = src + ((long)t * per_token_dim + (long)kv_head * head_dim + b * 32);
+    float amax = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 32; i++) {
+        float v = fabsf(chunk[i]);
+        if (v > amax) amax = v;
+    }
+    float d = amax / 127.0f;
+    float id = (d != 0.0f) ? (1.0f / d) : 0.0f;
+
+    block_q8_0 blk;
+    blk.scale = f32_to_f16_bits(d);
+    #pragma unroll
+    for (int i = 0; i < 32; i++) {
+        float val = roundf(chunk[i] * id);
+        if (val < -127.0f) val = -127.0f;
+        if (val > 127.0f) val = 127.0f;
+        blk.qs[i] = (signed char)val;
+    }
+    cache[((long)kv_head * max_pos + position) * blocks_per_head + b] = blk;
+}
+
+extern "C" __global__ void kv_scatter_tree_batched_q8_0(
+    const float* __restrict__ src, block_q8_0* __restrict__ cache,
+    const int* __restrict__ node_kvslot,
+    int n_kv_heads, int head_dim, int max_pos, int per_token_dim, int k_tokens
+) {
+    int blocks_per_head = head_dim / 32;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = k_tokens * n_kv_heads * blocks_per_head;
+    if (idx >= total) return;
+    int t = idx / (n_kv_heads * blocks_per_head);
+    int rem = idx % (n_kv_heads * blocks_per_head);
+    int kv_head = rem / blocks_per_head;
+    int b = rem % blocks_per_head;
+    int position = node_kvslot[t];
+
+    const float* chunk = src + ((long)t * per_token_dim + (long)kv_head * head_dim + b * 32);
+    float amax = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 32; i++) {
+        float v = fabsf(chunk[i]);
+        if (v > amax) amax = v;
+    }
+    float d = amax / 127.0f;
+    float id = (d != 0.0f) ? (1.0f / d) : 0.0f;
+
+    block_q8_0 blk;
+    blk.scale = f32_to_f16_bits(d);
+    #pragma unroll
+    for (int i = 0; i < 32; i++) {
+        float val = roundf(chunk[i] * id);
+        if (val < -127.0f) val = -127.0f;
+        if (val > 127.0f) val = 127.0f;
+        blk.qs[i] = (signed char)val;
+    }
+    cache[((long)kv_head * max_pos + position) * blocks_per_head + b] = blk;
+}
+
+extern "C" __global__ void attention_batched_q8_0(
+    const float* __restrict__ q, const block_q8_0* __restrict__ cache_k,
+    const block_q8_0* __restrict__ cache_v, float* __restrict__ out,
+    int n_heads, int n_kv_heads, int head_dim, int base_position, int max_pos, float scale,
+    int q_per_token, int k_tokens, int splitk_active
+) {
+    int t = blockIdx.x / n_heads;
+    int head = blockIdx.x % n_heads;
+    if (t >= k_tokens) return;
+    int position_count = base_position + t + 1;
+    int repeats = n_heads / n_kv_heads;
+    int kv_head = head / repeats;
+    const float* qh = q + (long)t * q_per_token + (long)head * head_dim;
+    int blocks_per_head = head_dim / 32;
+    const block_q8_0* kbase = cache_k + (long)kv_head * max_pos * blocks_per_head;
+    const block_q8_0* vbase = cache_v + (long)kv_head * max_pos * blocks_per_head;
+
+    extern __shared__ float shared[];
+    float* qsh = shared;
+    float* scores = shared + head_dim;
+    int tid = threadIdx.x;
+    for (int d = tid; d < head_dim; d += blockDim.x) qsh[d] = qh[d];
+    __syncthreads();
+
+    for (int p = tid; p < position_count; p += blockDim.x) {
+        const block_q8_0* kp = kbase + (long)p * blocks_per_head;
+        float dot = 0.0f;
+        for (int b = 0; b < blocks_per_head; b++) {
+            float d = f16_bits_to_f32(kp[b].scale);
+            float sum = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < 32; i++) {
+                sum += qsh[b * 32 + i] * (float)kp[b].qs[i];
+            }
+            dot += sum * d;
+        }
+        scores[p] = dot * scale;
+    }
+    __syncthreads();
+    __shared__ float s_max, s_sum;
+    if (tid == 0) {
+        float m = scores[0];
+        for (int p = 1; p < position_count; p++) if (scores[p] > m) m = scores[p];
+        s_max = m;
+    }
+    __syncthreads();
+    for (int p = tid; p < position_count; p += blockDim.x) scores[p] = expf(scores[p] - s_max);
+    __syncthreads();
+
+    if (splitk_active && position_count > 512) {
+        int n_splits = (position_count + 255) / 256;
+        if (n_splits < 2) n_splits = 2;
+        if (n_splits > 32) n_splits = 32;
+        if (tid == 0) {
+            float total = 0.0f;
+            for (int sp = 0; sp < n_splits; sp++) {
+                int p_lo = (int)((long)sp * position_count / n_splits);
+                int p_hi = (int)((long)(sp + 1) * position_count / n_splits);
+                float ls = 0.0f;
+                for (int p = p_lo; p < p_hi; p++) ls += scores[p];
+                total += ls;
+            }
+            s_sum = total;
+        }
+        __syncthreads();
+        float inv = 1.0f / s_sum;
+        for (int did = tid; did < head_dim; did += blockDim.x) {
+            int b = did / 32;
+            int bi = did % 32;
+            float acc = 0.0f;
+            for (int sp = 0; sp < n_splits; sp++) {
+                int p_lo = (int)((long)sp * position_count / n_splits);
+                int p_hi = (int)((long)(sp + 1) * position_count / n_splits);
+                float a = 0.0f;
+                for (int p = p_lo; p < p_hi; p++) {
+                    const block_q8_0* vp = vbase + ((long)p * blocks_per_head + b);
+                    float d = f16_bits_to_f32(vp->scale);
+                    a += scores[p] * (d * (float)vp->qs[bi]);
+                }
+                acc += a;
+            }
+            out[(long)t * q_per_token + (long)head * head_dim + did] = acc * inv;
+        }
+    } else {
+        if (tid == 0) {
+            float sum = 0.0f;
+            for (int p = 0; p < position_count; p++) sum += scores[p];
+            s_sum = sum;
+        }
+        __syncthreads();
+        float inv = 1.0f / s_sum;
+        int max_groups = 1024 / head_dim; if (max_groups < 1) max_groups = 1;
+        int G = (position_count + head_dim - 1) / head_dim;
+        if (G < 1) G = 1; if (G > max_groups) G = max_groups;
+        float* vpart = shared + head_dim + position_count;
+        int gid = tid / head_dim;
+        int did = tid % head_dim;
+        int b = did / 32;
+        int bi = did % 32;
+        int p_lo = (int)((long)gid * position_count / G);
+        int p_hi = (int)((long)(gid + 1) * position_count / G);
+        float acc = 0.0f;
+        for (int p = p_lo; p < p_hi; p++) {
+            const block_q8_0* vp = vbase + ((long)p * blocks_per_head + b);
+            float d = f16_bits_to_f32(vp->scale);
+            acc += (scores[p] * inv) * (d * (float)vp->qs[bi]);
+        }
+        vpart[(long)did * G + gid] = acc;
+        __syncthreads();
+        if (gid == 0) {
+            float sum = 0.0f;
+            for (int g = 0; g < G; g++) sum += vpart[(long)did * G + g];
+            out[(long)t * q_per_token + (long)head * head_dim + did] = sum;
+        }
+    }
+}
+
+extern "C" __global__ void attention_tree_batched_q8_0(
+    const float* __restrict__ q, const block_q8_0* __restrict__ cache_k,
+    const block_q8_0* __restrict__ cache_v, float* __restrict__ out,
+    const unsigned int* __restrict__ ancestor_bits, int words,
+    int n_heads, int n_kv_heads, int head_dim, int base_position, int max_pos, float scale,
+    int q_per_token, int k_tokens, int splitk_active
+) {
+    int t = blockIdx.x / n_heads;
+    int head = blockIdx.x % n_heads;
+    if (t >= k_tokens) return;
+    int repeats = n_heads / n_kv_heads;
+    int kv_head = head / repeats;
+    const float* qh = q + (long)t * q_per_token + (long)head * head_dim;
+    int blocks_per_head = head_dim / 32;
+    const block_q8_0* kbase = cache_k + (long)kv_head * max_pos * blocks_per_head;
+    const block_q8_0* vbase = cache_v + (long)kv_head * max_pos * blocks_per_head;
+    const unsigned int* anc = ancestor_bits + (long)t * words;
+
+    extern __shared__ float shared[];
+    float* qsh = shared;
+    float* scores = shared + head_dim;
+    int* slots = (int*)(scores + base_position + k_tokens);
+    int tid = threadIdx.x;
+    for (int d = tid; d < head_dim; d += blockDim.x) qsh[d] = qh[d];
+    __syncthreads();
+
+    __shared__ int s_count;
+    if (tid == 0) {
+        int n = 0;
+        for (int p = 0; p < base_position; p++) slots[n++] = p;
+        for (int j = 0; j < k_tokens; j++) {
+            if ((anc[j >> 5] >> (j & 31)) & 1u) slots[n++] = base_position + j;
+        }
+        s_count = n;
+    }
+    __syncthreads();
+    int count = s_count;
+
+    for (int i = tid; i < count; i += blockDim.x) {
+        const block_q8_0* kp = kbase + (long)slots[i] * blocks_per_head;
+        float dot = 0.0f;
+        for (int b = 0; b < blocks_per_head; b++) {
+            float d = f16_bits_to_f32(kp[b].scale);
+            float sum = 0.0f;
+            #pragma unroll
+            for (int idx = 0; idx < 32; idx++) {
+                sum += qsh[b * 32 + idx] * (float)kp[b].qs[idx];
+            }
+            dot += sum * d;
+        }
+        scores[i] = dot * scale;
+    }
+    __syncthreads();
+    __shared__ float s_max, s_sum;
+    if (tid == 0) {
+        float m = scores[0];
+        for (int i = 1; i < count; i++) if (scores[i] > m) m = scores[i];
+        s_max = m;
+    }
+    __syncthreads();
+    for (int i = tid; i < count; i += blockDim.x) scores[i] = expf(scores[i] - s_max);
+    __syncthreads();
+
+    if (splitk_active && count > 512) {
+        int n_splits = (count + 255) / 256;
+        if (n_splits < 2) n_splits = 2;
+        if (n_splits > 32) n_splits = 32;
+        if (tid == 0) {
+            float total = 0.0f;
+            for (int sp = 0; sp < n_splits; sp++) {
+                int i_lo = (int)((long)sp * count / n_splits);
+                int i_hi = (int)((long)(sp + 1) * count / n_splits);
+                float ls = 0.0f;
+                for (int i = i_lo; i < i_hi; i++) ls += scores[i];
+                total += ls;
+            }
+            s_sum = total;
+        }
+        __syncthreads();
+        float inv = 1.0f / s_sum;
+        for (int did = tid; did < head_dim; did += blockDim.x) {
+            int b = did / 32;
+            int bi = did % 32;
+            float acc = 0.0f;
+            for (int sp = 0; sp < n_splits; sp++) {
+                int i_lo = (int)((long)sp * count / n_splits);
+                int i_hi = (int)((long)(sp + 1) * count / n_splits);
+                float a = 0.0f;
+                for (int i = i_lo; i < i_hi; i++) {
+                    const block_q8_0* vp = vbase + ((long)slots[i] * blocks_per_head + b);
+                    float d = f16_bits_to_f32(vp->scale);
+                    a += scores[i] * (d * (float)vp->qs[bi]);
+                }
+                acc += a;
+            }
+            out[(long)t * q_per_token + (long)head * head_dim + did] = acc * inv;
+        }
+    } else {
+        if (tid == 0) {
+            float sum = 0.0f;
+            for (int i = 0; i < count; i++) sum += scores[i];
+            s_sum = sum;
+        }
+        __syncthreads();
+        float inv = 1.0f / s_sum;
+        int max_groups = 1024 / head_dim; if (max_groups < 1) max_groups = 1;
+        int G = (count + head_dim - 1) / head_dim;
+        if (G < 1) G = 1; if (G > max_groups) G = max_groups;
+        float* vpart = (float*)(slots + base_position + k_tokens);
+        for (int idx = tid; idx < G * head_dim; idx += blockDim.x) {
+            int gid = idx / head_dim, did = idx % head_dim;
+            int b = did / 32;
+            int bi = did % 32;
+            int i_lo = (int)((long)gid * count / G);
+            int i_hi = (int)((long)(gid + 1) * count / G);
+            float acc = 0.0f;
+            for (int i = i_lo; i < i_hi; i++) {
+                const block_q8_0* vp = vbase + ((long)slots[i] * blocks_per_head + b);
+                float d = f16_bits_to_f32(vp->scale);
+                acc += (scores[i] * inv) * (d * (float)vp->qs[bi]);
+            }
+            vpart[(long)did * G + gid] = acc;
+        }
+        __syncthreads();
+        for (int did = tid; did < head_dim; did += blockDim.x) {
+            float sum = 0.0f;
+            for (int g = 0; g < G; g++) sum += vpart[(long)did * G + g];
+            out[(long)t * q_per_token + (long)head * head_dim + did] = sum;
+        }
+    }
+}
+
 // Argmax of each of K logit rows (one block per token). Strict-greater, lowest
 // index — the greedy choice used to verify drafts.
 extern "C" __global__ void argmax_batched(
@@ -4726,6 +5251,98 @@ extern "C" __global__ void attn_sk_partial(
     for (int d = tid; d < head_dim; d += blockDim.x) {
         float a = 0.0f;
         for (int p = p_lo; p < p_hi; p++) a += sc_head[p] * f16_bits_to_f32(vbase[(long)p * head_dim + d]);
+        acc_buf[(((long)head * n_splits + sp) * head_dim) + d] = a;
+    }
+}
+
+extern "C" __global__ void attn_sk_scores_q8_0(
+    const float* __restrict__ q, const block_q8_0* __restrict__ cache_k,
+    float* __restrict__ scores_buf, float* __restrict__ chunkmax_buf,
+    int n_heads, int n_kv_heads, int head_dim, const int* __restrict__ position_ptr,
+    int max_pos, float scale, int n_splits
+) {
+    int position_count = position_ptr[0] + 1;
+    int head = blockIdx.x;
+    int sp = blockIdx.y;
+    if (head >= n_heads || sp >= n_splits) return;
+    int repeats = n_heads / n_kv_heads;
+    int kv_head = head / repeats;
+    const float* qh = q + (long)head * head_dim;
+    int blocks_per_head = head_dim / 32;
+    const block_q8_0* kbase = cache_k + (long)kv_head * max_pos * blocks_per_head;
+    int p_lo = (int)((long)sp * position_count / n_splits);
+    int p_hi = (int)((long)(sp + 1) * position_count / n_splits);
+
+    extern __shared__ float qsh[];
+    int tid = threadIdx.x;
+    for (int d = tid; d < head_dim; d += blockDim.x) qsh[d] = qh[d];
+    __syncthreads();
+
+    float local_max = -3.4e38f;
+    for (int p = p_lo + tid; p < p_hi; p += blockDim.x) {
+        const block_q8_0* kp = kbase + (long)p * blocks_per_head;
+        float dot = 0.0f;
+        for (int b = 0; b < blocks_per_head; b++) {
+            float d = f16_bits_to_f32(kp[b].scale);
+            float sum = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < 32; i++) {
+                sum += qsh[b * 32 + i] * (float)kp[b].qs[i];
+            }
+            dot += sum * d;
+        }
+        float sc = dot * scale;
+        scores_buf[(long)head * max_pos + p] = sc;
+        local_max = fmaxf(local_max, sc);
+    }
+    __shared__ float red[1024];
+    red[tid] = local_max;
+    __syncthreads();
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (tid < s) red[tid] = fmaxf(red[tid], red[tid + s]);
+        __syncthreads();
+    }
+    if (tid == 0) chunkmax_buf[(long)head * n_splits + sp] = red[0];
+}
+
+extern "C" __global__ void attn_sk_partial_q8_0(
+    const block_q8_0* __restrict__ cache_v, float* __restrict__ scores_buf,
+    const float* __restrict__ chunkmax_buf, float* __restrict__ lsum_buf,
+    float* __restrict__ acc_buf, int n_heads, int n_kv_heads, int head_dim,
+    const int* __restrict__ position_ptr, int max_pos, int n_splits
+) {
+    int position_count = position_ptr[0] + 1;
+    int head = blockIdx.x;
+    int sp = blockIdx.y;
+    if (head >= n_heads || sp >= n_splits) return;
+    int repeats = n_heads / n_kv_heads;
+    int kv_head = head / repeats;
+    int blocks_per_head = head_dim / 32;
+    const block_q8_0* vbase = cache_v + (long)kv_head * max_pos * blocks_per_head;
+    int p_lo = (int)((long)sp * position_count / n_splits);
+    int p_hi = (int)((long)(sp + 1) * position_count / n_splits);
+    float* sc_head = scores_buf + (long)head * max_pos;
+    int tid = threadIdx.x;
+
+    float gmax = -3.4e38f;
+    for (int i = 0; i < n_splits; i++) gmax = fmaxf(gmax, chunkmax_buf[(long)head * n_splits + i]);
+
+    for (int p = p_lo + tid; p < p_hi; p += blockDim.x) sc_head[p] = expf(sc_head[p] - gmax);
+    __syncthreads();
+    if (tid == 0) {
+        float ls = 0.0f;
+        for (int p = p_lo; p < p_hi; p++) ls += sc_head[p];
+        lsum_buf[(long)head * n_splits + sp] = ls;
+    }
+    for (int d = tid; d < head_dim; d += blockDim.x) {
+        int b = d / 32;
+        int bi = d % 32;
+        float a = 0.0f;
+        for (int p = p_lo; p < p_hi; p++) {
+            const block_q8_0* vp = vbase + ((long)p * blocks_per_head + b);
+            float scale_val = f16_bits_to_f32(vp->scale);
+            a += sc_head[p] * (scale_val * (float)vp->qs[bi]);
+        }
         acc_buf[(((long)head * n_splits + sp) * head_dim) + d] = a;
     }
 }
@@ -5811,6 +6428,15 @@ pub struct CudaResidentKernels {
     pub(crate) attention_batched: CudaFunction,
     pub(crate) kv_scatter_tree_batched: CudaFunction,
     pub(crate) attention_tree_batched: CudaFunction,
+    pub(crate) kv_scatter_q8_0: CudaFunction,
+    pub(crate) attention_q8_0: CudaFunction,
+    pub(crate) attention_sw_q8_0: CudaFunction,
+    pub(crate) kv_scatter_batched_q8_0: CudaFunction,
+    pub(crate) kv_scatter_tree_batched_q8_0: CudaFunction,
+    pub(crate) attention_batched_q8_0: CudaFunction,
+    pub(crate) attention_tree_batched_q8_0: CudaFunction,
+    pub(crate) attn_sk_scores_q8_0: CudaFunction,
+    pub(crate) attn_sk_partial_q8_0: CudaFunction,
     pub(crate) argmax_batched: CudaFunction,
     pub(crate) attn_sk_scores: CudaFunction,
     pub(crate) attn_sk_scores_coalesced: CudaFunction,
@@ -6014,6 +6640,15 @@ impl CudaResidentKernels {
             attention_batched: f("attention_batched")?,
             kv_scatter_tree_batched: f("kv_scatter_tree_batched")?,
             attention_tree_batched: f("attention_tree_batched")?,
+            kv_scatter_q8_0: f("kv_scatter_q8_0")?,
+            attention_q8_0: f("attention_decode_q8_0")?,
+            attention_sw_q8_0: f("attention_decode_sw_q8_0")?,
+            kv_scatter_batched_q8_0: f("kv_scatter_batched_q8_0")?,
+            kv_scatter_tree_batched_q8_0: f("kv_scatter_tree_batched_q8_0")?,
+            attention_batched_q8_0: f("attention_batched_q8_0")?,
+            attention_tree_batched_q8_0: f("attention_tree_batched_q8_0")?,
+            attn_sk_scores_q8_0: f("attn_sk_scores_q8_0")?,
+            attn_sk_partial_q8_0: f("attn_sk_partial_q8_0")?,
             argmax_batched: f("argmax_batched")?,
             attn_sk_scores: f("attn_sk_scores")?,
             attn_sk_scores_coalesced: f("attn_sk_scores_coalesced")?,
@@ -8037,7 +8672,47 @@ pub(crate) fn launch_kv_scatter_batched(
 ) -> Result<(), cudarc::driver::DriverError> {
     let total = (k * n_kv_heads * head_dim) as u32;
     let cfg = LaunchConfig {
-        grid_dim: (total.div_ceil(128), 1, 1),
+        grid_dim: (total.div_ceil(128).max(1), 1, 1),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let (bp, nkv, hd, mp, ptd, ki) = (
+        base_position as i32,
+        n_kv_heads as i32,
+        head_dim as i32,
+        max_pos as i32,
+        per_token_dim as i32,
+        k as i32,
+    );
+    let mut b = s.launch_builder(f);
+    b.arg(src)
+        .arg(cache)
+        .arg(&bp)
+        .arg(&nkv)
+        .arg(&hd)
+        .arg(&mp)
+        .arg(&ptd)
+        .arg(&ki);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn launch_kv_scatter_batched_q8_0(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    src: &CudaSlice<f32>,
+    cache: &mut CudaSlice<u8>,
+    base_position: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_pos: usize,
+    per_token_dim: usize,
+    k: usize,
+) -> Result<(), cudarc::driver::DriverError> {
+    let blocks_per_head = head_dim / 32;
+    let total = (k * n_kv_heads * blocks_per_head) as u32;
+    let cfg = LaunchConfig {
+        grid_dim: (total.div_ceil(128).max(1), 1, 1),
         block_dim: (128, 1, 1),
         shared_mem_bytes: 0,
     };
@@ -8066,8 +8741,8 @@ pub(crate) fn launch_attention_batched(
     s: &Arc<CudaStream>,
     f: &CudaFunction,
     q: &CudaSlice<f32>,
-    cache_k: &CudaSlice<u16>,
-    cache_v: &CudaSlice<u16>,
+    cache_k: &CudaSlice<u8>,
+    cache_v: &CudaSlice<u8>,
     out: &mut CudaSlice<f32>,
     n_heads: usize,
     n_kv_heads: usize,
@@ -8119,7 +8794,7 @@ pub(crate) fn launch_kv_scatter_tree_batched(
     s: &Arc<CudaStream>,
     f: &CudaFunction,
     src: &CudaSlice<f32>,
-    cache: &mut CudaSlice<u16>,
+    cache: &mut CudaSlice<u8>,
     node_kvslot: &CudaSlice<i32>,
     n_kv_heads: usize,
     head_dim: usize,
@@ -8129,7 +8804,46 @@ pub(crate) fn launch_kv_scatter_tree_batched(
 ) -> Result<(), cudarc::driver::DriverError> {
     let total = (k * n_kv_heads * head_dim) as u32;
     let cfg = LaunchConfig {
-        grid_dim: (total.div_ceil(128), 1, 1),
+        grid_dim: (total.div_ceil(128).max(1), 1, 1),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let (nkv, hd, mp, ptd, ki) = (
+        n_kv_heads as i32,
+        head_dim as i32,
+        max_pos as i32,
+        per_token_dim as i32,
+        k as i32,
+    );
+    let mut b = s.launch_builder(f);
+    b.arg(src)
+        .arg(cache)
+        .arg(node_kvslot)
+        .arg(&nkv)
+        .arg(&hd)
+        .arg(&mp)
+        .arg(&ptd)
+        .arg(&ki);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn launch_kv_scatter_tree_batched_q8_0(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    src: &CudaSlice<f32>,
+    cache: &mut CudaSlice<u8>,
+    node_kvslot: &CudaSlice<i32>,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_pos: usize,
+    per_token_dim: usize,
+    k: usize,
+) -> Result<(), cudarc::driver::DriverError> {
+    let blocks_per_head = head_dim / 32;
+    let total = (k * n_kv_heads * blocks_per_head) as u32;
+    let cfg = LaunchConfig {
+        grid_dim: (total.div_ceil(128).max(1), 1, 1),
         block_dim: (128, 1, 1),
         shared_mem_bytes: 0,
     };
@@ -8157,8 +8871,8 @@ pub(crate) fn launch_attention_tree_batched(
     s: &Arc<CudaStream>,
     f: &CudaFunction,
     q: &CudaSlice<f32>,
-    cache_k: &CudaSlice<u16>,
-    cache_v: &CudaSlice<u16>,
+    cache_k: &CudaSlice<u8>,
+    cache_v: &CudaSlice<u8>,
     out: &mut CudaSlice<f32>,
     ancestor_bits: &CudaSlice<u32>,
     words: usize,
@@ -8771,13 +9485,42 @@ pub(crate) fn launch_kv_scatter(
     s: &Arc<CudaStream>,
     f: &CudaFunction,
     src: &CudaSlice<f32>,
-    cache: &mut CudaSlice<u16>,
+    cache: &mut CudaSlice<u8>,
     position: &CudaSlice<i32>,
     n_kv_heads: usize,
     head_dim: usize,
     max_pos: usize,
 ) -> Result<(), cudarc::driver::DriverError> {
     let total = (n_kv_heads * head_dim) as u32;
+    let cfg = LaunchConfig {
+        grid_dim: (total.div_ceil(128).max(1), 1, 1),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let (nkv, hd, mp) = (n_kv_heads as i32, head_dim as i32, max_pos as i32);
+    let mut b = s.launch_builder(f);
+    b.arg(src)
+        .arg(cache)
+        .arg(position)
+        .arg(&nkv)
+        .arg(&hd)
+        .arg(&mp);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn launch_kv_scatter_q8_0(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    src: &CudaSlice<f32>,
+    cache: &mut CudaSlice<u8>,
+    position: &CudaSlice<i32>,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_pos: usize,
+) -> Result<(), cudarc::driver::DriverError> {
+    let blocks_per_head = head_dim / 32;
+    let total = (n_kv_heads * blocks_per_head) as u32;
     let cfg = LaunchConfig {
         grid_dim: (total.div_ceil(128).max(1), 1, 1),
         block_dim: (128, 1, 1),
@@ -8831,8 +9574,8 @@ pub(crate) fn launch_attention_splitk(
     s: &Arc<CudaStream>,
     k: &CudaResidentKernels,
     q: &CudaSlice<f32>,
-    cache_k: &CudaSlice<u16>,
-    cache_v: &CudaSlice<u16>,
+    cache_k: &CudaSlice<u8>,
+    cache_v: &CudaSlice<u8>,
     out: &mut CudaSlice<f32>,
     scores_buf: &mut CudaSlice<f32>,
     chunkmax_buf: &mut CudaSlice<f32>,
@@ -8845,6 +9588,7 @@ pub(crate) fn launch_attention_splitk(
     position_count: usize,
     max_pos: usize,
     scale: f32,
+    is_q8_0: bool,
 ) -> Result<(), cudarc::driver::DriverError> {
     let n_splits = position_count.div_ceil(256).clamp(2, SPLITK_MAX);
     let (nh, nkv, hd, mp, ns) = (
@@ -8864,7 +9608,9 @@ pub(crate) fn launch_attention_splitk(
         };
         // Env-gated coalesced K-dot (CAMELID_ATTN_COALESCED). Identical signature,
         // shared-mem and grid; only the K access pattern differs. Default OFF.
-        let scores_fn = if k.attn_coalesced {
+        let scores_fn = if is_q8_0 {
+            &k.attn_sk_scores_q8_0
+        } else if k.attn_coalesced {
             &k.attn_sk_scores_coalesced
         } else {
             &k.attn_sk_scores
@@ -8890,7 +9636,12 @@ pub(crate) fn launch_attention_splitk(
             block_dim: (block, 1, 1),
             shared_mem_bytes: 0,
         };
-        let mut b = s.launch_builder(&k.attn_sk_partial);
+        let partial_fn = if is_q8_0 {
+            &k.attn_sk_partial_q8_0
+        } else {
+            &k.attn_sk_partial
+        };
+        let mut b = s.launch_builder(partial_fn);
         b.arg(cache_v)
             .arg(&mut *scores_buf)
             .arg(&mut *chunkmax_buf)
@@ -8939,8 +9690,8 @@ pub(crate) fn launch_attention_flash_prefill(
     s: &Arc<CudaStream>,
     k: &CudaResidentKernels,
     q: &CudaSlice<f32>,
-    cache_k: &CudaSlice<u16>,
-    cache_v: &CudaSlice<u16>,
+    cache_k: &CudaSlice<u8>,
+    cache_v: &CudaSlice<u8>,
     out: &mut CudaSlice<f32>,
     scores_buf: &mut CudaSlice<f32>,
     chunkmax_buf: &mut CudaSlice<f32>,
@@ -9053,8 +9804,8 @@ pub(crate) fn launch_attention(
     s: &Arc<CudaStream>,
     f: &CudaFunction,
     q: &CudaSlice<f32>,
-    cache_k: &CudaSlice<u16>,
-    cache_v: &CudaSlice<u16>,
+    cache_k: &CudaSlice<u8>,
+    cache_v: &CudaSlice<u8>,
     out: &mut CudaSlice<f32>,
     n_heads: usize,
     n_kv_heads: usize,
@@ -9122,8 +9873,8 @@ pub(crate) fn launch_attention_sw(
     s: &Arc<CudaStream>,
     f: &CudaFunction,
     q: &CudaSlice<f32>,
-    cache_k: &CudaSlice<u16>,
-    cache_v: &CudaSlice<u16>,
+    cache_k: &CudaSlice<u8>,
+    cache_v: &CudaSlice<u8>,
     out: &mut CudaSlice<f32>,
     n_heads: usize,
     n_kv_heads: usize,
@@ -9720,10 +10471,10 @@ pub struct CudaResidentDecode {
     output_weight: CudaSlice<u8>,
     /// Quant lane of the output (lm_head) projection. Q6_K for Q4_K_M models.
     output_quant: ProjQuant,
-    // KV cache stored as f16 bits (u16) — half the VRAM of f32, bit-identical because the
-    // stored values are f16-rounded either way (see the kv_scatter / attention kernels).
-    cache_k: Vec<CudaSlice<u16>>,
-    cache_v: Vec<CudaSlice<u16>>,
+    /// KV cache stored as f16 bits (u16) or quantized Q8_0 blocks.
+    cache_k: Vec<CudaSlice<u8>>,
+    cache_v: Vec<CudaSlice<u8>>,
+    pub kv_quant: crate::model::KvCacheQuantization,
     /// Number of KV positions materialized on the GPU (so the driver knows
     /// whether the session needs (re)seeding from the CPU history).
     filled: usize,
@@ -10153,7 +10904,38 @@ impl CudaResidentDecode {
         eps: f32,
         split_half_pairing: bool,
     ) -> Result<Self, String> {
-        Self::new_for_artifact(
+        Self::new_with_kv_quant(
+            n_layers,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            hidden,
+            ffn_dim,
+            rope_dim,
+            max_pos,
+            vocab,
+            eps,
+            split_half_pairing,
+            crate::model::KvCacheQuantization::F16,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_kv_quant(
+        n_layers: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        hidden: usize,
+        ffn_dim: usize,
+        rope_dim: usize,
+        max_pos: usize,
+        vocab: usize,
+        eps: f32,
+        split_half_pairing: bool,
+        kv_quant: crate::model::KvCacheQuantization,
+    ) -> Result<Self, String> {
+        Self::new_for_artifact_with_kv_quant(
             n_layers,
             n_heads,
             n_kv_heads,
@@ -10166,6 +10948,7 @@ impl CudaResidentDecode {
             eps,
             split_half_pairing,
             ResidentCudaArtifact::Generic,
+            kv_quant,
         )
     }
 
@@ -10183,6 +10966,39 @@ impl CudaResidentDecode {
         eps: f32,
         split_half_pairing: bool,
         artifact: ResidentCudaArtifact,
+    ) -> Result<Self, String> {
+        Self::new_for_artifact_with_kv_quant(
+            n_layers,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            hidden,
+            ffn_dim,
+            rope_dim,
+            max_pos,
+            vocab,
+            eps,
+            split_half_pairing,
+            artifact,
+            crate::model::KvCacheQuantization::F16,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_for_artifact_with_kv_quant(
+        n_layers: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        hidden: usize,
+        ffn_dim: usize,
+        rope_dim: usize,
+        max_pos: usize,
+        vocab: usize,
+        eps: f32,
+        split_half_pairing: bool,
+        artifact: ResidentCudaArtifact,
+        kv_quant: crate::model::KvCacheQuantization,
     ) -> Result<Self, String> {
         let q_width = n_heads * head_dim;
         let kv_width = n_kv_heads * head_dim;
@@ -10203,12 +11019,16 @@ impl CudaResidentDecode {
         let s = &k.stream;
         let max_in = hidden.max(ffn_dim).max(q_width); // widest quantize input
         let alloc_f = |n: usize| s.alloc_zeros::<f32>(n).map_err(|e| format!("alloc: {e}"));
+        let kv_bytes_per_elem = match kv_quant {
+            crate::model::KvCacheQuantization::Q8_0 => (kv_width / 32) * 34,
+            _ => kv_width * 2,
+        };
         let cache_k = (0..n_layers)
-            .map(|_| s.alloc_zeros::<u16>(kv_width * max_pos))
+            .map(|_| s.alloc_zeros::<u8>(kv_bytes_per_elem * max_pos))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("kv alloc: {e}"))?;
         let cache_v = (0..n_layers)
-            .map(|_| s.alloc_zeros::<u16>(kv_width * max_pos))
+            .map(|_| s.alloc_zeros::<u8>(kv_bytes_per_elem * max_pos))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("kv alloc: {e}"))?;
         // Phase 6 side streams + join events, ONLY when opted in — keeps the default
@@ -10283,6 +11103,7 @@ impl CudaResidentDecode {
             output_quant: ProjQuant::Q8_0,
             cache_k,
             cache_v,
+            kv_quant,
             filled: 0,
             d_hidden: alloc_f(hidden)?,
             d_normed: alloc_f(max_in)?,
@@ -10797,10 +11618,10 @@ impl CudaResidentDecode {
         for li in 0..self.n_layers {
             if !keep_full.get(li).copied().unwrap_or(false) {
                 self.cache_k[li] = s
-                    .alloc_zeros::<u16>(1)
+                    .alloc_zeros::<u8>(1)
                     .map_err(|e| format!("kv placeholder: {e}"))?;
                 self.cache_v[li] = s
-                    .alloc_zeros::<u16>(1)
+                    .alloc_zeros::<u8>(1)
                     .map_err(|e| format!("kv placeholder: {e}"))?;
             }
         }
@@ -11211,27 +12032,70 @@ impl CudaResidentDecode {
             return Ok(());
         }
         let (hd, max_pos, n_kv) = (self.head_dim, self.max_pos, self.n_kv_heads);
-        let span = position * hd;
         let s = self.k.stream.clone();
-        for h in 0..n_kv {
-            let hsrc = h * span; // host: head h's [0,position) block
-            let gdst = h * max_pos * hd; // gpu: head h's base (positions 0..)
-                                         // The GPU KV cache holds f16 bits; convert host f32 (already f16-rounded) before
-                                         // upload so the bytes match what kv_scatter writes.
-            let kbits: Vec<u16> = ck[hsrc..hsrc + span]
-                .iter()
-                .map(|&x| crate::inference::f32_to_f16_bits(x))
-                .collect();
-            let mut vk = self.cache_k[layer].slice_mut(gdst..gdst + span);
-            s.memcpy_htod(&kbits, &mut vk)
-                .map_err(|e| format!("seed htod k: {e}"))?;
-            let vbits: Vec<u16> = cv[hsrc..hsrc + span]
-                .iter()
-                .map(|&x| crate::inference::f32_to_f16_bits(x))
-                .collect();
-            let mut vv = self.cache_v[layer].slice_mut(gdst..gdst + span);
-            s.memcpy_htod(&vbits, &mut vv)
-                .map_err(|e| format!("seed htod v: {e}"))?;
+        if self.kv_quant == crate::model::KvCacheQuantization::Q8_0 {
+            let blocks_per_head = hd / 32;
+            let bytes_per_head = blocks_per_head * 34;
+            let mut k_bytes = vec![0u8; position * bytes_per_head];
+            let mut v_bytes = vec![0u8; position * bytes_per_head];
+            let mut q_blocks = vec![crate::tensor::kv_quant::BlockQ8_0::default(); blocks_per_head];
+            for h in 0..n_kv {
+                let hsrc = h * position * hd;
+                for p in 0..position {
+                    let p_src = hsrc + p * hd;
+                    crate::tensor::kv_quant::quantize_row_q8_0(&ck[p_src..p_src + hd], &mut q_blocks);
+                    let q_bytes: &[u8] = unsafe {
+                        std::slice::from_raw_parts(
+                            q_blocks.as_ptr() as *const u8,
+                            bytes_per_head,
+                        )
+                    };
+                    k_bytes[p * bytes_per_head..(p + 1) * bytes_per_head].copy_from_slice(q_bytes);
+
+                    crate::tensor::kv_quant::quantize_row_q8_0(&cv[p_src..p_src + hd], &mut q_blocks);
+                    let q_bytes: &[u8] = unsafe {
+                        std::slice::from_raw_parts(
+                            q_blocks.as_ptr() as *const u8,
+                            bytes_per_head,
+                        )
+                    };
+                    v_bytes[p * bytes_per_head..(p + 1) * bytes_per_head].copy_from_slice(q_bytes);
+                }
+                let gdst = h * max_pos * bytes_per_head;
+                let span = position * bytes_per_head;
+                let mut vk = self.cache_k[layer].slice_mut(gdst..gdst + span);
+                s.memcpy_htod(&k_bytes, &mut vk)
+                    .map_err(|e| format!("seed htod k: {e}"))?;
+                let mut vv = self.cache_v[layer].slice_mut(gdst..gdst + span);
+                s.memcpy_htod(&v_bytes, &mut vv)
+                    .map_err(|e| format!("seed htod v: {e}"))?;
+            }
+        } else {
+            let span = position * hd;
+            for h in 0..n_kv {
+                let hsrc = h * span; // host: head h's [0,position) block
+                let gdst = h * max_pos * hd * 2; // gpu: head h's base byte offset
+                let kbits: Vec<u16> = ck[hsrc..hsrc + span]
+                    .iter()
+                    .map(|&x| crate::inference::f32_to_f16_bits(x))
+                    .collect();
+                let k_bytes: &[u8] = unsafe {
+                    std::slice::from_raw_parts(kbits.as_ptr() as *const u8, kbits.len() * 2)
+                };
+                let mut vk = self.cache_k[layer].slice_mut(gdst..gdst + span * 2);
+                s.memcpy_htod(k_bytes, &mut vk)
+                    .map_err(|e| format!("seed htod k: {e}"))?;
+                let vbits: Vec<u16> = cv[hsrc..hsrc + span]
+                    .iter()
+                    .map(|&x| crate::inference::f32_to_f16_bits(x))
+                    .collect();
+                let v_bytes: &[u8] = unsafe {
+                    std::slice::from_raw_parts(vbits.as_ptr() as *const u8, vbits.len() * 2)
+                };
+                let mut vv = self.cache_v[layer].slice_mut(gdst..gdst + span * 2);
+                s.memcpy_htod(v_bytes, &mut vv)
+                    .map_err(|e| format!("seed htod v: {e}"))?;
+            }
         }
         Ok(())
     }
@@ -11259,36 +12123,95 @@ impl CudaResidentDecode {
         }
         let (hd, max_pos, n_kv) = (self.head_dim, self.max_pos, self.n_kv_heads);
         let s = self.k.stream.clone();
-        let span = n_positions * hd;
-        // KV is stored as f16 bits on the GPU; download to u16 then convert back to f32.
-        let mut k_bits = vec![0u16; n_kv * span];
-        let mut v_bits = vec![0u16; n_kv * span];
-        for h in 0..n_kv {
-            let gsrc = h * max_pos * hd;
-            s.memcpy_dtoh(
-                &self.cache_k[layer].slice(gsrc..gsrc + span),
-                &mut k_bits[h * span..(h + 1) * span],
-            )
-            .map_err(|e| format!("read_kv_layer K dtoh: {e}"))?;
-            s.memcpy_dtoh(
-                &self.cache_v[layer].slice(gsrc..gsrc + span),
-                &mut v_bits[h * span..(h + 1) * span],
-            )
-            .map_err(|e| format!("read_kv_layer V dtoh: {e}"))?;
+        if self.kv_quant == crate::model::KvCacheQuantization::Q8_0 {
+            let blocks_per_head = hd / 32;
+            let bytes_per_head = blocks_per_head * 34;
+            let span = n_positions * bytes_per_head;
+            let mut k_bytes = vec![0u8; n_kv * span];
+            let mut v_bytes = vec![0u8; n_kv * span];
+            for h in 0..n_kv {
+                let gsrc = h * max_pos * bytes_per_head;
+                s.memcpy_dtoh(
+                    &self.cache_k[layer].slice(gsrc..gsrc + span),
+                    &mut k_bytes[h * span..(h + 1) * span],
+                )
+                .map_err(|e| format!("read_kv_layer K dtoh: {e}"))?;
+                s.memcpy_dtoh(
+                    &self.cache_v[layer].slice(gsrc..gsrc + span),
+                    &mut v_bytes[h * span..(h + 1) * span],
+                )
+                .map_err(|e| format!("read_kv_layer V dtoh: {e}"))?;
+            }
+            self.k
+                .ctx
+                .synchronize()
+                .map_err(|e| format!("read_kv_layer sync: {e}"))?;
+            let mut k_out = vec![0.0f32; n_kv * n_positions * hd];
+            let mut v_out = vec![0.0f32; n_kv * n_positions * hd];
+            for h in 0..n_kv {
+                for p in 0..n_positions {
+                    let src_idx = h * span + p * bytes_per_head;
+                    let dst_idx = (h * n_positions + p) * hd;
+                    let qk_blocks: &[crate::tensor::kv_quant::BlockQ8_0] = unsafe {
+                        std::slice::from_raw_parts(
+                            k_bytes[src_idx..].as_ptr() as *const crate::tensor::kv_quant::BlockQ8_0,
+                            blocks_per_head,
+                        )
+                    };
+                    crate::tensor::kv_quant::dequantize_row_q8_0(qk_blocks, &mut k_out[dst_idx..dst_idx + hd]);
+                    let qv_blocks: &[crate::tensor::kv_quant::BlockQ8_0] = unsafe {
+                        std::slice::from_raw_parts(
+                            v_bytes[src_idx..].as_ptr() as *const crate::tensor::kv_quant::BlockQ8_0,
+                            blocks_per_head,
+                        )
+                    };
+                    crate::tensor::kv_quant::dequantize_row_q8_0(qv_blocks, &mut v_out[dst_idx..dst_idx + hd]);
+                }
+            }
+            Ok((k_out, v_out))
+        } else {
+            let span = n_positions * hd;
+            let mut k_bits = vec![0u16; n_kv * span];
+            let mut v_bits = vec![0u16; n_kv * span];
+            for h in 0..n_kv {
+                let gsrc = h * max_pos * hd * 2;
+                let k_bytes_mut: &mut [u8] = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        k_bits[h * span..].as_mut_ptr() as *mut u8,
+                        span * 2,
+                    )
+                };
+                s.memcpy_dtoh(
+                    &self.cache_k[layer].slice(gsrc..gsrc + span * 2),
+                    k_bytes_mut,
+                )
+                .map_err(|e| format!("read_kv_layer K dtoh: {e}"))?;
+                let v_bytes_mut: &mut [u8] = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        v_bits[h * span..].as_mut_ptr() as *mut u8,
+                        span * 2,
+                    )
+                };
+                s.memcpy_dtoh(
+                    &self.cache_v[layer].slice(gsrc..gsrc + span * 2),
+                    v_bytes_mut,
+                )
+                .map_err(|e| format!("read_kv_layer V dtoh: {e}"))?;
+            }
+            self.k
+                .ctx
+                .synchronize()
+                .map_err(|e| format!("read_kv_layer sync: {e}"))?;
+            let k_out = k_bits
+                .iter()
+                .map(|&b| crate::inference::f16_bits_to_f32(b))
+                .collect();
+            let v_out = v_bits
+                .iter()
+                .map(|&b| crate::inference::f16_bits_to_f32(b))
+                .collect();
+            Ok((k_out, v_out))
         }
-        self.k
-            .ctx
-            .synchronize()
-            .map_err(|e| format!("read_kv_layer sync: {e}"))?;
-        let k_out = k_bits
-            .iter()
-            .map(|&b| crate::inference::f16_bits_to_f32(b))
-            .collect();
-        let v_out = v_bits
-            .iter()
-            .map(|&b| crate::inference::f16_bits_to_f32(b))
-            .collect();
-        Ok((k_out, v_out))
     }
 
     /// Run one decode step on the GPU. `embedding` is the current token's f32
@@ -11813,28 +12736,54 @@ impl CudaResidentDecode {
                     )
                     .map_err(map)?;
                     // KV write
-                    launch_kv_scatter(
-                        s_k,
-                        &self.k.kv_scatter,
-                        &self.d_k,
-                        &mut self.cache_k[li],
-                        &self.d_position,
-                        self.n_kv_heads,
-                        self.head_dim,
-                        self.max_pos,
-                    )
-                    .map_err(map)?;
-                    launch_kv_scatter(
-                        s_v,
-                        &self.k.kv_scatter,
-                        &self.d_v,
-                        &mut self.cache_v[li],
-                        &self.d_position,
-                        self.n_kv_heads,
-                        self.head_dim,
-                        self.max_pos,
-                    )
-                    .map_err(map)?;
+                    let is_q8_kv = self.kv_quant == crate::model::KvCacheQuantization::Q8_0;
+                    if is_q8_kv {
+                        launch_kv_scatter_q8_0(
+                            s_k,
+                            &self.k.kv_scatter_q8_0,
+                            &self.d_k,
+                            &mut self.cache_k[li],
+                            &self.d_position,
+                            self.n_kv_heads,
+                            self.head_dim,
+                            self.max_pos,
+                        )
+                        .map_err(map)?;
+                        launch_kv_scatter_q8_0(
+                            s_v,
+                            &self.k.kv_scatter_q8_0,
+                            &self.d_v,
+                            &mut self.cache_v[li],
+                            &self.d_position,
+                            self.n_kv_heads,
+                            self.head_dim,
+                            self.max_pos,
+                        )
+                        .map_err(map)?;
+                    } else {
+                        launch_kv_scatter(
+                            s_k,
+                            &self.k.kv_scatter,
+                            &self.d_k,
+                            &mut self.cache_k[li],
+                            &self.d_position,
+                            self.n_kv_heads,
+                            self.head_dim,
+                            self.max_pos,
+                        )
+                        .map_err(map)?;
+                        launch_kv_scatter(
+                            s_v,
+                            &self.k.kv_scatter,
+                            &self.d_v,
+                            &mut self.cache_v[li],
+                            &self.d_position,
+                            self.n_kv_heads,
+                            self.head_dim,
+                            self.max_pos,
+                        )
+                        .map_err(map)?;
+                    }
                     // Join: K and V (including their cache scatters) are now published;
                     // attention on main reads both caches, so it waits on the side
                     // chains here. These event waits also transitively order every
@@ -11863,9 +12812,14 @@ impl CudaResidentDecode {
                     // start to pay. GLOBAL gemma3 layers fall through to the
                     // unchanged logic below.
                     if let Some(window) = gemma3_window {
+                        let attn_fn = if is_q8_kv {
+                            &self.k.attention_sw_q8_0
+                        } else {
+                            &self.k.attention_sw
+                        };
                         launch_attention_sw(
                             &s,
-                            &self.k.attention_sw,
+                            attn_fn,
                             &self.d_q,
                             &self.cache_k[li],
                             &self.cache_v[li],
@@ -11899,12 +12853,18 @@ impl CudaResidentDecode {
                             attn_shared,
                             self.max_pos,
                             scale,
+                            is_q8_kv,
                         )
                         .map_err(map)?;
                     } else {
+                        let attn_fn = if is_q8_kv {
+                            &self.k.attention_q8_0
+                        } else {
+                            &self.k.attention
+                        };
                         launch_attention(
                             &s,
-                            &self.k.attention,
+                            attn_fn,
                             &self.d_q,
                             &self.cache_k[li],
                             &self.cache_v[li],
@@ -13871,33 +14831,64 @@ impl CudaResidentDecode {
                         pairing,
                     )
                     .map_err(map)?;
-                    launch_kv_scatter_batched(
-                        &s,
-                        &self.k.kv_scatter_batched,
-                        &sc.vk,
-                        &mut self.cache_k[li],
-                        base_position,
-                        n_kv,
-                        head_dim,
-                        max_pos,
-                        kv_width,
-                        k,
-                    )
-                    .map_err(map)?;
-                    launch_kv_scatter_batched(
-                        &s,
-                        &self.k.kv_scatter_batched,
-                        &sc.vv,
-                        &mut self.cache_v[li],
-                        base_position,
-                        n_kv,
-                        head_dim,
-                        max_pos,
-                        kv_width,
-                        k,
-                    )
-                    .map_err(map)?;
-                    if flash_ok
+                    let is_q8_kv = self.kv_quant == crate::model::KvCacheQuantization::Q8_0;
+                    if is_q8_kv {
+                        launch_kv_scatter_batched_q8_0(
+                            &s,
+                            &self.k.kv_scatter_batched_q8_0,
+                            &sc.vk,
+                            &mut self.cache_k[li],
+                            base_position,
+                            n_kv,
+                            head_dim,
+                            max_pos,
+                            kv_width,
+                            k,
+                        )
+                        .map_err(map)?;
+                        launch_kv_scatter_batched_q8_0(
+                            &s,
+                            &self.k.kv_scatter_batched_q8_0,
+                            &sc.vv,
+                            &mut self.cache_v[li],
+                            base_position,
+                            n_kv,
+                            head_dim,
+                            max_pos,
+                            kv_width,
+                            k,
+                        )
+                        .map_err(map)?;
+                    } else {
+                        launch_kv_scatter_batched(
+                            &s,
+                            &self.k.kv_scatter_batched,
+                            &sc.vk,
+                            &mut self.cache_k[li],
+                            base_position,
+                            n_kv,
+                            head_dim,
+                            max_pos,
+                            kv_width,
+                            k,
+                        )
+                        .map_err(map)?;
+                        launch_kv_scatter_batched(
+                            &s,
+                            &self.k.kv_scatter_batched,
+                            &sc.vv,
+                            &mut self.cache_v[li],
+                            base_position,
+                            n_kv,
+                            head_dim,
+                            max_pos,
+                            kv_width,
+                            k,
+                        )
+                        .map_err(map)?;
+                    }
+                    if !is_q8_kv
+                        && flash_ok
                         && flash_prefill_enabled()
                         && q_width == n_heads * head_dim
                         && k <= MAX_VERIFY_K
@@ -13925,9 +14916,14 @@ impl CudaResidentDecode {
                         )
                         .map_err(map)?;
                     } else {
+                        let attn_batched_fn = if is_q8_kv {
+                            &self.k.attention_batched_q8_0
+                        } else {
+                            &self.k.attention_batched
+                        };
                         launch_attention_batched(
                             &s,
-                            &self.k.attention_batched,
+                            attn_batched_fn,
                             &sc.vq,
                             &self.cache_k[li],
                             &self.cache_v[li],
@@ -14654,36 +15650,71 @@ impl CudaResidentDecode {
             )
             .map_err(map)?;
             // Tree scatter: each node to its own slot node_kvslot[t].
-            launch_kv_scatter_tree_batched(
-                &s,
-                &self.k.kv_scatter_tree_batched,
-                &sc.vk,
-                &mut self.cache_k[li],
-                node_kvslot,
-                n_kv,
-                head_dim,
-                max_pos,
-                kv_width,
-                k,
-            )
-            .map_err(map)?;
-            launch_kv_scatter_tree_batched(
-                &s,
-                &self.k.kv_scatter_tree_batched,
-                &sc.vv,
-                &mut self.cache_v[li],
-                node_kvslot,
-                n_kv,
-                head_dim,
-                max_pos,
-                kv_width,
-                k,
-            )
-            .map_err(map)?;
+            let is_q8_kv = self.kv_quant == crate::model::KvCacheQuantization::Q8_0;
+            if is_q8_kv {
+                launch_kv_scatter_tree_batched_q8_0(
+                    &s,
+                    &self.k.kv_scatter_tree_batched_q8_0,
+                    &sc.vk,
+                    &mut self.cache_k[li],
+                    node_kvslot,
+                    n_kv,
+                    head_dim,
+                    max_pos,
+                    kv_width,
+                    k,
+                )
+                .map_err(map)?;
+                launch_kv_scatter_tree_batched_q8_0(
+                    &s,
+                    &self.k.kv_scatter_tree_batched_q8_0,
+                    &sc.vv,
+                    &mut self.cache_v[li],
+                    node_kvslot,
+                    n_kv,
+                    head_dim,
+                    max_pos,
+                    kv_width,
+                    k,
+                )
+                .map_err(map)?;
+            } else {
+                launch_kv_scatter_tree_batched(
+                    &s,
+                    &self.k.kv_scatter_tree_batched,
+                    &sc.vk,
+                    &mut self.cache_k[li],
+                    node_kvslot,
+                    n_kv,
+                    head_dim,
+                    max_pos,
+                    kv_width,
+                    k,
+                )
+                .map_err(map)?;
+                launch_kv_scatter_tree_batched(
+                    &s,
+                    &self.k.kv_scatter_tree_batched,
+                    &sc.vv,
+                    &mut self.cache_v[li],
+                    node_kvslot,
+                    n_kv,
+                    head_dim,
+                    max_pos,
+                    kv_width,
+                    k,
+                )
+                .map_err(map)?;
+            }
             // Tree attention: dense prefix [0, base) + ancestor slots only.
+            let attn_tree_fn = if is_q8_kv {
+                &self.k.attention_tree_batched_q8_0
+            } else {
+                &self.k.attention_tree_batched
+            };
             launch_attention_tree_batched(
                 &s,
-                &self.k.attention_tree_batched,
+                attn_tree_fn,
                 &sc.vq,
                 &self.cache_k[li],
                 &self.cache_v[li],
@@ -14952,12 +15983,12 @@ impl CudaResidentDecode {
         let map = |e: cudarc::driver::DriverError| format!("cuda compact: {e}");
         let s = self.k.stream.clone();
         let (n_kv, head_dim, max_pos) = (self.n_kv_heads, self.head_dim, self.max_pos);
-        // A copy within one CudaSlice can't borrow it &mut and & at once (and the
-        // dst slot may equal another node's src), so route each row through host.
-        // Rows are tiny (head_dim u16) and compaction only fires when a branch
-        // diverges, so the round-trip is negligible. `path[r] >= r` always, so the
-        // gather-then-scatter is order-independent anyway.
-        let mut row = vec![0u16; head_dim];
+        let bytes_per_pos = if self.kv_quant == crate::model::KvCacheQuantization::Q8_0 {
+            (head_dim / 32) * 34
+        } else {
+            head_dim * 2
+        };
+        let mut row = vec![0u8; bytes_per_pos];
         for (r, &node) in path.iter().enumerate() {
             if node == r {
                 continue; // identity (the whole linear case) — slot already correct
@@ -14966,18 +15997,18 @@ impl CudaResidentDecode {
             let dst_pos = base + r;
             for li in 0..self.n_layers {
                 for kv_head in 0..n_kv {
-                    let row_base = kv_head * max_pos * head_dim;
-                    let src = row_base + src_pos * head_dim;
-                    let dst = row_base + dst_pos * head_dim;
+                    let row_base = kv_head * max_pos * bytes_per_pos;
+                    let src = row_base + src_pos * bytes_per_pos;
+                    let dst = row_base + dst_pos * bytes_per_pos;
                     // K
-                    s.memcpy_dtoh(&self.cache_k[li].slice(src..src + head_dim), &mut row)
+                    s.memcpy_dtoh(&self.cache_k[li].slice(src..src + bytes_per_pos), &mut row)
                         .map_err(map)?;
-                    s.memcpy_htod(&row, &mut self.cache_k[li].slice_mut(dst..dst + head_dim))
+                    s.memcpy_htod(&row, &mut self.cache_k[li].slice_mut(dst..dst + bytes_per_pos))
                         .map_err(map)?;
                     // V
-                    s.memcpy_dtoh(&self.cache_v[li].slice(src..src + head_dim), &mut row)
+                    s.memcpy_dtoh(&self.cache_v[li].slice(src..src + bytes_per_pos), &mut row)
                         .map_err(map)?;
-                    s.memcpy_htod(&row, &mut self.cache_v[li].slice_mut(dst..dst + head_dim))
+                    s.memcpy_htod(&row, &mut self.cache_v[li].slice_mut(dst..dst + bytes_per_pos))
                         .map_err(map)?;
                 }
             }
