@@ -31,6 +31,7 @@ pub(crate) mod nodes;
 pub mod policy;
 pub mod probe;
 pub mod server;
+pub(crate) mod watch;
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
