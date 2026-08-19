@@ -3545,7 +3545,7 @@ extern "C" __global__ void attention_decode(
     const unsigned short* __restrict__ cache_v, float* __restrict__ out,
     int n_heads, int n_kv_heads, int head_dim, const int* __restrict__ position_ptr,
     int max_pos, float scale
-) {
+, float* __restrict__ global_scores) {
     // position_count = current position + 1 (keys [0..=position] including this token).
     int position_count = position_ptr[0] + 1;
     int head = blockIdx.x;
@@ -3562,7 +3562,7 @@ extern "C" __global__ void attention_decode(
     int G = blockDim.x / head_dim;       // weighted-V groups per dim (blockDim is a multiple of head_dim)
     float* qsh = shared;                 // head_dim
     float* vpart = shared + head_dim;    // G * head_dim (per-dim partials, fixed-order combine)
-    float* scores = shared + head_dim + (long)G * head_dim;   // position_count
+    float* scores = global_scores + (long)head * max_pos;
     for (int d = tid; d < head_dim; d += blockDim.x) qsh[d] = qh[d];
     __syncthreads();
 
@@ -3658,7 +3658,7 @@ extern "C" __global__ void attention_decode_sw(
     const unsigned short* __restrict__ cache_v, float* __restrict__ out,
     int n_heads, int n_kv_heads, int head_dim, const int* __restrict__ position_ptr,
     int max_pos, float scale, int window
-) {
+, float* __restrict__ global_scores) {
     int position_count = position_ptr[0] + 1;
     int start = (window > 0 && position_count > window) ? (position_count - window) : 0;
     int head = blockIdx.x;
@@ -3674,7 +3674,7 @@ extern "C" __global__ void attention_decode_sw(
     int G = blockDim.x / head_dim;
     float* qsh = shared_sw;
     float* vpart = shared_sw + head_dim;
-    float* scores = shared_sw + head_dim + (long)G * head_dim;
+    float* scores = global_scores + (long)head * max_pos;
     for (int d = tid; d < head_dim; d += blockDim.x) qsh[d] = qh[d];
     __syncthreads();
 
@@ -3776,7 +3776,7 @@ extern "C" __global__ void attention_decode_q8_0(
     const block_q8_0* __restrict__ cache_v, float* __restrict__ out,
     int n_heads, int n_kv_heads, int head_dim, const int* __restrict__ position_ptr,
     int max_pos, float scale
-) {
+, float* __restrict__ global_scores) {
     int position_count = position_ptr[0] + 1;
     int head = blockIdx.x;
     if (head >= n_heads) return;
@@ -3792,7 +3792,7 @@ extern "C" __global__ void attention_decode_q8_0(
     int G = blockDim.x / head_dim;
     float* qsh = shared;
     float* vpart = shared + head_dim;
-    float* scores = shared + head_dim + (long)G * head_dim;
+    float* scores = global_scores + (long)head * max_pos;
     for (int d = tid; d < head_dim; d += blockDim.x) qsh[d] = qh[d];
     __syncthreads();
 
@@ -3856,7 +3856,7 @@ extern "C" __global__ void attention_decode_sw_q8_0(
     const block_q8_0* __restrict__ cache_v, float* __restrict__ out,
     int n_heads, int n_kv_heads, int head_dim, const int* __restrict__ position_ptr,
     int max_pos, float scale, int window
-) {
+, float* __restrict__ global_scores) {
     int position_count = position_ptr[0] + 1;
     int start = (window > 0 && position_count > window) ? (position_count - window) : 0;
     int head = blockIdx.x;
@@ -3873,7 +3873,7 @@ extern "C" __global__ void attention_decode_sw_q8_0(
     int G = blockDim.x / head_dim;
     float* qsh = shared_sw;
     float* vpart = shared_sw + head_dim;
-    float* scores = shared_sw + head_dim + (long)G * head_dim;
+    float* scores = global_scores + (long)head * max_pos;
     for (int d = tid; d < head_dim; d += blockDim.x) qsh[d] = qh[d];
     __syncthreads();
 
@@ -4464,7 +4464,7 @@ extern "C" __global__ void attention_batched(
     const unsigned short* __restrict__ cache_v, float* __restrict__ out,
     int n_heads, int n_kv_heads, int head_dim, int base_position, int max_pos, float scale,
     int q_per_token, int k_tokens, int splitk_active
-) {
+, float* __restrict__ global_scores) {
     int t = blockIdx.x / n_heads;
     int head = blockIdx.x % n_heads;
     if (t >= k_tokens) return;
@@ -4478,7 +4478,7 @@ extern "C" __global__ void attention_batched(
 
     extern __shared__ float shared[];
     float* qsh = shared;               // head_dim
-    float* scores = shared + head_dim; // position_count
+    float* scores = global_scores + (long)blockIdx.x * max_pos;
     int tid = threadIdx.x;
     for (int d = tid; d < head_dim; d += blockDim.x) qsh[d] = qh[d];
     __syncthreads();
@@ -4631,7 +4631,7 @@ extern "C" __global__ void attention_tree_batched(
     const unsigned int* __restrict__ ancestor_bits, int words,
     int n_heads, int n_kv_heads, int head_dim, int base_position, int max_pos, float scale,
     int q_per_token, int k_tokens, int splitk_active
-) {
+, float* __restrict__ global_scores) {
     int t = blockIdx.x / n_heads;
     int head = blockIdx.x % n_heads;
     if (t >= k_tokens) return;
@@ -4644,7 +4644,7 @@ extern "C" __global__ void attention_tree_batched(
 
     extern __shared__ float shared[];
     float* qsh = shared;               // head_dim
-    float* scores = shared + head_dim;  // base + (#in-chunk ancestors)
+    float* scores = global_scores + (long)blockIdx.x * max_pos;
     int* slots = (int*)(scores + base_position + k_tokens); // absolute KV slot per score
     int tid = threadIdx.x;
     for (int d = tid; d < head_dim; d += blockDim.x) qsh[d] = qh[d];
@@ -4835,7 +4835,7 @@ extern "C" __global__ void attention_batched_q8_0(
     const block_q8_0* __restrict__ cache_v, float* __restrict__ out,
     int n_heads, int n_kv_heads, int head_dim, int base_position, int max_pos, float scale,
     int q_per_token, int k_tokens, int splitk_active
-) {
+, float* __restrict__ global_scores) {
     int t = blockIdx.x / n_heads;
     int head = blockIdx.x % n_heads;
     if (t >= k_tokens) return;
@@ -4849,7 +4849,7 @@ extern "C" __global__ void attention_batched_q8_0(
 
     extern __shared__ float shared[];
     float* qsh = shared;
-    float* scores = shared + head_dim;
+    float* scores = global_scores + (long)blockIdx.x * max_pos;
     int tid = threadIdx.x;
     for (int d = tid; d < head_dim; d += blockDim.x) qsh[d] = qh[d];
     __syncthreads();
@@ -4953,7 +4953,7 @@ extern "C" __global__ void attention_tree_batched_q8_0(
     const unsigned int* __restrict__ ancestor_bits, int words,
     int n_heads, int n_kv_heads, int head_dim, int base_position, int max_pos, float scale,
     int q_per_token, int k_tokens, int splitk_active
-) {
+, float* __restrict__ global_scores) {
     int t = blockIdx.x / n_heads;
     int head = blockIdx.x % n_heads;
     if (t >= k_tokens) return;
@@ -4967,7 +4967,7 @@ extern "C" __global__ void attention_tree_batched_q8_0(
 
     extern __shared__ float shared[];
     float* qsh = shared;
-    float* scores = shared + head_dim;
+    float* scores = global_scores + (long)blockIdx.x * max_pos;
     int* slots = (int*)(scores + base_position + k_tokens);
     int tid = threadIdx.x;
     for (int d = tid; d < head_dim; d += blockDim.x) qsh[d] = qh[d];
@@ -9723,6 +9723,7 @@ pub(crate) fn launch_attention_flash_prefill(
     q_per_token: usize,
     max_pos: usize,
     scale: f32,
+    global_scores: &mut CudaSlice<f32>,
 ) -> Result<(), cudarc::driver::DriverError> {
     // Chunk length = full range every token could attend; per-token causal mask lives in the kernel.
     let position_count = base_position + k_tokens;
@@ -9835,6 +9836,7 @@ pub(crate) fn launch_attention(
     shared_positions: usize,
     max_pos: usize,
     scale: f32,
+    global_scores: &mut CudaSlice<f32>,
 ) -> Result<(), cudarc::driver::DriverError> {
     // Adaptive launch (occupancy/latency fix). attention_decode was starved at
     // batch-1 (ncu @ block 64: 4.4% occupancy, 0.07 waves/SM, 0.44% DRAM) — too few
@@ -9854,7 +9856,7 @@ pub(crate) fn launch_attention(
         grid_dim: (n_heads as u32, 1, 1),
         block_dim: (block, 1, 1),
         // qsh[head_dim] + vpart[groups*head_dim] + scores[shared_positions]
-        shared_mem_bytes: ((head_dim as u32 * (1 + groups)) + shared_positions as u32) * 4,
+        shared_mem_bytes: ((head_dim as u32 * (1 + groups))) * 4,
     };
     let (nh, nkv, hd, mp) = (
         n_heads as i32,
@@ -9911,7 +9913,7 @@ pub(crate) fn launch_attention_sw(
     let cfg = LaunchConfig {
         grid_dim: (n_heads as u32, 1, 1),
         block_dim: (block, 1, 1),
-        shared_mem_bytes: ((head_dim as u32 * (1 + groups)) + shared_positions as u32) * 4,
+        shared_mem_bytes: ((head_dim as u32 * (1 + groups))) * 4,
     };
     let (nh, nkv, hd, mp, win) = (
         n_heads as i32,
@@ -10513,7 +10515,8 @@ pub struct CudaResidentDecode {
     // SIROCCO Phase P M1 flash prefill scratch: k_tokens-major (flat (t*n_heads+head)), sized for
     // MAX_VERIFY_K query tokens so attn_sk_combine reuses these with n_heads = k*n_heads. Only
     // allocated/used when CAMELID_FLASH_PREFILL is on.
-    d_flash_scores: CudaSlice<f32>, // MAX_VERIFY_K * n_heads * max_pos
+    d_flash_scores: CudaSlice<f32>,
+    d_verify_scores: CudaSlice<f32>, // MAX_VERIFY_K * n_heads * max_pos
     d_flash_chunkmax: CudaSlice<f32>, // MAX_VERIFY_K * n_heads * SPLITK_MAX
     d_flash_lsum: CudaSlice<f32>,   // MAX_VERIFY_K * n_heads * SPLITK_MAX
     d_flash_acc: CudaSlice<f32>,    // MAX_VERIFY_K * n_heads * SPLITK_MAX * head_dim
@@ -11133,6 +11136,7 @@ impl CudaResidentDecode {
             d_sk_chunkmax: alloc_f(n_heads * SPLITK_MAX)?,
             d_sk_lsum: alloc_f(n_heads * SPLITK_MAX)?,
             d_sk_acc: alloc_f(n_heads * SPLITK_MAX * head_dim)?,
+            d_verify_scores: alloc_f(MAX_VERIFY_K * n_heads * max_pos)?,
             // Flash-prefill scratch: k_tokens-major, allocated only when opt-in (else 1-elem stub).
             d_flash_scores: alloc_f(if flash_prefill_enabled() {
                 MAX_VERIFY_K * n_heads * max_pos
@@ -12850,6 +12854,7 @@ impl CudaResidentDecode {
                             self.max_pos,
                             scale,
                             window,
+                            &mut self.d_sk_scores,
                         )
                         .map_err(map)?;
                     } else if !graph_capture && attn_shared > SPLITK_THRESHOLD {
@@ -12894,6 +12899,7 @@ impl CudaResidentDecode {
                             attn_shared,
                             self.max_pos,
                             scale,
+                            &mut self.d_sk_scores,
                         )
                         .map_err(map)?;
                     }
@@ -14955,6 +14961,7 @@ impl CudaResidentDecode {
                             q_width,
                             k,
                             if splitk_verify_active() { 1 } else { 0 },
+                            &mut self.d_verify_scores,
                         )
                         .map_err(map)?;
                     }
@@ -15748,6 +15755,7 @@ impl CudaResidentDecode {
                 q_width,
                 k,
                 if splitk_verify_active() { 1 } else { 0 },
+                &mut self.d_verify_scores,
             )
             .map_err(map)?;
             launch_quantize(
