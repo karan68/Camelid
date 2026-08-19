@@ -23,6 +23,24 @@ const KERNELS: &str = r#"
 #include <mma.h>
 #endif
 
+// ---- Hardware intrinsics (header-free) -------------------------------------
+// NVRTC runs without <cuda_runtime.h> or <sm_61_intrinsics.h>; provide direct
+// inline PTX assembly for dp4a (SM61+) and byte_perm (SM32+) so NVRTC does not
+// generate unresolved extern function calls to _Z6__dp4aiii.
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 610
+static __device__ __forceinline__ int __dp4a(int a, int b, int c) {
+    int d;
+    asm("dp4a.s32.s32 %0, %1, %2, %3;" : "=r"(d) : "r"(a), "r"(b), "r"(c));
+    return d;
+}
+#endif
+
+static __device__ __forceinline__ unsigned int __byte_perm(unsigned int a, unsigned int b, unsigned int s) {
+    unsigned int d;
+    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(d) : "r"(a), "r"(b), "r"(s));
+    return d;
+}
+
 // ---- f16 round-trip (header-free) ------------------------------------------
 // Bit-exact port of inference.rs f32_to_f16_bits / f16_bits_to_f32 (IEEE-754
 // round-half-to-even). Used wherever the CPU reference rounds a value through
