@@ -1052,7 +1052,7 @@ mod tests {
 
     #[test]
     fn test_speculative_rejection_monte_carlo_distribution() {
-        let drafts = [0];
+        
         let q0 = [0.7, 0.3];
         let draft_probs: [&[f32]; 1] = [&q0];
         let p0 = [0.2, 0.8];
@@ -1071,6 +1071,8 @@ mod tests {
         let mut count1 = 0;
 
         for _ in 0..trials {
+            let d = sample_from_probs(&q0, rng());
+            let drafts = [d];
             let res = speculative_rejection_sample(&drafts, &draft_probs, &target_probs, &mut rng);
             let first_token = res.emitted_tokens[0];
             if first_token == 0 {
