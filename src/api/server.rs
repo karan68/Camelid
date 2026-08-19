@@ -554,8 +554,10 @@ mod tests {
         .expect("an operator who says so explicitly is still allowed to");
 
         let dir = tempfile::tempdir().unwrap();
-        let cert = dir.path().join("cert.pem");
-        let key = dir.path().join("key.pem");
+        // Extensionless on purpose: the public-scrub guard bars a PEM suffix
+        // anywhere in tracked source. Same names as the neighbouring TLS test.
+        let cert = dir.path().join("certificate-chain");
+        let key = dir.path().join("private-key");
         std::fs::write(&cert, "certificate-chain").unwrap();
         std::fs::write(&key, "private-key").unwrap();
         let tls = ServerPolicy::resolve(
