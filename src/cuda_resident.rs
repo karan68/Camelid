@@ -9859,7 +9859,7 @@ pub(crate) fn launch_attention(
         grid_dim: (n_heads as u32, 1, 1),
         block_dim: (block, 1, 1),
         // qsh[head_dim] + vpart[groups*head_dim] + scores[shared_positions]
-        shared_mem_bytes: ((head_dim as u32 * (1 + groups))) * 4,
+        shared_mem_bytes: (head_dim as u32 * (1 + groups)) * 4,
     };
     let (nh, nkv, hd, mp) = (
         n_heads as i32,
@@ -9918,7 +9918,7 @@ pub(crate) fn launch_attention_sw(
     let cfg = LaunchConfig {
         grid_dim: (n_heads as u32, 1, 1),
         block_dim: (block, 1, 1),
-        shared_mem_bytes: ((head_dim as u32 * (1 + groups))) * 4,
+        shared_mem_bytes: (head_dim as u32 * (1 + groups)) * 4,
     };
     let (nh, nkv, hd, mp, win) = (
         n_heads as i32,
@@ -10524,8 +10524,8 @@ pub struct CudaResidentDecode {
     d_flash_scores: CudaSlice<f32>,
     d_verify_scores: CudaSlice<f32>, // MAX_VERIFY_K * n_heads * max_pos
     d_flash_chunkmax: CudaSlice<f32>, // MAX_VERIFY_K * n_heads * SPLITK_MAX
-    d_flash_lsum: CudaSlice<f32>,   // MAX_VERIFY_K * n_heads * SPLITK_MAX
-    d_flash_acc: CudaSlice<f32>,    // MAX_VERIFY_K * n_heads * SPLITK_MAX * head_dim
+    d_flash_lsum: CudaSlice<f32>,    // MAX_VERIFY_K * n_heads * SPLITK_MAX
+    d_flash_acc: CudaSlice<f32>,     // MAX_VERIFY_K * n_heads * SPLITK_MAX * head_dim
     d_proj: CudaSlice<f32>,
     /// Holds a projection's output AFTER a gemma3 sandwich post-norm and before
     /// its residual add. A top-level field rather than one inside `Gemma3Gpu` so
@@ -12071,21 +12071,21 @@ impl CudaResidentDecode {
                 let hsrc = h * position * hd;
                 for p in 0..position {
                     let p_src = hsrc + p * hd;
-                    crate::tensor::kv_quant::quantize_row_q8_0(&ck[p_src..p_src + hd], &mut q_blocks);
+                    crate::tensor::kv_quant::quantize_row_q8_0(
+                        &ck[p_src..p_src + hd],
+                        &mut q_blocks,
+                    );
                     let q_bytes: &[u8] = unsafe {
-                        std::slice::from_raw_parts(
-                            q_blocks.as_ptr() as *const u8,
-                            bytes_per_head,
-                        )
+                        std::slice::from_raw_parts(q_blocks.as_ptr() as *const u8, bytes_per_head)
                     };
                     k_bytes[p * bytes_per_head..(p + 1) * bytes_per_head].copy_from_slice(q_bytes);
 
-                    crate::tensor::kv_quant::quantize_row_q8_0(&cv[p_src..p_src + hd], &mut q_blocks);
+                    crate::tensor::kv_quant::quantize_row_q8_0(
+                        &cv[p_src..p_src + hd],
+                        &mut q_blocks,
+                    );
                     let q_bytes: &[u8] = unsafe {
-                        std::slice::from_raw_parts(
-                            q_blocks.as_ptr() as *const u8,
-                            bytes_per_head,
-                        )
+                        std::slice::from_raw_parts(q_blocks.as_ptr() as *const u8, bytes_per_head)
                     };
                     v_bytes[p * bytes_per_head..(p + 1) * bytes_per_head].copy_from_slice(q_bytes);
                 }
@@ -12182,18 +12182,26 @@ impl CudaResidentDecode {
                     let dst_idx = (h * n_positions + p) * hd;
                     let qk_blocks: &[crate::tensor::kv_quant::BlockQ8_0] = unsafe {
                         std::slice::from_raw_parts(
-                            k_bytes[src_idx..].as_ptr() as *const crate::tensor::kv_quant::BlockQ8_0,
+                            k_bytes[src_idx..].as_ptr()
+                                as *const crate::tensor::kv_quant::BlockQ8_0,
                             blocks_per_head,
                         )
                     };
-                    crate::tensor::kv_quant::dequantize_row_q8_0(qk_blocks, &mut k_out[dst_idx..dst_idx + hd]);
+                    crate::tensor::kv_quant::dequantize_row_q8_0(
+                        qk_blocks,
+                        &mut k_out[dst_idx..dst_idx + hd],
+                    );
                     let qv_blocks: &[crate::tensor::kv_quant::BlockQ8_0] = unsafe {
                         std::slice::from_raw_parts(
-                            v_bytes[src_idx..].as_ptr() as *const crate::tensor::kv_quant::BlockQ8_0,
+                            v_bytes[src_idx..].as_ptr()
+                                as *const crate::tensor::kv_quant::BlockQ8_0,
                             blocks_per_head,
                         )
                     };
-                    crate::tensor::kv_quant::dequantize_row_q8_0(qv_blocks, &mut v_out[dst_idx..dst_idx + hd]);
+                    crate::tensor::kv_quant::dequantize_row_q8_0(
+                        qv_blocks,
+                        &mut v_out[dst_idx..dst_idx + hd],
+                    );
                 }
             }
             Ok((k_out, v_out))
@@ -16035,13 +16043,19 @@ impl CudaResidentDecode {
                     // K
                     s.memcpy_dtoh(&self.cache_k[li].slice(src..src + bytes_per_pos), &mut row)
                         .map_err(map)?;
-                    s.memcpy_htod(&row, &mut self.cache_k[li].slice_mut(dst..dst + bytes_per_pos))
-                        .map_err(map)?;
+                    s.memcpy_htod(
+                        &row,
+                        &mut self.cache_k[li].slice_mut(dst..dst + bytes_per_pos),
+                    )
+                    .map_err(map)?;
                     // V
                     s.memcpy_dtoh(&self.cache_v[li].slice(src..src + bytes_per_pos), &mut row)
                         .map_err(map)?;
-                    s.memcpy_htod(&row, &mut self.cache_v[li].slice_mut(dst..dst + bytes_per_pos))
-                        .map_err(map)?;
+                    s.memcpy_htod(
+                        &row,
+                        &mut self.cache_v[li].slice_mut(dst..dst + bytes_per_pos),
+                    )
+                    .map_err(map)?;
                 }
             }
         }

@@ -3240,9 +3240,11 @@ impl LlamaInferenceSession {
         let mut guard = cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let need_build = guard
-            .as_ref()
-            .is_none_or(|slot| slot.key != key || !slot.engine.weights_ready() || slot.engine.kv_quant != self.config.kv_quant);
+        let need_build = guard.as_ref().is_none_or(|slot| {
+            slot.key != key
+                || !slot.engine.weights_ready()
+                || slot.engine.kv_quant != self.config.kv_quant
+        });
         if need_build {
             // Switching/rebuilding the resident engine: free any prior engine and
             // return its VRAM to the driver BEFORE the new engine's fit probe. cudarc's
@@ -4034,9 +4036,11 @@ impl LlamaInferenceSession {
             );
         }
         let need_build = windowed_mismatch
-            || guard
-                .as_ref()
-                .is_none_or(|slot| slot.key != key || !slot.engine.weights_ready() || slot.engine.kv_quant != self.config.kv_quant);
+            || guard.as_ref().is_none_or(|slot| {
+                slot.key != key
+                    || !slot.engine.weights_ready()
+                    || slot.engine.kv_quant != self.config.kv_quant
+            });
         if trace && need_build {
             match guard.as_ref() {
                 None => eprintln!("[resident-cuda] need_build: cache EMPTY (key={key:#x})"),

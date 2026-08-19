@@ -112,7 +112,7 @@ pub fn speculative_rejection_sample<R: FnMut() -> f32>(
         "draft_probs length must be at least drafts length"
     );
     assert!(
-        target_probs.len() >= k + 1,
+        target_probs.len() > k,
         "target_probs length must be at least drafts.len() + 1"
     );
 
@@ -125,11 +125,7 @@ pub fn speculative_rejection_sample<R: FnMut() -> f32>(
         let q = draft_probs[i].get(tok_idx).copied().unwrap_or(0.0);
         let p = target_probs[i].get(tok_idx).copied().unwrap_or(0.0);
 
-        let accept_prob = if q <= 0.0 {
-            0.0
-        } else {
-            (p / q).min(1.0)
-        };
+        let accept_prob = if q <= 0.0 { 0.0 } else { (p / q).min(1.0) };
 
         let r = rng();
         if r < accept_prob {
@@ -1067,7 +1063,7 @@ mod tests {
         let mut seed: u64 = 123456789;
         let mut rng = || {
             seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-            ((seed >> 33) as f32) / (f32::from(1u32 << 31))
+            ((seed >> 33) as f32) / ((1u32 << 31) as f32)
         };
 
         let trials = 20_000;
@@ -1088,7 +1084,13 @@ mod tests {
         let emp1 = (count1 as f32) / (trials as f32);
 
         // Should match p0 = [0.2, 0.8] within 0.01
-        assert!((emp0 - 0.2).abs() < 0.015, "empirical p(0)={emp0} expected ~0.2");
-        assert!((emp1 - 0.8).abs() < 0.015, "empirical p(1)={emp1} expected ~0.8");
+        assert!(
+            (emp0 - 0.2).abs() < 0.015,
+            "empirical p(0)={emp0} expected ~0.2"
+        );
+        assert!(
+            (emp1 - 0.8).abs() < 0.015,
+            "empirical p(1)={emp1} expected ~0.8"
+        );
     }
 }
