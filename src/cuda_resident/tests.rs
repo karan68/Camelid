@@ -6780,3 +6780,171 @@ fn ssm_layer_chain_matches_cpu() {
         "ssm chain conv_state diverged"
     );
 }
+
+// The specialized head_dim kernels must keep `o_acc` in registers: a non-zero stack frame means
+// the accumulator spilled to local memory, which is the failure mode the compile-time HEAD_DIM
+// specialization exists to prevent. Folding all four entry points into one kernel with a runtime
+// branch reintroduces it (measured on sm_89: 224 bytes charged to every launch).
+#[test]
+#[ignore = "requires a CUDA device"]
+fn flash_prefill_specialized_kernels_have_no_local_memory_frame() {
+    let Some(k) = kernels() else {
+        return;
+    };
+    for (name, f) in [
+        (
+            "flash_attention_prefill_tiled_d64",
+            &k.flash_attention_prefill_tiled_d64,
+        ),
+        (
+            "flash_attention_prefill_tiled_d128",
+            &k.flash_attention_prefill_tiled_d128,
+        ),
+        (
+            "flash_attention_prefill_tiled_d256",
+            &k.flash_attention_prefill_tiled_d256,
+        ),
+    ] {
+        let local = f.local_size_bytes().unwrap();
+        let regs = f.num_regs().unwrap();
+        let max_threads = f.max_threads_per_block().unwrap();
+        println!("{name}: num_regs={regs} local_size_bytes={local} max_threads={max_threads}");
+        assert_eq!(local, 0, "{name} spilled {local} bytes to local memory");
+        assert!(
+            max_threads >= 256,
+            "{name} cannot launch the 256-thread block the launcher uses (max {max_threads})"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn flash_attention_prefill_tiled_parity() {
+    let Some(k) = kernels() else {
+        return;
+    };
+    let n_heads = 8usize;
+    let n_kv = 2usize;
+    let max_pos = 2048usize;
+
+    // 64/128/256 take the compile-time-specialized kernels; 96 routes to the runtime-head_dim
+    // twin, which is a different entry point and would otherwise be shipped untested.
+    let head_dims = [64usize, 96usize, 128usize, 256usize];
+    let base_positions = [0usize, 64usize, 128usize, 512usize, 1024usize];
+    let k_tokens_list = [1usize, 8usize, 16usize, 32usize, 64usize];
+
+    for &head_dim in &head_dims {
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        for &base_position in &base_positions {
+            for &k_tokens in &k_tokens_list {
+                let mut rng = Lcg(0xCA_FE_12_34
+                    + (head_dim as u64) * 1000
+                    + (base_position as u64)
+                    + (k_tokens as u64));
+                let q: Vec<f32> = (0..k_tokens * n_heads * head_dim)
+                    .map(|_| rng.next_f32() * 2.0 - 1.0)
+                    .collect();
+                let total_kv_pos = base_position + k_tokens;
+                let mut cache_k_f32 = vec![0f32; n_kv * max_pos * head_dim];
+                let mut cache_v_f32 = vec![0f32; n_kv * max_pos * head_dim];
+                for x in cache_k_f32[..n_kv * total_kv_pos * head_dim].iter_mut() {
+                    *x = rng.next_f32() * 2.0 - 1.0;
+                }
+                for x in cache_v_f32[..n_kv * total_kv_pos * head_dim].iter_mut() {
+                    *x = rng.next_f32() * 2.0 - 1.0;
+                }
+
+                let cache_k_bits: Vec<u16> = cache_k_f32
+                    .iter()
+                    .map(|&x| crate::inference::f32_to_f16_bits(x))
+                    .collect();
+                let cache_v_bits: Vec<u16> = cache_v_f32
+                    .iter()
+                    .map(|&x| crate::inference::f32_to_f16_bits(x))
+                    .collect();
+
+                let dq = k.stream.clone_htod(&q).unwrap();
+                let dk = k.stream.clone_htod(&cache_k_bits).unwrap();
+                let dv = k.stream.clone_htod(&cache_v_bits).unwrap();
+                let mut dout = k
+                    .stream
+                    .alloc_zeros::<f32>(k_tokens * n_heads * head_dim)
+                    .unwrap();
+
+                super::launch_attention_flash_prefill(
+                    &k.stream,
+                    &k,
+                    &dq,
+                    &dk,
+                    &dv,
+                    &mut dout,
+                    n_heads,
+                    n_kv,
+                    head_dim,
+                    base_position,
+                    k_tokens,
+                    n_heads * head_dim,
+                    max_pos,
+                    scale,
+                )
+                .unwrap();
+
+                let mut got = vec![0f32; k_tokens * n_heads * head_dim];
+                k.stream.memcpy_dtoh(&dout, &mut got).unwrap();
+                k.ctx.synchronize().unwrap();
+
+                // CPU reference causal attention
+                let mut expected = vec![0f32; k_tokens * n_heads * head_dim];
+                let repeats = n_heads / n_kv;
+                for t in 0..k_tokens {
+                    let global_q_pos = base_position + t;
+                    for h in 0..n_heads {
+                        let kv_h = h / repeats;
+                        let q_offset = (t * n_heads + h) * head_dim;
+                        let q_slice = &q[q_offset..q_offset + head_dim];
+
+                        // Compute scores
+                        let mut scores = Vec::with_capacity(global_q_pos + 1);
+                        for p in 0..=global_q_pos {
+                            let k_offset = (kv_h * max_pos + p) * head_dim;
+                            let mut dot = 0.0f32;
+                            for d in 0..head_dim {
+                                let k_val =
+                                    crate::inference::f16_bits_to_f32(cache_k_bits[k_offset + d]);
+                                dot += q_slice[d] * k_val;
+                            }
+                            scores.push(dot * scale);
+                        }
+
+                        // Softmax
+                        let max_s = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                        let exp_scores: Vec<f32> =
+                            scores.iter().map(|&s| (s - max_s).exp()).collect();
+                        let sum_exp: f32 = exp_scores.iter().sum();
+                        let inv_sum = 1.0 / sum_exp;
+
+                        // Weighted V
+                        let out_offset = (t * n_heads + h) * head_dim;
+                        for d in 0..head_dim {
+                            let mut acc = 0.0f32;
+                            for (p, &exp_score) in
+                                exp_scores.iter().enumerate().take(global_q_pos + 1)
+                            {
+                                let v_offset = (kv_h * max_pos + p) * head_dim;
+                                let v_val =
+                                    crate::inference::f16_bits_to_f32(cache_v_bits[v_offset + d]);
+                                acc += exp_score * v_val;
+                            }
+                            expected[out_offset + d] = acc * inv_sum;
+                        }
+                    }
+                }
+
+                assert!(
+                    close(&got, &expected, 5e-4),
+                    "flash_attention_prefill_tiled diverged at head_dim={head_dim}, base_position={base_position}, k_tokens={k_tokens}"
+                );
+            }
+        }
+    }
+}
