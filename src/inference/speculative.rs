@@ -139,23 +139,45 @@ pub fn speculative_rejection_sample<R: FnMut() -> f32>(
         } else {
             // Draft rejected. Sample from residual distribution (p - q)+
             let vocab_size = target_probs[i].len();
-            let mut residual = vec![0.0f32; vocab_size];
             let mut residual_sum = 0.0f32;
-
             for v in 0..vocab_size {
                 let pv = target_probs[i][v];
                 let qv = draft_probs[i].get(v).copied().unwrap_or(0.0);
-                let diff = (pv - qv).max(0.0);
-                residual[v] = diff;
-                residual_sum += diff;
+                residual_sum += (pv - qv).max(0.0);
             }
 
             let bonus_token = if residual_sum > 0.0 {
-                let inv_sum = 1.0 / residual_sum;
+                let mut cumsum = 0.0f32;
+                // Avoid using exactly residual_sum to prevent boundary precision misses
+                let u = (rng() * residual_sum).clamp(0.0, residual_sum * 0.9999999);
+                let mut sampled = None;
                 for v in 0..vocab_size {
-                    residual[v] *= inv_sum;
+                    let pv = target_probs[i][v];
+                    let qv = draft_probs[i].get(v).copied().unwrap_or(0.0);
+                    let diff = (pv - qv).max(0.0);
+                    if diff > 0.0 {
+                        cumsum += diff;
+                        if cumsum > u {
+                            sampled = Some(v as u32);
+                            break;
+                        }
+                    }
                 }
-                sample_from_probs(&residual, rng())
+                sampled.unwrap_or_else(|| {
+                    // Fallback to argmax of residual if cumulative sum missed due to float rounding
+                    let mut max_diff = -1.0f32;
+                    let mut best_idx = 0;
+                    for v in 0..vocab_size {
+                        let pv = target_probs[i][v];
+                        let qv = draft_probs[i].get(v).copied().unwrap_or(0.0);
+                        let diff = (pv - qv).max(0.0);
+                        if diff > max_diff {
+                            max_diff = diff;
+                            best_idx = v as u32;
+                        }
+                    }
+                    best_idx
+                })
             } else {
                 sample_from_probs(target_probs[i], rng())
             };
