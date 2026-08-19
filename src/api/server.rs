@@ -88,6 +88,7 @@ pub struct ServeOptions {
     pub api_key_file: Option<PathBuf>,
     pub cors_origins: Vec<String>,
     pub allow_unauthenticated_remote: bool,
+    pub allow_cleartext_remote: bool,
     pub tls_cert: Option<PathBuf>,
     pub tls_key: Option<PathBuf>,
     pub max_request_body_bytes: usize,
@@ -104,6 +105,7 @@ impl Default for ServeOptions {
             api_key_file: None,
             cors_origins: Vec::new(),
             allow_unauthenticated_remote: false,
+            allow_cleartext_remote: false,
             tls_cert: None,
             tls_key: None,
             max_request_body_bytes: DEFAULT_MAX_REQUEST_BODY_BYTES,
@@ -125,6 +127,7 @@ impl fmt::Debug for ServeOptions {
                 "allow_unauthenticated_remote",
                 &self.allow_unauthenticated_remote,
             )
+            .field("allow_cleartext_remote", &self.allow_cleartext_remote)
             .field("tls_cert", &self.tls_cert)
             .field("tls_key", &self.tls_key.as_ref().map(|_| "[REDACTED PATH]"))
             .field("max_request_body_bytes", &self.max_request_body_bytes)
@@ -281,6 +284,23 @@ impl ServerPolicy {
         }
 
         let tls = resolve_tls(options.tls_cert, options.tls_key)?;
+
+        // The key configured above is sent on every request, so without TLS the
+        // very thing protecting a routable bind is what the bind gives away,
+        // along with every prompt and completion. `crate::fabric::server`
+        // refuses this same shape on the same three conditions.
+        if !addr.ip().is_loopback() && tls.is_none() && !options.allow_cleartext_remote {
+            return Err(Error::new(
+                ErrorKind::PermissionDenied,
+                format!(
+                    "refusing cleartext non-loopback listener {addr}; the API key and every \
+                     prompt would cross the network unencrypted. Bind a loopback address, \
+                     configure --tls-cert/--tls-key, or explicitly acknowledge the risk with \
+                     --allow-cleartext-remote"
+                ),
+            ));
+        }
+
         let cors_origins = options
             .cors_origins
             .iter()
@@ -464,10 +484,13 @@ mod tests {
         let error = ServerPolicy::resolve(addr, ServeOptions::default()).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::PermissionDenied);
 
+        // Cleartext is acknowledged throughout so this stays a test of the
+        // authentication question alone; the encryption one is tested below.
         let authenticated = ServerPolicy::resolve(
             addr,
             ServeOptions {
                 api_key: Some("secret".to_string()),
+                allow_cleartext_remote: true,
                 ..ServeOptions::default()
             },
         )
@@ -478,11 +501,83 @@ mod tests {
             addr,
             ServeOptions {
                 allow_unauthenticated_remote: true,
+                allow_cleartext_remote: true,
                 ..ServeOptions::default()
             },
         )
         .unwrap();
         assert!(overridden.remote_unauthenticated_override);
+    }
+
+    /// A key sent over cleartext protects nothing: it is on every request, so
+    /// the bind gives away the credential that was supposed to guard it.
+    #[test]
+    fn a_routable_cleartext_listener_is_refused_even_with_a_key() {
+        let addr = SocketAddr::from(([0, 0, 0, 0], 8181));
+
+        let error = ServerPolicy::resolve(
+            addr,
+            ServeOptions {
+                api_key: Some("secret".to_string()),
+                ..ServeOptions::default()
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::PermissionDenied);
+        let message = error.to_string();
+        assert!(
+            message.contains("--allow-cleartext-remote"),
+            "the refusal has to name the way out: {message}"
+        );
+        assert!(
+            message.contains("--tls-cert"),
+            "and the way to do it properly: {message}"
+        );
+    }
+
+    #[test]
+    fn loopback_is_unaffected_and_an_acknowledgement_or_tls_lets_a_routable_bind_through() {
+        let loopback = SocketAddr::from(([127, 0, 0, 1], 8181));
+        ServerPolicy::resolve(loopback, ServeOptions::default())
+            .expect("loopback never leaves the machine, so neither question applies");
+
+        let addr = SocketAddr::from(([0, 0, 0, 0], 8181));
+        ServerPolicy::resolve(
+            addr,
+            ServeOptions {
+                api_key: Some("secret".to_string()),
+                allow_cleartext_remote: true,
+                ..ServeOptions::default()
+            },
+        )
+        .expect("an operator who says so explicitly is still allowed to");
+
+        let dir = tempfile::tempdir().unwrap();
+        let cert = dir.path().join("cert.pem");
+        let key = dir.path().join("key.pem");
+        std::fs::write(&cert, "certificate-chain").unwrap();
+        std::fs::write(&key, "private-key").unwrap();
+        let tls = ServerPolicy::resolve(
+            addr,
+            ServeOptions {
+                api_key: Some("secret".to_string()),
+                tls_cert: Some(cert),
+                tls_key: Some(key),
+                ..ServeOptions::default()
+            },
+        )
+        .expect("TLS answers the question the acknowledgement only waives");
+        assert!(tls.tls.is_some());
+    }
+
+    #[test]
+    fn the_cleartext_acknowledgement_is_not_a_secret_but_is_still_reported() {
+        let options = ServeOptions {
+            allow_cleartext_remote: true,
+            ..ServeOptions::default()
+        };
+        assert!(format!("{options:?}").contains("allow_cleartext_remote: true"));
     }
 
     #[test]
@@ -650,6 +745,29 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.kind(), ErrorKind::PermissionDenied);
         assert!(error.to_string().contains("--api-key"));
+    }
+
+    #[test]
+    fn lan_chat_surface_obeys_the_remote_cleartext_guard() {
+        let addr = SocketAddr::from(([0, 0, 0, 0], 8181));
+        let options = ServeOptions {
+            api_key: Some("test-key".to_string()),
+            api_surface: ApiSurface::LanChatOnly,
+            ..ServeOptions::default()
+        };
+
+        let error = ServerPolicy::resolve(addr, options.clone()).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("--allow-cleartext-remote"));
+
+        ServerPolicy::resolve(
+            addr,
+            ServeOptions {
+                allow_cleartext_remote: true,
+                ..options
+            },
+        )
+        .expect("LAN Chat has the same explicit cleartext escape hatch as the full API");
     }
 
     #[test]
