@@ -7314,8 +7314,8 @@ pub struct Gemma4CudaResident {
     /// was the remaining prep bottleneck. `None` falls back to the CPU pli compute.
     gpu_ple_ctx: Option<Gemma4PleCtxDev>,
     // Per-owning-layer f16 KV caches ([kv_head][pos][head_dim]); None on shared layers.
-    cache_k: Vec<Option<cudarc::driver::CudaSlice<u16>>>,
-    cache_v: Vec<Option<cudarc::driver::CudaSlice<u16>>>,
+    cache_k: Vec<Option<cudarc::driver::CudaSlice<u8>>>,
+    cache_v: Vec<Option<cudarc::driver::CudaSlice<u8>>>,
     /// Token sequence currently represented in the persistent KV cache (the last request's
     /// prompt + its generated tokens). On the next request the longest matching prefix is
     /// reused, so only the genuinely new tokens are prefilled — this keeps multi-turn TTFT
@@ -7700,8 +7700,8 @@ impl Gemma4CudaResident {
         for p in &plan {
             if p.owns_kv {
                 let n = p.kv_dim * gemma4_kv_capacity(p.window, max_positions);
-                cache_k.push(Some(s.alloc_zeros::<u16>(n).map_err(cu)?));
-                cache_v.push(Some(s.alloc_zeros::<u16>(n).map_err(cu)?));
+                cache_k.push(Some(s.alloc_zeros::<u8>(n * 2).map_err(cu)?));
+                cache_v.push(Some(s.alloc_zeros::<u8>(n * 2).map_err(cu)?));
             } else {
                 cache_k.push(None);
                 cache_v.push(None);

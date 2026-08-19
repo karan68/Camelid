@@ -8680,7 +8680,7 @@ pub(crate) fn launch_kv_scatter_batched(
     s: &Arc<CudaStream>,
     f: &CudaFunction,
     src: &CudaSlice<f32>,
-    cache: &mut CudaSlice<u16>,
+    cache: &mut CudaSlice<u8>,
     base_position: usize,
     n_kv_heads: usize,
     head_dim: usize,
@@ -8771,6 +8771,7 @@ pub(crate) fn launch_attention_batched(
     q_per_token: usize,
     k: usize,
     splitk_active: i32,
+    global_scores: &mut CudaSlice<f32>,
 ) -> Result<(), cudarc::driver::DriverError> {
     // Shared = query (head_dim) + scores (longest prefix = base + k) + weighted-V partials
     // (max_groups * head_dim, the decode-parity G-group reduction scratch).
@@ -8803,7 +8804,8 @@ pub(crate) fn launch_attention_batched(
         .arg(&scale)
         .arg(&qpt)
         .arg(&ki)
-        .arg(&splitk_active);
+        .arg(&splitk_active)
+        .arg(global_scores);
     unsafe { b.launch(cfg) }.map(|_| ())
 }
 
@@ -8903,6 +8905,7 @@ pub(crate) fn launch_attention_tree_batched(
     q_per_token: usize,
     k: usize,
     splitk_active: i32,
+    global_scores: &mut CudaSlice<f32>,
 ) -> Result<(), cudarc::driver::DriverError> {
     // Shared = query (head_dim) + scores (<= base + k) + slot indices (<= base + k) + weighted-V
     // partials (max_groups * head_dim, the decode-parity G-group reduction scratch).
@@ -8939,7 +8942,8 @@ pub(crate) fn launch_attention_tree_batched(
         .arg(&scale)
         .arg(&qpt)
         .arg(&ki)
-        .arg(&splitk_active);
+        .arg(&splitk_active)
+        .arg(global_scores);
     unsafe { b.launch(cfg) }.map(|_| ())
 }
 
@@ -9723,7 +9727,6 @@ pub(crate) fn launch_attention_flash_prefill(
     q_per_token: usize,
     max_pos: usize,
     scale: f32,
-    global_scores: &mut CudaSlice<f32>,
 ) -> Result<(), cudarc::driver::DriverError> {
     // Chunk length = full range every token could attend; per-token causal mask lives in the kernel.
     let position_count = base_position + k_tokens;
@@ -9874,7 +9877,8 @@ pub(crate) fn launch_attention(
         .arg(&hd)
         .arg(position)
         .arg(&mp)
-        .arg(&scale);
+        .arg(&scale)
+        .arg(global_scores);
     unsafe { b.launch(cfg) }.map(|_| ())
 }
 
@@ -9904,6 +9908,7 @@ pub(crate) fn launch_attention_sw(
     max_pos: usize,
     scale: f32,
     window: usize,
+    global_scores: &mut CudaSlice<f32>,
 ) -> Result<(), cudarc::driver::DriverError> {
     let max_groups = (1024 / head_dim as u32).max(1);
     let groups = (shared_positions.max(1) as u32)
@@ -9933,7 +9938,8 @@ pub(crate) fn launch_attention_sw(
         .arg(position)
         .arg(&mp)
         .arg(&scale)
-        .arg(&win);
+        .arg(&win)
+        .arg(global_scores);
     unsafe { b.launch(cfg) }.map(|_| ())
 }
 
