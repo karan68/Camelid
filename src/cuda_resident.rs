@@ -9060,8 +9060,9 @@ pub(crate) fn launch_attention_splitk(
 /// Opt-in via `CAMELID_FLASH_PREFILL=1` (prefill-only, token-parity).
 /// Default is off (retaining bit-identity with serial forward pass).
 fn flash_prefill_enabled() -> bool {
-    std::env::var("CAMELID_FLASH_PREFILL")
-        .is_ok_and(|v| v != "0" && !v.eq_ignore_ascii_case("false") && !v.eq_ignore_ascii_case("off"))
+    std::env::var("CAMELID_FLASH_PREFILL").is_ok_and(|v| {
+        v != "0" && !v.eq_ignore_ascii_case("false") && !v.eq_ignore_ascii_case("off")
+    })
 }
 
 /// Fused Tiled Flash Prefill Attention (online softmax).
@@ -13716,7 +13717,11 @@ impl CudaResidentDecode {
             vgate: af(mk * ffn_dim)?,
             vup: af(mk * ffn_dim)?,
             vact: af(mk * ffn_dim)?,
-            vlogits: if include_logits { af(mk * vocab)? } else { af(1)? },
+            vlogits: if include_logits {
+                af(mk * vocab)?
+            } else {
+                af(1)?
+            },
             vsamp: if include_logits {
                 st.alloc_zeros::<u32>(mk)
                     .map_err(|e| format!("verify alloc: {e}"))?
@@ -13998,7 +14003,11 @@ impl CudaResidentDecode {
                         k,
                     )
                     .map_err(map)?;
-                    if flash_ok && flash_prefill_enabled() && q_width == n_heads * head_dim && head_dim <= 256 {
+                    if flash_ok
+                        && flash_prefill_enabled()
+                        && q_width == n_heads * head_dim
+                        && head_dim <= 256
+                    {
                         launch_attention_flash_prefill(
                             &s,
                             &self.k,

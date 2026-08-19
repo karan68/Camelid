@@ -6799,7 +6799,10 @@ fn flash_attention_prefill_tiled_parity() {
         let scale = 1.0 / (head_dim as f32).sqrt();
         for &base_position in &base_positions {
             for &k_tokens in &k_tokens_list {
-                let mut rng = Lcg(0xCA_FE_12_34 + (head_dim as u64) * 1000 + (base_position as u64) + (k_tokens as u64));
+                let mut rng = Lcg(0xCA_FE_12_34
+                    + (head_dim as u64) * 1000
+                    + (base_position as u64)
+                    + (k_tokens as u64));
                 let q: Vec<f32> = (0..k_tokens * n_heads * head_dim)
                     .map(|_| rng.next_f32() * 2.0 - 1.0)
                     .collect();
@@ -6868,7 +6871,8 @@ fn flash_attention_prefill_tiled_parity() {
                             let k_offset = (kv_h * max_pos + p) * head_dim;
                             let mut dot = 0.0f32;
                             for d in 0..head_dim {
-                                let k_val = crate::inference::f16_bits_to_f32(cache_k_bits[k_offset + d]);
+                                let k_val =
+                                    crate::inference::f16_bits_to_f32(cache_k_bits[k_offset + d]);
                                 dot += q_slice[d] * k_val;
                             }
                             scores.push(dot * scale);
@@ -6876,7 +6880,8 @@ fn flash_attention_prefill_tiled_parity() {
 
                         // Softmax
                         let max_s = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                        let exp_scores: Vec<f32> = scores.iter().map(|&s| (s - max_s).exp()).collect();
+                        let exp_scores: Vec<f32> =
+                            scores.iter().map(|&s| (s - max_s).exp()).collect();
                         let sum_exp: f32 = exp_scores.iter().sum();
                         let inv_sum = 1.0 / sum_exp;
 
@@ -6884,9 +6889,12 @@ fn flash_attention_prefill_tiled_parity() {
                         let out_offset = (t * n_heads + h) * head_dim;
                         for d in 0..head_dim {
                             let mut acc = 0.0f32;
-                            for (p, &exp_score) in exp_scores.iter().enumerate().take(global_q_pos + 1) {
+                            for (p, &exp_score) in
+                                exp_scores.iter().enumerate().take(global_q_pos + 1)
+                            {
                                 let v_offset = (kv_h * max_pos + p) * head_dim;
-                                let v_val = crate::inference::f16_bits_to_f32(cache_v_bits[v_offset + d]);
+                                let v_val =
+                                    crate::inference::f16_bits_to_f32(cache_v_bits[v_offset + d]);
                                 acc += exp_score * v_val;
                             }
                             expected[out_offset + d] = acc * inv_sum;
