@@ -9087,9 +9087,7 @@ pub(crate) fn launch_attention_flash_prefill(
 ) -> Result<(), cudarc::driver::DriverError> {
     const FLASH_PREFILL_BQ: usize = 16;
     const FLASH_PREFILL_BK: usize = 32;
-    if head_dim > 256 {
-        return Err(cudarc::driver::DriverError::InvalidValue);
-    }
+    assert!(head_dim <= 256, "flash prefill requires head_dim <= 256");
     let q_tiles = (k_tokens as u32).div_ceil(FLASH_PREFILL_BQ as u32);
     let block: u32 = 256;
     let shared_mem_bytes = (FLASH_PREFILL_BQ * head_dim * 4
