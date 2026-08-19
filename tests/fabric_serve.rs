@@ -1044,6 +1044,193 @@ async fn a_client_can_pin_a_node_even_when_the_proxy_defaults_to_throughput() {
     assert_eq!(header(&headers, "x-camelid-fabric-node"), Some("alpha"));
 }
 
+/// How long a change to the node file is given to take effect before the test
+/// calls it broken. Generous against the one-second re-read the proxy ships
+/// with, so a loaded machine does not fail this for being slow.
+const NODE_RELOAD_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn node_file(dir: &tempfile::TempDir, lines: &[String]) -> std::path::PathBuf {
+    let path = dir.path().join("nodes");
+    std::fs::write(&path, format!("{}\n", lines.join("\n"))).expect("write node file");
+    path
+}
+
+/// The line an operator would write for this stub, in `--node` syntax.
+fn node_line(node: &StubNode, label: &str) -> String {
+    let spec = node.spec(label);
+    format!("{}={}:{}", spec.label, spec.host, spec.port)
+}
+
+/// A proxy whose node set is a file, exactly as `fabric serve --nodes-file`
+/// builds one — including the shipped one-second re-read, not a test-only bound.
+fn fabric_watching(path: std::path::PathBuf) -> Fabric {
+    Fabric::from_node_file(path)
+        .expect("load node file")
+        .with_timeout(PROBE_TIMEOUT)
+}
+
+/// A machine the operator adds is placed on, without the proxy restarting.
+///
+/// Affinity is the instrument: both nodes serve the same model and `alpha`
+/// sorts first, so only an explicit pin can prove `beta` is in the set at all.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_machine_added_to_the_node_file_starts_being_placed_on() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let nodes = [
+        StubNode::start(StubConfig::ready("shared-model", 0)),
+        StubNode::start(StubConfig::ready("shared-model", 0)),
+    ];
+    let path = node_file(&dir, &[node_line(&nodes[0], "alpha")]);
+    let addr = start_proxy(fabric_watching(path.clone()), RouteMode::Affinity).await;
+    let body = serde_json::json!({ "model": "shared-model" });
+    let sticky = [("x-camelid-fabric-sticky", "beta")];
+
+    // beta is not in the set yet, so the pin cannot be honoured.
+    let (status, answered, headers) = post_chat(addr, &body, &sticky).await;
+    assert_eq!(status, 200, "{answered}");
+    assert_eq!(header(&headers, "x-camelid-fabric-node"), Some("alpha"));
+    assert_eq!(
+        completions_served(&nodes)[1],
+        0,
+        "a machine that is not in the node file must never be placed on"
+    );
+
+    std::fs::write(
+        &path,
+        format!(
+            "{}\n{}\n",
+            node_line(&nodes[0], "alpha"),
+            node_line(&nodes[1], "beta")
+        ),
+    )
+    .expect("add beta");
+
+    let started = Instant::now();
+    loop {
+        let (status, answered, headers) = post_chat(addr, &body, &sticky).await;
+        assert_eq!(status, 200, "{answered}");
+        if header(&headers, "x-camelid-fabric-node") == Some("beta") {
+            break;
+        }
+        assert!(
+            started.elapsed() < NODE_RELOAD_TIMEOUT,
+            "a machine added to the node file was still not placed on after {:?}",
+            started.elapsed()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        completions_served(&nodes)[1] > 0,
+        "the added machine served nothing"
+    );
+}
+
+/// A machine the operator takes away stops being placed on, and the rest of
+/// the fabric goes on serving.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_machine_removed_from_the_node_file_stops_being_placed_on() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let nodes = [
+        StubNode::start(StubConfig::ready("shared-model", 0)),
+        StubNode::start(StubConfig::ready("shared-model", 0)),
+    ];
+    let path = node_file(
+        &dir,
+        &[node_line(&nodes[0], "alpha"), node_line(&nodes[1], "beta")],
+    );
+    let addr = start_proxy(fabric_watching(path.clone()), RouteMode::Affinity).await;
+    let body = serde_json::json!({ "model": "shared-model" });
+    let sticky = [("x-camelid-fabric-sticky", "beta")];
+
+    let (status, answered, headers) = post_chat(addr, &body, &sticky).await;
+    assert_eq!(status, 200, "{answered}");
+    assert_eq!(header(&headers, "x-camelid-fabric-node"), Some("beta"));
+
+    std::fs::write(&path, format!("{}\n", node_line(&nodes[0], "alpha"))).expect("remove beta");
+
+    let started = Instant::now();
+    loop {
+        let (status, answered, headers) = post_chat(addr, &body, &sticky).await;
+        assert_eq!(status, 200, "{answered}");
+        if header(&headers, "x-camelid-fabric-node") == Some("alpha") {
+            break;
+        }
+        assert!(
+            started.elapsed() < NODE_RELOAD_TIMEOUT,
+            "a machine removed from the node file was still placed on after {:?}",
+            started.elapsed()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Settled: from here the removed machine must receive nothing more, and
+    // the one that is left must still be served.
+    let settled = completions_served(&nodes)[1];
+    let (status, answered, headers) = post_chat(addr, &body, &sticky).await;
+    assert_eq!(status, 200, "{answered}");
+    assert_eq!(header(&headers, "x-camelid-fabric-node"), Some("alpha"));
+    assert_eq!(
+        completions_served(&nodes)[1],
+        settled,
+        "a removed machine was still placed on"
+    );
+}
+
+/// Taking a machine away must not disturb the request already running on it.
+///
+/// The generation outlives the re-read interval on purpose: the second request
+/// proves the removal has actually taken effect while the first is still in
+/// flight, which is the only way this test can claim anything.
+#[tokio::test(flavor = "multi_thread")]
+async fn removing_a_machine_does_not_disturb_the_request_already_running_on_it() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let nodes = [
+        StubNode::start(StubConfig::ready("shared-model", 0)),
+        StubNode::start(StubConfig {
+            completion_delay: Duration::from_millis(2500),
+            ..StubConfig::ready("shared-model", 0)
+        }),
+    ];
+    let path = node_file(
+        &dir,
+        &[node_line(&nodes[0], "alpha"), node_line(&nodes[1], "beta")],
+    );
+    let addr = start_proxy(fabric_watching(path.clone()), RouteMode::Affinity).await;
+
+    let in_flight = tokio::spawn(async move {
+        let body = serde_json::json!({ "model": "shared-model" });
+        post_chat(addr, &body, &[("x-camelid-fabric-sticky", "beta")]).await
+    });
+
+    // Long enough for the request to be placed on beta and forwarded.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    std::fs::write(&path, format!("{}\n", node_line(&nodes[0], "alpha"))).expect("remove beta");
+
+    let body = serde_json::json!({ "model": "shared-model" });
+    let sticky = [("x-camelid-fabric-sticky", "beta")];
+    let started = Instant::now();
+    loop {
+        let (status, answered, headers) = post_chat(addr, &body, &sticky).await;
+        assert_eq!(status, 200, "{answered}");
+        if header(&headers, "x-camelid-fabric-node") == Some("alpha") {
+            break;
+        }
+        assert!(
+            started.elapsed() < NODE_RELOAD_TIMEOUT,
+            "the removal never took effect, so this proves nothing"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let (status, answered, headers) = in_flight.await.expect("the in-flight request panicked");
+    assert_eq!(status, 200, "{answered}");
+    assert_eq!(
+        header(&headers, "x-camelid-fabric-node"),
+        Some("beta"),
+        "a request already running on a removed machine must still be answered by it"
+    );
+}
+
 /// The load-bearing property: the proxy must relay events as they are produced.
 /// If it buffered the body and released it at the end, every piece would arrive
 /// at once, after the whole generation.

@@ -1175,8 +1175,21 @@ enum FabricAction {
     /// default and refuses a routable address unless the exposure is
     /// acknowledged explicitly.
     Serve {
-        #[arg(long = "node", required = true, value_name = "LABEL=HOST[:PORT]")]
+        #[arg(
+            long = "node",
+            required_unless_present = "nodes_file",
+            conflicts_with = "nodes_file",
+            value_name = "LABEL=HOST[:PORT]"
+        )]
         nodes: Vec<String>,
+        /// Read the nodes from a file instead, one `LABEL=HOST[:PORT]` per
+        /// line, and re-read it as it changes.
+        ///
+        /// Blank lines and whole-line `#` comments are ignored. Editing the
+        /// file adds or removes a machine without restarting the proxy, so
+        /// doing so does not drop the requests already in flight.
+        #[arg(long, value_name = "PATH")]
+        nodes_file: Option<PathBuf>,
         #[arg(long, default_value = "127.0.0.1:8282")]
         addr: SocketAddr,
         /// Default placement mode; a client can still request affinity to a
@@ -1385,6 +1398,38 @@ mod fabric_command_tests {
             ] {
                 Cli::try_parse_from(&argv).unwrap_or_else(|_| panic!("{argv:?} must parse"));
             }
+        });
+    }
+
+    /// The node set has one source. Allowing both would leave "which machines
+    /// am I actually placing on" with two answers, and the file is the one
+    /// that can change underneath.
+    #[test]
+    fn the_nodes_come_from_a_file_or_from_flags_but_never_both() {
+        on_cli_test_stack(|| {
+            Cli::try_parse_from([
+                "camelid",
+                "fabric",
+                "serve",
+                "--node",
+                "a=127.0.0.1",
+                "--nodes-file",
+                "nodes.txt",
+            ])
+            .expect_err("--node with --nodes-file was accepted");
+
+            // Either alone parses, so the guard is the combination — and
+            // --node is no longer required now that a file can supply them.
+            for argv in [
+                vec!["camelid", "fabric", "serve", "--node", "a=127.0.0.1"],
+                vec!["camelid", "fabric", "serve", "--nodes-file", "nodes.txt"],
+            ] {
+                Cli::try_parse_from(&argv).unwrap_or_else(|_| panic!("{argv:?} must parse"));
+            }
+
+            // Neither is still a refusal: a proxy with no nodes serves nothing.
+            Cli::try_parse_from(["camelid", "fabric", "serve"])
+                .expect_err("serve with no nodes at all was accepted");
         });
     }
 }
@@ -3063,6 +3108,7 @@ async fn main() -> anyhow::Result<()> {
             }
             FabricAction::Serve {
                 nodes,
+                nodes_file,
                 addr,
                 mode,
                 bearer,
@@ -3089,15 +3135,19 @@ async fn main() -> anyhow::Result<()> {
                 // must not arrive after the operator has been told the proxy is
                 // listening on an https address.
                 let tls = camelid::fabric::server::ProxyTls::resolve(tls_cert, tls_key).await?;
-                let specs = camelid::fabric::parse_fabric(&nodes)
-                    .map_err(|error| anyhow::anyhow!("{error}"))?;
-                let fabric = camelid::fabric::Fabric::new(specs)
-                    .with_timeout(std::time::Duration::from_millis(timeout_ms))
-                    .with_bearer(bearer.as_deref())
-                    .with_max_observation_age(std::time::Duration::from_millis(
-                        observation_max_age_ms,
-                    ))
-                    .with_max_forward_attempts(max_forward_attempts);
+                // Same reason: a node file that cannot be read is a refusal,
+                // and it has to arrive before the listening line.
+                let fabric = match nodes_file {
+                    Some(path) => camelid::fabric::Fabric::from_node_file(path)?,
+                    None => camelid::fabric::Fabric::new(
+                        camelid::fabric::parse_fabric(&nodes)
+                            .map_err(|error| anyhow::anyhow!("{error}"))?,
+                    ),
+                }
+                .with_timeout(std::time::Duration::from_millis(timeout_ms))
+                .with_bearer(bearer.as_deref())
+                .with_max_observation_age(std::time::Duration::from_millis(observation_max_age_ms))
+                .with_max_forward_attempts(max_forward_attempts);
 
                 // Bind before announcing, so a refused or already-taken address
                 // never prints a listening line it did not earn.
@@ -3122,6 +3172,15 @@ async fn main() -> anyhow::Result<()> {
                         "serving {} named clients; editing the key file revokes \
                          a client without a restart",
                         auth.client_count()
+                    );
+                }
+                // The startup report below names the nodes, but not that the
+                // set can still change — which is the one thing an operator
+                // cannot tell by looking at it.
+                if fabric.is_reloadable() {
+                    println!(
+                        "watching the node file; editing it adds or removes a \
+                         machine without a restart"
                     );
                 }
                 // Nothing is being served yet, so this probe costs no request, and
