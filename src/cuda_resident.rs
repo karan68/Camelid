@@ -4773,14 +4773,181 @@ extern "C" __global__ void attn_sk_combine(
 
 // ---- Fused Tiled Flash Prefill Attention with Online Softmax ----------------
 // Dynamic chunked flash prefill for prompt ingestion (1..=256+ tokens).
-// Tiled across query blocks (B_Q = 16) and key blocks (B_K = 32) entirely in shared
-// memory and registers. Maintains running online softmax max (m) and sum-exp (l)
-// without writing intermediate score matrices to DRAM (0 bytes DRAM scratch overhead,
-// O(N) memory bandwidth). Replaces 3-pass split-K with a single fused kernel pass.
+// Tiled across query blocks (B_Q = 16) and key blocks (B_K = 32) in shared memory and registers.
+// Maintains running online softmax max (m) and sum-exp (l) with per-tile rescaling,
+// computing causal attention in a single fused kernel pass with 0 bytes intermediate DRAM scratch
+// and fully unrolled register accumulation for standard head dimensions (64, 128, 256).
 #define FLASH_PREFILL_BQ 16
 #define FLASH_PREFILL_BK 32
 
-extern "C" __global__ void flash_attention_prefill_tiled(
+template<int HEAD_DIM>
+__device__ void flash_attention_prefill_tiled_impl(
+    const float* __restrict__ q,
+    const unsigned short* __restrict__ cache_k,
+    const unsigned short* __restrict__ cache_v,
+    float* __restrict__ out,
+    int n_heads,
+    int n_kv_heads,
+    int base_position,
+    int k_tokens,
+    int q_per_token,
+    int max_pos,
+    float scale
+) {
+    constexpr int D_STEPS = HEAD_DIM / 32;
+
+    int head = blockIdx.x;
+    int q_tile = blockIdx.y;
+    if (head >= n_heads) return;
+
+    int t_start = q_tile * FLASH_PREFILL_BQ;
+    if (t_start >= k_tokens) return;
+    int t_count = k_tokens - t_start;
+    if (t_count > FLASH_PREFILL_BQ) t_count = FLASH_PREFILL_BQ;
+
+    int repeats = n_heads / n_kv_heads;
+    int kv_head = head / repeats;
+    const unsigned short* kbase = cache_k + (long)kv_head * max_pos * HEAD_DIM;
+    const unsigned short* vbase = cache_v + (long)kv_head * max_pos * HEAD_DIM;
+
+    extern __shared__ char smem_raw[];
+    float* q_smem = reinterpret_cast<float*>(smem_raw);
+    unsigned short* k_smem = reinterpret_cast<unsigned short*>(q_smem + FLASH_PREFILL_BQ * HEAD_DIM);
+    unsigned short* v_smem = k_smem + FLASH_PREFILL_BK * HEAD_DIM;
+
+    int tid = threadIdx.x;
+    int num_threads = blockDim.x; // 256 threads = 8 warps
+
+    // 1. Collaboratively load Q tile into shared memory
+    for (int i = tid; i < t_count * HEAD_DIM; i += num_threads) {
+        int t = i / HEAD_DIM;
+        int d = i % HEAD_DIM;
+        q_smem[t * HEAD_DIM + d] = q[(long)(t_start + t) * q_per_token + (long)head * HEAD_DIM + d];
+    }
+    __syncthreads();
+
+    // 2. Warp-level query assignment:
+    // With 8 warps (blockDim.x = 256):
+    // Warp w in [0, 8) handles queries qi = 2*w and qi = 2*w + 1
+    int warp_id = tid >> 5;
+    int lane_id = tid & 31;
+    int q_local[2] = { warp_id * 2, warp_id * 2 + 1 };
+
+    float m_state[2] = { -3.4e38f, -3.4e38f };
+    float l_state[2] = { 0.0f, 0.0f };
+
+    float o_acc[2][D_STEPS];
+    #pragma unroll
+    for (int qi = 0; qi < 2; qi++) {
+        #pragma unroll
+        for (int di = 0; di < D_STEPS; di++) {
+            o_acc[qi][di] = 0.0f;
+        }
+    }
+
+    int max_p_tile = base_position + t_start + t_count;
+
+    // 3. Tile over keys and values in blocks of FLASH_PREFILL_BK (32)
+    for (int kp0 = 0; kp0 < max_p_tile; kp0 += FLASH_PREFILL_BK) {
+        int k_count = max_p_tile - kp0;
+        if (k_count > FLASH_PREFILL_BK) k_count = FLASH_PREFILL_BK;
+
+        for (int i = tid; i < k_count * HEAD_DIM; i += num_threads) {
+            int p_idx = i / HEAD_DIM;
+            int d = i % HEAD_DIM;
+            int global_p = kp0 + p_idx;
+            k_smem[p_idx * HEAD_DIM + d] = kbase[(long)global_p * HEAD_DIM + d];
+            v_smem[p_idx * HEAD_DIM + d] = vbase[(long)global_p * HEAD_DIM + d];
+        }
+        __syncthreads();
+
+        #pragma unroll
+        for (int qi = 0; qi < 2; qi++) {
+            int q_idx = q_local[qi];
+            if (q_idx < t_count) {
+                int global_q_pos = base_position + t_start + q_idx;
+                if (kp0 <= global_q_pos) {
+                    float tile_scores[FLASH_PREFILL_BK];
+                    float tile_m = -3.4e38f;
+
+                    #pragma unroll
+                    for (int p_idx = 0; p_idx < FLASH_PREFILL_BK; p_idx++) {
+                        if (p_idx < k_count && (kp0 + p_idx) <= global_q_pos) {
+                            float pdot = 0.0f;
+                            #pragma unroll
+                            for (int di = 0; di < D_STEPS; di++) {
+                                int d = lane_id + di * 32;
+                                float q_val = q_smem[q_idx * HEAD_DIM + d];
+                                float k_val = f16_bits_to_f32(k_smem[p_idx * HEAD_DIM + d]);
+                                pdot += q_val * k_val;
+                            }
+
+                            #pragma unroll
+                            for (int mask = 16; mask > 0; mask >>= 1) {
+                                pdot += __shfl_xor_sync(0xffffffffu, pdot, mask);
+                            }
+
+                            float score = pdot * scale;
+                            tile_scores[p_idx] = score;
+                            tile_m = fmaxf(tile_m, score);
+                        } else {
+                            tile_scores[p_idx] = -3.4e38f;
+                        }
+                    }
+
+                    if (tile_m > -3.0e38f) {
+                        float m_prev = m_state[qi];
+                        float m_curr = fmaxf(m_prev, tile_m);
+                        float alpha = expf(m_prev - m_curr);
+
+                        l_state[qi] = l_state[qi] * alpha;
+                        #pragma unroll
+                        for (int di = 0; di < D_STEPS; di++) {
+                            o_acc[qi][di] = o_acc[qi][di] * alpha;
+                        }
+
+                        float tile_l = 0.0f;
+                        #pragma unroll
+                        for (int p_idx = 0; p_idx < FLASH_PREFILL_BK; p_idx++) {
+                            if (p_idx < k_count && (kp0 + p_idx) <= global_q_pos) {
+                                float weight = expf(tile_scores[p_idx] - m_curr);
+                                tile_l += weight;
+                                #pragma unroll
+                                for (int di = 0; di < D_STEPS; di++) {
+                                    int d = lane_id + di * 32;
+                                    float v_val = f16_bits_to_f32(v_smem[p_idx * HEAD_DIM + d]);
+                                    o_acc[qi][di] += weight * v_val;
+                                }
+                            }
+                        }
+
+                        l_state[qi] += tile_l;
+                        m_state[qi] = m_curr;
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    // 4. Write normalized output to global memory
+    #pragma unroll
+    for (int qi = 0; qi < 2; qi++) {
+        int q_idx = q_local[qi];
+        if (q_idx < t_count) {
+            float inv_l = (l_state[qi] > 0.0f) ? (1.0f / l_state[qi]) : 0.0f;
+            int global_t = t_start + q_idx;
+            #pragma unroll
+            for (int di = 0; di < D_STEPS; di++) {
+                int d = lane_id + di * 32;
+                out[(long)global_t * q_per_token + (long)head * HEAD_DIM + d] = o_acc[qi][di] * inv_l;
+            }
+        }
+    }
+}
+
+template<int MAX_D_STEPS = 8>
+__device__ void flash_attention_prefill_tiled_dynamic(
     const float* __restrict__ q,
     const unsigned short* __restrict__ cache_k,
     const unsigned short* __restrict__ cache_v,
@@ -4794,6 +4961,9 @@ extern "C" __global__ void flash_attention_prefill_tiled(
     int max_pos,
     float scale
 ) {
+    int d_steps = (head_dim + 31) / 32;
+    if (d_steps > MAX_D_STEPS) d_steps = MAX_D_STEPS;
+
     int head = blockIdx.x;
     int q_tile = blockIdx.y;
     if (head >= n_heads) return;
@@ -4814,22 +4984,15 @@ extern "C" __global__ void flash_attention_prefill_tiled(
     unsigned short* v_smem = k_smem + FLASH_PREFILL_BK * head_dim;
 
     int tid = threadIdx.x;
-    int num_threads = blockDim.x; // 256 threads = 8 warps
+    int num_threads = blockDim.x;
 
-    // 1. Collaboratively load Q tile into shared memory
     for (int i = tid; i < t_count * head_dim; i += num_threads) {
         int t = i / head_dim;
         int d = i % head_dim;
         q_smem[t * head_dim + d] = q[(long)(t_start + t) * q_per_token + (long)head * head_dim + d];
     }
-    for (int i = t_count * head_dim + tid; i < FLASH_PREFILL_BQ * head_dim; i += num_threads) {
-        q_smem[i] = 0.0f;
-    }
     __syncthreads();
 
-    // 2. Warp-level query assignment:
-    // With 8 warps (blockDim.x = 256):
-    // Warp w in [0, 8) handles queries qi = 2*w and qi = 2*w + 1
     int warp_id = tid >> 5;
     int lane_id = tid & 31;
     int q_local[2] = { warp_id * 2, warp_id * 2 + 1 };
@@ -4837,18 +5000,17 @@ extern "C" __global__ void flash_attention_prefill_tiled(
     float m_state[2] = { -3.4e38f, -3.4e38f };
     float l_state[2] = { 0.0f, 0.0f };
 
-    float o_acc[2][8];
+    float o_acc[2][MAX_D_STEPS];
     #pragma unroll
     for (int qi = 0; qi < 2; qi++) {
         #pragma unroll
-        for (int di = 0; di < 8; di++) {
+        for (int di = 0; di < MAX_D_STEPS; di++) {
             o_acc[qi][di] = 0.0f;
         }
     }
 
     int max_p_tile = base_position + t_start + t_count;
 
-    // 3. Tile over keys and values in blocks of FLASH_PREFILL_BK (32)
     for (int kp0 = 0; kp0 < max_p_tile; kp0 += FLASH_PREFILL_BK) {
         int k_count = max_p_tile - kp0;
         if (k_count > FLASH_PREFILL_BK) k_count = FLASH_PREFILL_BK;
@@ -4862,42 +5024,66 @@ extern "C" __global__ void flash_attention_prefill_tiled(
         }
         __syncthreads();
 
-        for (int p_idx = 0; p_idx < k_count; p_idx++) {
-            int global_p = kp0 + p_idx;
+        for (int qi = 0; qi < 2; qi++) {
+            int q_idx = q_local[qi];
+            if (q_idx < t_count) {
+                int global_q_pos = base_position + t_start + q_idx;
+                if (kp0 <= global_q_pos) {
+                    float tile_scores[FLASH_PREFILL_BK];
+                    float tile_m = -3.4e38f;
 
-            #pragma unroll
-            for (int qi = 0; qi < 2; qi++) {
-                int q_idx = q_local[qi];
-                if (q_idx < t_count) {
-                    int global_q_pos = base_position + t_start + q_idx;
-                    if (global_p <= global_q_pos) {
-                        float pdot = 0.0f;
-                        for (int d = lane_id; d < head_dim; d += 32) {
-                            float q_val = q_smem[q_idx * head_dim + d];
-                            float k_val = f16_bits_to_f32(k_smem[p_idx * head_dim + d]);
-                            pdot += q_val * k_val;
+                    for (int p_idx = 0; p_idx < FLASH_PREFILL_BK; p_idx++) {
+                        if (p_idx < k_count && (kp0 + p_idx) <= global_q_pos) {
+                            float pdot = 0.0f;
+                            for (int di = 0; di < d_steps; di++) {
+                                int d = lane_id + di * 32;
+                                if (d < head_dim) {
+                                    float q_val = q_smem[q_idx * head_dim + d];
+                                    float k_val = f16_bits_to_f32(k_smem[p_idx * head_dim + d]);
+                                    pdot += q_val * k_val;
+                                }
+                            }
+
+                            #pragma unroll
+                            for (int mask = 16; mask > 0; mask >>= 1) {
+                                pdot += __shfl_xor_sync(0xffffffffu, pdot, mask);
+                            }
+
+                            float score = pdot * scale;
+                            tile_scores[p_idx] = score;
+                            tile_m = fmaxf(tile_m, score);
+                        } else {
+                            tile_scores[p_idx] = -3.4e38f;
                         }
+                    }
 
-                        #pragma unroll
-                        for (int mask = 16; mask > 0; mask >>= 1) {
-                            pdot += __shfl_xor_sync(0xffffffffu, pdot, mask);
-                        }
-
-                        float score = pdot * scale;
-
+                    if (tile_m > -3.0e38f) {
                         float m_prev = m_state[qi];
-                        float m_curr = fmaxf(m_prev, score);
+                        float m_curr = fmaxf(m_prev, tile_m);
                         float alpha = expf(m_prev - m_curr);
-                        float beta = expf(score - m_curr);
 
-                        l_state[qi] = l_state[qi] * alpha + beta;
-                        m_state[qi] = m_curr;
-
-                        int di_idx = 0;
-                        for (int d = lane_id; d < head_dim; d += 32, di_idx++) {
-                            float v_val = f16_bits_to_f32(v_smem[p_idx * head_dim + d]);
-                            o_acc[qi][di_idx] = o_acc[qi][di_idx] * alpha + beta * v_val;
+                        l_state[qi] = l_state[qi] * alpha;
+                        for (int di = 0; di < d_steps; di++) {
+                            o_acc[qi][di] = o_acc[qi][di] * alpha;
                         }
+
+                        float tile_l = 0.0f;
+                        for (int p_idx = 0; p_idx < FLASH_PREFILL_BK; p_idx++) {
+                            if (p_idx < k_count && (kp0 + p_idx) <= global_q_pos) {
+                                float weight = expf(tile_scores[p_idx] - m_curr);
+                                tile_l += weight;
+                                for (int di = 0; di < d_steps; di++) {
+                                    int d = lane_id + di * 32;
+                                    if (d < head_dim) {
+                                        float v_val = f16_bits_to_f32(v_smem[p_idx * head_dim + d]);
+                                        o_acc[qi][di] += weight * v_val;
+                                    }
+                                }
+                            }
+                        }
+
+                        l_state[qi] += tile_l;
+                        m_state[qi] = m_curr;
                     }
                 }
             }
@@ -4905,18 +5091,43 @@ extern "C" __global__ void flash_attention_prefill_tiled(
         __syncthreads();
     }
 
-    // 4. Write normalized output to global memory
-    #pragma unroll
     for (int qi = 0; qi < 2; qi++) {
         int q_idx = q_local[qi];
         if (q_idx < t_count) {
             float inv_l = (l_state[qi] > 0.0f) ? (1.0f / l_state[qi]) : 0.0f;
             int global_t = t_start + q_idx;
-            int di_idx = 0;
-            for (int d = lane_id; d < head_dim; d += 32, di_idx++) {
-                out[(long)global_t * q_per_token + (long)head * head_dim + d] = o_acc[qi][di_idx] * inv_l;
+            for (int di = 0; di < d_steps; di++) {
+                int d = lane_id + di * 32;
+                if (d < head_dim) {
+                    out[(long)global_t * q_per_token + (long)head * head_dim + d] = o_acc[qi][di] * inv_l;
+                }
             }
         }
+    }
+}
+
+extern "C" __global__ void flash_attention_prefill_tiled(
+    const float* __restrict__ q,
+    const unsigned short* __restrict__ cache_k,
+    const unsigned short* __restrict__ cache_v,
+    float* __restrict__ out,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int base_position,
+    int k_tokens,
+    int q_per_token,
+    int max_pos,
+    float scale
+) {
+    if (head_dim == 128) {
+        flash_attention_prefill_tiled_impl<128>(q, cache_k, cache_v, out, n_heads, n_kv_heads, base_position, k_tokens, q_per_token, max_pos, scale);
+    } else if (head_dim == 64) {
+        flash_attention_prefill_tiled_impl<64>(q, cache_k, cache_v, out, n_heads, n_kv_heads, base_position, k_tokens, q_per_token, max_pos, scale);
+    } else if (head_dim == 256) {
+        flash_attention_prefill_tiled_impl<256>(q, cache_k, cache_v, out, n_heads, n_kv_heads, base_position, k_tokens, q_per_token, max_pos, scale);
+    } else if (head_dim <= 256) {
+        flash_attention_prefill_tiled_dynamic(q, cache_k, cache_v, out, n_heads, n_kv_heads, head_dim, base_position, k_tokens, q_per_token, max_pos, scale);
     }
 }
 
@@ -8845,10 +9056,12 @@ pub(crate) fn launch_attention_splitk(
     Ok(())
 }
 
+/// Whether flash prefill attention is enabled.
+/// Opt-in via `CAMELID_FLASH_PREFILL=1` (prefill-only, token-parity).
+/// Default is off (retaining bit-identity with serial forward pass).
 fn flash_prefill_enabled() -> bool {
     std::env::var("CAMELID_FLASH_PREFILL")
-        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false") && !v.eq_ignore_ascii_case("off"))
-        .unwrap_or(true)
+        .is_ok_and(|v| v != "0" && !v.eq_ignore_ascii_case("false") && !v.eq_ignore_ascii_case("off"))
 }
 
 /// Fused Tiled Flash Prefill Attention (online softmax).
@@ -8873,6 +9086,9 @@ pub(crate) fn launch_attention_flash_prefill(
 ) -> Result<(), cudarc::driver::DriverError> {
     const FLASH_PREFILL_BQ: usize = 16;
     const FLASH_PREFILL_BK: usize = 32;
+    if head_dim > 256 {
+        return Err(cudarc::driver::DriverError::InvalidValue);
+    }
     let q_tiles = (k_tokens as u32).div_ceil(FLASH_PREFILL_BQ as u32);
     let block: u32 = 256;
     let shared_mem_bytes = (FLASH_PREFILL_BQ * head_dim * 4
@@ -10882,6 +11098,9 @@ impl CudaResidentDecode {
             .unwrap_or(1)
     }
 
+    /// Maximum token batch size for prompt prefill.
+    /// Overridable via `CAMELID_CUDA_PREFILL_BATCH_TOKENS=1..=256`.
+    /// When unset, caps chunk size to balance shared memory occupancy and GEMM efficiency.
     fn batched_prefill_token_cap(&self) -> usize {
         if let Ok(v) = std::env::var("CAMELID_CUDA_PREFILL_BATCH_TOKENS") {
             if let Ok(k) = v.parse::<usize>() {
@@ -10912,8 +11131,11 @@ impl CudaResidentDecode {
         }
         let max_cols = self.hidden.max(self.q_width).max(self.ffn_dim);
         let max_bpr = max_cols / 32;
-        let max_k = (46 * 1024) / (max_bpr * 4).max(1);
-        max_k.clamp(1, 32)
+        // Ensure at least 4 warps per block (128 threads) for healthy GEMM occupancy
+        // within the 46 KiB shared memory budget.
+        const TARGET_WARPS: usize = 4;
+        let max_k = (46 * 1024) / (TARGET_WARPS * max_bpr * 4).max(1);
+        max_k.clamp(1, 16)
     }
 
     fn batched_verify_token_cap(&self) -> usize {
@@ -13441,14 +13663,18 @@ impl CudaResidentDecode {
         if self.prefill_scratch.is_some() {
             return Ok(());
         }
-        self.prefill_scratch = Some(self.alloc_verify_scratch(cap)?);
+        self.prefill_scratch = Some(self.alloc_scratch(cap, false)?);
         Ok(())
     }
 
     /// Allocate a `VerifyScratch` sized to `cap` rows (`cap * dim`). Used by the
-    /// linear verify (`cap = MAX_VERIFY_K`) and the tree verify (`cap =
-    /// TREE_MAX_NODES`); the buffers are dimensionally identical, only wider.
+    /// linear verify (`cap = MAX_VERIFY_K`), tree verify (`cap = TREE_MAX_NODES`),
+    /// and prompt prefill (`cap = batch_cap`).
     fn alloc_verify_scratch(&self, cap: usize) -> Result<VerifyScratch, String> {
+        self.alloc_scratch(cap, true)
+    }
+
+    fn alloc_scratch(&self, cap: usize, include_logits: bool) -> Result<VerifyScratch, String> {
         let (hidden, q_width, kv_width, ffn_dim, vocab) = (
             self.hidden,
             self.q_width,
@@ -13490,26 +13716,34 @@ impl CudaResidentDecode {
             vgate: af(mk * ffn_dim)?,
             vup: af(mk * ffn_dim)?,
             vact: af(mk * ffn_dim)?,
-            vlogits: af(mk * vocab)?,
-            vsamp: st
-                .alloc_zeros::<u32>(mk)
-                .map_err(|e| format!("verify alloc: {e}"))?,
+            vlogits: if include_logits { af(mk * vocab)? } else { af(1)? },
+            vsamp: if include_logits {
+                st.alloc_zeros::<u32>(mk)
+                    .map_err(|e| format!("verify alloc: {e}"))?
+            } else {
+                st.alloc_zeros::<u32>(1)
+                    .map_err(|e| format!("verify alloc: {e}"))?
+            },
             vcos: af(mk * half)?,
             vsin: af(mk * half)?,
         })
     }
 
-    /// Run the batched layer stack for `k` tokens (`1..=MAX_VERIFY_K`) at consecutive
+    /// Run the batched layer stack for `k` tokens (`1..=MAX_VERIFY_K` or prefill chunk cap) at consecutive
     /// positions `[base_position, base_position+k)`. Reads the staged per-token input
     /// from `sc.vh` / `sc.vcos` / `sc.vsin`, writes each token's K/V into the cache,
     /// and leaves the post-final-layer hidden state in `sc.vh`. The caller stages the
     /// inputs and (for `verify_batch`) projects logits afterward.
     ///
     /// This is the single source of truth for the batched forward, shared by
-    /// `verify_batch` (speculative decode) and `prefill_batched`. It is bit-identical
-    /// to the serial `forward_pass` per token: each supported batched projection
-    /// reproduces its decode GEMV's integer decomposition and ordered fp32 sum, and the
-    /// batched norm/RoPE/scatter/attention kernels match their serial counterparts.
+    /// `verify_batch` (speculative decode) and `prefill_batched`.
+    /// On the default path (and for all `verify_batch` calls, where `flash_ok` is false),
+    /// it is bit-identical to the serial `forward_pass` per token: each supported batched
+    /// projection reproduces its decode GEMV's integer decomposition and ordered fp32 sum,
+    /// and the batched norm/RoPE/scatter/attention kernels match their serial counterparts.
+    /// When opt-in flash prefill is enabled (`CAMELID_FLASH_PREFILL=1`, prefill only), the fused
+    /// online-softmax attention kernel preserves greedy token-parity while eliminating intermediate
+    /// DRAM scratch.
     /// All K/V of the current chunk are scattered before attention reads them, so a
     /// token attends to every earlier position (prior chunks + earlier tokens in this
     /// chunk) exactly as sequential decoding would.
@@ -13764,7 +13998,7 @@ impl CudaResidentDecode {
                         k,
                     )
                     .map_err(map)?;
-                    if flash_ok && flash_prefill_enabled() && q_width == n_heads * head_dim {
+                    if flash_ok && flash_prefill_enabled() && q_width == n_heads * head_dim && head_dim <= 256 {
                         launch_attention_flash_prefill(
                             &s,
                             &self.k,
