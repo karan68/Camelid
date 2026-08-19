@@ -1,0 +1,421 @@
+{
+  "one_b": {
+    "lanes_before": {
+      "win": "cpu_q8_runtime_repack",
+      "mac": "metal_resident_q8_runtime"
+    },
+    "lanes_after": {
+      "win": "cpu_q8_runtime_repack",
+      "mac": "metal_resident_q8_runtime"
+    },
+    "lane_stable_across_campaign": true,
+    "summary": [
+      {
+        "model": "Llama 3.2 1B Instruct",
+        "rounds_measured": 5,
+        "per_round_req_per_s": [
+          {
+            "round": 1,
+            "win": 0.3333,
+            "mac": 3.5851,
+            "win+mac": 4.1442
+          },
+          {
+            "round": 2,
+            "win": 0.4234,
+            "mac": 3.4158,
+            "win+mac": 3.8323
+          },
+          {
+            "round": 3,
+            "win": 0.8119,
+            "mac": 3.0407,
+            "win+mac": 4.9447
+          },
+          {
+            "round": 4,
+            "win": 0.8257,
+            "mac": 3.3365,
+            "win+mac": 4.7255
+          },
+          {
+            "round": 5,
+            "win": 0.8674,
+            "mac": 3.4847,
+            "win+mac": 4.56
+          }
+        ],
+        "together_vs_best_single": {
+          "point": 1.3257875999619115,
+          "low": 1.1728692543667631,
+          "high": 1.4991339614977668,
+          "rounds": 5,
+          "enough": true,
+          "verdict": "higher"
+        },
+        "together_vs_sum_of_singles": {
+          "point": 1.1044812676387055,
+          "low": 1.027943125458414,
+          "high": 1.2067039663401524,
+          "rounds": 5,
+          "enough": true,
+          "verdict": "higher"
+        },
+        "every_round_had_zero_failures": true,
+        "every_arm_had_unique_prompts": true,
+        "quotable": true
+      }
+    ],
+    "latency_median_of_per_round": {
+      "win": {
+        "p50_ms": 4894.3,
+        "p95_ms": 5923.2,
+        "max_ms": 13754.3
+      },
+      "mac": {
+        "p50_ms": 1145.4,
+        "p95_ms": 1344.5,
+        "max_ms": 1733.5
+      },
+      "win+mac": {
+        "p50_ms": 572.9,
+        "p95_ms": 1956.5,
+        "max_ms": 6109.8
+      }
+    },
+    "together_p95_vs_fastest_single_p95": 1.455,
+    "fastest_single_arm": "mac",
+    "per_arm": [
+      {
+        "arm": "win",
+        "round": 0,
+        "warmup": true,
+        "ok": 18,
+        "failed": 0,
+        "req_per_s": 0.2442,
+        "tok_per_s": 6.905,
+        "latency_ms": {
+          "p50": 15543.5,
+          "p95": 18174.8,
+          "max": 18174.8
+        },
+        "by_node": {
+          "win": 18
+        },
+        "markers_unique": true
+      },
+      {
+        "arm": "mac",
+        "round": 0,
+        "warmup": true,
+        "ok": 216,
+        "failed": 0,
+        "req_per_s": 3.5433,
+        "tok_per_s": 102.461,
+        "latency_ms": {
+          "p50": 1117.5,
+          "p95": 1236.8,
+          "max": 1333.7
+        },
+        "by_node": {
+          "mac": 216
+        },
+        "markers_unique": true
+      },
+      {
+        "arm": "win+mac",
+        "round": 0,
+        "warmup": true,
+        "ok": 233,
+        "failed": 0,
+        "req_per_s": 3.7777,
+        "tok_per_s": 111.579,
+        "latency_ms": {
+          "p50": 585.4,
+          "p95": 3638.4,
+          "max": 7818.2
+        },
+        "by_node": {
+          "mac": 206,
+          "win": 27
+        },
+        "markers_unique": true
+      },
+      {
+        "arm": "mac",
+        "round": 1,
+        "warmup": false,
+        "ok": 218,
+        "failed": 0,
+        "req_per_s": 3.5851,
+        "tok_per_s": 94.742,
+        "latency_ms": {
+          "p50": 1100.2,
+          "p95": 1244.3,
+          "max": 1454.8
+        },
+        "by_node": {
+          "mac": 218
+        },
+        "markers_unique": true
+      },
+      {
+        "arm": "win+mac",
+        "round": 1,
+        "warmup": false,
+        "ok": 264,
+        "failed": 0,
+        "req_per_s": 4.1442,
+        "tok_per_s": 106.934,
+        "latency_ms": {
+          "p50": 560.3,
+          "p95": 3631.6,
+          "max": 6109.8
+        },
+        "by_node": {
+          "mac": 222,
+          "win": 42
+        },
+        "markers_unique": true
+      },
+      {
+        "arm": "win",
+        "round": 1,
+        "warmup": false,
+        "ok": 24,
+        "failed": 0,
+        "req_per_s": 0.3333,
+        "tok_per_s": 9.845,
+        "latency_ms": {
+          "p50": 11587.9,
+          "p95": 13642.1,
+          "max": 13754.3
+        },
+        "by_node": {
+          "win": 24
+        },
+        "markers_unique": true
+      },
+      {
+        "arm": "win+mac",
+        "round": 2,
+        "warmup": false,
+        "ok": 240,
+        "failed": 0,
+        "req_per_s": 3.8323,
+        "tok_per_s": 99.511,
+        "latency_ms": {
+          "p50": 572.9,
+          "p95": 4221.5,
+          "max": 5642.3
+        },
+        "by_node": {
+          "mac": 213,
+          "win": 27
+        },
+        "markers_unique": true
+      },
+      {
+        "arm": "win",
+        "round": 2,
+        "warmup": false,
+        "ok": 29,
+        "failed": 0,
+        "req_per_s": 0.4234,
+        "tok_per_s": 12.263,
+        "latency_ms": {
+          "p50": 9192.7,
+          "p95": 10808.9,
+          "max": 10912.3
+        },
+        "by_node": {
+          "win": 29
+        },
+        "markers_unique": true
+      },
+      {
+        "arm": "mac",
+        "round": 2,
+        "warmup": false,
+        "ok": 209,
+        "failed": 0,
+        "req_per_s": 3.4158,
+        "tok_per_s": 98.715,
+        "latency_ms": {
+          "p50": 1145.4,
+          "p95": 1344.5,
+          "max": 1566.3
+        },
+        "by_node": {
+          "mac": 209
+        },
+        "markers_unique": true
+      },
+      {
+        "arm": "win",
+        "round": 3,
+        "warmup": false,
+        "ok": 52,
+        "failed": 0,
+        "req_per_s": 0.8119,
+        "tok_per_s": 25.012,
+        "latency_ms": {
+          "p50": 4894.3,
+          "p95": 5724.4,
+          "max": 5738
+        },
+        "by_node": {
+          "win": 52
+        },
+        "markers_unique": true
+      },
+      {
+        "arm": "mac",
+        "round": 3,
+        "warmup": false,
+        "ok": 186,
+        "failed": 0,
+        "req_per_s": 3.0407,
+        "tok_per_s": 103.35,
+        "latency_ms": {
+          "p50": 1286.2,
+          "p95": 1574,
+          "max": 1733.5
+        },
+        "by_node": {
+          "mac": 186
+        },
+        "markers_unique": true
+      },
+      {
+        "arm": "win+mac",
+        "round": 3,
+        "warmup": false,
+        "ok": 303,
+        "failed": 0,
+        "req_per_s": 4.9447,
+        "tok_per_s": 127.403,
+        "latency_ms": {
+          "p50": 536.2,
+          "p95": 1956.5,
+          "max": 3238.7
+        },
+        "by_node": {
+          "mac": 241,
+          "win": 62
+        },
+        "markers_unique": true
+      },
+      {
+        "arm": "mac",
+        "round": 4,
+        "warmup": false,
+        "ok": 205,
+        "failed": 0,
+        "req_per_s": 3.3365,
+        "tok_per_s": 95.505,
+        "latency_ms": {
+          "p50": 1163,
+          "p95": 1405.6,
+          "max": 1460.8
+        },
+        "by_node": {
+          "mac": 205
+        },
+        "markers_unique": true
+      },
+      {
+        "arm": "win+mac",
+        "round": 4,
+        "warmup": false,
+        "ok": 288,
+        "failed": 0,
+        "req_per_s": 4.7255,
+        "tok_per_s": 118.039,
+        "latency_ms": {
+          "p50": 594.5,
+          "p95": 1902.7,
+          "max": 2500.2
+        },
+        "by_node": {
+          "mac": 224,
+          "win": 64
+        },
+        "markers_unique": true
+      },
+      {
+        "arm": "win",
+        "round": 4,
+        "warmup": false,
+        "ok": 53,
+        "failed": 0,
+        "req_per_s": 0.8257,
+        "tok_per_s": 25.909,
+        "latency_ms": {
+          "p50": 4751.3,
+          "p95": 5923.2,
+          "max": 6215.6
+        },
+        "by_node": {
+          "win": 53
+        },
+        "markers_unique": true
+      },
+      {
+        "arm": "win+mac",
+        "round": 5,
+        "warmup": false,
+        "ok": 280,
+        "failed": 0,
+        "req_per_s": 4.56,
+        "tok_per_s": 114.946,
+        "latency_ms": {
+          "p50": 635.9,
+          "p95": 1913.6,
+          "max": 2339.7
+        },
+        "by_node": {
+          "mac": 216,
+          "win": 64
+        },
+        "markers_unique": true
+      },
+      {
+        "arm": "win",
+        "round": 5,
+        "warmup": false,
+        "ok": 60,
+        "failed": 0,
+        "req_per_s": 0.8674,
+        "tok_per_s": 25.24,
+        "latency_ms": {
+          "p50": 4273.1,
+          "p95": 5120.3,
+          "max": 9374.9
+        },
+        "by_node": {
+          "win": 60
+        },
+        "markers_unique": true
+      },
+      {
+        "arm": "mac",
+        "round": 5,
+        "warmup": false,
+        "ok": 212,
+        "failed": 0,
+        "req_per_s": 3.4847,
+        "tok_per_s": 95.583,
+        "latency_ms": {
+          "p50": 1136.5,
+          "p95": 1294.8,
+          "max": 1526.4
+        },
+        "by_node": {
+          "mac": 212
+        },
+        "markers_unique": true
+      }
+    ]
+  }
+}

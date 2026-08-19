@@ -1,0 +1,65 @@
+{
+  "schema": "camelid.fabric_scale_evidence.v1",
+  "generated_utc": "2026-08-19T19:12:21.805Z",
+  "git_head": "a89e6b823676",
+  "nodes": [
+    {
+      "label": "win",
+      "machine": "machine-a",
+      "platform": "windows x86_64"
+    },
+    {
+      "label": "mac",
+      "machine": "machine-b",
+      "platform": "macOS arm64 Apple Silicon"
+    },
+    {
+      "label": "mac2",
+      "machine": "machine-b",
+      "platform": "macOS arm64 Apple Silicon",
+      "note": "shares a host with mac; placement evidence only"
+    }
+  ],
+  "models": [
+    "Llama 3.2 1B Instruct (Q8_0)",
+    "Llama 3.2 3B Instruct (Q5_K_M)"
+  ],
+  "claims": {
+    "supported": [
+      "A fabric of three nodes placed a concurrent burst across all three labels, with zero failed requests.",
+      "With one node stopped, the remaining nodes served every request; with two stopped, the third served every request. No client saw a failure.",
+      "GET /v1/models on the proxy returned the union of the models held by its nodes.",
+      "Naming a model placed the request only on a node that holds it: the 3B landed solely on the Windows node, the 1B solely on the two macOS nodes.",
+      "Every prompt in every arm was unique, so no number here can be a prefill-cache artefact.",
+      "Two nodes on two machines served more requests per second than the faster of them alone: 1.33x, 95% CI [1.17, 1.50] over five paired rounds with zero failed requests."
+    ],
+    "not_supported": [
+      "Any scaling number drawn from the third node. Nodes 2 and 3 share one machine, which is the arrangement #652 refused to draw a claim from.",
+      "The together_vs_sum_of_singles ratio as a scaling result. It is above 1.0 here, which is impossible for independent placement and is an artefact of the concurrency chosen: each node reports continuous_batch_slots=2 and every arm was driven at concurrency 4, so a single-node arm had 4 requests in flight against 2 slots and queued the rest, while the two-node arm had 4 against 4. The single-node denominators are therefore depressed. together_vs_best_single is the sound comparison.",
+      "Any claim about a lane other than the one recorded per node in this bundle.",
+      "Any comparison between the two machines as hardware: they ran different execution lanes and different thread counts, both recorded. The Windows node ran a CPU lane here, not its CUDA lane.",
+      "Any throughput claim for the second model. The throughput arms were run on the 1B only; the 3B appears in this bundle for placement and model-routing evidence, not for throughput."
+    ],
+    "honest_sentence": "Three nodes is met for placement; the throughput arms are two machines, because the third node shares a host.",
+    "method": [
+      "Arms are interleaved and their order rotated each round; ratios are taken within a round.",
+      "A unique marker leads every prompt.",
+      "Per-node attribution is read from the x-camelid-fabric-node response header, never inferred.",
+      "The execution lane is read from /v1/health execution_plan.selected_backend before and after each campaign.",
+      "One warm-up round per model is discarded.",
+      "A run containing any failed request is not reported as a throughput number."
+    ]
+  },
+  "logs": [
+    {
+      "name": "placement",
+      "file": "logs/placement.json",
+      "sha256": "98a766f032a6113dd08337f16ed304280442746bd4953a5d43e65d1dee2629c6"
+    },
+    {
+      "name": "throughput",
+      "file": "logs/throughput.json",
+      "sha256": "66ea1d7b50760ffe203203035dd19312833ea3e08af3c979e1752046d5fac2d5"
+    }
+  ]
+}
