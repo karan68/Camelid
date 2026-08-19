@@ -81,6 +81,13 @@ struct StubConfig {
     /// When set, `/v1/health` reports this model rather than the fixed one, so
     /// a test can load a different model while the proxy is running.
     live_model: Option<Arc<Mutex<String>>>,
+    /// How long a placed request is worked on while watching the socket for the
+    /// caller going away. A node with one JSON answer to give has nothing to
+    /// write until it is finished, so unlike `events_written` there is no
+    /// failing write to reveal a hang-up — it has to be looked for.
+    completion_watch: Duration,
+    /// How far into `completion_watch` the caller went away, if it did.
+    caller_left_after: Arc<Mutex<Option<Duration>>>,
 }
 
 impl StubConfig {
@@ -104,6 +111,8 @@ impl StubConfig {
             events_written: Arc::new(AtomicUsize::new(0)),
             live_in_flight: None,
             live_model: None,
+            completion_watch: Duration::ZERO,
+            caller_left_after: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -196,6 +205,19 @@ impl StubConfig {
     fn hanging_up_on_completion(model: &str) -> Self {
         Self {
             hangs_up_on_completion: true,
+            ..Self::ready(model, 0)
+        }
+    }
+
+    /// A node working on a request for `hold`, watching for its caller to go.
+    ///
+    /// A real engine notices the same event by the same means — its handler
+    /// frame is dropped when the connection is — and stops its decode loop
+    /// within one step. `hold` stands in for the generation that would still
+    /// have been running.
+    fn working_on_a_completion(model: &str, hold: Duration) -> Self {
+        Self {
+            completion_watch: hold,
             ..Self::ready(model, 0)
         }
     }
@@ -307,6 +329,19 @@ fn serve_once(stream: &mut TcpStream, config: &StubConfig, requests: &Mutex<Vec<
         return;
     }
 
+    if authorized
+        && !config.completion_watch.is_zero()
+        && PLACED_ROUTES.contains(&received.path.as_str())
+    {
+        // Recorded before the work starts, so a test can wait until the node
+        // really holds the request before taking its caller away.
+        requests.lock().expect("stub lock").push(received);
+        if caller_stayed(stream, config) {
+            write_json(stream, config.completion_status, &config.completion);
+        }
+        return;
+    }
+
     let (status, body) = match received.path.as_str() {
         _ if !authorized => (
             401_u16,
@@ -334,12 +369,53 @@ fn serve_once(stream: &mut TcpStream, config: &StubConfig, requests: &Mutex<Vec<
     // Record only after deciding, so a malformed request never poisons the log.
     requests.lock().expect("stub lock").push(received);
 
+    write_json(stream, status, &body);
+}
+
+fn write_json(stream: &mut TcpStream, status: u16, body: &str) {
     let response = format!(
         "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     let _ = stream.write_all(response.as_bytes());
     let _ = stream.flush();
+}
+
+/// Work on a placed request for `completion_watch`, watching the socket for the
+/// caller going away, and report whether it was still there at the end.
+///
+/// A node with one JSON answer to give writes nothing until it is finished, so
+/// unlike a stream there is no failing write to reveal a hang-up: it has to be
+/// looked for. A real engine notices the same event by the same means — its
+/// handler frame is dropped when the connection is.
+fn caller_stayed(stream: &mut TcpStream, config: &StubConfig) -> bool {
+    let started = Instant::now();
+    if stream
+        .set_read_timeout(Some(Duration::from_millis(20)))
+        .is_err()
+    {
+        return false;
+    }
+    let mut scratch = [0_u8; 64];
+    while started.elapsed() < config.completion_watch {
+        let gone = match stream.read(&mut scratch) {
+            // A graceful close reads as end-of-file and an abortive one as an
+            // error; both mean the caller has gone.
+            Ok(0) => true,
+            // Nothing here pipelines a second request, so anything readable is
+            // not the caller leaving.
+            Ok(_) => false,
+            Err(error) => !matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ),
+        };
+        if gone {
+            *config.caller_left_after.lock().expect("stub lock") = Some(started.elapsed());
+            return false;
+        }
+    }
+    true
 }
 
 /// What `/v1/health` answers: the configured body, carrying whatever load and
@@ -476,13 +552,27 @@ async fn start_proxy(fabric: Fabric, mode: RouteMode) -> SocketAddr {
 }
 
 async fn start_proxy_with_auth(fabric: Fabric, mode: RouteMode, auth: ClientAuth) -> SocketAddr {
+    start_proxy_waiting(fabric, mode, auth, FORWARD_TIMEOUT).await
+}
+
+/// The proxy with a forward budget of its own.
+///
+/// A cancellation test needs one far longer than the test itself, so that a
+/// request ending early can only be because it was given up on, never because
+/// it ran out of time.
+async fn start_proxy_waiting(
+    fabric: Fabric,
+    mode: RouteMode,
+    auth: ClientAuth,
+    forward_timeout: Duration,
+) -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind proxy");
     let addr = listener.local_addr().expect("proxy addr");
     let config = ServeConfig {
         mode,
-        forward_timeout: FORWARD_TIMEOUT,
+        forward_timeout,
         auth,
         tls: None,
         bound: addr,
@@ -1303,8 +1393,10 @@ async fn a_node_refusing_a_stream_is_relayed_as_a_readable_answer() {
 }
 
 /// A client that hangs up mid-stream must take the node's work with it.
-/// The buffered path cannot do this — blocking socket I/O is not cancellable —
-/// so this is a property the streaming path adds rather than inherits.
+///
+/// The relay notices because a send to a client that has gone fails. That only
+/// works once the node produces something to send, which is why the buffered
+/// path needs a mechanism of its own; see the test below it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_client_hanging_up_stops_the_node_generating() {
     let gap = Duration::from_millis(100);
@@ -1353,6 +1445,143 @@ async fn a_client_hanging_up_stops_the_node_generating() {
         later < events.len(),
         "the node wrote all {} events despite the client leaving",
         events.len()
+    );
+}
+
+/// Send a request over a real socket and leave without waiting for the answer.
+///
+/// Returns once the node holds the request, so the hang-up cannot land before
+/// there is anything to abandon. Polling the node beats sleeping a guess: the
+/// point of the measurement afterwards is that it is not a timing coincidence.
+async fn post_then_hang_up(addr: SocketAddr, node: &StubNode, path: &str, body: Value) {
+    let mut stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("connect to proxy");
+    let payload = body.to_string();
+    let request = format!(
+        "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+        payload.len()
+    );
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write request");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while served_on(std::slice::from_ref(node), path)[0] == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the node never received the request, so there was nothing to abandon"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    drop(stream);
+}
+
+/// What the node observed, once it observes anything, or `None` if it never did.
+async fn caller_left_within(seen: &Mutex<Option<Duration>>, bound: Duration) -> Option<Duration> {
+    let deadline = Instant::now() + bound;
+    loop {
+        if let Some(elapsed) = *seen.lock().expect("stub lock") {
+            return Some(elapsed);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// The buffered path has no relay whose failure could reveal a client leaving,
+/// so it has to be told — and this is what being told is worth. A Camelid node
+/// runs one generation at a time, so a request nobody wants holds that node's
+/// only slot until it finishes or the proxy's forward budget expires.
+///
+/// The budget here is 60s and the node would work for 30s; noticing inside a
+/// couple of seconds cannot be either of those running out.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_client_hanging_up_gives_the_node_back_its_generation_slot() {
+    let config = StubConfig::working_on_a_completion("m", Duration::from_secs(30));
+    let left = Arc::clone(&config.caller_left_after);
+    let node = StubNode::start(config);
+    let fabric = fabric_of(vec![node.spec("only")]);
+    let addr = start_proxy_waiting(
+        fabric,
+        RouteMode::Throughput,
+        ClientAuth::none(),
+        Duration::from_secs(60),
+    )
+    .await;
+
+    post_then_hang_up(
+        addr,
+        &node,
+        "/v1/chat/completions",
+        serde_json::json!({ "model": "m" }),
+    )
+    .await;
+
+    let noticed = caller_left_within(&left, Duration::from_secs(10))
+        .await
+        .expect("the node was never told its caller had gone; it kept the request for 30s");
+    assert!(
+        noticed < Duration::from_secs(3),
+        "the node held the request for {noticed:?} after its client left"
+    );
+}
+
+/// The same for a streaming request that has not reached its first event: the
+/// relay's own mechanism cannot fire, because nothing has been relayed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_client_leaving_before_the_first_event_still_stops_the_node() {
+    let config = StubConfig::working_on_a_completion("m", Duration::from_secs(30));
+    let left = Arc::clone(&config.caller_left_after);
+    let node = StubNode::start(config);
+    let fabric = fabric_of(vec![node.spec("only")]);
+    let addr = start_proxy_waiting(
+        fabric,
+        RouteMode::Throughput,
+        ClientAuth::none(),
+        Duration::from_secs(60),
+    )
+    .await;
+
+    post_then_hang_up(
+        addr,
+        &node,
+        "/v1/chat/completions",
+        serde_json::json!({ "model": "m", "stream": true }),
+    )
+    .await;
+
+    let noticed = caller_left_within(&left, Duration::from_secs(10))
+        .await
+        .expect("the node was never told its caller had gone before the first event");
+    assert!(
+        noticed < Duration::from_secs(3),
+        "the node held the request for {noticed:?} after its client left"
+    );
+}
+
+/// The control for both: a client that stays is served, and the node is never
+/// told to stop. Without this, a proxy that cancelled every request the moment
+/// it started one would pass the two tests above.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_client_that_waits_is_served_and_the_node_is_never_told_to_stop() {
+    let config = StubConfig::working_on_a_completion("m", Duration::from_millis(400));
+    let left = Arc::clone(&config.caller_left_after);
+    let node = StubNode::start(config);
+    let fabric = fabric_of(vec![node.spec("only")]);
+    let addr = start_proxy(fabric, RouteMode::Throughput).await;
+
+    let (status, body, _) = post_chat(addr, &serde_json::json!({ "model": "m" }), &[]).await;
+
+    assert_eq!(status, 200);
+    assert_eq!(body["choices"][0]["message"]["content"], "served by m");
+    assert_eq!(
+        *left.lock().expect("stub lock"),
+        None,
+        "a served request must not look like an abandoned one"
     );
 }
 

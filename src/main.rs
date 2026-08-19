@@ -3066,6 +3066,9 @@ async fn main() -> anyhow::Result<()> {
                     &body,
                     bearer.as_deref(),
                     std::time::Duration::from_secs(forward_timeout_s),
+                    // One request per process: this ends when the process does,
+                    // so there is no client that can leave while it runs.
+                    &camelid::fabric::Cancel::never(),
                 )
                 .map_err(|error| anyhow::anyhow!("{error}"))?;
 

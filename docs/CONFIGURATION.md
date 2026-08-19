@@ -242,6 +242,15 @@ part-way through a stream, ends the request with 502 rather than risking a secon
 `x-camelid-fabric-node`, `x-camelid-fabric-reason` and `x-camelid-fabric-attempts`, so a client can
 tell a first-choice placement from a failover.
 
+A client that hangs up takes its request's work with it. The proxy notices the connection going and
+hangs up on the node in turn, which that node reads as its own client leaving — it stops generating
+within one decode step. So a request nobody is waiting for gives back the node's generation slot
+instead of holding it for the rest of `--forward-timeout-s`, which matters because a node runs one
+generation at a time. It is not instantaneous: the check happens between socket operations, so it
+takes effect within about 100 ms while the proxy is waiting on a node. A probe round already under
+way is not interrupted, but it is bounded by `--timeout-ms` and costs a node a health read rather
+than its generation slot.
+
 Request bodies are bounded at the same 16 MiB default the node itself uses. A streaming request is
 relayed as it arrives; `fabric run`, which returns one complete answer, refuses `stream: true` with
 400 instead.
