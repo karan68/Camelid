@@ -5106,7 +5106,13 @@ __device__ void flash_attention_prefill_tiled_dynamic(
     }
 }
 
-extern "C" __global__ void flash_attention_prefill_tiled(
+// One entry point per supported head_dim. They are NOT folded into a single kernel with a runtime
+// branch: ptxas sizes registers and the stack frame for the WHOLE function, so the worst branch is
+// charged to every launch. Measured on sm_89 with all four folded into one entry point: num_regs=71
+// and a 224-byte per-thread stack frame on EVERY launch. Split, the frame is zero on all three
+// specialized kernels (64/128/256 -> 63/89/96 registers), which is what actually makes `o_acc`
+// register-resident rather than local-memory backed.
+extern "C" __global__ void flash_attention_prefill_tiled_d64(
     const float* __restrict__ q,
     const unsigned short* __restrict__ cache_k,
     const unsigned short* __restrict__ cache_v,
@@ -5120,15 +5126,64 @@ extern "C" __global__ void flash_attention_prefill_tiled(
     int max_pos,
     float scale
 ) {
-    if (head_dim == 128) {
-        flash_attention_prefill_tiled_impl<128>(q, cache_k, cache_v, out, n_heads, n_kv_heads, base_position, k_tokens, q_per_token, max_pos, scale);
-    } else if (head_dim == 64) {
-        flash_attention_prefill_tiled_impl<64>(q, cache_k, cache_v, out, n_heads, n_kv_heads, base_position, k_tokens, q_per_token, max_pos, scale);
-    } else if (head_dim == 256) {
-        flash_attention_prefill_tiled_impl<256>(q, cache_k, cache_v, out, n_heads, n_kv_heads, base_position, k_tokens, q_per_token, max_pos, scale);
-    } else if (head_dim <= 256) {
-        flash_attention_prefill_tiled_dynamic(q, cache_k, cache_v, out, n_heads, n_kv_heads, head_dim, base_position, k_tokens, q_per_token, max_pos, scale);
-    }
+    (void)head_dim;
+    flash_attention_prefill_tiled_impl<64>(q, cache_k, cache_v, out, n_heads, n_kv_heads, base_position, k_tokens, q_per_token, max_pos, scale);
+}
+
+extern "C" __global__ void flash_attention_prefill_tiled_d128(
+    const float* __restrict__ q,
+    const unsigned short* __restrict__ cache_k,
+    const unsigned short* __restrict__ cache_v,
+    float* __restrict__ out,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int base_position,
+    int k_tokens,
+    int q_per_token,
+    int max_pos,
+    float scale
+) {
+    (void)head_dim;
+    flash_attention_prefill_tiled_impl<128>(q, cache_k, cache_v, out, n_heads, n_kv_heads, base_position, k_tokens, q_per_token, max_pos, scale);
+}
+
+extern "C" __global__ void flash_attention_prefill_tiled_d256(
+    const float* __restrict__ q,
+    const unsigned short* __restrict__ cache_k,
+    const unsigned short* __restrict__ cache_v,
+    float* __restrict__ out,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int base_position,
+    int k_tokens,
+    int q_per_token,
+    int max_pos,
+    float scale
+) {
+    (void)head_dim;
+    flash_attention_prefill_tiled_impl<256>(q, cache_k, cache_v, out, n_heads, n_kv_heads, base_position, k_tokens, q_per_token, max_pos, scale);
+}
+
+// Runtime-head_dim twin for every other head_dim. Its loops are bounded by the runtime `head_dim`,
+// so `o_acc` is dynamically indexed and genuinely lands in local memory (measured: 224 bytes). It
+// stays a separate entry point so that frame is never charged to the specialized kernels above.
+extern "C" __global__ void flash_attention_prefill_tiled_dyn(
+    const float* __restrict__ q,
+    const unsigned short* __restrict__ cache_k,
+    const unsigned short* __restrict__ cache_v,
+    float* __restrict__ out,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int base_position,
+    int k_tokens,
+    int q_per_token,
+    int max_pos,
+    float scale
+) {
+    flash_attention_prefill_tiled_dynamic(q, cache_k, cache_v, out, n_heads, n_kv_heads, head_dim, base_position, k_tokens, q_per_token, max_pos, scale);
 }
 
 
@@ -5955,7 +6010,10 @@ pub struct CudaResidentKernels {
     pub(crate) attn_sk_scores_coalesced: CudaFunction,
     pub(crate) attn_sk_partial: CudaFunction,
     pub(crate) attn_sk_combine: CudaFunction,
-    pub(crate) flash_attention_prefill_tiled: CudaFunction,
+    pub(crate) flash_attention_prefill_tiled_d64: CudaFunction,
+    pub(crate) flash_attention_prefill_tiled_d128: CudaFunction,
+    pub(crate) flash_attention_prefill_tiled_d256: CudaFunction,
+    pub(crate) flash_attention_prefill_tiled_dyn: CudaFunction,
     // qwen35 (Ornith) gated-delta-net SSM kernels.
     pub(crate) ssm_l2_norm_per_head: CudaFunction,
     pub(crate) ssm_l2_norm_per_head_batched: CudaFunction,
@@ -6155,7 +6213,10 @@ impl CudaResidentKernels {
             attn_sk_scores_coalesced: f("attn_sk_scores_coalesced")?,
             attn_sk_partial: f("attn_sk_partial")?,
             attn_sk_combine: f("attn_sk_combine")?,
-            flash_attention_prefill_tiled: f("flash_attention_prefill_tiled")?,
+            flash_attention_prefill_tiled_d64: f("flash_attention_prefill_tiled_d64")?,
+            flash_attention_prefill_tiled_d128: f("flash_attention_prefill_tiled_d128")?,
+            flash_attention_prefill_tiled_d256: f("flash_attention_prefill_tiled_d256")?,
+            flash_attention_prefill_tiled_dyn: f("flash_attention_prefill_tiled_dyn")?,
             ssm_l2_norm_per_head: f("ssm_l2_norm_per_head")?,
             ssm_l2_norm_per_head_batched: f("ssm_l2_norm_per_head_batched")?,
             qwen35_ssm_qk_l2_norm_d128_batched: f("qwen35_ssm_qk_l2_norm_d128_batched")?,
@@ -9068,6 +9129,15 @@ fn flash_prefill_enabled() -> bool {
 /// Fused Tiled Flash Prefill Attention (online softmax).
 /// Tiled across query blocks (B_Q = 16) and key blocks (B_K = 32) in shared memory and registers.
 /// Computes causal attention in a single fused kernel pass with 0 bytes intermediate DRAM traffic.
+///
+/// One entry point per head_dim: 64/128/256 are compile-time specialized so the output accumulator
+/// stays in registers (measured on sm_89: 0-byte stack frame), and every other head_dim takes the
+/// runtime-bounded twin, whose accumulator is dynamically indexed and does use local memory.
+///
+/// Unlike the split-K kernels this replaces, there is no `SPLITK_THRESHOLD` engagement floor: with
+/// `CAMELID_FLASH_PREFILL` set this runs at every prefix length, so the token-parity reassociation
+/// now applies to short prompts too. Shared memory is `192 * head_dim` bytes and does NOT grow with
+/// the prefix, which is why the floor is no longer needed to bound it.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn launch_attention_flash_prefill(
     s: &Arc<CudaStream>,
@@ -9087,6 +9157,8 @@ pub(crate) fn launch_attention_flash_prefill(
 ) -> Result<(), cudarc::driver::DriverError> {
     const FLASH_PREFILL_BQ: usize = 16;
     const FLASH_PREFILL_BK: usize = 32;
+    // 192 * head_dim bytes; 256 is exactly the 48 KiB default dynamic shared-memory limit, and the
+    // block-per-query-tile layout assumes the 8 warps this launcher requests.
     assert!(head_dim <= 256, "flash prefill requires head_dim <= 256");
     let q_tiles = (k_tokens as u32).div_ceil(FLASH_PREFILL_BQ as u32);
     let block: u32 = 256;
@@ -9107,7 +9179,15 @@ pub(crate) fn launch_attention_flash_prefill(
         q_per_token as i32,
         max_pos as i32,
     );
-    let mut b = s.launch_builder(&k.flash_attention_prefill_tiled);
+    // Each head_dim has its own entry point so ptxas does not charge one kernel's register and
+    // stack-frame footprint to the others; the runtime-bounded twin is the fallback.
+    let f = match head_dim {
+        64 => &k.flash_attention_prefill_tiled_d64,
+        128 => &k.flash_attention_prefill_tiled_d128,
+        256 => &k.flash_attention_prefill_tiled_d256,
+        _ => &k.flash_attention_prefill_tiled_dyn,
+    };
+    let mut b = s.launch_builder(f);
     b.arg(q)
         .arg(cache_k)
         .arg(cache_v)
@@ -11097,44 +11177,56 @@ impl CudaResidentDecode {
             .unwrap_or(1)
     }
 
-    /// Maximum token batch size for prompt prefill.
-    /// Overridable via `CAMELID_CUDA_PREFILL_BATCH_TOKENS=1..=256`.
-    /// When unset, caps chunk size to balance shared memory occupancy and GEMM efficiency.
-    fn batched_prefill_token_cap(&self) -> usize {
-        if let Ok(v) = std::env::var("CAMELID_CUDA_PREFILL_BATCH_TOKENS") {
-            if let Ok(k) = v.parse::<usize>() {
-                return k.clamp(1, 256);
-            }
-        }
+    /// Largest prefill chunk this model's batched kernels can actually launch.
+    ///
+    /// Every batched GEMM stages `k` token rows of activations in shared memory, so `k` is bounded
+    /// by the portable 46 KiB budget the launchers use. Exceeding it is not a slowdown, it is a
+    /// failure: `launch_kquant_gemm_batched` asserts, and `launch_gemm_batched` builds a launch
+    /// config the driver rejects. This is the ceiling any operator override is clamped to.
+    fn prefill_token_cap_limit(&self) -> usize {
+        const SHARED_BUDGET: usize = 46 * 1024;
         if self.layers.iter().any(|layer| {
             layer.quants.contains(&ProjQuant::Q1_0)
                 || matches!(&layer.kind, LayerKind::Ssm(ssm) if ssm.quants.contains(&ProjQuant::Q1_0))
         }) {
-            let max = if self.k.fast_q1 {
-                MAX_PRISM_PREFILL_K
-            } else {
-                2
-            };
-            return std::env::var("CAMELID_PRISM_BATCH_TOKENS")
-                .ok()
-                .and_then(|value| value.parse::<usize>().ok())
-                .unwrap_or(max)
-                .clamp(1, max);
+            return MAX_PRISM_PREFILL_K;
         }
+        let max_cols = self.hidden.max(self.q_width).max(self.ffn_dim);
         let has_kquant = self
             .layers
             .iter()
             .any(|layer| layer.quants.iter().any(|q| q.needs_q8k()));
         if has_kquant {
-            return self.batched_layer_token_cap();
+            let n_sb = max_cols / 256;
+            let aux_lanes = if self
+                .layers
+                .iter()
+                .any(|layer| layer.quants.contains(&ProjQuant::Q4K))
+            {
+                9
+            } else {
+                8
+            };
+            return (SHARED_BUDGET / (n_sb * (260 + aux_lanes * 4)).max(1)).max(1);
         }
-        let max_cols = self.hidden.max(self.q_width).max(self.ffn_dim);
         let max_bpr = max_cols / 32;
-        // Ensure at least 4 warps per block (128 threads) for healthy GEMM occupancy
-        // within the 46 KiB shared memory budget.
-        const TARGET_WARPS: usize = 4;
-        let max_k = (46 * 1024) / (TARGET_WARPS * max_bpr * 4).max(1);
-        max_k.clamp(1, 16)
+        (SHARED_BUDGET / (max_bpr * 4).max(1)).max(1)
+    }
+
+    /// Maximum token batch size for prompt prefill.
+    ///
+    /// Defaults to the shared batched-stack cap, so the shipped prefill path is unchanged. Chunk
+    /// size and the flash attention kernel are independent levers and are measured separately:
+    /// `CAMELID_CUDA_PREFILL_BATCH_TOKENS` requests a chunk, clamped to what this lane's kernels
+    /// can launch (see `prefill_token_cap_limit`).
+    fn batched_prefill_token_cap(&self) -> usize {
+        match std::env::var("CAMELID_CUDA_PREFILL_BATCH_TOKENS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+        {
+            Some(k) => k.clamp(1, self.prefill_token_cap_limit()),
+            None => self.batched_layer_token_cap(),
+        }
     }
 
     fn batched_verify_token_cap(&self) -> usize {

@@ -6781,6 +6781,42 @@ fn ssm_layer_chain_matches_cpu() {
     );
 }
 
+// The specialized head_dim kernels must keep `o_acc` in registers: a non-zero stack frame means
+// the accumulator spilled to local memory, which is the failure mode the compile-time HEAD_DIM
+// specialization exists to prevent. Folding all four entry points into one kernel with a runtime
+// branch reintroduces it (measured on sm_89: 224 bytes charged to every launch).
+#[test]
+#[ignore = "requires a CUDA device"]
+fn flash_prefill_specialized_kernels_have_no_local_memory_frame() {
+    let Some(k) = kernels() else {
+        return;
+    };
+    for (name, f) in [
+        (
+            "flash_attention_prefill_tiled_d64",
+            &k.flash_attention_prefill_tiled_d64,
+        ),
+        (
+            "flash_attention_prefill_tiled_d128",
+            &k.flash_attention_prefill_tiled_d128,
+        ),
+        (
+            "flash_attention_prefill_tiled_d256",
+            &k.flash_attention_prefill_tiled_d256,
+        ),
+    ] {
+        let local = f.local_size_bytes().unwrap();
+        let regs = f.num_regs().unwrap();
+        let max_threads = f.max_threads_per_block().unwrap();
+        println!("{name}: num_regs={regs} local_size_bytes={local} max_threads={max_threads}");
+        assert_eq!(local, 0, "{name} spilled {local} bytes to local memory");
+        assert!(
+            max_threads >= 256,
+            "{name} cannot launch the 256-thread block the launcher uses (max {max_threads})"
+        );
+    }
+}
+
 #[test]
 #[ignore = "requires a CUDA device"]
 fn flash_attention_prefill_tiled_parity() {
@@ -6791,7 +6827,9 @@ fn flash_attention_prefill_tiled_parity() {
     let n_kv = 2usize;
     let max_pos = 2048usize;
 
-    let head_dims = [64usize, 128usize, 256usize];
+    // 64/128/256 take the compile-time-specialized kernels; 96 routes to the runtime-head_dim
+    // twin, which is a different entry point and would otherwise be shipped untested.
+    let head_dims = [64usize, 96usize, 128usize, 256usize];
     let base_positions = [0usize, 64usize, 128usize, 512usize, 1024usize];
     let k_tokens_list = [1usize, 8usize, 16usize, 32usize, 64usize];
 
