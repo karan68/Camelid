@@ -100,6 +100,7 @@ pub fn sample_from_probs(probs: &[f32], uniform_r: f32) -> u32 {
 ///   $p'_i(x) = \frac{\max(0, p_i(x) - q_i(x))}{\sum_y \max(0, p_i(y) - q_i(y))}$
 ///   and terminate the round.
 /// - If all $K$ drafts are accepted, sample a terminal bonus token from $p_K$.
+#[allow(clippy::needless_range_loop)]
 pub fn speculative_rejection_sample<R: FnMut() -> f32>(
     drafts: &[u32],
     draft_probs: &[&[f32]],
@@ -1005,7 +1006,7 @@ mod tests {
         let target_probs: [&[f32]; 3] = [&p0, &p1, &p2];
 
         // Sequence of random uniforms: r0=0.5 (accept), r1=0.5 (accept), r_term=0.8 (samples idx 2)
-        let r_values = vec![0.5f32, 0.5f32, 0.8f32];
+        let r_values = [0.5f32, 0.5f32, 0.8f32];
         let mut r_idx = 0;
         let rng = || {
             let val = r_values[r_idx];
@@ -1037,7 +1038,7 @@ mod tests {
         // idx 2: max(0, 0.3 - 0.2) = 0.1
         // sum = 0.6. Normalized: [0.5/0.6 = 0.833, 0.0, 0.1/0.6 = 0.167]
         // r_bonus = 0.2 (< 0.833) -> samples idx 0
-        let r_values = vec![0.5f32, 0.2f32];
+        let r_values = [0.5f32, 0.2f32];
         let mut r_idx = 0;
         let rng = || {
             let val = r_values[r_idx];
@@ -1052,7 +1053,6 @@ mod tests {
 
     #[test]
     fn test_speculative_rejection_monte_carlo_distribution() {
-        
         let q0 = [0.7, 0.3];
         let draft_probs: [&[f32]; 1] = [&q0];
         let p0 = [0.2, 0.8];
