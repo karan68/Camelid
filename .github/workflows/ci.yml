@@ -140,6 +140,15 @@ jobs:
       - name: Verify public evidence bundle checksums
         run: bash scripts/check-evidence-bundle-checksums.sh
 
+      # Design evidence makes the same privacy and checksum claims as a
+      # qa/ bundle, and both gates default to that other root, so without
+      # these two lines those claims are only self-attested.
+      - name: Audit design evidence for private details
+        run: node scripts/audit-evidence-bundle-privacy.mjs --root frontend/design-evidence --strict
+
+      - name: Verify design evidence checksums
+        run: bash scripts/check-evidence-bundle-checksums.sh frontend/design-evidence
+
       - name: Check public evidence claims
         run: node scripts/check-public-evidence-claims.mjs
 

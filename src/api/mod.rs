@@ -32538,7 +32538,11 @@ pub struct LocalModelsResponse {
     /// display form of the absolute path resolved at startup. The frontend
     /// builds load paths from this, so they stay valid whatever CWD the server
     /// process inherited.
-    pub models_dir: String,
+    ///
+    /// Absent on a LAN Chat listener: that surface selects a model by filename
+    /// and has no use for the path, which names the host it runs on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub models_dir: Option<String>,
     pub models: Vec<LocalModelEntry>,
 }
 
@@ -34635,7 +34639,8 @@ async fn local_models(
         }
     }
     Json(LocalModelsResponse {
-        models_dir: dir.display().to_string(),
+        models_dir: (state.api_surface != ApiSurface::LanChatOnly)
+            .then(|| dir.display().to_string()),
         models,
     })
 }

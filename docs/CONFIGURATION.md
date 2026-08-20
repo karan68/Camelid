@@ -131,7 +131,9 @@ Resource ceilings are resolved once at startup. Their CLI names and environment 
 | `--max-download-bytes` | 64 GiB | `CAMELID_MAX_DOWNLOAD_BYTES` |
 
 `--lan-chat-only` also has the environment alias `CAMELID_LAN_CHAT_ONLY=1` and always requires
-`CAMELID_API_KEY` or `CAMELID_API_KEY_FILE`. It conflicts with the anonymous remote override.
+`CAMELID_API_KEY` or `CAMELID_API_KEY_FILE`. The command line refuses it alongside
+`--allow-unauthenticated-remote`. Setting both through the environment is not refused there, but it
+changes nothing: this mode has no anonymous form, so the listener still will not start without a key.
 
 `GET /metrics` exposes bounded-name Prometheus counters and gauges for HTTP/generation latency,
 prompt/decode tokens, prompt and weight cache outcomes, engine queue/slot progress, process RSS,

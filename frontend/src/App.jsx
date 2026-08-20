@@ -152,11 +152,21 @@ function App() {
   }, [mobileNavOpen])
 
   /* Observatory stream listens from app start (Phase 6.1 DEFECT 1): runs made
-     before the view's first mount must not be invisible. */
+     before the view's first mount must not be invisible. It waits for one
+     health answer first, because until then the surface is unknown and a
+     stream opened against a LAN Chat listener would retry a 401 forever. Once
+     open it stays open: a later health blip is not a reason to drop a live
+     run. */
+  const telemetryConnectedRef = useRef(false)
   useEffect(() => {
-    ensureInferenceTelemetryConnected(
-      runtime?.status === 'online' && !isLanChatOnly(apiSurface) ? apiBase : null,
-    )
+    if (isLanChatOnly(apiSurface)) {
+      telemetryConnectedRef.current = false
+      ensureInferenceTelemetryConnected(null)
+      return
+    }
+    if (!telemetryConnectedRef.current && runtime?.status !== 'online') return
+    telemetryConnectedRef.current = true
+    ensureInferenceTelemetryConnected(apiBase)
   }, [apiBase, apiSurface, runtime?.status])
 
   /* Remember where the engine lives while it is still answering. Once it stops,
@@ -360,7 +370,7 @@ function App() {
           <BackendBanner backend={backend} apiBase={apiBase} onOpenSettings={() => navigateTab('settings')} />
         )}
 
-        {!DEMO_UI && firstRunActive && (
+        {!DEMO_UI && firstRunActive && !isLanChatOnly(apiSurface) && (
           <div className="camelid-firstrun-slot" hidden={tab !== 'chat'}>
             <FirstRunCard
               apiBase={apiBase}
