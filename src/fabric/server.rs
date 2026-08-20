@@ -39,8 +39,10 @@
 //! * Without a [`ClientAuth`], anything that can reach this address can drive
 //!   every node in the fabric, so [`bind`] refuses a non-loopback address
 //!   unless a key is configured or the risk is acknowledged explicitly.
-//! * Authentication is all-or-nothing: there is one key, it is not per-client,
-//!   and nothing here revokes or rotates it while the proxy is running.
+//! * `--api-key` and `--api-key-file` configure one fixed key that cannot be
+//!   rotated without restarting. `--client-keys` instead names clients and
+//!   re-reads its file when it changes, so one client's key can be revoked or
+//!   rotated without disturbing the others.
 //! * A [`ProxyTls`] pair encrypts what clients send. It is a separate refusal
 //!   from the one above and neither stands in for the other: a key sent over
 //!   cleartext is a key given away, and TLS says nothing about who may drive
