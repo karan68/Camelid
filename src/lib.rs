@@ -32,6 +32,7 @@ pub mod hf_browse;
 pub mod hf_tokenizer_json;
 pub mod inference;
 pub mod kv_equivalence;
+pub mod lan_key;
 pub mod metal;
 pub mod model;
 pub mod model_default;

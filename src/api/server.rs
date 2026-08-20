@@ -34,6 +34,52 @@ const MAX_API_KEY_BYTES: usize = 4 * 1024;
 
 static X_API_KEY: HeaderName = HeaderName::from_static("x-api-key");
 
+/// HTTP surface exposed after authentication.
+///
+/// `LanChatOnly` is deliberately an allowlist. Adding a route to the main
+/// router does not make it remotely reachable until this contract names the
+/// exact method and path as part of the embedded Chat UI.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiSurface {
+    #[default]
+    Full,
+    LanChatOnly,
+}
+
+impl ApiSurface {
+    fn allows(self, method: &Method, path: &str) -> bool {
+        match self {
+            Self::Full => true,
+            Self::LanChatOnly => matches!(
+                (method, path),
+                (&Method::GET, "/v1/models")
+                    | (&Method::GET, "/api/capabilities")
+                    | (&Method::GET, "/api/models/current")
+                    | (&Method::GET, "/api/models/local")
+                    | (&Method::GET, "/api/models/catalog/downloads")
+                    | (&Method::POST, "/api/models/load")
+                    | (&Method::POST, "/v1/chat/completions")
+            ),
+        }
+    }
+
+    fn forbidden(self) -> Response {
+        debug_assert_eq!(self, Self::LanChatOnly);
+        (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": {
+                    "code": "lan_chat_only",
+                    "message": "this Camelid listener serves authenticated Chat and local model switching only",
+                    "type": "permission_error"
+                }
+            })),
+        )
+            .into_response()
+    }
+}
+
 /// Public serve-time inputs. The CLI fills these directly; embedded callers
 /// can use `Default` and retain Camelid's anonymous loopback behavior.
 #[derive(Clone)]
@@ -48,6 +94,7 @@ pub struct ServeOptions {
     pub max_prompt_tokens: usize,
     pub max_generation_tokens: u32,
     pub max_download_bytes: u64,
+    pub api_surface: ApiSurface,
 }
 
 impl Default for ServeOptions {
@@ -63,6 +110,7 @@ impl Default for ServeOptions {
             max_prompt_tokens: DEFAULT_MAX_PROMPT_TOKENS,
             max_generation_tokens: DEFAULT_MAX_GENERATION_TOKENS,
             max_download_bytes: DEFAULT_MAX_DOWNLOAD_BYTES,
+            api_surface: ApiSurface::Full,
         }
     }
 }
@@ -83,6 +131,7 @@ impl fmt::Debug for ServeOptions {
             .field("max_prompt_tokens", &self.max_prompt_tokens)
             .field("max_generation_tokens", &self.max_generation_tokens)
             .field("max_download_bytes", &self.max_download_bytes)
+            .field("api_surface", &self.api_surface)
             .finish()
     }
 }
@@ -185,6 +234,7 @@ pub(crate) struct ServerPolicy {
     pub(crate) tls: Option<TlsFiles>,
     cors_origins: Arc<[HeaderValue]>,
     pub(crate) remote_unauthenticated_override: bool,
+    api_surface: ApiSurface,
 }
 
 impl fmt::Debug for ServerPolicy {
@@ -198,6 +248,7 @@ impl fmt::Debug for ServerPolicy {
                 "remote_unauthenticated_override",
                 &self.remote_unauthenticated_override,
             )
+            .field("api_surface", &self.api_surface)
             .finish()
     }
 }
@@ -210,6 +261,13 @@ impl ServerPolicy {
         validate_positive("max download bytes", options.max_download_bytes)?;
 
         let key = resolve_api_key(options.api_key, options.api_key_file)?;
+
+        if options.api_surface == ApiSurface::LanChatOnly && key.is_none() {
+            return Err(Error::new(
+                ErrorKind::PermissionDenied,
+                "--lan-chat-only requires --api-key or --api-key-file",
+            ));
+        }
 
         if !addr.ip().is_loopback() && key.is_none() && !options.allow_unauthenticated_remote {
             return Err(Error::new(
@@ -241,6 +299,7 @@ impl ServerPolicy {
             cors_origins: cors_origins.into(),
             remote_unauthenticated_override: !addr.ip().is_loopback()
                 && options.allow_unauthenticated_remote,
+            api_surface: options.api_surface,
         })
     }
 
@@ -266,21 +325,31 @@ impl ServerPolicy {
     pub(crate) fn cors_origin_count(&self) -> usize {
         self.cors_origins.len()
     }
+
+    pub(crate) fn request_policy(&self) -> (ApiAuth, ApiSurface) {
+        (self.auth.clone(), self.api_surface)
+    }
+
+    pub(crate) fn api_surface(&self) -> ApiSurface {
+        self.api_surface
+    }
 }
 
 pub(crate) async fn authenticate(
-    State(auth): State<ApiAuth>,
+    State((auth, surface)): State<(ApiAuth, ApiSurface)>,
     request: Request,
     next: Next,
 ) -> Response {
-    if request.method() == Method::OPTIONS
-        || !ApiAuth::route_requires_auth(request.uri().path())
-        || auth.accepts(request.headers())
-    {
+    if request.method() == Method::OPTIONS || !ApiAuth::route_requires_auth(request.uri().path()) {
         return next.run(request).await;
     }
-
-    ApiAuth::unauthorized()
+    if !auth.accepts(request.headers()) {
+        return ApiAuth::unauthorized();
+    }
+    if !surface.allows(request.method(), request.uri().path()) {
+        return surface.forbidden();
+    }
+    next.run(request).await
 }
 
 fn parse_bearer(value: &str) -> Option<&str> {
@@ -567,6 +636,185 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(health.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn lan_chat_surface_requires_a_key_even_on_loopback() {
+        let error = ServerPolicy::resolve(
+            SocketAddr::from(([127, 0, 0, 1], 8181)),
+            ServeOptions {
+                api_surface: ApiSurface::LanChatOnly,
+                ..ServeOptions::default()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("--api-key"));
+    }
+
+    #[test]
+    fn lan_chat_surface_is_an_exact_method_and_path_allowlist() {
+        let surface = ApiSurface::LanChatOnly;
+        for (method, path) in [
+            (Method::GET, "/v1/models"),
+            (Method::GET, "/api/capabilities"),
+            (Method::GET, "/api/models/current"),
+            (Method::GET, "/api/models/local"),
+            (Method::GET, "/api/models/catalog/downloads"),
+            (Method::POST, "/api/models/load"),
+            (Method::POST, "/v1/chat/completions"),
+        ] {
+            assert!(surface.allows(&method, path), "refused {method} {path}");
+        }
+        for (method, path) in [
+            (Method::POST, "/v1/models"),
+            (Method::GET, "/v1/models/loaded-model"),
+            (Method::POST, "/api/models/unload"),
+            (Method::POST, "/api/models/local/delete"),
+            (Method::POST, "/api/models/catalog/install"),
+            (Method::POST, "/api/runtime/gpu"),
+            (Method::GET, "/api/runtime/memory"),
+            (Method::GET, "/api/telemetry/stream"),
+            (Method::POST, "/api/agent/workspace/sessions"),
+            (Method::POST, "/v1/responses"),
+            (Method::POST, "/v1/conversations"),
+            (Method::GET, "/metrics"),
+            (Method::GET, "/api/not-yet-invented"),
+        ] {
+            assert!(!surface.allows(&method, path), "allowed {method} {path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn lan_chat_surface_authenticates_before_it_enforces_the_allowlist() {
+        let models = tempfile::tempdir().unwrap();
+        std::fs::write(models.path().join("local.gguf"), b"not a real gguf").unwrap();
+        let policy = ServerPolicy::resolve(
+            SocketAddr::from(([127, 0, 0, 1], 8181)),
+            ServeOptions {
+                api_key: Some("test-key".to_string()),
+                api_surface: ApiSurface::LanChatOnly,
+                ..ServeOptions::default()
+            },
+        )
+        .unwrap();
+        let state = super::super::AppState::default()
+            .with_models_dir(Some(models.path().to_path_buf()))
+            .with_server_policy(&policy);
+        let app = super::super::router_with_state_and_policy(state, policy);
+
+        let unauthenticated = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/models/catalog/install")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+        let forbidden = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/models/catalog/install")
+                    .header(&X_API_KEY, "test-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+        let body = axum::body::to_bytes(forbidden.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["code"], "lan_chat_only");
+
+        let allowed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/models")
+                    .header(&X_API_KEY, "test-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(allowed.status(), StatusCode::OK);
+
+        let arbitrary_model = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/models/load")
+                    .header(&X_API_KEY, "test-key")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"path":"outside.gguf","replace":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(arbitrary_model.status(), StatusCode::FORBIDDEN);
+        let body = axum::body::to_bytes(arbitrary_model.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["code"], "lan_model_not_local");
+
+        let local_model = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/models/load")
+                    .header(&X_API_KEY, "test-key")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"path":"ignored","filename":"local.gguf","replace":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(local_model.status(), StatusCode::BAD_REQUEST);
+
+        let chat = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/chat/completions")
+                    .header(&X_API_KEY, "test-key")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(chat.status(), StatusCode::FORBIDDEN);
+
+        let health = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(health.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["api_surface"], "lan_chat_only");
     }
 
     #[tokio::test]

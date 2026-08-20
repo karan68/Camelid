@@ -11,6 +11,7 @@ import { copyText } from '../lib/markdown'
 import { getConfiguredMaxTokens, setConfiguredMaxTokens } from '../lib/responseLimits'
 import { getStoredApiKey, setStoredApiKey } from '../lib/apiAuth'
 import { appStorage } from '../lib/appStorage.js'
+import { isLanChatOnly } from '../lib/apiSurface.js'
 import { ResponseLengthControl } from '../components/settings/ResponseLengthControl'
 
 const THEME_OPTS = [
@@ -20,6 +21,8 @@ const THEME_OPTS = [
 ]
 
 export default function SettingsView({
+  authRequired = false,
+  apiSurface = 'full',
   runtime,
   apiBase,
   setApiBase,
@@ -47,8 +50,14 @@ export default function SettingsView({
   const [gpu, setGpu] = useState(null)
   const [gpuBusy, setGpuBusy] = useState(false)
   const copyResetRef = useRef(null)
+  const apiKeyRef = useRef(null)
 
   useEffect(() => () => { if (copyResetRef.current) window.clearTimeout(copyResetRef.current) }, [])
+
+  useEffect(() => {
+    if (!authRequired) return
+    apiKeyRef.current?.focus()
+  }, [authRequired])
 
   // GPU (CUDA) acceleration availability + on/off state. Only present on a
   // CUDA-capable build/host; the card stays hidden everywhere else.
@@ -99,7 +108,12 @@ export default function SettingsView({
   const handleSaveApiKey = () => {
     const next = apiKeyDraft.trim()
     setStoredApiKey(next)
-    showNotice?.(next ? 'API key saved in this browser.' : 'API key cleared.', 'success')
+    showNotice?.(
+      next
+        ? authRequired ? 'API key saved. Checking access…' : 'API key saved in this browser.'
+        : 'API key cleared.',
+      next && !authRequired ? 'success' : 'info',
+    )
     refreshDashboard?.()
   }
 
@@ -190,8 +204,13 @@ export default function SettingsView({
       </Card>
 
       <Card>
-        <CardHeader eyebrow="Connection" title="API base URL" />
+        <CardHeader eyebrow="Connection" title={authRequired ? 'API key required' : 'API base URL'} />
         <CardBody>
+          {authRequired && (
+            <p className="settings-help" role="status" id="api-key-required-message">
+              Camelid is online and requires the laptop&apos;s LAN Chat key. Ask the laptop owner to run <code>camelid lan-key</code> and share the displayed key directly.
+            </p>
+          )}
           <p className="settings-help">Where the UI sends requests. Change this to reach a backend on another host or port.</p>
           <div className="settings-inline">
             <input type="text" value={apiBaseDraft} spellCheck={false} onChange={(e) => setApiBaseDraft(e.target.value)} placeholder="http://127.0.0.1:8181" />
@@ -199,7 +218,16 @@ export default function SettingsView({
           </div>
           <p className="settings-help">API key for authenticated LAN or remote backends. It is stored only in this browser.</p>
           <div className="settings-inline">
-            <input type="password" value={apiKeyDraft} autoComplete="off" spellCheck={false} onChange={(e) => setApiKeyDraft(e.target.value)} placeholder="Optional API key" />
+            <input
+              ref={apiKeyRef}
+              type="password"
+              value={apiKeyDraft}
+              autoComplete="off"
+              spellCheck={false}
+              aria-describedby={authRequired ? 'api-key-required-message' : undefined}
+              onChange={(e) => setApiKeyDraft(e.target.value)}
+              placeholder={authRequired ? 'Enter the server API key' : 'Optional API key'}
+            />
             <Button variant="tonal" onClick={handleSaveApiKey}>Save key</Button>
           </div>
         </CardBody>
@@ -231,15 +259,17 @@ export default function SettingsView({
         </Card>
       )}
 
-      <Card interactive className="settings-cluster-card" onClick={onOpenCluster}>
-        <CardHeader
-          icon={<IconNetwork size={20} />}
-          eyebrow="Infrastructure"
-          title="Cluster Topology"
-          actions={<IconChevronRight size={20} />}
-        />
-        <CardBody>Connect Macs, Windows PCs, Linux servers, and Raspberry Pis into one local Camelid compute fabric — add machines, assign roles, and see how everything is wired.</CardBody>
-      </Card>
+      {!isLanChatOnly(apiSurface) && (
+        <Card interactive className="settings-cluster-card" onClick={onOpenCluster}>
+          <CardHeader
+            icon={<IconNetwork size={20} />}
+            eyebrow="Infrastructure"
+            title="Cluster Topology"
+            actions={<IconChevronRight size={20} />}
+          />
+          <CardBody>Connect Macs, Windows PCs, Linux servers, and Raspberry Pis into one local Camelid compute fabric — add machines, assign roles, and see how everything is wired.</CardBody>
+        </Card>
+      )}
 
       <Card>
         <CardHeader eyebrow="Chat" title="Response length" />

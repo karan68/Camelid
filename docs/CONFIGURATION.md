@@ -66,9 +66,50 @@ target/release/camelid serve \
 API clients can send either `Authorization: Bearer <key>` or `X-API-Key: <key>`. Health and embedded
 same-origin UI assets remain public; API routes, including `/metrics`, require the key. CORS is
 disabled by default and accepts only explicit `http://` or `https://` origins—wildcard and `null`
-origins are refused. The bundled browser UI does not persist or inject the server API key, so use
-an API client or an authenticating reverse proxy for authenticated remote deployments. The existing
-frictionless browser UI remains the anonymous-loopback experience.
+origins are refused. The bundled browser UI stores an entered key in that browser and injects it
+only for the configured API origin. A fresh browser that reaches an authenticated listener opens
+the Settings credential field; a wrong key remains there instead of reporting the server offline.
+
+### Trusted-LAN browser Chat
+
+Create the LAN credential on the laptop first:
+
+```bash
+camelid lan-key
+```
+
+The command creates a 256-bit key under the platform app-data directory, or displays the existing
+key without changing it. Share the displayed key directly with the phone user and treat it like a
+password. Do not put it in a URL, screenshot, issue, or chat message. Run `camelid lan-key --rotate`
+only when you intend to invalidate every browser holding the old key.
+
+`--lan-chat-only` exposes the minimum authenticated backend surface used by the embedded Chat UI.
+It permits Chat and switching among direct regular `.gguf` files already present in the configured
+models directory. The switch request carries an explicit filename; absolute paths, traversal,
+prefixed paths, symlinks/reparse points, missing files, and non-GGUF files are rejected before any
+model transition. Downloads, deletion, arbitrary-path loading, unload-only operations, runtime
+controls, Workspace, Responses/Conversations, metrics, and every unknown protected route remain
+refused. Missing or wrong credentials still get `401` before route scope is considered. Bind the
+laptop's specific private address rather than every adapter:
+
+```bash
+target/release/camelid serve \
+  --addr <LAPTOP-LAN-IP>:8181 \
+  --model /path/to/model.gguf \
+  --api-key-file ./camelid-api.key \
+  --lan-chat-only \
+  --no-open
+```
+
+Open `http://<LAPTOP-LAN-IP>:8181` on the phone, then enter the same key under Settings. Both devices
+use inference on the laptop; the phone only runs the browser interface. The Chat model selector can
+switch to another local GGUF from that host's configured model directory. No CORS flag is needed for
+the embedded same-origin UI. Permit the port only on the operating system's private-network firewall
+profile.
+
+This mode authenticates but does not encrypt plain HTTP. Use it only on a trusted private LAN, or put
+the listener behind an encrypted private transport. Ordinary Chat conversations still live in each
+browser's storage, so laptop and phone history do not synchronize in this phase.
 
 Direct TLS is optional and requires a PEM certificate chain and private key together:
 
@@ -88,6 +129,9 @@ Resource ceilings are resolved once at startup. Their CLI names and environment 
 | `--max-prompt-tokens` | 131,072 | `CAMELID_MAX_PROMPT_TOKENS` |
 | `--max-generation-tokens` | 8,192 | `CAMELID_MAX_GENERATION_TOKENS` |
 | `--max-download-bytes` | 64 GiB | `CAMELID_MAX_DOWNLOAD_BYTES` |
+
+`--lan-chat-only` also has the environment alias `CAMELID_LAN_CHAT_ONLY=1` and always requires
+`CAMELID_API_KEY` or `CAMELID_API_KEY_FILE`. It conflicts with the anonymous remote override.
 
 `GET /metrics` exposes bounded-name Prometheus counters and gauges for HTTP/generation latency,
 prompt/decode tokens, prompt and weight cache outcomes, engine queue/slot progress, process RSS,

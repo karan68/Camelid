@@ -75,13 +75,19 @@ Camelid opens `http://127.0.0.1:8181`. Use `camelid chat` for the terminal UI, o
 Run `camelid pull` without an argument to list the curated model catalog.
 
 > [!WARNING]
-> A non-loopback listener requires authentication. Prefer an API key file:
+> A non-loopback listener requires authentication. For browser Chat on a trusted private LAN, bind
+> the laptop's specific LAN address, start with a model, and use the restricted surface:
 >
 > ```bash
-> camelid serve --addr 0.0.0.0:8181 --api-key-file ./camelid-api.key
+> camelid serve --addr <LAPTOP-LAN-IP>:8181 --model models/Llama-3.2-3B-Instruct-Q8_0.gguf --api-key-file ./camelid-api.key --lan-chat-only
 > ```
 >
-> See [configuration](docs/CONFIGURATION.md) for CORS, TLS, and remote-deployment options.
+> The phone is only a web interface; inference stays on the laptop. Plain HTTP is not encrypted, and
+> Chat history is still stored separately in each browser. Run `camelid lan-key` on the laptop to
+> create or display the key shared with the phone. The mobile Chat model selector may switch only
+> among local GGUF files already in the configured models directory. See
+> [configuration](docs/CONFIGURATION.md) for the exact route boundary, key rotation, firewall
+> guidance, CORS, TLS, and remote-deployment options.
 
 ## Supported models
 

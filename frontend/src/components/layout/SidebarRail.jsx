@@ -4,6 +4,7 @@ import { StatusDot } from '../ui/StatusDot'
 import { ThemeToggle } from '../ui/ThemeToggle'
 import { Tooltip } from '../ui/Tooltip'
 import { ConversationListItem } from './ConversationListItem'
+import { apiSurfaceAllowsTab } from '../../lib/apiSurface.js'
 import {
   IconAnalytics, IconApi, IconBolt, IconChart, IconChat, IconClose, IconHistory, IconMemory, IconModels,
   IconDownload, IconNetwork, IconNewChat, IconObservatory, IconReceipt, IconSearch, IconSettings, IconSidebar, IconSystem,
@@ -44,8 +45,6 @@ const NAV_SECTIONS = [
     ],
   },
 ]
-const NAV_ITEMS = NAV_SECTIONS.flatMap((section) => section.items)
-
 const RECENT_LIMIT = 6
 
 const BUCKETS = ['Today', 'Yesterday', 'Previous 7 days', 'Earlier']
@@ -73,6 +72,7 @@ export function SidebarRail({
   renameConversation,
   requestDeleteConversation,
   runtime,
+  apiSurface = 'full',
   themePreference,
   themeResolved,
   onCycleTheme,
@@ -82,6 +82,13 @@ export function SidebarRail({
     filteredConversations.slice(0, RECENT_LIMIT).forEach((c) => groups.get(bucketFor(c.updated_at))?.push(c))
     return BUCKETS.map((label) => ({ label, items: groups.get(label) || [] })).filter((g) => g.items.length)
   }, [filteredConversations])
+  const visibleSections = useMemo(() => NAV_SECTIONS
+    .map((section) => ({
+      ...section,
+      items: section.items.filter((item) => apiSurfaceAllowsTab(apiSurface, item.tab)),
+    }))
+    .filter((section) => section.items.length), [apiSurface])
+  const visibleItems = useMemo(() => visibleSections.flatMap((section) => section.items), [visibleSections])
 
   const online = runtime?.status === 'online'
   const statusTone = online ? 'ready' : 'offline'
@@ -103,7 +110,7 @@ export function SidebarRail({
           </Tooltip>
         </div>
         <nav className="rail__rail-nav" aria-label="Primary">
-          {NAV_ITEMS.map(({ tab: t, label, Icon }) => (
+          {visibleItems.map(({ tab: t, label, Icon }) => (
             <Tooltip key={t} content={label} placement="right">
               <button type="button" className={`rail__icon-btn ${tab === t ? 'is-active' : ''}`} aria-label={label} aria-current={tab === t ? 'page' : undefined} onClick={() => setTab(t)}>
                 <Icon size={20} />
@@ -192,7 +199,7 @@ export function SidebarRail({
         </div>
 
         <nav className="rail__nav" aria-label="Primary">
-          {NAV_SECTIONS.map(({ label: sectionLabel, items }) => (
+          {visibleSections.map(({ label: sectionLabel, items }) => (
             <div key={sectionLabel} className="rail__section">
               <div className="rail__section-label">{sectionLabel}</div>
               {items.map(({ tab: t, label, Icon }) => (

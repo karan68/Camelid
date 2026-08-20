@@ -445,6 +445,13 @@ jobs:
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: npm run smoke:offline-banner
 
+      # Real-browser trusted-LAN flow: public UI bootstrap, missing/wrong/correct
+      # key states, same-origin-only credential injection, exact-row Chat SSE,
+      # mobile geometry, restricted navigation, and credential reuse on reload.
+      - name: Frontend LAN Chat authentication smoke
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: npm run smoke:lan-auth
+
       # Covers frontend/src/lib/catalogBrowse.js: fit labels/details, the
       # settled-vs-retryable `unknown` split, grouping and search ranking. The
       # script shipped with the lane but was never wired here, so none of that

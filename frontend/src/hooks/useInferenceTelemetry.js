@@ -19,6 +19,11 @@ let connectedBase = null
    on first view mount would still lose every run made before the user ever
    opens the Observatory. */
 export function ensureInferenceTelemetryConnected(apiBase) {
+  if (!apiBase) {
+    sharedStore.disconnect()
+    connectedBase = null
+    return
+  }
   if (apiBase && apiBase !== connectedBase) {
     connectedBase = apiBase
     sharedStore.connect(apiBase)
