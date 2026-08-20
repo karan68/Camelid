@@ -42,7 +42,9 @@
 //! * `--api-key` and `--api-key-file` configure one fixed key that cannot be
 //!   rotated without restarting. `--client-keys` instead names clients and
 //!   re-reads its file when it changes, so one client's key can be revoked or
-//!   rotated without disturbing the others.
+//!   rotated without disturbing the others — but a re-read that fails keeps
+//!   the previous set in force, so a revocation written into a file that no
+//!   longer parses has not taken effect until it does.
 //! * A [`ProxyTls`] pair encrypts what clients send. It is a separate refusal
 //!   from the one above and neither stands in for the other: a key sent over
 //!   cleartext is a key given away, and TLS says nothing about who may drive
@@ -512,7 +514,7 @@ fn refuse_unauthenticated_remote(
         format!(
             "refusing unauthenticated non-loopback listener {addr}; this would expose every \
              configured node to the network. Bind a loopback address, configure \
-             --api-key/--api-key-file, or explicitly acknowledge the risk with \
+             --api-key/--api-key-file/--client-keys, or explicitly acknowledge the risk with \
              --allow-unauthenticated-remote"
         ),
     ))
@@ -2266,8 +2268,9 @@ mod tests {
             error.to_string().contains("--allow-unauthenticated-remote"),
             "{error}"
         );
-        // ...including the way out that does not give up authentication.
+        // ...including both ways out that do not give up authentication.
         assert!(error.to_string().contains("--api-key"), "{error}");
+        assert!(error.to_string().contains("--client-keys"), "{error}");
     }
 
     #[test]
