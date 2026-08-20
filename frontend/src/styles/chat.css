@@ -448,11 +448,38 @@
 /* Narrow composer: the labeled toolbar buttons collapse to icon-only (their
    aria-labels and title tooltips keep them identifiable) so the toolbar stays
    a single row and the docked composer keeps its height in check. */
-@media (max-width: 640px) {
+@media (max-width: 860px) {
+  .cxcomposer__toolbar { align-items: center; }
+  .cxcomposer__tools {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    overscroll-behavior-inline: contain;
+    scrollbar-width: none;
+  }
+  .cxcomposer__tools::-webkit-scrollbar { display: none; }
+  .cxcomposer__model { flex: 0 1 150px; min-width: 104px; }
   .cxcomposer__tool--collapsible .cxcomposer__tool-label { display: none; }
-  .cxcomposer__tool--collapsible { width: 32px; padding: 0; justify-content: center; }
-  .cxcomposer__model-select { max-width: 150px; }
+  .cxcomposer__tool--collapsible { width: 32px; padding: 0; flex: none; justify-content: center; }
+  .cxcomposer__model-select { width: 100%; min-width: 0; max-width: 150px; }
   .cxchat__empty { gap: var(--space-6); padding: var(--space-6) 0; }
+}
+
+@media (max-width: 860px) and (max-height: 500px) and (orientation: landscape) {
+  .cxchat__column { padding-inline: max(var(--space-3), env(safe-area-inset-left)) max(var(--space-3), env(safe-area-inset-right)); }
+  .cxchat__thread { gap: var(--space-4); padding-block: var(--space-2); }
+  .cxturn { gap: var(--space-2); }
+  .cxturn__avatar { display: none; }
+  .cxturn__actions { margin-top: var(--space-2); }
+  .cxturn__meta { gap: var(--space-1) var(--space-2); }
+  .parity-receipt-card { margin-top: var(--space-2); padding: var(--space-3); }
+  .cxchat__dock { padding-bottom: max(var(--space-1), env(safe-area-inset-bottom)); }
+  .cxcomposer__box { padding: var(--space-1) var(--space-2); border-radius: var(--radius-lg); }
+  .cxcomposer__input { max-height: 56px; padding: 0 var(--space-2); }
+  .cxcomposer__toolbar { margin-top: 0; }
+  .cxcomposer__status { flex-wrap: nowrap; margin-top: var(--space-1); padding-inline: var(--space-1); }
+  .cxcomposer__status-line { flex: 1; overflow: hidden; }
+  .cxcomposer__status-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .cxcomposer__status-info { width: 18px; height: 18px; }
 }
 
 /* ---- Ported from the retired pre-redesign sheet: streaming-loader + diagnostics-trigger
