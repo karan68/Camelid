@@ -419,8 +419,17 @@ export default function ChatWorkspace({
   useLayoutEffect(() => {
     const input = composerRef.current
     if (!input) return
-    input.style.height = 'auto'
-    input.style.height = `${Math.min(input.scrollHeight, 220)}px`
+    const resize = () => {
+      input.style.height = 'auto'
+      input.style.height = `${Math.min(input.scrollHeight, 220)}px`
+    }
+    resize()
+    window.addEventListener('resize', resize)
+    window.visualViewport?.addEventListener('resize', resize)
+    return () => {
+      window.removeEventListener('resize', resize)
+      window.visualViewport?.removeEventListener('resize', resize)
+    }
   }, [composer, isFreshThread, selectedConversation?.id])
 
   useEffect(() => {
