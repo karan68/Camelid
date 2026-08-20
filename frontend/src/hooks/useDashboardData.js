@@ -543,6 +543,7 @@ function makeDashboard({ health, models, currentModel, capabilities, conversatio
     models,
     runtime: {
       engine: normalizeEngineName(health?.engine),
+      api_surface: health?.api_surface || 'full',
       // Which build is answering. `runtime` is an explicit projection of health, not a
       // pass-through, so a field absent here is invisible to every view no matter what
       // /v1/health serializes.
@@ -581,6 +582,7 @@ function makeDashboard({ health, models, currentModel, capabilities, conversatio
 
 export function useDashboardData({ showNotice, clearNotice }) {
   const [dashboard, setDashboard] = useState(null)
+  const [authRequired, setAuthRequired] = useState(false)
   const [apiBase, setApiBaseState] = useState(getApiBase)
   const [tab, setTab] = useState(getInitialTab)
   const [selectedConversationId, setSelectedConversationIdState] = useState(getInitialConversationId)
@@ -818,6 +820,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
         memories: currentLocalMemories,
         apiBase: normalizedApiBase,
       })
+      setAuthRequired(false)
       setDashboard(nextDashboard)
       if (!silent) clearNotice()
       setSelectedConversationId((current) => {
@@ -845,6 +848,8 @@ export function useDashboardData({ showNotice, clearNotice }) {
         return chatUnlockedModel?.id || firstChatModel?.id || ''
       })
     } catch (error) {
+      const requiresAuth = error?.status === 401
+      setAuthRequired(requiresAuth)
       const fallbackDashboard = makeDashboard({
         health: { ok: false, engine: 'camelid', generation_ready: false, active_model_id: null },
         models: mergeModelLists({
@@ -861,7 +866,14 @@ export function useDashboardData({ showNotice, clearNotice }) {
         apiBase: normalizedApiBase,
       })
       setDashboard(fallbackDashboard)
-      if (!silent) showNotice(`Could not reach Camelid at ${normalizedApiBase}: ${getErrorMessage(error)}`, 'error')
+      if (!silent) {
+        showNotice(
+          requiresAuth
+            ? 'Camelid is reachable, but this browser needs the server API key.'
+            : `Could not reach Camelid at ${normalizedApiBase}: ${getErrorMessage(error)}`,
+          requiresAuth ? 'info' : 'error',
+        )
+      }
     }
   }
 
@@ -1674,7 +1686,12 @@ export function useDashboardData({ showNotice, clearNotice }) {
       // fit preflight judges this model against a host that has released the last one.
       const loaded = await fetchJson(`${normalizedApiBase}/api/models/load`, {
         method: 'POST',
-        body: JSON.stringify({ id, path: model.model_path, replace: true }),
+        body: JSON.stringify({
+          id,
+          path: model.model_path,
+          filename: modelFilenameFromPath(model.model_path),
+          replace: true,
+        }),
       })
       const loadedId = loaded?.id || id
       const loadedPath = getModelPath(loaded) || model.model_path
@@ -1828,6 +1845,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
 
   return {
     dashboard,
+    authRequired,
     tab,
     setTab,
     selectedConversationId,

@@ -9,6 +9,7 @@ import { isFirstRunHost } from './lib/firstRunActivation'
 import { formatPreview, formatSidebarDate } from './lib/formatters'
 import { hasOverlayTitleBar } from './lib/desktopShell'
 import { appStorage } from './lib/appStorage.js'
+import { apiSurfaceAllowsTab, isLanChatOnly } from './lib/apiSurface.js'
 import { useDashboardData } from './hooks/useDashboardData'
 import { useBackendLauncher } from './hooks/useBackendLauncher'
 import { useNotice } from './hooks/useNotice'
@@ -70,7 +71,7 @@ function App() {
 
   const dash = useDashboardData({ showNotice, clearNotice })
   const {
-    dashboard, tab, setTab, selectedConversationId, setSelectedConversationId,
+    dashboard, authRequired, tab, setTab, selectedConversationId, setSelectedConversationId,
     selectedModelId, setSelectedModelId, search, setSearch, memorySearch, setMemorySearch,
     composer, setComposer, newChatTitle, setNewChatTitle, sending, receiptMode, setReceiptMode,
     thinkingMode, setThinkingMode,
@@ -85,6 +86,33 @@ function App() {
   } = dash
 
   const backend = useBackendLauncher({ showNotice, loadDashboard })
+  const authReturnTabRef = useRef(null)
+  const apiSurface = runtime?.api_surface || 'full'
+
+  useEffect(() => {
+    if (authRequired) {
+      if (authReturnTabRef.current === null) {
+        authReturnTabRef.current = tab === 'settings' ? 'chat' : tab
+      }
+      if (tab !== 'settings') setTab('settings')
+      // Credential setup is a detour, not the user's chosen destination. Keep
+      // a reload on the intended view while the protected request decides
+      // whether the stored key is accepted.
+      appStorage.setItem('camelid.activeTab', authReturnTabRef.current)
+      return
+    }
+    if (authReturnTabRef.current !== null) {
+      const returnTab = authReturnTabRef.current
+      authReturnTabRef.current = null
+      setTab(returnTab)
+    }
+  }, [authRequired, setTab, tab])
+
+  useEffect(() => {
+    if (apiSurfaceAllowsTab(apiSurface, tab)) return
+    setTab('chat')
+    if (typeof window !== 'undefined') window.history.replaceState(null, '', window.location.pathname)
+  }, [apiSurface, setTab, tab])
 
   useEffect(() => {
     if (tab === 'library') setModelsVisited(true)
@@ -124,10 +152,22 @@ function App() {
   }, [mobileNavOpen])
 
   /* Observatory stream listens from app start (Phase 6.1 DEFECT 1): runs made
-     before the view's first mount must not be invisible. */
+     before the view's first mount must not be invisible. It waits for one
+     health answer first, because until then the surface is unknown and a
+     stream opened against a LAN Chat listener would retry a 401 forever. Once
+     open it stays open: a later health blip is not a reason to drop a live
+     run. */
+  const telemetryConnectedRef = useRef(false)
   useEffect(() => {
-    if (apiBase) ensureInferenceTelemetryConnected(apiBase)
-  }, [apiBase])
+    if (isLanChatOnly(apiSurface)) {
+      telemetryConnectedRef.current = false
+      ensureInferenceTelemetryConnected(null)
+      return
+    }
+    if (!telemetryConnectedRef.current && runtime?.status !== 'online') return
+    telemetryConnectedRef.current = true
+    ensureInferenceTelemetryConnected(apiBase)
+  }, [apiBase, apiSurface, runtime?.status])
 
   /* Remember where the engine lives while it is still answering. Once it stops,
      the offline banner needs this to offer a command that actually runs, and by
@@ -182,9 +222,10 @@ function App() {
   }, [mobileNavOpen, paletteOpen, shortcutsOpen])
 
   const navigateTab = (next) => {
-    setTab(next)
-    if (typeof window !== 'undefined' && HASH_TABS.has(next)) {
-      window.history.replaceState(null, '', next === 'chat' ? window.location.pathname : `#${next}`)
+    const allowedTab = apiSurfaceAllowsTab(apiSurface, next) ? next : 'chat'
+    setTab(allowedTab)
+    if (typeof window !== 'undefined' && HASH_TABS.has(allowedTab)) {
+      window.history.replaceState(null, '', allowedTab === 'chat' ? window.location.pathname : `#${allowedTab}`)
     }
     closeMobileNav()
   }
@@ -293,6 +334,7 @@ function App() {
           renameConversation={renameConversation}
           requestDeleteConversation={requestDeleteConversation}
           runtime={runtime}
+          apiSurface={apiSurface}
           themePreference={preference}
           themeResolved={resolved}
           onCycleTheme={cyclePreference}
@@ -328,7 +370,7 @@ function App() {
           <BackendBanner backend={backend} apiBase={apiBase} onOpenSettings={() => navigateTab('settings')} />
         )}
 
-        {!DEMO_UI && firstRunActive && (
+        {!DEMO_UI && firstRunActive && !isLanChatOnly(apiSurface) && (
           <div className="camelid-firstrun-slot" hidden={tab !== 'chat'}>
             <FirstRunCard
               apiBase={apiBase}
@@ -459,6 +501,8 @@ function App() {
 
           {tab === 'settings' && (
             <SettingsView
+              authRequired={authRequired}
+              apiSurface={apiSurface}
               runtime={runtime}
               apiBase={apiBase}
               setApiBase={setApiBase}
@@ -490,6 +534,7 @@ function App() {
         cyclePreference={cyclePreference}
         models={models}
         capabilities={dashboard?.capabilities?.model_compatibility || []}
+        apiSurface={apiSurface}
         setSelectedModelId={setSelectedModelId}
       />
       <ShortcutsOverlay open={shortcutsOpen} onClose={() => setShortcutsOpen(false)} />

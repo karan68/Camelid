@@ -140,6 +140,15 @@ jobs:
       - name: Verify public evidence bundle checksums
         run: bash scripts/check-evidence-bundle-checksums.sh
 
+      # Design evidence makes the same privacy and checksum claims as a
+      # qa/ bundle, and both gates default to that other root, so without
+      # these two lines those claims are only self-attested.
+      - name: Audit design evidence for private details
+        run: node scripts/audit-evidence-bundle-privacy.mjs --root frontend/design-evidence --strict
+
+      - name: Verify design evidence checksums
+        run: bash scripts/check-evidence-bundle-checksums.sh frontend/design-evidence
+
       - name: Check public evidence claims
         run: node scripts/check-public-evidence-claims.mjs
 
@@ -444,6 +453,13 @@ jobs:
       - name: Frontend offline banner smoke
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: npm run smoke:offline-banner
+
+      # Real-browser trusted-LAN flow: public UI bootstrap, missing/wrong/correct
+      # key states, same-origin-only credential injection, exact-row Chat SSE,
+      # mobile geometry, restricted navigation, and credential reuse on reload.
+      - name: Frontend LAN Chat authentication smoke
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: npm run smoke:lan-auth
 
       # Covers frontend/src/lib/catalogBrowse.js: fit labels/details, the
       # settled-vs-retryable `unknown` split, grouping and search ranking. The

@@ -344,6 +344,55 @@ mod ghost_moe_cli_tests {
             }
         });
     }
+
+    #[test]
+    fn serve_parses_lan_chat_only_and_refuses_the_anonymous_override() {
+        on_cli_test_stack(|| {
+            let cli = Cli::try_parse_from([
+                "camelid",
+                "serve",
+                "--lan-chat-only",
+                "--api-key-file",
+                "camelid.key",
+                "--no-open",
+            ])
+            .expect("parse authenticated LAN Chat flags");
+            match cli.command {
+                Some(Command::Serve {
+                    server, no_open, ..
+                }) => {
+                    assert!(server.lan_chat_only);
+                    assert_eq!(server.api_key_file, Some(PathBuf::from("camelid.key")));
+                    assert!(no_open);
+                }
+                other => panic!("expected Serve, got {other:?}"),
+            }
+
+            Cli::try_parse_from([
+                "camelid",
+                "serve",
+                "--lan-chat-only",
+                "--allow-unauthenticated-remote",
+            ])
+            .expect_err("LAN Chat accepted the anonymous remote override");
+        });
+    }
+
+    #[test]
+    fn lan_key_parses_with_rotation_explicit_and_off_by_default() {
+        on_cli_test_stack(|| {
+            for (args, expected) in [
+                (vec!["camelid", "lan-key"], false),
+                (vec!["camelid", "lan-key", "--rotate"], true),
+            ] {
+                let cli = Cli::try_parse_from(args).unwrap();
+                match cli.command {
+                    Some(Command::LanKey { rotate }) => assert_eq!(rotate, expected),
+                    other => panic!("expected LanKey, got {other:?}"),
+                }
+            }
+        });
+    }
 }
 
 use camelid::{
@@ -465,6 +514,16 @@ struct ServerPolicyArgs {
         default_value_t = false
     )]
     allow_unauthenticated_remote: bool,
+    /// Expose only the authenticated read surface needed by the embedded Chat
+    /// UI plus chat completions. Model mutation, Workspace, Responses, runtime
+    /// controls, and every other protected route return a typed 403.
+    #[arg(
+        long,
+        env = "CAMELID_LAN_CHAT_ONLY",
+        default_value_t = false,
+        conflicts_with = "allow_unauthenticated_remote"
+    )]
+    lan_chat_only: bool,
     /// PEM certificate chain for HTTPS. Requires --tls-key.
     #[arg(long, env = "CAMELID_TLS_CERT", requires = "tls_key")]
     tls_cert: Option<PathBuf>,
@@ -526,6 +585,7 @@ impl ServerPolicyArgs {
                 })
                 .unwrap_or_default(),
             allow_unauthenticated_remote: enabled("CAMELID_ALLOW_UNAUTHENTICATED_REMOTE"),
+            lan_chat_only: enabled("CAMELID_LAN_CHAT_ONLY"),
             tls_cert: std::env::var_os("CAMELID_TLS_CERT").map(PathBuf::from),
             tls_key: std::env::var_os("CAMELID_TLS_KEY").map(PathBuf::from),
             max_request_body_bytes: parsed("CAMELID_MAX_REQUEST_BODY_BYTES", 16 * 1024 * 1024),
@@ -547,6 +607,11 @@ impl ServerPolicyArgs {
             max_prompt_tokens: self.max_prompt_tokens,
             max_generation_tokens: self.max_generation_tokens,
             max_download_bytes: self.max_download_bytes,
+            api_surface: if self.lan_chat_only {
+                api::ApiSurface::LanChatOnly
+            } else {
+                api::ApiSurface::Full
+            },
         }
     }
 }
@@ -1436,6 +1501,13 @@ mod fabric_command_tests {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Create or display the local credential used by authenticated LAN Chat.
+    LanKey {
+        /// Replace the existing key, immediately invalidating browsers that
+        /// still hold it. Without this flag the existing key is reused.
+        #[arg(long, default_value_t = false)]
+        rotate: bool,
+    },
     /// Start the local HTTP API server.
     Serve {
         #[arg(long, default_value = "127.0.0.1:8181", env = "CAMELID_ADDR")]
@@ -2569,6 +2641,25 @@ async fn main() -> anyhow::Result<()> {
     }
 
     match command {
+        Command::LanKey { rotate } => {
+            let credential = camelid::lan_key::provision(rotate)?;
+            println!(
+                "LAN Chat key {} at {}",
+                if credential.created() {
+                    "created"
+                } else {
+                    "loaded"
+                },
+                credential.path().display()
+            );
+            println!("\n{}\n", credential.secret());
+            println!("Treat this key like a password. Share it directly with the phone user.");
+            println!("Never put it in a URL, screenshot, issue, or chat message.");
+            println!(
+                "\nStart the server with:\n  camelid serve --lan-chat-only --api-key-file \"{}\" --addr <LAPTOP-LAN-IP>:8181 --model <MODEL.gguf>",
+                credential.path().display()
+            );
+        }
         Command::Serve {
             addr,
             model,
