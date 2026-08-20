@@ -108,8 +108,8 @@ use serde_json::Value;
 
 use super::client_keys::Admission;
 use super::policy::{route, RouteDecision, RouteError, RouteMode, RouteRequest};
-use super::{self as fabric, Cancel, DispatchError, Fabric, ForwardError, StreamOutcome};
 use crate::api::{ApiAuth, DEFAULT_MAX_REQUEST_BODY_BYTES};
+use crate::fabric::{self as fabric, Cancel, DispatchError, Fabric, ForwardError, StreamOutcome};
 use crate::tls_pair::resolve_tls;
 
 /// Optional header a client sends to request affinity to a specific node.
@@ -1122,7 +1122,7 @@ async fn stream_completion(
             &dispatch_cancel,
         );
 
-        let (mut streaming, _placement) = match outcome {
+        let (mut streaming, mut placement) = match outcome {
             Err(error) => {
                 let _ = start_tx.send(StreamStart::Failed(error));
                 return;
@@ -1156,19 +1156,38 @@ async fn stream_completion(
                 }
             }
         };
+        let mut client_backpressured = false;
 
         loop {
             match streaming.next_chunk() {
-                Ok(None) => return,
+                Ok(None) => {
+                    if !client_backpressured {
+                        placement.record_success(streaming.elapsed());
+                    }
+                    return;
+                }
                 Ok(Some(chunk)) => {
                     // A closed channel means the client hung up. Returning drops
                     // the node's socket with it, so the generation is not left
                     // running for nobody.
-                    if chunk_tx.blocking_send(Ok(chunk)).is_err() {
-                        return;
+                    match chunk_tx.try_send(Ok(chunk)) {
+                        Ok(()) => {}
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(chunk)) => {
+                            // Once the channel fills, elapsed wall time includes
+                            // client backpressure rather than only node service.
+                            // Finish relaying, but never train placement on it.
+                            client_backpressured = true;
+                            if chunk_tx.blocking_send(chunk).is_err() {
+                                return;
+                            }
+                        }
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return,
                     }
                 }
                 Err(error) => {
+                    if !matches!(error, ForwardError::Cancelled { .. }) {
+                        placement.invalidate_service_time();
+                    }
                     let _ = chunk_tx.blocking_send(Err(error.to_string()));
                     return;
                 }

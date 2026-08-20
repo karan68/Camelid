@@ -1,9 +1,9 @@
 //! Routing policy: which node receives a whole request.
 //!
-//! Every function here is pure. The fabric's correctness lives in this file, so
-//! it is deliberately separated from the socket work in [`super::probe`] and can
-//! be tested exhaustively against hand-built snapshots with no network, no
-//! server and no model.
+//! Selection has no I/O or external side effects: the fabric supplies snapshots
+//! of observed load, reservations and learned service time, and this module
+//! returns a decision. The service-time book performs no socket work either, so
+//! both halves are tested against hand-built facts with no server or model.
 //!
 //! Two properties are load-bearing and each has a test that fails without it:
 //!
@@ -15,11 +15,34 @@
 
 use super::node::{NodeSnapshot, NodeStatus};
 
+/// Successful completions required from every candidate before learned
+/// service times may decide placement.
+///
+/// Until then the existing least-load rule explores the fabric without making
+/// a routing claim from one unusually fast or slow request.
+const MIN_SERVICE_TIME_SAMPLES: u32 = 5;
+
+/// Weight of history in the steady-state EWMA. The new sample owns the fifth
+/// part; integer arithmetic keeps the policy deterministic on every platform.
+const EWMA_HISTORY_WEIGHT: u128 = 4;
+
+/// A node not sampled inside this window is explored again before its old
+/// speed may decide placement. This catches thermal, power and topology
+/// changes without continuously diverting traffic from the estimated winner.
+const MAX_SERVICE_TIME_AGE: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// Dynamic node files and model switches must not grow resident policy state
+/// without bound. This is far above a practical fabric's active class count.
+const MAX_SERVICE_CLASSES: usize = 1_024;
+
 /// How to choose among eligible nodes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RouteMode {
     /// Spread independent requests over the least-loaded nodes.
     Throughput,
+    /// Minimise estimated time to finish from measured service time and load,
+    /// falling back to [`RouteMode::Throughput`] while the estimate is cold.
+    CompletionTime,
     /// Prefer the node that last served this session so its prompt prefix and KV
     /// cache stay warm, falling back to [`RouteMode::Throughput`] when it cannot.
     Affinity,
@@ -31,6 +54,9 @@ pub struct RouteRequest<'a> {
     pub mode: RouteMode,
     /// Required model id. `None` means any ready node will do.
     pub model: Option<&'a str>,
+    /// Comparable workload class supplied by dispatch. Service times from
+    /// unlike request sizes, routes or response shapes must not be mixed.
+    pub service_class: Option<&'a str>,
     /// Label of the node that served this session previously, if any.
     pub sticky: Option<&'a str>,
 }
@@ -40,12 +66,18 @@ impl<'a> RouteRequest<'a> {
         Self {
             mode,
             model: None,
+            service_class: None,
             sticky: None,
         }
     }
 
     pub fn with_model(mut self, model: Option<&'a str>) -> Self {
         self.model = model;
+        self
+    }
+
+    pub fn with_service_class(mut self, service_class: Option<&'a str>) -> Self {
+        self.service_class = service_class;
         self
     }
 
@@ -64,6 +96,8 @@ pub enum RouteReason {
     OnlyCandidate,
     /// Fewest queued jobs among the eligible nodes.
     LeastLoaded,
+    /// Lowest predicted time until this request finishes.
+    EstimatedCompletion,
 }
 
 impl RouteReason {
@@ -78,6 +112,7 @@ impl RouteReason {
             Self::Affinity => "Affinity",
             Self::OnlyCandidate => "OnlyCandidate",
             Self::LeastLoaded => "LeastLoaded",
+            Self::EstimatedCompletion => "EstimatedCompletion",
         }
     }
 }
@@ -193,10 +228,185 @@ impl Reservations {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ServiceClass {
+    label: String,
+    authority: String,
+    backend: String,
+    version: String,
+    model: String,
+    workload: String,
+}
+
+impl ServiceClass {
+    fn of(node: &NodeSnapshot, model: &str, workload: &str) -> Option<Self> {
+        let ready = node.status.ready()?;
+        Some(Self {
+            label: node.label().to_string(),
+            authority: node.spec.authority(),
+            backend: ready.backend.clone(),
+            version: ready.version.clone(),
+            model: model.to_string(),
+            workload: workload.to_string(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ServiceTimeEstimate {
+    mean_nanos: u128,
+    samples: u32,
+    last_observed: Option<std::time::Instant>,
+    last_selected: Option<std::time::Instant>,
+}
+
+/// Service time learned by this resident fabric, scoped to one node identity,
+/// model and comparable workload class.
+///
+/// Only successful completed requests belong here. The dispatch layer owns
+/// that distinction; this type only maintains deterministic estimates.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ServiceTimeEstimates(
+    std::collections::BTreeMap<ServiceClass, ServiceTimeEstimate>,
+);
+
+impl ServiceTimeEstimates {
+    pub(crate) fn selected(&mut self, node: &NodeSnapshot, model: &str, workload: &str) {
+        self.selected_at(node, model, workload, std::time::Instant::now());
+    }
+
+    fn selected_at(
+        &mut self,
+        node: &NodeSnapshot,
+        model: &str,
+        workload: &str,
+        now: std::time::Instant,
+    ) {
+        let Some(class) = ServiceClass::of(node, model, workload) else {
+            return;
+        };
+        self.0
+            .entry(class)
+            .and_modify(|estimate| estimate.last_selected = Some(now))
+            .or_insert(ServiceTimeEstimate {
+                mean_nanos: 0,
+                samples: 0,
+                last_observed: None,
+                last_selected: Some(now),
+            });
+        self.prune();
+    }
+
+    pub(crate) fn observe(
+        &mut self,
+        node: &NodeSnapshot,
+        model: &str,
+        workload: &str,
+        elapsed: std::time::Duration,
+    ) {
+        self.observe_at(node, model, workload, elapsed, std::time::Instant::now());
+    }
+
+    pub(crate) fn invalidate(&mut self, node: &NodeSnapshot, model: &str, workload: &str) {
+        let Some(class) = ServiceClass::of(node, model, workload) else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        self.0
+            .entry(class)
+            .and_modify(|estimate| {
+                estimate.mean_nanos = 0;
+                estimate.samples = 0;
+                estimate.last_observed = None;
+                estimate.last_selected = Some(now);
+            })
+            .or_insert(ServiceTimeEstimate {
+                mean_nanos: 0,
+                samples: 0,
+                last_observed: None,
+                last_selected: Some(now),
+            });
+        self.prune();
+    }
+
+    fn observe_at(
+        &mut self,
+        node: &NodeSnapshot,
+        model: &str,
+        workload: &str,
+        elapsed: std::time::Duration,
+        now: std::time::Instant,
+    ) {
+        let Some(class) = ServiceClass::of(node, model, workload) else {
+            return;
+        };
+        let sample = elapsed.as_nanos().max(1);
+        self.0
+            .entry(class)
+            .and_modify(|estimate| {
+                let stale = estimate.last_observed.is_some_and(|observed| {
+                    now.saturating_duration_since(observed) > MAX_SERVICE_TIME_AGE
+                });
+                if stale {
+                    estimate.mean_nanos = sample;
+                    estimate.samples = 0;
+                } else if estimate.samples < MIN_SERVICE_TIME_SAMPLES {
+                    let samples = u128::from(estimate.samples);
+                    estimate.mean_nanos = estimate
+                        .mean_nanos
+                        .saturating_mul(samples)
+                        .saturating_add(sample)
+                        / (samples + 1);
+                } else {
+                    estimate.mean_nanos = estimate
+                        .mean_nanos
+                        .saturating_mul(EWMA_HISTORY_WEIGHT)
+                        .saturating_add(sample)
+                        / (EWMA_HISTORY_WEIGHT + 1);
+                }
+                estimate.samples = estimate.samples.saturating_add(1);
+                estimate.last_observed = Some(now);
+            })
+            .or_insert(ServiceTimeEstimate {
+                mean_nanos: sample,
+                samples: 1,
+                last_observed: Some(now),
+                last_selected: None,
+            });
+
+        self.prune();
+    }
+
+    fn prune(&mut self) {
+        if self.0.len() > MAX_SERVICE_CLASSES {
+            let oldest = self
+                .0
+                .iter()
+                .min_by_key(|(_, estimate)| estimate.last_observed.max(estimate.last_selected))
+                .map(|(class, _)| class.clone())
+                .expect("an oversized estimate map is non-empty");
+            self.0.remove(&oldest);
+        }
+    }
+
+    fn get(
+        &self,
+        node: &NodeSnapshot,
+        model: Option<&str>,
+        workload: Option<&str>,
+    ) -> Option<ServiceTimeEstimate> {
+        let model = model.or_else(|| node.active_model_id())?;
+        let class = ServiceClass::of(node, model, workload?)?;
+        self.0.get(&class).copied()
+    }
+}
+
 /// One eligible node reduced to the fields selection actually uses.
 struct Candidate<'a> {
     label: &'a str,
     load: usize,
+    service_nanos: Option<u128>,
+    last_selected: Option<std::time::Instant>,
 }
 
 /// What a node is carrying, as far as this fabric can tell. Pure.
@@ -233,6 +443,36 @@ pub fn route_reserved(
     snapshots: &[NodeSnapshot],
     request: &RouteRequest<'_>,
     reserved: &Reservations,
+) -> Result<RouteDecision, RouteError> {
+    route_reserved_with_estimates(
+        snapshots,
+        request,
+        reserved,
+        &ServiceTimeEstimates::default(),
+    )
+}
+
+pub(crate) fn route_reserved_with_estimates(
+    snapshots: &[NodeSnapshot],
+    request: &RouteRequest<'_>,
+    reserved: &Reservations,
+    estimates: &ServiceTimeEstimates,
+) -> Result<RouteDecision, RouteError> {
+    route_reserved_with_estimates_at(
+        snapshots,
+        request,
+        reserved,
+        estimates,
+        std::time::Instant::now(),
+    )
+}
+
+fn route_reserved_with_estimates_at(
+    snapshots: &[NodeSnapshot],
+    request: &RouteRequest<'_>,
+    reserved: &Reservations,
+    estimates: &ServiceTimeEstimates,
+    now: std::time::Instant,
 ) -> Result<RouteDecision, RouteError> {
     if snapshots.is_empty() {
         return Err(RouteError::NoNodesConfigured);
@@ -285,9 +525,21 @@ pub fn route_reserved(
     let candidates: Vec<Candidate<'_>> = serving_model
         .iter()
         .filter_map(|snapshot| {
-            snapshot.status.ready().map(|ready| Candidate {
-                label: snapshot.label(),
-                load: load_of(ready.in_flight, reserved.get(snapshot.label())),
+            snapshot.status.ready().map(|ready| {
+                let estimate = estimates.get(snapshot, request.model, request.service_class);
+                let current = estimate.filter(|estimate| {
+                    estimate.last_observed.is_some_and(|observed| {
+                        now.saturating_duration_since(observed) <= MAX_SERVICE_TIME_AGE
+                    })
+                });
+                Candidate {
+                    label: snapshot.label(),
+                    load: load_of(ready.in_flight, reserved.get(snapshot.label())),
+                    service_nanos: current
+                        .filter(|estimate| estimate.samples >= MIN_SERVICE_TIME_SAMPLES)
+                        .map(|estimate| estimate.mean_nanos),
+                    last_selected: estimate.and_then(|estimate| estimate.last_selected),
+                }
             })
         })
         .collect();
@@ -311,14 +563,52 @@ pub fn route_reserved(
         }
     }
 
-    // Ties break on label so a dry run predicts the real decision.
-    let chosen = candidates
-        .iter()
-        .min_by(|a, b| a.load.cmp(&b.load).then_with(|| a.label.cmp(b.label)))
-        .expect("candidates is non-empty");
+    let has_complete_estimates = request.mode == RouteMode::CompletionTime
+        && candidates
+            .iter()
+            .all(|candidate| candidate.service_nanos.is_some());
+
+    // Ties break on label so a dry run predicts the real decision. Completion
+    // scores use u128 and saturating multiplication: neither a pathological
+    // duration nor load may wrap around and make a node look fast.
+    let chosen = if has_complete_estimates {
+        candidates
+            .iter()
+            .min_by(|a, b| {
+                let score = |candidate: &Candidate<'_>| {
+                    candidate
+                        .service_nanos
+                        .expect("all estimates are complete")
+                        .saturating_mul((candidate.load as u128).saturating_add(1))
+                };
+                score(a)
+                    .cmp(&score(b))
+                    .then_with(|| a.load.cmp(&b.load))
+                    .then_with(|| a.label.cmp(b.label))
+            })
+            .expect("candidates is non-empty")
+    } else {
+        candidates
+            .iter()
+            .min_by(|a, b| {
+                a.load
+                    .cmp(&b.load)
+                    .then_with(|| {
+                        if request.mode == RouteMode::CompletionTime {
+                            a.last_selected.cmp(&b.last_selected)
+                        } else {
+                            std::cmp::Ordering::Equal
+                        }
+                    })
+                    .then_with(|| a.label.cmp(b.label))
+            })
+            .expect("candidates is non-empty")
+    };
 
     let reason = if candidates.len() == 1 {
         RouteReason::OnlyCandidate
+    } else if has_complete_estimates {
+        RouteReason::EstimatedCompletion
     } else {
         RouteReason::LeastLoaded
     };
@@ -505,6 +795,322 @@ mod tests {
         assert_eq!(RouteReason::Affinity.as_str(), "Affinity");
         assert_eq!(RouteReason::OnlyCandidate.as_str(), "OnlyCandidate");
         assert_eq!(RouteReason::LeastLoaded.as_str(), "LeastLoaded");
+        assert_eq!(
+            RouteReason::EstimatedCompletion.as_str(),
+            "EstimatedCompletion"
+        );
+    }
+
+    fn observe_n(estimates: &mut ServiceTimeEstimates, node: &NodeSnapshot, elapsed_ms: u64) {
+        for _ in 0..MIN_SERVICE_TIME_SAMPLES {
+            estimates.observe(
+                node,
+                "m",
+                "/v1/chat/completions",
+                std::time::Duration::from_millis(elapsed_ms),
+            );
+        }
+    }
+
+    #[test]
+    fn completion_time_waits_for_every_candidate_before_using_estimates() {
+        let fast = ready("fast", Some("m"), 4);
+        let slow = ready("slow", Some("m"), 0);
+        let nodes = vec![fast.clone(), slow];
+        let mut estimates = ServiceTimeEstimates::default();
+        observe_n(&mut estimates, &fast, 100);
+
+        let request = RouteRequest::new(RouteMode::CompletionTime)
+            .with_model(Some("m"))
+            .with_service_class(Some("/v1/chat/completions"));
+        let decision =
+            route_reserved_with_estimates(&nodes, &request, &Reservations::none(), &estimates)
+                .expect("routes");
+
+        assert_eq!(decision.label, "slow", "cold estimates must fall back");
+        assert_eq!(decision.reason, RouteReason::LeastLoaded);
+    }
+
+    #[test]
+    fn completion_time_explores_cold_nodes_without_overriding_load() {
+        let nodes = vec![ready("a", Some("m"), 0), ready("b", Some("m"), 0)];
+        let request = RouteRequest::new(RouteMode::CompletionTime)
+            .with_model(Some("m"))
+            .with_service_class(Some("/v1/chat/completions"));
+        let mut estimates = ServiceTimeEstimates::default();
+        let mut chosen = Vec::new();
+
+        for _ in 0..(MIN_SERVICE_TIME_SAMPLES * 2) {
+            let decision =
+                route_reserved_with_estimates(&nodes, &request, &Reservations::none(), &estimates)
+                    .expect("routes");
+            chosen.push(decision.label.clone());
+            let node = nodes
+                .iter()
+                .find(|node| node.label() == decision.label)
+                .expect("chosen node exists");
+            estimates.selected(node, "m", "/v1/chat/completions");
+            estimates.observe(
+                node,
+                "m",
+                "/v1/chat/completions",
+                std::time::Duration::from_millis(100),
+            );
+        }
+
+        assert_eq!(
+            chosen,
+            vec!["a", "b", "a", "b", "a", "b", "a", "b", "a", "b"]
+        );
+
+        let busy_cold = ready("c", Some("m"), 1);
+        let decision = route_reserved_with_estimates(
+            &[nodes[0].clone(), busy_cold],
+            &request,
+            &Reservations::none(),
+            &estimates,
+        )
+        .expect("routes");
+        assert_eq!(
+            decision.label, "a",
+            "exploration may break an equal-load tie but must not override queue depth"
+        );
+    }
+
+    #[test]
+    fn a_failed_cold_selection_rotates_without_becoming_a_speed_sample() {
+        let nodes = vec![ready("a", Some("m"), 0), ready("b", Some("m"), 0)];
+        let request = RouteRequest::new(RouteMode::CompletionTime)
+            .with_model(Some("m"))
+            .with_service_class(Some("/v1/chat/completions"));
+        let mut estimates = ServiceTimeEstimates::default();
+
+        let first =
+            route_reserved_with_estimates(&nodes, &request, &Reservations::none(), &estimates)
+                .expect("routes");
+        assert_eq!(first.label, "a");
+        estimates.selected(&nodes[0], "m", "/v1/chat/completions");
+
+        let second =
+            route_reserved_with_estimates(&nodes, &request, &Reservations::none(), &estimates)
+                .expect("routes");
+        assert_eq!(
+            second.label, "b",
+            "a failed selection must not monopolise cold traffic"
+        );
+        assert_eq!(
+            estimates
+                .get(&nodes[0], Some("m"), Some("/v1/chat/completions"))
+                .expect("selection is tracked")
+                .samples,
+            0,
+            "selection recency must not masquerade as a successful service sample"
+        );
+    }
+
+    #[test]
+    fn invalidating_a_degraded_node_returns_the_class_to_cold_fallback() {
+        let fast = ready("fast", Some("m"), 4);
+        let slow = ready("slow", Some("m"), 0);
+        let nodes = vec![fast.clone(), slow.clone()];
+        let mut estimates = ServiceTimeEstimates::default();
+        observe_n(&mut estimates, &fast, 100);
+        observe_n(&mut estimates, &slow, 1_000);
+        let request = RouteRequest::new(RouteMode::CompletionTime)
+            .with_model(Some("m"))
+            .with_service_class(Some("/v1/chat/completions"));
+
+        let learned =
+            route_reserved_with_estimates(&nodes, &request, &Reservations::none(), &estimates)
+                .expect("routes");
+        assert_eq!(learned.label, "fast");
+
+        estimates.invalidate(&fast, "m", "/v1/chat/completions");
+        let after_failure =
+            route_reserved_with_estimates(&nodes, &request, &Reservations::none(), &estimates)
+                .expect("routes");
+        assert_eq!(after_failure.label, "slow");
+        assert_eq!(after_failure.reason, RouteReason::LeastLoaded);
+    }
+
+    #[test]
+    fn a_stale_estimate_is_explored_before_it_decides_placement_again() {
+        let now = std::time::Instant::now();
+        let fast = ready("fast", Some("m"), 4);
+        let slow = ready("slow", Some("m"), 0);
+        let nodes = vec![fast.clone(), slow.clone()];
+        let mut estimates = ServiceTimeEstimates::default();
+        for _ in 0..MIN_SERVICE_TIME_SAMPLES {
+            estimates.observe_at(
+                &fast,
+                "m",
+                "/v1/chat/completions",
+                std::time::Duration::from_millis(100),
+                now,
+            );
+            estimates.observe_at(
+                &slow,
+                "m",
+                "/v1/chat/completions",
+                std::time::Duration::from_millis(1_000),
+                now,
+            );
+        }
+        let request = RouteRequest::new(RouteMode::CompletionTime)
+            .with_model(Some("m"))
+            .with_service_class(Some("/v1/chat/completions"));
+
+        let learned = route_reserved_with_estimates_at(
+            &nodes,
+            &request,
+            &Reservations::none(),
+            &estimates,
+            now,
+        )
+        .expect("routes");
+        assert_eq!(learned.label, "fast");
+
+        let stale = route_reserved_with_estimates_at(
+            &nodes,
+            &request,
+            &Reservations::none(),
+            &estimates,
+            now + MAX_SERVICE_TIME_AGE + std::time::Duration::from_nanos(1),
+        )
+        .expect("routes");
+        assert_eq!(
+            stale.label, "slow",
+            "stale estimates must fall back to load"
+        );
+        assert_eq!(stale.reason, RouteReason::LeastLoaded);
+
+        estimates.observe_at(
+            &fast,
+            "m",
+            "/v1/chat/completions",
+            std::time::Duration::from_millis(100),
+            now + MAX_SERVICE_TIME_AGE + std::time::Duration::from_nanos(1),
+        );
+        assert_eq!(
+            estimates
+                .get(&fast, Some("m"), Some("/v1/chat/completions"))
+                .expect("the class remains present")
+                .samples,
+            1,
+            "one fresh sample must not revive a stale mature estimate"
+        );
+    }
+
+    #[test]
+    fn completion_time_accounts_for_both_speed_and_outstanding_work() {
+        let fast = ready("fast", Some("m"), 4);
+        let slow = ready("slow", Some("m"), 0);
+        let nodes = vec![fast.clone(), slow.clone()];
+        let mut estimates = ServiceTimeEstimates::default();
+        observe_n(&mut estimates, &fast, 100);
+        observe_n(&mut estimates, &slow, 1_000);
+        let request = RouteRequest::new(RouteMode::CompletionTime)
+            .with_model(Some("m"))
+            .with_service_class(Some("/v1/chat/completions"));
+
+        let decision =
+            route_reserved_with_estimates(&nodes, &request, &Reservations::none(), &estimates)
+                .expect("routes");
+        assert_eq!(decision.label, "fast");
+        assert_eq!(decision.reason, RouteReason::EstimatedCompletion);
+
+        let fast = ready("fast", Some("m"), 9);
+        let decision = route_reserved_with_estimates(
+            &[fast, slow],
+            &request,
+            &Reservations::none(),
+            &estimates,
+        )
+        .expect("routes");
+        assert_eq!(
+            decision.label, "slow",
+            "the slow node must receive work once the fast node's queue erases its advantage"
+        );
+    }
+
+    #[test]
+    fn service_time_is_scoped_to_node_identity_model_and_workload() {
+        let measured = ready("fast", Some("m"), 4);
+        let other = ready("slow", Some("m"), 0);
+        let mut estimates = ServiceTimeEstimates::default();
+        observe_n(&mut estimates, &measured, 100);
+        observe_n(&mut estimates, &other, 1_000);
+
+        let another_fast = ready("fast", Some("another-model"), 4);
+        let another_slow = ready("slow", Some("another-model"), 0);
+        let another_model = RouteRequest::new(RouteMode::CompletionTime)
+            .with_model(Some("another-model"))
+            .with_service_class(Some("/v1/chat/completions"));
+        let decision = route_reserved_with_estimates(
+            &[another_fast, another_slow],
+            &another_model,
+            &Reservations::none(),
+            &estimates,
+        )
+        .expect("routes");
+        assert_eq!(decision.label, "slow");
+        assert_eq!(decision.reason, RouteReason::LeastLoaded);
+
+        let another_route = RouteRequest::new(RouteMode::CompletionTime)
+            .with_model(Some("m"))
+            .with_service_class(Some("/v1/embeddings"));
+        let decision = route_reserved_with_estimates(
+            &[measured.clone(), other.clone()],
+            &another_route,
+            &Reservations::none(),
+            &estimates,
+        )
+        .expect("routes");
+        assert_eq!(decision.label, "slow");
+        assert_eq!(decision.reason, RouteReason::LeastLoaded);
+
+        let mut moved = measured.clone();
+        moved.spec.port += 1;
+        let request = RouteRequest::new(RouteMode::CompletionTime)
+            .with_model(Some("m"))
+            .with_service_class(Some("/v1/chat/completions"));
+        let decision = route_reserved_with_estimates(
+            &[moved, other],
+            &request,
+            &Reservations::none(),
+            &estimates,
+        )
+        .expect("routes");
+        assert_eq!(decision.reason, RouteReason::LeastLoaded);
+    }
+
+    #[test]
+    fn service_time_state_is_bounded() {
+        let node = ready("node", Some("m"), 0);
+        let now = std::time::Instant::now();
+        let mut estimates = ServiceTimeEstimates::default();
+        for index in 0..=MAX_SERVICE_CLASSES {
+            estimates.selected_at(
+                &node,
+                "m",
+                &format!("workload-{index}"),
+                now + std::time::Duration::from_nanos(index as u64),
+            );
+        }
+
+        assert_eq!(estimates.0.len(), MAX_SERVICE_CLASSES);
+        assert!(
+            estimates
+                .get(&node, Some("m"), Some("workload-0"))
+                .is_none(),
+            "the least-recent entry was not pruned"
+        );
+        assert!(
+            estimates
+                .get(&node, Some("m"), Some("workload-1024"))
+                .is_some(),
+            "the newest entry was pruned"
+        );
     }
 
     #[test]
