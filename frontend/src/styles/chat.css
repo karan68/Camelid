@@ -457,7 +457,14 @@
     scrollbar-width: none;
   }
   .cxcomposer__tools::-webkit-scrollbar { display: none; }
-  .cxcomposer__model { flex: 0 1 150px; min-width: 104px; }
+  .cxcomposer__model {
+    position: sticky;
+    left: 0;
+    z-index: 1;
+    flex: 0 1 150px;
+    min-width: 104px;
+    background: var(--color-composer-surface);
+  }
   .cxcomposer__tool--collapsible .cxcomposer__tool-label { display: none; }
   .cxcomposer__tool--collapsible { width: 32px; padding: 0; flex: none; justify-content: center; }
   .cxcomposer__model-select { width: 100%; min-width: 0; max-width: 150px; }
