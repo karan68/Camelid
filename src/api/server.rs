@@ -815,6 +815,10 @@ mod tests {
             .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["api_surface"], "lan_chat_only");
+        // Health answers before authentication, and this listener is read by a
+        // phone even while it is bound to loopback behind a tunnel.
+        assert!(body.get("executable").is_none(), "{body}");
+        assert!(body.get("listen_addr").is_none(), "{body}");
     }
 
     #[tokio::test]

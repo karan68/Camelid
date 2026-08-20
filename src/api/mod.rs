@@ -3359,8 +3359,11 @@ async fn health_registry_snapshot(state: &AppState) -> HealthResponse {
         engine_active_elapsed_seconds: slot.active_elapsed_seconds,
         engine_stalled_seconds: slot.stalled_seconds,
         continuous_batch_slots: state.engine.continuous_batch_slots(),
-        executable: loopback_executable_path(state.serve_addr),
-        listen_addr: (state.serve_addr.ip().is_loopback()).then(|| state.serve_addr.to_string()),
+        executable: discloses_host_details(state.serve_addr, state.api_surface)
+            .then(|| loopback_executable_path(state.serve_addr))
+            .flatten(),
+        listen_addr: discloses_host_details(state.serve_addr, state.api_surface)
+            .then(|| state.serve_addr.to_string()),
     }
 }
 
@@ -3473,9 +3476,22 @@ fn busy_health_response(state: &AppState) -> HealthResponse {
         engine_active_elapsed_seconds: slot.active_elapsed_seconds,
         engine_stalled_seconds: slot.stalled_seconds,
         continuous_batch_slots: state.engine.continuous_batch_slots(),
-        executable: loopback_executable_path(state.serve_addr),
-        listen_addr: (state.serve_addr.ip().is_loopback()).then(|| state.serve_addr.to_string()),
+        executable: discloses_host_details(state.serve_addr, state.api_surface)
+            .then(|| loopback_executable_path(state.serve_addr))
+            .flatten(),
+        listen_addr: discloses_host_details(state.serve_addr, state.api_surface)
+            .then(|| state.serve_addr.to_string()),
     }
+}
+
+/// Whether the public health route may name this machine. Pure.
+///
+/// A loopback bind used to mean the reader is sitting at the keyboard.
+/// `--lan-chat-only` exists to serve a remote browser, and reaching it through
+/// a tunnel or a reverse proxy leaves the listener on loopback, so the surface
+/// has to be consulted as well as the address.
+fn discloses_host_details(serve_addr: SocketAddr, api_surface: ApiSurface) -> bool {
+    serve_addr.ip().is_loopback() && matches!(api_surface, ApiSurface::Full)
 }
 
 /// Resolve the running binary's path for [`HealthResponse::executable`].
@@ -3496,7 +3512,7 @@ fn loopback_executable_path(serve_addr: SocketAddr) -> Option<String> {
 
 #[cfg(test)]
 mod executable_disclosure_tests {
-    use super::loopback_executable_path;
+    use super::{discloses_host_details, loopback_executable_path, ApiSurface};
     use std::net::SocketAddr;
 
     #[test]
@@ -3527,6 +3543,17 @@ mod executable_disclosure_tests {
                 "{addr} must not disclose the binary path"
             );
         }
+    }
+
+    /// A LAN Chat listener is read by a phone, and it stays on loopback when it
+    /// is reached through a tunnel, so the address alone cannot answer this.
+    #[test]
+    fn a_lan_chat_listener_names_this_machine_to_nobody() {
+        let loopback: SocketAddr = "127.0.0.1:8181".parse().unwrap();
+        let reachable: SocketAddr = "192.0.2.10:8181".parse().unwrap();
+        assert!(discloses_host_details(loopback, ApiSurface::Full));
+        assert!(!discloses_host_details(loopback, ApiSurface::LanChatOnly));
+        assert!(!discloses_host_details(reachable, ApiSurface::Full));
     }
 }
 

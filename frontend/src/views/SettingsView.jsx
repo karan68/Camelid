@@ -62,7 +62,7 @@ export default function SettingsView({
   // GPU (CUDA) acceleration availability + on/off state. Only present on a
   // CUDA-capable build/host; the card stays hidden everywhere else.
   useEffect(() => {
-    if (!online) { setGpu(null); return }
+    if (!online || isLanChatOnly(apiSurface)) { setGpu(null); return }
     let cancelled = false
     const base = (apiBase || '').replace(/\/$/, '')
     fetch(`${base}/api/runtime/gpu`)
@@ -70,7 +70,7 @@ export default function SettingsView({
       .then((d) => { if (!cancelled) setGpu(d) })
       .catch(() => {})
     return () => { cancelled = true }
-  }, [online, apiBase])
+  }, [online, apiBase, apiSurface])
 
   const toggleGpu = async (enabled) => {
     const base = (apiBase || '').replace(/\/$/, '')
