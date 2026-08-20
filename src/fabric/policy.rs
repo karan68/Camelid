@@ -831,6 +831,29 @@ mod tests {
         assert_eq!(decision.reason, RouteReason::LeastLoaded);
     }
 
+    /// The point of this mode is that idle is not the same as fast. Given real
+    /// service costs, a node three requests deep still wins if it is ten times
+    /// quicker than the idle one.
+    #[test]
+    fn a_fast_busy_node_beats_a_slow_idle_one() {
+        let fast = ready("fast", Some("m"), 3);
+        let slow = ready("slow", Some("m"), 0);
+        let nodes = vec![fast.clone(), slow.clone()];
+        let mut estimates = ServiceTimeEstimates::default();
+        observe_n(&mut estimates, &fast, 40);
+        observe_n(&mut estimates, &slow, 400);
+
+        let request = RouteRequest::new(RouteMode::CompletionTime)
+            .with_model(Some("m"))
+            .with_service_class(Some("/v1/chat/completions"));
+        let decision =
+            route_reserved_with_estimates(&nodes, &request, &Reservations::none(), &estimates)
+                .expect("routes");
+
+        assert_eq!(decision.label, "fast");
+        assert_eq!(decision.reason, RouteReason::EstimatedCompletion);
+    }
+
     #[test]
     fn completion_time_explores_cold_nodes_without_overriding_load() {
         let nodes = vec![ready("a", Some("m"), 0), ready("b", Some("m"), 0)];

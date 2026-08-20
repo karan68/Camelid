@@ -669,6 +669,16 @@ fn service_class(path: &str, body: &Value) -> String {
     )
 }
 
+/// One request's own service cost, with the queueing it waited through removed.
+///
+/// A sample is wall time from sending to completion, so it already contains the
+/// work the node was carrying when the request arrived. Selection multiplies an
+/// estimate by the load it can see, so leaving that in counts the same queue
+/// twice and ranks a fast node that is busy behind a slow node that is idle.
+fn service_time(elapsed: Duration, ahead: usize) -> Duration {
+    elapsed / u32::try_from(ahead.saturating_add(1)).unwrap_or(u32::MAX)
+}
+
 /// A request that a node took, and what it cost to get there.
 struct Sent<T> {
     value: T,
@@ -747,7 +757,13 @@ impl Placement {
         let (Some(model), Some(service_class)) = (&self.service_model, &self.service_class) else {
             return;
         };
-        lock(&self.service_times).observe(&self.node, model, service_class, elapsed);
+        let ahead = self.node.status.ready().map_or(0, |ready| ready.in_flight);
+        lock(&self.service_times).observe(
+            &self.node,
+            model,
+            service_class,
+            service_time(elapsed, ahead),
+        );
     }
 
     /// Forget a learned speed after the node itself fails this workload.
@@ -1041,6 +1057,22 @@ mod tests {
             service_class("/v1/chat/completions", &larger_input)
         );
         assert_ne!(base_class, service_class("/v1/embeddings", &base));
+    }
+
+    #[test]
+    fn a_sample_is_this_requests_own_cost_not_the_queue_it_waited_in() {
+        // 160ms spent behind three other requests on a node that runs one at a
+        // time is 40ms of work, and 40ms is what selection multiplies by the
+        // load it can see.
+        assert_eq!(
+            service_time(Duration::from_millis(160), 3),
+            Duration::from_millis(40)
+        );
+        // Nothing was ahead of it, so the measurement already is the cost.
+        assert_eq!(
+            service_time(Duration::from_millis(400), 0),
+            Duration::from_millis(400)
+        );
     }
 
     #[test]

@@ -208,7 +208,9 @@ successful requests completed during this proxy process, then minimizes:
 The estimate is scoped to the node's label, address, backend and version; the model; the API route;
 streaming versus buffered delivery; and coarse power-of-two buckets for request bytes and requested
 output tokens. That prevents a node which happened to receive a longer prompt or generation from
-being labelled intrinsically slow. No prompt or response content is retained.
+being labelled intrinsically slow. A measurement is wall time, so it also carries whatever the node
+was already working through; it is divided by the work the node reported in flight when the request
+was placed, because the formula above puts the queue back. No prompt or response content is retained.
 
 Every eligible node needs five successful completions in the same workload class before an estimate
 may decide placement. Until then the proxy uses least-load, rotating equal-load cold candidates by
