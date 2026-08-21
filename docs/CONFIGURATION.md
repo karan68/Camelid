@@ -204,10 +204,63 @@ Three limits are deliberate and worth knowing before you deploy it:
   `fabric status|route|run`. A node started with `--api-key` needs it: `/v1/health` is exempt from
   that node's auth, so without a token the node observes as ready and then answers every forwarded
   request with 401.
-- **TLS covers the client's hop only.** What the proxy speaks to a node is whatever that node's
-  listener speaks, and the proxy has no way to speak TLS to one. On a fabric whose nodes are not
-  loopback, the bearer above and every prompt and completion still cross that network unencrypted,
-  whatever the proxy presents to its own clients. Keep those hops on a trusted link.
+- Client-facing TLS (`--tls-cert`/`--tls-key`) and node-facing TLS (`--node-tls-ca`) are independent.
+  Configuring one does not protect the other hop.
+
+### Encrypting the node hop
+
+Every Fabric command applies the same node transport policy to health probes, buffered requests,
+streaming requests, failover attempts, and nodes added later through `--nodes-file`.
+
+| Node transport | Required option | Reachable nodes |
+|---|---|---|
+| CA-pinned TLS | `--node-tls-ca <PATH>` | any address whose certificate SAN matches the configured host/IP |
+| tunnel/local cleartext | none | loopback resolutions only |
+| direct cleartext | `--allow-cleartext-node-transport` | any resolution, explicitly unencrypted |
+
+Without extra flags, cleartext node transport is restricted after DNS resolution to loopback
+addresses. That preserves local nodes and encrypted tunnels while refusing a hostname that resolves
+only to another machine. Direct cleartext requires the explicit
+`--allow-cleartext-node-transport` acknowledgement (or
+`CAMELID_ALLOW_CLEARTEXT_NODE_TRANSPORT=1`). This is separate from
+`--allow-cleartext-remote`, which controls the client-facing proxy listener.
+
+For direct connections between machines, issue each node a certificate from one private CA. The
+certificate SAN must match the exact host or IP literal in `LABEL=HOST[:PORT]`; a DNS name is not
+accepted merely because it resolves to the certificate's IP. Start each node with the normal engine
+TLS and API-key options, then pin that CA at the Fabric:
+
+```bash
+# On each node (use that node's own certificate and key):
+camelid serve \
+  --addr <NODE-HOST>:8181 \
+  --model /path/to/model.gguf \
+  --api-key-file ./node-api.key \
+  --tls-cert ./node-cert-chain \
+  --tls-key ./node-private-key \
+  --no-open
+
+# On the proxy host:
+export CAMELID_API_KEY="$(cat ./node-api.key)"
+camelid fabric serve \
+  --node a=node-a.example:8181 --node b=node-b.example:8181 \
+  --node-tls-ca ./fabric-node-ca \
+  --addr 127.0.0.1:8282
+```
+
+The CA bundle is loaded before the first probe. Missing, empty, malformed, or unusable bundles stop
+the command. TLS verifies the node certificate and host/IP SAN before the HTTP request head is sent,
+so a failed handshake sends neither the bearer nor prompt bytes. The existing bearer authenticates
+the Fabric to the node; mutual TLS is not a second required client-identity system.
+
+A tunnel remains a supported alternative. Bind each node to loopback, forward a distinct local port
+to it with SSH, Tailscale, or another authenticated encrypted transport, and name the local tunnel
+endpoints (for example `a=127.0.0.1:18181`). No cleartext acknowledgement is needed because the
+Fabric sees only loopback; the tunnel owns encryption and remote identity.
+
+One Fabric uses one transport posture for all nodes: either one pinned CA or guarded cleartext. This
+prevents a node from silently downgrading while a node file reloads. CA rotation or changing posture
+requires restarting the Fabric; adding or removing nodes does not.
 
 ### Placement modes
 
@@ -363,8 +416,9 @@ way is not interrupted, but it is bounded by `--timeout-ms` and costs a node a h
 than its generation slot.
 
 Request bodies are bounded at the same 16 MiB default the node itself uses. A streaming request is
-relayed as it arrives; `fabric run`, which returns one complete answer, refuses `stream: true` with
-400 instead.
+relayed as it arrives. `--forward-timeout-s` bounds the wait for the first response head and each
+later silent gap; every event resets the latter, so it is not a cap on total stream duration.
+`fabric run`, which returns one complete answer, refuses `stream: true` with 400 instead.
 
 ### What the proxy serves
 

@@ -21,6 +21,7 @@
 //! * [`policy`] — pure placement decisions; the correctness of the fabric.
 //! * [`forward`] — sending a placed request to the node that will serve it.
 //! * [`cancel`] — telling that send it is no longer wanted.
+//! * `transport` — authenticating or explicitly constraining the node hop.
 
 pub mod cancel;
 pub(crate) mod client_keys;
@@ -31,6 +32,7 @@ pub(crate) mod nodes;
 pub mod policy;
 pub mod probe;
 pub mod server;
+mod transport;
 pub(crate) mod watch;
 
 use std::sync::{Arc, Mutex};
@@ -54,6 +56,7 @@ pub use policy::{
     RouteRequest,
 };
 pub use probe::{probe_fabric, probe_node, Observation, ProbeError, DEFAULT_PROBE_TIMEOUT};
+use transport::NodeTransport;
 
 /// How many nodes one request may be sent to before it fails.
 ///
@@ -74,6 +77,7 @@ pub struct Fabric {
     nodes: NodeSet,
     timeout: Duration,
     bearer: Option<String>,
+    transport: NodeTransport,
     /// Requests this fabric has placed and not yet finished.
     ///
     /// Shared across clones on purpose: the resident proxy hands a `Fabric` to
@@ -106,6 +110,7 @@ impl std::fmt::Debug for Fabric {
             .field("nodes", &self.nodes)
             .field("timeout", &self.timeout)
             .field("bearer", &self.bearer.as_ref().map(|_| "[REDACTED]"))
+            .field("transport", &self.transport)
             .field("max_observation_age", &self.max_observation_age)
             .field("max_forward_attempts", &self.max_forward_attempts)
             .finish()
@@ -138,6 +143,7 @@ impl Fabric {
             nodes,
             timeout: DEFAULT_PROBE_TIMEOUT,
             bearer: None,
+            transport: NodeTransport::default(),
             reserved: Arc::new(Mutex::new(Reservations::none())),
             service_times: Arc::new(Mutex::new(ServiceTimeEstimates::default())),
             observed: Arc::new(Mutex::new(None)),
@@ -182,6 +188,21 @@ impl Fabric {
         self
     }
 
+    /// Configure how every probe and forwarded request reaches a node.
+    ///
+    /// A CA bundle enables server-authenticated TLS for every node. Without
+    /// one, cleartext is restricted to loopback unless the operator explicitly
+    /// acknowledges direct cleartext node transport. The two modes cannot be
+    /// combined.
+    pub fn with_node_transport(
+        mut self,
+        ca_file: Option<&std::path::Path>,
+        allow_cleartext_remote: bool,
+    ) -> std::io::Result<Self> {
+        self.transport = NodeTransport::resolve(ca_file, allow_cleartext_remote)?;
+        Ok(self)
+    }
+
     /// The machines this fabric places on, as they stand right now.
     pub fn specs(&self) -> Vec<NodeSpec> {
         self.nodes.current().0.to_vec()
@@ -194,6 +215,11 @@ impl Fabric {
 
     pub fn is_empty(&self) -> bool {
         self.nodes.current().0.is_empty()
+    }
+
+    /// A secret-free description suitable for startup logs.
+    pub fn node_transport_description(&self) -> &'static str {
+        self.transport.description()
     }
 
     /// Observe every node.
@@ -247,7 +273,12 @@ impl Fabric {
 
     /// Probe every node in `specs`, whatever was observed before.
     fn probe(&self, specs: &[NodeSpec]) -> Vec<NodeSnapshot> {
-        probe_fabric(specs, self.bearer.as_deref(), self.timeout)
+        probe::probe_fabric_with_transport(
+            specs,
+            self.bearer.as_deref(),
+            self.timeout,
+            &self.transport,
+        )
     }
 
     /// Drop the current observation, so the next one is taken fresh.
@@ -402,6 +433,30 @@ impl Fabric {
         lock(&self.reserved).clone()
     }
 
+    /// Send a request to a node already chosen by this fabric.
+    ///
+    /// This exists for the one-shot `fabric run` path, whose request body uses
+    /// the chosen node's active model. Keeping the send here ensures it cannot
+    /// bypass the fabric's bearer or transport policy.
+    pub fn forward_to(
+        &self,
+        spec: &NodeSpec,
+        path: &str,
+        body: &Value,
+        timeout: Duration,
+        cancel: &Cancel,
+    ) -> Result<Forwarded, ForwardError> {
+        forward::forward_with_transport(
+            spec,
+            path,
+            body,
+            self.bearer.as_deref(),
+            timeout,
+            cancel,
+            &self.transport,
+        )
+    }
+
     /// Observe, place, and send — the whole path a caller actually wants.
     ///
     /// Returns the placement alongside the answer so a caller can record which
@@ -423,13 +478,14 @@ impl Fabric {
             (request.mode != RouteMode::Throughput).then(|| service_class(path, body));
         let request = request.with_service_class(service_class.as_deref());
         let mut sent = self.send_until_a_node_takes_it(&request, |spec| {
-            forward::forward(
+            forward::forward_with_transport(
                 spec,
                 path,
                 body,
                 self.bearer.as_deref(),
                 forward_timeout,
                 cancel,
+                &self.transport,
             )
         })?;
         if sent.value.is_success() {
@@ -467,7 +523,7 @@ impl Fabric {
             (request.mode != RouteMode::Throughput).then(|| service_class(path, body));
         let request = request.with_service_class(service_class.as_deref());
         let mut sent = self.send_until_a_node_takes_it(&request, |spec| {
-            forward::forward_streaming(
+            forward::forward_streaming_with_transport(
                 spec,
                 path,
                 body,
@@ -475,6 +531,7 @@ impl Fabric {
                 head_timeout,
                 idle_timeout,
                 cancel,
+                &self.transport,
             )
         })?;
         if let StreamOutcome::Buffered(answer) = &sent.value {

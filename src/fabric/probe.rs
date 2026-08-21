@@ -11,6 +11,7 @@ use serde::Deserialize;
 use super::cancel::Cancel;
 use super::http::{self, HttpError};
 use super::node::{NodeReady, NodeSnapshot, NodeSpec, NodeStatus};
+use super::transport::NodeTransport;
 
 /// Refuse a health body larger than this. A health response is a few KiB;
 /// anything at this size means we are not talking to a Camelid engine.
@@ -95,8 +96,9 @@ fn read_health(
     spec: &NodeSpec,
     bearer: Option<&str>,
     timeout: Duration,
+    transport: &NodeTransport,
 ) -> Result<HealthPayload, ProbeError> {
-    let response = http::request(
+    let response = http::request_with_transport(
         &spec.host,
         spec.port,
         "GET",
@@ -109,6 +111,7 @@ fn read_health(
         // health read, not a generation slot, so there is nothing here worth
         // the noise of making cancellable.
         &Cancel::never(),
+        transport,
     )?;
     if response.status != 200 {
         return Err(ProbeError::Status(response.status));
@@ -136,8 +139,17 @@ fn unreachable_reason(error: &ProbeError) -> String {
 /// Probe one node. Never fails: an unreachable node is a routing fact, not an
 /// error the caller has to handle separately.
 pub fn probe_node(spec: &NodeSpec, bearer: Option<&str>, timeout: Duration) -> NodeSnapshot {
+    probe_node_with_transport(spec, bearer, timeout, &NodeTransport::default())
+}
+
+pub(crate) fn probe_node_with_transport(
+    spec: &NodeSpec,
+    bearer: Option<&str>,
+    timeout: Duration,
+    transport: &NodeTransport,
+) -> NodeSnapshot {
     let started = Instant::now();
-    match read_health(spec, bearer, timeout) {
+    match read_health(spec, bearer, timeout, transport) {
         Ok(payload) => NodeSnapshot {
             spec: spec.clone(),
             status: classify(&payload),
@@ -162,13 +174,24 @@ pub fn probe_fabric(
     bearer: Option<&str>,
     timeout: Duration,
 ) -> Vec<NodeSnapshot> {
+    probe_fabric_with_transport(specs, bearer, timeout, &NodeTransport::default())
+}
+
+pub(crate) fn probe_fabric_with_transport(
+    specs: &[NodeSpec],
+    bearer: Option<&str>,
+    timeout: Duration,
+    transport: &NodeTransport,
+) -> Vec<NodeSnapshot> {
     if specs.is_empty() {
         return Vec::new();
     }
     std::thread::scope(|scope| {
         let handles: Vec<_> = specs
             .iter()
-            .map(|spec| scope.spawn(move || probe_node(spec, bearer, timeout)))
+            .map(|spec| {
+                scope.spawn(move || probe_node_with_transport(spec, bearer, timeout, transport))
+            })
             .collect();
         handles
             .into_iter()

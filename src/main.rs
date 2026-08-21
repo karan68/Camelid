@@ -1183,6 +1183,16 @@ fn fabric_from(
     }
 }
 
+fn configure_node_transport(
+    fabric: camelid::fabric::Fabric,
+    transport: &NodeTransportArgs,
+) -> anyhow::Result<camelid::fabric::Fabric> {
+    Ok(fabric.with_node_transport(
+        transport.node_tls_ca.as_deref(),
+        transport.allow_cleartext_node_transport,
+    )?)
+}
+
 /// Resolve the token the fabric authenticates to its nodes with.
 ///
 /// Deliberately not `#[arg(env = "CAMELID_API_KEY")]`: clap prints an env var's
@@ -1211,6 +1221,28 @@ fn resolve_bearer(flag: Option<String>, from_env: Option<String>) -> Option<Stri
 /// session, so nothing crosses the network inside the token loop. This is the
 /// throughput complement to `serve-distributed`, which shards one model's layers
 /// across machines and is slower than a single node by construction.
+#[derive(Debug, Clone, Args)]
+struct NodeTransportArgs {
+    /// PEM CA bundle that authenticates every node. Node hostnames and IP
+    /// literals are verified against the certificate SAN before any bearer or
+    /// request bytes are sent.
+    #[arg(
+        long,
+        value_name = "PATH",
+        conflicts_with = "allow_cleartext_node_transport"
+    )]
+    node_tls_ca: Option<PathBuf>,
+    /// Permit direct cleartext transport to a node that resolves outside
+    /// loopback. Without this acknowledgement, plaintext is limited to local
+    /// nodes and operator-owned tunnels.
+    #[arg(
+        long,
+        env = "CAMELID_ALLOW_CLEARTEXT_NODE_TRANSPORT",
+        default_value_t = false
+    )]
+    allow_cleartext_node_transport: bool,
+}
+
 #[derive(Debug, Subcommand)]
 enum FabricAction {
     /// Probe every node once and report what the fabric can serve.
@@ -1232,6 +1264,8 @@ enum FabricAction {
         /// secret is not in the process command line.
         #[arg(long, value_name = "TOKEN")]
         bearer: Option<String>,
+        #[command(flatten)]
+        transport: NodeTransportArgs,
         /// Per-node probe budget. Nodes are probed concurrently, so this bounds
         /// the whole command, not each node in turn.
         #[arg(long, default_value_t = 2000)]
@@ -1269,6 +1303,8 @@ enum FabricAction {
         /// CAMELID_API_KEY.
         #[arg(long, value_name = "TOKEN")]
         bearer: Option<String>,
+        #[command(flatten)]
+        transport: NodeTransportArgs,
         #[arg(long, default_value_t = 2000)]
         timeout_ms: u64,
         #[arg(long)]
@@ -1307,6 +1343,8 @@ enum FabricAction {
         /// ready and then answers this request with 401.
         #[arg(long, value_name = "TOKEN")]
         bearer: Option<String>,
+        #[command(flatten)]
+        transport: NodeTransportArgs,
         #[arg(long, default_value_t = 64)]
         max_tokens: u32,
         /// Per-node health probe budget.
@@ -1358,6 +1396,8 @@ enum FabricAction {
         /// answers every forwarded request with 401.
         #[arg(long, value_name = "TOKEN")]
         bearer: Option<String>,
+        #[command(flatten)]
+        transport: NodeTransportArgs,
         /// Require this key from clients of the proxy. This is the opposite
         /// direction to --bearer, and deliberately does NOT read CAMELID_API_KEY:
         /// on this command that variable already names the token sent to nodes,
@@ -1525,6 +1565,48 @@ mod fabric_command_tests {
                     other => panic!("expected a fabric command, got {other:?}"),
                 };
                 assert_eq!(bearer.as_deref(), Some("s3cret"), "{argv:?}");
+            }
+        });
+    }
+
+    #[test]
+    fn every_fabric_subcommand_has_the_same_node_transport_contract() {
+        on_cli_test_stack(|| {
+            for argv in [
+                vec!["camelid", "fabric", "status"],
+                vec!["camelid", "fabric", "route"],
+                vec!["camelid", "fabric", "run", "--prompt", "hi"],
+                vec!["camelid", "fabric", "serve"],
+            ] {
+                let mut tls = argv.clone();
+                tls.extend(["--node", "a=node.example", "--node-tls-ca", "node-ca"]);
+                let cli = Cli::try_parse_from(&tls).expect("TLS mode parses");
+                let transport = match cli.command {
+                    Some(Command::Fabric { action }) => match action {
+                        FabricAction::Status { transport, .. }
+                        | FabricAction::Route { transport, .. }
+                        | FabricAction::Run { transport, .. }
+                        | FabricAction::Serve { transport, .. } => transport,
+                    },
+                    other => panic!("expected a fabric command, got {other:?}"),
+                };
+                assert_eq!(
+                    transport.node_tls_ca.as_deref(),
+                    Some(std::path::Path::new("node-ca")),
+                    "{tls:?}"
+                );
+                assert!(!transport.allow_cleartext_node_transport, "{tls:?}");
+
+                let mut contradictory = argv;
+                contradictory.extend([
+                    "--node",
+                    "a=node.example",
+                    "--node-tls-ca",
+                    "node-ca",
+                    "--allow-cleartext-node-transport",
+                ]);
+                Cli::try_parse_from(&contradictory)
+                    .expect_err("TLS and cleartext acknowledgement conflict");
             }
         });
     }
@@ -3225,11 +3307,12 @@ async fn main() -> anyhow::Result<()> {
                 nodes,
                 nodes_file,
                 bearer,
+                transport,
                 timeout_ms,
                 json,
             } => {
                 let bearer = fabric_bearer(bearer);
-                let fabric = fabric_from(nodes, nodes_file)?
+                let fabric = configure_node_transport(fabric_from(nodes, nodes_file)?, &transport)?
                     .with_timeout(std::time::Duration::from_millis(timeout_ms))
                     .with_bearer(bearer.as_deref());
                 let snapshots = fabric.observe();
@@ -3246,12 +3329,13 @@ async fn main() -> anyhow::Result<()> {
                 model,
                 sticky,
                 bearer,
+                transport,
                 timeout_ms,
                 json,
             } => {
                 let bearer = fabric_bearer(bearer);
                 let mode = stateless_route_mode(&mode)?;
-                let fabric = fabric_from(nodes, nodes_file)?
+                let fabric = configure_node_transport(fabric_from(nodes, nodes_file)?, &transport)?
                     .with_timeout(std::time::Duration::from_millis(timeout_ms))
                     .with_bearer(bearer.as_deref());
                 let snapshots = fabric.observe();
@@ -3291,6 +3375,7 @@ async fn main() -> anyhow::Result<()> {
                 model,
                 sticky,
                 bearer,
+                transport,
                 max_tokens,
                 timeout_ms,
                 forward_timeout_s,
@@ -3298,7 +3383,7 @@ async fn main() -> anyhow::Result<()> {
             } => {
                 let bearer = fabric_bearer(bearer);
                 let mode = stateless_route_mode(&mode)?;
-                let fabric = fabric_from(nodes, nodes_file)?
+                let fabric = configure_node_transport(fabric_from(nodes, nodes_file)?, &transport)?
                     .with_timeout(std::time::Duration::from_millis(timeout_ms))
                     .with_bearer(bearer.as_deref());
 
@@ -3329,17 +3414,17 @@ async fn main() -> anyhow::Result<()> {
                 };
 
                 let body = camelid::fabric::forward::chat_request(&model_id, &prompt, max_tokens);
-                let answer = camelid::fabric::forward::forward(
-                    &chosen.spec,
-                    "/v1/chat/completions",
-                    &body,
-                    bearer.as_deref(),
-                    std::time::Duration::from_secs(forward_timeout_s),
-                    // One request per process: this ends when the process does,
-                    // so there is no client that can leave while it runs.
-                    &camelid::fabric::Cancel::never(),
-                )
-                .map_err(|error| anyhow::anyhow!("{error}"))?;
+                let answer = fabric
+                    .forward_to(
+                        &chosen.spec,
+                        "/v1/chat/completions",
+                        &body,
+                        std::time::Duration::from_secs(forward_timeout_s),
+                        // One request per process: this ends when the process does,
+                        // so there is no client that can leave while it runs.
+                        &camelid::fabric::Cancel::never(),
+                    )
+                    .map_err(|error| anyhow::anyhow!("{error}"))?;
 
                 if json {
                     println!(
@@ -3384,6 +3469,7 @@ async fn main() -> anyhow::Result<()> {
                 addr,
                 mode,
                 bearer,
+                transport,
                 api_key,
                 api_key_file,
                 timeout_ms,
@@ -3409,7 +3495,7 @@ async fn main() -> anyhow::Result<()> {
                 let tls = camelid::fabric::server::ProxyTls::resolve(tls_cert, tls_key).await?;
                 // Same reason: a node file that cannot be read is a refusal,
                 // and it has to arrive before the listening line.
-                let fabric = fabric_from(nodes, nodes_file)?
+                let fabric = configure_node_transport(fabric_from(nodes, nodes_file)?, &transport)?
                     .with_timeout(std::time::Duration::from_millis(timeout_ms))
                     .with_bearer(bearer.as_deref())
                     .with_max_observation_age(std::time::Duration::from_millis(
@@ -3432,6 +3518,7 @@ async fn main() -> anyhow::Result<()> {
                 let bound = listener.local_addr()?;
                 let scheme = if tls.is_some() { "https" } else { "http" };
                 println!("fabric serve listening on {scheme}://{bound}");
+                println!("node transport: {}", fabric.node_transport_description());
                 // A key set is the only thing here an operator can get subtly
                 // wrong without being told: a file that parsed but named one
                 // client when they meant three looks exactly like success.
