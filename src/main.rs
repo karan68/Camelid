@@ -395,6 +395,15 @@ mod ghost_moe_cli_tests {
             }
         });
     }
+
+    #[test]
+    fn lan_key_prints_a_server_command_that_passes_both_remote_guards() {
+        assert_eq!(
+            lan_chat_serve_command(std::path::Path::new("camelid.key")),
+            "camelid serve --lan-chat-only --api-key-file \"camelid.key\" \
+             --allow-cleartext-remote --addr <LAPTOP-LAN-IP>:8181 --model <MODEL.gguf>"
+        );
+    }
 }
 
 use camelid::{
@@ -418,6 +427,14 @@ use camelid::{
     tensor::{CpuTensor, Q8_0TensorBlocks, TensorStore},
     tokenizer::Tokenizer,
 };
+
+fn lan_chat_serve_command(key_path: &std::path::Path) -> String {
+    format!(
+        "camelid serve --lan-chat-only --api-key-file \"{}\" \
+         --allow-cleartext-remote --addr <LAPTOP-LAN-IP>:8181 --model <MODEL.gguf>",
+        key_path.display()
+    )
+}
 use clap::{Args, Parser, Subcommand};
 use rayon::ThreadPoolBuilder;
 use serde::Serialize;
@@ -2820,8 +2837,8 @@ async fn main() -> anyhow::Result<()> {
             println!("Treat this key like a password. Share it directly with the phone user.");
             println!("Never put it in a URL, screenshot, issue, or chat message.");
             println!(
-                "\nStart the server with:\n  camelid serve --lan-chat-only --api-key-file \"{}\" --addr <LAPTOP-LAN-IP>:8181 --model <MODEL.gguf>",
-                credential.path().display()
+                "\nStart the server with:\n  {}",
+                lan_chat_serve_command(credential.path())
             );
         }
         Command::Serve {
