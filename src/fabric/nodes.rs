@@ -157,7 +157,11 @@ impl NodeSet {
 
 impl std::fmt::Debug for NodeSet {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let (specs, generation) = self.current();
+        let specs = match &self.inner.source {
+            Source::Fixed(specs) => Arc::clone(specs),
+            Source::File(watched) => watched.cached(),
+        };
+        let generation = self.inner.generation.load(Ordering::SeqCst);
         f.debug_struct("NodeSet")
             .field("specs", &specs)
             .field("reloadable", &self.is_reloadable())
@@ -353,6 +357,28 @@ mod tests {
 
         assert_eq!(labels(&specs), vec!["a", "b"]);
         assert_eq!(before, after, "an identical rewrite is not a change");
+    }
+
+    #[test]
+    fn formatting_a_set_does_not_reload_its_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = write(&dir, "a=127.0.0.1:8181\n");
+        let set = NodeSet::from_file_every(path.clone(), Duration::ZERO).expect("load");
+        let (_, before) = set.current();
+
+        fs::write(&path, TWO).expect("rewrite");
+        let rendered = format!("{set:?}");
+
+        assert!(rendered.contains("a"), "{rendered}");
+        assert_eq!(
+            set.inner.generation.load(Ordering::SeqCst),
+            before,
+            "formatting must not perform I/O or change placement state"
+        );
+
+        let (specs, after) = set.current();
+        assert_eq!(labels(&specs), vec!["a", "b"]);
+        assert_ne!(before, after, "an explicit lookup still reloads the file");
     }
 
     /// Keeping the previous set is only safe if the operator is told, and

@@ -111,6 +111,11 @@ impl<T: Clone> WatchedFile<T> {
         &self.path
     }
 
+    /// The last value loaded, without looking at the file again.
+    pub(crate) fn cached(&self) -> T {
+        lock(&self.state).value.clone()
+    }
+
     /// The value as it stands, and what looking for a newer one did.
     ///
     /// `load` is called only when the interval has elapsed *and* the file's
