@@ -404,6 +404,51 @@ mod ghost_moe_cli_tests {
              --allow-cleartext-remote --addr <LAPTOP-LAN-IP>:8181 --model <MODEL.gguf>"
         );
     }
+
+    #[test]
+    fn remote_chat_actions_parse_a_loopback_backend_and_explicit_tailscale_binary() {
+        on_cli_test_stack(|| {
+            let start = Cli::try_parse_from(["camelid", "remote-chat", "start"])
+                .expect("parse remote Chat start");
+            match start.command {
+                Some(Command::RemoteChat {
+                    action: RemoteChatAction::Start { remote },
+                }) => {
+                    assert_eq!(remote.backend, "127.0.0.1:8181".parse().unwrap());
+                    assert_eq!(remote.tailscale_bin, None);
+                }
+                other => panic!("expected remote Chat start, got {other:?}"),
+            }
+
+            let status = Cli::try_parse_from([
+                "camelid",
+                "remote-chat",
+                "status",
+                "--backend",
+                "127.0.0.1:9191",
+                "--tailscale-bin",
+                "tailscale-test-bin",
+                "--json",
+            ])
+            .expect("parse remote Chat status");
+            match status.command {
+                Some(Command::RemoteChat {
+                    action: RemoteChatAction::Status { remote, json },
+                }) => {
+                    assert_eq!(remote.backend, "127.0.0.1:9191".parse().unwrap());
+                    assert_eq!(
+                        remote.tailscale_bin,
+                        Some(PathBuf::from("tailscale-test-bin"))
+                    );
+                    assert!(json);
+                }
+                other => panic!("expected remote Chat status, got {other:?}"),
+            }
+
+            Cli::try_parse_from(["camelid", "remote-chat"])
+                .expect_err("remote Chat accepted no lifecycle action");
+        });
+    }
 }
 
 use camelid::{
@@ -638,6 +683,27 @@ impl ServerPolicyArgs {
             } else {
                 api::ApiSurface::Full
             },
+        }
+    }
+}
+
+#[derive(Clone, Debug, Args)]
+struct RemoteChatArgs {
+    /// Existing authenticated LAN Chat listener to publish privately. Tailscale
+    /// Serve supports a local HTTP proxy only on 127.0.0.1.
+    #[arg(long, default_value = "127.0.0.1:8181")]
+    backend: SocketAddr,
+    /// Absolute path to the Tailscale CLI. Normally discovered from the standard
+    /// install location or PATH.
+    #[arg(long, env = "CAMELID_TAILSCALE_BIN")]
+    tailscale_bin: Option<PathBuf>,
+}
+
+impl RemoteChatArgs {
+    fn into_options(self) -> camelid::remote_chat::RemoteChatOptions {
+        camelid::remote_chat::RemoteChatOptions {
+            backend: self.backend,
+            tailscale_bin: self.tailscale_bin,
         }
     }
 }
@@ -1681,6 +1747,28 @@ mod fabric_command_tests {
 }
 
 #[derive(Debug, Subcommand)]
+enum RemoteChatAction {
+    /// Publish the verified loopback listener through private tailnet-only HTTPS.
+    Start {
+        #[command(flatten)]
+        remote: RemoteChatArgs,
+    },
+    /// Show the private URL, local backend readiness, and transport state.
+    Status {
+        #[command(flatten)]
+        remote: RemoteChatArgs,
+        /// Emit a machine-readable status object.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Remove only the exact Camelid root mapping from Tailscale Serve.
+    Stop {
+        #[command(flatten)]
+        remote: RemoteChatArgs,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum Command {
     /// Create or display the local credential used by authenticated LAN Chat.
     LanKey {
@@ -1688,6 +1776,11 @@ enum Command {
         /// still hold it. Without this flag the existing key is reused.
         #[arg(long, default_value_t = false)]
         rotate: bool,
+    },
+    /// Reach authenticated Chat from another network through private Tailscale HTTPS.
+    RemoteChat {
+        #[command(subcommand)]
+        action: RemoteChatAction,
     },
     /// Start the local HTTP API server.
     Serve {
@@ -2822,6 +2915,44 @@ async fn main() -> anyhow::Result<()> {
     }
 
     match command {
+        Command::RemoteChat { action } => match action {
+            RemoteChatAction::Start { remote } => {
+                let status = camelid::remote_chat::start(remote.into_options())?;
+                println!("Remote Chat is available within your Tailscale network:");
+                println!("  {}", status.url);
+                println!("Camelid remains on http://{}.", status.backend);
+                println!("The LAN Chat API key is still required in every browser.");
+                println!("Tailscale Funnel was not enabled.");
+            }
+            RemoteChatAction::Status { remote, json } => {
+                let status = camelid::remote_chat::status(remote.into_options())?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&status)?);
+                } else {
+                    println!("Remote Chat URL: {}", status.url);
+                    println!("Backend: http://{}", status.backend);
+                    println!(
+                        "Backend policy: {}",
+                        if status.backend_ready {
+                            "ready (authenticated LAN Chat only)"
+                        } else {
+                            "not ready"
+                        }
+                    );
+                    println!("Tailscale transport: {}", status.transport);
+                }
+            }
+            RemoteChatAction::Stop { remote } => {
+                let status = camelid::remote_chat::stop(remote.into_options())?;
+                println!("Camelid's remote Chat mapping is stopped.");
+                if status.transport != camelid::remote_chat::TransportState::Inactive {
+                    println!(
+                        "Other Tailscale configuration remains on HTTPS port 443 ({}).",
+                        status.transport
+                    );
+                }
+            }
+        },
         Command::LanKey { rotate } => {
             let credential = camelid::lan_key::provision(rotate)?;
             println!(
@@ -2837,8 +2968,12 @@ async fn main() -> anyhow::Result<()> {
             println!("Treat this key like a password. Share it directly with the phone user.");
             println!("Never put it in a URL, screenshot, issue, or chat message.");
             println!(
-                "\nStart the server with:\n  {}",
+                "\nTrusted LAN:\n  {}",
                 lan_chat_serve_command(credential.path())
+            );
+            println!(
+                "\nPrivate access from another network:\n  camelid serve --lan-chat-only --api-key-file \"{}\" --addr 127.0.0.1:8181 --model <MODEL.gguf>\n  camelid remote-chat start",
+                credential.path().display()
             );
         }
         Command::Serve {

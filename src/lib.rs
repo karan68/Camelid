@@ -41,6 +41,7 @@ pub mod offload;
 pub mod platform_fs;
 pub mod quality;
 pub mod receipt;
+pub mod remote_chat;
 pub mod runnable;
 pub mod runtime_config;
 pub mod runtime_manifest;
