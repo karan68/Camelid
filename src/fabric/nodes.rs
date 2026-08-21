@@ -14,10 +14,11 @@ use std::fs;
 use std::io::{Error, ErrorKind, Result};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime};
+use std::sync::Arc;
+use std::time::Duration;
 
 use super::node::{parse_fabric, NodeSpec};
+use super::watch::{Change, WatchedFile};
 
 /// How long a loaded set is trusted before the file is looked at again.
 ///
@@ -26,52 +27,15 @@ use super::node::{parse_fabric, NodeSpec};
 /// proxy is not stat-ing a file on every placement.
 pub(crate) const DEFAULT_NODE_RELOAD_INTERVAL: Duration = Duration::from_secs(1);
 
-/// What the file looked like when it was last read.
-///
-/// Length as well as modification time, because adding or removing a machine
-/// changes the length and mtime alone can be too coarse to notice a rewrite
-/// within one tick. It narrows that window rather than closing it: an edit of
-/// the same length inside a single tick still looks unchanged. Closing it would
-/// mean reading the file every interval, which is the cost this exists to
-/// avoid.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct FileStamp {
-    modified: Option<SystemTime>,
-    len: u64,
-}
-
-impl FileStamp {
-    fn of(path: &Path) -> Result<Self> {
-        let metadata = fs::metadata(path)?;
-        Ok(Self {
-            modified: metadata.modified().ok(),
-            len: metadata.len(),
-        })
-    }
-}
-
 enum Source {
     /// Specs given on the command line. They cannot change while the process
     /// runs, so there is nothing to re-read.
-    Fixed,
-    File {
-        path: PathBuf,
-        interval: Duration,
-    },
-}
-
-struct State {
-    specs: Arc<[NodeSpec]>,
-    stamp: Option<FileStamp>,
-    last_checked: Option<Instant>,
-    /// Whether the last re-read failed, so the notice below is printed once
-    /// per transition rather than once per interval for as long as it lasts.
-    stale: bool,
+    Fixed(Arc<[NodeSpec]>),
+    File(WatchedFile<Arc<[NodeSpec]>>),
 }
 
 struct Inner {
     source: Source,
-    state: Mutex<State>,
     /// Bumped only when the set actually changes, never merely because the
     /// file was re-read. An observation is valid for the generation it was
     /// taken in and no other; see [`NodeSet::current`].
@@ -94,13 +58,7 @@ impl NodeSet {
     pub(crate) fn fixed(specs: Vec<NodeSpec>) -> Self {
         Self {
             inner: Arc::new(Inner {
-                source: Source::Fixed,
-                state: Mutex::new(State {
-                    specs: Arc::from(specs),
-                    stamp: None,
-                    last_checked: None,
-                    stale: false,
-                }),
+                source: Source::Fixed(Arc::from(specs)),
                 generation: AtomicU64::new(0),
             }),
         }
@@ -118,17 +76,10 @@ impl NodeSet {
     pub(crate) fn from_file_every(path: PathBuf, interval: Duration) -> Result<Self> {
         // Loaded once here so an unusable file stops the proxy at startup
         // rather than at the first request.
-        let specs = load_node_file(&path)?;
-        let stamp = FileStamp::of(&path).ok();
+        let specs = load_specs(&path)?;
         Ok(Self {
             inner: Arc::new(Inner {
-                source: Source::File { path, interval },
-                state: Mutex::new(State {
-                    specs: Arc::from(specs),
-                    stamp,
-                    last_checked: Some(Instant::now()),
-                    stale: false,
-                }),
+                source: Source::File(WatchedFile::new(path, interval, specs)),
                 generation: AtomicU64::new(0),
             }),
         })
@@ -136,7 +87,7 @@ impl NodeSet {
 
     /// Whether the set changes without a restart.
     pub(crate) fn is_reloadable(&self) -> bool {
-        matches!(self.inner.source, Source::File { .. })
+        matches!(self.inner.source, Source::File(_))
     }
 
     /// The set as it stands, and the generation it belongs to.
@@ -150,103 +101,78 @@ impl NodeSet {
     /// change and leave the next caller reusing an observation of a set that
     /// no longer exists.
     pub(crate) fn current(&self) -> (Arc<[NodeSpec]>, u64) {
-        let Source::File { path, interval } = &self.inner.source else {
-            let state = lock(&self.inner.state);
-            return (Arc::clone(&state.specs), 0);
+        let Source::File(watched) = &self.inner.source else {
+            let Source::Fixed(specs) = &self.inner.source else {
+                unreachable!("a source is either fixed or a file")
+            };
+            return (Arc::clone(specs), 0);
         };
 
-        let mut state = lock(&self.inner.state);
-
-        let due = match state.last_checked {
-            Some(checked) if *interval > Duration::ZERO => checked.elapsed() >= *interval,
-            _ => true,
-        };
-        if !due {
-            return (
-                Arc::clone(&state.specs),
-                self.inner.generation.load(Ordering::SeqCst),
-            );
-        }
-        state.last_checked = Some(Instant::now());
-
-        let stamp = FileStamp::of(path).ok();
-        if stamp.is_some() && stamp == state.stamp {
-            return (
-                Arc::clone(&state.specs),
-                self.inner.generation.load(Ordering::SeqCst),
-            );
-        }
-
-        match load_node_file(path) {
-            Ok(specs) => {
-                state.stamp = stamp;
+        let (specs, change) = watched.look(load_specs);
+        match change {
+            Change::None => {}
+            Change::Loaded {
+                previous,
+                recovered,
+            } => {
                 // Compared, not assumed: touching a file without changing what
                 // it says must not throw away a usable observation.
-                if specs.as_slice() != &*state.specs {
+                if specs != previous {
                     tracing::info!(
                         nodes = specs.len(),
-                        path = %path.display(),
+                        path = %watched.path().display(),
                         "node set reloaded"
                     );
-                    state.specs = Arc::from(specs);
                     self.inner.generation.fetch_add(1, Ordering::SeqCst);
                 }
-                if state.stale {
+                if recovered {
                     eprintln!(
                         "fabric: node file {} is readable again; placing on {}",
-                        path.display(),
-                        nodes_phrase(state.specs.len())
+                        watched.path().display(),
+                        nodes_phrase(specs.len())
                     );
                 }
-                state.stale = false;
             }
-            Err(error) => {
-                // The previous set is kept on purpose. A file is often replaced
-                // by writing a new one and renaming it over the old, so a read
-                // that lands mid-swap sees a partial, empty or missing file;
-                // emptying the fabric on that would turn an ordinary edit into
-                // a total outage, because a fabric with no nodes refuses every
-                // request. The cost is that a change written into a broken or
-                // deleted file does not take effect, so the operator has to
-                // hear about it.
+            Change::Failed { error, first } => {
+                // The previous set is kept on purpose; see [`super::watch`].
+                // The cost is that a change written into a broken or deleted
+                // file does not take effect, so the operator has to hear about
+                // it.
                 tracing::warn!(
-                    path = %path.display(),
+                    path = %watched.path().display(),
                     %error,
                     "could not reload the node set; the previous one is still in force"
                 );
                 // Printed, not only traced: `RUST_LOG` is unset on a stock
                 // proxy, so a machine the operator meant to take out would go
-                // on being placed on with nothing said. Once per transition,
-                // because this is re-attempted every interval and a file left
-                // broken would otherwise emit a line a second indefinitely.
-                if !state.stale {
-                    eprintln!("{}", stale_node_set_notice(&error, state.specs.len()));
+                // on being placed on with nothing said.
+                if first {
+                    eprintln!("{}", stale_node_set_notice(&error, specs.len()));
                 }
-                state.stale = true;
             }
         }
-        (
-            Arc::clone(&state.specs),
-            self.inner.generation.load(Ordering::SeqCst),
-        )
+        (specs, self.inner.generation.load(Ordering::SeqCst))
     }
 }
 
 impl std::fmt::Debug for NodeSet {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let (specs, generation) = {
-            let state = lock(&self.inner.state);
-            (
-                Arc::clone(&state.specs),
-                self.inner.generation.load(Ordering::SeqCst),
-            )
+        let specs = match &self.inner.source {
+            Source::Fixed(specs) => Arc::clone(specs),
+            Source::File(watched) => watched.cached(),
         };
+        let generation = self.inner.generation.load(Ordering::SeqCst);
         f.debug_struct("NodeSet")
             .field("specs", &specs)
             .field("reloadable", &self.is_reloadable())
             .field("generation", &generation)
             .finish()
     }
+}
+
+/// Read and validate a node file into the shape the set holds.
+fn load_specs(path: &Path) -> Result<Arc<[NodeSpec]>> {
+    load_node_file(path).map(Arc::from)
 }
 
 /// Read and validate a node file.
@@ -314,14 +240,6 @@ fn nodes_phrase(count: usize) -> String {
     } else {
         format!("{count} machines")
     }
-}
-
-/// A poisoned lock is not corrupted state: some other request panicked while
-/// holding it. Recover the value rather than spreading the panic.
-fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 #[cfg(test)]
@@ -439,6 +357,28 @@ mod tests {
 
         assert_eq!(labels(&specs), vec!["a", "b"]);
         assert_eq!(before, after, "an identical rewrite is not a change");
+    }
+
+    #[test]
+    fn formatting_a_set_does_not_reload_its_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = write(&dir, "a=127.0.0.1:8181\n");
+        let set = NodeSet::from_file_every(path.clone(), Duration::ZERO).expect("load");
+        let (_, before) = set.current();
+
+        fs::write(&path, TWO).expect("rewrite");
+        let rendered = format!("{set:?}");
+
+        assert!(rendered.contains("a"), "{rendered}");
+        assert_eq!(
+            set.inner.generation.load(Ordering::SeqCst),
+            before,
+            "formatting must not perform I/O or change placement state"
+        );
+
+        let (specs, after) = set.current();
+        assert_eq!(labels(&specs), vec!["a", "b"]);
+        assert_ne!(before, after, "an explicit lookup still reloads the file");
     }
 
     /// Keeping the previous set is only safe if the operator is told, and

@@ -1121,6 +1121,28 @@ fn route_mode(raw: &str) -> anyhow::Result<camelid::fabric::RouteMode> {
     }
 }
 
+/// Build a fabric from whichever way the operator named its nodes.
+///
+/// Every `fabric` subcommand takes both forms, so the file an operator already
+/// maintains for `fabric serve` is the same one they can inspect with
+/// `fabric status`. Clap makes the two mutually exclusive and requires one, so
+/// exactly one arrives populated here.
+///
+/// A file that cannot be read is an error rather than an empty fabric: on the
+/// CLI that is a message instead of a table of nothing, and on `serve` it stops
+/// the proxy before it announces an address.
+fn fabric_from(
+    nodes: Vec<String>,
+    nodes_file: Option<PathBuf>,
+) -> anyhow::Result<camelid::fabric::Fabric> {
+    match nodes_file {
+        Some(path) => Ok(camelid::fabric::Fabric::from_node_file(path)?),
+        None => Ok(camelid::fabric::Fabric::new(
+            camelid::fabric::parse_fabric(&nodes).map_err(|error| anyhow::anyhow!("{error}"))?,
+        )),
+    }
+}
+
 /// Resolve the token the fabric authenticates to its nodes with.
 ///
 /// Deliberately not `#[arg(env = "CAMELID_API_KEY")]`: clap prints an env var's
@@ -1154,8 +1176,17 @@ enum FabricAction {
     /// Probe every node once and report what the fabric can serve.
     Status {
         /// A node, as `LABEL=HOST[:PORT]`. Repeat for each node.
-        #[arg(long = "node", required = true, value_name = "LABEL=HOST[:PORT]")]
+        #[arg(
+            long = "node",
+            required_unless_present = "nodes_file",
+            conflicts_with = "nodes_file",
+            value_name = "LABEL=HOST[:PORT]"
+        )]
         nodes: Vec<String>,
+        /// Read the nodes from the same file `fabric serve` takes, one
+        /// `LABEL=HOST[:PORT]` per line.
+        #[arg(long, value_name = "PATH")]
+        nodes_file: Option<PathBuf>,
         /// Bearer token for nodes started with an API key. Falls back to
         /// CAMELID_API_KEY. Prefer the variable on a shared machine, so the
         /// secret is not in the process command line.
@@ -1173,8 +1204,16 @@ enum FabricAction {
     ///
     /// Placement is deterministic, so this dry run predicts the real decision.
     Route {
-        #[arg(long = "node", required = true, value_name = "LABEL=HOST[:PORT]")]
+        #[arg(
+            long = "node",
+            required_unless_present = "nodes_file",
+            conflicts_with = "nodes_file",
+            value_name = "LABEL=HOST[:PORT]"
+        )]
         nodes: Vec<String>,
+        /// Read the nodes from the same file `fabric serve` takes.
+        #[arg(long, value_name = "PATH")]
+        nodes_file: Option<PathBuf>,
         /// `throughput` spreads independent requests; `affinity` keeps a session
         /// on the node whose prefix and KV cache are already warm.
         #[arg(long, default_value = "throughput")]
@@ -1199,8 +1238,16 @@ enum FabricAction {
     /// Placement, then forward: the request crosses the network once, not once
     /// per token.
     Run {
-        #[arg(long = "node", required = true, value_name = "LABEL=HOST[:PORT]")]
+        #[arg(
+            long = "node",
+            required_unless_present = "nodes_file",
+            conflicts_with = "nodes_file",
+            value_name = "LABEL=HOST[:PORT]"
+        )]
         nodes: Vec<String>,
+        /// Read the nodes from the same file `fabric serve` takes.
+        #[arg(long, value_name = "PATH")]
+        nodes_file: Option<PathBuf>,
         /// The user message to send.
         #[arg(long)]
         prompt: String,
@@ -1412,6 +1459,73 @@ mod fabric_command_tests {
                     other => panic!("expected a fabric command, got {other:?}"),
                 };
                 assert_eq!(bearer.as_deref(), Some("s3cret"), "{argv:?}");
+            }
+        });
+    }
+
+    /// The node file is the set an operator maintains for `fabric serve`.
+    /// Every subcommand has to read it, or inspecting the fabric means retyping
+    /// by hand the machines the proxy already knows about — and the two answers
+    /// can then disagree.
+    #[test]
+    fn every_fabric_subcommand_accepts_a_node_file() {
+        on_cli_test_stack(|| {
+            for argv in [
+                vec!["camelid", "fabric", "status"],
+                vec!["camelid", "fabric", "route"],
+                vec!["camelid", "fabric", "run", "--prompt", "hi"],
+                vec!["camelid", "fabric", "serve"],
+            ] {
+                let mut argv = argv;
+                argv.extend(["--nodes-file", "fabric.nodes"]);
+                let cli = Cli::try_parse_from(&argv).expect("parses");
+                let nodes_file = match cli.command {
+                    Some(Command::Fabric { action }) => match action {
+                        FabricAction::Status { nodes_file, .. }
+                        | FabricAction::Route { nodes_file, .. }
+                        | FabricAction::Run { nodes_file, .. }
+                        | FabricAction::Serve { nodes_file, .. } => nodes_file,
+                    },
+                    other => panic!("expected a fabric command, got {other:?}"),
+                };
+                assert_eq!(
+                    nodes_file.as_deref(),
+                    Some(std::path::Path::new("fabric.nodes")),
+                    "{argv:?}"
+                );
+            }
+        });
+    }
+
+    /// Two answers to "which machines" must not be configurable at once: the
+    /// file is the one that can change while the proxy runs, so a stray
+    /// `--node` silently winning would leave an operator editing a file that
+    /// nothing reads.
+    #[test]
+    fn naming_nodes_twice_is_refused_and_naming_them_not_at_all_is_too() {
+        on_cli_test_stack(|| {
+            for subcommand in [
+                vec!["status"],
+                vec!["route"],
+                vec!["run", "--prompt", "hi"],
+                vec!["serve"],
+            ] {
+                let both: Vec<&str> = ["camelid", "fabric"]
+                    .into_iter()
+                    .chain(subcommand.iter().copied())
+                    .chain(["--node", "a=127.0.0.1", "--nodes-file", "fabric.nodes"])
+                    .collect();
+                Cli::try_parse_from(&both)
+                    .err()
+                    .unwrap_or_else(|| panic!("{both:?} named its nodes twice and was accepted"));
+
+                let neither: Vec<&str> = ["camelid", "fabric"]
+                    .into_iter()
+                    .chain(subcommand.iter().copied())
+                    .collect();
+                Cli::try_parse_from(&neither).err().unwrap_or_else(|| {
+                    panic!("{neither:?} named no nodes at all and was accepted")
+                });
             }
         });
     }
@@ -3043,14 +3157,13 @@ async fn main() -> anyhow::Result<()> {
         Command::Fabric { action } => match action {
             FabricAction::Status {
                 nodes,
+                nodes_file,
                 bearer,
                 timeout_ms,
                 json,
             } => {
                 let bearer = fabric_bearer(bearer);
-                let specs = camelid::fabric::parse_fabric(&nodes)
-                    .map_err(|error| anyhow::anyhow!("{error}"))?;
-                let fabric = camelid::fabric::Fabric::new(specs)
+                let fabric = fabric_from(nodes, nodes_file)?
                     .with_timeout(std::time::Duration::from_millis(timeout_ms))
                     .with_bearer(bearer.as_deref());
                 let snapshots = fabric.observe();
@@ -3062,6 +3175,7 @@ async fn main() -> anyhow::Result<()> {
             }
             FabricAction::Route {
                 nodes,
+                nodes_file,
                 mode,
                 model,
                 sticky,
@@ -3071,9 +3185,7 @@ async fn main() -> anyhow::Result<()> {
             } => {
                 let bearer = fabric_bearer(bearer);
                 let mode = route_mode(&mode)?;
-                let specs = camelid::fabric::parse_fabric(&nodes)
-                    .map_err(|error| anyhow::anyhow!("{error}"))?;
-                let fabric = camelid::fabric::Fabric::new(specs)
+                let fabric = fabric_from(nodes, nodes_file)?
                     .with_timeout(std::time::Duration::from_millis(timeout_ms))
                     .with_bearer(bearer.as_deref());
                 let snapshots = fabric.observe();
@@ -3107,6 +3219,7 @@ async fn main() -> anyhow::Result<()> {
             }
             FabricAction::Run {
                 nodes,
+                nodes_file,
                 prompt,
                 mode,
                 model,
@@ -3119,9 +3232,7 @@ async fn main() -> anyhow::Result<()> {
             } => {
                 let bearer = fabric_bearer(bearer);
                 let mode = route_mode(&mode)?;
-                let specs = camelid::fabric::parse_fabric(&nodes)
-                    .map_err(|error| anyhow::anyhow!("{error}"))?;
-                let fabric = camelid::fabric::Fabric::new(specs)
+                let fabric = fabric_from(nodes, nodes_file)?
                     .with_timeout(std::time::Duration::from_millis(timeout_ms))
                     .with_bearer(bearer.as_deref());
 
@@ -3232,17 +3343,13 @@ async fn main() -> anyhow::Result<()> {
                 let tls = camelid::fabric::server::ProxyTls::resolve(tls_cert, tls_key).await?;
                 // Same reason: a node file that cannot be read is a refusal,
                 // and it has to arrive before the listening line.
-                let fabric = match nodes_file {
-                    Some(path) => camelid::fabric::Fabric::from_node_file(path)?,
-                    None => camelid::fabric::Fabric::new(
-                        camelid::fabric::parse_fabric(&nodes)
-                            .map_err(|error| anyhow::anyhow!("{error}"))?,
-                    ),
-                }
-                .with_timeout(std::time::Duration::from_millis(timeout_ms))
-                .with_bearer(bearer.as_deref())
-                .with_max_observation_age(std::time::Duration::from_millis(observation_max_age_ms))
-                .with_max_forward_attempts(max_forward_attempts);
+                let fabric = fabric_from(nodes, nodes_file)?
+                    .with_timeout(std::time::Duration::from_millis(timeout_ms))
+                    .with_bearer(bearer.as_deref())
+                    .with_max_observation_age(std::time::Duration::from_millis(
+                        observation_max_age_ms,
+                    ))
+                    .with_max_forward_attempts(max_forward_attempts);
 
                 // Bind before announcing, so a refused or already-taken address
                 // never prints a listening line it did not earn.
