@@ -51,16 +51,39 @@ That startup path loads the model immediately and applies the default `auto` exe
 
 ## Production HTTP policy
 
-Anonymous loopback serving remains the default. A non-loopback address is refused unless you
-configure `--api-key` / `--api-key-file`, or deliberately acknowledge an externally protected
-deployment with `--allow-unauthenticated-remote`. Prefer a key file because a literal command-line
-key can be visible to other local users:
+Anonymous loopback serving remains the default. A non-loopback address has to answer two separate
+questions, because they are two separate risks and answering one does not answer the other:
+
+| | anonymous | authenticated |
+|---|---|---|
+| **cleartext** | refused: needs both acknowledgements | refused: needs `--tls-cert`/`--tls-key` or `--allow-cleartext-remote` |
+| **TLS** | refused: needs `--api-key`, `--api-key-file`, or `--allow-unauthenticated-remote` | serves |
+
+Loopback is unaffected and needs neither. This is the same policy `camelid fabric serve` applies,
+for the same reason: a key travels on every request, so over cleartext the credential that is meant
+to protect a routable bind is itself given away, along with every prompt and completion.
+
+The recommended production shape is therefore TLS plus a key. Prefer a key file because a literal
+command-line key can be visible to other local users:
+
+```bash
+target/release/camelid serve \
+  --addr 0.0.0.0:8443 \
+  --api-key-file ./camelid-api.key \
+  --tls-cert ./server-cert-chain \
+  --tls-key ./server-private-key \
+  --cors-origin https://chat.example
+```
+
+If TLS is terminated in front of Camelid — a reverse proxy, a service mesh, an SSH tunnel — then the
+hop Camelid itself serves is still cleartext, and it has no way to know what is in front of it. Say
+so explicitly:
 
 ```bash
 target/release/camelid serve \
   --addr 0.0.0.0:8181 \
   --api-key-file ./camelid-api.key \
-  --cors-origin https://chat.example
+  --allow-cleartext-remote
 ```
 
 API clients can send either `Authorization: Bearer <key>` or `X-API-Key: <key>`. Health and embedded
@@ -98,6 +121,7 @@ target/release/camelid serve \
   --model /path/to/model.gguf \
   --api-key-file ./camelid-api.key \
   --lan-chat-only \
+  --allow-cleartext-remote \
   --no-open
 ```
 
@@ -107,19 +131,14 @@ switch to another local GGUF from that host's configured model directory. No COR
 the embedded same-origin UI. Permit the port only on the operating system's private-network firewall
 profile.
 
-This mode authenticates but does not encrypt plain HTTP. Use it only on a trusted private LAN, or put
-the listener behind an encrypted private transport. Ordinary Chat conversations still live in each
-browser's storage, so laptop and phone history do not synchronize in this phase.
+This mode authenticates but does not encrypt plain HTTP. `--allow-cleartext-remote` is the explicit
+acknowledgement required for that direct-LAN shape; it does not protect the credential, prompts, or
+responses from anyone on the path. Use it only on a trusted private LAN, or put the listener behind
+an encrypted private transport. Ordinary Chat conversations still live in each browser's storage,
+so laptop and phone history do not synchronize in this phase.
 
-Direct TLS is optional and requires a PEM certificate chain and private key together:
-
-```bash
-target/release/camelid serve \
-  --addr 0.0.0.0:8443 \
-  --api-key-file ./camelid-api.key \
-  --tls-cert ./server-cert-chain \
-  --tls-key ./server-private-key
-```
+Both acknowledgements also read from the environment, as `CAMELID_ALLOW_UNAUTHENTICATED_REMOTE` and
+`CAMELID_ALLOW_CLEARTEXT_REMOTE`.
 
 Resource ceilings are resolved once at startup. Their CLI names and environment aliases are:
 

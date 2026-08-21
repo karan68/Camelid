@@ -354,6 +354,7 @@ mod ghost_moe_cli_tests {
                 "--lan-chat-only",
                 "--api-key-file",
                 "camelid.key",
+                "--allow-cleartext-remote",
                 "--no-open",
             ])
             .expect("parse authenticated LAN Chat flags");
@@ -362,6 +363,7 @@ mod ghost_moe_cli_tests {
                     server, no_open, ..
                 }) => {
                     assert!(server.lan_chat_only);
+                    assert!(server.allow_cleartext_remote);
                     assert_eq!(server.api_key_file, Some(PathBuf::from("camelid.key")));
                     assert!(no_open);
                 }
@@ -393,6 +395,15 @@ mod ghost_moe_cli_tests {
             }
         });
     }
+
+    #[test]
+    fn lan_key_prints_a_server_command_that_passes_both_remote_guards() {
+        assert_eq!(
+            lan_chat_serve_command(std::path::Path::new("camelid.key")),
+            "camelid serve --lan-chat-only --api-key-file \"camelid.key\" \
+             --allow-cleartext-remote --addr <LAPTOP-LAN-IP>:8181 --model <MODEL.gguf>"
+        );
+    }
 }
 
 use camelid::{
@@ -416,6 +427,14 @@ use camelid::{
     tensor::{CpuTensor, Q8_0TensorBlocks, TensorStore},
     tokenizer::Tokenizer,
 };
+
+fn lan_chat_serve_command(key_path: &std::path::Path) -> String {
+    format!(
+        "camelid serve --lan-chat-only --api-key-file \"{}\" \
+         --allow-cleartext-remote --addr <LAPTOP-LAN-IP>:8181 --model <MODEL.gguf>",
+        key_path.display()
+    )
+}
 use clap::{Args, Parser, Subcommand};
 use rayon::ThreadPoolBuilder;
 use serde::Serialize;
@@ -524,6 +543,11 @@ struct ServerPolicyArgs {
         conflicts_with = "allow_unauthenticated_remote"
     )]
     lan_chat_only: bool,
+    /// Explicitly permit a cleartext non-loopback listener. Without this
+    /// acknowledgement or TLS, Camelid refuses the bind, because the API key
+    /// and every prompt would otherwise cross the network unencrypted.
+    #[arg(long, env = "CAMELID_ALLOW_CLEARTEXT_REMOTE", default_value_t = false)]
+    allow_cleartext_remote: bool,
     /// PEM certificate chain for HTTPS. Requires --tls-key.
     #[arg(long, env = "CAMELID_TLS_CERT", requires = "tls_key")]
     tls_cert: Option<PathBuf>,
@@ -586,6 +610,7 @@ impl ServerPolicyArgs {
                 .unwrap_or_default(),
             allow_unauthenticated_remote: enabled("CAMELID_ALLOW_UNAUTHENTICATED_REMOTE"),
             lan_chat_only: enabled("CAMELID_LAN_CHAT_ONLY"),
+            allow_cleartext_remote: enabled("CAMELID_ALLOW_CLEARTEXT_REMOTE"),
             tls_cert: std::env::var_os("CAMELID_TLS_CERT").map(PathBuf::from),
             tls_key: std::env::var_os("CAMELID_TLS_KEY").map(PathBuf::from),
             max_request_body_bytes: parsed("CAMELID_MAX_REQUEST_BODY_BYTES", 16 * 1024 * 1024),
@@ -601,6 +626,7 @@ impl ServerPolicyArgs {
             api_key_file: self.api_key_file,
             cors_origins: self.cors_origins,
             allow_unauthenticated_remote: self.allow_unauthenticated_remote,
+            allow_cleartext_remote: self.allow_cleartext_remote,
             tls_cert: self.tls_cert,
             tls_key: self.tls_key,
             max_request_body_bytes: self.max_request_body_bytes,
@@ -2811,8 +2837,8 @@ async fn main() -> anyhow::Result<()> {
             println!("Treat this key like a password. Share it directly with the phone user.");
             println!("Never put it in a URL, screenshot, issue, or chat message.");
             println!(
-                "\nStart the server with:\n  camelid serve --lan-chat-only --api-key-file \"{}\" --addr <LAPTOP-LAN-IP>:8181 --model <MODEL.gguf>",
-                credential.path().display()
+                "\nStart the server with:\n  {}",
+                lan_chat_serve_command(credential.path())
             );
         }
         Command::Serve {
