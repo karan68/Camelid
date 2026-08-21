@@ -1112,12 +1112,26 @@ fn read_tokenizer_gguf(
     Ok(gguf)
 }
 
-/// Parse the `--mode` flag shared by `fabric route` and `fabric run`.
+/// Parse the placement mode used by a resident or request-sending fabric.
 fn route_mode(raw: &str) -> anyhow::Result<camelid::fabric::RouteMode> {
     match raw {
         "throughput" => Ok(camelid::fabric::RouteMode::Throughput),
+        "completion-time" => Ok(camelid::fabric::RouteMode::CompletionTime),
         "affinity" => Ok(camelid::fabric::RouteMode::Affinity),
-        other => anyhow::bail!("unknown mode `{other}`; expected `throughput` or `affinity`"),
+        other => anyhow::bail!(
+            "unknown mode `{other}`; expected `throughput`, `completion-time` or `affinity`"
+        ),
+    }
+}
+
+/// A one-shot command owns no reusable service history, so it cannot honestly
+/// offer the resident completion-time policy.
+fn stateless_route_mode(raw: &str) -> anyhow::Result<camelid::fabric::RouteMode> {
+    match route_mode(raw)? {
+        camelid::fabric::RouteMode::CompletionTime => anyhow::bail!(
+            "mode `completion-time` learns across completed requests and is available only to the resident `fabric serve` command"
+        ),
+        mode => Ok(mode),
     }
 }
 
@@ -1215,7 +1229,8 @@ enum FabricAction {
         #[arg(long, value_name = "PATH")]
         nodes_file: Option<PathBuf>,
         /// `throughput` spreads independent requests; `affinity` keeps a session
-        /// on the node whose prefix and KV cache are already warm.
+        /// on the node whose prefix and KV cache are already warm. The learned
+        /// `completion-time` mode is unavailable to this stateless dry run.
         #[arg(long, default_value = "throughput")]
         mode: String,
         /// Only consider nodes serving this exact model id.
@@ -1251,6 +1266,8 @@ enum FabricAction {
         /// The user message to send.
         #[arg(long)]
         prompt: String,
+        /// `throughput` ranks queue depth; `affinity` prefers the requested
+        /// sticky node. Use resident `fabric serve` for learned placement.
         #[arg(long, default_value = "throughput")]
         mode: String,
         /// Require a node serving this exact model id. When omitted, the fabric
@@ -1305,8 +1322,9 @@ enum FabricAction {
         nodes_file: Option<PathBuf>,
         #[arg(long, default_value = "127.0.0.1:8282")]
         addr: SocketAddr,
-        /// Default placement mode; a client can still request affinity to a
-        /// specific node via the `x-camelid-fabric-sticky` request header.
+        /// Default placement mode. `completion-time` learns successful service
+        /// time per node, model and route; it falls back to queue depth until
+        /// every candidate is warm. A sticky header still requests affinity.
         #[arg(long, default_value = "throughput")]
         mode: String,
         /// Bearer token for nodes started with an API key. Falls back to
@@ -1432,6 +1450,28 @@ mod fabric_command_tests {
         assert_eq!(resolve_bearer(None, Some(String::new())), None);
         assert_eq!(resolve_bearer(None, Some("   ".into())), None);
         assert_eq!(resolve_bearer(Some("  ".into()), None), None);
+    }
+
+    #[test]
+    fn completion_time_is_available_only_to_the_resident_command() {
+        assert_eq!(
+            route_mode("completion-time").expect("resident mode parses"),
+            camelid::fabric::RouteMode::CompletionTime
+        );
+        assert!(stateless_route_mode("completion-time").is_err());
+
+        on_cli_test_stack(|| {
+            let argv = [
+                "camelid",
+                "fabric",
+                "serve",
+                "--node",
+                "a=127.0.0.1",
+                "--mode",
+                "completion-time",
+            ];
+            Cli::try_parse_from(argv).expect("resident mode must parse");
+        });
     }
 
     #[test]
@@ -3184,7 +3224,7 @@ async fn main() -> anyhow::Result<()> {
                 json,
             } => {
                 let bearer = fabric_bearer(bearer);
-                let mode = route_mode(&mode)?;
+                let mode = stateless_route_mode(&mode)?;
                 let fabric = fabric_from(nodes, nodes_file)?
                     .with_timeout(std::time::Duration::from_millis(timeout_ms))
                     .with_bearer(bearer.as_deref());
@@ -3231,7 +3271,7 @@ async fn main() -> anyhow::Result<()> {
                 json,
             } => {
                 let bearer = fabric_bearer(bearer);
-                let mode = route_mode(&mode)?;
+                let mode = stateless_route_mode(&mode)?;
                 let fabric = fabric_from(nodes, nodes_file)?
                     .with_timeout(std::time::Duration::from_millis(timeout_ms))
                     .with_bearer(bearer.as_deref());

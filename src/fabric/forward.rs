@@ -294,6 +294,7 @@ pub struct Streaming {
     /// The node's `Content-Type`, so the client is told what it is reading.
     pub content_type: Option<String>,
     stream: http::ResponseStream,
+    started: Instant,
 }
 
 impl std::fmt::Debug for Streaming {
@@ -317,6 +318,11 @@ impl Streaming {
         self.stream
             .next_chunk()
             .map_err(|error| after_the_head(&self.label, error))
+    }
+
+    /// Time from starting the request through the latest body read.
+    pub(crate) fn elapsed(&self) -> Duration {
+        self.started.elapsed()
     }
 }
 
@@ -408,6 +414,7 @@ pub fn forward_streaming(
         status: head.status,
         content_type: head.content_type,
         stream,
+        started,
     }))
 }
 

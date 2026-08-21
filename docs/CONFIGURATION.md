@@ -190,6 +190,52 @@ Three limits are deliberate and worth knowing before you deploy it:
   loopback, the bearer above and every prompt and completion still cross that network unencrypted,
   whatever the proxy presents to its own clients. Keep those hops on a trusted link.
 
+### Placement modes
+
+`--mode throughput` is the default and preserves the established policy: choose the smallest
+`max(node-reported in-flight jobs, requests this proxy has reserved)`, breaking ties by node label.
+`--mode affinity` prefers the node named by `x-camelid-fabric-sticky` and falls back to that same
+least-load rule if the node is unavailable or no longer serves the requested model. A sticky header
+requests affinity whatever default mode the proxy was started with.
+
+`--mode completion-time` is opt-in. It learns an exponentially weighted service time from clean,
+successful requests completed during this proxy process, then minimizes:
+
+```text
+(observed-or-reserved load + 1) * learned service time
+```
+
+The estimate is scoped to the node's label, address, backend and version; the model; the API route;
+streaming versus buffered delivery; and coarse power-of-two buckets for request bytes and requested
+output tokens. That prevents a node which happened to receive a longer prompt or generation from
+being labelled intrinsically slow. Only a completion placed while the node's observed-or-reserved
+load was zero is sampled. A busy completion includes unknown queueing from other workload classes,
+so dividing its wall time by total in-flight work would invent a service time the proxy did not
+observe. No prompt or response content is retained.
+
+Every eligible node needs five successful completions in the same workload class before an estimate
+may decide placement. Until then the proxy uses least-load, rotating equal-load cold candidates by
+least-recent selection so sequential traffic samples all of them. The response header says
+`x-camelid-fabric-reason: LeastLoaded` while cold and `EstimatedCompletion` once learned timing made
+the decision.
+
+Only a clean, queue-free success is a speed sample. A node-attributable 5xx, unreadable answer,
+transport failure, or truncated stream invalidates that node's estimate for the workload
+immediately. A queue-full refusal does not: it says the load bound worked, not that service became
+slow. Client cancellation does not either, because it says nothing about the node. A stream is
+sampled only at clean EOF, and not if the bounded relay channel filled behind a slow client. A
+request carrying a sticky header is not sampled either: affinity, rather than this policy, chose its
+node.
+
+Estimates older than five minutes become cold and have to be sampled again. They are memory-only,
+bounded to 1,024 node/workload entries, and disappear when the proxy restarts. `fabric route` and
+`fabric run` reject `completion-time`: as one-shot commands they have no resident history and could
+only pretend to make a learned decision.
+
+This mode changes placement, not node capacity or admission. A sole eligible node still receives the
+request, and a genuinely full node still owns its typed 503. Treat performance improvement as a
+measurement question: use a paired, interleaved fabric campaign before making a deployment claim.
+
 ### Naming clients, and cutting one off
 
 `--api-key` gives every client the same secret, so the access log can only say that *someone*
