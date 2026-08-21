@@ -66,21 +66,21 @@
         "quotable": true
       }
     ],
-    "latency_median_of_per_round": {
+    "latency_across_measured_rounds": {
       "win": {
-        "p50_ms": 4894.3,
-        "p95_ms": 5923.2,
-        "max_ms": 13754.3
+        "median_p50_ms": 4894.3,
+        "median_p95_ms": 5923.2,
+        "worst_max_ms": 13754.3
       },
       "mac": {
-        "p50_ms": 1145.4,
-        "p95_ms": 1344.5,
-        "max_ms": 1733.5
+        "median_p50_ms": 1145.4,
+        "median_p95_ms": 1344.5,
+        "worst_max_ms": 1733.5
       },
       "win+mac": {
-        "p50_ms": 572.9,
-        "p95_ms": 1956.5,
-        "max_ms": 6109.8
+        "median_p50_ms": 572.9,
+        "median_p95_ms": 1956.5,
+        "worst_max_ms": 6109.8
       }
     },
     "together_p95_vs_fastest_single_p95": 1.455,
