@@ -1236,9 +1236,10 @@ enum FabricAction {
     /// asking for `stream: true` is relayed as server-sent events, so a stock
     /// OpenAI client works against this address unchanged.
     ///
-    /// The proxy has no authentication of its own, so it binds loopback by
-    /// default and refuses a routable address unless the exposure is
-    /// acknowledged explicitly.
+    /// Client authentication is separate from the bearer the proxy sends to
+    /// its nodes. The proxy binds loopback by default; a routable address is
+    /// refused unless it is both authenticated and encrypted, or whichever of
+    /// those it is missing is acknowledged explicitly.
     Serve {
         #[arg(
             long = "node",
