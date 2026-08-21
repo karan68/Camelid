@@ -208,9 +208,10 @@ successful requests completed during this proxy process, then minimizes:
 The estimate is scoped to the node's label, address, backend and version; the model; the API route;
 streaming versus buffered delivery; and coarse power-of-two buckets for request bytes and requested
 output tokens. That prevents a node which happened to receive a longer prompt or generation from
-being labelled intrinsically slow. A measurement is wall time, so it also carries whatever the node
-was already working through; it is divided by the work the node reported in flight when the request
-was placed, because the formula above puts the queue back. No prompt or response content is retained.
+being labelled intrinsically slow. Only a completion placed while the node's observed-or-reserved
+load was zero is sampled. A busy completion includes unknown queueing from other workload classes,
+so dividing its wall time by total in-flight work would invent a service time the proxy did not
+observe. No prompt or response content is retained.
 
 Every eligible node needs five successful completions in the same workload class before an estimate
 may decide placement. Until then the proxy uses least-load, rotating equal-load cold candidates by
@@ -218,12 +219,13 @@ least-recent selection so sequential traffic samples all of them. The response h
 `x-camelid-fabric-reason: LeastLoaded` while cold and `EstimatedCompletion` once learned timing made
 the decision.
 
-Only clean success is a speed sample. A node-attributable 5xx, unreadable answer, transport failure,
-or truncated stream invalidates that node's estimate for the workload immediately. A queue-full
-refusal does not: it says the load bound worked, not that service became slow. Client cancellation
-does not either, because it says nothing about the node. A stream is sampled only at clean EOF, and
-not if the bounded relay channel filled behind a slow client. A request carrying a sticky header is
-not sampled either: affinity, rather than this policy, chose its node.
+Only a clean, queue-free success is a speed sample. A node-attributable 5xx, unreadable answer,
+transport failure, or truncated stream invalidates that node's estimate for the workload
+immediately. A queue-full refusal does not: it says the load bound worked, not that service became
+slow. Client cancellation does not either, because it says nothing about the node. A stream is
+sampled only at clean EOF, and not if the bounded relay channel filled behind a slow client. A
+request carrying a sticky header is not sampled either: affinity, rather than this policy, chose its
+node.
 
 Estimates older than five minutes become cold and have to be sampled again. They are memory-only,
 bounded to 1,024 node/workload entries, and disappear when the proxy restarts. `fabric route` and

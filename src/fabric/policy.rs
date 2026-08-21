@@ -399,6 +399,17 @@ impl ServiceTimeEstimates {
         let class = ServiceClass::of(node, model, workload?)?;
         self.0.get(&class).copied()
     }
+
+    #[cfg(test)]
+    pub(crate) fn sample_for(
+        &self,
+        node: &NodeSnapshot,
+        model: &str,
+        workload: &str,
+    ) -> Option<(u128, u32)> {
+        self.get(node, Some(model), Some(workload))
+            .map(|estimate| (estimate.mean_nanos, estimate.samples))
+    }
 }
 
 /// One eligible node reduced to the fields selection actually uses.
@@ -419,7 +430,7 @@ struct Candidate<'a> {
 /// Adding them instead would double-count for most of a request's life, and
 /// would do so asymmetrically: a node busy with this fabric's work would be
 /// ranked worse than a node equally busy with somebody else's.
-fn load_of(observed: usize, reserved: usize) -> usize {
+pub(crate) fn load_of(observed: usize, reserved: usize) -> usize {
     observed.max(reserved)
 }
 

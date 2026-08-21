@@ -48,11 +48,11 @@ pub use node::{
     NodeStatus, DEFAULT_NODE_PORT,
 };
 use nodes::NodeSet;
+use policy::{load_of, route_reserved_with_estimates, ServiceTimeEstimates};
 pub use policy::{
     route, route_reserved, Reservations, RouteDecision, RouteError, RouteMode, RouteReason,
     RouteRequest,
 };
-use policy::{route_reserved_with_estimates, ServiceTimeEstimates};
 pub use probe::{probe_fabric, probe_node, Observation, ProbeError, DEFAULT_PROBE_TIMEOUT};
 
 /// How many nodes one request may be sent to before it fails.
@@ -331,7 +331,8 @@ impl Fabric {
             .filter(|snapshot| !excluded.iter().any(|label| label == snapshot.label()))
             .collect();
 
-        let (decision, service_model) = if request.mode == RouteMode::CompletionTime {
+        let (decision, service_model, service_ahead) = if request.mode == RouteMode::CompletionTime
+        {
             // Deciding, reserving and recording cold-selection recency are one
             // step. Split them and concurrent placements can all decide from
             // the same policy state. These are the only nested fabric locks,
@@ -342,11 +343,14 @@ impl Fabric {
             let mut reserved = lock(&self.reserved);
             let decision =
                 route_reserved_with_estimates(&snapshots, request, &reserved, &service_times)?;
-            reserved.take(&decision.label);
             let selected = snapshots
                 .iter()
                 .find(|snapshot| snapshot.label() == decision.label)
                 .expect("placement returns a label it was given");
+            let service_ahead = selected.status.ready().map_or(0, |ready| {
+                load_of(ready.in_flight, reserved.get(&decision.label))
+            });
+            reserved.take(&decision.label);
             let service_model = request
                 .model
                 .or_else(|| selected.active_model_id())
@@ -356,7 +360,7 @@ impl Fabric {
             }
             drop(reserved);
             drop(service_times);
-            (decision, service_model)
+            (decision, service_model, service_ahead)
         } else {
             // Exactly the pre-existing throughput/affinity path: those modes
             // neither allocate nor lock service-time state during placement.
@@ -372,7 +376,7 @@ impl Fabric {
                 .model
                 .or_else(|| selected.active_model_id())
                 .map(str::to_string);
-            (decision, service_model)
+            (decision, service_model, 0)
         };
 
         let node = snapshots
@@ -387,6 +391,7 @@ impl Fabric {
             service_model,
             service_class: request.service_class.map(str::to_string),
             service_mode: request.mode,
+            service_ahead,
             service_recorded: false,
         })
     }
@@ -669,16 +674,6 @@ fn service_class(path: &str, body: &Value) -> String {
     )
 }
 
-/// One request's own service cost, with the queueing it waited through removed.
-///
-/// A sample is wall time from sending to completion, so it already contains the
-/// work the node was carrying when the request arrived. Selection multiplies an
-/// estimate by the load it can see, so leaving that in counts the same queue
-/// twice and ranks a fast node that is busy behind a slow node that is idle.
-fn service_time(elapsed: Duration, ahead: usize) -> Duration {
-    elapsed / u32::try_from(ahead.saturating_add(1)).unwrap_or(u32::MAX)
-}
-
 /// A request that a node took, and what it cost to get there.
 struct Sent<T> {
     value: T,
@@ -730,6 +725,7 @@ pub struct Placement {
     service_model: Option<String>,
     service_class: Option<String>,
     service_mode: RouteMode,
+    service_ahead: usize,
     service_recorded: bool,
 }
 
@@ -754,16 +750,17 @@ impl Placement {
             return;
         }
         self.service_recorded = true;
+        // A busy completion's wall time includes queueing from work whose
+        // workload class is not exposed by node health. Dividing by the total
+        // in-flight count would fabricate this class's service time, so only a
+        // request placed with nobody ahead becomes a sample.
+        if self.service_ahead != 0 {
+            return;
+        }
         let (Some(model), Some(service_class)) = (&self.service_model, &self.service_class) else {
             return;
         };
-        let ahead = self.node.status.ready().map_or(0, |ready| ready.in_flight);
-        lock(&self.service_times).observe(
-            &self.node,
-            model,
-            service_class,
-            service_time(elapsed, ahead),
-        );
+        lock(&self.service_times).observe(&self.node, model, service_class, elapsed);
     }
 
     /// Forget a learned speed after the node itself fails this workload.
@@ -1060,19 +1057,74 @@ mod tests {
     }
 
     #[test]
-    fn a_sample_is_this_requests_own_cost_not_the_queue_it_waited_in() {
-        // 160ms spent behind three other requests on a node that runs one at a
-        // time is 40ms of work, and 40ms is what selection multiplies by the
-        // load it can see.
-        assert_eq!(
-            service_time(Duration::from_millis(160), 3),
-            Duration::from_millis(40)
+    fn a_busy_completion_is_not_a_service_sample() {
+        let node = snapshot(
+            "a",
+            NodeStatus::Ready(NodeReady {
+                active_model_id: Some("m".to_string()),
+                backend: "llama".to_string(),
+                version: "0.5.4".to_string(),
+                in_flight: 0,
+                waiting: 0,
+            }),
         );
-        // Nothing was ahead of it, so the measurement already is the cost.
+        let measured = node.clone();
+        let fabric = Fabric::new(Vec::new());
+        {
+            let mut reserved = lock(&fabric.reserved);
+            reserved.take("a");
+            reserved.take("a");
+        }
+        let request = RouteRequest::new(RouteMode::CompletionTime)
+            .with_model(Some("m"))
+            .with_service_class(Some("class"));
+
+        let mut placement = fabric
+            .place_observed(vec![node], &request, &[])
+            .expect("routes");
+
         assert_eq!(
-            service_time(Duration::from_millis(400), 0),
-            Duration::from_millis(400)
+            placement.service_ahead, 2,
+            "sampling must use the same max(observed, reserved) load as selection"
         );
+        assert_eq!(fabric.reserved().get("a"), 3);
+        placement.record_success(Duration::from_millis(300));
+        let (_, samples) = lock(&fabric.service_times)
+            .sample_for(&measured, "m", "class")
+            .expect("selection recency keeps the class present");
+        assert_eq!(samples, 0, "busy queueing became a speed sample");
+        drop(placement);
+        assert_eq!(fabric.reserved().get("a"), 2);
+    }
+
+    #[test]
+    fn a_queue_free_completion_records_its_observed_wall_time() {
+        let node = snapshot(
+            "a",
+            NodeStatus::Ready(NodeReady {
+                active_model_id: Some("m".to_string()),
+                backend: "llama".to_string(),
+                version: "0.5.4".to_string(),
+                in_flight: 0,
+                waiting: 0,
+            }),
+        );
+        let measured = node.clone();
+        let fabric = Fabric::new(Vec::new());
+        let request = RouteRequest::new(RouteMode::CompletionTime)
+            .with_model(Some("m"))
+            .with_service_class(Some("class"));
+        let mut placement = fabric
+            .place_observed(vec![node], &request, &[])
+            .expect("routes");
+
+        placement.record_success(Duration::from_millis(400));
+
+        let (mean_nanos, samples) = lock(&fabric.service_times)
+            .sample_for(&measured, "m", "class")
+            .expect("the queue-free completion was sampled");
+        assert_eq!(samples, 1);
+        assert_eq!(mean_nanos, Duration::from_millis(400).as_nanos());
     }
 
     #[test]
