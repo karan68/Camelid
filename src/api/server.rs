@@ -285,18 +285,18 @@ impl ServerPolicy {
 
         let tls = resolve_tls(options.tls_cert, options.tls_key)?;
 
-        // The key configured above is sent on every request, so without TLS the
-        // very thing protecting a routable bind is what the bind gives away,
-        // along with every prompt and completion. `crate::fabric::server`
-        // refuses this same shape on the same three conditions.
+        // Without TLS the whole request path is readable, including any
+        // configured credential and every prompt and completion.
+        // `crate::fabric::server` refuses this same shape on the same three
+        // conditions.
         if !addr.ip().is_loopback() && tls.is_none() && !options.allow_cleartext_remote {
             return Err(Error::new(
                 ErrorKind::PermissionDenied,
                 format!(
-                    "refusing cleartext non-loopback listener {addr}; the API key and every \
-                     prompt would cross the network unencrypted. Bind a loopback address, \
-                     configure --tls-cert/--tls-key, or explicitly acknowledge the risk with \
-                     --allow-cleartext-remote"
+                    "refusing cleartext non-loopback listener {addr}; any credentials, prompts, \
+                     and completions would cross the network unencrypted. Bind a loopback \
+                     address, configure --tls-cert/--tls-key, or explicitly acknowledge the \
+                     risk with --allow-cleartext-remote"
                 ),
             ));
         }
@@ -534,6 +534,23 @@ mod tests {
             message.contains("--tls-cert"),
             "and the way to do it properly: {message}"
         );
+    }
+
+    #[test]
+    fn an_anonymous_override_is_not_told_it_has_a_key() {
+        let error = ServerPolicy::resolve(
+            SocketAddr::from(([0, 0, 0, 0], 8181)),
+            ServeOptions {
+                allow_unauthenticated_remote: true,
+                ..ServeOptions::default()
+            },
+        )
+        .unwrap_err();
+
+        let message = error.to_string();
+        assert!(message.contains("any credentials"), "{message}");
+        assert!(!message.contains("the API key"), "{message}");
+        assert!(message.contains("--allow-cleartext-remote"), "{message}");
     }
 
     #[test]
