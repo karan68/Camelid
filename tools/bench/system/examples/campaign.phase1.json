@@ -1,0 +1,84 @@
+{
+  "schema": "camelid.benchmark.campaign/v1",
+  "campaign_id": "replace-with-unique-campaign-id",
+  "mode": "pr",
+  "created_utc": "2026-08-23T00:00:00Z",
+  "controller": {
+    "source_manifest_sha256": "replace-with-output-of-cli-digest",
+    "version": "phase1"
+  },
+  "repository_root": "<absolute-repository-root>",
+  "source_arms": [
+    {
+      "id": "base",
+      "source_dir": "<absolute-clean-base-worktree>",
+      "expected_git_sha": "0000000000000000000000000000000000000000",
+      "cargo_path": "<absolute-cargo-executable>",
+      "toolchain": "1.89.0",
+      "features": [],
+      "target_dir": "<absolute-isolated-base-target>"
+    },
+    {
+      "id": "head",
+      "source_dir": "<absolute-clean-head-worktree>",
+      "expected_git_sha": "0000000000000000000000000000000000000000",
+      "cargo_path": "<absolute-cargo-executable>",
+      "toolchain": "1.89.0",
+      "features": [],
+      "target_dir": "<absolute-isolated-head-target>"
+    }
+  ],
+  "models": [
+    {
+      "id": "replace-with-exact-row-id",
+      "artifact_path": "<absolute-model-path>",
+      "expected_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "quantization": "Q8_0"
+    }
+  ],
+  "workloads": [
+    {
+      "id": "rt_prefill_short",
+      "adapter": "runtime-camelid",
+      "model_id": "replace-with-exact-row-id",
+      "prompt_file": "../../../../qa/benchmarks/runtime/prompts/prefill-short.txt",
+      "max_tokens": 1,
+      "warmup": true,
+      "deterministic": true,
+      "threads": 8,
+      "backend": {
+        "requested": "cpu_deterministic",
+        "assertion": "deterministic_no_offload"
+      },
+      "primary_metrics": ["prefill_ms", "ttft_ms", "peak_rss_bytes"],
+      "schedule": "balanced_rotation",
+      "repetitions": 2,
+      "timeout_ms": 600000
+    },
+    {
+      "id": "rt_decode_short",
+      "adapter": "runtime-camelid",
+      "model_id": "replace-with-exact-row-id",
+      "prompt_file": "../../../../qa/benchmarks/runtime/prompts/decode-short.txt",
+      "max_tokens": 64,
+      "warmup": true,
+      "deterministic": true,
+      "threads": 8,
+      "backend": {
+        "requested": "cpu_deterministic",
+        "assertion": "deterministic_no_offload"
+      },
+      "primary_metrics": ["tokens_per_second", "ttft_ms", "peak_rss_bytes"],
+      "schedule": "balanced_rotation",
+      "repetitions": 2,
+      "timeout_ms": 600000
+    }
+  ],
+  "resources": {
+    "minimum_free_disk_bytes": 21474836480
+  },
+  "security": {
+    "network": "deny",
+    "trust_tier": "local_exploratory"
+  }
+}

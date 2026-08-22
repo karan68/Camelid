@@ -1,0 +1,1 @@
+Write a concise technical explanation of why output-token equality must be checked before accepting an inference speed improvement. Discuss silent backend fallback, paired measurements, and reproducibility.

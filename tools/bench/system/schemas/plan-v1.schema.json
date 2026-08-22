@@ -1,0 +1,179 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://camelid.ai/schemas/benchmark/plan-v1.schema.json",
+  "title": "Camelid benchmark plan v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "campaign_id",
+    "mode",
+    "created_utc",
+    "controller",
+    "repository_root",
+    "source_arms",
+    "models",
+    "workloads",
+    "resources",
+    "security"
+  ],
+  "properties": {
+    "schema": { "const": "camelid.benchmark.plan/v1" },
+    "campaign_id": { "$ref": "#/$defs/id" },
+    "mode": {
+      "enum": ["pr", "main_trend", "release", "external_comparator", "ablation"]
+    },
+    "created_utc": { "type": "string", "format": "date-time" },
+    "repository_root": { "$ref": "#/$defs/non_empty" },
+    "controller": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_manifest_sha256", "version"],
+      "properties": {
+        "source_manifest_sha256": { "$ref": "#/$defs/sha256" },
+        "version": { "$ref": "#/$defs/non_empty" }
+      }
+    },
+    "source_arms": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/source_arm" }
+    },
+    "models": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/model" }
+    },
+    "workloads": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/workload" }
+    },
+    "resources": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["minimum_free_disk_bytes"],
+      "properties": {
+        "minimum_free_disk_bytes": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "security": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["network", "trust_tier"],
+      "properties": {
+        "network": { "enum": ["deny", "loopback_only", "explicit"] },
+        "trust_tier": {
+          "enum": ["hosted_validation", "trusted_benchmark", "release", "local_exploratory"]
+        }
+      }
+    }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$"
+    },
+    "non_empty": { "type": "string", "minLength": 1 },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "git_sha": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "source_arm": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "source_dir", "git_sha", "tree_dirty", "cargo_lock_sha256", "build"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "source_dir": { "$ref": "#/$defs/non_empty" },
+        "git_sha": { "$ref": "#/$defs/git_sha" },
+        "tree_dirty": { "type": "boolean" },
+        "cargo_lock_sha256": { "$ref": "#/$defs/sha256" },
+        "build": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["cargo_path", "toolchain", "profile", "features", "target_dir", "binary_path"],
+          "properties": {
+            "cargo_path": { "$ref": "#/$defs/non_empty" },
+            "toolchain": { "$ref": "#/$defs/non_empty" },
+            "profile": { "enum": ["release"] },
+            "features": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/non_empty" },
+              "uniqueItems": true
+            },
+            "target_dir": { "$ref": "#/$defs/non_empty" },
+            "binary_path": { "$ref": "#/$defs/non_empty" }
+          }
+        }
+      }
+    },
+    "model": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "artifact_path", "artifact_sha256", "size_bytes", "quantization"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "artifact_path": { "$ref": "#/$defs/non_empty" },
+        "artifact_sha256": { "$ref": "#/$defs/sha256" },
+        "size_bytes": { "type": "integer", "minimum": 1 },
+        "quantization": { "$ref": "#/$defs/non_empty" }
+      }
+    },
+    "workload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "adapter",
+        "model_id",
+        "prompt_file",
+        "prompt_sha256",
+        "prompt_policy",
+        "max_tokens",
+        "warmup",
+        "deterministic",
+        "threads",
+        "backend",
+        "primary_metrics",
+        "order",
+        "repetitions",
+        "timeout_ms"
+      ],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "adapter": { "enum": ["runtime-camelid"] },
+        "model_id": { "$ref": "#/$defs/id" },
+        "prompt_file": { "$ref": "#/$defs/non_empty" },
+        "prompt_sha256": { "$ref": "#/$defs/sha256" },
+        "prompt_policy": { "enum": ["front_block_marker_v1"] },
+        "max_tokens": { "type": "integer", "minimum": 1 },
+        "warmup": { "type": "boolean" },
+        "deterministic": { "const": true },
+        "threads": { "type": ["integer", "null"], "minimum": 1 },
+        "backend": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["requested", "assertion"],
+          "properties": {
+            "requested": { "enum": ["cpu_deterministic"] },
+            "assertion": { "enum": ["deterministic_no_offload"] }
+          }
+        },
+        "primary_metrics": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/non_empty" }
+        },
+        "order": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/id" }
+        },
+        "repetitions": { "type": "integer", "minimum": 1 },
+        "timeout_ms": { "type": "integer", "minimum": 1 }
+      }
+    }
+  }
+}

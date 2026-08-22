@@ -1,0 +1,134 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://camelid.ai/schemas/benchmark/comparison-v1.schema.json",
+  "title": "Camelid benchmark comparison v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "campaign_id", "runtime", "agents"],
+  "properties": {
+    "schema": { "const": "camelid.benchmark.comparison/v1" },
+    "campaign_id": { "$ref": "#/$defs/id" },
+    "runtime": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/runtime_comparison" }
+    },
+    "agents": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/agent_comparison" }
+    }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$"
+    },
+    "non_empty": { "type": "string", "minLength": 1 },
+    "positive_number": { "type": "number", "exclusiveMinimum": 0 },
+    "runtime_comparison": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "workload_id",
+        "metric",
+        "valid_pairs",
+        "excluded_pairs",
+        "base_median",
+        "head_median",
+        "median_ratio_head_over_base",
+        "bootstrap_ci95",
+        "practical_margin",
+        "observed_direction",
+        "bootstrap_seed",
+        "bootstrap_samples",
+        "verdict"
+      ],
+      "properties": {
+        "workload_id": { "$ref": "#/$defs/id" },
+        "metric": { "$ref": "#/$defs/non_empty" },
+        "valid_pairs": { "type": "integer", "minimum": 0 },
+        "excluded_pairs": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["process_block", "reason"],
+            "properties": {
+              "process_block": { "type": "integer", "minimum": 0 },
+              "reason": { "$ref": "#/$defs/non_empty" }
+            }
+          }
+        },
+        "base_median": {
+          "oneOf": [
+            { "$ref": "#/$defs/positive_number" },
+            { "type": "null" }
+          ]
+        },
+        "head_median": {
+          "oneOf": [
+            { "$ref": "#/$defs/positive_number" },
+            { "type": "null" }
+          ]
+        },
+        "median_ratio_head_over_base": {
+          "oneOf": [
+            { "$ref": "#/$defs/positive_number" },
+            { "type": "null" }
+          ]
+        },
+        "bootstrap_ci95": {
+          "oneOf": [
+            {
+              "type": "array",
+              "minItems": 2,
+              "maxItems": 2,
+              "items": { "$ref": "#/$defs/positive_number" }
+            },
+            { "type": "null" }
+          ]
+        },
+        "practical_margin": { "type": ["number", "null"], "minimum": 0 },
+        "observed_direction": {
+          "enum": ["head_faster", "head_slower", "no_clear_direction", "insufficient_data"]
+        },
+        "bootstrap_seed": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+        "bootstrap_samples": { "type": "integer", "minimum": 1 },
+        "verdict": {
+          "enum": [
+            "IMPROVEMENT",
+            "NO_MATERIAL_CHANGE",
+            "REGRESSION",
+            "INCONCLUSIVE_NOISE",
+            "INVALID_CORRECTNESS",
+            "INVALID_BACKEND",
+            "INVALID_INFRASTRUCTURE",
+            "UNSUPPORTED"
+          ]
+        }
+      }
+    },
+    "agent_count": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["passes", "valid_attempts"],
+      "properties": {
+        "passes": { "type": "integer", "minimum": 0 },
+        "valid_attempts": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "agent_comparison": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["task_id", "native", "pi", "comparative_claim_allowed", "reason"],
+      "properties": {
+        "task_id": { "$ref": "#/$defs/id" },
+        "native": { "$ref": "#/$defs/agent_count" },
+        "pi": { "$ref": "#/$defs/agent_count" },
+        "comparative_claim_allowed": { "type": "boolean" },
+        "reason": { "$ref": "#/$defs/non_empty" }
+      }
+    }
+  }
+}
