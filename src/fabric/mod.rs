@@ -1139,6 +1139,31 @@ mod tests {
                 assert_ne!(read, 0, "request ended before its headers");
                 request.extend_from_slice(&buffer[..read]);
             }
+            let header_end = request
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .expect("request headers end")
+                + 4;
+            let content_length = std::str::from_utf8(&request[..header_end])
+                .expect("ASCII request headers")
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length").then(|| {
+                        value
+                            .trim()
+                            .parse::<usize>()
+                            .expect("numeric content length")
+                    })
+                })
+                .unwrap_or(0);
+            while request.len() - header_end < content_length {
+                let read = stream
+                    .read(&mut buffer)
+                    .expect("read authenticated request body");
+                assert_ne!(read, 0, "request ended before its body");
+                request.extend_from_slice(&buffer[..read]);
+            }
             let body = r#"{"choices":[{"message":{"role":"assistant","content":"served"}}]}"#;
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
