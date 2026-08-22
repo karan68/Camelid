@@ -42,8 +42,22 @@ dead end. **Prefill is compute-bound** → that is the one place a tiled GEMM ca
   footing — q8 decode is **1.50× FASTER** (CI [1.468, 1.644]), rising monotonically with
   context depth (1.14× at 1k, 1.27× at 2k, 1.50× at 8k). So the KV-bandwidth win is real and
   the lane is **blocked, not dead**: the missing pieces are `attention_decode_splitk_kvq8`
-  and a Q8 flash/matmul prefill. Whether split-K and Q8 *compose* is **untested** and is the
-  one question worth spending on. Note one depth already wins outright: at 4117 tokens q8
+  and a Q8 flash/matmul prefill. **Both were then built and measured (2026-08-22, same
+  host).** PREFILL IS FIXED: the cause was one conjunct (`!self.kvq8` in `use_attn_mm`)
+  excluding q8 from the simdgroup-matrix attention, NOT the Q8 dequant — q8/f16 prefill was
+  1.00-1.07x at every depth while both trailed f32 by 1.8-4.4x, i.e. the two excluded
+  formats landed on top of each other. Admitting q8 via a `kv_dequant_q8_to_h` staging pass
+  takes prefill from **4.48x worse than the f32 default to 0.986x — parity** (CI [0.924,
+  1.132]), a 4.5x improvement (CI [0.198, 0.252]). DECODE: `attention_decode_splitk_kvq8`
+  was written and works, but **the composition hypothesis was WRONG** — predicted 1.5x-3.2x,
+  measured **+5.9%** at 8006 (CI [1.042, 1.153], significant) and nothing resolvable at
+  2066. Split-K wins mostly via memory-level parallelism on the KV read, which is the same
+  resource Q8 already relieves, so the second lever has little left to pull. It does lift q8
+  decode from significantly-worse-than-default to indistinguishable (0.949, CI [0.873,
+  1.030]). Net: q8 now matches the f32 default on prefill AND decode at 0.858 of its peak
+  RSS. Do not re-run the compose experiment; do not re-derive the prefill cause. Still open:
+  the es=2 activation stream (needs a `rope_scatter_qh_h_q8`), and `fit.rs KvDtype`.
+  Note one depth already won outright even before the fix: at 4117 tokens q8
   beats the default **1.031×** (significant) despite the forfeit. **Quality is where the two
   compressed formats diverge:** on coherent English (`realtext` probe, 1460 tok) **f16 is
   token-identical to f32 in 3/3 rounds at every depth tested, q8 is NOT** — it diverges

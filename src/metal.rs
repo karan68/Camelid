@@ -196,6 +196,8 @@ struct MetalLinearKernel {
     attention_decode_splitk_pipeline: ComputePipelineState,
     attention_decode_splitk_kv16_pipeline: ComputePipelineState,
     attention_decode_splitk_kv16_direct_pipeline: ComputePipelineState,
+    attention_decode_splitk_kvq8_pipeline: ComputePipelineState,
+    kv_dequant_q8_to_h_pipeline: ComputePipelineState,
     #[allow(dead_code)] // stage-bandwidth probe variant; exercised by the depth-probe test
     attention_splitk_kv16_stageonly_pipeline: ComputePipelineState,
     attention_decode_splitk_merge_pipeline: ComputePipelineState,
@@ -4238,6 +4240,211 @@ kernel void attention_decode_splitk_kv16(
     }
 }
 
+// Q8_0-KV twin of attention_decode_splitk_kv16.
+//
+// Why this exists: enabling a Q8_0 primary used to forfeit split-K decode entirely
+// (the gate required an F32 primary), so a q8 session traded split-K's ~2.1x for the
+// KV-bandwidth win alone and came out behind the shipped default. Measured on M3 /
+// Llama-3.2-1B-Q8_0, q8 without split-K is 1.14x-1.50x over f32-without-split-K but
+// only ~0.87x-1.03x of the f32 default. See METAL_KV_Q8_RESULT.md. This kernel is the
+// missing half: split-K parallelism AND GQA amortization over a cache that is 1.88x
+// smaller than the f16 mirrors the kv16 split-K reads.
+//
+// Staging strategy differs from the kv16 twin on purpose. That kernel stages
+// dequantized `half`, costing 8 KiB of threadgroup memory. Here we stage the RAW int8
+// codes plus one f16 scale per 32-value block and dequantize in f32 at use:
+//
+//   * ~4.3 KiB total (PT*128 bytes per cache + PT*MAX_DPL scales), roughly half the
+//     kv16 twin, so more threadgroups stay resident per core -- which is the whole
+//     point of split-K.
+//   * The dequantized value never round-trips through `half`, so the arithmetic is
+//     the same `scale * float(code)` in f32 that attention_decode_v2_kvq8 performs.
+//     Staging dequantized halves would add ~5e-4 relative error and miss the 2e-4
+//     parity tolerance the Q8 lane is already held to.
+//
+// The cost is dequantizing once per consuming query head rather than once per stage
+// (group-way redundant ALU). Decode is bandwidth-bound, so trading a convert+multiply
+// for occupancy and DRAM traffic is the right side of that bargain.
+//
+// Byte strides: under a Q8 primary, position_stride / kv_head_stride / kv_base_offset
+// are all denominated in BYTES (see kv_position_stride at the encode site), unlike the
+// f32/f16 kernels which take element strides. Blocks are 34 bytes: f16 scale then 32
+// signed codes. Dim d lives at block d/32, code d%32.
+kernel void attention_decode_splitk_kvq8(
+    device const float* query [[buffer(0)]],
+    device const uchar* keys [[buffer(1)]],
+    device const uchar* values [[buffer(2)]],
+    device float* partials [[buffer(3)]], // [n_heads][n_splits][head_dim + 2]
+    constant uint& n_heads [[buffer(5)]],
+    constant uint& head_dim [[buffer(6)]],
+    constant uint& position_count [[buffer(7)]],
+    constant uint& group [[buffer(8)]],
+    constant float& scale [[buffer(9)]],
+    constant uint& position_stride [[buffer(10)]],
+    constant uint& kv_head_stride [[buffer(11)]],
+    constant uint& kv_base_offset [[buffer(12)]],
+    constant uint& n_splits [[buffer(13)]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    constexpr uint PT = 16;
+    constexpr uint MAX_DPL = 4;
+    constexpr uint MAX_HD = 128;
+    const uint kvh = tg.x;
+    const uint split = tg.y;
+    const uint dpl = head_dim / 32;
+    const uint kv_base = kv_base_offset + kvh * kv_head_stride;
+    const uint chunk = (position_count + n_splits - 1) / n_splits;
+    const uint p0 = min(split * chunk, position_count);
+    const uint p1 = min(p0 + chunk, position_count);
+
+    const uint qh = kvh * group + sg;
+    const bool active = sg < group && qh < n_heads;
+    float q[MAX_DPL];
+    if (active) {
+        for (uint i = 0; i < dpl; ++i) {
+            q[i] = query[qh * head_dim + lane + i * 32] * scale;
+        }
+    }
+    float m = -INFINITY;
+    float l = 0.0f;
+    float acc[MAX_DPL] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    threadgroup char k_q[PT * MAX_HD];
+    threadgroup char v_q[PT * MAX_HD];
+    threadgroup half k_sc[PT * MAX_DPL];
+    threadgroup half v_sc[PT * MAX_DPL];
+    const uint tid = sg * 32 + lane;
+
+    for (uint pt = p0; pt < p1; pt += PT) {
+        const uint count = min(PT, p1 - pt);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // Codes: one byte per (position, dim). Adjacent lanes take adjacent dims, so the
+        // byte reads coalesce within a block. Vector loads are NOT available -- the code
+        // array starts 2 bytes into each 34-byte block, so it is never 4-byte aligned.
+        for (uint idx = tid; idx < count * head_dim; idx += 128) {
+            const uint p = idx / head_dim;
+            const uint d = idx - p * head_dim;
+            const uint boff = (d >> 5) * 34;
+            const uint off = d & 31;
+            const uint row = kv_base + (pt + p) * position_stride + boff;
+            k_q[idx] = reinterpret_cast<device const char*>(keys + row + 2)[off];
+            v_q[idx] = reinterpret_cast<device const char*>(values + row + 2)[off];
+        }
+        // Scales: one f16 per (position, block).
+        for (uint idx = tid; idx < count * dpl; idx += 128) {
+            const uint p = idx / dpl;
+            const uint b = idx - p * dpl;
+            const uint row = kv_base + (pt + p) * position_stride + b * 34;
+            k_sc[p * MAX_DPL + b] = *reinterpret_cast<device const half*>(keys + row);
+            v_sc[p * MAX_DPL + b] = *reinterpret_cast<device const half*>(values + row);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (active) {
+            // Online softmax batched 4 positions per round, identical in shape and order
+            // to the kv16 twin: the 4 dots and simd_sums are independent, and (m, l, acc)
+            // rescale once per round instead of once per position. Tail slots pad with
+            // -INF (w = 0) and their value reads are guarded so staged garbage cannot
+            // poison the accumulator.
+            for (uint j0 = 0; j0 < count; j0 += 4) {
+                float s4[4];
+                for (uint jj = 0; jj < 4; ++jj) {
+                    const uint j = j0 + jj;
+                    if (j < count) {
+                        float s = 0.0f;
+                        for (uint i = 0; i < dpl; ++i) {
+                            const float kd = float(k_sc[j * MAX_DPL + i]);
+                            s += q[i] * (kd * float(k_q[j * head_dim + lane + i * 32]));
+                        }
+                        s4[jj] = simd_sum(s);
+                    } else {
+                        s4[jj] = -INFINITY;
+                    }
+                }
+                const float m4 = max(max(s4[0], s4[1]), max(s4[2], s4[3]));
+                const float m_new = max(m, m4);
+                const float corr = exp(m - m_new);
+                float w4[4];
+                for (uint jj = 0; jj < 4; ++jj) {
+                    w4[jj] = (s4[jj] == -INFINITY) ? 0.0f : exp(s4[jj] - m_new);
+                }
+                for (uint i = 0; i < dpl; ++i) {
+                    float a = acc[i] * corr;
+                    for (uint jj = 0; jj < 4; ++jj) {
+                        const uint j = j0 + jj;
+                        if (j < count) {
+                            const float vd = float(v_sc[j * MAX_DPL + i]);
+                            a += w4[jj] * (vd * float(v_q[j * head_dim + lane + i * 32]));
+                        }
+                    }
+                    acc[i] = a;
+                }
+                l = l * corr + w4[0] + w4[1] + w4[2] + w4[3];
+                m = m_new;
+            }
+        }
+    }
+    if (active) {
+        device float* dst = partials + ((ulong)qh * n_splits + split) * (head_dim + 2);
+        for (uint i = 0; i < dpl; ++i) {
+            dst[lane + i * 32] = acc[i];
+        }
+        if (lane == 0) {
+            dst[head_dim] = m;
+            dst[head_dim + 1] = l;
+        }
+    }
+}
+
+// Dequantize one layer's Q8_0 KV slice into a half [kv_head][max_positions][head_dim]
+// staging buffer, laid out byte-identically to the f32 lane's persistent cache_k16 /
+// cache_v16 mirrors so the attention-as-matmul prefill consumes it with no stride changes.
+//
+// Why this exists: the attn-mm prefill (transpose_v16 -> half_mm_batched_f16o ->
+// softmax_causal_rows -> half_mm_batched_f16o, on simdgroup matrix units) reads half K/V.
+// Under a Q8 primary the mirrors are empty Vecs, which is the mechanical reason kvq8 was
+// excluded from that path -- and that exclusion, not the Q8 dequant, is what made q8
+// prefill 2.2x-4.5x slower. Measured: q8/f16 prefill is 1.00-1.07x at every depth while
+// both trail f32 by 1.8x-4.4x, i.e. f16 and q8 are excluded by the same predicate and land
+// on top of each other. Staging is O(n*d) per layer against the O(n^2) attention it
+// unblocks, and unlike the f32 lane's mirrors it is transient scratch (~16.8 MB pooled)
+// rather than a persistent second cache (~256 MB at 8192 positions), so the Q8 memory win
+// survives.
+//
+// One thread per element: adjacent lanes read adjacent code bytes and write adjacent
+// halves (both coalesced), and the 34-byte block's f16 scale is broadcast across the 32
+// lanes that share it. Positions past `valid_rows` are zero-filled rather than left
+// undefined -- causal masking would drop them, but an additive -inf mask cannot rescue a
+// NaN, so garbage in the pad rows could poison a whole row of scores.
+kernel void kv_dequant_q8_to_h(
+    device const uchar* src [[buffer(0)]],
+    device half* dst [[buffer(1)]],
+    constant uint& head_dim [[buffer(2)]],
+    constant uint& rows [[buffer(3)]],                // positions to fill (n_pad)
+    constant uint& valid_rows [[buffer(4)]],          // positions actually materialized
+    constant uint& src_position_stride [[buffer(5)]], // BYTES
+    constant uint& src_kv_head_stride [[buffer(6)]],  // BYTES
+    constant uint& dst_position_stride [[buffer(7)]], // elements
+    constant uint& dst_kv_head_stride [[buffer(8)]],  // elements
+    uint3 gid [[thread_position_in_grid]]
+) {
+    const uint d = gid.x;
+    const uint p = gid.y;
+    const uint kvh = gid.z;
+    if (d >= head_dim || p >= rows) return;
+    device half* out = dst + kvh * dst_kv_head_stride + p * dst_position_stride + d;
+    if (p >= valid_rows) {
+        *out = half(0.0f);
+        return;
+    }
+    device const uchar* b =
+        src + kvh * src_kv_head_stride + p * src_position_stride + (d >> 5) * 34;
+    const float scale = float(*reinterpret_cast<device const half*>(b));
+    const float code = float(reinterpret_cast<device const char*>(b + 2)[d & 31]);
+    *out = half(scale * code);
+}
+
 // f16-KV twin of attention_decode_v2_f32.
 kernel void attention_decode_v2_kv16(
     device const float* query [[buffer(0)]],
@@ -7740,6 +7947,18 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
             let attention_splitk_kv16_stageonly_pipeline = device
                 .new_compute_pipeline_state_with_function(&attention_splitk_kv16_stageonly_function)
                 .ok()?;
+            let kv_dequant_q8_to_h_function = elementwise_library
+                .get_function("kv_dequant_q8_to_h", None)
+                .ok()?;
+            let kv_dequant_q8_to_h_pipeline = device
+                .new_compute_pipeline_state_with_function(&kv_dequant_q8_to_h_function)
+                .ok()?;
+            let attention_decode_splitk_kvq8_function = elementwise_library
+                .get_function("attention_decode_splitk_kvq8", None)
+                .ok()?;
+            let attention_decode_splitk_kvq8_pipeline = device
+                .new_compute_pipeline_state_with_function(&attention_decode_splitk_kvq8_function)
+                .ok()?;
             let attention_decode_splitk_merge_function = elementwise_library
                 .get_function("attention_decode_splitk_merge_f32", None)
                 .ok()?;
@@ -8180,6 +8399,8 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 attention_decode_splitk_pipeline,
                 attention_decode_splitk_kv16_pipeline,
                 attention_decode_splitk_kv16_direct_pipeline,
+                attention_decode_splitk_kvq8_pipeline,
+                kv_dequant_q8_to_h_pipeline,
                 attention_splitk_kv16_stageonly_pipeline,
                 attention_decode_splitk_merge_pipeline,
                 attention_decode_f32_tree_pipeline,
@@ -12521,6 +12742,43 @@ fn mm_prefill_enabled() -> bool {
     })
 }
 
+/// Admit a Q8_0 primary to the attention-as-matmul prefill by staging its blocks into a
+/// transient half K/V buffer (`kv_dequant_q8_to_h`).
+///
+/// Default ON within the (already opt-in) Q8 lane; `CAMELID_METAL_Q8_ATTN_MM=0` disables.
+///
+/// Without it a Q8 primary is excluded from the attention-as-matmul prefill, which measured
+/// **4.48x slower prefill than the f32 default at 8006 tokens** (CI [4.39, 4.68]). With it,
+/// q8 prefill is statistically indistinguishable from that default (0.986, CI [0.924,
+/// 1.132]) — a 4.5x improvement, CI [0.198, 0.252]. Leaving it off would mean everyone who
+/// opts into q8 keeps paying that regression, which is why the escape hatch is the opt-out
+/// rather than the opt-in. Receipt: `METAL_KV_Q8_RESULT.md`.
+///
+/// Note the Q8 dequant was never the problem: q8/f16 prefill measured 1.00-1.07x at every
+/// depth while both trailed f32 by 1.8x-4.4x, i.e. f16 and q8 were excluded by the same
+/// predicate and landed on top of each other.
+///
+/// **Still missing: the half activation stream.** `use_h16` must track `use_fused_rope`,
+/// not `use_attn_mm` — when the fused RoPE is off, the attn-mm block rebuilds `q_h` with a
+/// convert that reads `q_buf` as f32, so setting `use_h16` there reinterprets half bytes as
+/// f32 and the sampler sees non-finite logits. The Q8 lane therefore keeps es=4 activations
+/// and takes only the attention win. Recovering es=2 needs a `rope_scatter_qh_h_q8` variant
+/// that emits `q_h` alongside a quantized K/V scatter; a Q8 scatter needs an amax across
+/// each 32-element block, which is a different thread mapping than the per-element RoPE
+/// kernel uses, which is exactly why the Q8 lane splits those dispatches today.
+///
+/// Validated on one host (M3) and one model shape (llama, head_dim 64, GQA group 4). Under
+/// BENCHMARK_TREATY that is not enough to promote a *default*; it is enough to improve an
+/// already opt-in lane, which is all this does.
+#[cfg(target_os = "macos")]
+fn q8_attn_mm_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !std::env::var("CAMELID_METAL_Q8_ATTN_MM")
+            .is_ok_and(|v| v == "0" || v.eq_ignore_ascii_case("false"))
+    })
+}
+
 /// K-split GEMV over an f32 activation vector (see q8_0_block_linear_row_ksplit_f32y).
 /// The weight buffer must match the active format: decoded 36-byte blocks normally, wire
 /// 34-byte blocks when CAMELID_METAL_WIRE is on (prepare_token resolves accordingly).
@@ -16415,9 +16673,12 @@ fn encode_attention(
     // covers (kv_heads x splits) threadgroups with the K/V tile staged once per group.
     // Below the threshold the fixed scratch/merge cost outweighs the win.
     let group = n_heads.checked_div(n_kv_heads).unwrap_or(0);
+    // A Q8 primary now has its own split-K kernel (attention_decode_splitk_kvq8), so it
+    // no longer has to forfeit split-K the way a kv16 primary still does. kv16-primary
+    // stays excluded: it keeps no separate mirrors, and its primary IS the half cache the
+    // f32 lane's mirrors provide, so there is nothing here to reuse for it yet.
     let splitk = v2
         && !kv16_enabled()
-        && !kvq8_enabled()
         && splitk_attention_enabled()
         && (1..=4).contains(&group)
         && position_count >= 128;
@@ -16433,7 +16694,16 @@ fn encode_attention(
         let use_mirrors = kv16_mirrors.is_some()
             && !std::env::var("CAMELID_METAL_ATTN_SPLITK_KV16")
                 .is_ok_and(|v| v == "0" || v.eq_ignore_ascii_case("false"));
-        if use_mirrors {
+        if kvq8_enabled() {
+            // Q8 primary: read the 34-byte-block cache directly. No mirrors exist on this
+            // lane (cache_k16/cache_v16 are empty under a compressed primary), and none are
+            // wanted -- the whole point is that the Q8 cache is 1.88x smaller than the f16
+            // mirrors this path reads on the f32 lane.
+            e.set_compute_pipeline_state(&k.attention_decode_splitk_kvq8_pipeline);
+            e.set_buffer(0, Some(query), query_off);
+            e.set_buffer(1, Some(keys), 0);
+            e.set_buffer(2, Some(values), 0);
+        } else if use_mirrors {
             let (mk, mv) = kv16_mirrors.expect("checked is_some above");
             // Direct-read variant for head_dim 128: no threadgroup staging or
             // barriers -> more resident threadgroups; GQA re-reads hit the SLC.
@@ -22689,8 +22959,12 @@ impl ResidentDecodeState {
         // norms, silu), halving activation traffic.
         let n_pad = n_tokens.next_multiple_of(128);
         let gqa_group = self.n_heads / self.n_kv_heads;
+        // A Q8 primary is admitted here by staging its blocks into a transient half K/V
+        // buffer below (`kv_dequant_q8_to_h`); kv16-primary is still excluded because its
+        // primary IS half and wants a direct binding rather than a staging pass.
+        let stage_q8_kv = self.kvq8 && q8_attn_mm_enabled();
         let use_attn_mm = !self.kv16
-            && !self.kvq8
+            && (!self.kvq8 || stage_q8_kv)
             && all_q8
             && mm_prefill_enabled()
             && !has_qk_norm
@@ -22714,7 +22988,15 @@ impl ResidentDecodeState {
         } else {
             0
         };
-        let use_h16 = use_attn_mm && half_rope * 2 == self.head_dim;
+        // `use_h16` must track `use_fused_rope`, NOT `use_attn_mm`. They shared a predicate
+        // before the Q8 lane was admitted here, and the attn-mm block relies on that: when
+        // the fused RoPE is off it rebuilds `q_h` with `convert(&q_buf, &q_h, .., 8, ..)`,
+        // which reads `q_buf` as f32. Setting use_h16 while use_fused_rope is off makes
+        // `q_buf` half, that convert reinterprets half bytes as f32, and the sampler sees
+        // non-finite logits. The Q8 lane therefore keeps the f32 activation stream for now
+        // and takes only the attention-as-matmul win; recovering es=2 as well needs the
+        // fused-RoPE Q8 variant described on `q8_attn_mm_enabled`.
+        let use_h16 = use_attn_mm && !stage_q8_kv && half_rope * 2 == self.head_dim;
         let es = if use_h16 { 2 } else { 4 }; // element size of the activation stream
         let seq = nb(n_tokens * self.hidden * es);
         let seq_out = nb(n_tokens * self.hidden * es);
@@ -22895,6 +23177,31 @@ impl ResidentDecodeState {
         } else {
             2
         });
+        // Transient half K/V staging for the Q8 lane, laid out exactly like the f32 lane's
+        // persistent cache_k16/cache_v16 mirrors (max_positions stride) so every consumer
+        // below binds it without a stride change. Reused across all layers: one layer is
+        // live at a time, so this is ~16.8 MB at 8192 positions rather than the ~256 MB of
+        // permanent mirrors the f32 lane carries.
+        let q8_stage_elems = if use_attn_mm && stage_q8_kv {
+            self.n_kv_heads * self.max_positions * self.head_dim
+        } else {
+            1
+        };
+        let q8_k_stage = nb(q8_stage_elems * 2);
+        let q8_v_stage = nb(q8_stage_elems * 2);
+        let q8_stage_scalar = nb(28);
+        if use_attn_mm && stage_q8_kv {
+            unsafe {
+                let p = q8_stage_scalar.contents() as *mut u32;
+                *p = self.head_dim as u32;
+                *p.add(1) = n_pad as u32; // rows to fill
+                *p.add(2) = n_tokens as u32; // rows actually materialized
+                *p.add(3) = ((self.head_dim / 32) * 34) as u32; // src position stride (bytes)
+                *p.add(4) = (self.max_positions * (self.head_dim / 32) * 34) as u32; // src kv-head stride (bytes)
+                *p.add(5) = self.head_dim as u32; // dst position stride (elements)
+                *p.add(6) = (self.max_positions * self.head_dim) as u32; // dst kv-head stride (elements)
+            }
+        }
         let fused_rope_scalar = nb(24);
         let vt_scalar = nb(16);
         unsafe {
@@ -23219,7 +23526,13 @@ impl ResidentDecodeState {
                 );
                 stage!("2b:qk_norm");
             }
-            let use_fused_rope = use_attn_mm && half_rope * 2 == self.head_dim;
+            // Deliberately excludes the Q8 lane: rope_scatter_qh_h writes rotated K straight
+            // into cache_k/cache_k16, which a Q8 primary cannot accept without a quantizing
+            // twin of that kernel. Decoupling it from use_attn_mm keeps this change to the
+            // attention path; the unfused RoPE costs three dispatches instead of one per
+            // layer, which is small next to the O(n^2) attention win being unblocked.
+            let use_fused_rope =
+                use_attn_mm && !stage_q8_kv && half_rope * 2 == self.head_dim;
             if use_fused_rope {
                 // Fused rope(Q)->half panel + rope(K)->caches + V scatter, one dispatch.
                 e.set_compute_pipeline_state(if use_h16 {
@@ -23402,10 +23715,48 @@ impl ResidentDecodeState {
                         },
                     );
                 };
+                // Q8 primary: materialize this layer's K/V as half into the staging pair
+                // before anything reads them. Must precede transpose_v16 (V) and the S=QK^T
+                // panel (K), both of which expect the f32 lane's mirror layout.
+                if stage_q8_kv {
+                    for (src, dst) in [
+                        (&self.cache_k[i], &q8_k_stage),
+                        (&self.cache_v[i], &q8_v_stage),
+                    ] {
+                        e.set_compute_pipeline_state(&k.kv_dequant_q8_to_h_pipeline);
+                        e.set_buffer(0, Some(src), 0);
+                        e.set_buffer(1, Some(dst), 0);
+                        for j in 0..7u64 {
+                            e.set_buffer(2 + j, Some(&q8_stage_scalar), j * 4);
+                        }
+                        e.dispatch_threads(
+                            metal::MTLSize {
+                                width: self.head_dim as u64,
+                                height: n_pad as u64,
+                                depth: self.n_kv_heads as u64,
+                            },
+                            metal::MTLSize {
+                                width: 32,
+                                height: 4,
+                                depth: 1,
+                            },
+                        );
+                    }
+                }
+                let attn_k16: &Buffer = if stage_q8_kv {
+                    &q8_k_stage
+                } else {
+                    &self.cache_k16[i]
+                };
+                let attn_v16: &Buffer = if stage_q8_kv {
+                    &q8_v_stage
+                } else {
+                    &self.cache_v16[i]
+                };
                 // Transpose this layer's V slice ONCE so every query block's PV
                 // A-staging reads contiguously.
                 e.set_compute_pipeline_state(&k.transpose_v16_pipeline);
-                e.set_buffer(0, Some(&self.cache_v16[i]), 0);
+                e.set_buffer(0, Some(attn_v16), 0);
                 e.set_buffer(1, Some(&vt_scratch), 0);
                 for j in 0..4u64 {
                     e.set_buffer(2 + j, Some(&vt_scalar), j * 4);
@@ -23432,7 +23783,7 @@ impl ResidentDecodeState {
                     // S = Q K^T (per query head; K shared per KV head)
                     smm(
                         &e,
-                        &self.cache_k16[i],
+                        attn_k16,
                         &q_h,
                         qh_off,
                         &s_big,

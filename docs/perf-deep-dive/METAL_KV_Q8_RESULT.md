@@ -226,25 +226,78 @@ saving**.
 Per-element the Q8_0 block costs `34/32 = 1.0625` B against f16's 2 B, so the cache is
 **46.9% smaller, not 50%**.
 
-## What to build
+## What was built next — and what it measured
 
-**`attention_decode_splitk_kvq8`.** Split-K and Q8 are independent wins — 2.1× and 1.50× —
-that today are mutually exclusive for no reason other than the split-K kernel having no Q8
-variant. If they compose, q8 + split-K lands near **1.5× the current default decode at
-1.88× less KV memory**, which on an 8 GiB Mac is the whole argument for the lane.
+Both blockers named above were implemented and re-measured on the same host. The
+predictions in this section's original text are kept below, because one of them was wrong
+and that is worth recording.
 
-That "if" is load-bearing and this receipt does not settle it. The two effects could
-overlap: split-K wins partly by improving memory-level parallelism on the KV read, which is
-the same resource Q8 relieves. The honest expectation is somewhere between 1.5× and 3.2×
-over `f32-nosplitk`, and the only way to find out is to write the kernel.
+### Prefill: fixed (the big one)
 
-Second, and independent: **prefill at 4.5× is disqualifying on its own.** Even with split-K
-Q8 decode, no user accepts a 4.5× TTFT regression at 8k. A Q8 flash / attention-as-matmul
-prefill is not optional if this lane is ever to be a default.
+**The Q8 dequant was never the problem.** The decisive tell was already in the data above:
+q8/f16 prefill is **1.00–1.07× at every depth** while both trail f32 by 1.8–4.4×. f16 and
+q8 were excluded by the *same* predicate and landed on top of each other, so at most ~7% of
+the regression was attributable to Q8.
 
-Third, cheap and worth doing regardless: `src/fit.rs` `KvDtype` has only `F32` and `F16`,
-so the admission planner cannot represent the 34/32 block overhead and sizes q8 as f16 — a
-1.88× over-estimate that can refuse a preload that would actually fit.
+The cause was one conjunct in `use_attn_mm`: `!self.kv16 && !self.kvq8 && …`. It dropped q8
+out of the simdgroup-matrix attention (`transpose_v16 → half_mm_batched_f16o →
+softmax_causal_rows → half_mm_batched_f16o`) and transitively out of the es=2 activation
+stream. Admitting q8 required a source of half K/V, since `cache_k16`/`cache_v16` are empty
+under a compressed primary — supplied by the new `kv_dequant_q8_to_h` staging kernel
+(transient pooled scratch, ~16.8 MB, against the ~256 MB of permanent mirrors the f32 lane
+carries at 8192 positions).
+
+| Depth | q8-both / q8-old | q8-both / f32 default |
+|---:|---|---|
+| 2066 | 0.426 (CI spans 1.0) | **0.990** [0.966, 1.369] — parity |
+| 8006 | **0.222** [0.198, 0.252] — **4.5× faster** | **0.986** [0.924, 1.132] — parity |
+
+Prefill went from **significantly 4.48× worse** than the default to **statistically
+indistinguishable** from it.
+
+### Decode: `attention_decode_splitk_kvq8` works, but the prediction above was wrong
+
+The kernel exists and is correct. It does **not** compose with split-K the way this
+document predicted.
+
+| Comparison @ 8006 | ratio | CI | verdict |
+|---|---:|---|---|
+| q8-splitk / q8-old | **1.059** | [1.042, 1.153] | significant — **+5.9%** |
+| q8-splitk / f32 default | 0.949 | [0.873, 1.030] | not resolved — **lifted to parity** |
+| q8-splitk / q8-old @ 2066 | 0.983 | [0.455, 1.102] | not resolved — no win |
+
+**Predicted ~1.5×–3.2×; measured +5.9%.** The two effects do not stack. The most likely
+reason is the one this document flagged as a risk and then discounted: split-K wins largely
+by improving memory-level parallelism on the KV read, and Q8 relieves that same resource, so
+the second lever has little left to pull. The win is real and significant at depth, and it
+does move q8 decode from *significantly worse* than the f32 default to *indistinguishable*
+from it — but it is a 6% kernel win, not a 2× one.
+
+### Net position
+
+q8 now matches the f32 default on **both** prefill and decode while holding **0.858 of its
+peak RSS** (significant) and 1.88× less KV. That makes the lane a viable capacity option
+rather than a measured loss, which is what it was for.
+
+Parity is unchanged by any of this: on coherent English q8-both is **token-identical to
+q8-old**, and its divergence from f32 sits at generated token 50 — exactly where the
+pre-existing q8 lane already diverged. The change costs no fidelity.
+
+### Still open
+
+- **The es=2 activation stream.** `use_h16` must track `use_fused_rope`, not `use_attn_mm`:
+  when the fused RoPE is off the attn-mm block rebuilds `q_h` with a convert that reads
+  `q_buf` as f32, so setting `use_h16` there reinterprets half bytes as f32 and the sampler
+  sees non-finite logits (this was hit, diagnosed, and fixed by keeping es=4). Recovering it
+  needs a `rope_scatter_qh_h_q8` that emits `q_h` alongside a quantized scatter — awkward
+  because Q8 quantization needs an amax across each 32-element block, a different thread
+  mapping than the per-element RoPE kernel, which is why the Q8 lane splits those dispatches
+  today.
+- **`src/fit.rs` `KvDtype` still has only `F32` and `F16`**, so the admission planner cannot
+  represent the 34/32 block overhead and sizes q8 as f16 — a 1.88× over-estimate that can
+  refuse a preload which would actually fit. Cheap and independent of everything above.
+- **One host, one model shape** (llama, head_dim 64, GQA group 4). Nothing here promotes a
+  default under BENCHMARK_TREATY; it improves an already opt-in lane.
 
 ## Limitations
 
