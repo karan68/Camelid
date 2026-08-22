@@ -1080,6 +1080,124 @@ mod tests {
         })
     }
 
+    fn ready_snapshot(spec: NodeSpec, model: &str) -> NodeSnapshot {
+        NodeSnapshot {
+            spec,
+            status: ready_status(model),
+            latency: Some(Duration::from_millis(4)),
+        }
+    }
+
+    #[test]
+    fn a_tls_authentication_failure_fails_over_without_leaking_the_bearer() {
+        use std::io::{Read, Write};
+
+        let issued = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+            .expect("generate trusted node certificate");
+        let key = rustls_pki_types::PrivatePkcs8KeyDer::from(issued.key_pair.serialize_der());
+        let server = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![issued.cert.der().clone()], key.into())
+            .expect("trusted certificate and key agree");
+        let directory = tempfile::tempdir().expect("temp dir");
+        let ca_path = directory.path().join("node-ca");
+        std::fs::write(&ca_path, rcgen::Certificate::pem(&issued.cert)).expect("write CA");
+
+        let impostor = std::net::TcpListener::bind("127.0.0.1:0").expect("bind impostor");
+        let impostor_port = impostor.local_addr().expect("impostor address").port();
+        let (captured_tx, captured_rx) = std::sync::mpsc::channel();
+        let impostor_thread = std::thread::spawn(move || {
+            let (mut socket, _) = impostor.accept().expect("accept first attempt");
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("bound impostor read");
+            let mut bytes = vec![0_u8; 8192];
+            let read = socket.read(&mut bytes).expect("read ClientHello");
+            bytes.truncate(read);
+            captured_tx.send(bytes).expect("send captured bytes");
+        });
+
+        let trusted = std::net::TcpListener::bind("127.0.0.1:0").expect("bind trusted node");
+        let trusted_port = trusted.local_addr().expect("trusted address").port();
+        let trusted_thread = std::thread::spawn(move || {
+            let (socket, _) = trusted.accept().expect("accept failover attempt");
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("bound trusted read");
+            socket
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .expect("bound trusted write");
+            let connection =
+                rustls::ServerConnection::new(Arc::new(server)).expect("create TLS server");
+            let mut stream = rustls::StreamOwned::new(connection, socket);
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream
+                    .read(&mut buffer)
+                    .expect("read authenticated request");
+                assert_ne!(read, 0, "request ended before its headers");
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let body = r#"{"choices":[{"message":{"role":"assistant","content":"served"}}]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write authenticated answer");
+            stream.flush().expect("flush authenticated answer");
+        });
+
+        let bad = NodeSpec {
+            label: "a-impostor".to_string(),
+            host: "localhost".to_string(),
+            port: impostor_port,
+        };
+        let good = NodeSpec {
+            label: "b-trusted".to_string(),
+            host: "localhost".to_string(),
+            port: trusted_port,
+        };
+        let bearer = "must-not-cross-before-authentication-74d1";
+        let fabric = Fabric::new(vec![bad.clone(), good.clone()])
+            .with_bearer(Some(bearer))
+            .with_node_transport(Some(&ca_path), false)
+            .expect("TLS transport resolves")
+            .with_max_observation_age(Duration::from_secs(30))
+            .with_max_forward_attempts(2);
+        *lock(&fabric.observed) = Some((
+            0,
+            Observation::taken_at(
+                vec![ready_snapshot(bad, "m"), ready_snapshot(good, "m")],
+                Instant::now(),
+            ),
+        ));
+
+        let dispatched = fabric
+            .dispatch(
+                "/v1/chat/completions",
+                &forward::chat_request("m", "ping", 8),
+                &RouteRequest::new(RouteMode::Throughput).with_model(Some("m")),
+                Duration::from_secs(3),
+                &Cancel::never(),
+            )
+            .expect("the authenticated sibling serves after TLS refusal");
+        assert_eq!(dispatched.answer.label, "b-trusted");
+        assert_eq!(dispatched.attempts, 2);
+
+        let captured = captured_rx.recv().expect("captured ClientHello");
+        assert!(
+            !captured
+                .windows(bearer.len())
+                .any(|window| window == bearer.as_bytes()),
+            "bearer crossed before server authentication"
+        );
+        impostor_thread.join().expect("impostor exits");
+        trusted_thread.join().expect("trusted node exits");
+    }
+
     #[test]
     fn service_classes_separate_workloads_with_different_cost_shapes() {
         let base = serde_json::json!({

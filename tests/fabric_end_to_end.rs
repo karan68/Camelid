@@ -655,6 +655,62 @@ fn a_fabric_observes_and_dispatches_through_one_ca_pinned_tls_policy() {
 }
 
 #[test]
+fn a_node_loaded_later_from_the_file_inherits_the_tls_policy() {
+    let original = TlsStubNode::start(StubConfig::ready("model-alpha", 0));
+    let joined = TlsStubNode::start(StubConfig::ready("model-alpha", 0));
+    let directory = tempfile::tempdir().expect("temp dir");
+    let path = directory.path().join("nodes");
+    std::fs::write(&path, format!("original=localhost:{}\n", original.port))
+        .expect("write initial node file");
+    let ca_path = directory.path().join("node-ca-bundle");
+    let ca_bundle = format!(
+        "{}\n{}",
+        std::fs::read_to_string(&original.ca_path).expect("read original CA"),
+        std::fs::read_to_string(&joined.ca_path).expect("read joined CA")
+    );
+    std::fs::write(&ca_path, ca_bundle).expect("write shared CA bundle");
+
+    let fabric = Fabric::from_node_file(path.clone())
+        .expect("load node file")
+        .with_timeout(PROBE_TIMEOUT)
+        .with_node_transport(Some(&ca_path), false)
+        .expect("node TLS policy resolves");
+    let initial = fabric.observe();
+    assert_eq!(initial.len(), 1);
+    assert_eq!(initial[0].label(), "original");
+    assert!(initial[0].status.is_ready());
+
+    // The shipped watcher checks once per second. Rewrite after that bound so
+    // this test exercises a newly loaded spec rather than the startup value.
+    std::thread::sleep(Duration::from_millis(1_100));
+    std::fs::write(&path, format!("joined-later=localhost:{}\n", joined.port))
+        .expect("replace node file with a distinct endpoint");
+
+    let reloaded = fabric.observe();
+    assert_eq!(reloaded.len(), 1);
+    assert_eq!(reloaded[0].label(), "joined-later");
+    assert!(reloaded[0].status.is_ready());
+    assert_eq!(
+        original
+            .received()
+            .iter()
+            .filter(|request| request.path == "/v1/health")
+            .count(),
+        1,
+        "the original endpoint must not be reused after reload"
+    );
+    assert_eq!(
+        joined
+            .received()
+            .iter()
+            .filter(|request| request.path == "/v1/health")
+            .count(),
+        1,
+        "the newly loaded endpoint must cross the existing TLS policy"
+    );
+}
+
+#[test]
 fn a_missing_or_wrong_key_arrives_as_a_401_answer_not_a_transport_failure() {
     // The defect this flag exists for. `/v1/health` is auth-exempt, so an
     // authenticated node observes as ready and places fine; only the forward is

@@ -28,8 +28,9 @@ use rustls_pki_types::ServerName;
 use super::cancel::Cancel;
 use super::transport::NodeTransport;
 
-/// Never spend the whole budget dialling; a forward budget is minutes long and
-/// a node that has not accepted in five seconds is not about to.
+/// Never spend the whole budget dialling or authenticating one address; a
+/// forward budget is minutes long and a node that has not completed transport
+/// setup in five seconds is not about to.
 const CONNECT_ATTEMPT_CAP: Duration = Duration::from_secs(5);
 
 /// Bounds the header block and a chunked body's size line, so a peer that never
@@ -438,12 +439,11 @@ fn tls_server_name(host: &str) -> Result<ServerName<'static>, HttpError> {
 
 fn negotiate_tls(
     mut stream: TcpStream,
-    host: &str,
+    server_name: ServerName<'static>,
     config: Arc<ClientConfig>,
     deadline: Instant,
     cancel: &Cancel,
 ) -> Result<NodeConnection, HttpError> {
-    let server_name = tls_server_name(host)?;
     let mut connection = ClientConnection::new(config, server_name)
         .map_err(|error| HttpError::Tls(error.to_string()))?;
 
@@ -452,7 +452,7 @@ fn negotiate_tls(
     // has completed.
     stream
         .set_write_timeout(Some(Duration::from_millis(100)))
-        .map_err(|error| HttpError::Io(error.to_string()))?;
+        .map_err(|error| HttpError::Tls(error.to_string()))?;
     while connection.is_handshaking() {
         if cancel.is_cancelled() {
             return Err(HttpError::Cancelled);
@@ -471,6 +471,75 @@ fn negotiate_tls(
     Ok(NodeConnection::Tls(Box::new(StreamOwned::new(
         connection, stream,
     ))))
+}
+
+fn connect_tls_any(
+    addrs: &[SocketAddr],
+    host: &str,
+    config: Arc<ClientConfig>,
+    deadline: Instant,
+    write_timeout: Duration,
+    cancel: &Cancel,
+) -> Result<NodeConnection, HttpError> {
+    let server_name = tls_server_name(host)?;
+    let mut last: Option<HttpError> = None;
+    for (index, addr) in addrs.iter().enumerate() {
+        if cancel.is_cancelled() {
+            return Err(HttpError::Cancelled);
+        }
+        let now = Instant::now();
+        let remaining = deadline.saturating_duration_since(now);
+        if remaining.is_zero() {
+            break;
+        }
+        // The address is not usable until its certificate authenticates. Give
+        // each untried address a bounded share of the remaining budget so a
+        // TCP endpoint that stalls or rejects TLS cannot hide a valid sibling.
+        let untried = (addrs.len() - index) as u32;
+        let attempt = (remaining / untried)
+            .min(CONNECT_ATTEMPT_CAP)
+            .max(Duration::from_millis(1));
+        let attempt_deadline = now + attempt;
+        let stream = match TcpStream::connect_timeout(addr, attempt) {
+            Ok(stream) => stream,
+            Err(error) => {
+                last = Some(HttpError::Connect(format!("{addr}: {error}")));
+                continue;
+            }
+        };
+        if let Err(error) = stream.set_read_timeout(Some(Duration::from_millis(100))) {
+            last = Some(HttpError::Tls(format!(
+                "could not configure {addr} for TLS: {error}"
+            )));
+            continue;
+        }
+        match negotiate_tls(
+            stream,
+            server_name.clone(),
+            Arc::clone(&config),
+            attempt_deadline,
+            cancel,
+        ) {
+            Ok(connection) => {
+                let configured = match &connection {
+                    NodeConnection::Tls(stream) => {
+                        stream.sock.set_write_timeout(Some(write_timeout))
+                    }
+                    NodeConnection::Plain(_) => unreachable!("TLS negotiation returns TLS"),
+                };
+                if let Err(error) = configured {
+                    last = Some(HttpError::Tls(error.to_string()));
+                    continue;
+                }
+                return Ok(connection);
+            }
+            Err(HttpError::Cancelled) => return Err(HttpError::Cancelled),
+            Err(error) => last = Some(error),
+        }
+    }
+    Err(last.unwrap_or_else(|| {
+        HttpError::Tls("no address authenticated within the connection budget".to_string())
+    }))
 }
 
 /// Build the request head. Pure, so the header set — including whether an
@@ -558,30 +627,20 @@ fn connect_and_send(
     let addrs = transport
         .permitted_addresses(&addrs)
         .map_err(|error| HttpError::Policy(error.to_string()))?;
-    let stream = connect_any(&addrs, deadline, cancel)?;
-    // Short socket reads keep the caller's loop responsive to its own deadline;
-    // one long read timeout would overshoot it on a stalled peer.
-    stream
-        .set_read_timeout(Some(Duration::from_millis(100)))
-        .map_err(|error| HttpError::Io(error.to_string()))?;
-    stream
-        .set_write_timeout(Some(write_timeout))
-        .map_err(|error| HttpError::Io(error.to_string()))?;
-
     let mut stream = match transport.tls_config() {
-        Some(config) => {
-            let connection = negotiate_tls(stream, host, config, deadline, cancel)?;
-            // `negotiate_tls` temporarily narrows this for cancellation.
-            match &connection {
-                NodeConnection::Tls(stream) => stream
-                    .sock
-                    .set_write_timeout(Some(write_timeout))
-                    .map_err(|error| HttpError::Io(error.to_string()))?,
-                NodeConnection::Plain(_) => unreachable!("TLS negotiation returns TLS"),
-            }
-            connection
+        Some(config) => connect_tls_any(&addrs, host, config, deadline, write_timeout, cancel)?,
+        None => {
+            let stream = connect_any(&addrs, deadline, cancel)?;
+            // Short socket reads keep the caller's loop responsive to its own
+            // deadline; one long timeout would overshoot on a stalled peer.
+            stream
+                .set_read_timeout(Some(Duration::from_millis(100)))
+                .map_err(|error| HttpError::Io(error.to_string()))?;
+            stream
+                .set_write_timeout(Some(write_timeout))
+                .map_err(|error| HttpError::Io(error.to_string()))?;
+            NodeConnection::Plain(stream)
         }
-        None => NodeConnection::Plain(stream),
     };
 
     stream
@@ -1178,6 +1237,61 @@ mod tests {
         .expect_err("name mismatch is refused");
         assert!(matches!(error, HttpError::Tls(_)), "{error:?}");
         handle.join().expect("wrong-name TLS node exits");
+    }
+
+    #[test]
+    fn a_stalled_tls_address_does_not_hide_an_authenticated_sibling() {
+        let (server, transport) = tls_material(vec!["localhost".to_string()]);
+        let (release_impostor, wait_for_sibling) = mpsc::channel();
+
+        let impostor = TcpListener::bind("127.0.0.1:0").expect("bind impostor");
+        let impostor_addr = impostor.local_addr().expect("impostor address");
+        let impostor_thread = std::thread::spawn(move || {
+            let (mut socket, _) = impostor.accept().expect("accept first attempt");
+            let mut client_hello = [0_u8; 1024];
+            let _ = socket.read(&mut client_hello);
+            // Keep the unauthenticated connection open. Only the trusted
+            // sibling releases it, so reaching that sibling proves this
+            // handshake was bounded rather than waited out indefinitely.
+            wait_for_sibling
+                .recv_timeout(Duration::from_secs(5))
+                .expect("trusted sibling was attempted");
+        });
+
+        let trusted = TcpListener::bind("127.0.0.1:0").expect("bind trusted node");
+        let trusted_addr = trusted.local_addr().expect("trusted address");
+        let trusted_thread = std::thread::spawn(move || {
+            let (mut socket, _) = trusted.accept().expect("accept second attempt");
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("bound reads");
+            socket
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .expect("bound writes");
+            let mut connection = rustls::ServerConnection::new(server).expect("create TLS server");
+            while connection.is_handshaking() {
+                connection
+                    .complete_io(&mut socket)
+                    .expect("complete TLS handshake");
+            }
+            release_impostor
+                .send(())
+                .expect("release stalled first address");
+        });
+
+        let connection = connect_tls_any(
+            &[impostor_addr, trusted_addr],
+            "localhost",
+            transport.tls_config().expect("TLS config"),
+            Instant::now() + Duration::from_secs(3),
+            Duration::from_secs(2),
+            &Cancel::never(),
+        )
+        .expect("the authenticated second address remains usable");
+        assert!(matches!(connection, NodeConnection::Tls(_)));
+
+        impostor_thread.join().expect("impostor exits");
+        trusted_thread.join().expect("trusted node exits");
     }
 
     #[test]
