@@ -679,19 +679,21 @@ export function useDashboardData({ showNotice, clearNotice }) {
   }
 
   const loadDashboard = async ({ silent = false, localModelsOverride = null } = {}) => {
+    let observedHealth = null
     try {
       const currentLocalModels = localModelsOverride || localModelsRef.current
       const currentLocalConversations = localConversationsRef.current
       const currentLocalMemories = localMemoriesRef.current
       const healthStartedAt = performance.now()
-      const [health, modelList, capabilities, downloads, localList] = await Promise.all([
-        fetchJson(`${normalizedApiBase}/v1/health`).then((result) => {
-          recordHealthPoll({ ok: true, latencyMs: performance.now() - healthStartedAt })
-          return result
-        }, (error) => {
-          recordHealthPoll({ ok: false, latencyMs: performance.now() - healthStartedAt })
-          throw error
-        }),
+      const health = await fetchJson(`${normalizedApiBase}/v1/health`).then((result) => {
+        recordHealthPoll({ ok: true, latencyMs: performance.now() - healthStartedAt })
+        observedHealth = result
+        return result
+      }, (error) => {
+        recordHealthPoll({ ok: false, latencyMs: performance.now() - healthStartedAt })
+        throw error
+      })
+      const [modelList, capabilities, downloads, localList] = await Promise.all([
         fetchJson(`${normalizedApiBase}/v1/models`),
         fetchJson(`${normalizedApiBase}/api/capabilities`).catch(() => null),
         fetchJson(`${normalizedApiBase}/api/models/catalog/downloads`).catch(() => []),
@@ -850,11 +852,12 @@ export function useDashboardData({ showNotice, clearNotice }) {
     } catch (error) {
       const requiresAuth = error?.status === 401
       setAuthRequired(requiresAuth)
+      const fallbackHealth = observedHealth || { ok: false, engine: 'camelid', generation_ready: false, active_model_id: null }
       const fallbackDashboard = makeDashboard({
-        health: { ok: false, engine: 'camelid', generation_ready: false, active_model_id: null },
+        health: fallbackHealth,
         models: mergeModelLists({
           modelItems: [],
-          health: { ok: false, engine: 'camelid', generation_ready: false, active_model_id: null },
+          health: fallbackHealth,
           currentModel: null,
           localModels: localModelsOverride || localModelsRef.current,
           apiBase: normalizedApiBase,

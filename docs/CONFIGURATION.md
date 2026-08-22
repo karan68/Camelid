@@ -140,6 +140,80 @@ so laptop and phone history do not synchronize in this phase.
 Both acknowledgements also read from the environment, as `CAMELID_ALLOW_UNAUTHENTICATED_REMOTE` and
 `CAMELID_ALLOW_CLEARTEXT_REMOTE`.
 
+### Private cross-network browser Chat with Tailscale
+
+Use this path when the browser and the Camelid host are on different networks. Install Tailscale
+1.52 or newer on the host and the phone, sign both devices in, and grant the phone access to the
+host in the tailnet policy. Camelid uses Tailscale Serve, not Tailscale Funnel: the generated HTTPS
+URL is reachable only by devices permitted through Tailscale.
+
+Keep Camelid on loopback. In the first terminal, provision the key and start the restricted surface:
+
+```bash
+camelid lan-key
+camelid serve \
+  --addr 127.0.0.1:8181 \
+  --model /path/to/model.gguf \
+  --api-key-file <PATH-PRINTED-BY-LAN-KEY> \
+  --lan-chat-only \
+  --no-open
+```
+
+In a second terminal, publish that verified listener through private tailnet HTTPS:
+
+```bash
+camelid remote-chat start
+```
+
+The first start may take up to two minutes while Tailscale provisions HTTPS. That longer allowance
+applies only to Serve creation; version, status, verification, and stop commands remain bounded to
+30 seconds.
+
+The command prints a URL such as `https://<DEVICE>.<TAILNET>.ts.net/`. Open it on the phone and enter
+the same Camelid key under Settings. The key is still required even though Tailscale authenticates
+the device. The key is never passed to the Tailscale CLI, placed in the URL, or written into the
+Serve configuration.
+
+The command fails closed unless all of these are true:
+
+- the backend address is exactly IPv4 loopback (`127.0.0.1`);
+- `/v1/health` reports `api_surface=lan_chat_only`, which also proves Camelid resolved an API key;
+- Tailscale is connected and reports an online device DNS name;
+- HTTPS port 443 is unused or already maps `/` to this exact Camelid listener; and
+- no Tailscale Funnel mapping is enabled on HTTPS port 443.
+
+After creating a mapping, Camelid reads Tailscale's Serve configuration back and removes the new
+mapping if the expected private proxy is not present. It never replaces another service already on
+port 443. No CORS flag is needed: the embedded UI and API remain same-origin at the Tailscale URL,
+while Tailscale terminates HTTPS and forwards only to loopback.
+
+Inspect or remove the mapping with:
+
+```bash
+camelid remote-chat status
+camelid remote-chat status --json
+camelid remote-chat stop
+```
+
+`start` is idempotent for the exact Camelid mapping. `stop` removes only that root mapping and leaves
+unrelated Tailscale Serve configuration alone. The `--bg` mapping survives a Tailscale restart, but
+the Camelid server must also be running for the URL to answer. If Tailscale is installed outside its
+standard location, pass `--tailscale-bin <ABSOLUTE_PATH>` or set `CAMELID_TAILSCALE_BIN`.
+
+This is private cross-network access, not an anonymous public link. A recipient needs both Tailscale
+access to the host and the Camelid API key. Funnel and direct router port forwarding are outside this
+workflow. Browser-local Chat histories still do not synchronize between devices.
+
+Direct TLS is optional and requires a PEM certificate chain and private key together:
+
+```bash
+target/release/camelid serve \
+  --addr 0.0.0.0:8443 \
+  --api-key-file ./camelid-api.key \
+  --tls-cert ./server-cert-chain \
+  --tls-key ./server-private-key
+```
+
 Resource ceilings are resolved once at startup. Their CLI names and environment aliases are:
 
 | Limit | Default | Environment |

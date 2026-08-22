@@ -91,6 +91,11 @@ Run `camelid pull` without an argument to list the curated model catalog.
 > [configuration](docs/CONFIGURATION.md) for the exact route boundary, key rotation, firewall
 > guidance, CORS, TLS, and remote-deployment options.
 
+For private Chat across different networks, keep Camelid on `127.0.0.1`, install Tailscale on both
+devices, and run `camelid remote-chat start` after the authenticated `--lan-chat-only` listener is
+healthy. Camelid prints a tailnet-only HTTPS URL; the browser still requires the Camelid API key.
+This workflow never enables Tailscale Funnel. See [configuration](docs/CONFIGURATION.md#private-cross-network-browser-chat-with-tailscale).
+
 ## Supported models
 
 Camelid deliberately supports exact model-and-quantization combinations rather than entire model families. Each supported file is validated token-for-token against a pinned llama.cpp reference. Files outside the supported set fail closed instead of silently using an unverified path.

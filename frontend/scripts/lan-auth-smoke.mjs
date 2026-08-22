@@ -386,6 +386,11 @@ try {
     /online and requires the laptop's LAN Chat key/i,
     'reachable-but-protected must not be described as an offline server',
   )
+  assert.equal(
+    await page.evaluate(() => document.body.textContent.includes('Cluster Topology')),
+    false,
+    'restricted Settings must not expose Cluster Topology before the key is accepted',
+  )
   assert.ok(
     observed.some((request) => request.path === '/v1/models' && request.apiKey === ''),
     'the initial protected request must actually be refused without a key',
@@ -401,7 +406,7 @@ try {
 
   await saveKey(API_KEY)
   await page.waitForSelector('main[data-view="chat"]', { timeout: 30000 })
-  const composer = await page.waitForSelector('textarea[aria-label="Message Camelid"]:not([disabled])', { timeout: 30000 })
+  await page.waitForSelector('textarea[aria-label="Message Camelid"]:not([disabled])', { timeout: 30000 })
   assert.ok(
     observed.some((request) => request.path === '/v1/models' && request.apiKey === API_KEY),
     'the accepted key must authenticate the protected dashboard request',
@@ -429,12 +434,30 @@ try {
     'the browser must authenticate the model switch request',
   )
 
-  await composer.type('Answer from the laptop')
+  await page.type('textarea[aria-label="Message Camelid"]:not([disabled])', 'Answer from the laptop')
   await page.click('button[aria-label="Send message"]')
-  await page.waitForFunction(() => {
-    const reply = document.querySelector('.cxturn--assistant .cxturn__body')?.textContent || ''
-    return reply.includes('LAN')
-  }, { timeout: 30000 })
+  try {
+    await page.waitForFunction(() => {
+      const reply = document.querySelector('.cxturn--assistant .cxturn__body')?.textContent || ''
+      return reply.includes('LAN')
+    }, { timeout: 30000 })
+  } catch (error) {
+    const browserState = await page.evaluate(() => ({
+      activeView: document.querySelector('main')?.getAttribute('data-view') || null,
+      assistantTurns: [...document.querySelectorAll('.cxturn--assistant')].map((turn) => ({
+        text: turn.textContent,
+        streaming: turn.matches('.is-streaming'),
+      })),
+      sendDisabled: document.querySelector('button[aria-label="Send message"]')?.disabled ?? null,
+    }))
+    throw new Error(`first LAN stream frame was not rendered: ${JSON.stringify({
+      chatRequestCount: chatRequests.length,
+      hostWaitingAfterFirstFrame: Boolean(releaseSecondChatFrame),
+      observedTail: observed.slice(-8).map(({ method, path, apiKey }) => ({ method, path, authenticated: Boolean(apiKey) })),
+      pageErrors,
+      browserState,
+    })}`, { cause: error })
+  }
   assert.equal(
     await page.evaluate(() => document.querySelector('.cxturn--assistant .cxturn__body')?.textContent.includes('LAN reply')),
     false,
