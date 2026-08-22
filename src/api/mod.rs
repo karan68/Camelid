@@ -60,9 +60,9 @@ use crate::{
         output_projection_diagnostics, q8_schedule_telemetry_enabled, reset_q8_schedule_telemetry,
         rope_pairing_for_config, snapshot_q8_schedule_telemetry,
         speculative::{
-            accepted_draft_prefix, ModelDrafter, NGramDrafter, SpecLatch, SpeculativeDrafter,
-            DEFAULT_MODEL_DRAFT_TOKENS, DEFAULT_NGRAM_DRAFT_TOKENS, DEFAULT_NGRAM_MAX_MATCH,
-            DEFAULT_NGRAM_MIN_MATCH,
+            accepted_draft_prefix, seeded_rejection_rng, speculative_rejection_sample,
+            ModelDrafter, NGramDrafter, SpecLatch, SpeculativeDrafter, DEFAULT_MODEL_DRAFT_TOKENS,
+            DEFAULT_NGRAM_DRAFT_TOKENS, DEFAULT_NGRAM_MAX_MATCH, DEFAULT_NGRAM_MIN_MATCH,
         },
         DeltaZeroTarget, LlamaForwardDiagnostics, LlamaForwardTimings, LlamaGenerationStep,
         LlamaInferenceSession, LlamaLayerMemoryTimings, LlamaLayerTimings, LlamaLoadedWeights,
@@ -17132,11 +17132,9 @@ fn mixtral_long_generation_is_blocked(
         && !explicitly_enabled
 }
 
-/// Whether lossless greedy speculation may engage for this request.
+/// Whether lossless greedy or distribution-preserving stochastic speculation may engage.
 ///
-/// The first four disqualifiers are the long-standing ones: speculation is a
-/// plain-greedy optimization, it cannot service per-step logit consumers, and
-/// it has no pipeline-sharded verify.
+/// Per-step logit consumers and pipeline-sharded verify remain unsupported.
 ///
 /// The windowed-arch disqualifier is Phase 3c finding F4. `serve --spec-decode`
 /// (CPU speculation) pins the target off the resident paths so the chunk-verify
@@ -17154,14 +17152,13 @@ fn mixtral_long_generation_is_blocked(
 /// plain resident lane, instead of failing every request. Lossless speculation
 /// only ever adds throughput, so dropping it costs correctness nothing.
 fn speculation_admissible(
-    sampling: &SamplingConfig,
+    _sampling: &SamplingConfig,
     collect_dense_diagnostics: bool,
     has_logit_diagnostics: bool,
     pipeline_sharded: bool,
     config: &LlamaModelConfig,
 ) -> bool {
-    *sampling == SamplingConfig::default()
-        && !collect_dense_diagnostics
+    !collect_dense_diagnostics
         && !has_logit_diagnostics
         && !pipeline_sharded
         && !crate::model::arch_has_windowed_attention(config)
@@ -17629,10 +17626,9 @@ async fn prepare_generation(
         }
     }
 
-    // for plain greedy requests with no per-step logit consumers; anything
-    // else keeps the unchanged vanilla decode loop.
-    // Lossless greedy speculation is a server-level opt-in; see
-    // `speculation_admissible` for the disqualifiers.
+    // for requests with no per-step logit consumers; anything else keeps the unchanged vanilla
+    // decode loop. Lossless speculation is a server-level opt-in; see
+    // `speculation_admissible` for the remaining disqualifiers.
     let speculative = match speculative_mode {
         None => None,
         Some(_)
@@ -17666,10 +17662,12 @@ async fn prepare_generation(
             accepted_drafts: 0,
         }),
     };
-    // CPU speculation needs CPU-authoritative KV for the chunk-verify rollback, so
-    // the target stays off the resident paths. GPU speculation (CAMELID_SPEC_GPU)
-    // keeps the target resident and verifies drafts via the batched GPU verify.
-    session.set_resident_paths_disabled(speculative.is_some() && !spec_gpu_enabled());
+    // CPU speculation needs CPU-authoritative KV for chunk-verify rollback. The GPU verifier
+    // currently returns greedy token IDs rather than full target distributions, so stochastic
+    // speculation also uses the CPU verify path even when CAMELID_SPEC_GPU is enabled.
+    session.set_resident_paths_disabled(
+        speculative.is_some() && (!spec_gpu_enabled() || sampling != SamplingConfig::default()),
+    );
 
     let telemetry_backend = {
         let plans = state.execution_plans.read().await;
@@ -19100,16 +19098,13 @@ fn generate_token_ids(
         } else {
             LlamaSampler::Sampling(sampling)
         };
-        // Lossless greedy speculation: draft tokens, verify them in ONE
-        // batched forward (one weight read for the whole batch), accept the
-        // longest matching prefix plus the target's own next token, and roll
-        // rejected KV entries back. Every emitted token is the target's own
-        // greedy argmax given its accepted prefix. Engages only after the
-        // first step (prompt evaluated, first-step diagnostics captured) and
-        // never alongside per-step logit consumers.
+        // Lossless speculation: draft tokens and verify them in one batched target forward.
+        // Greedy requests accept the longest exact-match prefix. Sampling requests use exact
+        // rejection sampling with the deterministic drafter treated as a delta distribution,
+        // preserving the target distribution while requiring no hidden drafter probabilities.
+        // Engages only after the first step and never alongside per-step logit consumers.
         if let Some(spec) = prepared.speculative.as_mut().filter(|_| {
             input.len() == 1
-                && matches!(sampler, LlamaSampler::Greedy)
                 && !collect_dense_for_step
                 && !collect_step_top_logits
                 && prepared.logprobs_top_n.is_none()
@@ -19149,21 +19144,22 @@ fn generate_token_ids(
                     // back to the CPU chunk verify when the engine isn't resident-ready.
                     // Lossless either way — the emitted tokens are the target's own greedy
                     // argmax given the accepted prefix.
-                    let gpu_accepted = if spec_gpu_enabled() {
-                        prepared
-                            .session
-                            .verify_drafts_gpu(input[0], &drafts)
-                            .map_err(|err| {
-                                Box::new(api_error(
-                                    StatusCode::SERVICE_UNAVAILABLE,
-                                    "speculative_verify_failed",
-                                    err.to_string(),
-                                    None,
-                                ))
-                            })?
-                    } else {
-                        None
-                    };
+                    let gpu_accepted =
+                        if matches!(sampler, LlamaSampler::Greedy) && spec_gpu_enabled() {
+                            prepared
+                                .session
+                                .verify_drafts_gpu(input[0], &drafts)
+                                .map_err(|err| {
+                                    Box::new(api_error(
+                                        StatusCode::SERVICE_UNAVAILABLE,
+                                        "speculative_verify_failed",
+                                        err.to_string(),
+                                        None,
+                                    ))
+                                })?
+                        } else {
+                            None
+                        };
                     let emitted: Vec<u32> = if let Some(acc) = gpu_accepted {
                         let accepted_count = (acc.len() as u64).saturating_sub(1);
                         spec.rounds += 1;
@@ -19176,18 +19172,72 @@ fn generate_token_ids(
                         let mut batch = Vec::with_capacity(1 + drafts.len());
                         batch.push(input[0]);
                         batch.extend_from_slice(&drafts);
-                        let (predictions, round_timings) = prepared
-                            .session
-                            .forward_greedy_verify_chunk(&batch)
-                            .map_err(|err| {
-                                Box::new(api_error(
-                                    StatusCode::SERVICE_UNAVAILABLE,
-                                    "speculative_verify_failed",
-                                    err.to_string(),
-                                    None,
-                                ))
-                            })?;
-                        let accepted = accepted_draft_prefix(&drafts, &predictions);
+                        let (round_emitted, accepted, round_timings) = match &sampler {
+                            LlamaSampler::Greedy => {
+                                let (predictions, timings) = prepared
+                                    .session
+                                    .forward_greedy_verify_chunk(&batch)
+                                    .map_err(|err| {
+                                        Box::new(api_error(
+                                            StatusCode::SERVICE_UNAVAILABLE,
+                                            "speculative_verify_failed",
+                                            err.to_string(),
+                                            None,
+                                        ))
+                                    })?;
+                                let accepted = accepted_draft_prefix(&drafts, &predictions);
+                                (predictions[..=accepted].to_vec(), accepted, timings)
+                            }
+                            LlamaSampler::Sampling(sampling) => {
+                                let (target_probabilities, timings) = prepared
+                                    .session
+                                    .forward_sampling_verify_chunk(&batch, sampling, &history)
+                                    .map_err(|err| {
+                                        Box::new(api_error(
+                                            StatusCode::SERVICE_UNAVAILABLE,
+                                            "speculative_verify_failed",
+                                            err.to_string(),
+                                            None,
+                                        ))
+                                    })?;
+                                let vocab = target_probabilities
+                                    .first()
+                                    .map(Vec::len)
+                                    .expect("verify batch is non-empty");
+                                let mut draft_probabilities = Vec::with_capacity(drafts.len());
+                                for &draft in &drafts {
+                                    let mut probabilities = vec![0.0f32; vocab];
+                                    let Some(probability) = probabilities.get_mut(draft as usize)
+                                    else {
+                                        return Err(Box::new(api_error(
+                                            StatusCode::SERVICE_UNAVAILABLE,
+                                            "speculative_draft_failed",
+                                            format!(
+                                                "draft token {draft} is outside vocabulary size {vocab}"
+                                            ),
+                                            None,
+                                        )));
+                                    };
+                                    *probability = 1.0;
+                                    draft_probabilities.push(probabilities);
+                                }
+                                let draft_refs: Vec<&[f32]> =
+                                    draft_probabilities.iter().map(Vec::as_slice).collect();
+                                let target_refs: Vec<&[f32]> =
+                                    target_probabilities.iter().map(Vec::as_slice).collect();
+                                let rng = seeded_rejection_rng(
+                                    sampling.seed.unwrap_or(0),
+                                    history.len() as u64,
+                                );
+                                let result = speculative_rejection_sample(
+                                    &drafts,
+                                    &draft_refs,
+                                    &target_refs,
+                                    rng,
+                                );
+                                (result.emitted_tokens, result.accepted_draft_count, timings)
+                            }
+                        };
                         prepared
                             .session
                             .rollback_to_position(base_position + 1 + accepted)
@@ -19204,7 +19254,7 @@ fn generate_token_ids(
                         spec.accepted_drafts += accepted as u64;
                         spec.latch.note_verified(accepted as u32);
                         forward_timings.add_assign(&round_timings);
-                        predictions[..=accepted].to_vec()
+                        round_emitted
                     };
                     for &token in &emitted {
                         generated.push(token);
@@ -29134,7 +29184,7 @@ mod tests {
             !speculation_admissible(&greedy, false, false, false, &tiny_gemma3_config()),
             "a windowed arch must never speculate: neither verify lane has a window"
         );
-        // The pre-existing disqualifiers keep biting (they had no test either).
+        // The remaining disqualifiers keep biting.
         assert!(!speculation_admissible(
             &greedy,
             true,
@@ -29156,7 +29206,7 @@ mod tests {
             true,
             &tiny_config()
         ));
-        assert!(!speculation_admissible(
+        assert!(speculation_admissible(
             &SamplingConfig {
                 temperature: 0.7,
                 ..SamplingConfig::default()
@@ -31066,6 +31116,44 @@ mod tests {
         assert_speculative_matches_vanilla(SpeculativeDrafter::Model(Box::new(ModelDrafter::new(
             draft_session,
         ))));
+    }
+
+    #[test]
+    fn sampling_verify_chunk_returns_normalized_target_rows() {
+        let _guard = crate::test_support::env_lock();
+        let config = tiny_spec_config();
+        let weights = Arc::new(tiny_weights());
+        let prompt = vec![0u32, 1, 2, 0];
+        let mut session = LlamaInferenceSession::new(config, weights).unwrap();
+        let first = session
+            .generate_next_token_with_history_diagnostics(
+                &prompt,
+                LlamaSampler::Greedy,
+                &prompt,
+                false,
+                None,
+            )
+            .unwrap();
+        let mut history = prompt;
+        history.push(first.next_token_id);
+        let batch = [first.next_token_id, 1, 2];
+        let sampling = SamplingConfig {
+            temperature: 0.8,
+            top_k: Some(2),
+            presence_penalty: 0.2,
+            seed: Some(7),
+            ..SamplingConfig::default()
+        };
+
+        let (rows, _timings) = session
+            .forward_sampling_verify_chunk(&batch, &sampling, &history)
+            .unwrap();
+
+        assert_eq!(rows.len(), batch.len());
+        for row in rows {
+            assert!((row.iter().sum::<f32>() - 1.0).abs() < 1e-5);
+            assert!(row.iter().filter(|probability| **probability > 0.0).count() <= 2);
+        }
     }
 
     #[test]

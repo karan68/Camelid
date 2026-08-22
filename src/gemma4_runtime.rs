@@ -7314,8 +7314,8 @@ pub struct Gemma4CudaResident {
     /// was the remaining prep bottleneck. `None` falls back to the CPU pli compute.
     gpu_ple_ctx: Option<Gemma4PleCtxDev>,
     // Per-owning-layer f16 KV caches ([kv_head][pos][head_dim]); None on shared layers.
-    cache_k: Vec<Option<cudarc::driver::CudaSlice<u16>>>,
-    cache_v: Vec<Option<cudarc::driver::CudaSlice<u16>>>,
+    cache_k: Vec<Option<cudarc::driver::CudaSlice<u8>>>,
+    cache_v: Vec<Option<cudarc::driver::CudaSlice<u8>>>,
     /// Token sequence currently represented in the persistent KV cache (the last request's
     /// prompt + its generated tokens). On the next request the longest matching prefix is
     /// reused, so only the genuinely new tokens are prefilled — this keeps multi-turn TTFT
@@ -7330,6 +7330,7 @@ pub struct Gemma4CudaResident {
     d_k: cudarc::driver::CudaSlice<f32>,
     d_v: cudarc::driver::CudaSlice<f32>,
     d_attn: cudarc::driver::CudaSlice<f32>,
+    d_attention_scores: cudarc::driver::CudaSlice<f32>,
     d_attnq: cudarc::driver::CudaSlice<i8>,
     d_attns: cudarc::driver::CudaSlice<f32>,
     d_o: cudarc::driver::CudaSlice<f32>,
@@ -7700,8 +7701,8 @@ impl Gemma4CudaResident {
         for p in &plan {
             if p.owns_kv {
                 let n = p.kv_dim * gemma4_kv_capacity(p.window, max_positions);
-                cache_k.push(Some(s.alloc_zeros::<u16>(n).map_err(cu)?));
-                cache_v.push(Some(s.alloc_zeros::<u16>(n).map_err(cu)?));
+                cache_k.push(Some(s.alloc_zeros::<u8>(n * 2).map_err(cu)?));
+                cache_v.push(Some(s.alloc_zeros::<u8>(n * 2).map_err(cu)?));
             } else {
                 cache_k.push(None);
                 cache_v.push(None);
@@ -7937,6 +7938,7 @@ impl Gemma4CudaResident {
             d_k: alloc_f(kv_dim_max).map_err(cu)?,
             d_v: alloc_f(kv_dim_max).map_err(cu)?,
             d_attn: alloc_f(q_dim_max).map_err(cu)?,
+            d_attention_scores: alloc_f(heads * max_positions).map_err(cu)?,
             d_attnq: alloc_i(q_dim_max).map_err(cu)?,
             d_attns: alloc_f(q_dim_max / 32).map_err(cu)?,
             d_o: alloc_f(hidden).map_err(cu)?,
@@ -9324,7 +9326,7 @@ impl Gemma4CudaResident {
                     let cfg = LaunchConfig {
                         grid_dim: (heads as u32, 1, 1),
                         block_dim: (hd as u32, 1, 1),
-                        shared_mem_bytes: ((2 * hd + self.max_positions) as u32) * 4,
+                        shared_mem_bytes: ((2 * hd) as u32) * 4,
                     };
                     let (nh, nkv, hdi, mp) =
                         (heads as i32, kv_heads as i32, hd as i32, src_cap as i32);
@@ -9340,7 +9342,8 @@ impl Gemma4CudaResident {
                         .arg(&self.d_position)
                         .arg(&mp)
                         .arg(&scale)
-                        .arg(&window);
+                        .arg(&window)
+                        .arg(&mut self.d_attention_scores);
                     unsafe { b.launch(cfg) }.map_err(cu)?;
                 }
 

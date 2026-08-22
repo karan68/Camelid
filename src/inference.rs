@@ -3240,9 +3240,11 @@ impl LlamaInferenceSession {
         let mut guard = cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let need_build = guard
-            .as_ref()
-            .is_none_or(|slot| slot.key != key || !slot.engine.weights_ready());
+        let need_build = guard.as_ref().is_none_or(|slot| {
+            slot.key != key
+                || !slot.engine.weights_ready()
+                || slot.engine.kv_quant != self.config.kv_quant
+        });
         if need_build {
             // Switching/rebuilding the resident engine: free any prior engine and
             // return its VRAM to the driver BEFORE the new engine's fit probe. cudarc's
@@ -3270,6 +3272,7 @@ impl LlamaInferenceSession {
                 tables.split_half_pairing,
                 self.is_drafter,
                 self.config.gemma3.as_ref(),
+                self.config.kv_quant,
             ) {
                 Some(engine) => {
                     // Prefill is whole-model only (`layer_range.is_some()` bails above), so
@@ -4033,9 +4036,11 @@ impl LlamaInferenceSession {
             );
         }
         let need_build = windowed_mismatch
-            || guard
-                .as_ref()
-                .is_none_or(|slot| slot.key != key || !slot.engine.weights_ready());
+            || guard.as_ref().is_none_or(|slot| {
+                slot.key != key
+                    || !slot.engine.weights_ready()
+                    || slot.engine.kv_quant != self.config.kv_quant
+            });
         if trace && need_build {
             match guard.as_ref() {
                 None => eprintln!("[resident-cuda] need_build: cache EMPTY (key={key:#x})"),
@@ -4073,6 +4078,7 @@ impl LlamaInferenceSession {
                 tables.split_half_pairing,
                 self.is_drafter,
                 self.config.gemma3.as_ref(),
+                self.config.kv_quant,
             ) {
                 Some(engine) => {
                     *guard = Some(ResidentCudaSlot {
@@ -4701,6 +4707,55 @@ impl LlamaInferenceSession {
         &mut self,
         token_ids: &[u32],
     ) -> Result<(Vec<u32>, LlamaForwardTimings)> {
+        let (logits, timings) = self.forward_verify_chunk_logits(token_ids)?;
+        Ok((greedy_sample_rows(&logits)?, timings))
+    }
+
+    /// Stochastic speculative-verification forward. Returns the fully filtered target
+    /// distribution for each row under the same sampling configuration and history semantics
+    /// used by ordinary one-token generation.
+    pub fn forward_sampling_verify_chunk(
+        &mut self,
+        token_ids: &[u32],
+        sampling: &SamplingConfig,
+        token_history: &[u32],
+    ) -> Result<(Vec<Vec<f32>>, LlamaForwardTimings)> {
+        sampling.validate()?;
+        let (logits, timings) = self.forward_verify_chunk_logits(token_ids)?;
+        if logits.shape.dims.len() != 2
+            || logits.shape.dims[0] != token_ids.len()
+            || logits.shape.dims[1] == 0
+        {
+            return Err(BackendError::RuntimeShapeMismatch(format!(
+                "sampling verify logits expected shape [{}, vocab], got {:?}",
+                token_ids.len(),
+                logits.shape.dims
+            )));
+        }
+
+        let rows = logits.shape.dims[0];
+        let vocab = logits.shape.dims[1];
+        let mut history = token_history.to_vec();
+        let mut probabilities = Vec::with_capacity(rows);
+        for (row, &row_token) in token_ids.iter().enumerate() {
+            if row > 0 {
+                history.push(row_token);
+            }
+            let start = row * vocab;
+            let row_logits = CpuTensor::from_f32(
+                "sampling_verify_row",
+                vec![1, vocab],
+                logits.data[start..start + vocab].to_vec(),
+            )?;
+            probabilities.push(sampling_probs_with_config(&row_logits, sampling, &history)?);
+        }
+        Ok((probabilities, timings))
+    }
+
+    fn forward_verify_chunk_logits(
+        &mut self,
+        token_ids: &[u32],
+    ) -> Result<(CpuTensor, LlamaForwardTimings)> {
         if token_ids.is_empty() {
             return Err(BackendError::RuntimeShapeMismatch(
                 "speculative verify chunk requires at least one token".to_string(),
@@ -4802,11 +4857,10 @@ impl LlamaInferenceSession {
         )?;
         timings.logits = logits_started.elapsed().as_micros();
 
-        let predictions = greedy_sample_rows(&logits)?;
         self.kv_cache.position += token_ids.len();
         timings.total = total_started.elapsed().as_micros();
         metal_seam::end_inference_session();
-        Ok((predictions, timings))
+        Ok((logits, timings))
     }
 
     fn forward_prefill_layer_major_timed_fast(
@@ -7012,16 +7066,16 @@ fn softmax_candidates(candidates: &[(usize, f32)], temperature: f32) -> Result<V
     Ok(weights)
 }
 
-fn sample_with_config(
+fn sampling_weights_with_config(
     logits: &CpuTensor,
     config: &SamplingConfig,
     token_history: &[u32],
-) -> Result<u32> {
+) -> Result<Vec<(usize, f32)>> {
     config.validate()?;
     validate_logits(logits)?;
     let adjusted = apply_sampling_adjustments(logits, config, token_history)?;
     if config.temperature == 0.0 {
-        return greedy_sample(&adjusted);
+        return Ok(vec![(greedy_sample(&adjusted)? as usize, 1.0)]);
     }
 
     let mut candidates: Vec<(usize, f32)> = adjusted.data.iter().copied().enumerate().collect();
@@ -7166,11 +7220,31 @@ fn sample_with_config(
         .zip(softmax_candidates(&candidates, config.temperature)?)
         .collect();
 
+    Ok(weighted)
+}
+
+fn sampling_probs_with_config(
+    logits: &CpuTensor,
+    config: &SamplingConfig,
+    token_history: &[u32],
+) -> Result<Vec<f32>> {
+    let weighted = sampling_weights_with_config(logits, config, token_history)?;
+    let mut probabilities = vec![0.0; logits.data.len()];
+    for (token, probability) in weighted {
+        probabilities[token] = probability;
+    }
+    Ok(probabilities)
+}
+
+fn sample_with_config(
+    logits: &CpuTensor,
+    config: &SamplingConfig,
+    token_history: &[u32],
+) -> Result<u32> {
+    let weighted = sampling_weights_with_config(logits, config, token_history)?;
     // Advance the RNG per decode step: `token_history.len()` is the deterministic
     // stream position, so each step draws a fresh uniform while a fixed seed still
-    // reproduces the whole sequence token-for-token. (Previously the draw depended
-    // only on the seed, so every step reused one identical value ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â a degenerate
-    // sampler.)
+    // reproduces the whole sequence token-for-token.
     let draw = seeded_unit_interval_at(config.seed.unwrap_or(0), token_history.len() as u64);
     let mut cumulative = 0.0;
     for (idx, probability) in &weighted {
@@ -13183,7 +13257,11 @@ fn build_resident_cuda_engine(
     // the schedule is keyed to the SAME parsed metadata the CPU oracle and the
     // Metal lane use.
     gemma3: Option<&crate::model::Gemma3Metadata>,
+    kv_quant: crate::model::KvCacheQuantization,
 ) -> Option<crate::cuda_resident::CudaResidentDecode> {
+    if kv_quant == crate::model::KvCacheQuantization::Q8_0 && !head_dim.is_multiple_of(32) {
+        return None;
+    }
     use crate::cuda_resident::ProjQuant;
     // Raw quant bytes (un-repacked) for a projection tensor. The resident engine
     // accepts either Q8_0 or one of the supported K-quant / low-bit encodings,
@@ -13268,8 +13346,11 @@ fn build_resident_cuda_engine(
     //   to a long context. If even the floor (256) cannot fit, return None so the
     //   caller runs the model on the CPU path rather than oversubscribing VRAM.
     const MIN_RESIDENT_CONTEXT: usize = 256;
-    // f16 KV: 2 bytes per element (K and V), see cuda_resident's u16 cache.
-    let kv_bytes_per_pos = (n_layers * n_kv * head_dim * 2 * 2) as u64;
+    let kv_bytes_per_elem: u64 = match kv_quant {
+        crate::model::KvCacheQuantization::Q8_0 => ((head_dim / 32) * 34) as u64,
+        _ => (head_dim * 2) as u64,
+    };
+    let kv_bytes_per_pos = (n_layers * n_kv * 2) as u64 * kv_bytes_per_elem;
     let weights_bytes: u64 = weights.layers[range.clone()]
         .iter()
         .flat_map(|l| {
@@ -13517,7 +13598,7 @@ fn build_resident_cuda_engine(
             return None;
         }
     }
-    let mut engine = crate::cuda_resident::CudaResidentDecode::new(
+    let mut engine = crate::cuda_resident::CudaResidentDecode::new_with_kv_quant(
         n_layers,
         n_heads,
         n_kv,
@@ -13529,6 +13610,7 @@ fn build_resident_cuda_engine(
         vocab,
         rms_eps,
         split_half_pairing,
+        kv_quant,
     )
     .ok()?;
     for (idx, l) in weights.layers[range.clone()].iter().enumerate() {

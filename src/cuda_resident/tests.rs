@@ -3,8 +3,32 @@
 //! isolated to a single kernel. All require a CUDA device (`#[ignore]`d in
 //! GPU-less CI); run with `cargo test --features cuda -- --ignored`.
 
-use super::{CudaResidentDecode, CudaResidentKernels, ProjQuant};
+use super::{CudaResidentDecode, CudaResidentKernels, ProjQuant, ResidentCudaArtifact};
 use cudarc::driver::{CudaSlice, LaunchConfig, PushKernelArg};
+
+#[test]
+fn q8_resident_cache_rejects_partial_blocks_before_cuda_initialization() {
+    let result = CudaResidentDecode::new_for_artifact_with_kv_quant(
+        1,
+        1,
+        1,
+        48,
+        48,
+        64,
+        48,
+        8,
+        32,
+        1e-5,
+        false,
+        ResidentCudaArtifact::Generic,
+        crate::model::KvCacheQuantization::Q8_0,
+    );
+    let err = match result {
+        Ok(_) => panic!("a partial Q8_0 head block must be rejected"),
+        Err(err) => err,
+    };
+    assert!(err.contains("multiple of 32"), "unexpected error: {err}");
+}
 
 fn fill_q1_wire(wire: &mut [u8], seed: u8) {
     for (block_index, block) in wire.chunks_exact_mut(18).enumerate() {
@@ -3595,16 +3619,25 @@ fn attention_decode_matches_cpu() {
     }
     // GPU
     let dq = k.stream.clone_htod(&q).unwrap();
-    let dk = k.stream.clone_htod(&cache_k_bits).unwrap();
-    let dv = k.stream.clone_htod(&cache_v_bits).unwrap();
+    let cache_k_bytes: Vec<u8> = cache_k_bits
+        .into_iter()
+        .flat_map(|x| x.to_le_bytes())
+        .collect();
+    let cache_v_bytes: Vec<u8> = cache_v_bits
+        .into_iter()
+        .flat_map(|x| x.to_le_bytes())
+        .collect();
+    let dk = k.stream.clone_htod(&cache_k_bytes).unwrap();
+    let dv = k.stream.clone_htod(&cache_v_bytes).unwrap();
     let mut dout = k.stream.alloc_zeros::<f32>(n_heads * head_dim).unwrap();
+    let mut dscores = k.stream.alloc_zeros::<f32>(n_heads * max_pos).unwrap();
     let (nh, nkv, hd, mp) = (n_heads as i32, n_kv as i32, head_dim as i32, max_pos as i32);
     // The kernel reads position from device memory and uses position_count = pos+1.
     let dpos = k.stream.clone_htod(&[(position_count - 1) as i32]).unwrap();
     let cfg = LaunchConfig {
         grid_dim: (n_heads as u32, 1, 1),
         block_dim: (64, 1, 1),
-        shared_mem_bytes: ((head_dim + position_count) * 4) as u32,
+        shared_mem_bytes: (2 * head_dim * 4) as u32,
     };
     let mut b = k.stream.launch_builder(&k.attention);
     b.arg(&dq)
@@ -3616,7 +3649,8 @@ fn attention_decode_matches_cpu() {
         .arg(&hd)
         .arg(&dpos)
         .arg(&mp)
-        .arg(&scale);
+        .arg(&scale)
+        .arg(&mut dscores);
     unsafe { b.launch(cfg).unwrap() };
     let mut got = vec![0f32; n_heads * head_dim];
     k.stream.memcpy_dtoh(&dout, &mut got).unwrap();
@@ -3677,8 +3711,16 @@ fn splitk_spec_verify_bit_identical() {
         .map(|&x| crate::inference::f32_to_f16_bits(x))
         .collect();
     let dq = k.stream.clone_htod(&q).unwrap();
-    let dk = k.stream.clone_htod(&cache_k_bits).unwrap();
-    let dv = k.stream.clone_htod(&cache_v_bits).unwrap();
+    let cache_k_bytes: Vec<u8> = cache_k_bits
+        .into_iter()
+        .flat_map(|x| x.to_le_bytes())
+        .collect();
+    let cache_v_bytes: Vec<u8> = cache_v_bits
+        .into_iter()
+        .flat_map(|x| x.to_le_bytes())
+        .collect();
+    let dk = k.stream.clone_htod(&cache_k_bytes).unwrap();
+    let dv = k.stream.clone_htod(&cache_v_bytes).unwrap();
 
     let bits = |v: &[f32]| -> Vec<u32> { v.iter().map(|x| x.to_bits()).collect() };
     let outlen = n_heads * head_dim;
@@ -3696,6 +3738,7 @@ fn splitk_spec_verify_bit_identical() {
         // Reference = exactly what plain decode dispatches at this position_count (the
         // `!graph_capture && attn_shared > SPLITK_THRESHOLD` branch in forward_pass).
         let mut dref = k.stream.alloc_zeros::<f32>(outlen).unwrap();
+        let mut d_scores = k.stream.alloc_zeros::<f32>(n_heads * max_pos).unwrap();
         if pc > super::SPLITK_THRESHOLD {
             let mut sc = k.stream.alloc_zeros::<f32>(n_heads * max_pos).unwrap();
             let mut cm = k
@@ -3712,7 +3755,7 @@ fn splitk_spec_verify_bit_identical() {
                 .unwrap();
             super::launch_attention_splitk(
                 &k.stream, &k, &dq, &dk, &dv, &mut dref, &mut sc, &mut cm, &mut ls, &mut ac,
-                n_heads, n_kv, head_dim, &dpos, pc, max_pos, scale,
+                n_heads, n_kv, head_dim, &dpos, pc, max_pos, scale, false,
             )
             .unwrap();
         } else {
@@ -3730,6 +3773,7 @@ fn splitk_spec_verify_bit_identical() {
                 pc,
                 max_pos,
                 scale,
+                &mut d_scores,
             )
             .unwrap();
         }
@@ -3738,6 +3782,7 @@ fn splitk_spec_verify_bit_identical() {
 
         // Linear verify: attention_batched, single token at absolute position pc-1, splitk_active=1.
         let mut dver = k.stream.alloc_zeros::<f32>(outlen).unwrap();
+        let mut d_scores = k.stream.alloc_zeros::<f32>(n_heads * max_pos).unwrap();
         super::launch_attention_batched(
             &k.stream,
             &k.attention_batched,
@@ -3754,6 +3799,7 @@ fn splitk_spec_verify_bit_identical() {
             n_heads * head_dim, // q_per_token
             1,                  // k
             1,                  // splitk_active
+            &mut d_scores,
         )
         .unwrap();
         let mut ver_out = vec![0f32; outlen];
@@ -3782,6 +3828,7 @@ fn splitk_spec_verify_bit_identical() {
             n_heads * head_dim,
             1,
             1,
+            &mut d_scores,
         )
         .unwrap();
         let mut tree_out = vec![0f32; outlen];
@@ -3888,16 +3935,25 @@ fn attention_decode_sw_matches_cpu() {
     }
     // GPU
     let dq = k.stream.clone_htod(&q).unwrap();
-    let dk = k.stream.clone_htod(&cache_k_bits).unwrap();
-    let dv = k.stream.clone_htod(&cache_v_bits).unwrap();
+    let cache_k_bytes: Vec<u8> = cache_k_bits
+        .into_iter()
+        .flat_map(|x| x.to_le_bytes())
+        .collect();
+    let cache_v_bytes: Vec<u8> = cache_v_bits
+        .into_iter()
+        .flat_map(|x| x.to_le_bytes())
+        .collect();
+    let dk = k.stream.clone_htod(&cache_k_bytes).unwrap();
+    let dv = k.stream.clone_htod(&cache_v_bytes).unwrap();
     let mut dout = k.stream.alloc_zeros::<f32>(n_heads * head_dim).unwrap();
+    let mut dscores = k.stream.alloc_zeros::<f32>(n_heads * max_pos).unwrap();
     let (nh, nkv, hd, mp) = (n_heads as i32, n_kv as i32, head_dim as i32, max_pos as i32);
     let win = window as i32;
     let dpos = k.stream.clone_htod(&[(position_count - 1) as i32]).unwrap();
     let cfg = LaunchConfig {
         grid_dim: (n_heads as u32, 1, 1),
         block_dim: (64, 1, 1),
-        shared_mem_bytes: ((head_dim + position_count) * 4) as u32,
+        shared_mem_bytes: (2 * head_dim * 4) as u32,
     };
     let mut b = k.stream.launch_builder(&k.attention_sw);
     b.arg(&dq)
@@ -3910,7 +3966,8 @@ fn attention_decode_sw_matches_cpu() {
         .arg(&dpos)
         .arg(&mp)
         .arg(&scale)
-        .arg(&win);
+        .arg(&win)
+        .arg(&mut dscores);
     unsafe { b.launch(cfg).unwrap() };
     let mut got = vec![0f32; n_heads * head_dim];
     k.stream.memcpy_dtoh(&dout, &mut got).unwrap();
@@ -6862,10 +6919,18 @@ fn flash_attention_prefill_tiled_parity() {
                     .iter()
                     .map(|&x| crate::inference::f32_to_f16_bits(x))
                     .collect();
+                let cache_k_bytes: Vec<u8> = cache_k_bits
+                    .iter()
+                    .flat_map(|bits| bits.to_le_bytes())
+                    .collect();
+                let cache_v_bytes: Vec<u8> = cache_v_bits
+                    .iter()
+                    .flat_map(|bits| bits.to_le_bytes())
+                    .collect();
 
                 let dq = k.stream.clone_htod(&q).unwrap();
-                let dk = k.stream.clone_htod(&cache_k_bits).unwrap();
-                let dv = k.stream.clone_htod(&cache_v_bits).unwrap();
+                let dk = k.stream.clone_htod(&cache_k_bytes).unwrap();
+                let dv = k.stream.clone_htod(&cache_v_bytes).unwrap();
                 let mut dout = k
                     .stream
                     .alloc_zeros::<f32>(k_tokens * n_heads * head_dim)

@@ -1,4 +1,4 @@
-//! Lossless greedy speculative decoding.
+//! Lossless greedy and distribution-preserving stochastic speculative decoding.
 //!
 //! Decode is memory-bandwidth bound: every sequential token costs a full
 //! weight read. Speculation drafts k candidate tokens cheaply, then verifies
@@ -53,6 +53,162 @@ pub fn accepted_draft_prefix(drafts: &[u32], target_predictions: &[u32]) -> usiz
         .zip(target_predictions.iter())
         .take_while(|(draft, prediction)| draft == prediction)
         .count()
+}
+
+/// Result of lossless speculative rejection sampling for a single verification round.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpeculativeRejectionResult {
+    /// Emitted tokens for this round: accepted prefix of draft tokens, followed by the
+    /// corrective or terminal bonus token from the target distribution.
+    pub emitted_tokens: Vec<u32>,
+    /// Number of draft tokens accepted before a rejection or full draft acceptance.
+    pub accepted_draft_count: usize,
+}
+
+/// Sample a token index from a discrete probability distribution given a uniform random value in [0, 1).
+pub fn sample_from_probs(probs: &[f32], uniform_r: f32) -> u32 {
+    let mut cumsum = 0.0f32;
+    let u = uniform_r.clamp(0.0, 0.9999999);
+    for (idx, &p) in probs.iter().enumerate() {
+        if p > 0.0 {
+            cumsum += p;
+            if cumsum > u {
+                return idx as u32;
+            }
+        }
+    }
+    // Fallback if sum of probabilities < 1 due to floating point rounding
+    probs
+        .iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(idx, _)| idx as u32)
+        .unwrap_or(0)
+}
+
+/// Deterministic random stream for one stochastic speculative-verification round.
+///
+/// Each committed token position owns a disjoint block of draws, so repeated runs with the same
+/// seed are reproducible even though a round may consume a variable number of random values.
+pub fn seeded_rejection_rng(seed: u64, committed_tokens: u64) -> impl FnMut() -> f32 {
+    let stream_base = committed_tokens.wrapping_mul(64);
+    let mut draw_index = 0u64;
+    move || {
+        let value = super::seeded_unit_interval_at(seed, stream_base.wrapping_add(draw_index));
+        draw_index = draw_index.wrapping_add(1);
+        value
+    }
+}
+
+/// Lossless speculative rejection sampling for stochastic generation (Leviathan et al., 2023).
+///
+/// For draft candidate tokens $x_1, \dots, x_K$:
+/// - Drafter proposed probability distributions: $q_0, \dots, q_{K-1}$ (where $q_i(t) = q(t \mid x_{<i})$).
+/// - Target model probability distributions: $p_0, \dots, p_K$ (where $p_i(t) = p(t \mid x_{<i})$).
+///
+/// At each step $i \in [0, K-1]$:
+/// - Candidate is $t = \text{drafts}[i]$.
+/// - Draw uniform random number $r \in [0, 1)$.
+/// - If $r < \min(1, \frac{p_i(t)}{q_i(t)})$, accept $t$.
+/// - If rejected, sample bonus token $t'$ from normalized residual distribution
+///   $p'_i(x) = \frac{\max(0, p_i(x) - q_i(x))}{\sum_y \max(0, p_i(y) - q_i(y))}$
+///   and terminate the round.
+/// - If all $K$ drafts are accepted, sample a terminal bonus token from $p_K$.
+#[allow(clippy::needless_range_loop)]
+pub fn speculative_rejection_sample<R: FnMut() -> f32>(
+    drafts: &[u32],
+    draft_probs: &[&[f32]],
+    target_probs: &[&[f32]],
+    mut rng: R,
+) -> SpeculativeRejectionResult {
+    let k = drafts.len();
+    assert!(
+        draft_probs.len() >= k,
+        "draft_probs length must be at least drafts length"
+    );
+    assert!(
+        target_probs.len() > k,
+        "target_probs length must be at least drafts.len() + 1"
+    );
+
+    let mut emitted = Vec::with_capacity(k + 1);
+    let mut accepted_count = 0;
+
+    for i in 0..k {
+        let draft_token = drafts[i];
+        let tok_idx = draft_token as usize;
+        let q = draft_probs[i].get(tok_idx).copied().unwrap_or(0.0);
+        let p = target_probs[i].get(tok_idx).copied().unwrap_or(0.0);
+
+        let accept_prob = if q <= 0.0 { 0.0 } else { (p / q).min(1.0) };
+
+        let r = rng();
+        if r < accept_prob {
+            // Draft accepted
+            emitted.push(draft_token);
+            accepted_count += 1;
+        } else {
+            // Draft rejected. Sample from residual distribution (p - q)+
+            let vocab_size = target_probs[i].len();
+            let mut residual_sum = 0.0f32;
+            for v in 0..vocab_size {
+                let pv = target_probs[i][v];
+                let qv = draft_probs[i].get(v).copied().unwrap_or(0.0);
+                residual_sum += (pv - qv).max(0.0);
+            }
+
+            let bonus_token = if residual_sum > 0.0 {
+                let mut cumsum = 0.0f32;
+                // Avoid using exactly residual_sum to prevent boundary precision misses
+                let u = (rng() * residual_sum).clamp(0.0, residual_sum * 0.9999999);
+                let mut sampled = None;
+                for v in 0..vocab_size {
+                    let pv = target_probs[i][v];
+                    let qv = draft_probs[i].get(v).copied().unwrap_or(0.0);
+                    let diff = (pv - qv).max(0.0);
+                    if diff > 0.0 {
+                        cumsum += diff;
+                        if cumsum > u {
+                            sampled = Some(v as u32);
+                            break;
+                        }
+                    }
+                }
+                sampled.unwrap_or_else(|| {
+                    // Fallback to argmax of residual if cumulative sum missed due to float rounding
+                    let mut max_diff = -1.0f32;
+                    let mut best_idx = 0;
+                    for v in 0..vocab_size {
+                        let pv = target_probs[i][v];
+                        let qv = draft_probs[i].get(v).copied().unwrap_or(0.0);
+                        let diff = (pv - qv).max(0.0);
+                        if diff > max_diff {
+                            max_diff = diff;
+                            best_idx = v as u32;
+                        }
+                    }
+                    best_idx
+                })
+            } else {
+                sample_from_probs(target_probs[i], rng())
+            };
+
+            emitted.push(bonus_token);
+            return SpeculativeRejectionResult {
+                emitted_tokens: emitted,
+                accepted_draft_count: accepted_count,
+            };
+        }
+    }
+
+    // All K drafts accepted; sample final bonus token from target_probs[k]
+    let final_token = sample_from_probs(target_probs[k], rng());
+    emitted.push(final_token);
+
+    SpeculativeRejectionResult {
+        emitted_tokens: emitted,
+        accepted_draft_count: accepted_count,
+    }
 }
 
 pub enum SpeculativeDrafter {
@@ -838,5 +994,159 @@ mod tests {
         latch.note_verified(0);
         assert!(!latch.speculating());
         assert!(!latch.should_speculate(), "failed probe resumes skipping");
+    }
+
+    #[test]
+    fn test_sample_from_probs_cdf() {
+        let probs = [0.1, 0.6, 0.3];
+        assert_eq!(sample_from_probs(&probs, 0.05), 0);
+        assert_eq!(sample_from_probs(&probs, 0.15), 1);
+        assert_eq!(sample_from_probs(&probs, 0.69), 1);
+        assert_eq!(sample_from_probs(&probs, 0.71), 2);
+        assert_eq!(sample_from_probs(&probs, 0.99), 2);
+    }
+
+    #[test]
+    fn test_speculative_rejection_all_accepted() {
+        let drafts = [1, 2];
+        let q0 = [0.0, 0.8, 0.2];
+        let q1 = [0.0, 0.1, 0.9];
+        let draft_probs: [&[f32]; 2] = [&q0, &q1];
+
+        // Target agrees with higher or equal probability
+        let p0 = [0.0, 0.9, 0.1];
+        let p1 = [0.0, 0.05, 0.95];
+        let p2 = [0.2, 0.3, 0.5]; // Terminal target distribution
+        let target_probs: [&[f32]; 3] = [&p0, &p1, &p2];
+
+        // Sequence of random uniforms: r0=0.5 (accept), r1=0.5 (accept), r_term=0.8 (samples idx 2)
+        let r_values = [0.5f32, 0.5f32, 0.8f32];
+        let mut r_idx = 0;
+        let rng = || {
+            let val = r_values[r_idx];
+            r_idx += 1;
+            val
+        };
+
+        let res = speculative_rejection_sample(&drafts, &draft_probs, &target_probs, rng);
+        assert_eq!(res.accepted_draft_count, 2);
+        assert_eq!(res.emitted_tokens, vec![1, 2, 2]);
+    }
+
+    #[test]
+    fn test_speculative_rejection_first_rejected() {
+        let drafts = [1];
+        let q0 = [0.0, 0.8, 0.2];
+        let draft_probs: [&[f32]; 1] = [&q0];
+
+        // Target assigns lower probability to draft 1 (0.2 vs 0.8)
+        let p0 = [0.5, 0.2, 0.3];
+        let p1 = [0.33, 0.33, 0.34];
+        let target_probs: [&[f32]; 2] = [&p0, &p1];
+
+        // accept_prob = 0.2 / 0.8 = 0.25
+        // r0 = 0.5 >= 0.25 -> reject draft!
+        // Residual (p - q)+:
+        // idx 0: max(0, 0.5 - 0.0) = 0.5
+        // idx 1: max(0, 0.2 - 0.8) = 0.0
+        // idx 2: max(0, 0.3 - 0.2) = 0.1
+        // sum = 0.6. Normalized: [0.5/0.6 = 0.833, 0.0, 0.1/0.6 = 0.167]
+        // r_bonus = 0.2 (< 0.833) -> samples idx 0
+        let r_values = [0.5f32, 0.2f32];
+        let mut r_idx = 0;
+        let rng = || {
+            let val = r_values[r_idx];
+            r_idx += 1;
+            val
+        };
+
+        let res = speculative_rejection_sample(&drafts, &draft_probs, &target_probs, rng);
+        assert_eq!(res.accepted_draft_count, 0);
+        assert_eq!(res.emitted_tokens, vec![0]);
+    }
+
+    #[test]
+    fn deterministic_proposal_preserves_the_target_distribution() {
+        let drafts = [0];
+        let q0 = [1.0, 0.0];
+        let draft_probs: [&[f32]; 1] = [&q0];
+        let p0 = [0.25, 0.75];
+        let p1 = [0.5, 0.5];
+        let target_probs: [&[f32]; 2] = [&p0, &p1];
+        let mut seed = 0x1234_5678_9abc_def0u64;
+        let mut rng = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((seed >> 40) as f32) / ((1u32 << 24) as f32)
+        };
+        let trials = 20_000;
+        let mut zeroes = 0;
+        for _ in 0..trials {
+            let result =
+                speculative_rejection_sample(&drafts, &draft_probs, &target_probs, &mut rng);
+            zeroes += usize::from(result.emitted_tokens[0] == 0);
+        }
+        let empirical = zeroes as f32 / trials as f32;
+        assert!(
+            (empirical - p0[0]).abs() < 0.015,
+            "empirical p(0)={empirical}, expected {}",
+            p0[0]
+        );
+    }
+
+    #[test]
+    fn seeded_rejection_stream_is_reproducible_and_position_scoped() {
+        let mut first = seeded_rejection_rng(17, 9);
+        let mut replay = seeded_rejection_rng(17, 9);
+        let mut next_position = seeded_rejection_rng(17, 10);
+        let first_draws: Vec<f32> = (0..8).map(|_| first()).collect();
+        let replay_draws: Vec<f32> = (0..8).map(|_| replay()).collect();
+        let next_draws: Vec<f32> = (0..8).map(|_| next_position()).collect();
+        assert_eq!(first_draws, replay_draws);
+        assert_ne!(first_draws, next_draws);
+    }
+
+    #[test]
+    fn test_speculative_rejection_monte_carlo_distribution() {
+        let q0 = [0.7, 0.3];
+        let draft_probs: [&[f32]; 1] = [&q0];
+        let p0 = [0.2, 0.8];
+        let p1 = [0.5, 0.5];
+        let target_probs: [&[f32]; 2] = [&p0, &p1];
+
+        // Linear congruential generator for deterministic test
+        let mut seed: u64 = 123456789;
+        let mut rng = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((seed >> 33) as f32) / ((1u32 << 31) as f32)
+        };
+
+        let trials = 20_000;
+        let mut count0 = 0;
+        let mut count1 = 0;
+
+        for _ in 0..trials {
+            let d = sample_from_probs(&q0, rng());
+            let drafts = [d];
+            let res = speculative_rejection_sample(&drafts, &draft_probs, &target_probs, &mut rng);
+            let first_token = res.emitted_tokens[0];
+            if first_token == 0 {
+                count0 += 1;
+            } else if first_token == 1 {
+                count1 += 1;
+            }
+        }
+
+        let emp0 = (count0 as f32) / (trials as f32);
+        let emp1 = (count1 as f32) / (trials as f32);
+
+        // Should match p0 = [0.2, 0.8] within 0.01
+        assert!(
+            (emp0 - 0.2).abs() < 0.015,
+            "empirical p(0)={emp0} expected ~0.2"
+        );
+        assert!(
+            (emp1 - 0.8).abs() < 0.015,
+            "empirical p(1)={emp1} expected ~0.8"
+        );
     }
 }
