@@ -1,4 +1,4 @@
-//! Lossless greedy speculative decoding.
+//! Lossless greedy and distribution-preserving stochastic speculative decoding.
 //!
 //! Decode is memory-bandwidth bound: every sequential token costs a full
 //! weight read. Speculation drafts k candidate tokens cheaply, then verifies
@@ -84,6 +84,20 @@ pub fn sample_from_probs(probs: &[f32], uniform_r: f32) -> u32 {
         .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
         .map(|(idx, _)| idx as u32)
         .unwrap_or(0)
+}
+
+/// Deterministic random stream for one stochastic speculative-verification round.
+///
+/// Each committed token position owns a disjoint block of draws, so repeated runs with the same
+/// seed are reproducible even though a round may consume a variable number of random values.
+pub fn seeded_rejection_rng(seed: u64, committed_tokens: u64) -> impl FnMut() -> f32 {
+    let stream_base = committed_tokens.wrapping_mul(64);
+    let mut draw_index = 0u64;
+    move || {
+        let value = super::seeded_unit_interval_at(seed, stream_base.wrapping_add(draw_index));
+        draw_index = draw_index.wrapping_add(1);
+        value
+    }
 }
 
 /// Lossless speculative rejection sampling for stochastic generation (Leviathan et al., 2023).
@@ -1049,6 +1063,46 @@ mod tests {
         let res = speculative_rejection_sample(&drafts, &draft_probs, &target_probs, rng);
         assert_eq!(res.accepted_draft_count, 0);
         assert_eq!(res.emitted_tokens, vec![0]);
+    }
+
+    #[test]
+    fn deterministic_proposal_preserves_the_target_distribution() {
+        let drafts = [0];
+        let q0 = [1.0, 0.0];
+        let draft_probs: [&[f32]; 1] = [&q0];
+        let p0 = [0.25, 0.75];
+        let p1 = [0.5, 0.5];
+        let target_probs: [&[f32]; 2] = [&p0, &p1];
+        let mut seed = 0x1234_5678_9abc_def0u64;
+        let mut rng = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((seed >> 40) as f32) / ((1u32 << 24) as f32)
+        };
+        let trials = 20_000;
+        let mut zeroes = 0;
+        for _ in 0..trials {
+            let result =
+                speculative_rejection_sample(&drafts, &draft_probs, &target_probs, &mut rng);
+            zeroes += usize::from(result.emitted_tokens[0] == 0);
+        }
+        let empirical = zeroes as f32 / trials as f32;
+        assert!(
+            (empirical - p0[0]).abs() < 0.015,
+            "empirical p(0)={empirical}, expected {}",
+            p0[0]
+        );
+    }
+
+    #[test]
+    fn seeded_rejection_stream_is_reproducible_and_position_scoped() {
+        let mut first = seeded_rejection_rng(17, 9);
+        let mut replay = seeded_rejection_rng(17, 9);
+        let mut next_position = seeded_rejection_rng(17, 10);
+        let first_draws: Vec<f32> = (0..8).map(|_| first()).collect();
+        let replay_draws: Vec<f32> = (0..8).map(|_| replay()).collect();
+        let next_draws: Vec<f32> = (0..8).map(|_| next_position()).collect();
+        assert_eq!(first_draws, replay_draws);
+        assert_ne!(first_draws, next_draws);
     }
 
     #[test]

@@ -4566,7 +4566,7 @@ extern "C" __global__ void attention_batched(
         int max_groups = 1024 / head_dim; if (max_groups < 1) max_groups = 1;
         int G = (position_count + head_dim - 1) / head_dim;
         if (G < 1) G = 1; if (G > max_groups) G = max_groups;
-        float* vpart = shared + head_dim + base_position + k_tokens; // [max_groups * head_dim]
+        float* vpart = shared + head_dim; // [max_groups * head_dim]
         for (int idx = tid; idx < G * head_dim; idx += blockDim.x) {
             int gid = idx / head_dim, did = idx % head_dim;
             int p_lo = (int)((long)gid * position_count / G);
@@ -4644,8 +4644,8 @@ extern "C" __global__ void attention_tree_batched(
 
     extern __shared__ float shared[];
     float* qsh = shared;               // head_dim
+    int* slots = (int*)(shared + head_dim); // absolute KV slot per score
     float* scores = global_scores + (long)blockIdx.x * max_pos;
-    int* slots = (int*)(scores + base_position + k_tokens); // absolute KV slot per score
     int tid = threadIdx.x;
     for (int d = tid; d < head_dim; d += blockDim.x) qsh[d] = qh[d];
     __syncthreads();
@@ -4924,7 +4924,7 @@ extern "C" __global__ void attention_batched_q8_0(
         int max_groups = 1024 / head_dim; if (max_groups < 1) max_groups = 1;
         int G = (position_count + head_dim - 1) / head_dim;
         if (G < 1) G = 1; if (G > max_groups) G = max_groups;
-        float* vpart = shared + head_dim + position_count;
+        float* vpart = shared + head_dim;
         int gid = tid / head_dim;
         int did = tid % head_dim;
         int b = did / 32;
@@ -4967,8 +4967,8 @@ extern "C" __global__ void attention_tree_batched_q8_0(
 
     extern __shared__ float shared[];
     float* qsh = shared;
+    int* slots = (int*)(shared + head_dim);
     float* scores = global_scores + (long)blockIdx.x * max_pos;
-    int* slots = (int*)(scores + base_position + k_tokens);
     int tid = threadIdx.x;
     for (int d = tid; d < head_dim; d += blockDim.x) qsh[d] = qh[d];
     __syncthreads();
@@ -8773,10 +8773,10 @@ pub(crate) fn launch_attention_batched(
     splitk_active: i32,
     global_scores: &mut CudaSlice<f32>,
 ) -> Result<(), cudarc::driver::DriverError> {
-    // Shared = query (head_dim) + scores (longest prefix = base + k) + weighted-V partials
-    // (max_groups * head_dim, the decode-parity G-group reduction scratch).
+    // Scores live in the per-engine global scratch buffer. Shared memory only holds the query
+    // and weighted-V partials (max_groups * head_dim, the decode-parity G-group reduction).
     let max_groups = (1024 / head_dim).max(1);
-    let shared = ((head_dim + base_position + k + max_groups * head_dim) as u32) * 4;
+    let shared = ((head_dim + max_groups * head_dim) as u32) * 4;
     let cfg = LaunchConfig {
         grid_dim: ((k * n_heads) as u32, 1, 1),
         block_dim: (128, 1, 1),
@@ -8907,11 +8907,10 @@ pub(crate) fn launch_attention_tree_batched(
     splitk_active: i32,
     global_scores: &mut CudaSlice<f32>,
 ) -> Result<(), cudarc::driver::DriverError> {
-    // Shared = query (head_dim) + scores (<= base + k) + slot indices (<= base + k) + weighted-V
-    // partials (max_groups * head_dim, the decode-parity G-group reduction scratch).
-    // scores are f32 and slots are i32, both 4 bytes ⇒ 2*(base+k) words past head_dim.
+    // Scores live in the per-engine global scratch buffer. Shared memory holds the query,
+    // slot indices (<= base + k), and weighted-V partials (max_groups * head_dim).
     let max_groups = (1024 / head_dim).max(1);
-    let shared = ((head_dim + 2 * (base_position + k) + max_groups * head_dim) as u32) * 4;
+    let shared = ((head_dim + base_position + k + max_groups * head_dim) as u32) * 4;
     let cfg = LaunchConfig {
         grid_dim: ((k * n_heads) as u32, 1, 1),
         block_dim: (128, 1, 1),
@@ -9833,9 +9832,8 @@ pub(crate) fn launch_attention(
     n_kv_heads: usize,
     head_dim: usize,
     position: &CudaSlice<i32>,
-    // Positions to size the shared `scores[]` array for. The non-graph path passes
-    // the exact current count (tight, best occupancy); the graph-capture path passes
-    // `max_pos` so the captured launch config holds for every replayed position.
+    // Positions used to choose the weighted-V group count. The non-graph path passes the exact
+    // current count; the graph-capture path passes `max_pos` so launch geometry is replay-stable.
     shared_positions: usize,
     max_pos: usize,
     scale: f32,
@@ -9858,7 +9856,7 @@ pub(crate) fn launch_attention(
     let cfg = LaunchConfig {
         grid_dim: (n_heads as u32, 1, 1),
         block_dim: (block, 1, 1),
-        // qsh[head_dim] + vpart[groups*head_dim] + scores[shared_positions]
+        // qsh[head_dim] + vpart[groups*head_dim]; scores live in global scratch.
         shared_mem_bytes: (head_dim as u32 * (1 + groups)) * 4,
     };
     let (nh, nkv, hd, mp) = (
@@ -9886,9 +9884,8 @@ pub(crate) fn launch_attention(
 /// geometry to [`launch_attention`] — same block/G sizing, same shared-memory
 /// budget — plus a trailing `window` scalar. The kernel computes
 /// `start = position_count - window` on the device from `position_ptr`, so the
-/// launch config does not vary with position and the shared `scores[]` must
-/// still cover the absolute index range `[start, position_count)`; sizing is
-/// therefore unchanged from the full-causal launcher.
+/// launch config does not vary with position. Scores use the same global scratch
+/// buffer as the full-causal launcher.
 ///
 /// `window` is the gemma3 convention: it INCLUDES the current position, so a
 /// layer at `pos` attends `[pos + 1 - window ..= pos]`.
@@ -11027,6 +11024,11 @@ impl CudaResidentDecode {
         artifact: ResidentCudaArtifact,
         kv_quant: crate::model::KvCacheQuantization,
     ) -> Result<Self, String> {
+        if kv_quant == crate::model::KvCacheQuantization::Q8_0 && !head_dim.is_multiple_of(32) {
+            return Err(format!(
+                "Q8_0 resident KV cache requires head_dim to be a multiple of 32, got {head_dim}"
+            ));
+        }
         let q_width = n_heads * head_dim;
         let kv_width = n_kv_heads * head_dim;
         let fast_q1 = prism_cuda_fast_from_env();

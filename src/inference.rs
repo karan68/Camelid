@@ -4707,6 +4707,55 @@ impl LlamaInferenceSession {
         &mut self,
         token_ids: &[u32],
     ) -> Result<(Vec<u32>, LlamaForwardTimings)> {
+        let (logits, timings) = self.forward_verify_chunk_logits(token_ids)?;
+        Ok((greedy_sample_rows(&logits)?, timings))
+    }
+
+    /// Stochastic speculative-verification forward. Returns the fully filtered target
+    /// distribution for each row under the same sampling configuration and history semantics
+    /// used by ordinary one-token generation.
+    pub fn forward_sampling_verify_chunk(
+        &mut self,
+        token_ids: &[u32],
+        sampling: &SamplingConfig,
+        token_history: &[u32],
+    ) -> Result<(Vec<Vec<f32>>, LlamaForwardTimings)> {
+        sampling.validate()?;
+        let (logits, timings) = self.forward_verify_chunk_logits(token_ids)?;
+        if logits.shape.dims.len() != 2
+            || logits.shape.dims[0] != token_ids.len()
+            || logits.shape.dims[1] == 0
+        {
+            return Err(BackendError::RuntimeShapeMismatch(format!(
+                "sampling verify logits expected shape [{}, vocab], got {:?}",
+                token_ids.len(),
+                logits.shape.dims
+            )));
+        }
+
+        let rows = logits.shape.dims[0];
+        let vocab = logits.shape.dims[1];
+        let mut history = token_history.to_vec();
+        let mut probabilities = Vec::with_capacity(rows);
+        for row in 0..rows {
+            if row > 0 {
+                history.push(token_ids[row]);
+            }
+            let start = row * vocab;
+            let row_logits = CpuTensor::from_f32(
+                "sampling_verify_row",
+                vec![1, vocab],
+                logits.data[start..start + vocab].to_vec(),
+            )?;
+            probabilities.push(sampling_probs_with_config(&row_logits, sampling, &history)?);
+        }
+        Ok((probabilities, timings))
+    }
+
+    fn forward_verify_chunk_logits(
+        &mut self,
+        token_ids: &[u32],
+    ) -> Result<(CpuTensor, LlamaForwardTimings)> {
         if token_ids.is_empty() {
             return Err(BackendError::RuntimeShapeMismatch(
                 "speculative verify chunk requires at least one token".to_string(),
@@ -4808,11 +4857,10 @@ impl LlamaInferenceSession {
         )?;
         timings.logits = logits_started.elapsed().as_micros();
 
-        let predictions = greedy_sample_rows(&logits)?;
         self.kv_cache.position += token_ids.len();
         timings.total = total_started.elapsed().as_micros();
         metal_seam::end_inference_session();
-        Ok((predictions, timings))
+        Ok((logits, timings))
     }
 
     fn forward_prefill_layer_major_timed_fast(
@@ -7018,16 +7066,16 @@ fn softmax_candidates(candidates: &[(usize, f32)], temperature: f32) -> Result<V
     Ok(weights)
 }
 
-fn sample_with_config(
+fn sampling_weights_with_config(
     logits: &CpuTensor,
     config: &SamplingConfig,
     token_history: &[u32],
-) -> Result<u32> {
+) -> Result<Vec<(usize, f32)>> {
     config.validate()?;
     validate_logits(logits)?;
     let adjusted = apply_sampling_adjustments(logits, config, token_history)?;
     if config.temperature == 0.0 {
-        return greedy_sample(&adjusted);
+        return Ok(vec![(greedy_sample(&adjusted)? as usize, 1.0)]);
     }
 
     let mut candidates: Vec<(usize, f32)> = adjusted.data.iter().copied().enumerate().collect();
@@ -7172,11 +7220,31 @@ fn sample_with_config(
         .zip(softmax_candidates(&candidates, config.temperature)?)
         .collect();
 
+    Ok(weighted)
+}
+
+fn sampling_probs_with_config(
+    logits: &CpuTensor,
+    config: &SamplingConfig,
+    token_history: &[u32],
+) -> Result<Vec<f32>> {
+    let weighted = sampling_weights_with_config(logits, config, token_history)?;
+    let mut probabilities = vec![0.0; logits.data.len()];
+    for (token, probability) in weighted {
+        probabilities[token] = probability;
+    }
+    Ok(probabilities)
+}
+
+fn sample_with_config(
+    logits: &CpuTensor,
+    config: &SamplingConfig,
+    token_history: &[u32],
+) -> Result<u32> {
+    let weighted = sampling_weights_with_config(logits, config, token_history)?;
     // Advance the RNG per decode step: `token_history.len()` is the deterministic
     // stream position, so each step draws a fresh uniform while a fixed seed still
-    // reproduces the whole sequence token-for-token. (Previously the draw depended
-    // only on the seed, so every step reused one identical value ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â a degenerate
-    // sampler.)
+    // reproduces the whole sequence token-for-token.
     let draw = seeded_unit_interval_at(config.seed.unwrap_or(0), token_history.len() as u64);
     let mut cumulative = 0.0;
     for (idx, probability) in &weighted {
@@ -13191,6 +13259,9 @@ fn build_resident_cuda_engine(
     gemma3: Option<&crate::model::Gemma3Metadata>,
     kv_quant: crate::model::KvCacheQuantization,
 ) -> Option<crate::cuda_resident::CudaResidentDecode> {
+    if kv_quant == crate::model::KvCacheQuantization::Q8_0 && !head_dim.is_multiple_of(32) {
+        return None;
+    }
     use crate::cuda_resident::ProjQuant;
     // The resident upload byte source for a projection: CPU Q8_0 36-byte blocks,
     // raw K-quant super-blocks, or native Prism Q1/Q2 packed blocks. These are the

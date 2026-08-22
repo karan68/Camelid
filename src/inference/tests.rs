@@ -10,6 +10,34 @@ fn assert_close(actual: f32, expected: f32) {
 }
 
 #[test]
+fn sampling_probabilities_match_the_normal_sampler_candidate_weights() {
+    let logits =
+        CpuTensor::from_f32("logits", vec![1, 5], vec![2.5, 1.0, 0.5, -0.5, -2.0]).unwrap();
+    let config = SamplingConfig {
+        temperature: 0.8,
+        top_k: Some(4),
+        top_p: Some(0.9),
+        min_p: Some(0.02),
+        presence_penalty: 0.2,
+        frequency_penalty: 0.1,
+        repeat_penalty: 1.1,
+        logit_bias: vec![(3, 0.4)],
+        ..SamplingConfig::default()
+    };
+    let history = [1, 1, 2];
+
+    let weighted = sampling_weights_with_config(&logits, &config, &history).unwrap();
+    let dense = sampling_probs_with_config(&logits, &config, &history).unwrap();
+
+    assert_close(dense.iter().sum(), 1.0);
+    for (token, probability) in weighted {
+        assert_close(dense[token], probability);
+    }
+    let sampled = sample_with_config(&logits, &config, &history).unwrap();
+    assert!(dense[sampled as usize] > 0.0);
+}
+
+#[test]
 fn projection_bias_broadcasts_across_every_token_row() {
     let projection =
         CpuTensor::from_f32("q", vec![2, 3], vec![1.0, 2.0, 3.0, -1.0, -2.0, -3.0]).unwrap();

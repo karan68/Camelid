@@ -6200,8 +6200,8 @@ mod gpu_ssm_layer_tests {
 
         // persistent KV cache (f16 bits, layout [kv_head][position][head_dim]) +
         // device position + per-pair RoPE tables.
-        let mut cache_k = s.alloc_zeros::<u8>(kv_width * max_pos).unwrap();
-        let mut cache_v = s.alloc_zeros::<u8>(kv_width * max_pos).unwrap();
+        let mut cache_k = s.alloc_zeros::<u8>(kv_width * max_pos * 2).unwrap();
+        let mut cache_v = s.alloc_zeros::<u8>(kv_width * max_pos * 2).unwrap();
         let mut d_pos = s.alloc_zeros::<i32>(1).unwrap();
         let mut d_cos = s.alloc_zeros::<f32>(half).unwrap();
         let mut d_sin = s.alloc_zeros::<f32>(half).unwrap();
