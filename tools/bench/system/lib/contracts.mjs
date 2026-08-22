@@ -349,7 +349,7 @@ export function validateComparison(value) {
   id(value.campaign_id, '$.campaign_id', issues)
   array(value.runtime, '$.runtime', issues)
   array(value.agents, '$.agents', issues)
-  const workloadIds = new Set()
+  const runtimeKeys = new Set()
   if (Array.isArray(value.runtime)) {
     value.runtime.forEach((record, index) => {
       const path = `$.runtime[${index}]`
@@ -360,8 +360,8 @@ export function validateComparison(value) {
         'bootstrap_samples', 'verdict',
       ], issues, (item) => {
         id(item.workload_id, `${path}.workload_id`, issues)
-        unique(item.workload_id, workloadIds, `${path}.workload_id`, issues)
         nonEmpty(item.metric, `${path}.metric`, issues)
+        unique(`${item.workload_id}\u0000${item.metric}`, runtimeKeys, `${path}.workload_id+metric`, issues)
         nonNegativeInteger(item.valid_pairs, `${path}.valid_pairs`, issues)
         validateExcludedPairs(item.excluded_pairs, `${path}.excluded_pairs`, issues)
         nullablePositiveNumber(item.base_median, `${path}.base_median`, issues)

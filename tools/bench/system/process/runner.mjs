@@ -10,8 +10,8 @@ export async function runProcess(options) {
   const normalized = validateOptions(options)
   await prepareLog(normalized.stdoutFile)
   await prepareLog(normalized.stderrFile)
-  const stdoutWriter = normalized.stdoutFile ? createWriteStream(normalized.stdoutFile) : null
-  const stderrWriter = normalized.stderrFile ? createWriteStream(normalized.stderrFile) : null
+  const stdoutWriter = openWriter(normalized.stdoutFile)
+  const stderrWriter = openWriter(normalized.stderrFile)
   const stdoutCapture = capture(normalized.maxCaptureBytes)
   const stderrCapture = capture(normalized.maxCaptureBytes)
   const started = performance.now()
@@ -38,11 +38,11 @@ export async function runProcess(options) {
 
     child.stdout.on('data', (chunk) => {
       stdoutCapture.append(chunk)
-      stdoutWriter?.write(chunk)
+      stdoutWriter?.stream.write(chunk)
     })
     child.stderr.on('data', (chunk) => {
       stderrCapture.append(chunk)
-      stderrWriter?.write(chunk)
+      stderrWriter?.stream.write(chunk)
     })
     child.once('error', (error) => {
       spawnError = error
@@ -165,10 +165,25 @@ async function prepareLog(path) {
   if (path) await mkdir(dirname(path), { recursive: true })
 }
 
-async function closeWriter(writer) {
-  if (!writer) return
-  await new Promise((resolveClose, reject) => {
-    writer.once('error', reject)
-    writer.end(resolveClose)
+function openWriter(path) {
+  if (!path) return null
+  const state = { stream: createWriteStream(path), error: null }
+  // Attach immediately so ENOSPC/permission errors cannot become unhandled
+  // events while the child is still running. The campaign fails after the
+  // child closes and the writer reaches a terminal state.
+  state.stream.on('error', (error) => {
+    state.error ??= error
   })
+  return state
+}
+
+async function closeWriter(state) {
+  if (!state) return
+  if (!state.stream.closed) {
+    await new Promise((resolveClose) => {
+      state.stream.once('close', resolveClose)
+      state.stream.end()
+    })
+  }
+  if (state.error) throw state.error
 }

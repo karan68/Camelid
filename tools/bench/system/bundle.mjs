@@ -19,6 +19,7 @@ export async function writeBenchmarkBundle(input, options = {}) {
   await mkdir(outputDir, { recursive: true })
   await writeCanonical(join(outputDir, 'plan.json'), plan)
   await writeCanonical(join(outputDir, 'prepared-arms.json'), preparedArms)
+  await writeCanonical(join(outputDir, 'executions.json'), executions)
 
   const sampleFiles = []
   for (const sample of samples) {
@@ -47,6 +48,7 @@ export async function writeBenchmarkBundle(input, options = {}) {
     invalid_sample_count: invalidSamples.length,
     sample_files: sampleFiles.sort(),
     raw_execution_count: executions.length,
+    executions_file: 'executions.json',
     preparation_mode: input.preparationMode,
     comparison_file: 'comparison.json',
     claim_boundary: 'Local informational Phase 1 runtime comparison only; no numeric gate or public performance claim.',

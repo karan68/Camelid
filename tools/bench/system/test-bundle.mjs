@@ -42,7 +42,7 @@ try {
   assert.equal(result.comparison.runtime[0].observed_direction, 'head_faster')
   assert.equal(result.comparison.runtime[0].verdict, 'INCONCLUSIVE_NOISE')
   assert.equal(result.comparison.runtime[0].valid_pairs, 2)
-  for (const file of ['plan.json', 'prepared-arms.json', 'comparison.json', 'manifest.json', 'summary.md', 'SHA256SUMS']) {
+  for (const file of ['plan.json', 'prepared-arms.json', 'executions.json', 'comparison.json', 'manifest.json', 'summary.md', 'SHA256SUMS']) {
     await access(join(temp, file))
   }
   const verification = await verifyBundleChecksums(temp)

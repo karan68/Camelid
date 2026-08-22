@@ -68,6 +68,16 @@ const invalidComparison = structuredClone(comparison)
 invalidComparison.runtime[0].verdict = 'PASS'
 fails(() => validateComparison(invalidComparison), '$.runtime[0].verdict must be one of')
 
+const multiMetricComparison = structuredClone(comparison)
+multiMetricComparison.runtime.push({
+  ...structuredClone(multiMetricComparison.runtime[0]),
+  metric: 'ttft_ms',
+})
+assert.equal(validateComparison(multiMetricComparison), multiMetricComparison)
+const duplicateMetricComparison = structuredClone(multiMetricComparison)
+duplicateMetricComparison.runtime.push(structuredClone(duplicateMetricComparison.runtime[0]))
+fails(() => validateComparison(duplicateMetricComparison), 'workload_id+metric duplicates')
+
 for (const fixture of ['valid-direct.jsonl', 'valid-runnable.jsonl']) {
   const records = await jsonLines(`fixtures/bench-generate/${fixture}`)
   assert.ok(records.length > 0)
