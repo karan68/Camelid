@@ -33,6 +33,29 @@ dead end. **Prefill is compute-bound** → that is the one place a tiled GEMM ca
   s_sync ≈ 1.03). Phases 3–4 dropped. Full curve: `BARCHAN_PHASE1_COST_CURVE.md`.
   Reopening requires first answering "why does one verified row cost a full decode?", which is a
   Q8 Metal *kernel* question — a lane `METAL_PARITY_RESULT.md` §4 already closed.
+- **Q8_0 resident KV on Metal AS SHIPPED (`CAMELID_METAL_KV_DTYPE=q8`), M3/8 GiB, Llama-3.2-1B
+  Q8_0, 2026-08-22:** do not re-run the plain "is q8 faster than the default" A/B — it is
+  answered and the answer is *no, but not for the reason it looks like*. Against the
+  zero-config F32 default, q8 decode is **not resolved** (0.871×, CI [0.731, 1.066]) and
+  prefill is **4.48× worse** (significant). But enabling any compressed primary forfeits
+  split-K decode, and against an F32 arm with split-K forced off — the apples-to-apples
+  footing — q8 decode is **1.50× FASTER** (CI [1.468, 1.644]), rising monotonically with
+  context depth (1.14× at 1k, 1.27× at 2k, 1.50× at 8k). So the KV-bandwidth win is real and
+  the lane is **blocked, not dead**: the missing pieces are `attention_decode_splitk_kvq8`
+  and a Q8 flash/matmul prefill. Whether split-K and Q8 *compose* is **untested** and is the
+  one question worth spending on. Note one depth already wins outright: at 4117 tokens q8
+  beats the default **1.031×** (significant) despite the forfeit. **Quality is where the two
+  compressed formats diverge:** on coherent English (`realtext` probe, 1460 tok) **f16 is
+  token-identical to f32 in 3/3 rounds at every depth tested, q8 is NOT** — it diverges
+  deterministically at generated token 50, though benignly (fluent alternative continuation).
+  Filler-prompt parity numbers are worthless in both directions and must not be cited: flat
+  distributions flip the argmax on noise, and long filler runs collapse into a repetition
+  attractor (9 distinct tokens across 64 positions) where every arm agrees for free. Also
+  settled: process peak RSS cannot measure this (it does not separate q8 from f16 at all);
+  `vmmap` on `IOAccelerator (graphics)` shows f16→q8 saving 102.4 MB against 120 MB
+  predicted. Receipt
+  `PERF_RECEIPTS/same-host/metal-kv-q8-m3-20260822.json`, writeup `METAL_KV_Q8_RESULT.md`.
+  One host only → nothing promotes.
 - Gated x86 packed-rows4/GEMM4 SIMD A/B (`CAMELID_X86_Q8_*`): −8…−11%, byte-identical → default-off.
 - VNNI/AVX2/scalar packed-dot matrix: identical-throughput + byte-identical → decode is DRAM-bound.
 - Prefill routing (layer-major, chunk 64/all/lm): <3% noise, parity-identical.

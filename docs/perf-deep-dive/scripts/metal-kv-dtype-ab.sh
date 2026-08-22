@@ -4,7 +4,20 @@
 # Governed by ../BENCHMARK_TREATY.md. Produces the JSONL that
 # metal-kv-dtype-stats.py turns into a receipt.
 #
-#   ./metal-kv-dtype-ab.sh <camelid-binary> <model.gguf> <short|long> <max_tokens> <rounds> <out.jsonl>
+#   ./metal-kv-dtype-ab.sh <camelid-binary> <model.gguf> <probe> <max_tokens> <rounds> <out.jsonl>
+#
+# <probe> is `short` (a 6-token prompt), `long` (~8k tokens), `tokN` for a prompt of about
+# N tokens (tok512, tok2048, tok8192), or `realtext` (see below). The tokN form is what
+# produces the context-depth sweep: decode attention is KV-bandwidth-bound, so the q8
+# advantage is a FUNCTION OF DEPTH, and a single context length cannot show that.
+#
+# WHY `realtext` EXISTS.  The generated prompts are random filler, which is correct for
+# throughput -- memory bandwidth does not care what the tokens mean -- but useless for the
+# PARITY gate. Filler gives a nearly flat next-token distribution, so a lossy KV cache
+# flips the argmax on numerical noise, and conversely a long filler run collapses into a
+# repetition attractor where both arms agree for free. Neither outcome says anything about
+# quality. `realtext` uses this repo's own BENCHMARK_TREATY.md as the prompt: coherent
+# English, in-tree, identical for anyone who reruns it.
 #
 # WHY CROSS-PROCESS.  `resident_kv_format_override()` caches CAMELID_METAL_KV_DTYPE in a
 # OnceLock (src/metal.rs), so the KV format is frozen at first read. `camelid
@@ -32,24 +45,44 @@ set -u
 BIN="$1"; MODEL="$2"; PROBE="$3"; MAXTOK="$4"; ROUNDS="$5"; OUT="$6"
 
 PROMPT="$(dirname "$OUT")/prompt-$PROBE.txt"
+SCRIPT_DIR="${0:A:h}"
 
-# Prompts are GENERATED, not committed: seed 677 reproduces them byte-for-byte.
-python3 - "$PROBE" "$PROMPT" <<'PY'
+# Prompts are derived, not committed: the filler probes regenerate byte-for-byte from
+# seed 677, and `realtext` reads an in-tree doc.
+python3 - "$PROBE" "$PROMPT" "$SCRIPT_DIR" <<'PY'
 import random, sys
-probe, path = sys.argv[1], sys.argv[2]
+probe, path, script_dir = sys.argv[1], sys.argv[2], sys.argv[3]
+WORDS = ("alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron "
+         "pi rho sigma tau upsilon phi chi psi omega tensor kernel buffer cache decode "
+         "prefill quantize residency throughput latency bandwidth attention softmax residual "
+         "embedding projection scatter gather stride occupancy simdgroup threadgroup").split()
+# Measured on Llama-3.2-1B-Instruct-Q8_0: this filler tokenizes at ~5.46 chars/token.
+# Only used to SIZE the prompt; the receipt records the exact prompt_tokens the engine
+# reported, never this estimate.
+CHARS_PER_TOKEN = 5.46
+
+
+def filler(target_chars):
+    random.seed(677)
+    out, n = [], 0
+    while n < target_chars:
+        k = random.randint(8, 18)
+        s = " ".join(random.choice(WORDS) for _ in range(k)).capitalize() + "."
+        out.append(s)
+        n += len(s) + 1
+    return " ".join(out)
+
+
 if probe == "short":
     open(path, "w").write("The capital of France is")
+elif probe == "realtext":
+    import os
+    src = os.path.join(script_dir, "..", "BENCHMARK_TREATY.md")
+    open(path, "w").write(open(src, encoding="utf-8").read())
+elif probe.startswith("tok"):
+    open(path, "w").write(filler(int(int(probe[3:]) * CHARS_PER_TOKEN)))
 else:
-    random.seed(677)
-    words = ("alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron "
-             "pi rho sigma tau upsilon phi chi psi omega tensor kernel buffer cache decode "
-             "prefill quantize residency throughput latency bandwidth attention softmax residual "
-             "embedding projection scatter gather stride occupancy simdgroup threadgroup").split()
-    sents = []
-    for _ in range(480):
-        n = random.randint(8, 18)
-        sents.append(" ".join(random.choice(words) for _ in range(n)).capitalize() + ".")
-    open(path, "w").write(" ".join(sents))
+    open(path, "w").write(filler(int(8000 * CHARS_PER_TOKEN)))
 PY
 
 ARMS=("f32:f32:1" "f16:f16:1" "q8:q8:1" "f32-nosplitk:f32:0")
