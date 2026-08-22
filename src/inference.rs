@@ -4737,9 +4737,9 @@ impl LlamaInferenceSession {
         let vocab = logits.shape.dims[1];
         let mut history = token_history.to_vec();
         let mut probabilities = Vec::with_capacity(rows);
-        for row in 0..rows {
+        for (row, &row_token) in token_ids.iter().enumerate() {
             if row > 0 {
-                history.push(token_ids[row]);
+                history.push(row_token);
             }
             let start = row * vocab;
             let row_logits = CpuTensor::from_f32(
