@@ -85,6 +85,12 @@ const canvasBlob = (canvas, quality) => new Promise((resolve) => {
   canvas.toBlob(resolve, 'image/jpeg', quality)
 })
 
+const resizeComposerInput = (input) => {
+  if (!input) return
+  input.style.height = 'auto'
+  input.style.height = `${Math.min(input.scrollHeight, 220)}px`
+}
+
 async function prepareVisionAttachment(file) {
   if (!['image/png', 'image/jpeg'].includes(file.type)) {
     throw new Error('Choose a PNG or JPEG image.')
@@ -417,10 +423,17 @@ export default function ChatWorkspace({
   }, [generationActive, streamingScrollSignature])
 
   useLayoutEffect(() => {
-    const input = composerRef.current
-    if (!input) return
-    input.style.height = 'auto'
-    input.style.height = `${Math.min(input.scrollHeight, 220)}px`
+    const resize = () => resizeComposerInput(composerRef.current)
+    window.addEventListener('resize', resize)
+    window.visualViewport?.addEventListener('resize', resize)
+    return () => {
+      window.removeEventListener('resize', resize)
+      window.visualViewport?.removeEventListener('resize', resize)
+    }
+  }, [])
+
+  useLayoutEffect(() => {
+    resizeComposerInput(composerRef.current)
   }, [composer, isFreshThread, selectedConversation?.id])
 
   useEffect(() => {

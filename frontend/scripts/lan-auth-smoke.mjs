@@ -3,7 +3,7 @@
  * authenticated LAN listener. Requires `npm run build` first. */
 import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync } from 'node:fs'
 import { extname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -12,9 +12,21 @@ import { launchBrowser } from './lib/launch-browser.mjs'
 const scriptDir = fileURLToPath(new URL('.', import.meta.url))
 const distDir = resolve(scriptDir, '../dist')
 const ledgerPath = resolve(scriptDir, '../../ledger/camelid-ledger.json')
+const captureDir = process.env.CAMELID_CAPTURE_LAN_RESPONSIVE === '1'
+  ? resolve(scriptDir, '../design-evidence/lan-chat-responsive')
+  : null
 const API_KEY = 'lan-browser-key-9f72'
 const MODEL_FILENAME = 'Qwen3-0.6B-Q8_0.gguf'
 const SECOND_MODEL_FILENAME = 'Qwen3-1.7B-Q8_0.gguf'
+const RESPONSIVE_VIEWPORTS = [
+  { name: 'compact-portrait', width: 360, height: 800, compact: true },
+  { name: 'phone-portrait', width: 390, height: 844, compact: true },
+  { name: 'narrow-phone-landscape', width: 480, height: 320, compact: true },
+  { name: 'phone-landscape', width: 844, height: 390, compact: true },
+  { name: 'phone-landscape-short', width: 740, height: 320, compact: true },
+  { name: 'tablet-portrait', width: 768, height: 1024, compact: true },
+  { name: 'desktop', width: 1440, height: 900, compact: false },
+]
 const MIME = {
   '.css': 'text/css',
   '.html': 'text/html',
@@ -194,6 +206,171 @@ async function saveKey(value) {
   })
 }
 
+async function measureResponsiveLayout(viewport) {
+  await page.setViewport({ width: viewport.width, height: viewport.height, deviceScaleFactor: 1 })
+  await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))))
+  return page.evaluate(() => {
+    const rect = (selector) => {
+      const bounds = document.querySelector(selector)?.getBoundingClientRect()
+      return bounds && {
+        top: Math.round(bounds.top),
+        right: Math.round(bounds.right),
+        bottom: Math.round(bounds.bottom),
+        left: Math.round(bounds.left),
+        width: Math.round(bounds.width),
+        height: Math.round(bounds.height),
+      }
+    }
+    const noticeText = document.querySelector('.cx-notice__text')
+    const noticeTextStyle = noticeText ? window.getComputedStyle(noticeText) : null
+    return {
+      innerWidth: window.innerWidth,
+      innerHeight: window.innerHeight,
+      scrollWidth: document.documentElement.scrollWidth,
+      topbar: rect('.topbar'),
+      notice: rect('.camelid-notice-slot'),
+      noticeTextStyle: noticeTextStyle && {
+        display: noticeTextStyle.display,
+        lineClamp: noticeTextStyle.webkitLineClamp,
+        textOverflow: noticeTextStyle.textOverflow,
+        whiteSpace: noticeTextStyle.whiteSpace,
+      },
+      toolbar: rect('.cxcomposer__toolbar'),
+      composer: rect('.cxcomposer'),
+      composerBox: rect('.cxcomposer__box'),
+      composerInput: rect('.cxcomposer__input'),
+      composerStatus: rect('.cxcomposer__status'),
+      chatScroll: rect('.cxchat__scroll'),
+      modelSelect: rect('.cxcomposer__model-select'),
+      send: rect('.cxcomposer__send'),
+    }
+  })
+}
+
+async function assertResponsiveLayout() {
+  const measurements = []
+  for (const viewport of RESPONSIVE_VIEWPORTS) {
+    const layout = await measureResponsiveLayout(viewport)
+    measurements.push({ name: viewport.name, ...layout })
+    assert.ok(layout.scrollWidth <= layout.innerWidth + 1, `${viewport.name} document overflow: ${JSON.stringify(layout)}`)
+    assert.ok(layout.toolbar && layout.composer && layout.chatScroll && layout.modelSelect && layout.send, `${viewport.name} is missing a chat control`)
+    assert.ok(layout.send.right <= layout.innerWidth && layout.send.left >= 0, `${viewport.name} send control is clipped: ${JSON.stringify(layout)}`)
+    assert.ok(layout.modelSelect.right <= layout.innerWidth && layout.modelSelect.left >= 0, `${viewport.name} model control is clipped: ${JSON.stringify(layout)}`)
+    assert.ok(layout.composer.bottom <= layout.innerHeight + 1, `${viewport.name} composer is below the viewport: ${JSON.stringify(layout)}`)
+    if (viewport.compact) {
+      assert.ok(layout.toolbar.height <= 44, `${viewport.name} composer tools wrapped into extra rows: ${JSON.stringify(layout)}`)
+      assert.ok(layout.chatScroll.height >= 120, `${viewport.name} leaves too little room for messages: ${JSON.stringify(layout)}`)
+      if (layout.notice && viewport.width <= 480 && viewport.height > viewport.width) {
+        assert.ok(layout.notice.height <= 72, `${viewport.name} notice consumes too much chat height: ${JSON.stringify(layout)}`)
+      }
+      if (layout.notice && viewport.height <= 500 && viewport.width > viewport.height) {
+        assert.ok(layout.notice.height <= 36, `${viewport.name} landscape notice is not compact: ${JSON.stringify(layout)}`)
+      }
+      if (viewport.name === 'narrow-phone-landscape') {
+        assert.deepEqual(
+          layout.noticeTextStyle,
+          { display: 'block', lineClamp: 'none', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+          `${viewport.name} notice must use one-line ellipsis instead of the portrait line clamp`,
+        )
+      }
+    }
+  }
+  return measurements
+}
+
+async function captureResponsiveEvidence() {
+  if (!captureDir) return
+  mkdirSync(captureDir, { recursive: true })
+  for (const [viewportName, filename] of [
+    ['compact-portrait', '01-mobile-portrait.png'],
+    ['phone-landscape-short', '02-mobile-landscape-short.png'],
+  ]) {
+    const viewport = RESPONSIVE_VIEWPORTS.find((candidate) => candidate.name === viewportName)
+    await page.setViewport({ width: viewport.width, height: viewport.height, deviceScaleFactor: 1 })
+    await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))))
+    await page.waitForFunction(() => {
+      const app = document.querySelector('.camelid-app')
+      const rail = document.querySelector('#camelid-sidebar')?.getBoundingClientRect()
+      return !app?.classList.contains('is-mobile-open') && rail && rail.right <= 1
+    })
+    await page.screenshot({ path: join(captureDir, filename) })
+  }
+}
+
+async function assertCompactInteractions(viewport) {
+  await page.setViewport({ width: viewport.width, height: viewport.height, deviceScaleFactor: 1 })
+  await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))))
+  await page.waitForFunction(() => {
+    const app = document.querySelector('.camelid-app')
+    const rail = document.querySelector('#camelid-sidebar')?.getBoundingClientRect()
+    return !app?.classList.contains('is-mobile-open') && rail && rail.right <= 1
+  })
+
+  const toggleHitTarget = await page.$eval('button[aria-label="Toggle sidebar"]', (button) => {
+    const bounds = button.getBoundingClientRect()
+    const centerX = bounds.left + bounds.width / 2
+    const centerY = bounds.top + bounds.height / 2
+    const hit = document.elementFromPoint(centerX, centerY)
+    return {
+      left: Math.round(bounds.left),
+      top: Math.round(bounds.top),
+      right: Math.round(bounds.right),
+      bottom: Math.round(bounds.bottom),
+      disabled: button.disabled,
+      hitLabel: hit?.closest('button')?.getAttribute('aria-label') || null,
+    }
+  })
+  assert.equal(toggleHitTarget.disabled, false, `${viewport.name} drawer toggle is disabled: ${JSON.stringify(toggleHitTarget)}`)
+  assert.equal(toggleHitTarget.hitLabel, 'Toggle sidebar', `${viewport.name} drawer toggle is not reachable: ${JSON.stringify(toggleHitTarget)}`)
+  await page.click('button[aria-label="Toggle sidebar"]')
+  await page.waitForFunction(() => document.querySelector('.camelid-app')?.classList.contains('is-mobile-open'))
+  await page.waitForFunction(() => Math.abs(document.querySelector('#camelid-sidebar')?.getBoundingClientRect().left || 0) <= 1)
+  const drawer = await page.$eval('#camelid-sidebar', (node) => {
+    const bounds = node.getBoundingClientRect()
+    return { left: Math.round(bounds.left), right: Math.round(bounds.right), width: Math.round(bounds.width) }
+  })
+  assert.ok(Math.abs(drawer.left) <= 1, `${viewport.name} drawer should settle against the left edge: ${JSON.stringify(drawer)}`)
+  assert.ok(drawer.right <= viewport.width, `${viewport.name} drawer exceeds the viewport: ${JSON.stringify(drawer)}`)
+  assert.ok(drawer.right < viewport.width, `${viewport.name} drawer leaves no reachable close scrim: ${JSON.stringify(drawer)}`)
+  await page.click('button[aria-label="Close navigation"]', {
+    offset: {
+      x: Math.round(drawer.right + (viewport.width - drawer.right) / 2),
+      y: Math.round(viewport.height / 2),
+    },
+  })
+  await page.waitForFunction(() => !document.querySelector('.camelid-app')?.classList.contains('is-mobile-open'))
+
+  const toolReachability = await page.evaluate(() => {
+    const tools = document.querySelector('.cxcomposer__tools')
+    const model = tools?.querySelector('.cxcomposer__model-select')
+    const control = tools?.querySelector('button[aria-label="Generation controls"]')
+    if (!tools || !model || !control) return null
+    tools.scrollLeft = tools.scrollWidth
+    const toolsRect = tools.getBoundingClientRect()
+    const modelRect = model.getBoundingClientRect()
+    const controlRect = control.getBoundingClientRect()
+    return {
+      scrollLeft: tools.scrollLeft,
+      toolsLeft: Math.round(toolsRect.left),
+      toolsRight: Math.round(toolsRect.right),
+      modelLeft: Math.round(modelRect.left),
+      modelRight: Math.round(modelRect.right),
+      controlLeft: Math.round(controlRect.left),
+      controlRight: Math.round(controlRect.right),
+    }
+  })
+  assert.ok(toolReachability, `${viewport.name} compact composer controls are missing`)
+  assert.ok(toolReachability.modelLeft >= toolReachability.toolsLeft - 1, `${viewport.name} model selector scrolled out of view: ${JSON.stringify(toolReachability)}`)
+  assert.ok(toolReachability.modelRight <= toolReachability.toolsRight + 1, `${viewport.name} model selector is clipped: ${JSON.stringify(toolReachability)}`)
+  assert.ok(toolReachability.controlLeft >= toolReachability.toolsLeft, `${viewport.name} last composer control cannot scroll into view: ${JSON.stringify(toolReachability)}`)
+  assert.ok(toolReachability.controlRight <= toolReachability.toolsRight + 1, `${viewport.name} last composer control remains clipped: ${JSON.stringify(toolReachability)}`)
+  assert.ok(toolReachability.modelRight <= toolReachability.controlLeft, `${viewport.name} compact composer controls overlap: ${JSON.stringify(toolReachability)}`)
+  await page.$eval('button[aria-label="Generation controls"]', (button) => button.click())
+  await page.waitForSelector('.chat-controls')
+  await page.click('.chat-controls__head button')
+  await page.waitForFunction(() => !document.querySelector('.chat-controls'))
+}
+
 try {
   await page.goto(origin, { waitUntil: 'domcontentloaded' })
   await page.waitForSelector('main[data-view="settings"]', { timeout: 30000 })
@@ -300,6 +477,13 @@ try {
   assert.ok(paletteLabels.includes('Settings'), 'the LAN Chat command palette should retain Settings')
   await page.keyboard.press('Escape')
 
+  const responsiveMeasurements = await assertResponsiveLayout()
+  await captureResponsiveEvidence()
+  await assertCompactInteractions(RESPONSIVE_VIEWPORTS.find((viewport) => viewport.name === 'compact-portrait'))
+  await assertCompactInteractions(RESPONSIVE_VIEWPORTS.find((viewport) => viewport.name === 'phone-landscape'))
+
+  await page.setViewport({ width: 390, height: 844, deviceScaleFactor: 1 })
+  await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))))
   await page.evaluate((url) => fetch(url), `${foreignOrigin}/foreign-origin-negative-control`)
   await page.waitForFunction(() => true)
   assert.deepEqual(
@@ -327,7 +511,7 @@ try {
   assert.equal(pageErrors.length, 0, `browser errors: ${pageErrors.join('\n')}`)
 
   console.log('LAN_AUTH_SMOKE_PASS')
-  console.log(JSON.stringify({ protectedRequests: observed.filter((request) => request.apiKey).length, viewport: geometry }))
+  console.log(JSON.stringify({ protectedRequests: observed.filter((request) => request.apiKey).length, viewport: geometry, responsiveMeasurements }))
 } finally {
   releaseSecondChatFrame?.()
   await page.close().catch(() => {})
