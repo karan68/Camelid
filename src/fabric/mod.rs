@@ -21,6 +21,7 @@
 //! * [`policy`] — pure placement decisions; the correctness of the fabric.
 //! * [`forward`] — sending a placed request to the node that will serve it.
 //! * [`cancel`] — telling that send it is no longer wanted.
+//! * `transport` — authenticating or explicitly constraining the node hop.
 
 pub mod cancel;
 pub(crate) mod client_keys;
@@ -31,6 +32,7 @@ pub(crate) mod nodes;
 pub mod policy;
 pub mod probe;
 pub mod server;
+mod transport;
 pub(crate) mod watch;
 
 use std::sync::{Arc, Mutex};
@@ -54,6 +56,7 @@ pub use policy::{
     RouteRequest,
 };
 pub use probe::{probe_fabric, probe_node, Observation, ProbeError, DEFAULT_PROBE_TIMEOUT};
+use transport::NodeTransport;
 
 /// How many nodes one request may be sent to before it fails.
 ///
@@ -74,6 +77,7 @@ pub struct Fabric {
     nodes: NodeSet,
     timeout: Duration,
     bearer: Option<String>,
+    transport: NodeTransport,
     /// Requests this fabric has placed and not yet finished.
     ///
     /// Shared across clones on purpose: the resident proxy hands a `Fabric` to
@@ -106,6 +110,7 @@ impl std::fmt::Debug for Fabric {
             .field("nodes", &self.nodes)
             .field("timeout", &self.timeout)
             .field("bearer", &self.bearer.as_ref().map(|_| "[REDACTED]"))
+            .field("transport", &self.transport)
             .field("max_observation_age", &self.max_observation_age)
             .field("max_forward_attempts", &self.max_forward_attempts)
             .finish()
@@ -138,6 +143,7 @@ impl Fabric {
             nodes,
             timeout: DEFAULT_PROBE_TIMEOUT,
             bearer: None,
+            transport: NodeTransport::default(),
             reserved: Arc::new(Mutex::new(Reservations::none())),
             service_times: Arc::new(Mutex::new(ServiceTimeEstimates::default())),
             observed: Arc::new(Mutex::new(None)),
@@ -182,6 +188,21 @@ impl Fabric {
         self
     }
 
+    /// Configure how every probe and forwarded request reaches a node.
+    ///
+    /// A CA bundle enables server-authenticated TLS for every node. Without
+    /// one, cleartext is restricted to loopback unless the operator explicitly
+    /// acknowledges direct cleartext node transport. The two modes cannot be
+    /// combined.
+    pub fn with_node_transport(
+        mut self,
+        ca_file: Option<&std::path::Path>,
+        allow_cleartext_remote: bool,
+    ) -> std::io::Result<Self> {
+        self.transport = NodeTransport::resolve(ca_file, allow_cleartext_remote)?;
+        Ok(self)
+    }
+
     /// The machines this fabric places on, as they stand right now.
     pub fn specs(&self) -> Vec<NodeSpec> {
         self.nodes.current().0.to_vec()
@@ -194,6 +215,11 @@ impl Fabric {
 
     pub fn is_empty(&self) -> bool {
         self.nodes.current().0.is_empty()
+    }
+
+    /// A secret-free description suitable for startup logs.
+    pub fn node_transport_description(&self) -> &'static str {
+        self.transport.description()
     }
 
     /// Observe every node.
@@ -247,7 +273,12 @@ impl Fabric {
 
     /// Probe every node in `specs`, whatever was observed before.
     fn probe(&self, specs: &[NodeSpec]) -> Vec<NodeSnapshot> {
-        probe_fabric(specs, self.bearer.as_deref(), self.timeout)
+        probe::probe_fabric_with_transport(
+            specs,
+            self.bearer.as_deref(),
+            self.timeout,
+            &self.transport,
+        )
     }
 
     /// Drop the current observation, so the next one is taken fresh.
@@ -402,6 +433,30 @@ impl Fabric {
         lock(&self.reserved).clone()
     }
 
+    /// Send a request to a node already chosen by this fabric.
+    ///
+    /// This exists for the one-shot `fabric run` path, whose request body uses
+    /// the chosen node's active model. Keeping the send here ensures it cannot
+    /// bypass the fabric's bearer or transport policy.
+    pub fn forward_to(
+        &self,
+        spec: &NodeSpec,
+        path: &str,
+        body: &Value,
+        timeout: Duration,
+        cancel: &Cancel,
+    ) -> Result<Forwarded, ForwardError> {
+        forward::forward_with_transport(
+            spec,
+            path,
+            body,
+            self.bearer.as_deref(),
+            timeout,
+            cancel,
+            &self.transport,
+        )
+    }
+
     /// Observe, place, and send — the whole path a caller actually wants.
     ///
     /// Returns the placement alongside the answer so a caller can record which
@@ -423,13 +478,14 @@ impl Fabric {
             (request.mode != RouteMode::Throughput).then(|| service_class(path, body));
         let request = request.with_service_class(service_class.as_deref());
         let mut sent = self.send_until_a_node_takes_it(&request, |spec| {
-            forward::forward(
+            forward::forward_with_transport(
                 spec,
                 path,
                 body,
                 self.bearer.as_deref(),
                 forward_timeout,
                 cancel,
+                &self.transport,
             )
         })?;
         if sent.value.is_success() {
@@ -467,7 +523,7 @@ impl Fabric {
             (request.mode != RouteMode::Throughput).then(|| service_class(path, body));
         let request = request.with_service_class(service_class.as_deref());
         let mut sent = self.send_until_a_node_takes_it(&request, |spec| {
-            forward::forward_streaming(
+            forward::forward_streaming_with_transport(
                 spec,
                 path,
                 body,
@@ -475,6 +531,7 @@ impl Fabric {
                 head_timeout,
                 idle_timeout,
                 cancel,
+                &self.transport,
             )
         })?;
         if let StreamOutcome::Buffered(answer) = &sent.value {
@@ -1021,6 +1078,149 @@ mod tests {
             in_flight: 1,
             waiting: 0,
         })
+    }
+
+    fn ready_snapshot(spec: NodeSpec, model: &str) -> NodeSnapshot {
+        NodeSnapshot {
+            spec,
+            status: ready_status(model),
+            latency: Some(Duration::from_millis(4)),
+        }
+    }
+
+    #[test]
+    fn a_tls_authentication_failure_fails_over_without_leaking_the_bearer() {
+        use std::io::{Read, Write};
+
+        let issued = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+            .expect("generate trusted node certificate");
+        let key = rustls_pki_types::PrivatePkcs8KeyDer::from(issued.key_pair.serialize_der());
+        let server = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![issued.cert.der().clone()], key.into())
+            .expect("trusted certificate and key agree");
+        let directory = tempfile::tempdir().expect("temp dir");
+        let ca_path = directory.path().join("node-ca");
+        std::fs::write(&ca_path, rcgen::Certificate::pem(&issued.cert)).expect("write CA");
+
+        let impostor = std::net::TcpListener::bind("127.0.0.1:0").expect("bind impostor");
+        let impostor_port = impostor.local_addr().expect("impostor address").port();
+        let (captured_tx, captured_rx) = std::sync::mpsc::channel();
+        let impostor_thread = std::thread::spawn(move || {
+            let (mut socket, _) = impostor.accept().expect("accept first attempt");
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("bound impostor read");
+            let mut bytes = vec![0_u8; 8192];
+            let read = socket.read(&mut bytes).expect("read ClientHello");
+            bytes.truncate(read);
+            captured_tx.send(bytes).expect("send captured bytes");
+        });
+
+        let trusted = std::net::TcpListener::bind("127.0.0.1:0").expect("bind trusted node");
+        let trusted_port = trusted.local_addr().expect("trusted address").port();
+        let trusted_thread = std::thread::spawn(move || {
+            let (socket, _) = trusted.accept().expect("accept failover attempt");
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("bound trusted read");
+            socket
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .expect("bound trusted write");
+            let connection =
+                rustls::ServerConnection::new(Arc::new(server)).expect("create TLS server");
+            let mut stream = rustls::StreamOwned::new(connection, socket);
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream
+                    .read(&mut buffer)
+                    .expect("read authenticated request");
+                assert_ne!(read, 0, "request ended before its headers");
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let header_end = request
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .expect("request headers end")
+                + 4;
+            let content_length = std::str::from_utf8(&request[..header_end])
+                .expect("ASCII request headers")
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length").then(|| {
+                        value
+                            .trim()
+                            .parse::<usize>()
+                            .expect("numeric content length")
+                    })
+                })
+                .unwrap_or(0);
+            while request.len() - header_end < content_length {
+                let read = stream
+                    .read(&mut buffer)
+                    .expect("read authenticated request body");
+                assert_ne!(read, 0, "request ended before its body");
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let body = r#"{"choices":[{"message":{"role":"assistant","content":"served"}}]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write authenticated answer");
+            stream.flush().expect("flush authenticated answer");
+        });
+
+        let bad = NodeSpec {
+            label: "a-impostor".to_string(),
+            host: "localhost".to_string(),
+            port: impostor_port,
+        };
+        let good = NodeSpec {
+            label: "b-trusted".to_string(),
+            host: "localhost".to_string(),
+            port: trusted_port,
+        };
+        let bearer = "must-not-cross-before-authentication-74d1";
+        let fabric = Fabric::new(vec![bad.clone(), good.clone()])
+            .with_bearer(Some(bearer))
+            .with_node_transport(Some(&ca_path), false)
+            .expect("TLS transport resolves")
+            .with_max_observation_age(Duration::from_secs(30))
+            .with_max_forward_attempts(2);
+        *lock(&fabric.observed) = Some((
+            0,
+            Observation::taken_at(
+                vec![ready_snapshot(bad, "m"), ready_snapshot(good, "m")],
+                Instant::now(),
+            ),
+        ));
+
+        let dispatched = fabric
+            .dispatch(
+                "/v1/chat/completions",
+                &forward::chat_request("m", "ping", 8),
+                &RouteRequest::new(RouteMode::Throughput).with_model(Some("m")),
+                Duration::from_secs(3),
+                &Cancel::never(),
+            )
+            .expect("the authenticated sibling serves after TLS refusal");
+        assert_eq!(dispatched.answer.label, "b-trusted");
+        assert_eq!(dispatched.attempts, 2);
+
+        let captured = captured_rx.recv().expect("captured ClientHello");
+        assert!(
+            !captured
+                .windows(bearer.len())
+                .any(|window| window == bearer.as_bytes()),
+            "bearer crossed before server authentication"
+        );
+        impostor_thread.join().expect("impostor exits");
+        trusted_thread.join().expect("trusted node exits");
     }
 
     #[test]

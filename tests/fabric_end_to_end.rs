@@ -123,6 +123,7 @@ impl StubNode {
                     break;
                 }
                 let Ok(mut stream) = stream else { continue };
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
                 serve_once(&mut stream, &config, &thread_requests);
             }
         });
@@ -159,7 +160,89 @@ impl Drop for StubNode {
     }
 }
 
-fn serve_once(stream: &mut TcpStream, config: &StubConfig, requests: &Mutex<Vec<Received>>) {
+/// The same stub node over server-authenticated TLS.
+struct TlsStubNode {
+    port: u16,
+    shutdown: Arc<AtomicBool>,
+    requests: Arc<Mutex<Vec<Received>>>,
+    thread: Option<JoinHandle<()>>,
+    _directory: tempfile::TempDir,
+    ca_path: std::path::PathBuf,
+}
+
+impl TlsStubNode {
+    fn start(config: StubConfig) -> Self {
+        let issued = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+            .expect("generate a node certificate");
+        let key = rustls_pki_types::PrivatePkcs8KeyDer::from(issued.key_pair.serialize_der());
+        let server = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![issued.cert.der().clone()], key.into())
+            .expect("node certificate and key agree");
+        let directory = tempfile::tempdir().expect("temp dir");
+        let ca_path = directory.path().join("node-ca");
+        std::fs::write(&ca_path, rcgen::Certificate::pem(&issued.cert)).expect("write node CA");
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind TLS node");
+        let port = listener.local_addr().expect("local addr").port();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let thread_shutdown = Arc::clone(&shutdown);
+        let thread_requests = Arc::clone(&requests);
+        let server = Arc::new(server);
+        let thread = std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                if thread_shutdown.load(Ordering::SeqCst) {
+                    break;
+                }
+                let Ok(stream) = stream else { continue };
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+                let connection = rustls::ServerConnection::new(Arc::clone(&server))
+                    .expect("create TLS server connection");
+                let mut stream = rustls::StreamOwned::new(connection, stream);
+                serve_once(&mut stream, &config, &thread_requests);
+            }
+        });
+
+        Self {
+            port,
+            shutdown,
+            requests,
+            thread: Some(thread),
+            _directory: directory,
+            ca_path,
+        }
+    }
+
+    fn spec(&self, label: &str) -> NodeSpec {
+        NodeSpec {
+            label: label.to_string(),
+            host: "localhost".to_string(),
+            port: self.port,
+        }
+    }
+
+    fn received(&self) -> Vec<Received> {
+        self.requests.lock().expect("TLS stub lock").clone()
+    }
+}
+
+impl Drop for TlsStubNode {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+        let _ = TcpStream::connect(("127.0.0.1", self.port));
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn serve_once(
+    stream: &mut (impl Read + Write),
+    config: &StubConfig,
+    requests: &Mutex<Vec<Received>>,
+) {
     let Some(received) = read_request(stream) else {
         return;
     };
@@ -196,9 +279,7 @@ fn serve_once(stream: &mut TcpStream, config: &StubConfig, requests: &Mutex<Vec<
     let _ = stream.flush();
 }
 
-fn read_request(stream: &mut TcpStream) -> Option<Received> {
-    stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
-
+fn read_request(stream: &mut impl Read) -> Option<Received> {
     let mut raw = Vec::new();
     let mut chunk = [0_u8; 1024];
     // Read until the headers are complete, then until Content-Length is met.
@@ -534,6 +615,99 @@ fn a_fabric_carrying_the_key_is_served_by_an_authenticated_node() {
             request.path
         );
     }
+}
+
+#[test]
+fn a_fabric_observes_and_dispatches_through_one_ca_pinned_tls_policy() {
+    let alpha = TlsStubNode::start(StubConfig::requiring_key("model-alpha", "s3cret"));
+    let fabric = fabric_of(vec![alpha.spec("alpha")])
+        .with_bearer(Some("s3cret"))
+        .with_node_transport(Some(&alpha.ca_path), false)
+        .expect("node TLS policy resolves");
+
+    let snapshots = fabric.observe();
+    assert_eq!(snapshots[0].active_model_id(), Some("model-alpha"));
+
+    let dispatched = fabric
+        .dispatch(
+            "/v1/chat/completions",
+            &forward::chat_request("model-alpha", "ping", 8),
+            &RouteRequest::new(RouteMode::Throughput),
+            FORWARD_TIMEOUT,
+            &Cancel::never(),
+        )
+        .expect("the TLS node serves the request");
+    assert_eq!(dispatched.decision.label, "alpha");
+    assert_eq!(dispatched.answer.status, 200);
+    assert_eq!(
+        forward::completion_text(&dispatched.answer.body),
+        Some("served by model-alpha")
+    );
+
+    let seen = alpha.received();
+    assert!(seen.iter().any(|request| request.path == "/v1/health"));
+    assert!(seen
+        .iter()
+        .any(|request| request.path == "/v1/chat/completions"));
+    assert!(seen
+        .iter()
+        .all(|request| { request.header("authorization") == Some("Bearer s3cret") }));
+}
+
+#[test]
+fn a_node_loaded_later_from_the_file_inherits_the_tls_policy() {
+    let original = TlsStubNode::start(StubConfig::ready("model-alpha", 0));
+    let joined = TlsStubNode::start(StubConfig::ready("model-alpha", 0));
+    let directory = tempfile::tempdir().expect("temp dir");
+    let path = directory.path().join("nodes");
+    std::fs::write(&path, format!("original=localhost:{}\n", original.port))
+        .expect("write initial node file");
+    let ca_path = directory.path().join("node-ca-bundle");
+    let ca_bundle = format!(
+        "{}\n{}",
+        std::fs::read_to_string(&original.ca_path).expect("read original CA"),
+        std::fs::read_to_string(&joined.ca_path).expect("read joined CA")
+    );
+    std::fs::write(&ca_path, ca_bundle).expect("write shared CA bundle");
+
+    let fabric = Fabric::from_node_file(path.clone())
+        .expect("load node file")
+        .with_timeout(PROBE_TIMEOUT)
+        .with_node_transport(Some(&ca_path), false)
+        .expect("node TLS policy resolves");
+    let initial = fabric.observe();
+    assert_eq!(initial.len(), 1);
+    assert_eq!(initial[0].label(), "original");
+    assert!(initial[0].status.is_ready());
+
+    // The shipped watcher checks once per second. Rewrite after that bound so
+    // this test exercises a newly loaded spec rather than the startup value.
+    std::thread::sleep(Duration::from_millis(1_100));
+    std::fs::write(&path, format!("joined-later=localhost:{}\n", joined.port))
+        .expect("replace node file with a distinct endpoint");
+
+    let reloaded = fabric.observe();
+    assert_eq!(reloaded.len(), 1);
+    assert_eq!(reloaded[0].label(), "joined-later");
+    assert!(reloaded[0].status.is_ready());
+    assert_eq!(
+        original
+            .received()
+            .iter()
+            .filter(|request| request.path == "/v1/health")
+            .count(),
+        1,
+        "the original endpoint must not be reused after reload"
+    );
+    assert_eq!(
+        joined
+            .received()
+            .iter()
+            .filter(|request| request.path == "/v1/health")
+            .count(),
+        1,
+        "the newly loaded endpoint must cross the existing TLS policy"
+    );
 }
 
 #[test]

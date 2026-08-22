@@ -3,7 +3,7 @@
 //!
 //! Response parsing is pure over byte slices, so the awkward parts — chunked
 //! bodies, truncated frames, a node that answers 500 — are tested without a
-//! server. Only [`request`] touches a socket.
+//! server. Only [`connect_and_send`] touches a socket.
 //!
 //! This deliberately does not reuse `chat::client`: that module is private to
 //! `chat`, is keyed on a resolved `SocketAddr` where fabric members are named
@@ -18,14 +18,30 @@
 //! node to stop generating.
 
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
+use std::panic::AssertUnwindSafe;
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use super::cancel::Cancel;
+use rustls::{ClientConfig, ClientConnection, StreamOwned};
+use rustls_pki_types::ServerName;
 
-/// Never spend the whole budget dialling; a forward budget is minutes long and
-/// a node that has not accepted in five seconds is not about to.
+use super::cancel::Cancel;
+use super::transport::NodeTransport;
+
+/// Never spend the whole budget dialling or authenticating one address; a
+/// forward budget is minutes long and a node that has not completed transport
+/// setup in five seconds is not about to.
 const CONNECT_ATTEMPT_CAP: Duration = Duration::from_secs(5);
+
+/// The host resolver has no portable cancellation API. Keep it off request and
+/// probe threads, and cap both workers and queued work so a broken resolver
+/// cannot grow one abandoned thread per incoming request. Callers still stop at
+/// their own deadline; IP literals remain usable even if every worker is stuck.
+const RESOLVER_WORKERS: usize = 4;
+const RESOLVER_QUEUE_CAPACITY: usize = 64;
+const RESOLVER_WAIT_SLICE: Duration = Duration::from_millis(100);
+const RESOLVER_QUEUE_WAIT_SLICE: Duration = Duration::from_millis(10);
 
 /// Bounds the header block and a chunked body's size line, so a peer that never
 /// terminates either cannot grow a buffer without bound.
@@ -41,6 +57,10 @@ pub(crate) enum HttpError {
     TooLarge(usize),
     /// The request could not be written safely; refused before any socket work.
     InvalidRequest(String),
+    /// Local policy refused the transport before any request bytes were sent.
+    Policy(String),
+    /// TLS setup or the handshake failed before any request bytes were sent.
+    Tls(String),
     /// The caller stopped wanting the answer before it arrived.
     Cancelled,
 }
@@ -48,11 +68,12 @@ pub(crate) enum HttpError {
 impl HttpError {
     /// Whether the peer provably never received any part of the request.
     ///
-    /// Only resolution and dialling qualify. Every other variant is raised at or
-    /// after the first write, and `write_all` does not say how many bytes left
-    /// the socket, so the request may already be running on the peer. Answering
-    /// "it may have arrived" whenever that is possible is what lets a caller
-    /// re-send elsewhere without risking a second execution.
+    /// Resolution, dialling, local transport policy, and TLS setup/authentication
+    /// qualify. Every other transport variant is raised at or after the first
+    /// write, and `write_all` does not say how many bytes left the socket, so the
+    /// request may already be running on the peer. Answering "it may have arrived"
+    /// whenever that is possible is what lets a caller re-send elsewhere without
+    /// risking a second execution.
     ///
     /// [`HttpError::InvalidRequest`] is deliberately excluded: nothing was sent,
     /// but the request is malformed, so another peer would refuse it identically.
@@ -61,7 +82,7 @@ impl HttpError {
     /// answer for a caller that has already stopped waiting for one.
     pub(crate) fn peer_never_received_it(&self) -> bool {
         match self {
-            Self::Resolve(_) | Self::Connect(_) => true,
+            Self::Resolve(_) | Self::Connect(_) | Self::Policy(_) | Self::Tls(_) => true,
             Self::Io(_)
             | Self::Malformed(_)
             | Self::TooLarge(_)
@@ -80,7 +101,200 @@ impl std::fmt::Display for HttpError {
             Self::Malformed(detail) => write!(f, "malformed HTTP response: {detail}"),
             Self::TooLarge(limit) => write!(f, "response exceeded {limit} bytes"),
             Self::InvalidRequest(detail) => write!(f, "cannot build request: {detail}"),
+            Self::Policy(detail) => write!(f, "node transport refused: {detail}"),
+            Self::Tls(detail) => write!(f, "node TLS failed: {detail}"),
             Self::Cancelled => write!(f, "the answer was no longer wanted"),
+        }
+    }
+}
+
+enum NodeConnection {
+    Plain(TcpStream),
+    Tls(Box<StreamOwned<ClientConnection, TcpStream>>),
+}
+
+type ResolveResult = Result<Vec<SocketAddr>, String>;
+type Lookup = Box<dyn FnOnce() -> ResolveResult + Send + 'static>;
+
+struct ResolveJob {
+    lookup: Lookup,
+    reply: mpsc::Sender<ResolveResult>,
+    deadline: Instant,
+    cancel: Cancel,
+}
+
+struct ResolverPool {
+    jobs: mpsc::SyncSender<ResolveJob>,
+}
+
+impl ResolverPool {
+    fn new(worker_count: usize, queue_capacity: usize) -> Result<Self, String> {
+        let (jobs, receiver) = mpsc::sync_channel::<ResolveJob>(queue_capacity);
+        let receiver = Arc::new(Mutex::new(receiver));
+        for index in 0..worker_count {
+            let receiver = Arc::clone(&receiver);
+            std::thread::Builder::new()
+                .name(format!("camelid-node-resolver-{index}"))
+                .spawn(move || loop {
+                    let job = {
+                        let receiver = receiver
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        match receiver.recv() {
+                            Ok(job) => job,
+                            Err(_) => return,
+                        }
+                    };
+                    if job.cancel.is_cancelled() || Instant::now() >= job.deadline {
+                        let _ = job.reply.send(Err(
+                            "resolution was no longer wanted before it started".to_string(),
+                        ));
+                        continue;
+                    }
+                    let answer = std::panic::catch_unwind(AssertUnwindSafe(job.lookup))
+                        .unwrap_or_else(|_| Err("resolver worker caught a panic".to_string()));
+                    let _ = job.reply.send(answer);
+                })
+                .map_err(|error| format!("could not start resolver worker: {error}"))?;
+        }
+        Ok(Self { jobs })
+    }
+}
+
+fn resolver_sender() -> Result<mpsc::SyncSender<ResolveJob>, HttpError> {
+    static RESOLVER: OnceLock<Mutex<Option<ResolverPool>>> = OnceLock::new();
+    let resolver = RESOLVER.get_or_init(|| Mutex::new(None));
+    let mut resolver = resolver
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if resolver.is_none() {
+        *resolver = Some(
+            ResolverPool::new(RESOLVER_WORKERS, RESOLVER_QUEUE_CAPACITY)
+                .map_err(HttpError::Resolve)?,
+        );
+    }
+    Ok(resolver
+        .as_ref()
+        .expect("resolver initialized above")
+        .jobs
+        .clone())
+}
+
+fn resolve_with_sender(
+    jobs: &mpsc::SyncSender<ResolveJob>,
+    deadline: Instant,
+    cancel: &Cancel,
+    lookup: Lookup,
+) -> Result<Vec<SocketAddr>, HttpError> {
+    if cancel.is_cancelled() {
+        return Err(HttpError::Cancelled);
+    }
+    if Instant::now() >= deadline {
+        return Err(HttpError::Resolve(
+            "resolution exceeded the request deadline".to_string(),
+        ));
+    }
+    let (reply, result) = mpsc::channel();
+    let mut job = ResolveJob {
+        lookup,
+        reply,
+        deadline,
+        cancel: cancel.clone(),
+    };
+    loop {
+        if cancel.is_cancelled() {
+            return Err(HttpError::Cancelled);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(HttpError::Resolve(
+                "resolution exceeded the request deadline while queued".to_string(),
+            ));
+        }
+        match jobs.try_send(job) {
+            Ok(()) => break,
+            Err(mpsc::TrySendError::Full(returned)) => {
+                job = returned;
+                std::thread::sleep(remaining.min(RESOLVER_QUEUE_WAIT_SLICE));
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                return Err(HttpError::Resolve("resolver workers stopped".to_string()))
+            }
+        }
+    }
+
+    loop {
+        if cancel.is_cancelled() {
+            return Err(HttpError::Cancelled);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(HttpError::Resolve(
+                "resolution exceeded the request deadline".to_string(),
+            ));
+        }
+        match result.recv_timeout(remaining.min(RESOLVER_WAIT_SLICE)) {
+            Ok(Ok(addrs)) => return Ok(addrs),
+            Ok(Err(detail)) => return Err(HttpError::Resolve(detail)),
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(HttpError::Resolve(
+                    "resolver worker stopped without an answer".to_string(),
+                ))
+            }
+        }
+    }
+}
+
+fn resolve_host(
+    host: &str,
+    port: u16,
+    deadline: Instant,
+    cancel: &Cancel,
+) -> Result<Vec<SocketAddr>, HttpError> {
+    let bare_host = host
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(host);
+    if let Ok(ip) = bare_host.parse::<IpAddr>() {
+        return Ok(vec![SocketAddr::new(ip, port)]);
+    }
+    let host = bare_host.to_string();
+    let lookup_host = host.clone();
+    resolve_with_sender(
+        &resolver_sender()?,
+        deadline,
+        cancel,
+        Box::new(move || {
+            (lookup_host.as_str(), port)
+                .to_socket_addrs()
+                .map(|addrs| addrs.collect())
+                .map_err(|error| format!("{host}: {error}"))
+        }),
+    )
+}
+
+impl Read for NodeConnection {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Plain(stream) => stream.read(buffer),
+            Self::Tls(stream) => stream.read(buffer),
+        }
+    }
+}
+
+impl Write for NodeConnection {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Plain(stream) => stream.write(buffer),
+            Self::Tls(stream) => stream.write(buffer),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Plain(stream) => stream.flush(),
+            Self::Tls(stream) => stream.flush(),
         }
     }
 }
@@ -386,6 +600,120 @@ fn connect_any(
     })))
 }
 
+fn tls_server_name(host: &str) -> Result<ServerName<'static>, HttpError> {
+    let host = host
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(host);
+    ServerName::try_from(host.to_string())
+        .map_err(|error| HttpError::Tls(format!("`{host}` is not a valid server name: {error}")))
+}
+
+fn negotiate_tls(
+    mut stream: TcpStream,
+    server_name: ServerName<'static>,
+    config: Arc<ClientConfig>,
+    deadline: Instant,
+    cancel: &Cancel,
+) -> Result<NodeConnection, HttpError> {
+    let mut connection = ClientConnection::new(config, server_name)
+        .map_err(|error| HttpError::Tls(error.to_string()))?;
+
+    // Keep the handshake responsive to cancellation and the shared request
+    // deadline. The larger body-write timeout is restored once authentication
+    // has completed.
+    stream
+        .set_write_timeout(Some(Duration::from_millis(100)))
+        .map_err(|error| HttpError::Tls(error.to_string()))?;
+    while connection.is_handshaking() {
+        if cancel.is_cancelled() {
+            return Err(HttpError::Cancelled);
+        }
+        if Instant::now() >= deadline {
+            return Err(HttpError::Tls(
+                "handshake exceeded the request deadline".to_string(),
+            ));
+        }
+        match connection.complete_io(&mut stream) {
+            Ok(_) => {}
+            Err(error) if is_retryable(&error) => continue,
+            Err(error) => return Err(HttpError::Tls(error.to_string())),
+        }
+    }
+    Ok(NodeConnection::Tls(Box::new(StreamOwned::new(
+        connection, stream,
+    ))))
+}
+
+fn connect_tls_any(
+    addrs: &[SocketAddr],
+    host: &str,
+    config: Arc<ClientConfig>,
+    deadline: Instant,
+    write_timeout: Duration,
+    cancel: &Cancel,
+) -> Result<NodeConnection, HttpError> {
+    let server_name = tls_server_name(host)?;
+    let mut last: Option<HttpError> = None;
+    for (index, addr) in addrs.iter().enumerate() {
+        if cancel.is_cancelled() {
+            return Err(HttpError::Cancelled);
+        }
+        let now = Instant::now();
+        let remaining = deadline.saturating_duration_since(now);
+        if remaining.is_zero() {
+            break;
+        }
+        // The address is not usable until its certificate authenticates. Give
+        // each untried address a bounded share of the remaining budget so a
+        // TCP endpoint that stalls or rejects TLS cannot hide a valid sibling.
+        let untried = (addrs.len() - index) as u32;
+        let attempt = (remaining / untried)
+            .min(CONNECT_ATTEMPT_CAP)
+            .max(Duration::from_millis(1));
+        let attempt_deadline = now + attempt;
+        let stream = match TcpStream::connect_timeout(addr, attempt) {
+            Ok(stream) => stream,
+            Err(error) => {
+                last = Some(HttpError::Connect(format!("{addr}: {error}")));
+                continue;
+            }
+        };
+        if let Err(error) = stream.set_read_timeout(Some(Duration::from_millis(100))) {
+            last = Some(HttpError::Tls(format!(
+                "could not configure {addr} for TLS: {error}"
+            )));
+            continue;
+        }
+        match negotiate_tls(
+            stream,
+            server_name.clone(),
+            Arc::clone(&config),
+            attempt_deadline,
+            cancel,
+        ) {
+            Ok(connection) => {
+                let configured = match &connection {
+                    NodeConnection::Tls(stream) => {
+                        stream.sock.set_write_timeout(Some(write_timeout))
+                    }
+                    NodeConnection::Plain(_) => unreachable!("TLS negotiation returns TLS"),
+                };
+                if let Err(error) = configured {
+                    last = Some(HttpError::Tls(error.to_string()));
+                    continue;
+                }
+                return Ok(connection);
+            }
+            Err(HttpError::Cancelled) => return Err(HttpError::Cancelled),
+            Err(error) => last = Some(error),
+        }
+    }
+    Err(last.unwrap_or_else(|| {
+        HttpError::Tls("no address authenticated within the connection budget".to_string())
+    }))
+}
+
 /// Build the request head. Pure, so the header set — including whether an
 /// `Authorization` line is present at all — is tested without a server.
 ///
@@ -431,8 +759,8 @@ pub(crate) const ACCEPT_EVENT_STREAM: &str = "text/event-stream";
 
 /// Resolve, connect, and write one request, leaving the socket ready to read.
 ///
-/// Shared by [`request`] and [`open_stream`] so both dial, authenticate and
-/// frame a request exactly the same way.
+/// Shared by [`request_with_transport`] and [`open_stream_with_transport`] so
+/// both dial, authenticate and frame a request exactly the same way.
 #[allow(clippy::too_many_arguments)]
 fn connect_and_send(
     host: &str,
@@ -445,7 +773,8 @@ fn connect_and_send(
     deadline: Instant,
     write_timeout: Duration,
     cancel: &Cancel,
-) -> Result<TcpStream, HttpError> {
+    transport: &NodeTransport,
+) -> Result<NodeConnection, HttpError> {
     // Before resolving, which is itself a blocking call: a caller that has
     // already given up costs its node nothing at all, not even a connection.
     if cancel.is_cancelled() {
@@ -457,25 +786,31 @@ fn connect_and_send(
     // refused without touching the network.
     let head = request_head(method, path, &authority, accept, body, bearer)?;
 
-    let addrs: Vec<SocketAddr> = authority
-        .to_socket_addrs()
-        .map_err(|error| HttpError::Resolve(error.to_string()))?
-        .collect();
+    let addrs = resolve_host(host, port, deadline, cancel)?;
     if addrs.is_empty() {
         return Err(HttpError::Resolve(
             "host resolved to no addresses".to_string(),
         ));
     }
 
-    let mut stream = connect_any(&addrs, deadline, cancel)?;
-    // Short socket reads keep the caller's loop responsive to its own deadline;
-    // one long read timeout would overshoot it on a stalled peer.
-    stream
-        .set_read_timeout(Some(Duration::from_millis(100)))
-        .map_err(|error| HttpError::Io(error.to_string()))?;
-    stream
-        .set_write_timeout(Some(write_timeout))
-        .map_err(|error| HttpError::Io(error.to_string()))?;
+    let addrs = transport
+        .permitted_addresses(&addrs)
+        .map_err(|error| HttpError::Policy(error.to_string()))?;
+    let mut stream = match transport.tls_config() {
+        Some(config) => connect_tls_any(&addrs, host, config, deadline, write_timeout, cancel)?,
+        None => {
+            let stream = connect_any(&addrs, deadline, cancel)?;
+            // Short socket reads keep the caller's loop responsive to its own
+            // deadline; one long timeout would overshoot on a stalled peer.
+            stream
+                .set_read_timeout(Some(Duration::from_millis(100)))
+                .map_err(|error| HttpError::Io(error.to_string()))?;
+            stream
+                .set_write_timeout(Some(write_timeout))
+                .map_err(|error| HttpError::Io(error.to_string()))?;
+            NodeConnection::Plain(stream)
+        }
+    };
 
     stream
         .write_all(head.as_bytes())
@@ -501,6 +836,7 @@ fn connect_and_send(
 // One more parameter than clippy's threshold; every one of them is a distinct
 // property of a single round trip, so bundling them would only move the list.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) fn request(
     host: &str,
     port: u16,
@@ -511,6 +847,33 @@ pub(crate) fn request(
     timeout: Duration,
     max_body: usize,
     cancel: &Cancel,
+) -> Result<HttpResponse, HttpError> {
+    request_with_transport(
+        host,
+        port,
+        method,
+        path,
+        body,
+        bearer,
+        timeout,
+        max_body,
+        cancel,
+        &NodeTransport::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn request_with_transport(
+    host: &str,
+    port: u16,
+    method: &str,
+    path: &str,
+    body: Option<&[u8]>,
+    bearer: Option<&str>,
+    timeout: Duration,
+    max_body: usize,
+    cancel: &Cancel,
+    transport: &NodeTransport,
 ) -> Result<HttpResponse, HttpError> {
     let deadline = Instant::now() + timeout;
     let mut stream = connect_and_send(
@@ -524,6 +887,7 @@ pub(crate) fn request(
         deadline,
         timeout,
         cancel,
+        transport,
     )?;
 
     let mut raw = Vec::new();
@@ -546,6 +910,17 @@ pub(crate) fn request(
                 }
             }
             Err(error) if is_retryable(&error) => continue,
+            // rustls reports an EOF without close_notify as UnexpectedEof.
+            // HTTP framing can still prove the authenticated response whole:
+            // Content-Length and the terminal chunk both make truncation
+            // detectable. Never apply this to a close-delimited or incomplete
+            // body, where the TLS close is the only end marker.
+            Err(error)
+                if error.kind() == std::io::ErrorKind::UnexpectedEof
+                    && parse_response(&raw, max_body).is_ok() =>
+            {
+                break;
+            }
             Err(error) => return Err(HttpError::Io(error.to_string())),
         }
     }
@@ -569,7 +944,7 @@ fn is_retryable(error: &std::io::Error) -> bool {
 /// payload — a caller relaying server-sent events forwards the bytes verbatim,
 /// so an event field this client has never heard of cannot be mangled.
 pub(crate) struct ResponseStream {
-    stream: TcpStream,
+    stream: NodeConnection,
     head: ResponseHead,
     decoder: ChunkDecoder,
     /// Body bytes that arrived alongside the head, not yet framed.
@@ -595,6 +970,7 @@ fn truncated_body() -> HttpError {
 /// `cancel` bounds the wait for that head and is kept by the returned stream,
 /// so it bounds every later read too.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) fn open_stream(
     host: &str,
     port: u16,
@@ -606,6 +982,35 @@ pub(crate) fn open_stream(
     idle_timeout: Duration,
     max_chunk: usize,
     cancel: &Cancel,
+) -> Result<ResponseStream, HttpError> {
+    open_stream_with_transport(
+        host,
+        port,
+        method,
+        path,
+        body,
+        bearer,
+        head_timeout,
+        idle_timeout,
+        max_chunk,
+        cancel,
+        &NodeTransport::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn open_stream_with_transport(
+    host: &str,
+    port: u16,
+    method: &str,
+    path: &str,
+    body: Option<&[u8]>,
+    bearer: Option<&str>,
+    head_timeout: Duration,
+    idle_timeout: Duration,
+    max_chunk: usize,
+    cancel: &Cancel,
+    transport: &NodeTransport,
 ) -> Result<ResponseStream, HttpError> {
     let deadline = Instant::now() + head_timeout;
     let mut stream = connect_and_send(
@@ -619,6 +1024,7 @@ pub(crate) fn open_stream(
         deadline,
         head_timeout,
         cancel,
+        transport,
     )?;
 
     let mut raw = Vec::new();
@@ -789,8 +1195,482 @@ impl ResponseStream {
 mod tests {
     use super::*;
     use std::net::TcpListener;
+    use std::sync::mpsc;
 
     const LIMIT: usize = 1024 * 1024;
+
+    #[test]
+    fn a_stalled_resolution_cannot_outlive_the_request_deadline() {
+        let pool = ResolverPool::new(1, 1).expect("resolver pool starts");
+        let (release, blocked) = mpsc::channel();
+        let started = Instant::now();
+        let error = resolve_with_sender(
+            &pool.jobs,
+            started + Duration::from_millis(150),
+            &Cancel::never(),
+            Box::new(move || {
+                blocked.recv().expect("test releases resolver");
+                Ok(vec![SocketAddr::from(([127, 0, 0, 1], 8181))])
+            }),
+        )
+        .expect_err("a stalled resolver must not escape the request deadline");
+        assert!(matches!(error, HttpError::Resolve(_)), "{error:?}");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        release.send(()).expect("release resolver worker");
+    }
+
+    #[test]
+    fn cancellation_stops_waiting_for_a_blocked_resolution() {
+        let pool = Arc::new(ResolverPool::new(1, 1).expect("resolver pool starts"));
+        let cancel = Cancel::new();
+        let handed_to_waiter = cancel.clone();
+        let (release, blocked) = mpsc::channel();
+        let started = Instant::now();
+        let waiter = {
+            let pool = Arc::clone(&pool);
+            std::thread::spawn(move || {
+                resolve_with_sender(
+                    &pool.jobs,
+                    Instant::now() + Duration::from_secs(5),
+                    &handed_to_waiter,
+                    Box::new(move || {
+                        blocked.recv().expect("test releases resolver");
+                        Ok(vec![SocketAddr::from(([127, 0, 0, 1], 8181))])
+                    }),
+                )
+            })
+        };
+        std::thread::sleep(Duration::from_millis(50));
+        cancel.cancel();
+        let error = waiter
+            .join()
+            .expect("waiter exits")
+            .expect_err("cancelled resolution is abandoned");
+        assert_eq!(error, HttpError::Cancelled);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        release.send(()).expect("release resolver worker");
+    }
+
+    #[test]
+    fn a_saturated_resolver_queue_backpressures_until_the_deadline() {
+        let pool = ResolverPool::new(1, 1).expect("resolver pool starts");
+        let first_jobs = pool.jobs.clone();
+        let (first_started, wait_for_first) = mpsc::channel();
+        let (release_first, first_blocked) = mpsc::channel();
+        let first = std::thread::spawn(move || {
+            resolve_with_sender(
+                &first_jobs,
+                Instant::now() + Duration::from_secs(5),
+                &Cancel::never(),
+                Box::new(move || {
+                    first_started.send(()).expect("announce first lookup");
+                    first_blocked.recv().expect("release first lookup");
+                    Ok(vec![SocketAddr::from(([127, 0, 0, 1], 8181))])
+                }),
+            )
+        });
+        wait_for_first.recv().expect("first lookup started");
+
+        let second_jobs = pool.jobs.clone();
+        let (release_second, second_blocked) = mpsc::channel();
+        let second = std::thread::spawn(move || {
+            resolve_with_sender(
+                &second_jobs,
+                Instant::now() + Duration::from_secs(5),
+                &Cancel::never(),
+                Box::new(move || {
+                    second_blocked.recv().expect("release second lookup");
+                    Ok(vec![SocketAddr::from(([127, 0, 0, 1], 8182))])
+                }),
+            )
+        });
+        std::thread::sleep(Duration::from_millis(50));
+
+        let started = Instant::now();
+        let error = resolve_with_sender(
+            &pool.jobs,
+            started + Duration::from_millis(150),
+            &Cancel::never(),
+            Box::new(|| Ok(vec![SocketAddr::from(([127, 0, 0, 1], 8183))])),
+        )
+        .expect_err("a full queue must remain bounded by the caller deadline");
+        assert!(matches!(error, HttpError::Resolve(_)), "{error:?}");
+        assert!(started.elapsed() >= Duration::from_millis(100));
+        assert!(started.elapsed() < Duration::from_secs(1));
+
+        release_first.send(()).expect("release first lookup");
+        release_second.send(()).expect("release second lookup");
+        first
+            .join()
+            .expect("first waiter exits")
+            .expect("first resolves");
+        second
+            .join()
+            .expect("second waiter exits")
+            .expect("second resolves");
+    }
+
+    #[test]
+    fn a_panicking_lookup_does_not_retire_its_resolver_worker() {
+        let pool = ResolverPool::new(1, 1).expect("resolver pool starts");
+        let error = resolve_with_sender(
+            &pool.jobs,
+            Instant::now() + Duration::from_secs(1),
+            &Cancel::never(),
+            Box::new(|| panic!("synthetic resolver panic")),
+        )
+        .expect_err("resolver panic becomes an error");
+        assert!(matches!(error, HttpError::Resolve(_)), "{error:?}");
+
+        assert_eq!(
+            resolve_with_sender(
+                &pool.jobs,
+                Instant::now() + Duration::from_secs(1),
+                &Cancel::never(),
+                Box::new(|| Ok(vec![SocketAddr::from(([127, 0, 0, 1], 8181))])),
+            )
+            .expect("worker still resolves"),
+            vec![SocketAddr::from(([127, 0, 0, 1], 8181))]
+        );
+    }
+
+    #[test]
+    fn a_burst_of_resolutions_is_backpressured_not_rejected() {
+        const CALLERS: usize = 128;
+        let pool = Arc::new(ResolverPool::new(4, 64).expect("resolver pool starts"));
+        let start = Arc::new(std::sync::Barrier::new(CALLERS + 1));
+        let handles: Vec<_> = (0..CALLERS)
+            .map(|_| {
+                let jobs = pool.jobs.clone();
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    resolve_with_sender(
+                        &jobs,
+                        Instant::now() + Duration::from_secs(5),
+                        &Cancel::never(),
+                        Box::new(|| Ok(vec![SocketAddr::from(([127, 0, 0, 1], 8181))])),
+                    )
+                })
+            })
+            .collect();
+        start.wait();
+
+        for handle in handles {
+            let addrs = handle
+                .join()
+                .expect("resolver caller exits")
+                .expect("resolution is not rejected under a burst");
+            assert!(!addrs.is_empty());
+        }
+    }
+
+    fn tls_material(names: Vec<String>) -> (Arc<rustls::ServerConfig>, NodeTransport) {
+        let issued = rcgen::generate_simple_self_signed(names).expect("generate certificate");
+        let key = rustls_pki_types::PrivatePkcs8KeyDer::from(issued.key_pair.serialize_der());
+        let server = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![issued.cert.der().clone()], key.into())
+            .expect("server certificate and key agree");
+
+        let directory = tempfile::tempdir().expect("temp dir");
+        let ca_path = directory.path().join("node-ca");
+        std::fs::write(&ca_path, rcgen::Certificate::pem(&issued.cert)).expect("write CA");
+        let transport = NodeTransport::resolve(Some(&ca_path), false).expect("load CA");
+        (Arc::new(server), transport)
+    }
+
+    fn serve_tls_once(
+        server: Arc<rustls::ServerConfig>,
+        response: &'static [u8],
+    ) -> (u16, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind TLS node");
+        let port = listener.local_addr().expect("local address").port();
+        let handle = std::thread::spawn(move || {
+            let (socket, _) = listener.accept().expect("accept TLS client");
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("bound reads");
+            socket
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .expect("bound writes");
+            let connection = rustls::ServerConnection::new(server).expect("server connection");
+            let mut stream = rustls::StreamOwned::new(connection, socket);
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = match stream.read(&mut buffer) {
+                    Ok(0) | Err(_) => return,
+                    Ok(read) => read,
+                };
+                request.extend_from_slice(&buffer[..read]);
+            }
+            stream.write_all(response).expect("write TLS response");
+            stream.flush().expect("flush TLS response");
+        });
+        (port, handle)
+    }
+
+    #[test]
+    fn a_ca_authenticated_node_serves_a_real_https_request() {
+        let (server, transport) = tls_material(vec!["localhost".to_string()]);
+        let (port, handle) = serve_tls_once(
+            server,
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
+        );
+
+        let response = request_with_transport(
+            "localhost",
+            port,
+            "GET",
+            "/v1/health",
+            None,
+            None,
+            Duration::from_secs(2),
+            LIMIT,
+            &Cancel::never(),
+            &transport,
+        )
+        .expect("trusted TLS node answers");
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, br#"{"ok":true}"#);
+        handle.join().expect("TLS node exits");
+    }
+
+    #[test]
+    fn an_ip_literal_is_verified_against_an_ip_subject_alt_name() {
+        let (server, transport) = tls_material(vec!["127.0.0.1".to_string()]);
+        let (port, handle) = serve_tls_once(
+            server,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+        );
+        let response = request_with_transport(
+            "127.0.0.1",
+            port,
+            "GET",
+            "/v1/health",
+            None,
+            None,
+            Duration::from_secs(2),
+            LIMIT,
+            &Cancel::never(),
+            &transport,
+        )
+        .expect("IP SAN matches the node IP literal");
+        assert_eq!(response.status, 200);
+        handle.join().expect("IP SAN TLS node exits");
+    }
+
+    #[test]
+    fn a_streaming_response_crosses_the_same_authenticated_tls_transport() {
+        let (server, transport) = tls_material(vec!["localhost".to_string()]);
+        let body = b"data: {\"token\":\"hi\"}\n\n";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let response = Box::leak([response.as_bytes(), body].concat().into_boxed_slice());
+        let (port, handle) = serve_tls_once(server, response);
+
+        let mut stream = open_stream_with_transport(
+            "localhost",
+            port,
+            "POST",
+            "/v1/chat/completions",
+            Some(b"{}"),
+            None,
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+            LIMIT,
+            &Cancel::never(),
+            &transport,
+        )
+        .expect("trusted TLS stream opens");
+        assert!(stream.head().is_event_stream());
+        assert_eq!(
+            stream.next_chunk().expect("reads event"),
+            Some(body.to_vec())
+        );
+        assert_eq!(stream.next_chunk().expect("stream ends"), None);
+        handle.join().expect("TLS node exits");
+    }
+
+    #[test]
+    fn a_tls_stream_cut_off_before_its_declared_end_is_not_a_clean_eof() {
+        let (server, transport) = tls_material(vec!["localhost".to_string()]);
+        let body = b"data: partial\n\n";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len() + 20
+        );
+        let response = Box::leak([response.as_bytes(), body].concat().into_boxed_slice());
+        let (port, handle) = serve_tls_once(server, response);
+        let mut stream = open_stream_with_transport(
+            "localhost",
+            port,
+            "POST",
+            "/v1/chat/completions",
+            Some(b"{}"),
+            None,
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+            LIMIT,
+            &Cancel::never(),
+            &transport,
+        )
+        .expect("TLS stream opens before the truncation");
+        assert_eq!(
+            stream.next_chunk().expect("partial event arrives"),
+            Some(body.to_vec())
+        );
+        let error = stream
+            .next_chunk()
+            .expect_err("missing authenticated bytes are not a clean EOF");
+        assert!(
+            matches!(error, HttpError::Io(_) | HttpError::Malformed(_)),
+            "{error:?}"
+        );
+        handle.join().expect("truncated TLS node exits");
+    }
+
+    #[test]
+    fn an_untrusted_ca_and_a_wrong_server_name_are_refused_before_http() {
+        let (server, _) = tls_material(vec!["localhost".to_string()]);
+        let (_, wrong_ca) = tls_material(vec!["localhost".to_string()]);
+        let (port, handle) = serve_tls_once(server, b"");
+        let error = request_with_transport(
+            "localhost",
+            port,
+            "GET",
+            "/v1/health",
+            None,
+            None,
+            Duration::from_secs(2),
+            LIMIT,
+            &Cancel::never(),
+            &wrong_ca,
+        )
+        .expect_err("untrusted certificate is refused");
+        assert!(matches!(error, HttpError::Tls(_)), "{error:?}");
+        assert!(error.peer_never_received_it());
+        handle.join().expect("untrusted TLS node exits");
+
+        let (server, transport) = tls_material(vec!["node.example".to_string()]);
+        let (port, handle) = serve_tls_once(server, b"");
+        let error = request_with_transport(
+            "localhost",
+            port,
+            "GET",
+            "/v1/health",
+            None,
+            None,
+            Duration::from_secs(2),
+            LIMIT,
+            &Cancel::never(),
+            &transport,
+        )
+        .expect_err("name mismatch is refused");
+        assert!(matches!(error, HttpError::Tls(_)), "{error:?}");
+        handle.join().expect("wrong-name TLS node exits");
+    }
+
+    #[test]
+    fn a_stalled_tls_address_does_not_hide_an_authenticated_sibling() {
+        let (server, transport) = tls_material(vec!["localhost".to_string()]);
+        let (release_impostor, wait_for_sibling) = mpsc::channel();
+
+        let impostor = TcpListener::bind("127.0.0.1:0").expect("bind impostor");
+        let impostor_addr = impostor.local_addr().expect("impostor address");
+        let impostor_thread = std::thread::spawn(move || {
+            let (mut socket, _) = impostor.accept().expect("accept first attempt");
+            let mut client_hello = [0_u8; 1024];
+            let _ = socket.read(&mut client_hello);
+            // Keep the unauthenticated connection open. Only the trusted
+            // sibling releases it, so reaching that sibling proves this
+            // handshake was bounded rather than waited out indefinitely.
+            wait_for_sibling
+                .recv_timeout(Duration::from_secs(5))
+                .expect("trusted sibling was attempted");
+        });
+
+        let trusted = TcpListener::bind("127.0.0.1:0").expect("bind trusted node");
+        let trusted_addr = trusted.local_addr().expect("trusted address");
+        let trusted_thread = std::thread::spawn(move || {
+            let (mut socket, _) = trusted.accept().expect("accept second attempt");
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("bound reads");
+            socket
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .expect("bound writes");
+            let mut connection = rustls::ServerConnection::new(server).expect("create TLS server");
+            while connection.is_handshaking() {
+                connection
+                    .complete_io(&mut socket)
+                    .expect("complete TLS handshake");
+            }
+            release_impostor
+                .send(())
+                .expect("release stalled first address");
+        });
+
+        let connection = connect_tls_any(
+            &[impostor_addr, trusted_addr],
+            "localhost",
+            transport.tls_config().expect("TLS config"),
+            Instant::now() + Duration::from_secs(3),
+            Duration::from_secs(2),
+            &Cancel::never(),
+        )
+        .expect("the authenticated second address remains usable");
+        assert!(matches!(connection, NodeConnection::Tls(_)));
+
+        impostor_thread.join().expect("impostor exits");
+        trusted_thread.join().expect("trusted node exits");
+    }
+
+    #[test]
+    fn bearer_bytes_are_not_sent_before_the_tls_peer_is_authenticated() {
+        let (_, transport) = tls_material(vec!["localhost".to_string()]);
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind impostor");
+        let port = listener.local_addr().expect("local address").port();
+        let (sent, received) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("accept client");
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("bound reads");
+            let mut bytes = vec![0_u8; 8192];
+            let read = socket.read(&mut bytes).expect("read ClientHello");
+            bytes.truncate(read);
+            sent.send(bytes).expect("send captured bytes");
+            // Closing here makes the handshake fail immediately.
+        });
+
+        let secret = "bearer-must-not-cross-before-auth-9f72";
+        let error = request_with_transport(
+            "localhost",
+            port,
+            "GET",
+            "/v1/health",
+            None,
+            Some(secret),
+            Duration::from_secs(2),
+            LIMIT,
+            &Cancel::never(),
+            &transport,
+        )
+        .expect_err("a non-TLS peer is refused");
+        assert!(matches!(error, HttpError::Tls(_)), "{error:?}");
+        let captured = received.recv().expect("captured ClientHello");
+        assert!(
+            !captured
+                .windows(secret.len())
+                .any(|window| window == secret.as_bytes()),
+            "bearer appeared before server authentication"
+        );
+        handle.join().expect("impostor exits");
+    }
 
     #[test]
     fn a_dead_leading_address_does_not_hide_a_live_one() {
@@ -841,6 +1721,12 @@ mod tests {
             HttpError::Cancelled,
         ] {
             assert!(!error.peer_never_received_it(), "{error:?}");
+        }
+        for error in [
+            HttpError::Policy("cleartext refused".to_string()),
+            HttpError::Tls("certificate rejected".to_string()),
+        ] {
+            assert!(error.peer_never_received_it(), "{error:?}");
         }
     }
 
