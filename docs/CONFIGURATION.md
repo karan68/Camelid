@@ -225,6 +225,11 @@ only to another machine. Direct cleartext requires the explicit
 `CAMELID_ALLOW_CLEARTEXT_NODE_TRANSPORT=1`). This is separate from
 `--allow-cleartext-remote`, which controls the client-facing proxy listener.
 
+Named nodes use the host operating system's resolver, preserving its hosts-file, split-DNS, VPN, and
+multicast-discovery behavior. Resolution runs in a fixed-size process-wide pool and shares the
+command's deadline, so a stuck resolver cannot hold the calling request indefinitely or grow one
+thread per request. IP literals bypass resolution and remain usable even while DNS is unavailable.
+
 For direct connections between machines, issue each node a certificate from one private CA. The
 certificate SAN must match the exact host or IP literal in `LABEL=HOST[:PORT]`; a DNS name is not
 accepted merely because it resolves to the certificate's IP. Start each node with the normal engine

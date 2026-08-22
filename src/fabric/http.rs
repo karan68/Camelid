@@ -18,8 +18,9 @@
 //! node to stop generating.
 
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
-use std::sync::Arc;
+use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
+use std::panic::AssertUnwindSafe;
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use rustls::{ClientConfig, ClientConnection, StreamOwned};
@@ -32,6 +33,15 @@ use super::transport::NodeTransport;
 /// forward budget is minutes long and a node that has not completed transport
 /// setup in five seconds is not about to.
 const CONNECT_ATTEMPT_CAP: Duration = Duration::from_secs(5);
+
+/// The host resolver has no portable cancellation API. Keep it off request and
+/// probe threads, and cap both workers and queued work so a broken resolver
+/// cannot grow one abandoned thread per incoming request. Callers still stop at
+/// their own deadline; IP literals remain usable even if every worker is stuck.
+const RESOLVER_WORKERS: usize = 4;
+const RESOLVER_QUEUE_CAPACITY: usize = 64;
+const RESOLVER_WAIT_SLICE: Duration = Duration::from_millis(100);
+const RESOLVER_QUEUE_WAIT_SLICE: Duration = Duration::from_millis(10);
 
 /// Bounds the header block and a chunked body's size line, so a peer that never
 /// terminates either cannot grow a buffer without bound.
@@ -58,11 +68,12 @@ pub(crate) enum HttpError {
 impl HttpError {
     /// Whether the peer provably never received any part of the request.
     ///
-    /// Only resolution and dialling qualify. Every other variant is raised at or
-    /// after the first write, and `write_all` does not say how many bytes left
-    /// the socket, so the request may already be running on the peer. Answering
-    /// "it may have arrived" whenever that is possible is what lets a caller
-    /// re-send elsewhere without risking a second execution.
+    /// Resolution, dialling, local transport policy, and TLS setup/authentication
+    /// qualify. Every other transport variant is raised at or after the first
+    /// write, and `write_all` does not say how many bytes left the socket, so the
+    /// request may already be running on the peer. Answering "it may have arrived"
+    /// whenever that is possible is what lets a caller re-send elsewhere without
+    /// risking a second execution.
     ///
     /// [`HttpError::InvalidRequest`] is deliberately excluded: nothing was sent,
     /// but the request is malformed, so another peer would refuse it identically.
@@ -100,6 +111,167 @@ impl std::fmt::Display for HttpError {
 enum NodeConnection {
     Plain(TcpStream),
     Tls(Box<StreamOwned<ClientConnection, TcpStream>>),
+}
+
+type ResolveResult = Result<Vec<SocketAddr>, String>;
+type Lookup = Box<dyn FnOnce() -> ResolveResult + Send + 'static>;
+
+struct ResolveJob {
+    lookup: Lookup,
+    reply: mpsc::Sender<ResolveResult>,
+    deadline: Instant,
+    cancel: Cancel,
+}
+
+struct ResolverPool {
+    jobs: mpsc::SyncSender<ResolveJob>,
+}
+
+impl ResolverPool {
+    fn new(worker_count: usize, queue_capacity: usize) -> Result<Self, String> {
+        let (jobs, receiver) = mpsc::sync_channel::<ResolveJob>(queue_capacity);
+        let receiver = Arc::new(Mutex::new(receiver));
+        for index in 0..worker_count {
+            let receiver = Arc::clone(&receiver);
+            std::thread::Builder::new()
+                .name(format!("camelid-node-resolver-{index}"))
+                .spawn(move || loop {
+                    let job = {
+                        let receiver = receiver
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        match receiver.recv() {
+                            Ok(job) => job,
+                            Err(_) => return,
+                        }
+                    };
+                    if job.cancel.is_cancelled() || Instant::now() >= job.deadline {
+                        let _ = job.reply.send(Err(
+                            "resolution was no longer wanted before it started".to_string(),
+                        ));
+                        continue;
+                    }
+                    let answer = std::panic::catch_unwind(AssertUnwindSafe(job.lookup))
+                        .unwrap_or_else(|_| Err("resolver worker caught a panic".to_string()));
+                    let _ = job.reply.send(answer);
+                })
+                .map_err(|error| format!("could not start resolver worker: {error}"))?;
+        }
+        Ok(Self { jobs })
+    }
+}
+
+fn resolver_sender() -> Result<mpsc::SyncSender<ResolveJob>, HttpError> {
+    static RESOLVER: OnceLock<Mutex<Option<ResolverPool>>> = OnceLock::new();
+    let resolver = RESOLVER.get_or_init(|| Mutex::new(None));
+    let mut resolver = resolver
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if resolver.is_none() {
+        *resolver = Some(
+            ResolverPool::new(RESOLVER_WORKERS, RESOLVER_QUEUE_CAPACITY)
+                .map_err(HttpError::Resolve)?,
+        );
+    }
+    Ok(resolver
+        .as_ref()
+        .expect("resolver initialized above")
+        .jobs
+        .clone())
+}
+
+fn resolve_with_sender(
+    jobs: &mpsc::SyncSender<ResolveJob>,
+    deadline: Instant,
+    cancel: &Cancel,
+    lookup: Lookup,
+) -> Result<Vec<SocketAddr>, HttpError> {
+    if cancel.is_cancelled() {
+        return Err(HttpError::Cancelled);
+    }
+    if Instant::now() >= deadline {
+        return Err(HttpError::Resolve(
+            "resolution exceeded the request deadline".to_string(),
+        ));
+    }
+    let (reply, result) = mpsc::channel();
+    let mut job = ResolveJob {
+        lookup,
+        reply,
+        deadline,
+        cancel: cancel.clone(),
+    };
+    loop {
+        if cancel.is_cancelled() {
+            return Err(HttpError::Cancelled);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(HttpError::Resolve(
+                "resolution exceeded the request deadline while queued".to_string(),
+            ));
+        }
+        match jobs.try_send(job) {
+            Ok(()) => break,
+            Err(mpsc::TrySendError::Full(returned)) => {
+                job = returned;
+                std::thread::sleep(remaining.min(RESOLVER_QUEUE_WAIT_SLICE));
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                return Err(HttpError::Resolve("resolver workers stopped".to_string()))
+            }
+        }
+    }
+
+    loop {
+        if cancel.is_cancelled() {
+            return Err(HttpError::Cancelled);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(HttpError::Resolve(
+                "resolution exceeded the request deadline".to_string(),
+            ));
+        }
+        match result.recv_timeout(remaining.min(RESOLVER_WAIT_SLICE)) {
+            Ok(Ok(addrs)) => return Ok(addrs),
+            Ok(Err(detail)) => return Err(HttpError::Resolve(detail)),
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(HttpError::Resolve(
+                    "resolver worker stopped without an answer".to_string(),
+                ))
+            }
+        }
+    }
+}
+
+fn resolve_host(
+    host: &str,
+    port: u16,
+    deadline: Instant,
+    cancel: &Cancel,
+) -> Result<Vec<SocketAddr>, HttpError> {
+    let bare_host = host
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(host);
+    if let Ok(ip) = bare_host.parse::<IpAddr>() {
+        return Ok(vec![SocketAddr::new(ip, port)]);
+    }
+    let host = bare_host.to_string();
+    let lookup_host = host.clone();
+    resolve_with_sender(
+        &resolver_sender()?,
+        deadline,
+        cancel,
+        Box::new(move || {
+            (lookup_host.as_str(), port)
+                .to_socket_addrs()
+                .map(|addrs| addrs.collect())
+                .map_err(|error| format!("{host}: {error}"))
+        }),
+    )
 }
 
 impl Read for NodeConnection {
@@ -614,10 +786,7 @@ fn connect_and_send(
     // refused without touching the network.
     let head = request_head(method, path, &authority, accept, body, bearer)?;
 
-    let addrs: Vec<SocketAddr> = authority
-        .to_socket_addrs()
-        .map_err(|error| HttpError::Resolve(error.to_string()))?
-        .collect();
+    let addrs = resolve_host(host, port, deadline, cancel)?;
     if addrs.is_empty() {
         return Err(HttpError::Resolve(
             "host resolved to no addresses".to_string(),
@@ -1029,6 +1198,172 @@ mod tests {
     use std::sync::mpsc;
 
     const LIMIT: usize = 1024 * 1024;
+
+    #[test]
+    fn a_stalled_resolution_cannot_outlive_the_request_deadline() {
+        let pool = ResolverPool::new(1, 1).expect("resolver pool starts");
+        let (release, blocked) = mpsc::channel();
+        let started = Instant::now();
+        let error = resolve_with_sender(
+            &pool.jobs,
+            started + Duration::from_millis(150),
+            &Cancel::never(),
+            Box::new(move || {
+                blocked.recv().expect("test releases resolver");
+                Ok(vec![SocketAddr::from(([127, 0, 0, 1], 8181))])
+            }),
+        )
+        .expect_err("a stalled resolver must not escape the request deadline");
+        assert!(matches!(error, HttpError::Resolve(_)), "{error:?}");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        release.send(()).expect("release resolver worker");
+    }
+
+    #[test]
+    fn cancellation_stops_waiting_for_a_blocked_resolution() {
+        let pool = Arc::new(ResolverPool::new(1, 1).expect("resolver pool starts"));
+        let cancel = Cancel::new();
+        let handed_to_waiter = cancel.clone();
+        let (release, blocked) = mpsc::channel();
+        let started = Instant::now();
+        let waiter = {
+            let pool = Arc::clone(&pool);
+            std::thread::spawn(move || {
+                resolve_with_sender(
+                    &pool.jobs,
+                    Instant::now() + Duration::from_secs(5),
+                    &handed_to_waiter,
+                    Box::new(move || {
+                        blocked.recv().expect("test releases resolver");
+                        Ok(vec![SocketAddr::from(([127, 0, 0, 1], 8181))])
+                    }),
+                )
+            })
+        };
+        std::thread::sleep(Duration::from_millis(50));
+        cancel.cancel();
+        let error = waiter
+            .join()
+            .expect("waiter exits")
+            .expect_err("cancelled resolution is abandoned");
+        assert_eq!(error, HttpError::Cancelled);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        release.send(()).expect("release resolver worker");
+    }
+
+    #[test]
+    fn a_saturated_resolver_queue_backpressures_until_the_deadline() {
+        let pool = ResolverPool::new(1, 1).expect("resolver pool starts");
+        let first_jobs = pool.jobs.clone();
+        let (first_started, wait_for_first) = mpsc::channel();
+        let (release_first, first_blocked) = mpsc::channel();
+        let first = std::thread::spawn(move || {
+            resolve_with_sender(
+                &first_jobs,
+                Instant::now() + Duration::from_secs(5),
+                &Cancel::never(),
+                Box::new(move || {
+                    first_started.send(()).expect("announce first lookup");
+                    first_blocked.recv().expect("release first lookup");
+                    Ok(vec![SocketAddr::from(([127, 0, 0, 1], 8181))])
+                }),
+            )
+        });
+        wait_for_first.recv().expect("first lookup started");
+
+        let second_jobs = pool.jobs.clone();
+        let (release_second, second_blocked) = mpsc::channel();
+        let second = std::thread::spawn(move || {
+            resolve_with_sender(
+                &second_jobs,
+                Instant::now() + Duration::from_secs(5),
+                &Cancel::never(),
+                Box::new(move || {
+                    second_blocked.recv().expect("release second lookup");
+                    Ok(vec![SocketAddr::from(([127, 0, 0, 1], 8182))])
+                }),
+            )
+        });
+        std::thread::sleep(Duration::from_millis(50));
+
+        let started = Instant::now();
+        let error = resolve_with_sender(
+            &pool.jobs,
+            started + Duration::from_millis(150),
+            &Cancel::never(),
+            Box::new(|| Ok(vec![SocketAddr::from(([127, 0, 0, 1], 8183))])),
+        )
+        .expect_err("a full queue must remain bounded by the caller deadline");
+        assert!(matches!(error, HttpError::Resolve(_)), "{error:?}");
+        assert!(started.elapsed() >= Duration::from_millis(100));
+        assert!(started.elapsed() < Duration::from_secs(1));
+
+        release_first.send(()).expect("release first lookup");
+        release_second.send(()).expect("release second lookup");
+        first
+            .join()
+            .expect("first waiter exits")
+            .expect("first resolves");
+        second
+            .join()
+            .expect("second waiter exits")
+            .expect("second resolves");
+    }
+
+    #[test]
+    fn a_panicking_lookup_does_not_retire_its_resolver_worker() {
+        let pool = ResolverPool::new(1, 1).expect("resolver pool starts");
+        let error = resolve_with_sender(
+            &pool.jobs,
+            Instant::now() + Duration::from_secs(1),
+            &Cancel::never(),
+            Box::new(|| panic!("synthetic resolver panic")),
+        )
+        .expect_err("resolver panic becomes an error");
+        assert!(matches!(error, HttpError::Resolve(_)), "{error:?}");
+
+        assert_eq!(
+            resolve_with_sender(
+                &pool.jobs,
+                Instant::now() + Duration::from_secs(1),
+                &Cancel::never(),
+                Box::new(|| Ok(vec![SocketAddr::from(([127, 0, 0, 1], 8181))])),
+            )
+            .expect("worker still resolves"),
+            vec![SocketAddr::from(([127, 0, 0, 1], 8181))]
+        );
+    }
+
+    #[test]
+    fn a_burst_of_resolutions_is_backpressured_not_rejected() {
+        const CALLERS: usize = 128;
+        let pool = Arc::new(ResolverPool::new(4, 64).expect("resolver pool starts"));
+        let start = Arc::new(std::sync::Barrier::new(CALLERS + 1));
+        let handles: Vec<_> = (0..CALLERS)
+            .map(|_| {
+                let jobs = pool.jobs.clone();
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    resolve_with_sender(
+                        &jobs,
+                        Instant::now() + Duration::from_secs(5),
+                        &Cancel::never(),
+                        Box::new(|| Ok(vec![SocketAddr::from(([127, 0, 0, 1], 8181))])),
+                    )
+                })
+            })
+            .collect();
+        start.wait();
+
+        for handle in handles {
+            let addrs = handle
+                .join()
+                .expect("resolver caller exits")
+                .expect("resolution is not rejected under a burst");
+            assert!(!addrs.is_empty());
+        }
+    }
 
     fn tls_material(names: Vec<String>) -> (Arc<rustls::ServerConfig>, NodeTransport) {
         let issued = rcgen::generate_simple_self_signed(names).expect("generate certificate");
