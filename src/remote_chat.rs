@@ -17,6 +17,7 @@ use crate::chat::client::Client;
 const DEFAULT_BACKEND: &str = "127.0.0.1:8181";
 const HTTPS_PORT: u16 = 443;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+const SERVE_CREATION_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_COMMAND_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 const CONFIG_VERIFY_ATTEMPTS: usize = 4;
 const CONFIG_VERIFY_DELAY: Duration = Duration::from_millis(100);
@@ -170,7 +171,15 @@ impl TailscaleCli {
 
 impl TailscaleRunner for TailscaleCli {
     fn run(&self, args: &[&str]) -> anyhow::Result<CapturedOutput> {
-        run_process(&self.executable, args, COMMAND_TIMEOUT)
+        run_process(&self.executable, args, command_timeout(args))
+    }
+}
+
+fn command_timeout(args: &[&str]) -> Duration {
+    if matches!(args, ["serve", "--bg", "--yes", "--https=443", _]) {
+        SERVE_CREATION_TIMEOUT
+    } else {
+        COMMAND_TIMEOUT
     }
 }
 
@@ -976,6 +985,28 @@ mod tests {
         );
         assert!(calls.iter().flatten().all(|arg| !arg.contains("funnel")));
         assert!(calls.iter().flatten().all(|arg| !arg.contains("key")));
+    }
+
+    #[test]
+    fn only_serve_creation_gets_the_extended_timeout() {
+        assert_eq!(
+            command_timeout(&[
+                "serve",
+                "--bg",
+                "--yes",
+                "--https=443",
+                "http://127.0.0.1:8181",
+            ]),
+            SERVE_CREATION_TIMEOUT
+        );
+        for args in [
+            &["version"][..],
+            &["status", "--json"],
+            &["serve", "status", "--json"],
+            &["serve", "--yes", "--https=443", "off"],
+        ] {
+            assert_eq!(command_timeout(args), COMMAND_TIMEOUT);
+        }
     }
 
     #[test]

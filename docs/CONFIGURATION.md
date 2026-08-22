@@ -165,6 +165,10 @@ In a second terminal, publish that verified listener through private tailnet HTT
 camelid remote-chat start
 ```
 
+The first start may take up to two minutes while Tailscale provisions HTTPS. That longer allowance
+applies only to Serve creation; version, status, verification, and stop commands remain bounded to
+30 seconds.
+
 The command prints a URL such as `https://<DEVICE>.<TAILNET>.ts.net/`. Open it on the phone and enter
 the same Camelid key under Settings. The key is still required even though Tailscale authenticates
 the device. The key is never passed to the Tailscale CLI, placed in the URL, or written into the
