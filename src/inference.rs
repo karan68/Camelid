@@ -13263,41 +13263,42 @@ fn build_resident_cuda_engine(
         return None;
     }
     use crate::cuda_resident::ProjQuant;
-    // The resident upload byte source for a projection: CPU Q8_0 36-byte blocks,
-    // raw K-quant super-blocks, or native Prism Q1/Q2 packed blocks. These are the
+    // Raw quant bytes (un-repacked) for a projection tensor. The resident engine
+    // accepts either Q8_0 or one of the supported K-quant / low-bit encodings,
+    // which it reads directly from the tensor's backing memory. Returns the
     // bytes `set_layer_located`/`set_output` repack per lane.
-    fn raw(t: &CpuTensor) -> Option<&[u8]> {
-        if let Some(b) = t.q8_0_blocks.as_deref() {
-            return Some(q8_0_blocks_as_bytes(b));
+    fn raw(t: &CpuTensor) -> Option<std::borrow::Cow<'_, [u8]>> {
+        if let Some(bytes) = t.q8_0_raw_bytes() {
+            return Some(bytes);
         }
         if t.source_type == Some(GgufTensorType::Q4K) {
             if let Some(w) = t.q4_k_wire() {
-                return Some(w);
+                return Some(std::borrow::Cow::Borrowed(w));
             }
         }
         if t.source_type == Some(GgufTensorType::Q5K) {
             if let Some(w) = t.q5_k_wire_bytes.as_deref() {
-                return Some(w.as_slice());
+                return Some(std::borrow::Cow::Borrowed(w.as_slice()));
             }
         }
         if t.source_type == Some(GgufTensorType::Q6K) {
             if let Some(w) = t.q6_k_wire() {
-                return Some(w);
+                return Some(std::borrow::Cow::Borrowed(w));
             }
         }
         if t.source_type == Some(GgufTensorType::Q2K) {
             if let Some(w) = t.q2_k_wire_bytes.as_deref() {
-                return Some(w.as_slice());
+                return Some(std::borrow::Cow::Borrowed(w.as_slice()));
             }
         }
         if t.source_type == Some(GgufTensorType::Q3K) {
             if let Some(w) = t.q3_k_wire_bytes.as_deref() {
-                return Some(w.as_slice());
+                return Some(std::borrow::Cow::Borrowed(w.as_slice()));
             }
         }
         if t.source_type == Some(GgufTensorType::IQ4XS) {
             if let Some(w) = t.iq4_xs_wire_bytes.as_deref() {
-                return Some(w.as_slice());
+                return Some(std::borrow::Cow::Borrowed(w.as_slice()));
             }
         }
         if matches!(
@@ -13310,7 +13311,7 @@ fn build_resident_cuda_engine(
             )
         ) {
             if let Some(w) = t.low_bit_wire() {
-                return Some(w);
+                return Some(std::borrow::Cow::Borrowed(w));
             }
         }
         None
@@ -13641,13 +13642,13 @@ fn build_resident_cuda_engine(
         ];
         engine
             .set_layer_located(
-                q,
-                k,
-                v,
-                o,
-                gate,
-                up,
-                down,
+                &q,
+                &k,
+                &v,
+                &o,
+                &gate,
+                &up,
+                &down,
                 &l.attention_norm.data,
                 &l.ffn_norm.data,
                 l.attention_q_norm.as_ref().map(|t| t.data.as_slice()),
@@ -13732,10 +13733,11 @@ fn build_resident_cuda_engine(
     };
     eprintln!("{}", status.describe());
     crate::offload::set_offload_run_status(Some(status));
+    let output_raw = raw(weights.output_projection())?;
     engine
         .set_output(
             &weights.output_norm.data,
-            raw(weights.output_projection())?,
+            &output_raw,
             proj_quant(weights.output_projection()),
         )
         .ok()?;

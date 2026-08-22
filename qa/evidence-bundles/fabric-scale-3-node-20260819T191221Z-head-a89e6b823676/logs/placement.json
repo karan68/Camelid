@@ -1,0 +1,256 @@
+{
+  "campaign_sequence": [
+    {
+      "phase": "three_label_burst",
+      "model": "Llama 3.2 1B Instruct",
+      "topology_snapshot": "topology_before_three_label_burst",
+      "note": "All three nodes held the 1B during this phase."
+    },
+    {
+      "phase": "named_model_routing",
+      "models": [
+        "Llama 3.2 1B Instruct",
+        "Llama 3.2 3B Instruct"
+      ],
+      "topology_snapshot": "topology_after_windows_switched_to_3b",
+      "note": "The Windows node was restarted on the 3B after the burst and before the named-model routing checks."
+    }
+  ],
+  "topology_before_three_label_burst": {
+    "taken_utc": "2026-08-19T17:22:33.389Z",
+    "nodes": {
+      "win": {
+        "reachable": true,
+        "active_model_id": "Llama 3.2 1B Instruct",
+        "generation_ready": true,
+        "selected_backend": "cuda_resident_q8_runtime",
+        "decode_path": "q8_0_cuda_resident_decode",
+        "prefill_path": "q8_0_cuda_resident_prefill",
+        "support_level": "supported_exact_row_smoke_512_1024_2048_4096_8192",
+        "platform_label": "windows x86_64",
+        "quant_type": "Q8_0",
+        "thread_count": 32,
+        "continuous_batch_slots": 2,
+        "engine_queue_depth": 0,
+        "models": [
+          "Llama 3.2 1B Instruct"
+        ]
+      },
+      "mac": {
+        "reachable": true,
+        "active_model_id": "Llama 3.2 1B Instruct",
+        "generation_ready": true,
+        "selected_backend": "metal_resident_q8_runtime",
+        "decode_path": "q8_0_metal_resident_decode",
+        "prefill_path": "q8_0_metal_resident_prefill",
+        "support_level": "supported_exact_row_smoke_512_1024_2048_4096_8192",
+        "platform_label": "macOS arm64 Apple Silicon",
+        "quant_type": "Q8_0",
+        "thread_count": 18,
+        "continuous_batch_slots": 2,
+        "engine_queue_depth": 0,
+        "models": [
+          "Llama 3.2 1B Instruct"
+        ]
+      },
+      "mac2": {
+        "reachable": true,
+        "active_model_id": "Llama 3.2 1B Instruct",
+        "generation_ready": true,
+        "selected_backend": "metal_resident_q8_runtime",
+        "decode_path": "q8_0_metal_resident_decode",
+        "prefill_path": "q8_0_metal_resident_prefill",
+        "support_level": "supported_exact_row_smoke_512_1024_2048_4096_8192",
+        "platform_label": "macOS arm64 Apple Silicon",
+        "quant_type": "Q8_0",
+        "thread_count": 18,
+        "continuous_batch_slots": 2,
+        "engine_queue_depth": 0,
+        "models": [
+          "Llama 3.2 1B Instruct"
+        ]
+      }
+    },
+    "proxies": {
+      "win": {
+        "reachable": true,
+        "models": [
+          "Llama 3.2 1B Instruct"
+        ]
+      },
+      "mac": {
+        "reachable": true,
+        "models": [
+          "Llama 3.2 1B Instruct"
+        ]
+      },
+      "both": {
+        "reachable": true,
+        "models": [
+          "Llama 3.2 1B Instruct"
+        ]
+      },
+      "all": {
+        "reachable": true,
+        "models": [
+          "Llama 3.2 1B Instruct"
+        ]
+      }
+    }
+  },
+  "topology_after_windows_switched_to_3b": {
+    "taken_utc": "2026-08-19T17:28:22.210Z",
+    "nodes": {
+      "win": {
+        "reachable": true,
+        "active_model_id": "Llama 3.2 3B Instruct",
+        "generation_ready": true,
+        "selected_backend": "cpu_kquant_block_dot",
+        "decode_path": "kquant_cpu_block_dot_decode",
+        "prefill_path": "cpu_kquant_block_dot_prefill",
+        "support_level": "unknown_or_unvalidated",
+        "platform_label": "windows x86_64",
+        "quant_type": "Q5_K_M",
+        "thread_count": 32,
+        "continuous_batch_slots": 2,
+        "engine_queue_depth": 0,
+        "models": [
+          "Llama 3.2 3B Instruct"
+        ]
+      },
+      "mac": {
+        "reachable": true,
+        "active_model_id": "Llama 3.2 1B Instruct",
+        "generation_ready": true,
+        "selected_backend": "metal_resident_q8_runtime",
+        "decode_path": "q8_0_metal_resident_decode",
+        "prefill_path": "q8_0_metal_resident_prefill",
+        "support_level": "supported_exact_row_smoke_512_1024_2048_4096_8192",
+        "platform_label": "macOS arm64 Apple Silicon",
+        "quant_type": "Q8_0",
+        "thread_count": 18,
+        "continuous_batch_slots": 2,
+        "engine_queue_depth": 0,
+        "models": [
+          "Llama 3.2 1B Instruct"
+        ]
+      },
+      "mac2": {
+        "reachable": true,
+        "active_model_id": "Llama 3.2 1B Instruct",
+        "generation_ready": true,
+        "selected_backend": "metal_resident_q8_runtime",
+        "decode_path": "q8_0_metal_resident_decode",
+        "prefill_path": "q8_0_metal_resident_prefill",
+        "support_level": "supported_exact_row_smoke_512_1024_2048_4096_8192",
+        "platform_label": "macOS arm64 Apple Silicon",
+        "quant_type": "Q8_0",
+        "thread_count": 18,
+        "continuous_batch_slots": 2,
+        "engine_queue_depth": 0,
+        "models": [
+          "Llama 3.2 1B Instruct"
+        ]
+      }
+    },
+    "proxies": {
+      "win": {
+        "reachable": true,
+        "models": [
+          "Llama 3.2 3B Instruct"
+        ]
+      },
+      "mac": {
+        "reachable": true,
+        "models": [
+          "Llama 3.2 1B Instruct"
+        ]
+      },
+      "both": {
+        "reachable": true,
+        "models": [
+          "Llama 3.2 1B Instruct",
+          "Llama 3.2 3B Instruct"
+        ]
+      },
+      "all": {
+        "reachable": true,
+        "models": [
+          "Llama 3.2 1B Instruct",
+          "Llama 3.2 3B Instruct"
+        ]
+      }
+    }
+  },
+  "burst_across_three_labels": {
+    "proxy_label": "all",
+    "model": "Llama 3.2 1B Instruct",
+    "requested": 36,
+    "ok": 36,
+    "failed": 0,
+    "distinct_labels": 3,
+    "by_node": {
+      "mac": 16,
+      "mac2": 13,
+      "win": 7
+    },
+    "markers_unique": true,
+    "failures": []
+  },
+  "failover_one_node_down": {
+    "proxy_label": "all",
+    "model": "Llama 3.2 1B Instruct",
+    "requested": 18,
+    "ok": 18,
+    "failed": 0,
+    "distinct_labels": 2,
+    "by_node": {
+      "mac2": 9,
+      "mac": 9
+    },
+    "markers_unique": true,
+    "failures": []
+  },
+  "failover_third_node_alone": {
+    "proxy_label": "all",
+    "model": "Llama 3.2 1B Instruct",
+    "requested": 12,
+    "ok": 12,
+    "failed": 0,
+    "distinct_labels": 1,
+    "by_node": {
+      "mac2": 12
+    },
+    "markers_unique": true,
+    "failures": []
+  },
+  "model_routed_to_the_only_node_holding_it": {
+    "asked_for_3b": {
+      "proxy_label": "all",
+      "model": "Llama 3.2 3B Instruct",
+      "requested": 8,
+      "ok": 8,
+      "failed": 0,
+      "distinct_labels": 1,
+      "by_node": {
+        "win": 8
+      },
+      "markers_unique": true,
+      "failures": []
+    },
+    "asked_for_1b": {
+      "proxy_label": "all",
+      "model": "Llama 3.2 1B Instruct",
+      "requested": 12,
+      "ok": 12,
+      "failed": 0,
+      "distinct_labels": 2,
+      "by_node": {
+        "mac2": 5,
+        "mac": 7
+      },
+      "markers_unique": true,
+      "failures": []
+    }
+  }
+}

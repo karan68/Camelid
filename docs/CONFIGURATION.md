@@ -51,24 +51,158 @@ That startup path loads the model immediately and applies the default `auto` exe
 
 ## Production HTTP policy
 
-Anonymous loopback serving remains the default. A non-loopback address is refused unless you
-configure `--api-key` / `--api-key-file`, or deliberately acknowledge an externally protected
-deployment with `--allow-unauthenticated-remote`. Prefer a key file because a literal command-line
-key can be visible to other local users:
+Anonymous loopback serving remains the default. A non-loopback address has to answer two separate
+questions, because they are two separate risks and answering one does not answer the other:
+
+| | anonymous | authenticated |
+|---|---|---|
+| **cleartext** | refused: needs both acknowledgements | refused: needs `--tls-cert`/`--tls-key` or `--allow-cleartext-remote` |
+| **TLS** | refused: needs `--api-key`, `--api-key-file`, or `--allow-unauthenticated-remote` | serves |
+
+Loopback is unaffected and needs neither. This is the same policy `camelid fabric serve` applies,
+for the same reason: a key travels on every request, so over cleartext the credential that is meant
+to protect a routable bind is itself given away, along with every prompt and completion.
+
+The recommended production shape is therefore TLS plus a key. Prefer a key file because a literal
+command-line key can be visible to other local users:
+
+```bash
+target/release/camelid serve \
+  --addr 0.0.0.0:8443 \
+  --api-key-file ./camelid-api.key \
+  --tls-cert ./server-cert-chain \
+  --tls-key ./server-private-key \
+  --cors-origin https://chat.example
+```
+
+If TLS is terminated in front of Camelid — a reverse proxy, a service mesh, an SSH tunnel — then the
+hop Camelid itself serves is still cleartext, and it has no way to know what is in front of it. Say
+so explicitly:
 
 ```bash
 target/release/camelid serve \
   --addr 0.0.0.0:8181 \
   --api-key-file ./camelid-api.key \
-  --cors-origin https://chat.example
+  --allow-cleartext-remote
 ```
 
 API clients can send either `Authorization: Bearer <key>` or `X-API-Key: <key>`. Health and embedded
 same-origin UI assets remain public; API routes, including `/metrics`, require the key. CORS is
 disabled by default and accepts only explicit `http://` or `https://` origins—wildcard and `null`
-origins are refused. The bundled browser UI does not persist or inject the server API key, so use
-an API client or an authenticating reverse proxy for authenticated remote deployments. The existing
-frictionless browser UI remains the anonymous-loopback experience.
+origins are refused. The bundled browser UI stores an entered key in that browser and injects it
+only for the configured API origin. A fresh browser that reaches an authenticated listener opens
+the Settings credential field; a wrong key remains there instead of reporting the server offline.
+
+### Trusted-LAN browser Chat
+
+Create the LAN credential on the laptop first:
+
+```bash
+camelid lan-key
+```
+
+The command creates a 256-bit key under the platform app-data directory, or displays the existing
+key without changing it. Share the displayed key directly with the phone user and treat it like a
+password. Do not put it in a URL, screenshot, issue, or chat message. Run `camelid lan-key --rotate`
+only when you intend to invalidate every browser holding the old key.
+
+`--lan-chat-only` exposes the minimum authenticated backend surface used by the embedded Chat UI.
+It permits Chat and switching among direct regular `.gguf` files already present in the configured
+models directory. The switch request carries an explicit filename; absolute paths, traversal,
+prefixed paths, symlinks/reparse points, missing files, and non-GGUF files are rejected before any
+model transition. Downloads, deletion, arbitrary-path loading, unload-only operations, runtime
+controls, Workspace, Responses/Conversations, metrics, and every unknown protected route remain
+refused. Missing or wrong credentials still get `401` before route scope is considered. Bind the
+laptop's specific private address rather than every adapter:
+
+```bash
+target/release/camelid serve \
+  --addr <LAPTOP-LAN-IP>:8181 \
+  --model /path/to/model.gguf \
+  --api-key-file ./camelid-api.key \
+  --lan-chat-only \
+  --allow-cleartext-remote \
+  --no-open
+```
+
+Open `http://<LAPTOP-LAN-IP>:8181` on the phone, then enter the same key under Settings. Both devices
+use inference on the laptop; the phone only runs the browser interface. The Chat model selector can
+switch to another local GGUF from that host's configured model directory. No CORS flag is needed for
+the embedded same-origin UI. Permit the port only on the operating system's private-network firewall
+profile.
+
+This mode authenticates but does not encrypt plain HTTP. `--allow-cleartext-remote` is the explicit
+acknowledgement required for that direct-LAN shape; it does not protect the credential, prompts, or
+responses from anyone on the path. Use it only on a trusted private LAN, or put the listener behind
+an encrypted private transport. Ordinary Chat conversations still live in each browser's storage,
+so laptop and phone history do not synchronize in this phase.
+
+Both acknowledgements also read from the environment, as `CAMELID_ALLOW_UNAUTHENTICATED_REMOTE` and
+`CAMELID_ALLOW_CLEARTEXT_REMOTE`.
+
+### Private cross-network browser Chat with Tailscale
+
+Use this path when the browser and the Camelid host are on different networks. Install Tailscale
+1.52 or newer on the host and the phone, sign both devices in, and grant the phone access to the
+host in the tailnet policy. Camelid uses Tailscale Serve, not Tailscale Funnel: the generated HTTPS
+URL is reachable only by devices permitted through Tailscale.
+
+Keep Camelid on loopback. In the first terminal, provision the key and start the restricted surface:
+
+```bash
+camelid lan-key
+camelid serve \
+  --addr 127.0.0.1:8181 \
+  --model /path/to/model.gguf \
+  --api-key-file <PATH-PRINTED-BY-LAN-KEY> \
+  --lan-chat-only \
+  --no-open
+```
+
+In a second terminal, publish that verified listener through private tailnet HTTPS:
+
+```bash
+camelid remote-chat start
+```
+
+The first start may take up to two minutes while Tailscale provisions HTTPS. That longer allowance
+applies only to Serve creation; version, status, verification, and stop commands remain bounded to
+30 seconds.
+
+The command prints a URL such as `https://<DEVICE>.<TAILNET>.ts.net/`. Open it on the phone and enter
+the same Camelid key under Settings. The key is still required even though Tailscale authenticates
+the device. The key is never passed to the Tailscale CLI, placed in the URL, or written into the
+Serve configuration.
+
+The command fails closed unless all of these are true:
+
+- the backend address is exactly IPv4 loopback (`127.0.0.1`);
+- `/v1/health` reports `api_surface=lan_chat_only`, which also proves Camelid resolved an API key;
+- Tailscale is connected and reports an online device DNS name;
+- HTTPS port 443 is unused or already maps `/` to this exact Camelid listener; and
+- no Tailscale Funnel mapping is enabled on HTTPS port 443.
+
+After creating a mapping, Camelid reads Tailscale's Serve configuration back and removes the new
+mapping if the expected private proxy is not present. It never replaces another service already on
+port 443. No CORS flag is needed: the embedded UI and API remain same-origin at the Tailscale URL,
+while Tailscale terminates HTTPS and forwards only to loopback.
+
+Inspect or remove the mapping with:
+
+```bash
+camelid remote-chat status
+camelid remote-chat status --json
+camelid remote-chat stop
+```
+
+`start` is idempotent for the exact Camelid mapping. `stop` removes only that root mapping and leaves
+unrelated Tailscale Serve configuration alone. The `--bg` mapping survives a Tailscale restart, but
+the Camelid server must also be running for the URL to answer. If Tailscale is installed outside its
+standard location, pass `--tailscale-bin <ABSOLUTE_PATH>` or set `CAMELID_TAILSCALE_BIN`.
+
+This is private cross-network access, not an anonymous public link. A recipient needs both Tailscale
+access to the host and the Camelid API key. Funnel and direct router port forwarding are outside this
+workflow. Browser-local Chat histories still do not synchronize between devices.
 
 Direct TLS is optional and requires a PEM certificate chain and private key together:
 
@@ -88,6 +222,11 @@ Resource ceilings are resolved once at startup. Their CLI names and environment 
 | `--max-prompt-tokens` | 131,072 | `CAMELID_MAX_PROMPT_TOKENS` |
 | `--max-generation-tokens` | 8,192 | `CAMELID_MAX_GENERATION_TOKENS` |
 | `--max-download-bytes` | 64 GiB | `CAMELID_MAX_DOWNLOAD_BYTES` |
+
+`--lan-chat-only` also has the environment alias `CAMELID_LAN_CHAT_ONLY=1` and always requires
+`CAMELID_API_KEY` or `CAMELID_API_KEY_FILE`. The command line refuses it alongside
+`--allow-unauthenticated-remote`. Setting both through the environment is not refused there, but it
+changes nothing: this mode has no anonymous form, so the listener still will not start without a key.
 
 `GET /metrics` exposes bounded-name Prometheus counters and gauges for HTTP/generation latency,
 prompt/decode tokens, prompt and weight cache outcomes, engine queue/slot progress, process RSS,
@@ -143,6 +282,52 @@ Three limits are deliberate and worth knowing before you deploy it:
   listener speaks, and the proxy has no way to speak TLS to one. On a fabric whose nodes are not
   loopback, the bearer above and every prompt and completion still cross that network unencrypted,
   whatever the proxy presents to its own clients. Keep those hops on a trusted link.
+
+### Placement modes
+
+`--mode throughput` is the default and preserves the established policy: choose the smallest
+`max(node-reported in-flight jobs, requests this proxy has reserved)`, breaking ties by node label.
+`--mode affinity` prefers the node named by `x-camelid-fabric-sticky` and falls back to that same
+least-load rule if the node is unavailable or no longer serves the requested model. A sticky header
+requests affinity whatever default mode the proxy was started with.
+
+`--mode completion-time` is opt-in. It learns an exponentially weighted service time from clean,
+successful requests completed during this proxy process, then minimizes:
+
+```text
+(observed-or-reserved load + 1) * learned service time
+```
+
+The estimate is scoped to the node's label, address, backend and version; the model; the API route;
+streaming versus buffered delivery; and coarse power-of-two buckets for request bytes and requested
+output tokens. That prevents a node which happened to receive a longer prompt or generation from
+being labelled intrinsically slow. Only a completion placed while the node's observed-or-reserved
+load was zero is sampled. A busy completion includes unknown queueing from other workload classes,
+so dividing its wall time by total in-flight work would invent a service time the proxy did not
+observe. No prompt or response content is retained.
+
+Every eligible node needs five successful completions in the same workload class before an estimate
+may decide placement. Until then the proxy uses least-load, rotating equal-load cold candidates by
+least-recent selection so sequential traffic samples all of them. The response header says
+`x-camelid-fabric-reason: LeastLoaded` while cold and `EstimatedCompletion` once learned timing made
+the decision.
+
+Only a clean, queue-free success is a speed sample. A node-attributable 5xx, unreadable answer,
+transport failure, or truncated stream invalidates that node's estimate for the workload
+immediately. A queue-full refusal does not: it says the load bound worked, not that service became
+slow. Client cancellation does not either, because it says nothing about the node. A stream is
+sampled only at clean EOF, and not if the bounded relay channel filled behind a slow client. A
+request carrying a sticky header is not sampled either: affinity, rather than this policy, chose its
+node.
+
+Estimates older than five minutes become cold and have to be sampled again. They are memory-only,
+bounded to 1,024 node/workload entries, and disappear when the proxy restarts. `fabric route` and
+`fabric run` reject `completion-time`: as one-shot commands they have no resident history and could
+only pretend to make a learned decision.
+
+This mode changes placement, not node capacity or admission. A sole eligible node still receives the
+request, and a genuinely full node still owns its typed 503. Treat performance improvement as a
+measurement question: use a paired, interleaved fabric campaign before making a deployment claim.
 
 ### Naming clients, and cutting one off
 
@@ -351,6 +536,8 @@ Backend runtime knobs used during performance work:
 - `CAMELID_GPU_TEMP_SAMPLING` controls the CUDA-resident Gumbel-max path for plain temperature sampling. It defaults to enabled after seeded device/reference and streaming validation, avoiding a full-vocabulary device-to-host copy and CPU sort on each sampled token. Set it to `0`, `false`, `off`, or `no` to force the CPU sampling fallback for diagnosis.
 - `CAMELID_CUDA_RESIDENT_PREFILL_BATCHED` overrides the resident CUDA prefill policy. Q8_0 uses batched prefill by default; Q4_K/Q6_K keep the sustained-throughput winner (serial prefill) by default on the Windows/WDDM reference host. Set it to `1`, `true`, or `on` to exercise the parity-checked Q4_K/Q6_K batched kernels, or `0`, `false`, or `off` to force serial prefill for any quant lane.
 - `CAMELID_CUDA_KQUANT_BATCH_TOKENS` selects the requested Q4_K/Q6_K CUDA prefill tile size from `1` through `4` when batched K-quant prefill is explicitly enabled. Default: `2`; the runtime clamps it to the model dimensions and portable shared-memory budget. This remains a diagnostic tuning knob until a target GPU shows a sustained gain.
+- `CAMELID_CUDA_PREFILL_BATCH_TOKENS` requests how many prompt tokens the CUDA-resident batched prefill processes per chunk. Unset, prefill uses the same chunk the batched layer stack uses for speculative verify, so the shipped path is unchanged. Any requested value is clamped to the largest chunk this model's batched GEMMs can stage inside the portable 46 KiB shared-memory budget, so it cannot produce a launch the driver refuses. This is a diagnostic tuning knob; chunk size is a separate lever from the flash attention kernel below and must be measured separately.
+- `CAMELID_FLASH_PREFILL` enables the fused tiled flash prefill attention kernel for CUDA-resident prompt ingestion. Default: off. Set it to `1` (or any value other than `0`, `false`, or `off`) to enable it. This path uses an online-softmax reassociation, so it is token-parity rather than bit-identical to the serial forward pass; the default path and speculative verify keep the bit-identity contract and never take it. Opt-in only, prefill only.
 - `CAMELID_PREFILL_CHUNK_TOKENS` controls how many non-final prompt tokens the backend processes per chunk in the chunked prefill path. Default: `256`, matching the current long-prefill performance lane while keeping the global lazy Q8 file cache disabled outside explicit/scoped reuse. Set it to `1` to force the older sequential prefill path while debugging; invalid/zero values fall back to the default. This is a runtime/performance knob only; it is not support evidence for any model row by itself; the separate published source/runtime-head PASS bundle and synchronized docs/API/frontend updates are what close exact Llama 3 8B checked 1024/2048 packs; the knob itself is not evidence for today's checkout.
 - `CAMELID_PREFILL_LAYER_MAJOR` controls the long-context prefill schedule that processes all prefill chunks one layer at a time, reusing file-backed Q8_0 weights across chunks before moving to the next layer. By default it is enabled only when lazy Q8_0 file-backed weights are present. Set it to `0`, `false`, `off`, or `disabled` to force the older chunk-major schedule while debugging.
 - `CAMELID_PREFILL_LAYER_MAJOR_CHUNK_TOKENS` controls the per-layer prompt chunk size only for the layer-major schedule. Default: `512`, unless `CAMELID_PREFILL_CHUNK_TOKENS` is explicitly set, in which case the shared chunk setting is reused for comparability. It also accepts `all`, `full`, `prompt`, or `unbounded` for one diagnostic full-prompt prefill chunk. This is a runtime/performance knob only and does not promote any 8B 1024/2048 support bucket by itself.

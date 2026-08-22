@@ -21,6 +21,8 @@ pub struct Health {
     pub ok: bool,
     #[serde(default)]
     pub generation_ready: bool,
+    #[serde(default)]
+    pub api_surface: Option<String>,
 }
 
 /// One supported/planned row from `/api/capabilities` → `model_compatibility`

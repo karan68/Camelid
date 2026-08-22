@@ -289,6 +289,8 @@ export function createInferenceTelemetryStore() {
       eventSource = null
     }
     connectedBase = null
+    connection = CONNECTION.UNAVAILABLE
+    notify()
   }
 
   function isRunStale() {

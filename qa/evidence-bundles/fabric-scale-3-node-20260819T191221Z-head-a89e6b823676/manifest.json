@@ -1,0 +1,67 @@
+{
+  "schema": "camelid.fabric_scale_evidence.v1",
+  "generated_utc": "2026-08-19T19:12:21.805Z",
+  "git_head": "a89e6b823676",
+  "nodes": [
+    {
+      "label": "win",
+      "machine": "machine-a",
+      "platform": "windows x86_64"
+    },
+    {
+      "label": "mac",
+      "machine": "machine-b",
+      "platform": "macOS arm64 Apple Silicon"
+    },
+    {
+      "label": "mac2",
+      "machine": "machine-b",
+      "platform": "macOS arm64 Apple Silicon",
+      "note": "shares a host with mac; placement evidence only"
+    }
+  ],
+  "models": [
+    "Llama 3.2 1B Instruct (Q8_0)",
+    "Llama 3.2 3B Instruct (Q5_K_M)"
+  ],
+  "claims": {
+    "supported": [
+      "A fabric of three nodes, all serving the 1B in that phase, placed a concurrent model-constrained burst across all three labels, with zero failed requests.",
+      "With one node stopped, the remaining nodes served every request; with two stopped, the third served every request. No client saw a failure.",
+      "GET /v1/models on the proxy returned the union of the models held by its nodes.",
+      "Naming a model placed the request only on a node that holds it: the 3B landed solely on the Windows node, the 1B solely on the two macOS nodes.",
+      "Every prompt in every arm was unique, so no number here can be a prefill-cache artefact.",
+      "Two nodes on two machines served more requests per second than the faster of them alone: 1.33x, 95% CI [1.17, 1.50] over five paired rounds with zero failed requests."
+    ],
+    "not_supported": [
+      "Any scaling number drawn from the third node. Nodes 2 and 3 share one machine, which is the arrangement #652 refused to draw a claim from.",
+      "The together_vs_sum_of_singles ratio as a scaling result. It is above 1.0 here, which cannot establish independent scaling. The concurrency shape can depress the single-node denominators: each node reports continuous_batch_slots=2 and every arm was driven at concurrency 4, so a single-node arm queued work against two slots while the two-node arm had four slots. No matched-concurrency ablation isolated how much of the ratio this explains. together_vs_best_single is the supported comparison.",
+      "Any claim about a lane other than the one recorded per node in this bundle.",
+      "Any comparison between the two machines as hardware: they ran different execution lanes and different thread counts, both recorded. The Windows node ran a CPU lane here, not its CUDA lane.",
+      "Any throughput claim for the second model. The throughput arms were run on the 1B only; the 3B appears in this bundle for placement and model-routing evidence, not for throughput.",
+      "Any support or parity promotion for the 3B row. Its recorded support_level is unknown_or_unvalidated; this bundle demonstrates model-scoped routing only."
+    ],
+    "honest_sentence": "Three nodes is met for placement; the throughput arms are two machines, because the third node shares a host.",
+    "method": [
+      "Placement has two explicit phases. All three nodes served the 1B for the three-label burst. The Windows node was then restarted on the 3B before the second topology snapshot and named-model routing checks.",
+      "Arms are interleaved and their order rotated each round; ratios are taken within a round.",
+      "A unique marker leads every prompt.",
+      "Per-node attribution is read from the x-camelid-fabric-node response header, never inferred.",
+      "The execution lane is read from /v1/health execution_plan.selected_backend before and after each campaign.",
+      "One warm-up round per model is discarded.",
+      "A run containing any failed request is not reported as a throughput number."
+    ]
+  },
+  "logs": [
+    {
+      "name": "placement",
+      "file": "logs/placement.json",
+      "sha256": "178cf51434caabf55bcbf69d31386ec0a0d73db22609b3ff25ce5be5d6a47995"
+    },
+    {
+      "name": "throughput",
+      "file": "logs/throughput.json",
+      "sha256": "35ac1c0e5fe4e5dc70481330fdec3acba2f4bbe11ce040112f7b7ecc747b7d88"
+    }
+  ]
+}
