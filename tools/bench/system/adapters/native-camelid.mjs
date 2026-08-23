@@ -181,11 +181,11 @@ export function nativeExecArgs({ task, modelPath, workdir, addr, tracePath }) {
     'exec',
     task.goal,
     '--model',
-    resolve(modelPath),
+    modelPath,
     '--addr',
     addr,
     '--workdir',
-    resolve(workdir),
+    workdir,
     '--max-steps',
     String(task.budgets.max_steps),
     '--max-tokens',
@@ -196,7 +196,7 @@ export function nativeExecArgs({ task, modelPath, workdir, addr, tracePath }) {
     String(Math.max(1, Math.ceil(task.budgets.command_ms / 1000))),
     '--today-is-a-good-day-to-die',
     '--benchmark-events',
-    resolve(tracePath),
+    tracePath,
   ]
   for (const flag of FORBIDDEN_SHARED_FLAGS) {
     if (args.includes(flag)) throw new NativeAdapterError('INVALID_FIXTURE', `shared task enabled forbidden flag ${flag}`)

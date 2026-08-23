@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url'
 
 import {
   NativeAdapterError,
+  nativeExecArgs,
   runNativeAgentAttempt,
   windowsPathToWsl,
   wslBwrapPrefix,
@@ -82,6 +83,17 @@ try {
   assert.ok(bwrap.includes('/mnt/c/models/model.gguf'))
   assert.ok(bwrap.includes('/mnt/c/runs/task/attempt'))
   assert.equal(windowsPathToWsl('C:\\runs\\task'), '/mnt/c/runs/task')
+
+  const linuxArgs = nativeExecArgs({
+    task: { goal: 'fix the task', budgets: { max_steps: 1, max_output_tokens_per_step: 32, command_ms: 1000 } },
+    modelPath: '/model/model.gguf',
+    workdir: '/workspace',
+    addr: '127.0.0.1:8231',
+    tracePath: '/workspace/.camelid-benchmark-trace.json',
+  })
+  assert.equal(linuxArgs[linuxArgs.indexOf('--model') + 1], '/model/model.gguf')
+  assert.equal(linuxArgs[linuxArgs.indexOf('--workdir') + 1], '/workspace')
+  assert.equal(linuxArgs[linuxArgs.indexOf('--benchmark-events') + 1], '/workspace/.camelid-benchmark-trace.json')
 } finally {
   await rm(tempRoot, { recursive: true, force: true })
 }
