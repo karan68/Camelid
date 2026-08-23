@@ -260,24 +260,70 @@ indistinguishable** from it.
 The kernel exists and is correct. It does **not** compose with split-K the way this
 document predicted.
 
-| Comparison @ 8006 | ratio | CI | verdict |
-|---|---:|---|---|
-| q8-splitk / q8-old | **1.059** | [1.042, 1.153] | significant — **+5.9%** |
-| q8-splitk / f32 default | 0.949 | [0.873, 1.030] | not resolved — **lifted to parity** |
-| q8-splitk / q8-old @ 2066 | 0.983 | [0.455, 1.102] | not resolved — no win |
+**Predicted ~1.5×–3.2×. Measured roughly +5%, and it does not resolve in every run.** Four
+independent 4-round paired runs of `q8-splitk / q8-old` on tokens_per_second:
 
-**Predicted ~1.5×–3.2×; measured +5.9%.** The two effects do not stack. The most likely
-reason is the one this document flagged as a risk and then discounted: split-K wins largely
-by improving memory-level parallelism on the KV read, and Q8 relieves that same resource, so
-the second lever has little left to pull. The win is real and significant at depth, and it
-does move q8 decode from *significantly worse* than the f32 default to *indistinguishable*
-from it — but it is a 6% kernel win, not a 2× one.
+| Run | ratio | CI | resolved? |
+|---|---:|---|---|
+| 8006, run 1 | 1.059 | [1.042, 1.153] | **yes** |
+| 8006, run 2 | 1.036 | [0.977, 1.149] | no |
+| 2066, run 1 | 0.983 | [0.455, 1.102] | no |
+| 2066, run 2 | 1.106 | [1.045, 2.084] | **yes** |
+
+So the honest statement is **~+5%, significant in 2 of 4 paired runs** — a small positive
+effect that this host cannot resolve reliably, not the 2× the prediction implied. An earlier
+revision of this document quoted the 8006 run-1 figure ("+5.9%, significant") as if it were
+the result; that was one run of four and is corrected here.
+
+The most likely reason it does not stack is the risk this document flagged and then
+discounted: split-K wins largely by improving memory-level parallelism on the KV read, and Q8
+relieves that same resource, so the second lever has little left to pull.
+
+### The es=2 activation stream: no throughput win, but it buys exact agreement with f32
+
+The half activation stream was the remaining item. It is now closed —
+`rope_rotate_batch_h` (half RoPE with separate src/dst, so Q rotates straight into the half
+query panel) and `kv_scatter_batch_kvq8_h` (Q8 block quantization from half operands). A
+fused `rope_scatter_qh_h_q8` was considered and rejected as the wrong shape: that kernel runs
+one thread per RoPE pair while Q8 needs an amax across each 32-element block, and the split
+path turns out to be one dispatch *cheaper* than es=4 anyway, because the rotation absorbs
+the f32→f16 convert.
+
+**It produced no statistically resolvable throughput change at either depth.** Four paired
+runs of `q8-both / f32` on prefill:
+
+| Depth | es=4 | es=2 |
+|---|---|---|
+| 8006 | 0.986 [0.924, 1.132] — not resolved | 1.000 [0.941, 1.419] — not resolved |
+| 2066 | 0.990 [0.966, 1.369] — not resolved | 0.984 [0.513, 1.093] — not resolved |
+
+Parity with the f32 default, before and after. At 8006 the activation stream is swamped by
+the O(n²) attention; at 2066 a 3-round reading did show a significant 0.974 but the fourth
+round widened it back to unresolved, so it does not stand.
+
+What es=2 *did* buy is **fidelity**: with the activation precision matched to the f32 lane,
+q8 greedy output became **token-identical to f32 in 4/4 rounds** at 2066, where the es=4 q8
+path diverged at generated token 13. Only KV quantization now separates the two paths, and on
+this model that sits below the argmax threshold. That plus one fewer dispatch is the case for
+keeping it — not speed.
 
 ### Net position
 
-q8 now matches the f32 default on **both** prefill and decode while holding **0.858 of its
-peak RSS** (significant) and 1.88× less KV. That makes the lane a viable capacity option
-rather than a measured loss, which is what it was for.
+q8 matches the f32 default on **both** prefill and decode while holding **0.858 of its peak
+RSS at 8006** (0.948 at 2066, both significant) and 1.88× less KV. That makes the lane a
+viable capacity option rather than a measured loss, which is what it was for.
+
+Aggregate across all four paired runs, so no single run is mistaken for the result:
+
+| Claim | 8006 r1 | 8006 r2 | 2066 r1 | 2066 r2 | Verdict |
+|---|---|---|---|---|---|
+| attn-mm prefill vs old q8 | **0.222** | **0.220** | 0.426 | **0.398** | 2.5–4.5× faster, solid |
+| q8-both prefill vs f32 | 0.986 | 1.000 | 0.990 | 0.984 | parity, consistently |
+| split-K decode vs old q8 | **1.059** | 1.036 | 0.983 | **1.106** | ~+5%, 2 of 4 resolved |
+
+**Bold = CI excludes 1.0.** The prefill fix is the durable result; the decode kernel is a
+small real effect this host cannot resolve every time; es=2 is a fidelity and dispatch-count
+improvement, not a speedup.
 
 Parity is unchanged by any of this: on coherent English q8-both is **token-identical to
 q8-old**, and its divergence from f32 sits at generated token 50 — exactly where the

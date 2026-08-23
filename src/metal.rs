@@ -198,6 +198,8 @@ struct MetalLinearKernel {
     attention_decode_splitk_kv16_direct_pipeline: ComputePipelineState,
     attention_decode_splitk_kvq8_pipeline: ComputePipelineState,
     kv_dequant_q8_to_h_pipeline: ComputePipelineState,
+    rope_rotate_batch_h_pipeline: ComputePipelineState,
+    kv_scatter_batch_kvq8_h_pipeline: ComputePipelineState,
     #[allow(dead_code)] // stage-bandwidth probe variant; exercised by the depth-probe test
     attention_splitk_kv16_stageonly_pipeline: ComputePipelineState,
     attention_decode_splitk_merge_pipeline: ComputePipelineState,
@@ -5140,6 +5142,131 @@ kernel void rope_rotate_batch_f32(
     row[dim1] = x0 * s + x1 * c;
 }
 
+// Half twin of rope_rotate_batch_f32, with SEPARATE source and destination pointers so one
+// kernel covers both roles the es=2 Q8 lane needs:
+//
+//   * K, rotated in place       (src == dst == k_buf)
+//   * Q, rotated straight into the half query panel the attention-as-matmul score GEMM
+//     consumes (src = q_buf, dst = q_h)
+//
+// The f32 lane gets the second job from rope_scatter_qh_batch_h, which a Q8 primary cannot
+// use: that kernel writes K/V into the f32 + half caches, and a Q8 cache needs an amax
+// across each 32-element block, which is a different thread mapping than one-thread-per-
+// RoPE-pair. Splitting RoPE from the scatter is exactly what the Q8 lane already does.
+//
+// Writing Q into a separate destination is what makes es=2 reachable at all: the generic
+// `convert` helper is hardwired to f32_to_f16, so with a half q_buf it would reinterpret
+// half bytes as f32 and the sampler would see non-finite logits.
+//
+// Only rotated dims are written, so a distinct destination is safe ONLY under full rotary
+// coverage (half_rope * 2 == head_dim) — which is precisely the condition use_h16 already
+// requires. Arithmetic mirrors the f32 twin: widen to float, rotate, narrow once on store,
+// so the half round trip costs one rounding rather than two.
+kernel void rope_rotate_batch_h(
+    device const half* src [[buffer(0)]],
+    device half* dst [[buffer(1)]],
+    device const float* cos_table [[buffer(2)]],
+    device const float* sin_table [[buffer(3)]],
+    constant uint& head_count [[buffer(4)]],
+    constant uint& head_dim [[buffer(5)]],
+    constant uint& half_rope [[buffer(6)]],
+    constant uint& pairing [[buffer(7)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    const uint total = head_count * half_rope;
+    if (gid.x >= total) return;
+    const uint t = gid.y;
+    const uint row_base = t * head_count * head_dim;
+    device const half* srow = src + row_base;
+    device half* drow = dst + row_base;
+    device const float* ct = cos_table + t * half_rope;
+    device const float* st = sin_table + t * half_rope;
+    const uint head = gid.x / half_rope;
+    const uint pair = gid.x - head * half_rope;
+    const float c = ct[pair];
+    const float s = st[pair];
+    const uint head_start = head * head_dim;
+    uint dim0;
+    uint dim1;
+    if (pairing == 0u) {
+        dim0 = head_start + pair * 2u;
+        dim1 = dim0 + 1u;
+    } else {
+        dim0 = head_start + pair;
+        dim1 = head_start + pair + half_rope;
+    }
+    const float x0 = float(srow[dim0]);
+    const float x1 = float(srow[dim1]);
+    drow[dim0] = half(x0 * c - x1 * s);
+    drow[dim1] = half(x0 * s + x1 * c);
+}
+
+// Half-input twin of kv_scatter_batch_kvq8, for the es=2 activation stream: identical block
+// quantization, only the source operands widen from half instead of being read as f32.
+//
+// It deliberately does NOT also populate the half staging buffers, even though its
+// one-thread-per-32-element-block mapping is exactly the right granularity and the
+// dequantized values would be free here. Two reasons, both load-bearing:
+//
+//   * The staging buffer must cover the whole history [0, n_pad) that attention reads,
+//     whereas this kernel only writes [base_position, base_position + n_tokens). Folding
+//     staging in would be correct for a fresh prefill and silently wrong for an incremental
+//     one, and it would also drop the pad-row zero fill that keeps a garbage half from
+//     decoding to NaN and poisoning a whole score row.
+//   * The scatter stores `half(kd)` but quantizes with the UNROUNDED `1.0f/kd`, while every
+//     reader (kv_dequant_q8_to_h, attention_decode_v2_kvq8) uses the half-rounded scale. A
+//     staging write that reused `kd` here would not match what any dequant of the cache
+//     produces. This asymmetry is inherited verbatim from the f32 twin; do not "fix" it in
+//     one place only.
+//
+// So kv_dequant_q8_to_h stays as the single source of the staging buffer.
+//
+// NOTE ON BIT-EXACTNESS: under es=2 the amax is taken over K/V that were already rounded to
+// half by the QKV GEMM, so the Q8 codes this writes differ slightly from what the es=4 lane
+// produces. That is inherent to the half activation stream, not to this kernel, but it means
+// the Q8 cache is not byte-identical across the es axis -- relevant to any golden test that
+// pins cache bytes.
+kernel void kv_scatter_batch_kvq8_h(
+    device const half* src_k [[buffer(0)]],
+    device const half* src_v [[buffer(1)]],
+    device uchar* cache_k [[buffer(2)]],
+    device uchar* cache_v [[buffer(3)]],
+    constant uint& head_dim [[buffer(4)]],
+    constant uint& max_positions [[buffer(5)]],
+    constant uint& base_position [[buffer(6)]],
+    constant uint& total_blocks [[buffer(7)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    if (gid.x >= total_blocks) return;
+    const uint blocks_per_head = head_dim / 32;
+    const uint head = gid.x / blocks_per_head;
+    const uint block = gid.x - head * blocks_per_head;
+    const uint token = gid.y;
+    const uint total_values = total_blocks * 32;
+    const uint src = token * total_values + head * head_dim + block * 32;
+    const uint row_bytes = blocks_per_head * 34;
+    const uint dst =
+        (head * max_positions + base_position + token) * row_bytes + block * 34;
+    float kmax = 0.0f;
+    float vmax = 0.0f;
+    for (uint i = 0; i < 32; ++i) {
+        kmax = max(kmax, fabs(float(src_k[src + i])));
+        vmax = max(vmax, fabs(float(src_v[src + i])));
+    }
+    const float kd = kmax / 127.0f;
+    const float vd = vmax / 127.0f;
+    *reinterpret_cast<device half*>(cache_k + dst) = half(kd);
+    *reinterpret_cast<device half*>(cache_v + dst) = half(vd);
+    const float kinv = kd == 0.0f ? 0.0f : 1.0f / kd;
+    const float vinv = vd == 0.0f ? 0.0f : 1.0f / vd;
+    for (uint i = 0; i < 32; ++i) {
+        cache_k[dst + 2 + i] =
+            uchar(char(clamp(int(round(float(src_k[src + i]) * kinv)), -127, 127)));
+        cache_v[dst + 2 + i] =
+            uchar(char(clamp(int(round(float(src_v[src + i]) * vinv)), -127, 127)));
+    }
+}
+
 // kv_scatter_f32 over n_tokens rows: gid.y = token, written at base_position + token.
 // Also writes half copies (same layout) for the attention-as-matmul prefill path,
 // whose batched GEMMs consume K and V as half operands.
@@ -7947,6 +8074,18 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
             let attention_splitk_kv16_stageonly_pipeline = device
                 .new_compute_pipeline_state_with_function(&attention_splitk_kv16_stageonly_function)
                 .ok()?;
+            let rope_rotate_batch_h_function = elementwise_library
+                .get_function("rope_rotate_batch_h", None)
+                .ok()?;
+            let rope_rotate_batch_h_pipeline = device
+                .new_compute_pipeline_state_with_function(&rope_rotate_batch_h_function)
+                .ok()?;
+            let kv_scatter_batch_kvq8_h_function = elementwise_library
+                .get_function("kv_scatter_batch_kvq8_h", None)
+                .ok()?;
+            let kv_scatter_batch_kvq8_h_pipeline = device
+                .new_compute_pipeline_state_with_function(&kv_scatter_batch_kvq8_h_function)
+                .ok()?;
             let kv_dequant_q8_to_h_function = elementwise_library
                 .get_function("kv_dequant_q8_to_h", None)
                 .ok()?;
@@ -8401,6 +8540,8 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 attention_decode_splitk_kv16_direct_pipeline,
                 attention_decode_splitk_kvq8_pipeline,
                 kv_dequant_q8_to_h_pipeline,
+                rope_rotate_batch_h_pipeline,
+                kv_scatter_batch_kvq8_h_pipeline,
                 attention_splitk_kv16_stageonly_pipeline,
                 attention_decode_splitk_merge_pipeline,
                 attention_decode_f32_tree_pipeline,
@@ -22988,15 +23129,18 @@ impl ResidentDecodeState {
         } else {
             0
         };
-        // `use_h16` must track `use_fused_rope`, NOT `use_attn_mm`. They shared a predicate
-        // before the Q8 lane was admitted here, and the attn-mm block relies on that: when
-        // the fused RoPE is off it rebuilds `q_h` with `convert(&q_buf, &q_h, .., 8, ..)`,
-        // which reads `q_buf` as f32. Setting use_h16 while use_fused_rope is off makes
-        // `q_buf` half, that convert reinterprets half bytes as f32, and the sampler sees
-        // non-finite logits. The Q8 lane therefore keeps the f32 activation stream for now
-        // and takes only the attention-as-matmul win; recovering es=2 as well needs the
-        // fused-RoPE Q8 variant described on `q8_attn_mm_enabled`.
-        let use_h16 = use_attn_mm && !stage_q8_kv && half_rope * 2 == self.head_dim;
+        // Element size of the whole activation stream. This once had to track
+        // `use_fused_rope` rather than `use_attn_mm`, because with the fused RoPE off the
+        // attn-mm block rebuilt `q_h` via a convert hardwired to f32->f16 -- so a half
+        // `q_buf` was reinterpreted as f32 and the sampler saw non-finite logits.
+        //
+        // The Q8 lane no longer needs that restriction: `rope_rotate_batch_h` rotates Q
+        // straight into the half panel (and K in place), and `kv_scatter_batch_kvq8_h`
+        // quantizes from half operands, so the es=2 stream is closed end to end without a
+        // fused rope+scatter kernel -- which would have been the wrong shape anyway, since
+        // Q8 needs a per-32-element-block amax and the fused kernel runs one thread per
+        // RoPE pair. The convert is now guarded on `!use_h16` to match.
+        let use_h16 = use_attn_mm && half_rope * 2 == self.head_dim;
         let es = if use_h16 { 2 } else { 4 }; // element size of the activation stream
         let seq = nb(n_tokens * self.hidden * es);
         let seq_out = nb(n_tokens * self.hidden * es);
@@ -23563,6 +23707,43 @@ impl ResidentDecodeState {
                     (self.n_heads + self.n_kv_heads) * half_rope + kv_dim,
                     n_tokens,
                 );
+            } else if use_h16 && stage_q8_kv {
+                // es=2 Q8 lane: q_buf/k_buf/v_buf are half here, so the f32 RoPE would
+                // reinterpret them. Q rotates straight into the half query panel rather
+                // than in place, because the `convert` that would otherwise build q_h is
+                // hardwired f32->f16 and would misread a half q_buf. Safe only under full
+                // rotary coverage (half_rope * 2 == head_dim), which use_h16 requires.
+                let rope_h = |e: &metal::ComputeCommandEncoderRef,
+                              src: &Buffer,
+                              dst: &Buffer,
+                              scalar: &Buffer,
+                              heads: usize| {
+                    e.set_compute_pipeline_state(&k.rope_rotate_batch_h_pipeline);
+                    e.set_buffer(0, Some(src), 0);
+                    e.set_buffer(1, Some(dst), 0);
+                    e.set_buffer(2, Some(&cos_buf), 0);
+                    e.set_buffer(3, Some(&sin_buf), 0);
+                    for j in 0..4u64 {
+                        e.set_buffer(4 + j, Some(scalar), j * 4);
+                    }
+                    dispatch_rows(e, &k.rope_rotate_batch_h_pipeline, heads * half_rope, n_tokens);
+                };
+                rope_h(&e, &q_buf, &q_h, &rope_q_scalar, self.n_heads);
+                rope_h(&e, &k_buf, &k_buf, &rope_k_scalar, self.n_kv_heads);
+                e.set_compute_pipeline_state(&k.kv_scatter_batch_kvq8_h_pipeline);
+                e.set_buffer(0, Some(&k_buf), 0);
+                e.set_buffer(1, Some(&v_buf), 0);
+                e.set_buffer(2, Some(&self.cache_k[i]), 0);
+                e.set_buffer(3, Some(&self.cache_v[i]), 0);
+                for j in 0..4u64 {
+                    e.set_buffer(4 + j, Some(&scatter_scalar), j * 4);
+                }
+                dispatch_rows(
+                    &e,
+                    &k.kv_scatter_batch_kvq8_h_pipeline,
+                    self.n_kv_heads * (self.head_dim / 32),
+                    n_tokens,
+                );
             } else {
                 e.set_compute_pipeline_state(&k.rope_rotate_batch_pipeline);
                 e.set_buffer(0, Some(&q_buf), 0);
@@ -23644,7 +23825,10 @@ impl ResidentDecodeState {
                 // weight GEMMs, with upper-triangle S tiles culled and the PV k-range
                 // clamped to the causal limit.
                 // q -> half (already produced by the fused rope pass when eligible)
-                if !use_fused_rope {
+                // q -> half. Produced by the fused rope pass when eligible, and by
+                // rope_rotate_batch_h on the es=2 Q8 lane. This convert is hardwired
+                // f32->f16, so it is correct ONLY when q_buf is genuinely f32 (es=4).
+                if !use_fused_rope && !use_h16 {
                     convert(&e, &q_buf, &q_h, &n_elems, 8, n_tokens * q_dim);
                 }
                 // S = Q K^T (per query head; K shared per KV head)

@@ -48,15 +48,23 @@ dead end. **Prefill is compute-bound** → that is the one place a tiled GEMM ca
   1.00-1.07x at every depth while both trailed f32 by 1.8-4.4x, i.e. the two excluded
   formats landed on top of each other. Admitting q8 via a `kv_dequant_q8_to_h` staging pass
   takes prefill from **4.48x worse than the f32 default to 0.986x — parity** (CI [0.924,
-  1.132]), a 4.5x improvement (CI [0.198, 0.252]). DECODE: `attention_decode_splitk_kvq8`
-  was written and works, but **the composition hypothesis was WRONG** — predicted 1.5x-3.2x,
-  measured **+5.9%** at 8006 (CI [1.042, 1.153], significant) and nothing resolvable at
-  2066. Split-K wins mostly via memory-level parallelism on the KV read, which is the same
-  resource Q8 already relieves, so the second lever has little left to pull. It does lift q8
-  decode from significantly-worse-than-default to indistinguishable (0.949, CI [0.873,
-  1.030]). Net: q8 now matches the f32 default on prefill AND decode at 0.858 of its peak
-  RSS. Do not re-run the compose experiment; do not re-derive the prefill cause. Still open:
-  the es=2 activation stream (needs a `rope_scatter_qh_h_q8`), and `fit.rs KvDtype`.
+  1.132]), a 4.5x improvement (CI [0.198, 0.252]); reproduced across four paired runs at
+  0.222/0.220/0.426/0.398 vs pre-change q8. DECODE: `attention_decode_splitk_kvq8` was
+  written and works, but **the composition hypothesis was WRONG** — predicted 1.5x-3.2x,
+  measured **~+5%, and significant in only 2 of 4 paired runs** (1.059 SIG / 1.036 / 0.983 /
+  1.106 SIG). Split-K wins mostly via memory-level parallelism on the KV read, the same
+  resource Q8 already relieves, so the second lever has little left to pull. Treat it as a
+  small real effect this host cannot resolve reliably, NOT as a headline number — an earlier
+  revision of this entry quoted the single 8006 run-1 figure and overstated it. ES=2: also
+  landed (`rope_rotate_batch_h` + `kv_scatter_batch_kvq8_h`; a fused `rope_scatter_qh_h_q8`
+  is the WRONG SHAPE — one thread per RoPE pair cannot do a per-32-block amax, and the split
+  path is one dispatch cheaper anyway). It produced **no resolvable throughput change at
+  either depth** (q8-both/f32 prefill 0.986->1.000 at 8006, 0.990->0.984 at 2066, all
+  unresolved) but made q8 output **token-identical to f32 in 4/4 rounds** at 2066 where es=4
+  diverged at token 13 — keep it for fidelity and the dispatch saving, not for speed.
+  Net: q8 matches the f32 default on prefill AND decode at 0.858 of its peak RSS (0.948 at
+  2066). Do not re-run the compose experiment; do not re-derive the prefill cause; do not
+  re-attempt a fused rope+Q8-scatter. Still open: `fit.rs KvDtype` has no Q8 variant.
   Note one depth already won outright even before the fix: at 4117 tokens q8
   beats the default **1.031×** (significant) despite the forfeit. **Quality is where the two
   compressed formats diverge:** on coherent English (`realtext` probe, 1460 tok) **f16 is
