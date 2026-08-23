@@ -116,6 +116,11 @@ recorded in `adapter.json` and `manifest.json`.
 `--max-tokens-per-step` may tighten but never exceed the task package's declared
 per-step ceiling. The effective value is recorded in the same evidence files.
 
+Trace-emitting disposable benchmark runs disable Camelid's user-facing undo
+checkpoints. Ordinary agent sessions retain checkpoints; benchmark bundles
+record `checkpoints_enabled: false` so strict repository scoring sees only task
+mutations rather than adapter-owned `.camelid/` state.
+
 The workspace path must not already exist. This prevents materialization from
 overwriting an unrelated directory or a pre-existing canary.
 

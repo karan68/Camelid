@@ -18,6 +18,7 @@ try {
   assert.equal(bundle.manifest.workspace_included, false)
   assert.equal(bundle.manifest.boundary, 'wsl-bwrap')
   assert.equal(bundle.manifest.gpu_enabled, false)
+  assert.equal(bundle.manifest.checkpoints_enabled, false)
   assert.equal(bundle.manifest.max_output_tokens_per_step, 1024)
   assert.equal((await verifyBundleChecksums(outputDir)).ok, true)
   assert.equal(await exists(join(outputDir, 'workspace')), false)
@@ -69,6 +70,7 @@ function fixtureResult() {
   return {
     boundary: 'wsl-bwrap',
     gpu_enabled: false,
+    checkpoints_enabled: false,
     max_output_tokens_per_step: 1024,
     address: 'loopback_ephemeral',
     trace_error: null,

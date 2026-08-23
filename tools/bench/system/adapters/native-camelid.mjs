@@ -109,6 +109,7 @@ export async function runNativeAgentAttempt(options) {
     },
     boundary: normalized.boundary.kind,
     gpu_enabled: normalized.boundary.gpuEnabled,
+    checkpoints_enabled: false,
     max_output_tokens_per_step: maxOutputTokensPerStep,
     address: 'loopback_ephemeral',
     args,

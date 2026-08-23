@@ -2267,7 +2267,8 @@ pub fn run_exec(
     };
     let sandbox = Sandbox::new(&cfg.workdir, cfg.allow_net, cfg.shell_timeout)?
         .with_shell_mode(cfg.shell_sandbox)
-        .with_fs_unrestricted(cfg.allow_fs);
+        .with_fs_unrestricted(cfg.allow_fs)
+        .with_checkpoints(benchmark_events.is_none());
 
     let trace_audit = benchmark_events.map(|_| InMemorySink::default());
     if let Some(sink) = &trace_audit {

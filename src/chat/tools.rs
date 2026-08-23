@@ -244,6 +244,9 @@ pub struct Sandbox {
     root: PathBuf,
     allow_net: bool,
     shell_timeout: Duration,
+    /// User-facing undo snapshots. Disposable benchmark workspaces disable
+    /// these so adapter-owned state cannot contaminate repository scoring.
+    checkpoints_enabled: bool,
     /// OS-level confinement mode for `run_shell` (Task 1). Defaults to
     /// [`ShellSandbox::Sandboxed`]; production sets it from `--shell-sandbox`.
     shell_mode: ShellSandbox,
@@ -279,9 +282,20 @@ impl Sandbox {
             root,
             allow_net,
             shell_timeout,
+            checkpoints_enabled: true,
             shell_mode: ShellSandbox::default(),
             fs_unrestricted: false,
         })
+    }
+
+    /// Enable or disable user-facing undo snapshots for this sandbox.
+    pub fn with_checkpoints(mut self, enabled: bool) -> Self {
+        self.checkpoints_enabled = enabled;
+        self
+    }
+
+    pub fn checkpoints_enabled(&self) -> bool {
+        self.checkpoints_enabled
     }
 
     /// Set the `run_shell` confinement mode (defaults to sandboxed).
