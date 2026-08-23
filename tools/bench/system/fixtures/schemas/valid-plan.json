@@ -1,0 +1,81 @@
+{
+  "schema": "camelid.benchmark.plan/v1",
+  "campaign_id": "phase1-schema-test",
+  "mode": "ablation",
+  "created_utc": "2026-08-23T00:00:00Z",
+  "controller": {
+    "source_manifest_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "version": "phase1-w01"
+  },
+  "repository_root": "<repo>",
+  "source_arms": [
+    {
+      "id": "base",
+      "source_dir": "<repo>/base",
+      "git_sha": "1111111111111111111111111111111111111111",
+      "tree_dirty": false,
+      "cargo_lock_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "build": {
+        "cargo_path": "<cargo>",
+        "toolchain": "1.89.0",
+        "profile": "release",
+        "features": [],
+        "target_dir": "<local-target>/base",
+        "binary_path": "<local-target>/base/release/camelid"
+      }
+    },
+    {
+      "id": "head",
+      "source_dir": "<repo>/head",
+      "git_sha": "2222222222222222222222222222222222222222",
+      "tree_dirty": false,
+      "cargo_lock_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "build": {
+        "cargo_path": "<cargo>",
+        "toolchain": "1.89.0",
+        "profile": "release",
+        "features": [],
+        "target_dir": "<local-target>/head",
+        "binary_path": "<local-target>/head/release/camelid"
+      }
+    }
+  ],
+  "models": [
+    {
+      "id": "synthetic-q8-row",
+      "artifact_path": "<models>/synthetic-Q8_0.gguf",
+      "artifact_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "size_bytes": 1321082528,
+      "quantization": "Q8_0"
+    }
+  ],
+  "workloads": [
+    {
+      "id": "rt_decode_128",
+      "adapter": "runtime-camelid",
+      "model_id": "synthetic-q8-row",
+      "prompt_file": "<prompts>/decode.txt",
+      "prompt_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "prompt_policy": "front_block_marker_v1",
+      "max_tokens": 128,
+      "warmup": true,
+      "deterministic": true,
+      "threads": 8,
+      "backend": {
+        "requested": "cpu_deterministic",
+        "assertion": "deterministic_no_offload"
+      },
+      "primary_metrics": ["tokens_per_second"],
+      "order": ["base", "head", "head", "base"],
+      "repetitions": 2,
+      "timeout_ms": 600000
+    }
+  ],
+  "resources": {
+    "minimum_free_disk_bytes": 1
+  },
+  "security": {
+    "network": "deny",
+    "trust_tier": "local_exploratory"
+  }
+}

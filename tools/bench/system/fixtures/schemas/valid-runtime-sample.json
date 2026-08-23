@@ -1,0 +1,47 @@
+{
+  "schema": "camelid.benchmark.runtime-sample/v1",
+  "campaign_id": "phase1-schema-test",
+  "workload_id": "rt_decode_128",
+  "arm_id": "head",
+  "process_block": 0,
+  "request_index": 0,
+  "validity": "valid",
+  "invalid_reason": null,
+  "identity": {
+    "source_sha": "2222222222222222222222222222222222222222",
+    "binary_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "model_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "prompt_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+  },
+  "backend": {
+    "requested": "cpu_deterministic",
+    "observed": "cpu_deterministic",
+    "assertion_passed": true
+  },
+  "metrics": {
+    "load_ms": 925.5,
+    "prefill_ms": 43.25,
+    "ttft_ms": 47.75,
+    "decode_ms": 1625.0,
+    "tokens_per_second": 38.7692307692,
+    "prompt_tokens": 19,
+    "generated_tokens": 64,
+    "peak_rss_bytes": 1447034880,
+    "peak_vram_bytes": null,
+    "peak_vram_unavailable_reason": "not reported by bench-generate"
+  },
+  "metrics_unavailable_reason": null,
+  "correctness": {
+    "output_token_ids_sha256": "abababababababababababababababababababababababababababababababab",
+    "parity_required": true,
+    "parity_passed": true,
+    "unavailable_reason": null,
+    "parity_unavailable_reason": null
+  },
+  "process": {
+    "state": "exited",
+    "exit_code": 0,
+    "timed_out": false,
+    "cleanup_passed": true
+  }
+}

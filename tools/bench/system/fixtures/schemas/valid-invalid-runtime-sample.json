@@ -1,0 +1,36 @@
+{
+  "schema": "camelid.benchmark.runtime-sample/v1",
+  "campaign_id": "phase1-schema-test",
+  "workload_id": "rt_decode_128",
+  "arm_id": "head",
+  "process_block": 0,
+  "request_index": 0,
+  "validity": "invalid_timeout",
+  "invalid_reason": "bench-generate exceeded its 600000 ms bound",
+  "identity": {
+    "source_sha": "2222222222222222222222222222222222222222",
+    "binary_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "model_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "prompt_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+  },
+  "backend": {
+    "requested": "cpu_deterministic",
+    "observed": null,
+    "assertion_passed": false
+  },
+  "metrics": null,
+  "metrics_unavailable_reason": "process did not produce a complete record",
+  "correctness": {
+    "output_token_ids_sha256": null,
+    "parity_required": true,
+    "parity_passed": null,
+    "unavailable_reason": "process did not produce output token IDs",
+    "parity_unavailable_reason": "process did not produce output token IDs"
+  },
+  "process": {
+    "state": "timed_out",
+    "exit_code": 1,
+    "timed_out": true,
+    "cleanup_passed": true
+  }
+}
