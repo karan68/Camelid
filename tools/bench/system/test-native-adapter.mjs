@@ -50,6 +50,7 @@ try {
   assert.equal(answered.attempt.timing.model_ms, 20)
   assert.equal(answered.attempt.timing.ttft_ms, 3)
   assert.equal(answered.checkpoints_enabled, false)
+  assert.equal(answered.tool_profile, 'benchmark_shared')
   assert.equal(answered.max_output_tokens_per_step, 1024)
   assert.equal(answered.identity.task_definition_sha256, '45729be61b56480e6656dc19fa1e4b01fc0d8784ab8b880ed1d09dc60f0e709b')
   assert.equal(answered.identity.fixture_manifest_sha256, 'f5a273b7ae8d07987de95ec85389bbceba3a3d632c31689e86179ffc4f9e2895')

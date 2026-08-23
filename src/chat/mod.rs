@@ -171,6 +171,7 @@ pub fn run_chat(opts: ChatOptions) -> anyhow::Result<i32> {
                 return Ok(2);
             }
         };
+        let benchmark_exec = opts.benchmark_events.is_some();
         let cfg = agent::AgentConfig {
             workdir: opts.workdir.unwrap_or_else(|| PathBuf::from(".")),
             max_steps: opts.max_steps,
@@ -183,7 +184,11 @@ pub fn run_chat(opts: ChatOptions) -> anyhow::Result<i32> {
             temperature: opts.temperature,
             audit: audit::sink_from_config(opts.audit_webhook.as_deref()),
             shell_sandbox,
-            tool_profile: tools::ToolProfile::Full,
+            tool_profile: if benchmark_exec {
+                tools::ToolProfile::BenchmarkShared
+            } else {
+                tools::ToolProfile::Full
+            },
             // The smaller of what the model was trained for and what the agent
             // lane is validated to; falls back to the validated ceiling when the
             // server has not reported a context length.

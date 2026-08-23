@@ -121,6 +121,11 @@ checkpoints. Ordinary agent sessions retain checkpoints; benchmark bundles
 record `checkpoints_enabled: false` so strict repository scoring sees only task
 mutations rather than adapter-owned `.camelid/` state.
 
+The same path uses the recorded `benchmark_shared` tool profile: exactly
+`read_file`, `list_dir`, `search`, `write_file`, `edit_file`, and `run_shell`.
+Native-only planning, GUI, MCP, network, system-inspection, and subagent tools
+are neither advertised nor accepted for shared-task evidence.
+
 The workspace path must not already exist. This prevents materialization from
 overwriting an unrelated directory or a pre-existing canary.
 

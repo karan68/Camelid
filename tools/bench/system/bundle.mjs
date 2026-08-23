@@ -122,6 +122,7 @@ export async function writeNativeAgentBundle(input, options = {}) {
     boundary: input.result.boundary,
     gpu_enabled: input.result.gpu_enabled,
     checkpoints_enabled: input.result.checkpoints_enabled,
+    tool_profile: input.result.tool_profile,
     max_output_tokens_per_step: input.result.max_output_tokens_per_step,
     address: input.result.address,
     trace_error: input.result.trace_error,
@@ -152,6 +153,7 @@ export async function writeNativeAgentBundle(input, options = {}) {
     boundary: input.result.boundary,
     gpu_enabled: input.result.gpu_enabled,
     checkpoints_enabled: input.result.checkpoints_enabled,
+    tool_profile: input.result.tool_profile,
     max_output_tokens_per_step: input.result.max_output_tokens_per_step,
     claim_boundary: 'Local Phase 3 native-agent evidence only; scorer outcome is authoritative and no public model-quality claim is made.',
   }
