@@ -615,6 +615,23 @@ pub fn run_loop(
                         Some(max_bytes) => outcome.clipped(max_bytes),
                         None => outcome,
                     };
+                    let list_dir_file = match &action {
+                        Action::ListDir { path, .. } if path.is_file() => Some(path),
+                        _ => None,
+                    };
+                    let outcome = if cfg.tool_profile.is_benchmark_shared() && outcome.is_err() {
+                        if let Some(path) = list_dir_file {
+                            let relative = sandbox.rel(path);
+                            ToolOutcome::Err(format!(
+                                "{relative} is a file, not a directory; call read_file with path \
+                                 `{relative}` to inspect its content"
+                            ))
+                        } else {
+                            outcome
+                        }
+                    } else {
+                        outcome
+                    };
                     if cfg.tool_profile.is_workspace() && !outcome.is_err() {
                         observed_workspace = true;
                         if let Action::ReadFile { path, .. } = &action {
@@ -3432,6 +3449,7 @@ mod tests {
                     json!({"path":"src/pricing.cjs","old":"> 10000","new":">= 10000"}),
                 )]),
                 ModelStep::Calls(vec![tc("list_dir", json!({"path":"."}))]),
+                ModelStep::Calls(vec![tc("list_dir", json!({"path":"src/pricing.cjs"}))]),
                 ModelStep::Calls(vec![tc("read_file", json!({"path":"src/pricing.cjs"}))]),
                 ModelStep::Calls(vec![tc(
                     "edit_file",
@@ -3460,6 +3478,10 @@ mod tests {
 
         assert_eq!(end, LoopEnd::Answered);
         assert!(reporter.results[0].contains("requires a successful read_file"));
+        assert!(reporter
+            .results
+            .iter()
+            .any(|result| result.contains("call read_file with path `src/pricing.cjs`")));
         assert_eq!(reporter.text, vec!["fixed and verified"]);
         assert!(std::fs::read_to_string(dir.path().join("src/pricing.cjs"))
             .unwrap()
