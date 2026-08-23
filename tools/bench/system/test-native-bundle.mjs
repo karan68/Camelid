@@ -22,6 +22,13 @@ try {
   assert.match(await readFile(join(outputDir, 'summary.md'), 'utf8'), /PASS_COMPARABLE/)
   await assert.rejects(writeNativeAgentBundle({ outputDir, result }), /not empty/)
 
+  const unlistedPath = join(outputDir, 'unlisted.txt')
+  await writeFile(unlistedPath, 'not sealed\n')
+  const unlisted = await verifyBundleChecksums(outputDir)
+  assert.equal(unlisted.ok, false)
+  assert.ok(unlisted.failures.some((failure) => failure.includes('unlisted.txt: not listed')))
+  await rm(unlistedPath)
+
   await writeFile(join(outputDir, 'attempt.json'), '{}\n')
   const tampered = await verifyBundleChecksums(outputDir)
   assert.equal(tampered.ok, false)
@@ -65,6 +72,10 @@ function fixtureResult() {
       source_sha: 'a'.repeat(40),
       binary_sha256: 'b'.repeat(64),
       model_sha256: 'c'.repeat(64),
+      controller_manifest_sha256: 'd'.repeat(64),
+      task_definition_sha256: 'e'.repeat(64),
+      fixture_manifest_sha256: 'f'.repeat(64),
+      scorer_manifest_sha256: '0'.repeat(64),
     },
     execution: {
       state: 'exited',

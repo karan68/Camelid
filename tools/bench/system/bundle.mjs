@@ -1,5 +1,5 @@
 import { mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
-import { join, relative, resolve, sep } from 'node:path'
+import { isAbsolute, join, relative, resolve, sep } from 'node:path'
 
 import { buildComparison } from './aggregate.mjs'
 import {
@@ -68,6 +68,7 @@ export async function verifyBundleChecksums(outputDir) {
   const root = resolve(outputDir)
   const text = await readFile(join(root, 'SHA256SUMS'), 'utf8')
   const failures = []
+  const expectedFiles = new Set()
   for (const [index, line] of text.split(/\r?\n/).entries()) {
     if (line.length === 0) continue
     const match = line.match(/^([0-9a-f]{64})  (.+)$/)
@@ -76,6 +77,15 @@ export async function verifyBundleChecksums(outputDir) {
       continue
     }
     const [, expected, relativeFile] = match
+    if (!isSafeChecksumPath(relativeFile)) {
+      failures.push(`line ${index + 1} has an unsafe path: ${relativeFile}`)
+      continue
+    }
+    if (expectedFiles.has(relativeFile)) {
+      failures.push(`line ${index + 1} duplicates ${relativeFile}`)
+      continue
+    }
+    expectedFiles.add(relativeFile)
     let actual
     try {
       actual = await sha256File(join(root, ...relativeFile.split('/')))
@@ -84,6 +94,17 @@ export async function verifyBundleChecksums(outputDir) {
       continue
     }
     if (actual !== expected) failures.push(`${relativeFile}: expected ${expected}, got ${actual}`)
+  }
+  let actualFiles = []
+  try {
+    actualFiles = (await walk(root))
+      .map((path) => relativePath(root, path))
+      .filter((path) => path !== 'SHA256SUMS')
+  } catch (error) {
+    failures.push(error.message)
+  }
+  for (const actualFile of actualFiles) {
+    if (!expectedFiles.has(actualFile)) failures.push(`${actualFile}: not listed in SHA256SUMS`)
   }
   return { ok: failures.length === 0, failures }
 }
@@ -197,8 +218,14 @@ async function walk(directory) {
     const path = join(directory, entry.name)
     if (entry.isDirectory()) files.push(...await walk(path))
     else if (entry.isFile()) files.push(path)
+    else throw new Error(`bundle contains unsupported entry: ${path}`)
   }
   return files
+}
+
+function isSafeChecksumPath(path) {
+  if (path === 'SHA256SUMS' || path.includes('\\') || isAbsolute(path)) return false
+  return path.split('/').every((part) => part.length > 0 && part !== '.' && part !== '..')
 }
 
 async function writeCanonical(path, value) {
