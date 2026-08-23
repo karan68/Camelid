@@ -11,8 +11,18 @@ overlays, and outside canary remain controller-owned. Package, fixture, scorer,
 and canary identities are checked before execution; task, fixture, and scorer
 identities are checked again after scoring.
 
+Phase 3 starts the native Camelid adapter around the shipped `camelid agent
+exec` CLI. The adapter verifies candidate/model bytes before materialization,
+reserves an ephemeral loopback address, constructs bounded shared-task flags,
+strips credentials and Camelid environment overrides, preserves exit `0/1/3`,
+kills the owned process tree on timeout, and invokes the independent scorer only
+after cleanup. Unattended execution requires an explicit disposable-boundary
+acknowledgment.
+
 It does not set a regression threshold, run model-backed work in CI, compare
-external runtimes, execute either agent adapter, or create public evidence.
+external runtimes, execute a real model in hosted CI, or create public evidence.
+Detailed native model/tool/timing metrics remain unavailable until O9 provides
+a stable structured event source; human stderr is not parsed into evidence.
 
 ## Safety and validity
 
@@ -111,8 +121,10 @@ node tools/bench/system/test-cli.mjs
 node tools/bench/system/test-safety.mjs
 node tools/bench/test-v0.1-benchmark-harness.mjs
 node scripts/test-benchmark-system-phase2.mjs
+node scripts/test-benchmark-system-phase3.mjs
 ```
 
 The existing `validation-scripts` CI job runs the same set through
 `scripts/test-benchmark-system-phase1.mjs` and
-`scripts/test-benchmark-system-phase2.mjs`.
+`scripts/test-benchmark-system-phase2.mjs`. The model-free Phase 3 adapter test
+is discovered through `scripts/test-benchmark-system-phase3.mjs`.
