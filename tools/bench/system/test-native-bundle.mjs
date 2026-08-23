@@ -17,6 +17,7 @@ try {
   assert.equal(bundle.manifest.state, 'COMPLETE')
   assert.equal(bundle.manifest.workspace_included, false)
   assert.equal(bundle.manifest.boundary, 'wsl-bwrap')
+  assert.equal(bundle.manifest.gpu_enabled, false)
   assert.equal((await verifyBundleChecksums(outputDir)).ok, true)
   assert.equal(await exists(join(outputDir, 'workspace')), false)
   assert.match(await readFile(join(outputDir, 'summary.md'), 'utf8'), /PASS_COMPARABLE/)
@@ -66,6 +67,7 @@ function fixtureResult() {
   }
   return {
     boundary: 'wsl-bwrap',
+    gpu_enabled: false,
     address: 'loopback_ephemeral',
     trace_error: null,
     identity: {

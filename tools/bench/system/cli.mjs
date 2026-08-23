@@ -142,6 +142,7 @@ try {
         distribution: args.values.get('wsl-distribution') ?? 'Ubuntu',
         linuxBinaryPath: requiredValue(args, 'linux-binary'),
         linuxModelPath: requiredValue(args, 'linux-model'),
+        gpuEnabled: booleanValue(args, 'wsl-gpu', false),
       },
     })
     const bundle = await writeNativeAgentBundle({ outputDir, result })
@@ -239,6 +240,13 @@ function integerValue(parsed, name, fallback, allowZero) {
   return value
 }
 
+function booleanValue(parsed, name, fallback) {
+  const raw = parsed.values.get(name)
+  if (raw === undefined) return fallback
+  if (raw !== 'true' && raw !== 'false') throw new Error(`--${name} must be true or false`)
+  return raw === 'true'
+}
+
 async function requireNewDirectory(path) {
   try {
     const info = await stat(path)
@@ -268,5 +276,5 @@ function usage() {
     `  node tools/bench/system/cli.mjs task-verify --task <task-dir>\n` +
     `  node tools/bench/system/cli.mjs task-materialize --task <task-dir> --workspace <new-workspace>\n` +
     `  node tools/bench/system/cli.mjs task-score --task <task-dir> --workspace <workspace> [--out <score.json>]\n` +
-    `  node tools/bench/system/cli.mjs native-run --task <task-dir> --workspace <new-workspace> --binary <windows-visible-linux-binary> --linux-binary <linux-path> --model <windows-model> --linux-model <linux-path> --source-sha <sha> --campaign-id <id> --timeout-ms <ms> --out <bundle-dir>\n`
+    `  node tools/bench/system/cli.mjs native-run --task <task-dir> --workspace <new-workspace> --binary <windows-visible-linux-binary> --linux-binary <linux-path> --model <windows-model> --linux-model <linux-path> --source-sha <sha> --campaign-id <id> --timeout-ms <ms> --out <bundle-dir> [--wsl-gpu <true|false>]\n`
 }

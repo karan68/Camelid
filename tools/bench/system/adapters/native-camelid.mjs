@@ -102,6 +102,7 @@ export async function runNativeAgentAttempt(options) {
       scorer_manifest_sha256: taskPackage.scorer.sha256,
     },
     boundary: normalized.boundary.kind,
+    gpu_enabled: normalized.boundary.gpuEnabled,
     address: 'loopback_ephemeral',
     args,
     execution,
@@ -133,6 +134,7 @@ async function prepareLaunch(options, attemptRoot, tracePath) {
       linuxBinaryPath: options.boundary.linuxBinaryPath,
       linuxModelPath: options.boundary.linuxModelPath,
       linuxAttemptPath: windowsPathToWsl(attemptRoot),
+      gpuEnabled: options.boundary.gpuEnabled,
     }),
     // Each bwrap process owns a fresh network namespace.
     addr: '127.0.0.1:8231',
@@ -142,8 +144,12 @@ async function prepareLaunch(options, attemptRoot, tracePath) {
   }
 }
 
-export function wslBwrapPrefix({ distribution, linuxBinaryPath, linuxModelPath, linuxAttemptPath }) {
+export function wslBwrapPrefix({ distribution, linuxBinaryPath, linuxModelPath, linuxAttemptPath, gpuEnabled = false }) {
   const sandboxModelPath = linuxModelSandboxPath(linuxModelPath)
+  const gpuDeviceArgs = gpuEnabled ? ['--dev-bind', '/dev/dxg', '/dev/dxg'] : []
+  const gpuEnvironmentArgs = gpuEnabled
+    ? ['--setenv', 'LD_LIBRARY_PATH', '/usr/lib/wsl/lib:/usr/lib/x86_64-linux-gnu']
+    : []
   return [
     '-d', distribution, '--',
     'bwrap',
@@ -157,6 +163,7 @@ export function wslBwrapPrefix({ distribution, linuxBinaryPath, linuxModelPath, 
     '--ro-bind', '/sys', '/sys',
     '--proc', '/proc',
     '--dev', '/dev',
+    ...gpuDeviceArgs,
     '--tmpfs', '/tmp',
     '--dir', '/opt',
     '--dir', '/opt/camelid',
@@ -170,6 +177,7 @@ export function wslBwrapPrefix({ distribution, linuxBinaryPath, linuxModelPath, 
     '--clearenv',
     '--setenv', 'PATH', '/usr/bin:/bin',
     '--setenv', 'HOME', '/tmp/home',
+    ...gpuEnvironmentArgs,
     '/opt/camelid/camelid',
   ]
 }
@@ -270,9 +278,12 @@ function validateBoundary(options) {
   }
   if (boundary.kind === 'synthetic') {
     if (options.syntheticCandidate !== true) throw new NativeAdapterError('INVALID_INFRASTRUCTURE', 'synthetic boundary is test-only')
-    return { kind: 'synthetic' }
+    return { kind: 'synthetic', gpuEnabled: false }
   }
   if (boundary.kind !== 'wsl-bwrap') throw new NativeAdapterError('INVALID_INFRASTRUCTURE', `unsupported native boundary ${boundary.kind}`)
+  if (boundary.gpuEnabled !== undefined && typeof boundary.gpuEnabled !== 'boolean') {
+    throw new TypeError('WSL gpuEnabled must be a boolean')
+  }
   if (typeof boundary.distribution !== 'string' || !/^[A-Za-z0-9_.-]+$/.test(boundary.distribution)) {
     throw new TypeError('WSL distribution must be a simple name')
   }
@@ -285,6 +296,7 @@ function validateBoundary(options) {
     distribution: boundary.distribution,
     linuxBinaryPath: boundary.linuxBinaryPath,
     linuxModelPath: boundary.linuxModelPath,
+    gpuEnabled: boundary.gpuEnabled ?? false,
     wslExecutable: boundary.wslExecutable
       ? resolve(boundary.wslExecutable)
       : resolve(systemRoot, 'System32', 'wsl.exe'),
@@ -395,6 +407,13 @@ function timingFromTrace(trace, wallMs) {
 }
 
 async function verifyWslBoundary(boundary) {
+  const gpuDeviceArgs = boundary.gpuEnabled ? ['--dev-bind', '/dev/dxg', '/dev/dxg'] : []
+  const gpuEnvironmentArgs = boundary.gpuEnabled
+    ? ['--setenv', 'LD_LIBRARY_PATH', '/usr/lib/wsl/lib:/usr/lib/x86_64-linux-gnu']
+    : []
+  const gpuProbe = boundary.gpuEnabled
+    ? ' && /usr/lib/wsl/lib/nvidia-smi -L >/dev/null 2>&1'
+    : ''
   const execution = await runProcess({
     file: boundary.wslExecutable,
     args: [
@@ -409,11 +428,13 @@ async function verifyWslBoundary(boundary) {
       '--ro-bind', '/bin', '/bin',
       '--proc', '/proc',
       '--dev', '/dev',
+      ...gpuDeviceArgs,
       '--tmpfs', '/tmp',
       '--clearenv',
       '--setenv', 'PATH', '/usr/bin:/bin',
+      ...gpuEnvironmentArgs,
       '/bin/sh', '-c',
-      'test ! -e /mnt/c && ! /usr/bin/curl -fsS --max-time 2 https://example.com >/dev/null 2>&1 && printf BOUNDARY_OK',
+      `test ! -e /mnt/c && ! /usr/bin/curl -fsS --max-time 2 https://example.com >/dev/null 2>&1${gpuProbe} && printf BOUNDARY_OK`,
     ],
     env: isolatedNativeEnv(process.env),
     timeoutMs: 10000,

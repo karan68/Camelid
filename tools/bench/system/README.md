@@ -104,8 +104,14 @@ node tools/bench/system/cli.mjs native-run \
   --task <task-dir> --workspace <new-workspace> \
   --binary <windows-visible-linux-binary> --linux-binary <linux-path> \
   --model <windows-model> --linux-model <linux-path> \
-  --source-sha <sha> --campaign-id <id> --timeout-ms <ms> --out <bundle-dir>
+  --source-sha <sha> --campaign-id <id> --timeout-ms <ms> --out <bundle-dir> \
+  --wsl-gpu true
 ```
+
+CPU remains the default. `--wsl-gpu true` adds only the WSL GPU device and
+driver-library search path to the otherwise unchanged network-unshared
+bubblewrap boundary, requires a successful in-boundary GPU preflight, and is
+recorded in `adapter.json` and `manifest.json`.
 
 The workspace path must not already exist. This prevents materialization from
 overwriting an unrelated directory or a pre-existing canary.

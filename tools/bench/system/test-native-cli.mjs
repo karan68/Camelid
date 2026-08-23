@@ -11,6 +11,7 @@ const cli = resolve(systemRoot, 'cli.mjs')
 const usage = run([])
 assert.equal(usage.status, 0, usage.stderr)
 assert.match(usage.stdout, /native-run/)
+assert.match(usage.stdout, /--wsl-gpu <true\|false>/)
 
 const missing = run(['native-run'])
 assert.equal(missing.status, 1)

@@ -84,11 +84,24 @@ try {
     assert.ok(bwrap.includes(directory), directory)
   }
   assert.equal(bwrap.join(' ').includes('--bind /mnt/c /mnt/c'), false)
+  assert.equal(bwrap.includes('/dev/dxg'), false)
   assert.ok(bwrap.includes('/mnt/c/models/model.gguf'))
   assert.ok(bwrap.includes('/model/model.gguf'))
   assert.ok(bwrap.includes('/mnt/c/runs/task/attempt'))
   assert.equal(windowsPathToWsl('C:\\runs\\task'), '/mnt/c/runs/task')
   assert.equal(linuxModelSandboxPath('/root/models/Qwen3-4B-Q4_K_M.gguf'), '/model/Qwen3-4B-Q4_K_M.gguf')
+
+  const gpuBwrap = wslBwrapPrefix({
+    distribution: 'Ubuntu',
+    linuxBinaryPath: '/root/camelid/camelid',
+    linuxModelPath: '/root/models/Qwen3-4B-Q4_K_M.gguf',
+    linuxAttemptPath: '/mnt/c/runs/task/attempt',
+    gpuEnabled: true,
+  })
+  const deviceBind = gpuBwrap.indexOf('--dev-bind')
+  assert.deepEqual(gpuBwrap.slice(deviceBind, deviceBind + 3), ['--dev-bind', '/dev/dxg', '/dev/dxg'])
+  const libraryPath = gpuBwrap.indexOf('LD_LIBRARY_PATH')
+  assert.equal(gpuBwrap[libraryPath + 1], '/usr/lib/wsl/lib:/usr/lib/x86_64-linux-gnu')
 
   const linuxArgs = nativeExecArgs({
     task: { goal: 'fix the task', budgets: { max_steps: 1, max_output_tokens_per_step: 32, command_ms: 1000 } },
