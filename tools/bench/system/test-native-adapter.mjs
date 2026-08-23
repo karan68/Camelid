@@ -75,6 +75,9 @@ try {
   })
   assert.ok(bwrap.includes('--unshare-all'))
   assert.ok(bwrap.includes('--clearenv'))
+  for (const directory of ['/opt/camelid', '/model', '/workspace']) {
+    assert.ok(bwrap.includes(directory), directory)
+  }
   assert.equal(bwrap.join(' ').includes('--bind /mnt/c /mnt/c'), false)
   assert.ok(bwrap.includes('/mnt/c/models/model.gguf'))
   assert.ok(bwrap.includes('/mnt/c/runs/task/attempt'))

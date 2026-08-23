@@ -3,12 +3,14 @@ import { readFile, rm } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 
 import { validateAgentAttempt, validateAgentExecTrace } from '../lib/contracts.mjs'
+import { controllerManifest } from '../lib/controller-manifest.mjs'
 import { sha256File } from '../lib/digest.mjs'
 import { runProcess } from '../process/runner.mjs'
 import { loadTaskPackage, materializeTask, scoreTaskAttempt } from '../tasks/package.mjs'
 
 const FORBIDDEN_SHARED_FLAGS = new Set(['--allow-net', '--allow-fs', '--allow-mcp'])
-const COMMON_NATIVE_TOOLS = new Set(['read_file', 'list_dir', 'search', 'write_file', 'edit_file', 'run_shell', 'update_plan'])
+const COMMON_NATIVE_TOOLS = new Set(['read_file', 'list_dir', 'search', 'write_file', 'edit_file', 'run_shell'])
+const systemRoot = resolve(import.meta.dirname, '..')
 
 export async function runNativeAgentAttempt(options) {
   const normalized = validateOptions(options)
@@ -25,6 +27,7 @@ export async function runNativeAgentAttempt(options) {
     sha256File(normalized.binaryPath),
     sha256File(normalized.modelPath),
   ])
+  const controller = await controllerManifest(systemRoot)
   if (normalized.boundary.kind === 'wsl-bwrap') {
     await verifyWslBoundary(normalized.boundary)
     await verifyWslIdentity(normalized.boundary, binarySha256, modelSha256)
@@ -93,6 +96,7 @@ export async function runNativeAgentAttempt(options) {
       source_sha: normalized.sourceSha,
       binary_sha256: binarySha256,
       model_sha256: modelSha256,
+      controller_manifest_sha256: controller.sha256,
     },
     boundary: normalized.boundary.kind,
     address: 'loopback_ephemeral',
@@ -149,6 +153,10 @@ export function wslBwrapPrefix({ distribution, linuxBinaryPath, linuxModelPath, 
     '--proc', '/proc',
     '--dev', '/dev',
     '--tmpfs', '/tmp',
+    '--dir', '/opt',
+    '--dir', '/opt/camelid',
+    '--dir', '/model',
+    '--dir', '/workspace',
     '--dir', '/tmp/home',
     '--ro-bind', linuxBinaryPath, '/opt/camelid/camelid',
     '--ro-bind', linuxModelPath, '/model/model.gguf',
