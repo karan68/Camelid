@@ -125,6 +125,7 @@ async function prepareLaunch(options, attemptRoot, tracePath) {
       tracePath,
     }
   }
+  const sandboxModelPath = linuxModelSandboxPath(options.boundary.linuxModelPath)
   return {
     file: options.boundary.wslExecutable,
     prefixArgs: wslBwrapPrefix({
@@ -135,13 +136,14 @@ async function prepareLaunch(options, attemptRoot, tracePath) {
     }),
     // Each bwrap process owns a fresh network namespace.
     addr: '127.0.0.1:8231',
-    modelPath: '/model/model.gguf',
+    modelPath: sandboxModelPath,
     workdir: '/workspace',
     tracePath: '/workspace/.camelid-benchmark-trace.json',
   }
 }
 
 export function wslBwrapPrefix({ distribution, linuxBinaryPath, linuxModelPath, linuxAttemptPath }) {
+  const sandboxModelPath = linuxModelSandboxPath(linuxModelPath)
   return [
     '-d', distribution, '--',
     'bwrap',
@@ -162,7 +164,7 @@ export function wslBwrapPrefix({ distribution, linuxBinaryPath, linuxModelPath, 
     '--dir', '/workspace',
     '--dir', '/tmp/home',
     '--ro-bind', linuxBinaryPath, '/opt/camelid/camelid',
-    '--ro-bind', linuxModelPath, '/model/model.gguf',
+    '--ro-bind', linuxModelPath, sandboxModelPath,
     '--bind', linuxAttemptPath, '/workspace',
     '--chdir', '/workspace',
     '--clearenv',
@@ -170,6 +172,14 @@ export function wslBwrapPrefix({ distribution, linuxBinaryPath, linuxModelPath, 
     '--setenv', 'HOME', '/tmp/home',
     '/opt/camelid/camelid',
   ]
+}
+
+export function linuxModelSandboxPath(path) {
+  const filename = path.split('/').at(-1)
+  if (!filename || filename === '.' || filename === '..') {
+    throw new TypeError('linuxModelPath must name a model file')
+  }
+  return `/model/${filename}`
 }
 
 export function windowsPathToWsl(path) {

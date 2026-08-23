@@ -7,6 +7,7 @@ import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import {
+  linuxModelSandboxPath,
   NativeAdapterError,
   nativeExecArgs,
   runNativeAgentAttempt,
@@ -84,17 +85,19 @@ try {
   }
   assert.equal(bwrap.join(' ').includes('--bind /mnt/c /mnt/c'), false)
   assert.ok(bwrap.includes('/mnt/c/models/model.gguf'))
+  assert.ok(bwrap.includes('/model/model.gguf'))
   assert.ok(bwrap.includes('/mnt/c/runs/task/attempt'))
   assert.equal(windowsPathToWsl('C:\\runs\\task'), '/mnt/c/runs/task')
+  assert.equal(linuxModelSandboxPath('/root/models/Qwen3-4B-Q4_K_M.gguf'), '/model/Qwen3-4B-Q4_K_M.gguf')
 
   const linuxArgs = nativeExecArgs({
     task: { goal: 'fix the task', budgets: { max_steps: 1, max_output_tokens_per_step: 32, command_ms: 1000 } },
-    modelPath: '/model/model.gguf',
+    modelPath: '/model/Qwen3-4B-Q4_K_M.gguf',
     workdir: '/workspace',
     addr: '127.0.0.1:8231',
     tracePath: '/workspace/.camelid-benchmark-trace.json',
   })
-  assert.equal(linuxArgs[linuxArgs.indexOf('--model') + 1], '/model/model.gguf')
+  assert.equal(linuxArgs[linuxArgs.indexOf('--model') + 1], '/model/Qwen3-4B-Q4_K_M.gguf')
   assert.equal(linuxArgs[linuxArgs.indexOf('--workdir') + 1], '/workspace')
   assert.equal(linuxArgs[linuxArgs.indexOf('--benchmark-events') + 1], '/workspace/.camelid-benchmark-trace.json')
 } finally {
