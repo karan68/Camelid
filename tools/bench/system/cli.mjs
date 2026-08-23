@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises'
-import { dirname, isAbsolute, resolve } from 'node:path'
+import { basename, dirname, isAbsolute, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { writeBenchmarkBundle, verifyBundleChecksums } from './bundle.mjs'
@@ -10,6 +10,7 @@ import { acquireCampaignLock, assertMinimumFreeDisk } from './lib/safety.mjs'
 import { resolveCampaignPlan, serializePlan } from './planner.mjs'
 import { prepareArms } from './prepare.mjs'
 import { runRuntimeCampaign } from './adapters/runtime-camelid.mjs'
+import { loadTaskPackage, materializeTask, scoreTaskAttempt } from './tasks/package.mjs'
 
 const systemRoot = resolve(fileURLToPath(new URL('.', import.meta.url)))
 const args = parseArgs(process.argv.slice(2))
@@ -77,6 +78,47 @@ try {
     } finally {
       await lock.release()
     }
+  } else if (command === 'task-verify') {
+    const taskPath = requiredValue(args, 'task')
+    const taskPackage = await loadTaskPackage(resolve(taskPath))
+    process.stdout.write(canonicalJson({
+      schema: 'camelid.benchmark.task-package-verification/v1',
+      task_id: taskPackage.task.id,
+      task_definition_sha256: taskPackage.taskDefinitionSha256,
+      fixture_manifest_sha256: taskPackage.fixture.sha256,
+      scorer_manifest_sha256: taskPackage.scorer.sha256,
+      verified: true,
+    }))
+  } else if (command === 'task-materialize') {
+    const taskPath = requiredValue(args, 'task')
+    const workspacePath = requiredValue(args, 'workspace')
+    const taskPackage = await loadTaskPackage(resolve(taskPath))
+    const materialized = await materializeTask(taskPackage, resolve(workspacePath))
+    process.stdout.write(canonicalJson({
+      schema: 'camelid.benchmark.task-materialization/v1',
+      task_id: taskPackage.task.id,
+      workspace_root: materialized.workspaceRoot,
+      attempt_root: materialized.attemptRoot,
+      setup_passed: true,
+    }))
+  } else if (command === 'task-score') {
+    const taskPath = resolve(requiredValue(args, 'task'))
+    const workspacePath = resolve(requiredValue(args, 'workspace'))
+    const result = await scoreTaskAttempt(taskPath, workspacePath)
+    let taskId = basename(taskPath)
+    try {
+      taskId = JSON.parse(await readFile(resolve(taskPath, 'task.json'), 'utf8')).id ?? taskId
+    } catch {
+      // The invalid score remains the authority when the manifest itself is unreadable.
+    }
+    const record = canonicalJson({
+      schema: 'camelid.benchmark.task-score/v1',
+      task_id: taskId,
+      ...result,
+    })
+    if (args.values.has('out')) await writeText(resolve(args.values.get('out')), record)
+    process.stdout.write(record)
+    if (result.outcome.startsWith('INVALID_')) process.exitCode = 1
   } else {
     process.stdout.write(usage())
     process.exitCode = command ? 2 : 0
@@ -91,7 +133,7 @@ try {
       error_message: error.message,
     })).catch(() => {})
   }
-  console.error(`benchmark Phase 1 ${command ?? 'command'} failed: ${error.message}`)
+  console.error(`benchmark system ${command ?? 'command'} failed: ${error.message}`)
   process.exitCode = 1
 }
 
@@ -147,6 +189,12 @@ function parseArgs(argv) {
   return { positionals, values }
 }
 
+function requiredValue(parsed, name) {
+  const value = parsed.values.get(name)
+  if (!value) throw new Error(`--${name} is required`)
+  return value
+}
+
 async function requireNewDirectory(path) {
   try {
     const info = await stat(path)
@@ -169,8 +217,11 @@ function joinDefaultOutput(repositoryRoot) {
 }
 
 function usage() {
-  return `Camelid Phase 1 benchmark system\n\n` +
+  return `Camelid benchmark system\n\n` +
     `  node tools/bench/system/cli.mjs digest\n` +
     `  node tools/bench/system/cli.mjs plan --config <campaign.json> [--out <plan.json>]\n` +
-    `  node tools/bench/system/cli.mjs run --config <campaign.json> [--out-root <dir>] [--prepared <prepared-arms.json>]\n`
+    `  node tools/bench/system/cli.mjs run --config <campaign.json> [--out-root <dir>] [--prepared <prepared-arms.json>]\n` +
+    `  node tools/bench/system/cli.mjs task-verify --task <task-dir>\n` +
+    `  node tools/bench/system/cli.mjs task-materialize --task <task-dir> --workspace <new-workspace>\n` +
+    `  node tools/bench/system/cli.mjs task-score --task <task-dir> --workspace <workspace> [--out <score.json>]\n`
 }

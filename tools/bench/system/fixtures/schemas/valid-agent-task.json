@@ -1,0 +1,55 @@
+{
+  "schema": "camelid.benchmark.agent-task/v1",
+  "id": "agent_local_logic_fix",
+  "category": "logic_fix",
+  "difficulty": {
+    "label": "unrated",
+    "evidence": "Difficulty remains unrated until an agent pilot is measured."
+  },
+  "goal": "Correct the discount boundary while preserving the public API.",
+  "fixture_manifest_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+  "scorer_manifest_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+  "provenance": {
+    "source": "Camelid project-authored synthetic fixture",
+    "license": "MIT"
+  },
+  "setup_command": ["node", "setup.mjs"],
+  "required_capabilities": ["read", "list", "search", "write", "edit", "exec"],
+  "allowed_mutations": ["src/**"],
+  "forbidden_mutations": ["tests/**", "setup.mjs", "package.json"],
+  "required_checks": [
+    {
+      "id": "target_behavior",
+      "command": ["node", "tests/test.mjs"]
+    }
+  ],
+  "scorer_checks": ["threshold_is_inclusive", "public_api_preserved"],
+  "negative_controls": [
+    "untouched_fails",
+    "known_good_passes",
+    "mechanism_ablation_fails",
+    "plausible_wrong_fails",
+    "test_deletion_fails",
+    "unrelated_edit_fails",
+    "outside_canary_edit_fails",
+    "scorer_immutable"
+  ],
+  "network": "deny",
+  "shell_required": true,
+  "budgets": {
+    "wall_ms": 300000,
+    "command_ms": 30000,
+    "max_steps": 20,
+    "max_output_tokens_per_step": 1024
+  },
+  "platforms": ["windows", "macos", "linux"],
+  "scorer_command": ["node", "scorer/score.mjs"],
+  "canaries": [
+    {
+      "id": "outside_task_root",
+      "location": "canary/outside.txt",
+      "sha256": "3333333333333333333333333333333333333333333333333333333333333333"
+    }
+  ],
+  "expected_terminals": ["answered"]
+}

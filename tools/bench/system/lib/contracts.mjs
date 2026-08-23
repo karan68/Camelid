@@ -39,6 +39,34 @@ const RUNTIME_VERDICTS = new Set([
 ])
 const BACKENDS = new Set(['cpu_deterministic'])
 const BACKEND_ASSERTIONS = new Set(['deterministic_no_offload'])
+const AGENT_CAPABILITIES = new Set(['read', 'list', 'search', 'write', 'edit', 'exec'])
+const AGENT_DIFFICULTIES = new Set(['unrated', 'easy', 'medium', 'hard'])
+const AGENT_PLATFORMS = new Set(['windows', 'macos', 'linux'])
+const AGENT_TERMINALS = new Set(['answered', 'failed', 'inconclusive', 'timed_out', 'cancelled', 'adapter_error'])
+const NEGATIVE_CONTROLS = new Set([
+  'untouched_fails',
+  'known_good_passes',
+  'mechanism_ablation_fails',
+  'plausible_wrong_fails',
+  'test_deletion_fails',
+  'unrelated_edit_fails',
+  'outside_canary_edit_fails',
+  'scorer_immutable',
+])
+const AGENT_ADAPTERS = new Set(['camelid-native', 'pi'])
+const AGENT_COMPARABILITY = new Set(['comparable', 'noncomparable'])
+const AGENT_OUTCOMES = new Set([
+  'PASS_COMPARABLE',
+  'PASS_NONCOMPARABLE',
+  'FAIL_BEHAVIOR',
+  'FAIL_FORBIDDEN_MUTATION',
+  'FAIL_AGENT_TERMINAL',
+  'INCONCLUSIVE_TIMEOUT',
+  'INCONCLUSIVE_STEP_CAP',
+  'INVALID_FIXTURE',
+  'INVALID_SCORER',
+  'INVALID_INFRASTRUCTURE',
+])
 
 export class ContractError extends Error {
   constructor(contract, issues) {
@@ -408,6 +436,164 @@ export function validateComparison(value) {
   return value
 }
 
+export function validateAgentTask(value) {
+  const issues = []
+  object(value, '$', issues)
+  if (issues.length > 0) fail('agent-task/v1', issues)
+  exactKeys(value, '$', [
+    'schema', 'id', 'category', 'difficulty', 'goal', 'fixture_manifest_sha256',
+    'scorer_manifest_sha256', 'provenance', 'setup_command', 'required_capabilities',
+    'allowed_mutations', 'forbidden_mutations', 'required_checks', 'scorer_checks', 'negative_controls',
+    'network', 'shell_required', 'budgets', 'platforms', 'scorer_command', 'canaries',
+    'expected_terminals',
+  ], [], issues)
+  equal(value.schema, 'camelid.benchmark.agent-task/v1', '$.schema', issues)
+  id(value.id, '$.id', issues)
+  id(value.category, '$.category', issues)
+  nestedObject(value.difficulty, '$.difficulty', ['label', 'evidence'], issues, (difficulty) => {
+    member(difficulty.label, AGENT_DIFFICULTIES, '$.difficulty.label', issues)
+    nonEmpty(difficulty.evidence, '$.difficulty.evidence', issues)
+    if (difficulty.label !== 'unrated' && typeof difficulty.evidence === 'string' && !difficulty.evidence.includes('observed')) {
+      issues.push('$.difficulty.evidence must cite observed completion data for a rated task')
+    }
+  })
+  nonEmpty(value.goal, '$.goal', issues)
+  sha256(value.fixture_manifest_sha256, '$.fixture_manifest_sha256', issues)
+  sha256(value.scorer_manifest_sha256, '$.scorer_manifest_sha256', issues)
+  nestedObject(value.provenance, '$.provenance', ['source', 'license'], issues, (provenance) => {
+    nonEmpty(provenance.source, '$.provenance.source', issues)
+    nonEmpty(provenance.license, '$.provenance.license', issues)
+  })
+  command(value.setup_command, '$.setup_command', issues)
+  memberArray(value.required_capabilities, AGENT_CAPABILITIES, '$.required_capabilities', issues)
+  pathPatternArray(value.allowed_mutations, '$.allowed_mutations', issues)
+  pathPatternArray(value.forbidden_mutations, '$.forbidden_mutations', issues)
+  identifiedCommands(value.required_checks, '$.required_checks', issues)
+  nonEmptyStringArray(value.scorer_checks, '$.scorer_checks', issues, true)
+  if (Array.isArray(value.scorer_checks)) {
+    value.scorer_checks.forEach((checkId, index) => id(checkId, `$.scorer_checks[${index}]`, issues))
+  }
+  memberArray(value.negative_controls, NEGATIVE_CONTROLS, '$.negative_controls', issues)
+  for (const control of NEGATIVE_CONTROLS) {
+    if (Array.isArray(value.negative_controls) && !value.negative_controls.includes(control)) {
+      issues.push(`$.negative_controls must include ${control}`)
+    }
+  }
+  equal(value.network, 'deny', '$.network', issues)
+  boolean(value.shell_required, '$.shell_required', issues)
+  nestedObject(value.budgets, '$.budgets', [
+    'wall_ms', 'command_ms', 'max_steps', 'max_output_tokens_per_step',
+  ], issues, (budgets) => {
+    positiveInteger(budgets.wall_ms, '$.budgets.wall_ms', issues)
+    positiveInteger(budgets.command_ms, '$.budgets.command_ms', issues)
+    positiveInteger(budgets.max_steps, '$.budgets.max_steps', issues)
+    positiveInteger(budgets.max_output_tokens_per_step, '$.budgets.max_output_tokens_per_step', issues)
+    if (Number.isSafeInteger(budgets.wall_ms) && Number.isSafeInteger(budgets.command_ms)
+      && budgets.command_ms > budgets.wall_ms) {
+      issues.push('$.budgets.command_ms cannot exceed $.budgets.wall_ms')
+    }
+  })
+  memberArray(value.platforms, AGENT_PLATFORMS, '$.platforms', issues)
+  command(value.scorer_command, '$.scorer_command', issues)
+  canaries(value.canaries, '$.canaries', issues)
+  memberArray(value.expected_terminals, AGENT_TERMINALS, '$.expected_terminals', issues)
+  if (issues.length > 0) fail('agent-task/v1', issues)
+  return value
+}
+
+export function validateAgentAttempt(value) {
+  const issues = []
+  object(value, '$', issues)
+  if (issues.length > 0) fail('agent-attempt/v1', issues)
+  exactKeys(value, '$', [
+    'schema', 'campaign_id', 'task_id', 'adapter', 'attempt', 'comparability',
+    'terminal', 'score', 'usage', 'timing', 'process',
+  ], [], issues)
+  equal(value.schema, 'camelid.benchmark.agent-attempt/v1', '$.schema', issues)
+  id(value.campaign_id, '$.campaign_id', issues)
+  id(value.task_id, '$.task_id', issues)
+  member(value.adapter, AGENT_ADAPTERS, '$.adapter', issues)
+  nonNegativeInteger(value.attempt, '$.attempt', issues)
+  member(value.comparability, AGENT_COMPARABILITY, '$.comparability', issues)
+  nestedObject(value.terminal, '$.terminal', ['class', 'exit_code', 'reason'], issues, (terminal) => {
+    member(terminal.class, AGENT_TERMINALS, '$.terminal.class', issues)
+    if (terminal.exit_code !== null && !Number.isInteger(terminal.exit_code)) issues.push('$.terminal.exit_code must be an integer or null')
+    nonEmpty(terminal.reason, '$.terminal.reason', issues)
+  })
+  nestedObject(value.score, '$.score', ['outcome', 'required_checks', 'passed_checks', 'diff_sha256'], issues, (score) => {
+    member(score.outcome, AGENT_OUTCOMES, '$.score.outcome', issues)
+    positiveInteger(score.required_checks, '$.score.required_checks', issues)
+    nonNegativeInteger(score.passed_checks, '$.score.passed_checks', issues)
+    if (Number.isInteger(score.required_checks) && Number.isInteger(score.passed_checks)
+      && score.passed_checks > score.required_checks) {
+      issues.push('$.score.passed_checks cannot exceed $.score.required_checks')
+    }
+    sha256(score.diff_sha256, '$.score.diff_sha256', issues)
+  })
+  nestedObject(value.usage, '$.usage', [
+    'model_steps', 'tool_calls', 'input_tokens', 'output_tokens', 'unavailable_reason',
+  ], issues, (usage) => {
+    const names = ['model_steps', 'tool_calls', 'input_tokens', 'output_tokens']
+    for (const name of names) nullableNonNegativeInteger(usage[name], `$.usage.${name}`, issues)
+    const unavailable = names.some((name) => usage[name] === null)
+    if (unavailable) nonEmpty(usage.unavailable_reason, '$.usage.unavailable_reason', issues)
+    else if (usage.unavailable_reason !== null) issues.push('$.usage.unavailable_reason must be null when all usage values are available')
+  })
+  nestedObject(value.timing, '$.timing', ['wall_ms', 'model_ms', 'ttft_ms'], issues, (timing) => {
+    nonNegativeNumber(timing.wall_ms, '$.timing.wall_ms', issues)
+    nullableNonNegativeNumber(timing.model_ms, '$.timing.model_ms', issues)
+    nullableNonNegativeNumber(timing.ttft_ms, '$.timing.ttft_ms', issues)
+  })
+  nestedObject(value.process, '$.process', ['cleanup_passed'], issues, (process) => {
+    boolean(process.cleanup_passed, '$.process.cleanup_passed', issues)
+  })
+  if (value.score?.outcome === 'PASS_COMPARABLE') {
+    equal(value.comparability, 'comparable', '$.comparability', issues)
+    equal(value.terminal?.class, 'answered', '$.terminal.class', issues)
+    equal(value.terminal?.exit_code, 0, '$.terminal.exit_code', issues)
+    equal(value.process?.cleanup_passed, true, '$.process.cleanup_passed', issues)
+    if (value.score?.passed_checks !== value.score?.required_checks) issues.push('$.score.passed_checks must equal required_checks for PASS_COMPARABLE')
+  }
+  if (value.score?.outcome === 'PASS_NONCOMPARABLE') {
+    equal(value.comparability, 'noncomparable', '$.comparability', issues)
+    equal(value.terminal?.class, 'answered', '$.terminal.class', issues)
+    equal(value.terminal?.exit_code, 0, '$.terminal.exit_code', issues)
+    equal(value.process?.cleanup_passed, true, '$.process.cleanup_passed', issues)
+    if (value.score?.passed_checks !== value.score?.required_checks) issues.push('$.score.passed_checks must equal required_checks for PASS_NONCOMPARABLE')
+  }
+  if (value.score?.outcome === 'INCONCLUSIVE_TIMEOUT') equal(value.terminal?.class, 'timed_out', '$.terminal.class', issues)
+  if (value.score?.outcome === 'INCONCLUSIVE_STEP_CAP') equal(value.terminal?.class, 'inconclusive', '$.terminal.class', issues)
+  if (issues.length > 0) fail('agent-attempt/v1', issues)
+  return value
+}
+
+export function validateTaskCheck(value) {
+  const issues = []
+  object(value, '$', issues)
+  if (issues.length > 0) fail('task-check/v1', issues)
+  exactKeys(value, '$', ['schema', 'passed', 'checks'], [], issues)
+  equal(value.schema, 'camelid.benchmark.task-check/v1', '$.schema', issues)
+  boolean(value.passed, '$.passed', issues)
+  nonEmptyArray(value.checks, '$.checks', issues)
+  const checkIds = new Set()
+  if (Array.isArray(value.checks)) {
+    value.checks.forEach((check, index) => {
+      const path = `$.checks[${index}]`
+      nestedObject(check, path, ['id', 'passed', 'detail'], issues, (item) => {
+        id(item.id, `${path}.id`, issues)
+        unique(item.id, checkIds, `${path}.id`, issues)
+        boolean(item.passed, `${path}.passed`, issues)
+        nonEmpty(item.detail, `${path}.detail`, issues)
+      })
+    })
+    if (typeof value.passed === 'boolean' && value.passed !== value.checks.every((check) => check?.passed === true)) {
+      issues.push('$.passed must equal the conjunction of $.checks[].passed')
+    }
+  }
+  if (issues.length > 0) fail('task-check/v1', issues)
+  return value
+}
+
 export function validateBenchGenerateRecord(value) {
   const issues = []
   object(value, '$', issues)
@@ -519,6 +705,79 @@ function stringArray(value, path, issues, uniqueValues) {
   })
 }
 
+function memberArray(value, members, path, issues) {
+  nonEmptyStringArray(value, path, issues, true)
+  if (!Array.isArray(value)) return
+  value.forEach((item, index) => member(item, members, `${path}[${index}]`, issues))
+}
+
+function command(value, path, issues) {
+  nonEmptyStringArray(value, path, issues, false)
+  if (!Array.isArray(value)) return
+  if (value[0] !== 'node') issues.push(`${path}[0] must equal "node"`)
+  let script
+  if (value[1] === '--check') {
+    if (value.length !== 3) issues.push(`${path} using --check must contain exactly three items`)
+    script = value[2]
+  } else {
+    if (value.length !== 2) issues.push(`${path} must contain exactly two items`)
+    script = value[1]
+  }
+  relativePath(script, `${path}.script`, issues)
+  if (typeof script === 'string' && !/[.](?:cjs|mjs|js)$/.test(script)) {
+    issues.push(`${path}.script must name a JavaScript file`)
+  }
+}
+
+function pathPatternArray(value, path, issues) {
+  nonEmptyStringArray(value, path, issues, true)
+  if (!Array.isArray(value)) return
+  value.forEach((pattern, index) => relativePath(pattern, `${path}[${index}]`, issues))
+}
+
+function relativePath(value, path, issues) {
+  nonEmpty(value, path, issues)
+  if (typeof value !== 'string' || value.length === 0) return
+  if (value.includes('\\')) issues.push(`${path} must use forward slashes`)
+  if (value.startsWith('/') || /^[A-Za-z]:/.test(value)) issues.push(`${path} must be relative`)
+  if (value.split('/').includes('..')) issues.push(`${path} cannot contain a parent segment`)
+  const wildcardIndex = value.search(/[?*]/)
+  if (wildcardIndex >= 0 && (!value.endsWith('/**') || wildcardIndex !== value.length - 2)) {
+    issues.push(`${path} may use wildcards only as a trailing /**`)
+  }
+}
+
+function identifiedCommands(value, path, issues) {
+  nonEmptyArray(value, path, issues)
+  if (!Array.isArray(value)) return
+  const ids = new Set()
+  value.forEach((item, index) => {
+    const itemPath = `${path}[${index}]`
+    nestedObject(item, itemPath, ['id', 'command'], issues, (check) => {
+      id(check.id, `${itemPath}.id`, issues)
+      unique(check.id, ids, `${itemPath}.id`, issues)
+      command(check.command, `${itemPath}.command`, issues)
+    })
+  })
+}
+
+function canaries(value, path, issues) {
+  nonEmptyArray(value, path, issues)
+  if (!Array.isArray(value)) return
+  const ids = new Set()
+  const locations = new Set()
+  value.forEach((item, index) => {
+    const itemPath = `${path}[${index}]`
+    nestedObject(item, itemPath, ['id', 'location', 'sha256'], issues, (canary) => {
+      id(canary.id, `${itemPath}.id`, issues)
+      unique(canary.id, ids, `${itemPath}.id`, issues)
+      relativePath(canary.location, `${itemPath}.location`, issues)
+      unique(canary.location, locations, `${itemPath}.location`, issues)
+      sha256(canary.sha256, `${itemPath}.sha256`, issues)
+    })
+  })
+}
+
 function nonEmptyStringArray(value, path, issues, uniqueValues) {
   if (!Array.isArray(value) || value.length === 0) {
     issues.push(`${path} must be a non-empty array`)
@@ -579,12 +838,20 @@ function nonNegativeInteger(value, path, issues) {
   if (!Number.isSafeInteger(value) || value < 0) issues.push(`${path} must be a non-negative safe integer`)
 }
 
+function nullableNonNegativeInteger(value, path, issues) {
+  if (value !== null) nonNegativeInteger(value, path, issues)
+}
+
 function positiveNumber(value, path, issues) {
   if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) issues.push(`${path} must be a positive finite number`)
 }
 
 function nonNegativeNumber(value, path, issues) {
   if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) issues.push(`${path} must be a non-negative finite number`)
+}
+
+function nullableNonNegativeNumber(value, path, issues) {
+  if (value !== null) nonNegativeNumber(value, path, issues)
 }
 
 function nullableReason(value, path, issues, required) {
