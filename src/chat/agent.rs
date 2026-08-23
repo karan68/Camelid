@@ -347,6 +347,7 @@ pub fn run_loop(
         BTreeSet::new()
     };
     let mut observed_workspace = false;
+    let mut observed_file_content = false;
     let mut workspace_observations: Vec<(String, String)> = Vec::new();
     let mut successful_workspace_reads = BTreeSet::new();
     let mut calibration: Option<f32> = None;
@@ -434,6 +435,16 @@ pub fn run_loop(
         }
         match step {
             ModelStep::Text(text) => {
+                if cfg.tool_profile.is_benchmark_shared() && !observed_file_content {
+                    reporter.notice("Shared benchmark requires file evidence before answering");
+                    history.push(AgentMsg::System(
+                        "Inspect the actual workspace before answering. Use list_dir to discover \
+                         paths, then read_file or search to observe relevant file content. Do not \
+                         invent paths or describe a fix without applying and verifying it."
+                            .into(),
+                    ));
+                    continue;
+                }
                 let missing_reads = required_workspace_reads
                     .difference(&successful_workspace_reads)
                     .cloned()
@@ -525,6 +536,23 @@ pub fn run_loop(
                     }
                     let signature = format!("{}::{}", call.name, call.args);
                     *ran.entry(call.name.clone()).or_insert(0) += 1;
+                    if cfg.tool_profile.is_benchmark_shared()
+                        && !observed_file_content
+                        && !matches!(call.name.as_str(), "read_file" | "list_dir" | "search")
+                    {
+                        reporter.tool_call(&format!("{}(?)", call.name));
+                        let outcome = ToolOutcome::Err(
+                            "shared benchmark requires a successful read_file or search before \
+                             mutation or command execution; discover paths with list_dir first"
+                                .into(),
+                        );
+                        reporter.tool_result(&call.name, &outcome);
+                        history.push(AgentMsg::ToolResult {
+                            name: call.name,
+                            outcome,
+                        });
+                        continue;
+                    }
                     // Validate against schema + sandbox. A bad/unknown/escape call
                     // becomes a tool-error result the model can recover from.
                     let action = match tools::validate_for(cfg.tool_profile, &call, sandbox) {
@@ -595,6 +623,12 @@ pub fn run_loop(
                         }
                         workspace_observations
                             .push((action.tool_name().to_string(), outcome.text().to_string()));
+                    }
+                    if cfg.tool_profile.is_benchmark_shared() && !outcome.is_err() {
+                        observed_workspace = true;
+                        if matches!(action, Action::ReadFile { .. } | Action::Search { .. }) {
+                            observed_file_content = true;
+                        }
                     }
                     let name = action.tool_name();
                     reporter.tool_result(name, &outcome);
@@ -3378,6 +3412,58 @@ mod tests {
         assert_eq!(reporter.text.len(), 1);
         assert!(reporter.text[0].contains("Found 1 Markdown file"));
         assert!(reporter.text[0].contains("- `README.md`"));
+    }
+
+    #[test]
+    fn benchmark_requires_file_evidence_before_mutation_or_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("src/pricing.cjs"),
+            "if (subtotalCents > 10000) return subtotalCents\n",
+        )
+        .unwrap();
+        let sandbox = Sandbox::new(dir.path(), false, Duration::from_secs(5)).unwrap();
+        let mut driver = MockDriver {
+            steps: vec![
+                ModelStep::Text("done without looking".into()),
+                ModelStep::Calls(vec![tc(
+                    "edit_file",
+                    json!({"path":"src/pricing.cjs","old":"> 10000","new":">= 10000"}),
+                )]),
+                ModelStep::Calls(vec![tc("list_dir", json!({"path":"."}))]),
+                ModelStep::Calls(vec![tc("read_file", json!({"path":"src/pricing.cjs"}))]),
+                ModelStep::Calls(vec![tc(
+                    "edit_file",
+                    json!({"path":"src/pricing.cjs","old":"> 10000","new":">= 10000"}),
+                )]),
+                ModelStep::Text("fixed and verified".into()),
+            ],
+            idx: 0,
+        };
+        let mut approver = ScriptApprover(vec![Decision::Once], 0);
+        let mut reporter = RecordReporter::default();
+        let mut history = vec![AgentMsg::User("fix the discount boundary".into())];
+        let mut config = cfg(dir.path(), false);
+        config.tool_profile = tools::ToolProfile::BenchmarkShared;
+
+        let end = run_loop(
+            &mut driver,
+            &mut approver,
+            &mut reporter,
+            &sandbox,
+            &config,
+            &AtomicBool::new(false),
+            &mut Policy::default(),
+            &mut history,
+        );
+
+        assert_eq!(end, LoopEnd::Answered);
+        assert!(reporter.results[0].contains("requires a successful read_file"));
+        assert_eq!(reporter.text, vec!["fixed and verified"]);
+        assert!(std::fs::read_to_string(dir.path().join("src/pricing.cjs"))
+            .unwrap()
+            .contains(">= 10000"));
     }
 
     #[test]

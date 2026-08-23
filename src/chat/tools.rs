@@ -420,6 +420,10 @@ impl ToolProfile {
         self == Self::WorkspaceReadOnly
     }
 
+    pub fn is_benchmark_shared(self) -> bool {
+        self == Self::BenchmarkShared
+    }
+
     pub fn observation_limit(self) -> Option<usize> {
         match self {
             Self::Full | Self::BenchmarkShared => None,
