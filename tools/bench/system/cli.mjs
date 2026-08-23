@@ -137,6 +137,7 @@ try {
       sourceSha: requiredValue(args, 'source-sha'),
       attempt: integerValue(args, 'attempt', 0, true),
       timeoutMs: integerValue(args, 'timeout-ms', null, false),
+      maxOutputTokensPerStep: optionalIntegerValue(args, 'max-tokens-per-step'),
       boundary: {
         kind: 'wsl-bwrap',
         distribution: args.values.get('wsl-distribution') ?? 'Ubuntu',
@@ -247,6 +248,11 @@ function booleanValue(parsed, name, fallback) {
   return raw === 'true'
 }
 
+function optionalIntegerValue(parsed, name) {
+  if (!parsed.values.has(name)) return null
+  return integerValue(parsed, name, null, false)
+}
+
 async function requireNewDirectory(path) {
   try {
     const info = await stat(path)
@@ -276,5 +282,5 @@ function usage() {
     `  node tools/bench/system/cli.mjs task-verify --task <task-dir>\n` +
     `  node tools/bench/system/cli.mjs task-materialize --task <task-dir> --workspace <new-workspace>\n` +
     `  node tools/bench/system/cli.mjs task-score --task <task-dir> --workspace <workspace> [--out <score.json>]\n` +
-    `  node tools/bench/system/cli.mjs native-run --task <task-dir> --workspace <new-workspace> --binary <windows-visible-linux-binary> --linux-binary <linux-path> --model <windows-model> --linux-model <linux-path> --source-sha <sha> --campaign-id <id> --timeout-ms <ms> --out <bundle-dir> [--wsl-gpu <true|false>]\n`
+    `  node tools/bench/system/cli.mjs native-run --task <task-dir> --workspace <new-workspace> --binary <windows-visible-linux-binary> --linux-binary <linux-path> --model <windows-model> --linux-model <linux-path> --source-sha <sha> --campaign-id <id> --timeout-ms <ms> --out <bundle-dir> [--wsl-gpu <true|false>] [--max-tokens-per-step <n>]\n`
 }

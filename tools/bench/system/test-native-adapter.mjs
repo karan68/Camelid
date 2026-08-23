@@ -31,6 +31,11 @@ try {
     (error) => error instanceof NativeAdapterError && error.outcome === 'INVALID_FIXTURE',
   )
   assert.equal(await exists(join(tempRoot, 'workspace-over-budget')), false)
+  await assert.rejects(
+    run('token-over-budget', { kind: 'synthetic' }, 5000, 1025),
+    (error) => error instanceof NativeAdapterError && error.outcome === 'INVALID_FIXTURE',
+  )
+  assert.equal(await exists(join(tempRoot, 'workspace-token-over-budget')), false)
 
   const answered = await run('answered', { kind: 'synthetic' })
   assert.equal(answered.attempt.terminal.class, 'answered')
@@ -44,6 +49,7 @@ try {
   assert.equal(answered.attempt.usage.output_tokens, 7)
   assert.equal(answered.attempt.timing.model_ms, 20)
   assert.equal(answered.attempt.timing.ttft_ms, 3)
+  assert.equal(answered.max_output_tokens_per_step, 1024)
   assert.equal(answered.identity.task_definition_sha256, '45729be61b56480e6656dc19fa1e4b01fc0d8784ab8b880ed1d09dc60f0e709b')
   assert.equal(answered.identity.fixture_manifest_sha256, 'f5a273b7ae8d07987de95ec85389bbceba3a3d632c31689e86179ffc4f9e2895')
   assert.equal(answered.identity.scorer_manifest_sha256, '6b8fe59f3fc70be1ce38d12809c49768015e9893808f203ac89cb23980c49973')
@@ -109,17 +115,19 @@ try {
     workdir: '/workspace',
     addr: '127.0.0.1:8231',
     tracePath: '/workspace/.camelid-benchmark-trace.json',
+    maxOutputTokensPerStep: 256,
   })
   assert.equal(linuxArgs[linuxArgs.indexOf('--model') + 1], '/model/Qwen3-4B-Q4_K_M.gguf')
   assert.equal(linuxArgs[linuxArgs.indexOf('--workdir') + 1], '/workspace')
   assert.equal(linuxArgs[linuxArgs.indexOf('--benchmark-events') + 1], '/workspace/.camelid-benchmark-trace.json')
+  assert.equal(linuxArgs[linuxArgs.indexOf('--max-tokens') + 1], '256')
 } finally {
   await rm(tempRoot, { recursive: true, force: true })
 }
 
 console.log('benchmark Phase 3 native adapter canned lifecycle: PASS')
 
-async function run(mode, boundary, timeoutMs = 5000) {
+async function run(mode, boundary, timeoutMs = 5000, maxOutputTokensPerStep = null) {
   const scriptPath = await fakeCandidate(mode)
   return runNativeAgentAttempt({
     taskRoot,
@@ -130,6 +138,7 @@ async function run(mode, boundary, timeoutMs = 5000) {
     sourceSha: 'a'.repeat(40),
     attempt: 0,
     timeoutMs,
+    maxOutputTokensPerStep,
     boundary,
     env: {
       ...process.env,

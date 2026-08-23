@@ -105,13 +105,16 @@ node tools/bench/system/cli.mjs native-run \
   --binary <windows-visible-linux-binary> --linux-binary <linux-path> \
   --model <windows-model> --linux-model <linux-path> \
   --source-sha <sha> --campaign-id <id> --timeout-ms <ms> --out <bundle-dir> \
-  --wsl-gpu true
+  --wsl-gpu true --max-tokens-per-step 256
 ```
 
 CPU remains the default. `--wsl-gpu true` adds only the WSL GPU device and
 driver-library search path to the otherwise unchanged network-unshared
 bubblewrap boundary, requires a successful in-boundary GPU preflight, and is
 recorded in `adapter.json` and `manifest.json`.
+
+`--max-tokens-per-step` may tighten but never exceed the task package's declared
+per-step ceiling. The effective value is recorded in the same evidence files.
 
 The workspace path must not already exist. This prevents materialization from
 overwriting an unrelated directory or a pre-existing canary.

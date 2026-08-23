@@ -121,6 +121,7 @@ export async function writeNativeAgentBundle(input, options = {}) {
   await writeCanonical(join(outputDir, 'adapter.json'), {
     boundary: input.result.boundary,
     gpu_enabled: input.result.gpu_enabled,
+    max_output_tokens_per_step: input.result.max_output_tokens_per_step,
     address: input.result.address,
     trace_error: input.result.trace_error,
   })
@@ -149,6 +150,7 @@ export async function writeNativeAgentBundle(input, options = {}) {
     workspace_included: false,
     boundary: input.result.boundary,
     gpu_enabled: input.result.gpu_enabled,
+    max_output_tokens_per_step: input.result.max_output_tokens_per_step,
     claim_boundary: 'Local Phase 3 native-agent evidence only; scorer outcome is authoritative and no public model-quality claim is made.',
   }
   await writeCanonical(join(outputDir, 'manifest.json'), manifest)

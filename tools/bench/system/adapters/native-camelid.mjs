@@ -21,6 +21,11 @@ export async function runNativeAgentAttempt(options) {
   if (normalized.timeoutMs > taskPackage.task.budgets.wall_ms) {
     throw new NativeAdapterError('INVALID_FIXTURE', 'native adapter timeout cannot exceed the task wall budget')
   }
+  const maxOutputTokensPerStep = normalized.maxOutputTokensPerStep
+    ?? taskPackage.task.budgets.max_output_tokens_per_step
+  if (maxOutputTokensPerStep > taskPackage.task.budgets.max_output_tokens_per_step) {
+    throw new NativeAdapterError('INVALID_FIXTURE', 'native adapter token cap cannot exceed the task token budget')
+  }
 
   // Resolve immutable inputs before materializing any writable task state.
   const [binarySha256, modelSha256] = await Promise.all([
@@ -42,6 +47,7 @@ export async function runNativeAgentAttempt(options) {
     workdir: launch.workdir,
     addr: launch.addr,
     tracePath: launch.tracePath,
+    maxOutputTokensPerStep,
   })
   const startedAt = performance.now()
   const execution = await runProcess({
@@ -103,6 +109,7 @@ export async function runNativeAgentAttempt(options) {
     },
     boundary: normalized.boundary.kind,
     gpu_enabled: normalized.boundary.gpuEnabled,
+    max_output_tokens_per_step: maxOutputTokensPerStep,
     address: 'loopback_ephemeral',
     args,
     execution,
@@ -196,7 +203,7 @@ export function windowsPathToWsl(path) {
   return `/mnt/${match[1].toLowerCase()}/${match[2].replaceAll('\\', '/')}`
 }
 
-export function nativeExecArgs({ task, modelPath, workdir, addr, tracePath }) {
+export function nativeExecArgs({ task, modelPath, workdir, addr, tracePath, maxOutputTokensPerStep = task.budgets.max_output_tokens_per_step }) {
   const args = [
     'agent',
     'exec',
@@ -210,7 +217,7 @@ export function nativeExecArgs({ task, modelPath, workdir, addr, tracePath }) {
     '--max-steps',
     String(task.budgets.max_steps),
     '--max-tokens',
-    String(task.budgets.max_output_tokens_per_step),
+    String(maxOutputTokensPerStep),
     '--shell-sandbox',
     'sandboxed',
     '--shell-timeout',
@@ -265,6 +272,7 @@ function validateOptions(options) {
     sourceSha: options.sourceSha,
     attempt: options.attempt,
     timeoutMs: options.timeoutMs,
+    maxOutputTokensPerStep: optionalPositiveInteger(options.maxOutputTokensPerStep, 'maxOutputTokensPerStep'),
     env: options.env ?? process.env,
     boundary: validateBoundary(options),
     syntheticCandidatePrefix: syntheticPrefix(options),
@@ -468,4 +476,10 @@ function processSucceeded(execution) {
     && execution.exitCode === 0
     && execution.timedOut === false
     && execution.cleanupPassed === true
+}
+
+function optionalPositiveInteger(value, name) {
+  if (value === undefined || value === null) return null
+  if (!Number.isSafeInteger(value) || value < 1) throw new TypeError(`${name} must be a positive safe integer`)
+  return value
 }
