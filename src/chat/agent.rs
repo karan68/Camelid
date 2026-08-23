@@ -9,15 +9,16 @@
 //! the redraw loop) is a documented follow-up. See `DECISIONS.md` D9.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fs::OpenOptions;
 use std::io::Write;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use super::audit::{self, AuditEvent, AuditSink};
+use super::audit::{self, AuditEvent, AuditKind, AuditSink, InMemorySink};
 use super::banner;
 use super::client::{Client, StreamEnd};
 use super::session::{Session, CANCEL};
@@ -2241,8 +2242,9 @@ impl Approver for InlineApprover {
 pub fn run_exec(
     session: &mut Session,
     addr: SocketAddr,
-    cfg: AgentConfig,
+    mut cfg: AgentConfig,
     goal: &str,
+    benchmark_events: Option<&Path>,
 ) -> anyhow::Result<i32> {
     if !session.active_tool_capable() {
         eprintln!(
@@ -2266,6 +2268,11 @@ pub fn run_exec(
     let sandbox = Sandbox::new(&cfg.workdir, cfg.allow_net, cfg.shell_timeout)?
         .with_shell_mode(cfg.shell_sandbox)
         .with_fs_unrestricted(cfg.allow_fs);
+
+    let trace_audit = benchmark_events.map(|_| InMemorySink::default());
+    if let Some(sink) = &trace_audit {
+        cfg.audit = Box::new(sink.clone());
+    }
 
     super::subagent::configure(super::subagent::SubagentConfig::for_session(
         addr,
@@ -2291,7 +2298,8 @@ pub fn run_exec(
     let mut driver = LiveDriver::new(session, cfg.max_tokens, cfg.temperature);
     // Progress narrates on stderr so stdout carries only the answer and can be
     // piped into something else.
-    let mut reporter = StderrReporter;
+    let started = Instant::now();
+    let mut reporter = ExecTraceReporter::default();
     let mut approver = super::subagent::NonInteractiveApprover;
 
     CANCEL.store(false, Ordering::SeqCst);
@@ -2310,6 +2318,21 @@ pub fn run_exec(
         Some(AgentMsg::Assistant(a)) => a.clone(),
         _ => String::new(),
     };
+    let outcome = RunOutcome::classify(&end);
+    if let Some(path) = benchmark_events {
+        let audit_events = trace_audit
+            .as_ref()
+            .map(InMemorySink::events)
+            .unwrap_or_default();
+        write_exec_trace(
+            path,
+            &end,
+            outcome,
+            started.elapsed(),
+            &reporter,
+            &audit_events,
+        )?;
+    }
     // stdout is reserved for the answer so a headless run can be piped; every
     // other outcome narrates on stderr. The exit code itself is not decided
     // here -- it comes from the shared `RunOutcome` classifier the subagent
@@ -2321,7 +2344,7 @@ pub fn run_exec(
         LoopEnd::Repeated => eprintln!("stopped — the model was repeating a failing call"),
         LoopEnd::Aborted => eprintln!("aborted"),
     }
-    Ok(RunOutcome::classify(&end).exit_code())
+    Ok(outcome.exit_code())
 }
 
 /// Clear the plan without importing the module at every call site.
@@ -2329,9 +2352,18 @@ fn plan_reset() {
     super::plan::clear();
 }
 
-/// Reporter for headless runs: everything to stderr, so stdout stays the answer.
-struct StderrReporter;
-impl Reporter for StderrReporter {
+/// Reporter for headless runs. Human progress stays on stderr; the optional
+/// benchmark trace retains only typed metrics and counters.
+#[derive(Default)]
+struct ExecTraceReporter {
+    pending_context: Option<Value>,
+    steps: Vec<Value>,
+    compactions: u64,
+    model_ms: u64,
+    output_tokens: Option<u64>,
+}
+
+impl Reporter for ExecTraceReporter {
     fn model_text(&mut self, _text: &str) {}
     fn tool_call(&mut self, line: &str) {
         eprintln!("  ▸ {line}");
@@ -2341,7 +2373,110 @@ impl Reporter for StderrReporter {
         eprintln!("  └ {name}: {tag}");
     }
     fn notice(&mut self, text: &str) {
+        if text.starts_with("compacted context:") {
+            self.compactions = self.compactions.saturating_add(1);
+        }
         eprintln!("· {text}");
+    }
+    fn context_budget(&mut self, usage: ContextBudgetUsage) {
+        self.pending_context = Some(context_budget_json(usage));
+    }
+    fn model_timing(&mut self, metrics: ModelStepMetrics) {
+        let index = self.steps.len();
+        self.model_ms = self.model_ms.saturating_add(metrics.total_ms);
+        self.output_tokens = match (index, self.output_tokens, metrics.output_tokens) {
+            (0, _, Some(tokens)) => Some(u64::from(tokens)),
+            (_, Some(total), Some(tokens)) => Some(total.saturating_add(u64::from(tokens))),
+            _ => None,
+        };
+        self.steps.push(json!({
+            "index": index,
+            "model_ms": metrics.total_ms,
+            "ttft_ms": metrics.ttft_ms,
+            "output_tokens": metrics.output_tokens,
+            "context": self.pending_context.take(),
+        }));
+    }
+}
+
+fn context_budget_json(usage: ContextBudgetUsage) -> Value {
+    json!({
+        "prompt_tokens": usage.prompt_tokens,
+        "generation_tokens": usage.generation_tokens,
+        "budget_tokens": usage.budget_tokens,
+        "system_tokens_estimate": usage.system_tokens_estimate,
+        "tool_definition_tokens_estimate": usage.tool_definition_tokens_estimate,
+        "message_tokens_estimate": usage.message_tokens_estimate,
+        "recent_memory_tokens_estimate": usage.recent_memory_tokens_estimate,
+        "retrieved_memory_tokens_estimate": usage.retrieved_memory_tokens_estimate,
+        "evidence_memory_tokens_estimate": usage.evidence_memory_tokens_estimate,
+        "tool_result_tokens_estimate": usage.tool_result_tokens_estimate,
+    })
+}
+
+fn write_exec_trace(
+    path: &Path,
+    end: &LoopEnd,
+    outcome: RunOutcome,
+    wall: Duration,
+    reporter: &ExecTraceReporter,
+    audit_events: &[AuditEvent],
+) -> anyhow::Result<()> {
+    let events = audit_events
+        .iter()
+        .map(|event| {
+            let mut value = event.to_json();
+            if let Some(object) = value.as_object_mut() {
+                object.remove("timestamp_unix_ms");
+            }
+            value
+        })
+        .collect::<Vec<_>>();
+    let tool_calls = audit_events
+        .iter()
+        .filter(|event| event.kind == AuditKind::ToolCall)
+        .count();
+    let tool_errors = events
+        .iter()
+        .filter(|event| {
+            event.get("event").and_then(Value::as_str) == Some("agent.tool_result")
+                && event.get("outcome").and_then(Value::as_str) == Some("error")
+        })
+        .count();
+    let (status, exit_code) = outcome.terminal_contract();
+    let trace = json!({
+        "schema": "camelid.agent-exec-trace/v1",
+        "terminal": {
+            "reason": loop_end_label(end),
+            "outcome": status,
+            "exit_code": exit_code,
+            "wall_ms": u64::try_from(wall.as_millis()).unwrap_or(u64::MAX),
+        },
+        "summary": {
+            "model_steps": reporter.steps.len(),
+            "tool_calls": tool_calls,
+            "tool_errors": tool_errors,
+            "compactions": reporter.compactions,
+            "model_ms": reporter.model_ms,
+            "output_tokens": reporter.output_tokens,
+        },
+        "steps": reporter.steps,
+        "audit_events": events,
+    });
+    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    serde_json::to_writer_pretty(&mut file, &trace)?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn loop_end_label(end: &LoopEnd) -> &'static str {
+    match end {
+        LoopEnd::Answered => "answered",
+        LoopEnd::Aborted => "aborted",
+        LoopEnd::StepCapped => "step_capped",
+        LoopEnd::Repeated => "repeated",
+        LoopEnd::DriverError => "driver_error",
     }
 }
 
@@ -4579,6 +4714,70 @@ mod tests {
             assert_eq!(outcome.subagent_status(), status);
             assert_eq!(outcome.exit_code(), code);
         }
+    }
+
+    #[test]
+    fn exec_trace_is_typed_secret_safe_and_create_new() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trace.json");
+        let mut reporter = ExecTraceReporter::default();
+        reporter.context_budget(ContextBudgetUsage {
+            prompt_tokens: 100,
+            generation_tokens: 32,
+            budget_tokens: 4096,
+            system_tokens_estimate: 10,
+            tool_definition_tokens_estimate: 20,
+            message_tokens_estimate: 30,
+            recent_memory_tokens_estimate: 0,
+            retrieved_memory_tokens_estimate: 0,
+            evidence_memory_tokens_estimate: 0,
+            tool_result_tokens_estimate: 40,
+        });
+        reporter.model_timing(ModelStepMetrics {
+            total_ms: 20,
+            ttft_ms: Some(3),
+            output_tokens: Some(7),
+        });
+        reporter.notice("compacted context: 10 messages -> 5 (4 folded into a summary)");
+        let digest = audit::digest_args(&json!({"token":"secret-value"}));
+        let events = vec![
+            AuditEvent::call("read_file", "auto", digest.clone()),
+            AuditEvent::result(
+                "read_file",
+                "auto",
+                digest,
+                &ToolOutcome::Ok("secret tool output".into()),
+                Duration::from_millis(2),
+            ),
+        ];
+        write_exec_trace(
+            &path,
+            &LoopEnd::Answered,
+            RunOutcome::Completed,
+            Duration::from_millis(25),
+            &reporter,
+            &events,
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let trace: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(trace["terminal"]["reason"], "answered");
+        assert_eq!(trace["summary"]["model_steps"], 1);
+        assert_eq!(trace["summary"]["tool_calls"], 1);
+        assert_eq!(trace["summary"]["compactions"], 1);
+        assert_eq!(trace["summary"]["output_tokens"], 7);
+        assert!(!text.contains("secret-value"));
+        assert!(!text.contains("secret tool output"));
+        assert!(!text.contains("timestamp_unix_ms"));
+        assert!(write_exec_trace(
+            &path,
+            &LoopEnd::Answered,
+            RunOutcome::Completed,
+            Duration::from_millis(25),
+            &reporter,
+            &events,
+        )
+        .is_err());
     }
 
     /// `--yolo` is the one flag that hands an unattended process exec-tier

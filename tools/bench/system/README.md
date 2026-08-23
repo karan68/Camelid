@@ -17,12 +17,15 @@ reserves an ephemeral loopback address, constructs bounded shared-task flags,
 strips credentials and Camelid environment overrides, preserves exit `0/1/3`,
 kills the owned process tree on timeout, and invokes the independent scorer only
 after cleanup. Unattended execution requires an explicit disposable-boundary
-acknowledgment.
+implementation; the production CLI exposes only WSL bubblewrap, with network
+unshared, Windows mounts absent, system/runtime/model read-only, and only the
+task attempt writable. Synthetic mode exists only inside canned tests.
 
 It does not set a regression threshold, run model-backed work in CI, compare
 external runtimes, execute a real model in hosted CI, or create public evidence.
-Detailed native model/tool/timing metrics remain unavailable until O9 provides
-a stable structured event source; human stderr is not parsed into evidence.
+O9 is implemented through `agent exec --benchmark-events`: a create-new,
+secret-safe typed trace carries terminal state, per-step token/timing data, and
+hashed tool audit events. Human stderr is never parsed into evidence.
 
 ## Safety and validity
 
@@ -92,13 +95,24 @@ node tools/bench/system/cli.mjs task-materialize --task <task-dir> --workspace <
 node tools/bench/system/cli.mjs task-score --task <task-dir> --workspace <workspace> --out <score.json>
 ```
 
+Run one real native attempt only through the WSL bubblewrap boundary, score it,
+seal the local evidence bundle, verify checksums, and remove the disposable
+workspace after success:
+
+```sh
+node tools/bench/system/cli.mjs native-run \
+  --task <task-dir> --workspace <new-workspace> \
+  --binary <windows-visible-linux-binary> --linux-binary <linux-path> \
+  --model <windows-model> --linux-model <linux-path> \
+  --source-sha <sha> --campaign-id <id> --timeout-ms <ms> --out <bundle-dir>
+```
+
 The workspace path must not already exist. This prevents materialization from
 overwriting an unrelated directory or a pre-existing canary.
 
-The initial task packages name Windows and Linux. Windows is verified locally;
-Linux requires the hosted validation-script run on the exact published head
-before publication claims it as proven. macOS remains unclaimed until the same
-model-free suite runs there. Phase 2 paths use forward slashes, are
+The initial task packages name Windows and Linux; exact-head hosted validation
+proves both. macOS remains unclaimed until the same model-free suite runs there.
+Phase 2 paths use forward slashes, are
 case-sensitive, and allow either an exact
 relative path or a trailing recursive `/**`. Parent traversal, absolute paths,
 backslashes, other wildcard forms, symlinks, special files, and case-folding

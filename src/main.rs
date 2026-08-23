@@ -970,7 +970,48 @@ enum AgentAction {
         shell_timeout: u64,
         #[arg(long)]
         models_dir: Option<PathBuf>,
+        /// Write a secret-safe, versioned benchmark trace after the agent loop
+        /// reaches a typed terminal state. The path must not already exist.
+        #[arg(long)]
+        benchmark_events: Option<PathBuf>,
     },
+}
+
+#[cfg(test)]
+mod agent_command_tests {
+    use super::*;
+
+    #[test]
+    fn agent_exec_parses_a_benchmark_event_destination() {
+        std::thread::Builder::new()
+            .name("agent-cli-parse-test".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let cli = Cli::try_parse_from([
+                    "camelid",
+                    "agent",
+                    "exec",
+                    "fix the boundary",
+                    "--model",
+                    "model.gguf",
+                    "--benchmark-events",
+                    "trace.json",
+                ])
+                .unwrap();
+                match cli.command {
+                    Some(Command::Agent {
+                        action:
+                            AgentAction::Exec {
+                                benchmark_events, ..
+                            },
+                    }) => assert_eq!(benchmark_events, Some(PathBuf::from("trace.json"))),
+                    other => panic!("expected agent exec, got {other:?}"),
+                }
+            })
+            .expect("spawn agent CLI parse test")
+            .join()
+            .expect("agent CLI parse test panicked");
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -3212,6 +3253,7 @@ async fn main() -> anyhow::Result<()> {
                 plain,
                 models_dir: models_dir.unwrap_or_else(|| PathBuf::from("models")),
                 exec_goal: None,
+                benchmark_events: None,
                 agent,
                 workdir,
                 max_steps,
@@ -4658,6 +4700,7 @@ async fn main() -> anyhow::Result<()> {
                 shell_sandbox,
                 shell_timeout,
                 models_dir,
+                benchmark_events,
             } => {
                 // The goal may come from stdin so a caller can pipe a long or
                 // generated prompt in without shell quoting.
@@ -4698,6 +4741,7 @@ async fn main() -> anyhow::Result<()> {
                     audit_webhook: None,
                     shell_sandbox,
                     exec_goal: Some(goal),
+                    benchmark_events,
                 })?;
                 std::process::exit(code);
             }

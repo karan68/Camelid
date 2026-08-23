@@ -5,7 +5,11 @@ import { fileURLToPath } from 'node:url'
 
 const root = resolve(fileURLToPath(new URL('..', import.meta.url)))
 const tests = [
+  'tools/bench/system/test-agent-exec-trace.mjs',
+  'tools/bench/system/test-native-contracts.mjs',
   'tools/bench/system/test-native-adapter.mjs',
+  'tools/bench/system/test-native-bundle.mjs',
+  'tools/bench/system/test-native-cli.mjs',
 ]
 
 for (const test of tests) {
@@ -18,4 +22,4 @@ for (const test of tests) {
   if (result.status !== 0) process.exit(result.status ?? 1)
 }
 
-console.log(`benchmark Phase 3 validation: PASS (${tests.length} test)`)
+console.log(`benchmark Phase 3 validation: PASS (${tests.length} tests)`)

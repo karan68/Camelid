@@ -2,7 +2,12 @@ import { mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { join, relative, resolve, sep } from 'node:path'
 
 import { buildComparison } from './aggregate.mjs'
-import { validatePlan, validateRuntimeSample } from './lib/contracts.mjs'
+import {
+  validateAgentAttempt,
+  validateAgentExecTrace,
+  validatePlan,
+  validateRuntimeSample,
+} from './lib/contracts.mjs'
 import { canonicalJson, sha256File } from './lib/digest.mjs'
 
 export async function writeBenchmarkBundle(input, options = {}) {
@@ -81,6 +86,96 @@ export async function verifyBundleChecksums(outputDir) {
     if (actual !== expected) failures.push(`${relativeFile}: expected ${expected}, got ${actual}`)
   }
   return { ok: failures.length === 0, failures }
+}
+
+export async function writeNativeAgentBundle(input, options = {}) {
+  const outputDir = resolve(input.outputDir)
+  await requireEmptyDirectory(outputDir)
+  validateAgentAttempt(input.result.attempt)
+  if (input.result.trace !== null) validateAgentExecTrace(input.result.trace)
+  await mkdir(outputDir, { recursive: true })
+  await writeCanonical(join(outputDir, 'attempt.json'), input.result.attempt)
+  await writeCanonical(join(outputDir, 'score.json'), input.result.repository_score)
+  await writeCanonical(join(outputDir, 'identity.json'), input.result.identity)
+  await writeCanonical(join(outputDir, 'adapter.json'), {
+    boundary: input.result.boundary,
+    address: input.result.address,
+    trace_error: input.result.trace_error,
+  })
+  if (input.result.trace !== null) await writeCanonical(join(outputDir, 'trace.json'), input.result.trace)
+  await writeCanonical(join(outputDir, 'execution.json'), boundedExecution(input.result.execution))
+
+  const manifest = {
+    schema: 'camelid.benchmark.native-bundle/v1',
+    campaign_id: input.result.attempt.campaign_id,
+    task_id: input.result.attempt.task_id,
+    generated_utc: options.generatedUtc ?? new Date().toISOString(),
+    state: input.result.attempt.score.outcome.startsWith('INVALID_')
+      ? 'INCOMPLETE'
+      : 'COMPLETE',
+    outcome: input.result.attempt.score.outcome,
+    terminal_class: input.result.attempt.terminal.class,
+    cleanup_passed: input.result.attempt.process.cleanup_passed,
+    files: {
+      attempt: 'attempt.json',
+      score: 'score.json',
+      identity: 'identity.json',
+      adapter: 'adapter.json',
+      execution: 'execution.json',
+      trace: input.result.trace === null ? null : 'trace.json',
+    },
+    workspace_included: false,
+    boundary: input.result.boundary,
+    claim_boundary: 'Local Phase 3 native-agent evidence only; scorer outcome is authoritative and no public model-quality claim is made.',
+  }
+  await writeCanonical(join(outputDir, 'manifest.json'), manifest)
+  await writeFile(join(outputDir, 'summary.md'), renderNativeSummary(manifest), 'utf8')
+  await writeChecksums(outputDir)
+  return { outputDir, manifest }
+}
+
+function boundedExecution(execution) {
+  return {
+    state: execution.state,
+    exit_code: execution.exitCode,
+    signal: execution.signal,
+    timed_out: execution.timedOut,
+    duration_ms: execution.durationMs,
+    cleanup_passed: execution.cleanupPassed,
+    cleanup_detail: execution.cleanupDetail,
+    error: execution.error,
+    stdout: execution.stdout,
+    stderr: execution.stderr,
+  }
+}
+
+function renderNativeSummary(manifest) {
+  return [
+    '# Camelid Phase 3 Native Agent Attempt',
+    '',
+    `- Campaign: \`${manifest.campaign_id}\``,
+    `- Task: \`${manifest.task_id}\``,
+    `- State: **${manifest.state}**`,
+    `- Terminal: \`${manifest.terminal_class}\``,
+    `- Scorer outcome: **${manifest.outcome}**`,
+    `- Cleanup passed: ${manifest.cleanup_passed}`,
+    `- Boundary: \`${manifest.boundary}\``,
+    `- Workspace included: ${manifest.workspace_included}`,
+    `- Claim boundary: ${manifest.claim_boundary}`,
+    '',
+  ].join('\n')
+}
+
+async function requireEmptyDirectory(path) {
+  try {
+    const info = await stat(path)
+    if (!info.isDirectory()) throw new Error(`native bundle output exists and is not a directory: ${path}`)
+    const entries = await readdir(path)
+    if (entries.length > 0) throw new Error(`native bundle output directory is not empty: ${path}`)
+  } catch (error) {
+    if (error.code === 'ENOENT') return
+    throw error
+  }
 }
 
 async function writeChecksums(outputDir) {

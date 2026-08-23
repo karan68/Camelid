@@ -453,12 +453,14 @@ fn reap_locked(state: &mut SessionState) {
             // Produced its own result → no longer live. Reap so a completed child
             // doesn't linger as a zombie (no-op on Windows; matters on Linux).
             let _ = entry.child.wait();
+            remove_task_file(entry);
             return false;
         }
         match entry.child.try_wait() {
             Ok(Some(_)) => {
                 // try_wait already reaped the exited child.
                 write_terminal_result(entry, "failed", "subagent exited without a result");
+                remove_task_file(entry);
                 false
             }
             Ok(None) => {
@@ -474,6 +476,7 @@ fn reap_locked(state: &mut SessionState) {
                         "inconclusive",
                         "subagent timed out and was terminated",
                     );
+                    remove_task_file(entry);
                     false
                 } else {
                     true
@@ -481,10 +484,17 @@ fn reap_locked(state: &mut SessionState) {
             }
             Err(_) => {
                 let _ = entry.child.wait();
+                remove_task_file(entry);
                 false
             }
         }
     });
+}
+
+fn remove_task_file(entry: &ChildEntry) {
+    let mut path = entry.result_path.clone();
+    path.set_file_name(format!("task_{}.json", entry.subtask_id));
+    let _ = std::fs::remove_file(path);
 }
 
 /// Write a result file atomically — a same-dir temp then rename — so a concurrent
@@ -928,6 +938,66 @@ mod tests {
         let tpath = subagent_dir(root).join("task_evil.json");
         std::fs::write(&tpath, serde_json::to_string(&task).unwrap()).unwrap();
         assert!(run_worker(&tpath).is_err());
+    }
+
+    #[test]
+    fn timed_out_subagent_is_reaped_and_its_task_file_is_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(subagent_dir(root)).unwrap();
+        let tpath = task_path(root, "timeout-cleanup");
+        std::fs::write(&tpath, "stale task").unwrap();
+
+        #[cfg(windows)]
+        let mut command = {
+            let mut command = std::process::Command::new("cmd.exe");
+            command.args(["/C", "ping -n 6 127.0.0.1 >NUL"]);
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x0800_0000);
+            command
+        };
+        #[cfg(not(windows))]
+        let mut command = {
+            let mut command = std::process::Command::new("sh");
+            command.args(["-c", "sleep 5"]);
+            command
+        };
+        let child = command.spawn().unwrap();
+
+        #[cfg(windows)]
+        let job = {
+            use std::os::windows::io::AsRawHandle;
+            let job = super::super::win_job::JobObject::new().ok();
+            if let Some(ref value) = job {
+                value.assign(child.as_raw_handle()).unwrap();
+            }
+            job
+        };
+
+        let rpath = result_path(root, "timeout-cleanup");
+        let mut state = SessionState {
+            config: None,
+            children: vec![ChildEntry {
+                subtask_id: "timeout-cleanup".into(),
+                child,
+                #[cfg(windows)]
+                job,
+                started: Instant::now(),
+                timeout: Duration::ZERO,
+                result_path: rpath.clone(),
+            }],
+        };
+        reap_locked(&mut state);
+
+        assert!(state.children.is_empty());
+        assert!(
+            !tpath.exists(),
+            "timed-out task file must not remain reusable"
+        );
+        let result: SubagentResult =
+            serde_json::from_str(&std::fs::read_to_string(rpath).unwrap()).unwrap();
+        assert_eq!(result.status, "inconclusive");
+        assert!(result.note.contains("timed out"));
     }
 
     #[test]

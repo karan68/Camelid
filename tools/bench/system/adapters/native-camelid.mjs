@@ -1,12 +1,14 @@
 import { createServer } from 'node:net'
-import { resolve } from 'node:path'
+import { readFile, rm } from 'node:fs/promises'
+import { join, resolve } from 'node:path'
 
-import { validateAgentAttempt } from '../lib/contracts.mjs'
+import { validateAgentAttempt, validateAgentExecTrace } from '../lib/contracts.mjs'
 import { sha256File } from '../lib/digest.mjs'
 import { runProcess } from '../process/runner.mjs'
 import { loadTaskPackage, materializeTask, scoreTaskAttempt } from '../tasks/package.mjs'
 
 const FORBIDDEN_SHARED_FLAGS = new Set(['--allow-net', '--allow-fs', '--allow-mcp'])
+const COMMON_NATIVE_TOOLS = new Set(['read_file', 'list_dir', 'search', 'write_file', 'edit_file', 'run_shell', 'update_plan'])
 
 export async function runNativeAgentAttempt(options) {
   const normalized = validateOptions(options)
@@ -23,37 +25,55 @@ export async function runNativeAgentAttempt(options) {
     sha256File(normalized.binaryPath),
     sha256File(normalized.modelPath),
   ])
+  if (normalized.boundary.kind === 'wsl-bwrap') {
+    await verifyWslBoundary(normalized.boundary)
+    await verifyWslIdentity(normalized.boundary, binarySha256, modelSha256)
+  }
 
   const materialized = await materializeTask(taskPackage, normalized.workspaceRoot)
-  const addr = await reserveLoopbackAddress()
+  const tracePath = join(materialized.attemptRoot, '.camelid-benchmark-trace.json')
+  const launch = await prepareLaunch(normalized, materialized.attemptRoot, tracePath)
   const args = nativeExecArgs({
     task: taskPackage.task,
-    modelPath: normalized.modelPath,
-    workdir: materialized.attemptRoot,
-    addr,
+    modelPath: launch.modelPath,
+    workdir: launch.workdir,
+    addr: launch.addr,
+    tracePath: launch.tracePath,
   })
   const startedAt = performance.now()
   const execution = await runProcess({
-    file: normalized.binaryPath,
-    args: [...normalized.syntheticCandidatePrefix, ...args],
+    file: launch.file,
+    args: [...launch.prefixArgs, ...args],
     cwd: materialized.attemptRoot,
     env: isolatedNativeEnv(normalized.env),
     timeoutMs: normalized.timeoutMs,
   })
   const wallMs = performance.now() - startedAt
 
+  const traceState = await readNativeTrace(tracePath, execution)
+  await rm(tracePath, { force: true })
+
   // The scorer runs only after runProcess has observed a terminal child and,
   // on timeout, completed exact descendant cleanup.
   const repositoryScore = await scoreTaskAttempt(normalized.taskRoot, materialized.workspaceRoot)
-  const terminal = terminalFromExecution(execution)
-  const outcome = attemptOutcome(terminal, execution.cleanupPassed, repositoryScore.outcome)
+  const terminal = terminalFromExecution(execution, traceState.trace)
+  const comparability = comparabilityFromTrace(traceState.trace)
+  const outcome = attemptOutcome(
+    terminal,
+    execution.cleanupPassed,
+    repositoryScore.outcome,
+    traceState.error,
+    comparability,
+  )
+  const usage = usageFromTrace(traceState.trace)
+  const timing = timingFromTrace(traceState.trace, wallMs)
   const attemptRecord = validateAgentAttempt({
     schema: 'camelid.benchmark.agent-attempt/v1',
     campaign_id: normalized.campaignId,
     task_id: taskPackage.task.id,
     adapter: 'camelid-native',
     attempt: normalized.attempt,
-    comparability: 'comparable',
+    comparability,
     terminal,
     score: {
       outcome,
@@ -61,18 +81,8 @@ export async function runNativeAgentAttempt(options) {
       passed_checks: repositoryScore.passed_checks,
       diff_sha256: repositoryScore.diff_sha256,
     },
-    usage: {
-      model_steps: null,
-      tool_calls: null,
-      input_tokens: null,
-      output_tokens: null,
-      unavailable_reason: 'native structured events are not implemented (O9)',
-    },
-    timing: {
-      wall_ms: wallMs,
-      model_ms: null,
-      ttft_ms: null,
-    },
+    usage,
+    timing,
     process: {
       cleanup_passed: execution.cleanupPassed,
     },
@@ -84,9 +94,12 @@ export async function runNativeAgentAttempt(options) {
       binary_sha256: binarySha256,
       model_sha256: modelSha256,
     },
+    boundary: normalized.boundary.kind,
     address: 'loopback_ephemeral',
     args,
     execution,
+    trace: traceState.trace,
+    trace_error: traceState.error,
     repository_score: repositoryScore,
     attempt: attemptRecord,
     workspace_root: materialized.workspaceRoot,
@@ -94,7 +107,67 @@ export async function runNativeAgentAttempt(options) {
   }
 }
 
-export function nativeExecArgs({ task, modelPath, workdir, addr }) {
+async function prepareLaunch(options, attemptRoot, tracePath) {
+  if (options.boundary.kind === 'synthetic') {
+    return {
+      file: options.binaryPath,
+      prefixArgs: options.syntheticCandidatePrefix,
+      addr: await reserveLoopbackAddress(),
+      modelPath: options.modelPath,
+      workdir: attemptRoot,
+      tracePath,
+    }
+  }
+  return {
+    file: options.boundary.wslExecutable,
+    prefixArgs: wslBwrapPrefix({
+      distribution: options.boundary.distribution,
+      linuxBinaryPath: options.boundary.linuxBinaryPath,
+      linuxModelPath: options.boundary.linuxModelPath,
+      linuxAttemptPath: windowsPathToWsl(attemptRoot),
+    }),
+    // Each bwrap process owns a fresh network namespace.
+    addr: '127.0.0.1:8231',
+    modelPath: '/model/model.gguf',
+    workdir: '/workspace',
+    tracePath: '/workspace/.camelid-benchmark-trace.json',
+  }
+}
+
+export function wslBwrapPrefix({ distribution, linuxBinaryPath, linuxModelPath, linuxAttemptPath }) {
+  return [
+    '-d', distribution, '--',
+    'bwrap',
+    '--unshare-all',
+    '--new-session',
+    '--die-with-parent',
+    '--ro-bind', '/usr', '/usr',
+    '--ro-bind', '/lib', '/lib',
+    '--ro-bind', '/lib64', '/lib64',
+    '--ro-bind', '/bin', '/bin',
+    '--ro-bind', '/sys', '/sys',
+    '--proc', '/proc',
+    '--dev', '/dev',
+    '--tmpfs', '/tmp',
+    '--dir', '/tmp/home',
+    '--ro-bind', linuxBinaryPath, '/opt/camelid/camelid',
+    '--ro-bind', linuxModelPath, '/model/model.gguf',
+    '--bind', linuxAttemptPath, '/workspace',
+    '--chdir', '/workspace',
+    '--clearenv',
+    '--setenv', 'PATH', '/usr/bin:/bin',
+    '--setenv', 'HOME', '/tmp/home',
+    '/opt/camelid/camelid',
+  ]
+}
+
+export function windowsPathToWsl(path) {
+  const match = resolve(path).match(/^([A-Za-z]):[\\/](.*)$/)
+  if (!match) throw new NativeAdapterError('INVALID_INFRASTRUCTURE', `WSL boundary requires a drive-qualified Windows path: ${path}`)
+  return `/mnt/${match[1].toLowerCase()}/${match[2].replaceAll('\\', '/')}`
+}
+
+export function nativeExecArgs({ task, modelPath, workdir, addr, tracePath }) {
   const args = [
     'agent',
     'exec',
@@ -114,6 +187,8 @@ export function nativeExecArgs({ task, modelPath, workdir, addr }) {
     '--shell-timeout',
     String(Math.max(1, Math.ceil(task.budgets.command_ms / 1000))),
     '--today-is-a-good-day-to-die',
+    '--benchmark-events',
+    resolve(tracePath),
   ]
   for (const flag of FORBIDDEN_SHARED_FLAGS) {
     if (args.includes(flag)) throw new NativeAdapterError('INVALID_FIXTURE', `shared task enabled forbidden flag ${flag}`)
@@ -145,9 +220,6 @@ function validateOptions(options) {
   if (options === null || typeof options !== 'object' || Array.isArray(options)) {
     throw new TypeError('native adapter options must be an object')
   }
-  if (options.disposableBoundary !== true) {
-    throw new NativeAdapterError('INVALID_INFRASTRUCTURE', 'unattended native agent execution requires an explicit disposable boundary')
-  }
   for (const name of ['taskRoot', 'workspaceRoot', 'binaryPath', 'modelPath']) {
     if (typeof options[name] !== 'string' || options[name].length === 0) throw new TypeError(`${name} must be a non-empty string`)
   }
@@ -165,7 +237,36 @@ function validateOptions(options) {
     attempt: options.attempt,
     timeoutMs: options.timeoutMs,
     env: options.env ?? process.env,
+    boundary: validateBoundary(options),
     syntheticCandidatePrefix: syntheticPrefix(options),
+  }
+}
+
+function validateBoundary(options) {
+  const boundary = options.boundary
+  if (boundary === null || typeof boundary !== 'object' || Array.isArray(boundary)) {
+    throw new NativeAdapterError('INVALID_INFRASTRUCTURE', 'unattended native agent execution requires a verified boundary')
+  }
+  if (boundary.kind === 'synthetic') {
+    if (options.syntheticCandidate !== true) throw new NativeAdapterError('INVALID_INFRASTRUCTURE', 'synthetic boundary is test-only')
+    return { kind: 'synthetic' }
+  }
+  if (boundary.kind !== 'wsl-bwrap') throw new NativeAdapterError('INVALID_INFRASTRUCTURE', `unsupported native boundary ${boundary.kind}`)
+  if (typeof boundary.distribution !== 'string' || !/^[A-Za-z0-9_.-]+$/.test(boundary.distribution)) {
+    throw new TypeError('WSL distribution must be a simple name')
+  }
+  for (const name of ['linuxBinaryPath', 'linuxModelPath']) {
+    if (typeof boundary[name] !== 'string' || !boundary[name].startsWith('/')) throw new TypeError(`${name} must be an absolute Linux path`)
+  }
+  const systemRoot = process.env.SYSTEMROOT ?? 'C:\\Windows'
+  return {
+    kind: 'wsl-bwrap',
+    distribution: boundary.distribution,
+    linuxBinaryPath: boundary.linuxBinaryPath,
+    linuxModelPath: boundary.linuxModelPath,
+    wslExecutable: boundary.wslExecutable
+      ? resolve(boundary.wslExecutable)
+      : resolve(systemRoot, 'System32', 'wsl.exe'),
   }
 }
 
@@ -182,21 +283,31 @@ function syntheticPrefix(options) {
   return [...options.syntheticCandidatePrefix]
 }
 
-function terminalFromExecution(execution) {
+function terminalFromExecution(execution, trace) {
   if (execution.timedOut) return { class: 'timed_out', exit_code: execution.exitCode, reason: 'native agent wall timeout expired' }
   if (execution.state !== 'exited') return { class: 'adapter_error', exit_code: execution.exitCode, reason: execution.error ?? execution.state }
-  if (execution.exitCode === 0) return { class: 'answered', exit_code: 0, reason: 'agent exec returned answered' }
-  if (execution.exitCode === 1) return { class: 'failed', exit_code: 1, reason: 'agent exec returned failed or blocked' }
-  if (execution.exitCode === 3) return { class: 'inconclusive', exit_code: 3, reason: 'agent exec returned inconclusive; exact reason unavailable without O9 events' }
+  if (execution.exitCode === 0) return { class: 'answered', exit_code: 0, reason: trace ? `agent exec trace: ${trace.terminal.reason}` : 'agent exec returned answered' }
+  if (execution.exitCode === 1) return { class: 'failed', exit_code: 1, reason: trace ? `agent exec trace: ${trace.terminal.reason}` : 'agent exec returned failed or blocked' }
+  if (execution.exitCode === 3) return { class: 'inconclusive', exit_code: 3, reason: trace ? `agent exec trace: ${trace.terminal.reason}` : 'agent exec returned inconclusive without a valid trace' }
   return { class: 'adapter_error', exit_code: execution.exitCode, reason: `unexpected agent exec exit ${execution.exitCode}` }
 }
 
-function attemptOutcome(terminal, cleanupPassed, repositoryOutcome) {
+function attemptOutcome(terminal, cleanupPassed, repositoryOutcome, traceError, comparability) {
   if (!cleanupPassed) return 'INVALID_INFRASTRUCTURE'
+  if (traceError) return 'INVALID_INFRASTRUCTURE'
   if (terminal.class === 'timed_out') return 'INCONCLUSIVE_TIMEOUT'
   if (terminal.class === 'adapter_error') return 'INVALID_INFRASTRUCTURE'
   if (terminal.class !== 'answered') return 'FAIL_AGENT_TERMINAL'
+  if (repositoryOutcome === 'PASS_COMPARABLE' && comparability === 'noncomparable') return 'PASS_NONCOMPARABLE'
   return repositoryOutcome
+}
+
+function comparabilityFromTrace(trace) {
+  if (!trace) return 'noncomparable'
+  const used = trace.audit_events
+    .filter((event) => event.event === 'agent.tool_call')
+    .map((event) => event.tool)
+  return used.every((tool) => COMMON_NATIVE_TOOLS.has(tool)) ? 'comparable' : 'noncomparable'
 }
 
 export function isolatedNativeEnv(source) {
@@ -215,4 +326,104 @@ export function isolatedNativeEnv(source) {
     'WINDIR',
   ])
   return Object.fromEntries(Object.entries(source).filter(([key]) => allowed.has(key.toUpperCase())))
+}
+
+async function readNativeTrace(path, execution) {
+  if (execution.timedOut || execution.state !== 'exited') return { trace: null, error: null }
+  try {
+    const trace = validateAgentExecTrace(JSON.parse(await readFile(path, 'utf8')))
+    if (trace.terminal.exit_code !== execution.exitCode) {
+      return { trace: null, error: `trace exit ${trace.terminal.exit_code} does not match process exit ${execution.exitCode}` }
+    }
+    return { trace, error: null }
+  } catch (error) {
+    return { trace: null, error: `native trace unavailable or invalid: ${error.message}` }
+  }
+}
+
+function usageFromTrace(trace) {
+  if (!trace) {
+    return {
+      model_steps: null,
+      tool_calls: null,
+      input_tokens: null,
+      output_tokens: null,
+      unavailable_reason: 'native trace unavailable',
+    }
+  }
+  const contextsKnown = trace.steps.every((step) => step.context !== null)
+  return {
+    model_steps: trace.summary.model_steps,
+    tool_calls: trace.summary.tool_calls,
+    input_tokens: contextsKnown
+      ? trace.steps.reduce((sum, step) => sum + step.context.prompt_tokens, 0)
+      : null,
+    output_tokens: trace.summary.output_tokens,
+    unavailable_reason: contextsKnown && trace.summary.output_tokens !== null
+      ? null
+      : 'one or more native model steps did not report token metrics',
+  }
+}
+
+function timingFromTrace(trace, wallMs) {
+  return {
+    wall_ms: wallMs,
+    model_ms: trace?.summary.model_ms ?? null,
+    ttft_ms: trace?.steps[0]?.ttft_ms ?? null,
+  }
+}
+
+async function verifyWslBoundary(boundary) {
+  const execution = await runProcess({
+    file: boundary.wslExecutable,
+    args: [
+      '-d', boundary.distribution, '--',
+      'bwrap',
+      '--unshare-all',
+      '--new-session',
+      '--die-with-parent',
+      '--ro-bind', '/usr', '/usr',
+      '--ro-bind', '/lib', '/lib',
+      '--ro-bind', '/lib64', '/lib64',
+      '--ro-bind', '/bin', '/bin',
+      '--proc', '/proc',
+      '--dev', '/dev',
+      '--tmpfs', '/tmp',
+      '--clearenv',
+      '--setenv', 'PATH', '/usr/bin:/bin',
+      '/bin/sh', '-c',
+      'test ! -e /mnt/c && ! /usr/bin/curl -fsS --max-time 2 https://example.com >/dev/null 2>&1 && printf BOUNDARY_OK',
+    ],
+    env: isolatedNativeEnv(process.env),
+    timeoutMs: 10000,
+  })
+  if (!processSucceeded(execution) || execution.stdout.preview !== 'BOUNDARY_OK') {
+    throw new NativeAdapterError('INVALID_INFRASTRUCTURE', `WSL bubblewrap boundary preflight failed: ${execution.stderr.preview || execution.stdout.preview || execution.state}`)
+  }
+}
+
+async function verifyWslIdentity(boundary, binarySha256, modelSha256) {
+  const execution = await runProcess({
+    file: boundary.wslExecutable,
+    args: [
+      '-d', boundary.distribution, '--',
+      'sha256sum', '--', boundary.linuxBinaryPath, boundary.linuxModelPath,
+    ],
+    env: isolatedNativeEnv(process.env),
+    timeoutMs: 300000,
+  })
+  if (!processSucceeded(execution) || execution.stdout.truncated) {
+    throw new NativeAdapterError('INVALID_INFRASTRUCTURE', `could not hash WSL candidate/model inputs: ${execution.stderr.preview || execution.state}`)
+  }
+  const hashes = execution.stdout.preview.trim().split(/\r?\n/).map((line) => line.split(/\s+/, 1)[0])
+  if (hashes.length !== 2 || hashes[0] !== binarySha256 || hashes[1] !== modelSha256) {
+    throw new NativeAdapterError('INVALID_INFRASTRUCTURE', 'Windows-visible and WSL-invoked candidate/model bytes do not match')
+  }
+}
+
+function processSucceeded(execution) {
+  return execution.state === 'exited'
+    && execution.exitCode === 0
+    && execution.timedOut === false
+    && execution.cleanupPassed === true
 }

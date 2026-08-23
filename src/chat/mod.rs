@@ -114,6 +114,8 @@ pub struct ChatOptions {
     /// Headless one-shot (`camelid agent exec`): run this goal to completion and
     /// exit, instead of opening a REPL. Implies `agent` + `plain`.
     pub exec_goal: Option<String>,
+    /// Secret-safe benchmark trace emitted only by headless `agent exec`.
+    pub benchmark_events: Option<PathBuf>,
 }
 
 /// Entry point for the `Chat` subcommand. Returns a process exit code (0 = ok,
@@ -216,7 +218,13 @@ pub fn run_chat(opts: ChatOptions) -> anyhow::Result<i32> {
 
         // Headless one-shot: no REPL, tri-state exit, answer on stdout.
         if let Some(goal) = opts.exec_goal.as_deref() {
-            let code = agent::run_exec(&mut session, opts.addr, cfg, goal);
+            let code = agent::run_exec(
+                &mut session,
+                opts.addr,
+                cfg,
+                goal,
+                opts.benchmark_events.as_deref(),
+            );
             mcp::shutdown();
             return code;
         }
