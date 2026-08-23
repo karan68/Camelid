@@ -7,8 +7,8 @@
     "evidence": "Difficulty remains unrated until an agent pilot is measured."
   },
   "goal": "Orders with a subtotal of at least 10000 cents must receive the requested discount. Correct the boundary without changing the exported API.",
-  "fixture_manifest_sha256": "e8a224563b268ccfdeb0ca62f9388ef0b9a7e2e7647a568ebdd2346c5a77a127",
-  "scorer_manifest_sha256": "127d03cdd1b68dfaeb662505d64256a790ea2337180d5171af480b7d4c7c4458",
+  "fixture_manifest_sha256": "f5a273b7ae8d07987de95ec85389bbceba3a3d632c31689e86179ffc4f9e2895",
+  "scorer_manifest_sha256": "6b8fe59f3fc70be1ce38d12809c49768015e9893808f203ac89cb23980c49973",
   "provenance": {
     "source": "Camelid project-authored synthetic fixture",
     "license": "MIT"

@@ -7,8 +7,8 @@
     "evidence": "Difficulty remains unrated until an agent pilot is measured."
   },
   "goal": "Accept only base-10 digit strings representing ports from 1 through 65535. Reject whitespace, signs, fractions, alternate numeric syntax, and out-of-range values.",
-  "fixture_manifest_sha256": "c68474716ada9f444c0863476e3a0db92d0d1c258cb92bb544a18a2e465d6dd8",
-  "scorer_manifest_sha256": "f130234e051c094124044600cd5ac1c4967b8bb20bb9878ece791ac745b1fbe9",
+  "fixture_manifest_sha256": "19944496b9b1a8915427a9951eb14c7d02e11ee6cd3d2e8403bc2f7bb2235b99",
+  "scorer_manifest_sha256": "5cdebc528c6aa50279a306d96492b29a2cbb306e98a27607cd6f3ef8456a692a",
   "provenance": {
     "source": "Camelid project-authored synthetic fixture",
     "license": "MIT"

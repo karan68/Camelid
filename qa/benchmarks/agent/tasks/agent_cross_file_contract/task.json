@@ -7,8 +7,8 @@
     "evidence": "Difficulty remains unrated until an agent pilot is measured."
   },
   "goal": "Migrate the public profile record field from displayName to display_name and update every source caller while preserving rendered output.",
-  "fixture_manifest_sha256": "6ca36ce13744df88fc155ebbd195830514e312133155b0decc160acaed476b51",
-  "scorer_manifest_sha256": "8ace8bce899d962cf23d0315400599d4bd90b9ae8721e07ffcd3401f325d3617",
+  "fixture_manifest_sha256": "846ad2f3ecaddced598fb16bad870d4f0d59f8507043a21c1831fc4bab0ea83d",
+  "scorer_manifest_sha256": "f7d84da214ab42b4da64df8ce3fb049a5e59e1882dd23b25423fb8385bfca492",
   "provenance": {
     "source": "Camelid project-authored synthetic fixture",
     "license": "MIT"
