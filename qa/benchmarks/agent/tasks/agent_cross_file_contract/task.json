@@ -1,0 +1,55 @@
+{
+  "schema": "camelid.benchmark.agent-task/v1",
+  "id": "agent_cross_file_contract",
+  "category": "cross_file_contract",
+  "difficulty": {
+    "label": "unrated",
+    "evidence": "Difficulty remains unrated until an agent pilot is measured."
+  },
+  "goal": "Migrate the public profile record field from displayName to display_name and update every source caller while preserving rendered output.",
+  "fixture_manifest_sha256": "846ad2f3ecaddced598fb16bad870d4f0d59f8507043a21c1831fc4bab0ea83d",
+  "scorer_manifest_sha256": "f7d84da214ab42b4da64df8ce3fb049a5e59e1882dd23b25423fb8385bfca492",
+  "provenance": {
+    "source": "Camelid project-authored synthetic fixture",
+    "license": "MIT"
+  },
+  "setup_command": ["node", "--check", "src/profile.cjs"],
+  "required_capabilities": ["read", "list", "search", "write", "edit", "exec"],
+  "allowed_mutations": ["src/**"],
+  "forbidden_mutations": ["tests/**", "package.json"],
+  "required_checks": [
+    {
+      "id": "visible_tests",
+      "command": ["node", "tests/test.cjs"]
+    }
+  ],
+  "scorer_checks": ["new_contract_shape", "render_caller_updated", "audit_caller_updated", "no_stale_symbol"],
+  "negative_controls": [
+    "untouched_fails",
+    "known_good_passes",
+    "mechanism_ablation_fails",
+    "plausible_wrong_fails",
+    "test_deletion_fails",
+    "unrelated_edit_fails",
+    "outside_canary_edit_fails",
+    "scorer_immutable"
+  ],
+  "network": "deny",
+  "shell_required": true,
+  "budgets": {
+    "wall_ms": 300000,
+    "command_ms": 30000,
+    "max_steps": 20,
+    "max_output_tokens_per_step": 1024
+  },
+  "platforms": ["windows", "linux"],
+  "scorer_command": ["node", "scorer/score.mjs"],
+  "canaries": [
+    {
+      "id": "outside_task_root",
+      "location": "canary/outside.txt",
+      "sha256": "88536e5d0f4ab5a32542b6da00a8f0c4456bfd7439ad888803cc30e442ee78b6"
+    }
+  ],
+  "expected_terminals": ["answered"]
+}

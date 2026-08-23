@@ -1,0 +1,34 @@
+{
+  "schema": "camelid.benchmark.agent-attempt/v1",
+  "campaign_id": "agent-pilot-001",
+  "task_id": "agent_local_logic_fix",
+  "adapter": "camelid-native",
+  "attempt": 0,
+  "comparability": "comparable",
+  "terminal": {
+    "class": "answered",
+    "exit_code": 0,
+    "reason": "agent reported a terminal answer"
+  },
+  "score": {
+    "outcome": "PASS_COMPARABLE",
+    "required_checks": 2,
+    "passed_checks": 2,
+    "diff_sha256": "4444444444444444444444444444444444444444444444444444444444444444"
+  },
+  "usage": {
+    "model_steps": null,
+    "tool_calls": null,
+    "input_tokens": null,
+    "output_tokens": null,
+    "unavailable_reason": "structured native events not implemented"
+  },
+  "timing": {
+    "wall_ms": 1000,
+    "model_ms": null,
+    "ttft_ms": null
+  },
+  "process": {
+    "cleanup_passed": true
+  }
+}

@@ -1,11 +1,18 @@
-# Camelid Phase 1 runtime comparator
+# Camelid benchmark system foundations
 
 This internal harness implements the first benchmark-system phase: a local,
 informational, same-host base/head comparison over Camelid's hidden
 `bench-generate` command.
 
-It does not set a regression threshold, run in CI, compare external runtimes,
-exercise either agent loop, or create public evidence.
+It also implements the model-free Phase 2 task/scorer foundation. Phase 2 task
+packages contain a small fixture, but only that fixture is copied into the
+writable attempt root. The task manifest, hidden scorer, expected control
+overlays, and outside canary remain controller-owned. Package, fixture, scorer,
+and canary identities are checked before execution; task, fixture, and scorer
+identities are checked again after scoring.
+
+It does not set a regression threshold, run model-backed work in CI, compare
+external runtimes, execute either agent adapter, or create public evidence.
 
 ## Safety and validity
 
@@ -61,6 +68,34 @@ prove the recorded PID and all campaign-owned children are gone before manually
 removing the lock. A run that fails after creating its directory writes
 `failure.json` with state `INCOMPLETE`; reruns use a new campaign ID.
 
+Verify a Phase 2 task package and its pinned fixture/scorer/canary identities:
+
+```sh
+node tools/bench/system/cli.mjs task-verify --task qa/benchmarks/agent/tasks/agent_local_logic_fix
+```
+
+Materialize a fresh writable attempt plus an outside canary, then score the
+terminal repository state independently of any agent prose:
+
+```sh
+node tools/bench/system/cli.mjs task-materialize --task <task-dir> --workspace <new-workspace>
+node tools/bench/system/cli.mjs task-score --task <task-dir> --workspace <workspace> --out <score.json>
+```
+
+The workspace path must not already exist. This prevents materialization from
+overwriting an unrelated directory or a pre-existing canary.
+
+The initial task packages name Windows and Linux. Windows is verified locally;
+Linux requires the hosted validation-script run on the exact published head
+before publication claims it as proven. macOS remains unclaimed until the same
+model-free suite runs there. Phase 2 paths use forward slashes, are
+case-sensitive, and allow either an exact
+relative path or a trailing recursive `/**`. Parent traversal, absolute paths,
+backslashes, other wildcard forms, symlinks, special files, and case-folding
+collisions are refused. Model-free setup/check commands are restricted to
+`node <relative-script>` or `node --check <relative-script>` with an isolated
+environment and no shell interpolation.
+
 ## Self-tests
 
 ```sh
@@ -75,7 +110,9 @@ node tools/bench/system/test-bundle.mjs
 node tools/bench/system/test-cli.mjs
 node tools/bench/system/test-safety.mjs
 node tools/bench/test-v0.1-benchmark-harness.mjs
+node scripts/test-benchmark-system-phase2.mjs
 ```
 
 The existing `validation-scripts` CI job runs the same set through
-`scripts/test-benchmark-system-phase1.mjs`.
+`scripts/test-benchmark-system-phase1.mjs` and
+`scripts/test-benchmark-system-phase2.mjs`.
