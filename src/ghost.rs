@@ -137,6 +137,42 @@ const LAYER_ROLES: [&str; 9] = [
     "ffn_down",
 ];
 
+/// Queue an asynchronous read-ahead over a mapped byte range. Best-effort by
+/// design: a failure just means the pages fault in on demand, as they did before.
+#[cfg(windows)]
+fn prefetch_range_best_effort(range: &[u8]) {
+    use windows_sys::Win32::System::Memory::{PrefetchVirtualMemory, WIN32_MEMORY_RANGE_ENTRY};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    if range.is_empty() {
+        return;
+    }
+    let entry = WIN32_MEMORY_RANGE_ENTRY {
+        VirtualAddress: range.as_ptr() as *mut core::ffi::c_void,
+        NumberOfBytes: range.len(),
+    };
+    // SAFETY: `entry` describes a live, immutably-mapped range owned by the caller's
+    // `GgufWireMmap`, which outlives this call. The API only hints the pager; it never
+    // writes, and the return value is deliberately discarded.
+    unsafe {
+        PrefetchVirtualMemory(GetCurrentProcess(), 1, &entry, 0);
+    }
+}
+
+#[cfg(not(windows))]
+fn prefetch_range_best_effort(range: &[u8]) {
+    if range.is_empty() {
+        return;
+    }
+    // SAFETY: as above — an advisory call over a live read-only mapping.
+    unsafe {
+        libc::posix_madvise(
+            range.as_ptr() as *mut libc::c_void,
+            range.len(),
+            libc::POSIX_MADV_WILLNEED,
+        );
+    }
+}
+
 fn invalid(msg: String) -> BackendError {
     BackendError::InvalidModelMetadata(msg)
 }
@@ -721,6 +757,22 @@ fn write_cghost_moe_with_counts(
         ("source GGUF", store.source_path()),
         (".cghost output", out_path),
     ])?;
+    // Refuse a sparse source. Repacking from the hot shadow (models/*.hot) instead of
+    // the full GGUF is a one-character mistake that produces a SILENTLY WRONG artifact:
+    // the shadow zeroes the routed-expert extents but deliberately retains a 128-byte
+    // identity island at exactly the offset `validate_moe_expert_payload_identity`
+    // samples, and this writer's verbatim copy preserves that byte at the same
+    // record-relative offset. So a mostly-zero .cghost passes BOTH the source-identity
+    // sweep and the per-record payload check, and the only symptom is degraded output.
+    // `source_is_sparse` already existed but was wired only into the READ path.
+    if source_is_sparse(store.source_path())? {
+        return Err(invalid(format!(
+            "{} is a sparse file — that is a hot shadow, not a full GGUF, and its routed-expert \
+             ranges are holes. Repacking from it would write a .cghost of mostly zeros that still \
+             passes every identity check. Repack from the full GGUF instead.",
+            store.source_path().display()
+        )));
+    }
     let total_layers = binding.layers.len();
     let range = layer_range.unwrap_or(0..total_layers);
     if range.start >= range.end || range.end > total_layers {
@@ -898,6 +950,19 @@ pub struct GhostMoeExpert {
     pub down: GhostMoeTensorView,
 }
 
+/// Metadata-only description of the two projection views inside one contiguous
+/// routed-expert record. Fixed host/device staging uses these role-aware ranges
+/// instead of assuming the container stored gate/up before down.
+#[cfg(any(feature = "cuda", test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GhostMoeExpertRecordLayout {
+    pub(crate) byte_len: usize,
+    pub(crate) gate_up: std::ops::Range<usize>,
+    pub(crate) gate_up_dtype: GgufTensorType,
+    pub(crate) down: std::ops::Range<usize>,
+    pub(crate) down_dtype: GgufTensorType,
+}
+
 impl GhostMoeExpert {
     pub fn byte_len(&self) -> usize {
         self.bytes.len()
@@ -945,19 +1010,6 @@ pub struct GhostMoeTensorView {
     pub dims: Vec<u64>,
     offset: usize,
     len: usize,
-}
-
-impl GhostMoeTensorView {
-    /// This tensor's byte range inside its own expert record.
-    ///
-    /// Callers that own the record's storage — the CUDA lane's page-locked host
-    /// tier reads whole records into fixed-stride slots with
-    /// [`GhostFile::read_moe_expert_into`] — need the sub-ranges without going
-    /// back through an allocating `GhostMoeExpert`.
-    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
-    pub(crate) fn record_range(&self) -> std::ops::Range<usize> {
-        self.offset..self.offset + self.len
-    }
 }
 
 /// Prevalidated coordinates for one routed-expert payload in [`CghostIndex::groups`].
@@ -1049,10 +1101,23 @@ fn parse_moe_group_id(id: &str) -> Option<(usize, usize)> {
     Some((layer_idx, expert_idx))
 }
 
+/// Spans at or above this size take the explicit-read path when `bulk_reads` is set.
+/// Well under one 3.19 MiB expert record and well above the few-hundred-byte identity
+/// samples, so each lands on the path built for it.
+const CGHOST_BULK_READ_MIN_BYTES: u64 = 256 * 1024;
+
 /// Open `.cghost` reader: parses the index once, then serves page-aligned group reads.
 pub struct GhostFile {
     pub index: CghostIndex,
     file: File,
+    /// Raised around a cold bulk sweep (layer-major prefill), where records are read
+    /// once and a map copy degenerates into ~816 demand faults per record. Lowered for
+    /// decode, where reuse makes the map copy a pure memcpy and the explicit read a
+    /// measured 13% regression. See `read_positioned_span_into` for both receipts.
+    bulk_reads: AtomicBool,
+    /// Set by `--ghost-strict-cache`: every read bypasses the page cache. Distinct from
+    /// `bulk_reads`, which is a per-phase hint; both route to the same unbuffered handle.
+    strict_cache: AtomicBool,
     /// Normal buffered mode maps the immutable payload so CUDA can upload a
     /// validated expert record without an intermediate Vec/read copy. Strict
     /// cache mode clears this mapping and retains positioned I/O semantics.
@@ -1093,13 +1158,21 @@ impl GhostFile {
         let mut this = Self::open(path)?;
         if evict_page_cache {
             this.mmap = None;
+            this.strict_cache.store(true, Ordering::Relaxed);
             crate::tensor::disable_file_cache_best_effort(&this.file);
-            #[cfg(windows)]
+        }
+        // Open the unbuffered handle regardless. Strict mode uses it for EVERY read;
+        // normal mode uses it only for the cold bulk sweep (`bulk_reads`), where the
+        // page cache has nothing to offer and this drive delivers ~1.9 GB/s unbuffered
+        // against ~1.3 GB/s buffered. It costs one handle plus a sector-aligned scratch
+        // buffer of one expert record.
+        #[cfg(windows)]
+        if this.uncached.is_none() {
             match UncachedReader::open(path, this.max_layer_span()) {
                 Ok(reader) => this.uncached = Some(std::sync::Mutex::new(reader)),
                 Err(e) => eprintln!(
-                    "[ghost] --evict-page-cache: unbuffered (FILE_FLAG_NO_BUFFERING) open failed \
-                     ({e}); falling back to buffered reads (page cache active)"
+                    "[ghost] unbuffered (FILE_FLAG_NO_BUFFERING) open failed ({e}); \
+                     falling back to buffered reads"
                 ),
             }
         }
@@ -1139,12 +1212,21 @@ impl GhostFile {
         Ok(Self {
             index,
             file,
+            bulk_reads: AtomicBool::new(false),
+            strict_cache: AtomicBool::new(false),
             mmap: Some(GgufWireMmap::map(path)?),
             moe_access,
             moe_payload_verified,
             #[cfg(windows)]
             uncached: None,
         })
+    }
+
+    /// Select the read path for the phase that is about to run: `true` for a cold bulk
+    /// sweep (prefill), `false` for reuse-dominated access (decode). Cheap and
+    /// idempotent; the two paths return identical bytes.
+    pub(crate) fn set_bulk_reads(&self, on: bool) {
+        self.bulk_reads.store(on, Ordering::Relaxed);
     }
 
     /// Validate the structural identity required by the Gemma 4 paged-expert
@@ -1494,6 +1576,108 @@ impl GhostFile {
         Ok(len)
     }
 
+    /// Resolve projection roles and byte ranges without reading the record.
+    /// Generic `.cghost` files may store the two tensors in either contiguous
+    /// order, so callers that split a caller-owned record must use this metadata
+    /// rather than a hard-coded offset.
+    #[cfg(any(feature = "cuda", test))]
+    /// Ask the OS to begin faulting in one MoE layer's entire routed-expert span.
+    ///
+    /// The v2 layout stores experts layer-contiguous (`blk.L.exp.0 … blk.L.exp.E-1`),
+    /// so a whole layer is ONE contiguous byte range — 408 MiB on the tracked 26B row.
+    ///
+    /// Prefetching the WHOLE layer rather than the routed subset is what makes this
+    /// possible at all: layer L+1's routing is unknown until layer L has produced its
+    /// output, but the layer's byte range is knowable immediately. It is also nearly
+    /// free here — layer-major prefill was measured touching 121.1 of 128 experts per
+    /// layer, so covering all 128 costs ~5% more bytes while turning ~121 scattered
+    /// 3.19 MiB reads into one 408 MiB sequential read, which is the access pattern
+    /// this NVMe is actually good at.
+    ///
+    /// Best-effort and asynchronous: `PrefetchVirtualMemory` queues the transfer and
+    /// returns immediately, so there is no thread, no extra VRAM, and the on-demand
+    /// mmap path underneath is untouched. Every failure is ignored — the pages simply
+    /// fault in on first touch exactly as before.
+    ///
+    /// Prefill only. Do NOT call this per decoded token: a whole layer per token would
+    /// be 408 MiB/token against the ~98 MiB the routed subset actually needs.
+    pub(crate) fn prefetch_moe_layer(&self, layer_idx: usize, expert_count: usize) {
+        if expert_count == 0 {
+            return;
+        }
+        let Some(mmap) = self.mmap.as_ref() else {
+            return;
+        };
+        let Ok((_, first_start, _)) = self.checked_moe_expert_span(layer_idx, 0) else {
+            return;
+        };
+        let Ok((_, last_start, last_len)) =
+            self.checked_moe_expert_span(layer_idx, expert_count - 1)
+        else {
+            return;
+        };
+        let Some(len) = last_start
+            .checked_add(last_len as u64)
+            .and_then(|end| end.checked_sub(first_start))
+            .and_then(|len| usize::try_from(len).ok())
+        else {
+            return;
+        };
+        let Ok(range) = mmap.bytes(first_start, len) else {
+            return;
+        };
+        prefetch_range_best_effort(range);
+    }
+
+    pub(crate) fn moe_expert_record_layout(
+        &self,
+        layer_idx: usize,
+        expert_idx: usize,
+    ) -> Result<GhostMoeExpertRecordLayout> {
+        let (group, start, byte_len) = self.checked_moe_expert_span(layer_idx, expert_idx)?;
+        let (_, access) = self.moe_group_access(layer_idx, expert_idx)?;
+        let gate_up = self.moe_group_tensor(group, access, "gate_up_exps")?;
+        let down = self.moe_group_tensor(group, access, "down_exps")?;
+        let relative_range = |tensor: &CghostTensor| -> Result<std::ops::Range<usize>> {
+            let begin = tensor
+                .offset
+                .checked_sub(start)
+                .and_then(|offset| usize::try_from(offset).ok())
+                .ok_or_else(|| {
+                    invalid(format!(
+                        "group {} tensor {} begins before or outside its record",
+                        group.id, tensor.name
+                    ))
+                })?;
+            let len = usize::try_from(tensor.len).map_err(|_| {
+                invalid(format!(
+                    "group {} tensor {} length is not representable on this host",
+                    group.id, tensor.name
+                ))
+            })?;
+            let end = begin.checked_add(len).ok_or_else(|| {
+                invalid(format!(
+                    "group {} tensor {} relative range overflows usize",
+                    group.id, tensor.name
+                ))
+            })?;
+            if end > byte_len {
+                return Err(invalid(format!(
+                    "group {} tensor {} range {begin}..{end} exceeds record length {byte_len}",
+                    group.id, tensor.name
+                )));
+            }
+            Ok(begin..end)
+        };
+        Ok(GhostMoeExpertRecordLayout {
+            byte_len,
+            gate_up: relative_range(gate_up)?,
+            gate_up_dtype: gate_up.dtype,
+            down: relative_range(down)?,
+            down_dtype: down.dtype,
+        })
+    }
+
     /// Validate the fixed record layout consumed by persistent routed-expert
     /// accelerators.
     ///
@@ -1736,14 +1920,54 @@ impl GhostFile {
         // bypasses the page cache. read_into returns false when it declines (a group that is
         // not sector-aligned or whose aligned span would pass EOF -- never for a v1 .cghost's
         // 16 KiB-aligned blk groups), in which case we fall through to the buffered read.
+        // Unbuffered path. Strict mode takes it for every read; normal mode only for the
+        // cold bulk sweep, where the page cache has nothing to offer. `read_into` returns
+        // false when it declines (span not sector-aligned, or the aligned span would pass
+        // EOF), in which case we fall through.
         #[cfg(windows)]
-        if let Some(uncached) = &self.uncached {
-            let served = uncached
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .read_into(start, len, &mut buf[..])
-                .map_err(|e| io_err(Path::new("<cghost>"), e))?;
-            if served {
+        if self.strict_cache.load(Ordering::Relaxed)
+            || (self.bulk_reads.load(Ordering::Relaxed) && len >= CGHOST_BULK_READ_MIN_BYTES)
+        {
+            if let Some(uncached) = &self.uncached {
+                let served = uncached
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .read_into(start, len, &mut buf[..])
+                    .map_err(|e| io_err(Path::new("<cghost>"), e))?;
+                if served {
+                    return Ok(());
+                }
+            }
+        }
+        // WHICH PATH IS FASTER DEPENDS ENTIRELY ON THE REGIME, and both regimes were
+        // measured on this box:
+        //
+        // DECODE (warm reuse): the map wins. Routing record-sized spans to an explicit
+        // `read_exact_at` measured a 13.0% REGRESSION (paired ABABAB, 3/3 pairs negative,
+        // token-ID and hit/miss identity PASS; qa/perf/receipts/paired-mmap-vs-pread.json).
+        // With ~52% of decode misses being re-fetches of evicted experts, most reads hit
+        // the page cache, where the map copy is a pure memcpy and a positioned read pays a
+        // syscall plus that same copy. The map arm also scaled with cache warmth
+        // (19.6 -> 23.0 steady across pairs) while the positioned arm stayed flat.
+        //
+        // PREFILL (cold sweep): the map loses badly. Layer-major prefill streams the whole
+        // ~12 GiB payload once, so nearly every record is a genuine cold fault, and
+        // `copy_from_slice` over an unresident 3.19 MiB record degenerates into ~816
+        // synchronous 4 KiB demand faults. Profiled at **0.74 GB/s** against this drive's
+        // flat 1.3-1.9 GB/s on explicit reads — 57% of prefill wall.
+        //
+        // So the choice is made per regime, not once. The runtime raises `bulk_reads`
+        // around prefill. Byte-identical either way: same file, same offset, same length.
+        // Fall through to the map on any error rather than failing the read.
+        if self.bulk_reads.load(Ordering::Relaxed)
+            && len >= CGHOST_BULK_READ_MIN_BYTES
+            && read_exact_at(&self.file, buf, start).is_ok()
+        {
+            return Ok(());
+        }
+        if let Some(mmap) = &self.mmap {
+            if let Ok(slice) = mmap.bytes(start, len as usize) {
+                buf.copy_from_slice(slice);
                 return Ok(());
             }
         }
@@ -2385,6 +2609,31 @@ mod tests {
                 .unwrap();
             assert_eq!(destination.as_slice(), expected.bytes.as_ref());
         }
+    }
+
+    #[test]
+    fn expert_record_layout_resolves_projection_roles_in_either_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tiny.cghost");
+        write_tiny_moe_cghost(&path);
+        let mut ghost = GhostFile::open(&path).unwrap();
+
+        let canonical = ghost.moe_expert_record_layout(0, 0).unwrap();
+        assert_eq!(canonical.byte_len, 4);
+        assert_eq!(canonical.gate_up, 0..2);
+        assert_eq!(canonical.down, 2..4);
+
+        let group = &mut ghost.index.groups[0];
+        let start = group.tensors[0].offset;
+        group.tensors.swap(0, 1);
+        group.tensors[0].offset = start;
+        group.tensors[1].offset = start + group.tensors[0].len;
+        ghost.moe_access = GhostMoeAccessIndex::build(&ghost.index).unwrap();
+
+        let reversed = ghost.moe_expert_record_layout(0, 0).unwrap();
+        assert_eq!(reversed.byte_len, 4);
+        assert_eq!(reversed.down, 0..2);
+        assert_eq!(reversed.gate_up, 2..4);
     }
 
     #[test]

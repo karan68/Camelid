@@ -202,7 +202,7 @@ copying an intermediate expert record on every cache miss. `--ghost-strict-cache
 disables that mapping and retains the bounded positioned/unbuffered reader path.
 
 The Windows CUDA hot path batches routed hits while a dedicated copy stream fills miss slots.
-An eight-slot page-locked host ring pipelines one complete top-8 route without pinning the 12 GiB
+An eight-slot cacheable page-locked host ring pipelines one complete top-8 route without pinning the 12 GiB
 expert payload. Q4_0 nibble bias is removed with packed byte subtraction and the exact integer dot
 uses DP4A; the existing ordered f32 block fold is unchanged. Routed GeGLU and Q8_0 quantization are
 fused, and one router-order kernel replaces eight weighted-accumulate launches. These optimizations
@@ -211,21 +211,73 @@ are on by default for the experimental CUDA lane. Set
 `CAMELID_GEMMA4_CUDA_PINNED_EXPERTS=0` to bypass the page-locked transfer ring.
 
 Between the VRAM cache and storage sits a page-locked **host expert tier**: a cacheable pinned
-arena of whole `.cghost` records, auto-sized from available host RAM minus a reserve
+arena of whole `.cghost` records, auto-sized from available host RAM minus a reserve and capped at
+one fifth of installed physical RAM
 (`CAMELID_GEMMA4_GHOST_HOST_TIER_MIB` overrides it explicitly, `0` disables;
-`CAMELID_GEMMA4_GHOST_HOST_TIER_RESERVE_MIB` adjusts the default 3 GiB reserve). Auto-sizing
-refuses to build a tier smaller than a quarter of the routed payload: the tier only sees the
-VRAM cache's miss tail, and a small arena measured 0% hits on that stream while pinning RAM
-away from the OS page cache that was otherwise absorbing the reads — strictly worse than no
-tier. The explicit override still forces any size for measurement. A VRAM miss that
+`CAMELID_GEMMA4_GHOST_HOST_TIER_RESERVE_MIB` adjusts the default 3 GiB reserve, and
+`CAMELID_GEMMA4_GHOST_HOST_TIER_MAX_MIB` overrides the proportional cap). Auto-sizing
+refuses to build a tier covering less than 40% of the routed payload: after direct pinned staging
+and batch DMA removed the no-tier dispatch penalty, the measured 3.07 GiB tier was both slower and
+3 GiB larger than tier zero on a 16 GiB host. The explicit override still forces any size for
+long-session tuning or measurement. A VRAM miss that
 the tier holds costs one async DMA straight from pinned memory — the CPU never touches the bytes —
 instead of a storage read. This matters because the tracked machine's NVMe delivers a flat
 1.3–1.9 GB/s regardless of read queue depth, so no amount of read parallelism can serve the
-~800 MB/token routed working set from disk. `CAMELID_GEMMA4_GHOST_TIER_PREFILL=1` optionally
-fills the tier at load with a uniform per-layer stripe of records (mostly sequential reads).
-On the tracked 16 GiB machine this measured neutral-to-negative — the prefill read evicts the OS
-page cache's copy of the same payload, giving back what the extra tier hits gain — so it is off
-by default; it is expected to pay off only when the tier can hold the entire routed payload.
+~800 MB/token routed working set from disk. A viable tier covering at least 40% of all expert
+records is prefilled at load with a uniform per-layer stripe (mostly sequential reads); smaller
+tiers stay cold so they do not evict the Windows page cache for little reuse. The explicit
+`CAMELID_GEMMA4_GHOST_TIER_PREFILL=0/1` override always wins. On the tracked 5.98 GiB tier the
+current controlled run improved steady decode from 7.91 to 12.57 forwards/s, while the threshold
+keeps the previously measured 1 GiB/zero-hit failure disabled.
+
+`CAMELID_GEMMA4_CUDA_BATCH_EXPERT_COPIES=1` enables a default-off CUDA 12.8+ path for VRAM misses.
+With a host tier, sources are its resident pinned records. Without one, Camelid reads each miss
+directly into a unique slot in the small cacheable-pinned top-8 ring, avoiding an allocating mapped-
+record pre-pass. Both modes submit the independent gate/up and down uploads for one layer as one
+`cuMemcpyBatchAsync` call (`2 × miss_count` operations) instead of one driver call per projection.
+Camelid resolves the symbol through the runtime driver, so an older or unsupported driver keeps the
+existing individual-copy path. If an attempted batch is rejected, Camelid synchronizes the copy
+stream before retrying the byte-identical individual copies and disables batching for the rest of
+the process. The tracked RTX 3060/CUDA 12.8 A/B receipt used two matched 128-token runs per mode
+with the 5.98 GiB pinned tier: all 128 token IDs, 28,010 VRAM hits, 3,910 VRAM misses, 2,592 tier
+hits, and 1,318 storage reads matched. Batching raised mean steady decode from 11.55 to 15.90
+forwards/s (+37.6%) and cut mean decode wall time by 21.5%. This remains opt-in because the driver
+entry point and WDDM behavior are platform-specific.
+
+`CAMELID_GEMMA4_CUDA_FREQ_ADMISSION=1` enables a separate default-off VRAM-cache experiment aimed
+at scan pollution. It reserves exactly eight of the existing physical expert slots as per-layer
+streaming scratch, leaving the rest as the persistent hot cache, and keeps exact lifetime access
+counts for every `(layer, expert)`. Once the hot cache is full, an incoming miss replaces the
+least-frequent unprotected resident (least-recently-used breaks frequency ties) only when its count
+is strictly higher. An equally cold miss instead uploads to a unique scratch slot for that top-8
+route and is never published as resident. The same expert bytes and GEMV kernels run in both cases,
+so this changes residency only, not model arithmetic. CLI diagnostics report how many misses were
+streamed without admission. While this experiment is enabled Camelid deliberately bypasses the
+`CAMELID_GEMMA4_CUDA_BATCH_EXPERT_COPIES` path and uses the ordinary copy path; benchmark the saved
+evictions against the eight-slot reduction and copy-dispatch cost before adopting it. Counts live
+for the loaded runtime, so restart the model between controlled A/B runs.
+
+The current RTX 3060 Laptop defaults keep exact GPU expert-input quantization enabled with two
+warps per Q8_0 CTA. The two attempted overlap policies are available for other drivers but default
+off here: `CAMELID_GEMMA4_CUDA_OVERLAP_MISS_IO=1` submits resident hits before synchronous miss
+resolution, and `CAMELID_GEMMA4_CUDA_OVERLAP_ROUTER_COPY=1` moves the cacheable-pinned router DtoH
+to a second stream. Both added WDDM overhead in the controlled 128-token receipts. Override the
+Q8_0 geometry with `CAMELID_GEMMA4_CUDA_EXPERT_Q8_WARPS=1|2|4|8`; two warps produced the lowest
+profiled expert-loop time while endpoint differences versus eight warps remained within run noise.
+
+For the maximum-throughput profile, set `CAMELID_GEMMA4_GHOST_HOST_TIER_MIB=7165` only when about
+9 GiB or more of physical RAM is free before model load. At the full 4096-token CUDA context this
+admitted 2,165 host experts (7,163 MiB). Two identical 128-token runs sustained 19.54–19.64
+forwards/s over the second half and 12.93–13.55 forwards/s across all 127 timed decode forwards;
+the host tier served 72.5% of the VRAM miss tail and reduced `.cghost` reads to 1,075 (3.39 GiB).
+The same-binary 5.98 GiB receipts admitted 1,807 host experts, read 1,318 records (4.15 GiB), and
+ran around 18.7–18.8 steady / 12.8–12.9 all-decode forwards/s. Every compared run emitted the same
+128 token IDs. On a 16 GiB host, leave the tier unset so auto-sizing selects the ~26 MiB direct
+staging ring, or set 3072 MiB explicitly only when longer steady-state output matters more than
+short-request latency and 3 GiB of RAM. A measured 5.98 GiB tier drove system-available memory down
+to tens of MiB once WDDM and the file cache were active. Explicit maximum-throughput overrides
+remain available for hosts with enough physical headroom.
+
 `CAMELID_GEMMA4_GHOST_CUDA_CONTEXT` bounds the KV window (default 4096). Sliding-layer KV caches
 are rings of window+1 positions (a sliding layer can never attend further back than its 1024-token
 window, so older slots are reclaimed in place), which means only the 5 global layers scale with

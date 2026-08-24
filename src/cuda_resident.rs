@@ -260,6 +260,51 @@ extern "C" __global__ void rms_norm_quantize(
     }
 }
 
+// ---- Host-RMS-inverse norm + Windows-parity Q8_0 quantize -----------------
+// Gemma's CPU router already scans the post-attention row. The host supplies the
+// exact sequential Rust `(mss + eps).powf(-0.5)` result from that scan, while this
+// kernel applies `x * rms_inv * weight` directly to the resident device row. One
+// warp owns each 32-value Q8 block. Lane 0 visits the normalized values in index
+// order, preserving the CPU's serial max scan, then every lane quantizes one value.
+// `roundf` is intentional: CUDA roundf and Rust f32::round both break exact halves
+// away from zero. The generic quantizers above retain their existing rintf semantics.
+extern "C" __global__ void rms_inv_norm_quantize_q8_0(
+    const float* __restrict__ x, const float* __restrict__ weight,
+    signed char* __restrict__ quants, float* __restrict__ scales,
+    int n, float rms_inv
+) {
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int warps_per_cta = blockDim.x >> 5;
+    int qblock = blockIdx.x * warps_per_cta + warp;
+    int n_blocks = n >> 5;
+    if (qblock >= n_blocks) return;
+
+    long i = ((long)qblock << 5) + lane;
+    // Keep the same left-associated f32 operations as
+    // `rms_norm`: `(x[i] * rms_inv) * weight[i]`.
+    float value = x[i] * rms_inv * weight[i];
+    unsigned int mask = 0xffffffffu;
+    float max_abs = 0.0f;
+    #pragma unroll
+    for (int source_lane = 0; source_lane < 32; source_lane++) {
+        float candidate = __shfl_sync(mask, value, source_lane);
+        if (lane == 0) {
+            float a = fabsf(candidate);
+            if (a > max_abs) max_abs = a;
+        }
+    }
+    max_abs = __shfl_sync(mask, max_abs, 0);
+
+    float unrounded = max_abs / 127.0f;
+    if (lane == 0) scales[qblock] = f16_round(unrounded);
+    float inv_scale = unrounded == 0.0f ? 0.0f : 1.0f / unrounded;
+    float q = roundf(value * inv_scale); // Rust f32::round: ties away from zero
+    if (q > 127.0f) q = 127.0f;
+    if (q < -128.0f) q = -128.0f;
+    quants[i] = (signed char)q;
+}
+
 // ---- Q8_0 GEMV: one warp per output row, __dp4a dot, ordered float sum -------
 // weight_bytes is the repacked SoA layout (see repack_q8_soa): all quants first
 // (rows*blocks_per_row*32 i8, 16-byte aligned), then the original f16 scale bits
@@ -1990,6 +2035,33 @@ __device__ __forceinline__ int q4_0_dot32_dp4a(
     return sum;
 }
 
+// Same computation as `q4_0_dot32_dp4a` above, for callers that already hold the
+// block's 16 nibble bytes in a register (one aligned `uint4` load out of an SoA
+// quant plane) instead of pointing at an unaligned 18-byte wire block. Identical
+// low/high nibble split, identical activation pairing, identical __dp4a chain --
+// so the integer result is the same integer, and any kernel can be swapped between
+// the two forms without moving a single output bit.
+//
+// Defined here, beside its sibling, because NVRTC needs it before its first use
+// and `q4_0_gemv_soa` follows shortly.
+__device__ __forceinline__ int q4_0_dot32_dp4a_packed(
+    uint4 packed, const signed char* __restrict__ y
+) {
+    unsigned int words[4] = {packed.x, packed.y, packed.z, packed.w};
+    int sum = 0;
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        unsigned int q = words[j];
+        int lo = (int)__vsub4(q & 0x0f0f0f0fu, 0x08080808u);
+        int hi = (int)__vsub4((q >> 4) & 0x0f0f0f0fu, 0x08080808u);
+        int ylo = *((const int*)(y + j * 4));
+        int yhi = *((const int*)(y + 16 + j * 4));
+        sum = __dp4a(lo, ylo, sum);
+        sum = __dp4a(hi, yhi, sum);
+    }
+    return sum;
+}
+
 // ---- Q4_0 GEMV: one warp per output row, raw 18-byte wire, Q8_0 activation ----
 // Bit-identical reproduction of the validated CPU oracle `q4_0_wire_row_dot_scalar`
 // (the gemma4 QAT linear lane). Per 18-byte block: scale = f16(blk[0..2]); for
@@ -2029,6 +2101,75 @@ extern "C" __global__ void q4_0_gemv(
             float w_scale = f16_bits_to_f32((unsigned short)(blk[0] | (blk[1] << 8)));
             const signed char* y = s_iq + (long)b * 32;
             int isum = q4_0_dot32_dp4a(blk + 2, y);
+            myterms[b] = (float)isum * w_scale * s_is[b];
+        }
+    }
+    __syncwarp();
+    if (row < rows && lane == 0) {
+        float acc = 0.0f;
+        for (int b = 0; b < blocks_per_row; b++) acc += myterms[b];
+        output[row] = residual ? (output[row] + acc) : acc;
+    }
+}
+
+// ---- Q4_0 GEMV, quants-first SoA weights ------------------------------------
+// Identical arithmetic to `q4_0_gemv` above; the ONLY difference is how the same
+// 18 bytes per block reach the registers.
+//
+// The raw-wire kernel reads its 16 nibble bytes off an 18-byte stride, so the
+// block never lands on a 4-byte boundary and `q4_0_dot32_dp4a` has to assemble
+// each 32-bit word from four scalar byte loads -- 16 scalar loads per block,
+// spanning up to five cache lines, plus two more for the f16 scale. That is the
+// same defect that held the sibling q8_gemv at ~52% of memory bandwidth until it
+// got its SoA repack (+12% decode on this GPU); Q4_0 never received the fix.
+//
+// `q4_0_wire_to_soa` splits the tensor into a quants plane and a scales plane:
+//   [rows*blocks_per_row*16 nibble bytes][rows*blocks_per_row*2 f16 scale bits]
+// Block b of row r therefore starts at a 16-byte aligned offset, so its nibbles
+// are ONE `uint4` load, and the scales are a coalesced u16 read. Total bytes are
+// unchanged at 18/block, so VRAM residency and every slot budget stay identical.
+//
+// BIT-IDENTICAL BY CONSTRUCTION, not by observation:
+//   * `q4_0_dot32_dp4a_packed` consumes exactly the bytes `q4_0_dot32_dp4a` did,
+//     with the same low/high nibble split and the same activation pairing
+//     (y[j] with the low nibble, y[16+j] with the high nibble).
+//   * The integer `__dp4a` chain is exact regardless of grouping, so `isum` is
+//     the same integer.
+//   * The per-block float term `(float)isum * w_scale * s_is[b]` is unchanged.
+//   * The tail fold is still lane 0 summing `myterms` in increasing block order.
+// Only the load instructions change. `q4_0_gemv_soa_matches_wire` pins this.
+extern "C" __global__ void q4_0_gemv_soa(
+    const float* __restrict__ input_scales, const signed char* __restrict__ input_quants,
+    const unsigned char* __restrict__ weight_bytes, int rows, int blocks_per_row,
+    float* __restrict__ output, int residual
+) {
+    extern __shared__ unsigned char smem40s[];
+    signed char* s_iq = (signed char*)smem40s;                        // blocks_per_row*32 i8
+    float* s_is = (float*)(smem40s + (long)blocks_per_row * 32);      // blocks_per_row f32
+    float* terms = (float*)(smem40s + (long)blocks_per_row * 36);     // warps*blocks_per_row f32
+    int tid = threadIdx.x;
+    for (int i = tid; i < blocks_per_row * 8; i += blockDim.x)
+        ((int*)s_iq)[i] = ((const int*)input_quants)[i];
+    for (int i = tid; i < blocks_per_row; i += blockDim.x) s_is[i] = input_scales[i];
+    __syncthreads();
+
+    int warp = tid >> 5;
+    int lane = tid & 31;
+    int warps_per_block = blockDim.x >> 5;
+    int row = blockIdx.x * warps_per_block + warp;
+    float* myterms = terms + (long)warp * blocks_per_row;
+    // Plane bases. The scale plane begins after every row's nibbles.
+    const uint4* quant_plane = (const uint4*)weight_bytes;
+    const unsigned short* scale_plane =
+        (const unsigned short*)(weight_bytes + (long)rows * blocks_per_row * 16);
+    if (row < rows) {
+        long row_block0 = (long)row * blocks_per_row;
+        for (int b = lane; b < blocks_per_row; b += 32) {
+            long idx = row_block0 + b;
+            uint4 packed = quant_plane[idx];            // one aligned 16-byte load
+            float w_scale = f16_bits_to_f32(scale_plane[idx]);
+            const signed char* y = s_iq + (long)b * 32;
+            int isum = q4_0_dot32_dp4a_packed(packed, y);
             myterms[b] = (float)isum * w_scale * s_is[b];
         }
     }
@@ -2095,6 +2236,212 @@ extern "C" __global__ void q4_1_gemv(
         float acc = 0.0f;
         for (int b = 0; b < blocks_per_row; b++) acc += myterms[b];
         output[row] = residual ? (output[row] + acc) : acc;
+    }
+}
+
+// Pack four bytes from an arbitrary (and, for Q4_0's 18-byte stride, commonly
+// unaligned) wire address without issuing an unaligned uint load. Keeping the
+// packed words in registers lets the K-batched kernels decode one weight block
+// once and reuse it for every speculative token.
+__device__ __forceinline__ unsigned int q4_pack4_le(const unsigned char* p) {
+    return (unsigned int)p[0]
+        | ((unsigned int)p[1] << 8)
+        | ((unsigned int)p[2] << 16)
+        | ((unsigned int)p[3] << 24);
+}
+
+__device__ __forceinline__ int2 q4_1_dot32_dp4a_packed(
+    uint4 packed, const signed char* __restrict__ y
+) {
+    unsigned int words[4] = {packed.x, packed.y, packed.z, packed.w};
+    int isum = 0;
+    int asum = 0;
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        unsigned int q = words[j];
+        int lo = (int)(q & 0x0f0f0f0fu);
+        int hi = (int)((q >> 4) & 0x0f0f0f0fu);
+        int ylo = *((const int*)(y + j * 4));
+        int yhi = *((const int*)(y + 16 + j * 4));
+        isum = __dp4a(lo, ylo, isum);
+        isum = __dp4a(hi, yhi, isum);
+        asum = __dp4a(0x01010101, ylo, asum);
+        asum = __dp4a(0x01010101, yhi, asum);
+    }
+    return make_int2(isum, asum);
+}
+
+// ---- Batched raw-wire Q4 GEMMs: K token-inputs against M weight rows --------
+// These are the Gemma-4 QAT counterparts of q8_gemm_batched. One warp owns an
+// output row. Each lane loads one 18/20-byte weight block exactly once, keeps its
+// packed nibbles and scale(s) in registers, and contracts it with all K Q8_0
+// activation rows. Lane 0 then replays the scalar GEMV's block-order f32 sum for
+// every token, preserving the exact per-block association and greedy parity.
+extern "C" __global__ void q4_0_gemm_batched(
+    const float* __restrict__ input_scales, const signed char* __restrict__ input_quants,
+    const unsigned char* __restrict__ weight_bytes, int rows, int blocks_per_row,
+    int k_tokens, float* __restrict__ output
+) {
+    extern __shared__ float terms[]; // [warp][token][block]
+    int warp = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    int warps_per_block = blockDim.x >> 5;
+    int row = blockIdx.x * warps_per_block + warp;
+    float* myterms = terms + (long)warp * k_tokens * blocks_per_row;
+    const int WIRE = 18;
+    if (row < rows) {
+        long row_block0 = (long)row * blocks_per_row;
+        for (int b = lane; b < blocks_per_row; b += 32) {
+            const unsigned char* blk = weight_bytes + (long)(row_block0 + b) * WIRE;
+            float w_scale = f16_bits_to_f32((unsigned short)(blk[0] | (blk[1] << 8)));
+            uint4 packed = make_uint4(
+                q4_pack4_le(blk + 2), q4_pack4_le(blk + 6),
+                q4_pack4_le(blk + 10), q4_pack4_le(blk + 14));
+            for (int t = 0; t < k_tokens; t++) {
+                const signed char* y = input_quants
+                    + ((long)t * blocks_per_row + b) * 32;
+                int isum = q4_0_dot32_dp4a_packed(packed, y);
+                myterms[(long)t * blocks_per_row + b] =
+                    (float)isum * w_scale * input_scales[(long)t * blocks_per_row + b];
+            }
+        }
+    }
+    __syncwarp();
+    if (row < rows && lane == 0) {
+        for (int t = 0; t < k_tokens; t++) {
+            float acc = 0.0f;
+            for (int b = 0; b < blocks_per_row; b++)
+                acc += myterms[(long)t * blocks_per_row + b];
+            output[(long)t * rows + row] = acc;
+        }
+    }
+}
+
+// ---- Routed Q4_0 GEMM: one expert's weights against ITS tokens -------------
+// This is the prefill counterpart of `q4_0_gemv_routed`, and it exists because the
+// GEMV form re-reads a weight for every token that routes to it. On a 362-token
+// prompt each expert is wanted by ~22.6 tokens, so the per-layer weight traffic is
+// 362 x 8 x 3.19 MiB = 9.02 GiB instead of the 408 MiB the layer actually contains
+// — 271 GiB across a whole prefill against 12 GiB here. The FLOPs are identical;
+// only the redundancy goes away, which turns a memory-bound GEMV into a
+// compute-bound GEMM.
+//
+// Routing is RAGGED — expert e is wanted by a variable subset of the chunk's
+// tokens — so the assignment is passed CSR-style: `token_offsets[e]..token_offsets[e+1]`
+// indexes into `token_ids`. Output is written per ASSIGNMENT, not per token, so the
+// caller's existing route-order weighted sum keeps its exact accumulation order.
+//
+// BIT-IDENTICAL to `q4_0_gemv_routed` for every (expert, token) pair it covers: the
+// same 16 weight bytes meet the same activation row through the same
+// `q4_0_dot32_dp4a_packed`, the per-block float term is the same product in the same
+// order, and each row is still folded by ONE lane over increasing b. Only the loop
+// nesting changes — the weight is hoisted into registers and reused across tokens
+// instead of being re-fetched. Pinned by `q4_0_gemm_routed_matches_gemv`.
+//
+// Shared scratch is [warp][tile][blocks_per_row] floats, so the caller tiles the
+// assignment list: at blocks_per_row 88 and 8 warps that is 2.75 KiB per tile row.
+extern "C" __global__ void q4_0_gemm_routed(
+    const float* __restrict__ input_scales,
+    const signed char* __restrict__ input_quants,
+    const unsigned char* __restrict__ weight_arena,
+    const int* __restrict__ slot_ids,
+    const int* __restrict__ token_offsets,
+    const int* __restrict__ token_ids,
+    unsigned long long weight_stride, int rows, int blocks_per_row,
+    float* __restrict__ output, int expert_count, int tile
+) {
+    int expert = blockIdx.y;
+    if (expert >= expert_count) return;
+    int first = token_offsets[expert];
+    int count = token_offsets[expert + 1] - first;
+    int tile_base = blockIdx.z * tile;
+    if (tile_base >= count) return;
+    int n_tok = count - tile_base;
+    if (n_tok > tile) n_tok = tile;
+
+    const unsigned char* expert_weights = weight_arena + (long)slot_ids[expert] * weight_stride;
+
+    extern __shared__ float smem40gr[];
+    int warp = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    int warps_per_block = blockDim.x >> 5;
+    int row = blockIdx.x * warps_per_block + warp;
+    float* myterms = smem40gr + (long)warp * tile * blocks_per_row;
+    const int WIRE = 18;
+
+    if (row < rows) {
+        long row_block0 = (long)row * blocks_per_row;
+        for (int b = lane; b < blocks_per_row; b += 32) {
+            // Load this block's weight ONCE and hold it in registers across all
+            // n_tok activation rows. This reuse is the entire point of the kernel.
+            const unsigned char* blk = expert_weights + (row_block0 + b) * WIRE;
+            float w_scale = f16_bits_to_f32(
+                (unsigned short)(blk[0] | (blk[1] << 8)));
+            uint4 packed = make_uint4(
+                q4_pack4_le(blk + 2), q4_pack4_le(blk + 6),
+                q4_pack4_le(blk + 10), q4_pack4_le(blk + 14));
+            for (int j = 0; j < n_tok; j++) {
+                int t = token_ids[first + tile_base + j];
+                const signed char* y = input_quants
+                    + ((long)t * blocks_per_row + b) * 32;
+                int isum = q4_0_dot32_dp4a_packed(packed, y);
+                myterms[(long)j * blocks_per_row + b] =
+                    (float)isum * w_scale * input_scales[(long)t * blocks_per_row + b];
+            }
+        }
+    }
+    __syncwarp();
+    if (row < rows && lane == 0) {
+        for (int j = 0; j < n_tok; j++) {
+            float acc = 0.0f;
+            for (int b = 0; b < blocks_per_row; b++)
+                acc += myterms[(long)j * blocks_per_row + b];
+            // Per-assignment output: (first + tile_base + j) is this expert's slot in
+            // the caller's flat route list, so route order is preserved downstream.
+            output[(long)(first + tile_base + j) * rows + row] = acc;
+        }
+    }
+}
+
+extern "C" __global__ void q4_1_gemm_batched(
+    const float* __restrict__ input_scales, const signed char* __restrict__ input_quants,
+    const unsigned char* __restrict__ weight_bytes, int rows, int blocks_per_row,
+    int k_tokens, float* __restrict__ output
+) {
+    extern __shared__ float terms[]; // [warp][token][block]
+    int warp = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    int warps_per_block = blockDim.x >> 5;
+    int row = blockIdx.x * warps_per_block + warp;
+    float* myterms = terms + (long)warp * k_tokens * blocks_per_row;
+    const int WIRE = 20;
+    if (row < rows) {
+        long row_block0 = (long)row * blocks_per_row;
+        for (int b = lane; b < blocks_per_row; b += 32) {
+            const unsigned char* blk = weight_bytes + (long)(row_block0 + b) * WIRE;
+            float w_d = f16_bits_to_f32((unsigned short)(blk[0] | (blk[1] << 8)));
+            float w_m = f16_bits_to_f32((unsigned short)(blk[2] | (blk[3] << 8)));
+            uint4 packed = make_uint4(
+                q4_pack4_le(blk + 4), q4_pack4_le(blk + 8),
+                q4_pack4_le(blk + 12), q4_pack4_le(blk + 16));
+            for (int t = 0; t < k_tokens; t++) {
+                const signed char* y = input_quants
+                    + ((long)t * blocks_per_row + b) * 32;
+                int2 sums = q4_1_dot32_dp4a_packed(packed, y);
+                myterms[(long)t * blocks_per_row + b] =
+                    (w_d * (float)sums.x + w_m * (float)sums.y)
+                    * input_scales[(long)t * blocks_per_row + b];
+            }
+        }
+    }
+    __syncwarp();
+    if (row < rows && lane == 0) {
+        for (int t = 0; t < k_tokens; t++) {
+            float acc = 0.0f;
+            for (int b = 0; b < blocks_per_row; b++)
+                acc += myterms[(long)t * blocks_per_row + b];
+            output[(long)t * rows + row] = acc;
+        }
     }
 }
 
@@ -3101,6 +3448,28 @@ extern "C" __global__ void quantize_q8k(
     quant_q8k_block_parallel(v, tid, r_amax, r_maxv, r_idx,
                              quants + (long)b * 256, scales + b);
 }
+
+// Host supplies Gemma's exact sequential Rust RMS inverse; CUDA applies the
+// weighted norm to the resident row and feeds the existing parity-locked Q8_K
+// reducer. `quant_q8k_block_parallel` retains the serial reference's first
+// absolute-maximum signed value and `nearest_int_ref` byte quantization.
+extern "C" __global__ void rms_inv_norm_quantize_q8k(
+    const float* __restrict__ x, const float* __restrict__ weight,
+    signed char* __restrict__ quants, float* __restrict__ scales,
+    int n, float rms_inv
+) {
+    __shared__ float r_amax[256];
+    __shared__ float r_maxv[256];
+    __shared__ int r_idx[256];
+    int b = blockIdx.x;
+    int n_sb = n >> 8;
+    if (b >= n_sb) return;
+    int tid = threadIdx.x;
+    long i = ((long)b << 8) + tid;
+    float value = x[i] * rms_inv * weight[i];
+    quant_q8k_block_parallel(value, tid, r_amax, r_maxv, r_idx,
+                             quants + ((long)b << 8), scales + b);
+}
 // Fused RMS-norm + Q8_K quantize (K-quant analog of rms_norm_quantize). One block
 // stages the row in shared, thread 0 does the in-order sum-of-squares (bit-identical
 // to rms_norm_f32), every thread applies norm*weight back into shared, then each
@@ -3866,6 +4235,174 @@ extern "C" __global__ void q4_0_gemv_routed(
     }
 }
 
+// ---- Routed Q4_0 GEMV, R output rows per warp ------------------------------
+// Same arithmetic as `q4_0_gemv_routed`; the only change is WHO does the tail fold.
+//
+// The one-row-per-warp shape ends with `if (lane == 0) for (b...) acc += myterms[b]`.
+// For the routed gate_up geometry that is 88 serially dependent f32 adds -- roughly
+// 350 cycles of pure dependent-FADD latency -- issued by a single lane while the other
+// 31 sit predicated off, against about 24 dp4a instructions of actual work. The fold,
+// not the dot product, is the kernel.
+//
+// Here each warp owns G4_ROUTED_ROWS consecutive output rows. Phase 1 computes every
+// (row, block) term exactly as before, so the weight reads keep their coalescing: at a
+// given row the 32 lanes still walk 32 consecutive blocks. Phase 2 hands row r to lane
+// r, and each lane sums ITS OWN row across b = 0,1,2,... in the same increasing-block
+// order the single lane used. Every row's f32 association is therefore byte-identical
+// and the greedy token stream cannot move -- this is the parity-SAFE alternative to a
+// warp-shuffle tree, which commit a03fca63 tried on the sibling q8_gemv for +4%, found
+// it flipped a greedy near-tie, and reverted.
+//
+// Costs R x more shared scratch per warp and divides the grid by R, so R trades fold
+// parallelism against occupancy. R=8 keeps 176 blocks for the 1408-row gate_up shape,
+// still comfortably above this box's 30 SMs. `q4_0_gemv_routed_rows_matches_scalar`
+// pins the bitwise equality.
+// Blocks processed per pass. 32 keeps every lane busy in the term phase (the inner
+// stride is 32) while bounding the scratch; the launcher must size shared memory with
+// the same constant.
+#define G4_ROUTED_CHUNK 32
+extern "C" __global__ void q4_0_gemv_routed_rows(
+    const float* __restrict__ input_scales,
+    const signed char* __restrict__ input_quants,
+    const unsigned char* __restrict__ weight_arena,
+    const int* __restrict__ slot_ids,
+    const int* __restrict__ route_ids,
+    unsigned long long weight_stride, int rows, int blocks_per_row,
+    float* __restrict__ output, int expert_count, int batched_input,
+    int rows_per_warp
+) {
+    int expert = blockIdx.y;
+    if (expert >= expert_count) return;
+    int route = route_ids[expert];
+    int slot = slot_ids[expert];
+    const float* expert_scales = input_scales
+        + (batched_input ? (long)route * blocks_per_row : 0);
+    const signed char* expert_quants = input_quants
+        + (batched_input ? (long)route * blocks_per_row * 32 : 0);
+    const unsigned char* expert_weights = weight_arena + (long)slot * weight_stride;
+
+    extern __shared__ unsigned char smem40rr[];
+    signed char* s_iq = (signed char*)smem40rr;
+    float* s_is = (float*)(smem40rr + (long)blocks_per_row * 32);
+    float* terms = (float*)(smem40rr + (long)blocks_per_row * 36);
+    int tid = threadIdx.x;
+    for (int i = tid; i < blocks_per_row * 8; i += blockDim.x)
+        ((int*)s_iq)[i] = ((const int*)expert_quants)[i];
+    for (int i = tid; i < blocks_per_row; i += blockDim.x)
+        s_is[i] = expert_scales[i];
+    __syncthreads();
+
+    int warp = tid >> 5;
+    int lane = tid & 31;
+    int warps_per_block = blockDim.x >> 5;
+    int row0 = (blockIdx.x * warps_per_block + warp) * rows_per_warp;
+    // Scratch is R x CHUNK per warp, NOT R x blocks_per_row: holding every row's full
+    // term vector would take 8 x 88 x 4 = 22.5 KB per block on the gate_up shape and
+    // halve occupancy, which measurably ate most of the fold win. Walking the blocks in
+    // CHUNK-sized passes keeps the scratch at 8 x 32 x 4 = 1 KB per warp and full
+    // occupancy, and each lane simply carries its running accumulator across passes --
+    // so the per-row summation is still strictly increasing in b, and still done by one
+    // lane. Bit-exactness is unchanged; only the residency is better.
+    float* myterms = terms + (long)warp * rows_per_warp * G4_ROUTED_CHUNK;
+
+    int myrow = row0 + lane;
+    bool folder = (lane < rows_per_warp) && (myrow < rows);
+    float acc = 0.0f;
+
+    for (int c0 = 0; c0 < blocks_per_row; c0 += G4_ROUTED_CHUNK) {
+        int cn = blocks_per_row - c0;
+        if (cn > G4_ROUTED_CHUNK) cn = G4_ROUTED_CHUNK;
+        for (int r = 0; r < rows_per_warp; r++) {
+            int row = row0 + r;
+            if (row >= rows) break;
+            long row_block0 = (long)row * blocks_per_row;
+            float* rowterms = myterms + (long)r * G4_ROUTED_CHUNK;
+            for (int b = lane; b < cn; b += 32) {
+                const unsigned char* blk = expert_weights + (row_block0 + c0 + b) * 18;
+                float w_scale = f16_bits_to_f32(
+                    (unsigned short)(blk[0] | (blk[1] << 8)));
+                const signed char* y = s_iq + (long)(c0 + b) * 32;
+                int isum = q4_0_dot32_dp4a(blk + 2, y);
+                rowterms[b] = (float)isum * w_scale * s_is[c0 + b];
+            }
+        }
+        __syncwarp();
+        if (folder) {
+            const float* rowterms = myterms + (long)lane * G4_ROUTED_CHUNK;
+            for (int b = 0; b < cn; b++) acc += rowterms[b];
+        }
+        __syncwarp();
+    }
+    if (folder) output[(long)route * rows + myrow] = acc;
+}
+
+// ---- Routed batched Q4_1 GEMV -------------------------------------------
+extern "C" __global__ void q4_1_gemv_routed(
+    const float* __restrict__ input_scales,
+    const signed char* __restrict__ input_quants,
+    const unsigned char* __restrict__ weight_arena,
+    const int* __restrict__ slot_ids,
+    const int* __restrict__ route_ids,
+    unsigned long long weight_stride, int rows, int blocks_per_row,
+    float* __restrict__ output, int expert_count, int batched_input
+) {
+    int expert = blockIdx.y;
+    if (expert >= expert_count) return;
+    int route = route_ids[expert];
+    int slot = slot_ids[expert];
+    const float* expert_scales = input_scales
+        + (batched_input ? (long)route * blocks_per_row : 0);
+    const signed char* expert_quants = input_quants
+        + (batched_input ? (long)route * blocks_per_row * 32 : 0);
+    const unsigned char* expert_weights = weight_arena + (long)slot * weight_stride;
+
+    extern __shared__ unsigned char smem41r[];
+    signed char* s_iq = (signed char*)smem41r;
+    float* s_is = (float*)(smem41r + (long)blocks_per_row * 32);
+    float* terms = (float*)(smem41r + (long)blocks_per_row * 36);
+    int tid = threadIdx.x;
+    for (int i = tid; i < blocks_per_row * 8; i += blockDim.x)
+        ((int*)s_iq)[i] = ((const int*)expert_quants)[i];
+    for (int i = tid; i < blocks_per_row; i += blockDim.x)
+        s_is[i] = expert_scales[i];
+    __syncthreads();
+
+    int warp = tid >> 5;
+    int lane = tid & 31;
+    int warps_per_block = blockDim.x >> 5;
+    int row = blockIdx.x * warps_per_block + warp;
+    float* myterms = terms + (long)warp * blocks_per_row;
+    const int WIRE = 20;
+    if (row < rows) {
+        long row_block0 = (long)row * blocks_per_row;
+        for (int b = lane; b < blocks_per_row; b += 32) {
+            const unsigned char* blk = expert_weights + (long)(row_block0 + b) * WIRE;
+            float w_d = f16_bits_to_f32((unsigned short)(blk[0] | (blk[1] << 8)));
+            float w_m = f16_bits_to_f32((unsigned short)(blk[2] | (blk[3] << 8)));
+            const signed char* y = s_iq + (long)b * 32;
+            int isum = 0;
+            int asum = 0;
+            #pragma unroll
+            for (int j = 0; j < 16; j++) {
+                unsigned char byte = blk[4 + j];
+                int lo = (int)(byte & 0xF);
+                int hi = (int)(byte >> 4);
+                int ylo = (int)y[j];
+                int yhi = (int)y[j + 16];
+                isum += lo * ylo + hi * yhi;
+                asum += ylo + yhi;
+            }
+            myterms[b] = (w_d * (float)isum + w_m * (float)asum) * s_is[b];
+        }
+    }
+    __syncwarp();
+    if (row < rows && lane == 0) {
+        float acc = 0.0f;
+        for (int b = 0; b < blocks_per_row; b++) acc += myterms[b];
+        output[(long)route * rows + row] = acc;
+    }
+}
+
 // Routed twin of q2k_gemv for the Ghost-MoE expert arenas: blockIdx.y selects
 // one routed expert; slot_ids locate its Q2_K gate_up slab in the fixed-stride
 // VRAM arena and route_ids place the output row block in router order. Every
@@ -3962,9 +4499,13 @@ extern "C" __global__ void q2k_gemv_routed(
     }
 }
 
-// Fuse each routed expert's GeGLU with its Q8_0 quantization. One thread owns a
-// 32-value Q8 block, retaining its GeGLU values locally across the max and quant
-// passes so neither a second tanh nor a global f32 intermediate is needed.
+// Fuse each routed expert's GeGLU with its Q8_0 quantization. One WARP owns a
+// 32-value Q8 block, so every lane keeps one GeGLU value in a register while a
+// comparison-only shuffle reduction finds the block maximum. Max is independent
+// of reduction order; initializing each lane from zero also preserves the former
+// serial loop's behavior of ignoring NaNs in the maximum scan. This replaces 32
+// serial tanhf/quantize iterations in one thread with one iteration per lane and
+// eliminates the former 32-float per-thread local array.
 extern "C" __global__ void geglu_quantize_routed(
     const float* __restrict__ gate_up,
     const int* __restrict__ route_ids,
@@ -3973,31 +4514,40 @@ extern "C" __global__ void geglu_quantize_routed(
     int nff, int blocks_per_expert, int expert_count
 ) {
     int expert = blockIdx.y;
-    int block = blockIdx.x * blockDim.x + threadIdx.x;
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int warps_per_cta = blockDim.x >> 5;
+    int block = blockIdx.x * warps_per_cta + warp;
     if (expert >= expert_count || block >= blocks_per_expert) return;
     int route = route_ids[expert];
-    const float* gate = gate_up + (long)route * (2 * nff) + (long)block * 32;
-    const float* up = gate_up + (long)route * (2 * nff) + nff + (long)block * 32;
-    float values[32];
+    long value_index = (long)block * 32 + lane;
+    const float* route_values = gate_up + (long)route * (2 * nff);
+    float x = route_values[value_index];
+    float up = route_values[nff + value_index];
+    float inner = 0.79788456f * (x + 0.044715f * x * x * x);
+    float value = (0.5f * x * (1.0f + tanhf(inner))) * up;
+
+    // Match `max_abs = 0; if (fabsf(value) > max_abs) ...`: in particular,
+    // a NaN candidate remains zero and cannot poison the warp reduction.
     float max_abs = 0.0f;
-    for (int j = 0; j < 32; j++) {
-        float x = gate[j];
-        float inner = 0.79788456f * (x + 0.044715f * x * x * x);
-        float v = (0.5f * x * (1.0f + tanhf(inner))) * up[j];
-        values[j] = v;
-        float a = fabsf(v);
-        if (a > max_abs) max_abs = a;
+    float a = fabsf(value);
+    if (a > max_abs) max_abs = a;
+    unsigned int mask = 0xffffffffu;
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        float other = __shfl_down_sync(mask, max_abs, offset);
+        if (other > max_abs) max_abs = other;
     }
+    max_abs = __shfl_sync(mask, max_abs, 0);
+
     float unrounded = max_abs / 127.0f;
-    scales[(long)route * blocks_per_expert + block] = f16_round(unrounded);
+    if (lane == 0)
+        scales[(long)route * blocks_per_expert + block] = f16_round(unrounded);
     float inv = unrounded == 0.0f ? 0.0f : 1.0f / unrounded;
-    signed char* qb = quants + ((long)route * blocks_per_expert + block) * 32;
-    for (int j = 0; j < 32; j++) {
-        float q = rintf(values[j] * inv);
-        if (q > 127.0f) q = 127.0f;
-        if (q < -128.0f) q = -128.0f;
-        qb[j] = (signed char)q;
-    }
+    float q = rintf(value * inv);
+    if (q > 127.0f) q = 127.0f;
+    if (q < -128.0f) q = -128.0f;
+    quants[((long)route * blocks_per_expert + block) * 32 + lane] = (signed char)q;
 }
 
 // Strict router-order weighted sum. One thread owns one hidden coordinate and
@@ -5945,6 +6495,7 @@ pub struct CudaResidentKernels {
     pub(crate) rms_norm_per_head: CudaFunction,
     pub(crate) quantize: CudaFunction,
     pub(crate) rms_norm_quantize: CudaFunction,
+    pub(crate) rms_inv_norm_quantize_q8_0: CudaFunction,
     pub(crate) gemv: CudaFunction,
     pub(crate) prism_low_bit_f32_gemv: CudaFunction,
     pub(crate) prism_q1_q8_gemv: CudaFunction,
@@ -5965,7 +6516,12 @@ pub struct CudaResidentKernels {
     pub(crate) prism_q8_b128_bitpack: Option<CudaFunction>,
     pub(crate) prism_q1_q8_b128_bmma_gemm_batched: Option<CudaFunction>,
     pub(crate) q4_0_gemv: CudaFunction,
+    /// Quants-first SoA variant of `q4_0_gemv`, bit-identical and used for every
+    /// gemma4 dense/attention/FFN projection (see `q4_0_wire_to_soa`).
+    pub(crate) q4_0_gemv_soa: CudaFunction,
     pub(crate) q4_1_gemv: CudaFunction,
+    pub(crate) q4_0_gemm_batched: CudaFunction,
+    pub(crate) q4_1_gemm_batched: CudaFunction,
     pub(crate) nvfp4_gemv: CudaFunction,
     pub(crate) q4k_gemv: CudaFunction,
     pub(crate) q5k_gemv: CudaFunction,
@@ -5977,6 +6533,7 @@ pub struct CudaResidentKernels {
     pub(crate) q6k_gemm_batched: CudaFunction,
     pub(crate) quantize_q8k: CudaFunction,
     pub(crate) rms_norm_quantize_q8k: CudaFunction,
+    pub(crate) rms_inv_norm_quantize_q8k: CudaFunction,
     pub(crate) silu_mul_quantize_q8k: CudaFunction,
     pub(crate) rope: CudaFunction,
     pub(crate) kv_scatter: CudaFunction,
@@ -5991,6 +6548,11 @@ pub struct CudaResidentKernels {
     pub(crate) residual_add: CudaFunction,
     pub(crate) scaled_axpy: CudaFunction,
     pub(crate) q4_0_gemv_routed: CudaFunction,
+    /// R-rows-per-warp variant of `q4_0_gemv_routed`; bitwise-identical, opt-in.
+    pub(crate) q4_0_gemv_routed_rows: CudaFunction,
+    /// Prefill counterpart of `q4_0_gemv_routed`: one expert against its CSR token list.
+    pub(crate) q4_0_gemm_routed: CudaFunction,
+    pub(crate) q4_1_gemv_routed: CudaFunction,
     pub(crate) q2k_gemv_routed: CudaFunction,
     pub(crate) geglu_quantize_routed: CudaFunction,
     pub(crate) moe_weighted_sum_routed: CudaFunction,
@@ -6138,6 +6700,7 @@ impl CudaResidentKernels {
             rms_norm_per_head: f("rms_norm_per_head_f32")?,
             quantize: f("quantize_q8_0")?,
             rms_norm_quantize: f("rms_norm_quantize")?,
+            rms_inv_norm_quantize_q8_0: f("rms_inv_norm_quantize_q8_0")?,
             gemv: f("q8_gemv")?,
             prism_low_bit_f32_gemv: f("prism_low_bit_f32_gemv")?,
             prism_q1_q8_gemv: f("prism_q1_q8_gemv")?,
@@ -6168,7 +6731,10 @@ impl CudaResidentKernels {
                 .then(|| f("prism_q1_q8_b128_bmma_gemm_batched"))
                 .transpose()?,
             q4_0_gemv: f("q4_0_gemv")?,
+            q4_0_gemv_soa: f("q4_0_gemv_soa")?,
             q4_1_gemv: f("q4_1_gemv")?,
+            q4_0_gemm_batched: f("q4_0_gemm_batched")?,
+            q4_1_gemm_batched: f("q4_1_gemm_batched")?,
             nvfp4_gemv: f("nvfp4_gemv")?,
             q4k_gemv: f("q4k_gemv")?,
             q5k_gemv: f("q5k_gemv")?,
@@ -6180,6 +6746,7 @@ impl CudaResidentKernels {
             q6k_gemm_batched: f("q6k_gemm_batched")?,
             quantize_q8k: f("quantize_q8k")?,
             rms_norm_quantize_q8k: f("rms_norm_quantize_q8k")?,
+            rms_inv_norm_quantize_q8k: f("rms_inv_norm_quantize_q8k")?,
             silu_mul_quantize_q8k: f("silu_mul_quantize_q8k")?,
             rope: f("rope_rotate")?,
             kv_scatter: f("kv_scatter")?,
@@ -6194,6 +6761,9 @@ impl CudaResidentKernels {
             residual_add: f("residual_add")?,
             scaled_axpy: f("scaled_axpy")?,
             q4_0_gemv_routed: f("q4_0_gemv_routed")?,
+            q4_0_gemv_routed_rows: f("q4_0_gemv_routed_rows")?,
+            q4_0_gemm_routed: f("q4_0_gemm_routed")?,
+            q4_1_gemv_routed: f("q4_1_gemv_routed")?,
             q2k_gemv_routed: f("q2k_gemv_routed")?,
             geglu_quantize_routed: f("geglu_quantize_routed")?,
             moe_weighted_sum_routed: f("moe_weighted_sum_routed")?,
@@ -6278,6 +6848,32 @@ pub(crate) fn widen_q8(bytes: &[u8]) -> Vec<u8> {
 /// (`n_blocks * 32` i8), then all scales (`n_blocks` f16 bit patterns).
 /// Quants-first keeps every block's 32 i8 16-byte aligned for `int4` loads;
 /// compact scales restore the GGUF block's 34-byte footprint in VRAM.
+/// Q4_0 wire (18 B/block: `[2 B f16 scale][16 B nibbles]`) into the quants-first
+/// SoA layout `q4_0_gemv_soa` reads: `[n*16 nibble bytes][n*2 f16 scale bits]`.
+///
+/// Same total size — 18 bytes per block either way — so VRAM residency, every
+/// slot budget and every DMA byte count are unchanged. The point is alignment:
+/// block b's nibbles now begin at a 16-byte boundary, so the GEMV issues one
+/// `uint4` load instead of assembling the identical 16 bytes from 16 scalar byte
+/// loads off an 18-byte stride.
+///
+/// Pure byte permutation, bit-identical by construction — see the kernel comment
+/// on `q4_0_gemv_soa` for the four-step argument, and
+/// `q4_0_gemv_soa_matches_wire` for the test that pins it. Mirrors the same
+/// contract as `repack_q8_soa`, `swz_q4k_blocks` and `repack_q1_t128`.
+pub(crate) fn q4_0_wire_to_soa(bytes: &[u8]) -> Vec<u8> {
+    const WIRE: usize = 18;
+    let n = bytes.len() / WIRE;
+    let mut out = vec![0u8; n * WIRE];
+    let (quants, scales) = out.split_at_mut(n * 16);
+    for b in 0..n {
+        let blk = &bytes[b * WIRE..b * WIRE + WIRE];
+        scales[b * 2..b * 2 + 2].copy_from_slice(&blk[0..2]);
+        quants[b * 16..b * 16 + 16].copy_from_slice(&blk[2..WIRE]);
+    }
+    out
+}
+
 pub(crate) fn repack_q8_soa(bytes: &[u8]) -> Vec<u8> {
     let n = bytes.len() / 36;
     let mut out = vec![0u8; n * 32 + n * 2];
@@ -6509,6 +7105,62 @@ pub(crate) fn launch_rmsnorm_quantize(
     let n_i = n as i32;
     let mut b = s.launch_builder(f);
     b.arg(x).arg(w).arg(quants).arg(scales).arg(&n_i).arg(&eps);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+const GEMMA4_EXPERT_Q8_DEFAULT_WARPS: u32 = 2;
+
+fn parse_gemma4_expert_q8_warps(value: Option<&str>) -> u32 {
+    value
+        .and_then(|raw| raw.trim().parse::<u32>().ok())
+        .filter(|warps| matches!(*warps, 1 | 2 | 4 | 8))
+        .unwrap_or(GEMMA4_EXPERT_Q8_DEFAULT_WARPS)
+}
+
+/// Process-stable launch policy so a receipt cannot change geometry halfway
+/// through generation. Only whole power-of-two warp counts up to the former
+/// 256-thread shape are valid; malformed/unsupported values retain that default.
+fn gemma4_expert_q8_warps() -> u32 {
+    static WARPS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *WARPS.get_or_init(|| {
+        let value = std::env::var("CAMELID_GEMMA4_CUDA_EXPERT_Q8_WARPS").ok();
+        parse_gemma4_expert_q8_warps(value.as_deref())
+    })
+}
+
+/// Apply a host-computed RMS inverse to a resident row and quantize it to Q8_0
+/// with Windows/Rust byte semantics. The caller must compute `rms_inv` through
+/// the CPU reference's sequential `(mss + eps).powf(-0.5)` path. Set
+/// `CAMELID_GEMMA4_CUDA_EXPERT_Q8_WARPS` to 1, 2, 4, or 8 before the first launch
+/// to A/B the process-cached CTA geometry; invalid values retain the tuned default.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn launch_rms_inv_norm_quantize_q8_0(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    x: &CudaSlice<f32>,
+    w: &CudaSlice<f32>,
+    quants: &mut CudaSlice<i8>,
+    scales: &mut CudaSlice<f32>,
+    n: usize,
+    rms_inv: f32,
+) -> Result<(), cudarc::driver::DriverError> {
+    debug_assert!(n.is_multiple_of(32));
+    let warps_per_cta = gemma4_expert_q8_warps();
+    let block = warps_per_cta * 32;
+    let n_blocks = (n / 32) as u32;
+    let cfg = LaunchConfig {
+        grid_dim: (n_blocks.div_ceil(warps_per_cta), 1, 1),
+        block_dim: (block, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let n_i = n as i32;
+    let mut b = s.launch_builder(f);
+    b.arg(x)
+        .arg(w)
+        .arg(quants)
+        .arg(scales)
+        .arg(&n_i)
+        .arg(&rms_inv);
     unsafe { b.launch(cfg) }.map(|_| ())
 }
 
@@ -7966,6 +8618,37 @@ pub(crate) fn launch_rmsnorm_quantize_q8k(
     unsafe { b.launch(cfg) }.map(|_| ())
 }
 
+/// Q8_K counterpart of [`launch_rms_inv_norm_quantize_q8_0`]. Normalization
+/// stays device-side, while the CPU-provided RMS inverse and the existing
+/// first-max/nearest-int Q8_K reducer preserve the reference bytes.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn launch_rms_inv_norm_quantize_q8k(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    x: &CudaSlice<f32>,
+    w: &CudaSlice<f32>,
+    quants: &mut CudaSlice<i8>,
+    scales: &mut CudaSlice<f32>,
+    n: usize,
+    rms_inv: f32,
+) -> Result<(), cudarc::driver::DriverError> {
+    debug_assert!(n.is_multiple_of(256));
+    let cfg = LaunchConfig {
+        grid_dim: ((n / 256) as u32, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let n_i = n as i32;
+    let mut b = s.launch_builder(f);
+    b.arg(x)
+        .arg(w)
+        .arg(quants)
+        .arg(scales)
+        .arg(&n_i)
+        .arg(&rms_inv);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
 /// Fused SiLU(gate)*up + Q8_K quantize: one thread per 256-block. K-quant analog
 /// of `launch_silu_mul_quantize`.
 pub(crate) fn launch_silu_mul_quantize_q8k(
@@ -8055,6 +8738,96 @@ pub(crate) fn launch_gemm_batched(
         .arg(&kt)
         .arg(out);
     unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+/// Batched raw-wire Q4_0/Q4_1 GEMM. The kernel keeps each packed weight block in
+/// registers while applying it to all `k_tokens` Q8_0 rows, then performs the
+/// same block-order f32 accumulation as the corresponding scalar GEMV.
+#[allow(dead_code, clippy::too_many_arguments)]
+fn launch_q4_wire_gemm_batched(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    in_scales: &CudaSlice<f32>,
+    in_quants: &CudaSlice<i8>,
+    weight: &CudaSlice<u8>,
+    rows: usize,
+    blocks_per_row: usize,
+    k_tokens: usize,
+    out: &mut CudaSlice<f32>,
+) -> Result<(), cudarc::driver::DriverError> {
+    const SHARED_BUDGET: u32 = 46 * 1024;
+    assert!(k_tokens > 0, "Q4 batch must contain at least one token");
+    let per_warp_bytes = (k_tokens as u32) * (blocks_per_row as u32) * 4;
+    assert!(
+        per_warp_bytes <= SHARED_BUDGET,
+        "Q4 batch does not fit the shared-memory budget"
+    );
+    let warps_per_block = (SHARED_BUDGET / per_warp_bytes.max(1)).clamp(1, 8);
+    let cfg = LaunchConfig {
+        grid_dim: ((rows as u32).div_ceil(warps_per_block), 1, 1),
+        block_dim: (warps_per_block * 32, 1, 1),
+        shared_mem_bytes: warps_per_block * per_warp_bytes,
+    };
+    let (r, bpr, kt) = (rows as i32, blocks_per_row as i32, k_tokens as i32);
+    let mut b = s.launch_builder(f);
+    b.arg(in_scales)
+        .arg(in_quants)
+        .arg(weight)
+        .arg(&r)
+        .arg(&bpr)
+        .arg(&kt)
+        .arg(out);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+#[allow(dead_code, clippy::too_many_arguments)]
+pub(crate) fn launch_q4_0_gemm_batched(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    in_scales: &CudaSlice<f32>,
+    in_quants: &CudaSlice<i8>,
+    weight: &CudaSlice<u8>,
+    rows: usize,
+    blocks_per_row: usize,
+    k_tokens: usize,
+    out: &mut CudaSlice<f32>,
+) -> Result<(), cudarc::driver::DriverError> {
+    launch_q4_wire_gemm_batched(
+        s,
+        f,
+        in_scales,
+        in_quants,
+        weight,
+        rows,
+        blocks_per_row,
+        k_tokens,
+        out,
+    )
+}
+
+#[allow(dead_code, clippy::too_many_arguments)]
+pub(crate) fn launch_q4_1_gemm_batched(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    in_scales: &CudaSlice<f32>,
+    in_quants: &CudaSlice<i8>,
+    weight: &CudaSlice<u8>,
+    rows: usize,
+    blocks_per_row: usize,
+    k_tokens: usize,
+    out: &mut CudaSlice<f32>,
+) -> Result<(), cudarc::driver::DriverError> {
+    launch_q4_wire_gemm_batched(
+        s,
+        f,
+        in_scales,
+        in_quants,
+        weight,
+        rows,
+        blocks_per_row,
+        k_tokens,
+        out,
+    )
 }
 
 /// Batched Q4_K/Q6_K GEMM. Each warp owns one output row and keeps the

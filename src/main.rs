@@ -2527,6 +2527,59 @@ enum Command {
     },
 }
 
+/// Counts reported by the CUDA Gemma 4 development benchmark.
+///
+/// These are deliberately separate: the timed runtime currently exposes one
+/// duration per decode forward, while its returned ID list contains tokens
+/// emitted from both prefill logits and decode logits. Treating either count as
+/// the other can overstate throughput (and hides generation-budget bugs).
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Gemma4CudaBenchmarkCounts {
+    requested_new_tokens: usize,
+    emitted_non_stop_tokens: usize,
+    timed_decode_forwards: usize,
+}
+
+#[cfg(feature = "cuda")]
+impl Gemma4CudaBenchmarkCounts {
+    fn new(
+        requested_new_tokens: usize,
+        emitted_non_stop_tokens: usize,
+        timed_decode_forwards: usize,
+    ) -> Self {
+        Self {
+            requested_new_tokens,
+            emitted_non_stop_tokens,
+            timed_decode_forwards,
+        }
+    }
+
+    fn emitted_budget_is_respected(self) -> bool {
+        self.emitted_non_stop_tokens <= self.requested_new_tokens
+    }
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod gemma4_cuda_benchmark_tests {
+    use super::Gemma4CudaBenchmarkCounts;
+
+    #[test]
+    fn accounting_does_not_conflate_emitted_tokens_with_decode_forwards() {
+        let counts = Gemma4CudaBenchmarkCounts::new(8, 9, 8);
+        assert_eq!(counts.requested_new_tokens, 8);
+        assert_eq!(counts.emitted_non_stop_tokens, 9);
+        assert_eq!(counts.timed_decode_forwards, 8);
+        assert!(!counts.emitted_budget_is_respected());
+    }
+
+    #[test]
+    fn early_stop_can_emit_fewer_tokens_than_requested() {
+        let counts = Gemma4CudaBenchmarkCounts::new(8, 3, 3);
+        assert!(counts.emitted_budget_is_respected());
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -3641,17 +3694,36 @@ async fn main() -> anyhow::Result<()> {
             );
             let t1 = std::time::Instant::now();
             let (out, ids, per_token) = runtime.generate_greedy_timed(&prompt, max_tokens)?;
-            let gen = t1.elapsed().as_secs_f32();
+            let gen = t1.elapsed().as_secs_f64();
+            let counts = Gemma4CudaBenchmarkCounts::new(max_tokens, ids.len(), per_token.len());
+            let emitted_rate = if gen > 0.0 {
+                counts.emitted_non_stop_tokens as f64 / gen
+            } else {
+                0.0
+            };
             eprintln!(
-                "[gemma4-cuda] generated in {gen:.1}s ({:.2} tok/s overall incl. prefill)",
-                ids.len() as f32 / gen
+                "[gemma4-cuda] generated in {gen:.3}s ({emitted_rate:.2} emitted tok/s end-to-end, incl. prefill)"
             );
-            // Warm-up curve: mean tok/s over successive 8-token windows of decode-only
-            // wall time (excludes prefill). With the SSER cache ON this should accelerate
-            // as the hot experts populate VRAM.
+            eprintln!(
+                "[gemma4-cuda] accounting: requested_new_tokens={}, emitted_non_stop_tokens={}, timed_decode_forwards={}",
+                counts.requested_new_tokens,
+                counts.emitted_non_stop_tokens,
+                counts.timed_decode_forwards,
+            );
+            if !counts.emitted_budget_is_respected() {
+                eprintln!(
+                    "[gemma4-cuda] WARNING: runtime emitted {} non-stop tokens for a {}-token request; decode rates below count timed forwards, not returned IDs",
+                    counts.emitted_non_stop_tokens, counts.requested_new_tokens,
+                );
+            }
+            // Warm-up curve: forward/s over successive 8-forward windows of decode-only
+            // wall time (excludes prefill). This uses exactly the operations represented by
+            // `per_token`, rather than assuming every returned ID owns a decode duration.
             if !per_token.is_empty() {
                 let win = 8usize;
-                eprint!("[gemma4-cuda] warm-up curve (tok/s per {win}-tok window):");
+                eprint!(
+                    "[gemma4-cuda] decode warm-up curve (forwards/s per {win}-forward window):"
+                );
                 let mut i = 0;
                 while i < per_token.len() {
                     let end = (i + win).min(per_token.len());
@@ -3666,25 +3738,31 @@ async fn main() -> anyhow::Result<()> {
                     i = end;
                 }
                 eprintln!();
-                // Steady-state: decode-only tok/s over the SECOND HALF of the tokens
-                // (past warm-up) — the honest cache-warm rate.
+                // Steady-state: decode-forward throughput over the second half of the
+                // measured forwards (past warm-up) — the honest cache-warm rate.
                 let half = per_token.len() / 2;
                 let steady: f64 = per_token[half..].iter().sum();
                 let sn = (per_token.len() - half) as f64;
                 let decode_all: f64 = per_token.iter().sum();
                 eprintln!(
-                    "[gemma4-cuda] decode-only: {:.2} tok/s all, {:.2} tok/s steady (2nd half, {} tok)",
+                    "[gemma4-cuda] decode-only: {:.2} forwards/s all, {:.2} forwards/s steady (2nd half, {} forwards; {:.3}s timed decode wall)",
                     per_token.len() as f64 / decode_all.max(1e-9),
                     sn / steady.max(1e-9),
                     per_token.len() - half,
+                    decode_all,
                 );
             }
             if let Some((hits, misses, resident, cap)) = runtime.sser_stats() {
                 let total = hits + misses;
                 eprintln!(
-                    "[gemma4-cuda] SSER cache: {hits} hits / {misses} misses = {:.1}% hit-rate; {resident}/{cap} experts resident",
+                    "[gemma4-cuda] SSER cache (lifetime since load): {hits} hits / {misses} misses = {:.1}% hit-rate; {resident}/{cap} experts resident",
                     if total > 0 { 100.0 * hits as f64 / total as f64 } else { 0.0 }
                 );
+                if let Some(streamed) = runtime.sser_streamed_misses() {
+                    eprintln!(
+                        "[gemma4-cuda] SSER frequency admission: {streamed} misses streamed without cache admission"
+                    );
+                }
             }
             eprintln!("[gemma4-cuda] token_ids: {ids:?}");
             println!("{prompt}{out}");

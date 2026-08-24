@@ -1187,16 +1187,18 @@ pub fn gemma4_cuda_lane_admitted(gguf: &GgufFile) -> Result<(), String> {
 ///   and the load site then refused and served on the CPU — the D20 defect this
 ///   predicate exists to prevent.
 fn gemma4_projection_quant_admitted(gguf: &GgufFile) -> Result<(), String> {
-    const RECEIPTED_PROJECTION_FORMATS: [GgufTensorType; 3] = [
+    const RECEIPTED_PROJECTION_FORMATS: [GgufTensorType; 5] = [
         GgufTensorType::Q8_0,
         GgufTensorType::Q4_0,
         GgufTensorType::Q4_1,
+        GgufTensorType::Q6K,
+        GgufTensorType::Q2K,
     ];
     match gemma4_projection_tensors(gguf)
         .find(|t| !RECEIPTED_PROJECTION_FORMATS.contains(&t.tensor_type))
     {
         Some(t) => Err(format!(
-            "gemma4 CUDA-resident decode has a greedy-parity receipt for Q8_0/Q4_0/Q4_1 layer \
+            "gemma4 CUDA-resident decode has a greedy-parity receipt for Q8_0/Q4_0/Q4_1/Q6_K layer \
              projections; this row is {} and carries {} as {:?}, which has no parity receipt on \
              this lane (the CPU gemma4 runtime serves it correctly)",
             quant_type(gguf),
