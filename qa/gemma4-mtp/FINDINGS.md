@@ -4,9 +4,10 @@ Work toward MTP on the Windows/CUDA ghost lane. The assistant forward is being b
 against the committed BF16 oracle **before** any kernel work, because it is self-contained
 and target-free: the oracle needs no 26B weights at all.
 
-**Status: NOT YET EXACT.** Recurrent-hidden cosine **0.547**, magnitude 215.64 vs the
-oracle's 220.88 (within 2.4%). Up from 0.176 at first run. Five real semantic errors found
-and fixed; at least one remains. Do not build on this until it reaches parity.
+**Status: NOT YET EXACT.** Recurrent-hidden cosine **0.695**, magnitude 219.87 (f32) vs the
+oracle's 220.88. Up from 0.176 at first run, via 0.481 -> 0.547 -> 0.641 -> 0.695. Seven real
+semantic errors found and fixed; at least one remains. Do not build on this until it reaches
+parity.
 
 ## Provenance — everything below is hash-verified, not inferred
 
@@ -61,9 +62,18 @@ the latter cost several wrong guesses before the sources settled every question 
   pre_feedforward_layernorm → mlp → post_feedforward_layernorm → +residual → *layer_scalar`.
 - `hidden_activation: gelu_pytorch_tanh`, `rms_norm_eps: 1e-6`.
 
+6. **RoPE cos/sin must be rounded to BF16** before use. The reference computes them in the
+   model dtype; keeping them f32 costs real accuracy here (0.547 -> 0.641 with everything
+   else held fixed).
+7. **BF16 rounding after every op matters** (0.641 -> 0.695) — the reference is BF16
+   end-to-end with `type_as` after each stage. NOTE: this arm currently overshoots the
+   magnitude (237.40 vs 220.88) while the f32 arm sits at 219.87, so the cast PLACEMENT here
+   is still not the reference's. Getting the cast points exactly right is likely the rest of
+   the gap.
+
 ## What is still wrong
 
-Cosine 0.547 with the magnitude essentially correct. A correct-magnitude / wrong-direction
+Cosine 0.695 with the magnitude essentially correct in the f32 arm. A correct-magnitude / wrong-direction
 error is the signature of a rotation or an indexing/ordering fault, not a scale bug. Prime
 suspects, in order:
 1. The reference runs **BF16 end to end**, casting after every op (`type_as`), while this
