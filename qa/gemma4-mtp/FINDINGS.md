@@ -23,7 +23,7 @@ The first four match `qa/evidence-bundles/gemma4-26b-mtp-assistant-oracle/manife
 exactly. **Fetch the reference source instead of reverse-engineering from config** — doing
 the latter cost several wrong guesses before the sources settled every question in minutes.
 
-## The five corrections (each one was measurably wrong)
+## The seven corrections (each one was measurably wrong)
 
 1. **★ RMSNorm is `normed * weight`, NOT Gemma 2/3's `normed * (1 + weight)`.** Gemma 4
    changed the convention (`Gemma4RMSNorm.forward`). This was the single biggest error —
@@ -44,6 +44,15 @@ the latter cost several wrong guesses before the sources settled every question 
    `scaling = 1.0` the softmax is extremely peaked, so 7 positions out of 1031 swing the
    result enormously — window boundaries are not a rounding detail here.
 
+6. **RoPE cos/sin must be rounded to BF16** before use. The reference computes them in the
+   model dtype; keeping them f32 costs real accuracy here (0.547 -> 0.641 with everything
+   else held fixed).
+7. **BF16 rounding after every op matters** (0.641 -> 0.695) — the reference is BF16
+   end-to-end with `type_as` after each stage. NOTE: this arm currently overshoots the
+   magnitude (237.40 vs 220.88) while the f32 arm sits at 219.87, so the cast PLACEMENT here
+   is still not the reference's. Getting the cast points exactly right is likely the rest of
+   the gap.
+
 ## Architecture, confirmed
 
 - 4 layers: 3 × `sliding_attention` (16 q-heads × 256, 8 KV heads), 1 × `full_attention`
@@ -62,23 +71,14 @@ the latter cost several wrong guesses before the sources settled every question 
   pre_feedforward_layernorm → mlp → post_feedforward_layernorm → +residual → *layer_scalar`.
 - `hidden_activation: gelu_pytorch_tanh`, `rms_norm_eps: 1e-6`.
 
-6. **RoPE cos/sin must be rounded to BF16** before use. The reference computes them in the
-   model dtype; keeping them f32 costs real accuracy here (0.547 -> 0.641 with everything
-   else held fixed).
-7. **BF16 rounding after every op matters** (0.641 -> 0.695) — the reference is BF16
-   end-to-end with `type_as` after each stage. NOTE: this arm currently overshoots the
-   magnitude (237.40 vs 220.88) while the f32 arm sits at 219.87, so the cast PLACEMENT here
-   is still not the reference's. Getting the cast points exactly right is likely the rest of
-   the gap.
-
 ## What is still wrong
 
 Cosine 0.695 with the magnitude essentially correct in the f32 arm. A correct-magnitude / wrong-direction
 error is the signature of a rotation or an indexing/ordering fault, not a scale bug. Prime
 suspects, in order:
-1. The reference runs **BF16 end to end**, casting after every op (`type_as`), while this
-   harness is f32 throughout. With `scaling = 1.0` and a very peaked softmax, BF16 rounding
-   of the scores is not obviously second-order — worth testing before anything else.
+1. **Exact BF16 cast placement.** Rounding after every op helps (0.641 -> 0.695) but
+   overshoots magnitude, so my cast points are close but not the reference's. This is the
+   leading suspect and it is inherently a per-stage question.
 2. The bidirectional mask may contribute more than the plain window crop modelled here.
 3. RoPE frequency indexing on the sliding layers.
 
