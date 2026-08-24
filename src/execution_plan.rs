@@ -1195,10 +1195,10 @@ pub fn gemma4_cuda_lane_admitted(gguf: &GgufFile) -> Result<(), String> {
 /// **Q6_K is the one K-quant admitted**, because the 26B-A4B ghost row forces the
 /// question rather than because the format is trusted in general.
 /// `google_gemma-4-26B-A4B-it-Q4_0.gguf` is a MIXED export: 14 of its 30
-/// `attn_q.weight` tensors are Q6_K and the other 16 are Q4_0 (`ffn_down` is 27×Q4_0
-/// + 3×Q4_1, `ffn_down_exps` 23×Q4_0 + 7×Q4_1). Declining Q6_K declines the row this
-/// lane exists to serve. The admission is scoped to that evidence: it says Q6_K
-/// appears in a receipted row, NOT that a Q6_K-throughout row is receipted.
+/// `attn_q.weight` tensors are Q6_K and the other 16 are Q4_0, `ffn_down` is 27×Q4_0
+/// plus 3×Q4_1, and `ffn_down_exps` is 23×Q4_0 plus 7×Q4_1. Declining Q6_K declines
+/// the row this lane exists to serve. The admission is scoped to that evidence: it
+/// says Q6_K appears in a receipted row, NOT that a Q6_K-throughout row is receipted.
 fn gemma4_projection_quant_admitted(gguf: &GgufFile) -> Result<(), String> {
     const RECEIPTED_PROJECTION_FORMATS: [GgufTensorType; 4] = [
         GgufTensorType::Q8_0,
@@ -2962,7 +2962,10 @@ mod tests {
             GgufTensorType::Q8_0,
         ))
         .expect_err("Q2_K projections decoded degenerate output; they are not receipted");
-        assert!(err.contains("Q2K"), "the decline must name the format: {err}");
+        assert!(
+            err.contains("Q2K"),
+            "the decline must name the format: {err}"
+        );
 
         // The real 26B-A4B ghost row is MIXED and must stay admitted: 14/30 attn_q are
         // Q6_K and 16/30 are Q4_0, ffn_down is 27xQ4_0 + 3xQ4_1, ffn_down_exps is

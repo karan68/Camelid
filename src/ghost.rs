@@ -1135,10 +1135,48 @@ pub struct GhostFile {
     /// already-open handle. `None` unless `--evict-page-cache` requested it and the open
     /// succeeded; the read path falls back to the buffered `file` handle otherwise. Behind a
     /// `Mutex` because `GhostFile` is shared across the prefetch worker via `Arc` (needs
-    /// `Sync`) and the aligned scratch buffer is interior-mutable; reads are single-threaded
-    /// per file so the lock is uncontended.
+    /// `Sync`) and the aligned scratch buffer is interior-mutable.
+    ///
+    /// A POOL, not one reader. Each entry owns its own handle AND its own aligned scratch,
+    /// so N record reads can be in flight at once. The previous single-`Mutex` form made the
+    /// unbuffered path serial by construction: measured on this box with concurrent
+    /// record-sized (3.19 MiB) reads, the drive delivers 1.04 GB/s at depth 1 but 2.42 at
+    /// depth 4 and 3.03 at depth 28 — a 2.9x span that a single shared scratch cannot reach.
+    /// The engine was getting exactly the depth-1 rate (1.13 GB/s profiled), and raising
+    /// `CAMELID_GEMMA4_GHOST_READ_THREADS` made it WORSE (0.94 GB/s) because the extra rayon
+    /// threads only contended on this lock. Pool size is
+    /// `CAMELID_GEMMA4_GHOST_UNCACHED_READERS` (default 1 = the historical behaviour, so this
+    /// is inert until measured); each extra reader costs one handle plus one aligned scratch
+    /// of the largest group span.
+    ///
+    /// TWO THINGS MEASURED AND CLOSED (2026-08-24), so nobody re-derives them:
+    /// 1. **The pool alone changes nothing**, because the caller is serial. The CUDA miss loop
+    ///    reads each record "serially, with the GPU idle behind the fence"
+    ///    (`gemma4_runtime.rs`, tier-0 hot path), so no two reads are ever outstanding and the
+    ///    pool has nothing to overlap. Paired runs: 1.12 / 1.11 / 1.13 GB/s at 1 / 8 / 8
+    ///    readers, token IDs identical.
+    /// 2. **Splitting ONE record across the pool is a REGRESSION**, monotone in the split
+    ///    factor: 1.41 GB/s unsplit -> 1.02-1.12 at 4 -> 0.88 at 8, prefill 14.84s -> 18.04s
+    ///    (bit-exact throughout). The 2.9x depth win comes from INDEPENDENT records at
+    ///    scattered offsets being in flight; chopping one contiguous 3.19 MiB span adds
+    ///    per-request and fan-out cost with no seek to overlap. Implementation removed.
+    ///
+    /// The real fix is therefore at the CALLER, not here: batch a layer's *distinct* missing
+    /// records and issue them together, then stage them. That is invasive — the miss loop
+    /// interleaves per-expert layout validation, transfer-slot assignment and pinned-copy
+    /// bookkeeping with each read — which is why this pool exists but stays at 1: it is the
+    /// prerequisite half, landed and bit-exact, waiting on the caller half.
     #[cfg(windows)]
-    uncached: Option<std::sync::Mutex<UncachedReader>>,
+    uncached: Vec<std::sync::Mutex<UncachedReader>>,
+    /// Round-robin start index for pool selection. Relaxed: a stale value only changes which
+    /// reader is tried first, never correctness.
+    #[cfg(windows)]
+    uncached_cursor: std::sync::atomic::AtomicUsize,
+    /// Logical sector size of the volume holding `.cghost`, cached so the split-read planner
+    /// can align chunk boundaries without taking a reader lock just to read it. Every pool
+    /// entry opens the same file, so they all report the same value.
+    #[cfg(windows)]
+    uncached_sector: u64,
 }
 
 impl GhostFile {
@@ -1167,13 +1205,43 @@ impl GhostFile {
         // against ~1.3 GB/s buffered. It costs one handle plus a sector-aligned scratch
         // buffer of one expert record.
         #[cfg(windows)]
-        if this.uncached.is_none() {
-            match UncachedReader::open(path, this.max_layer_span()) {
-                Ok(reader) => this.uncached = Some(std::sync::Mutex::new(reader)),
-                Err(e) => eprintln!(
-                    "[ghost] unbuffered (FILE_FLAG_NO_BUFFERING) open failed ({e}); \
-                     falling back to buffered reads"
-                ),
+        if this.uncached.is_empty() {
+            // Default 1 reader = byte-for-byte the historical path. >1 opens independent
+            // handles + scratches so a layer's expert-union records can be read concurrently;
+            // see the field doc for the depth-vs-bandwidth receipts.
+            let requested = std::env::var("CAMELID_GEMMA4_GHOST_UNCACHED_READERS")
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(1)
+                .clamp(1, 32);
+            let span = this.max_layer_span();
+            for i in 0..requested {
+                match UncachedReader::open(path, span) {
+                    Ok(reader) => this.uncached.push(std::sync::Mutex::new(reader)),
+                    Err(e) => {
+                        // A partial pool is still correct — selection walks whatever exists,
+                        // and an empty pool falls through to the buffered/mapped path.
+                        eprintln!(
+                            "[ghost] unbuffered (FILE_FLAG_NO_BUFFERING) open failed for reader \
+                             {i} of {requested} ({e}); continuing with {} reader(s)",
+                            this.uncached.len()
+                        );
+                        break;
+                    }
+                }
+            }
+            this.uncached_sector = this
+                .uncached
+                .first()
+                .map(|r| r.lock().unwrap_or_else(|p| p.into_inner()).sector as u64)
+                .unwrap_or(0);
+            if this.uncached.len() > 1 {
+                eprintln!(
+                    "[ghost] unbuffered reader pool: {} readers (scratch {:.2} MiB each, sector {} B)",
+                    this.uncached.len(),
+                    span as f64 / (1024.0 * 1024.0),
+                    this.uncached_sector
+                );
             }
         }
         Ok(this)
@@ -1218,7 +1286,11 @@ impl GhostFile {
             moe_access,
             moe_payload_verified,
             #[cfg(windows)]
-            uncached: None,
+            uncached: Vec::new(),
+            #[cfg(windows)]
+            uncached_cursor: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(windows)]
+            uncached_sector: 0,
         })
     }
 
@@ -1925,18 +1997,35 @@ impl GhostFile {
         // false when it declines (span not sector-aligned, or the aligned span would pass
         // EOF), in which case we fall through.
         #[cfg(windows)]
-        if self.strict_cache.load(Ordering::Relaxed)
-            || (self.bulk_reads.load(Ordering::Relaxed) && len >= CGHOST_BULK_READ_MIN_BYTES)
+        if !self.uncached.is_empty()
+            && (self.strict_cache.load(Ordering::Relaxed)
+                || (self.bulk_reads.load(Ordering::Relaxed) && len >= CGHOST_BULK_READ_MIN_BYTES))
         {
-            if let Some(uncached) = &self.uncached {
-                let served = uncached
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .read_into(start, len, &mut buf[..])
-                    .map_err(|e| io_err(Path::new("<cghost>"), e))?;
-                if served {
-                    return Ok(());
+            // Pick a free reader so concurrent callers overlap on the device instead of
+            // queueing on one scratch. With a single-entry pool this is exactly the old
+            // path: one try_lock that always succeeds when uncontended.
+            let n = self.uncached.len();
+            let first = self.uncached_cursor.fetch_add(1, Ordering::Relaxed) % n;
+            let mut picked = None;
+            for k in 0..n {
+                if let Ok(guard) = self.uncached[(first + k) % n].try_lock() {
+                    picked = Some(guard);
+                    break;
                 }
+            }
+            let mut guard = match picked {
+                Some(guard) => guard,
+                // Every reader busy (or poisoned): block on the round-robin pick rather
+                // than spin. Poison is recovered — the scratch is overwritten before use.
+                None => self.uncached[first]
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner()),
+            };
+            let served = guard
+                .read_into(start, len, &mut buf[..])
+                .map_err(|e| io_err(Path::new("<cghost>"), e))?;
+            if served {
+                return Ok(());
             }
         }
         // WHICH PATH IS FASTER DEPENDS ENTIRELY ON THE REGIME, and both regimes were
