@@ -200,7 +200,7 @@ export function linuxModelSandboxPath(path) {
 }
 
 export function windowsPathToWsl(path) {
-  const match = resolve(path).match(/^([A-Za-z]):[\\/](.*)$/)
+  const match = path.match(/^([A-Za-z]):[\\/](.*)$/)
   if (!match) throw new NativeAdapterError('INVALID_INFRASTRUCTURE', `WSL boundary requires a drive-qualified Windows path: ${path}`)
   return `/mnt/${match[1].toLowerCase()}/${match[2].replaceAll('\\', '/')}`
 }
