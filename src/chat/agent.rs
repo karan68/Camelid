@@ -621,7 +621,7 @@ pub fn run_loop(
                     };
                     let outcome = if cfg.tool_profile.is_benchmark_shared() && outcome.is_err() {
                         if let Some(path) = list_dir_file {
-                            let relative = sandbox.rel(path);
+                            let relative = normalize_workspace_path(&sandbox.rel(path));
                             ToolOutcome::Err(format!(
                                 "{relative} is a file, not a directory; call read_file with path \
                                  `{relative}` to inspect its content"
