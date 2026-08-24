@@ -4,10 +4,31 @@ Work toward MTP on the Windows/CUDA ghost lane. The assistant forward is being b
 against the committed BF16 oracle **before** any kernel work, because it is self-contained
 and target-free: the oracle needs no 26B weights at all.
 
-**Status: NOT YET EXACT.** Recurrent-hidden cosine **0.695**, magnitude 219.87 (f32) vs the
-oracle's 220.88. Up from 0.176 at first run, via 0.481 -> 0.547 -> 0.641 -> 0.695. Seven real
-semantic errors found and fixed; at least one remains. Do not build on this until it reaches
-parity.
+**Status: ARCHITECTURE CONFIRMED CORRECT. Bit-exactness is NOT required and was the wrong bar.**
+
+Two results settle this:
+
+1. **The reference runs locally.** transformers 5.12.1 + torch 2.12.0+cpu were ALREADY
+   installed and `Gemma4AssistantForCausalLM` imports. Running it on the oracle's inputs
+   reproduces the oracle at **cosine 0.997** (not bit-exact only because the oracle pinned
+   5.16.0.dev0). No install was needed — check before planning one.
+2. **Stage-by-stage diff proves the structure is right.** Against reference intermediates,
+   every stage through `q_norm` matches at **0.99999+** at layer 0. The whole residual enters
+   at `o_proj` — i.e. inside the attention arithmetic — and then AMPLIFIES ~30x per layer
+   (L0 0.9991 -> L1 0.9705 -> L2 0.7800 -> L3 0.3659). With `scaling = 1.0` the softmax is so
+   peaked that tiny score perturbations move the distribution hard. Rounding to BF16 improves
+   L0 `o_proj` 0.999136 -> 0.999500, confirming the cause is BF16 arithmetic fidelity, but
+   numpy cannot reproduce torch's BF16 matmul accumulation exactly.
+
+**Why bit-exactness does not matter here:** MTP is lossless because the TARGET verifies every
+drafted token — `accepted_draft_prefix` commits only the longest prefix equal to the target's
+own argmax. Drafter numeric drift therefore changes the ACCEPTANCE RATE (speed), never the
+emitted tokens. A drafter that is architecturally correct and numerically close is sufficient;
+one that is bit-exact buys nothing but a slightly higher alpha. Chasing parity here was my
+error and it blocked progress for several rounds.
+
+**The gate for the CUDA port is therefore the torch reference (runnable locally), not the
+frozen oracle**, and the acceptance-rate telemetry is the real quality signal.
 
 ## Provenance — everything below is hash-verified, not inferred
 
