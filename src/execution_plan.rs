@@ -1180,19 +1180,31 @@ pub fn gemma4_cuda_lane_admitted(gguf: &GgufFile) -> Result<(), String> {
 ///   parity test, but no gemma4 ROW has an end-to-end receipt on this lane. Kernel
 ///   parity is not row parity — that gap is exactly what the Q4_0 mis-decode was
 ///   (`q4_0_gemv` had a passing kernel parity test the whole time it shipped garbage).
-/// - **K-quant projections (Q4_K/Q5_K/Q6_K).** The CPU wire lane serves them and
+/// - **K-quant projections (Q4_K/Q5_K).** The CPU wire lane serves them and
 ///   `nvfp4_cuda_lane_check` refuses them at load. Declining HERE too is what makes
 ///   the disclosure honest: an E4B Q4_K_M row has a Q8_0 `token_embd`, so the old
 ///   any-Q8_0-tensor test admitted it, the plan printed `gemma4_cuda_resident_runtime`,
 ///   and the load site then refused and served on the CPU — the D20 defect this
 ///   predicate exists to prevent.
+/// - **Q2_K.** Declined on a NEGATIVE receipt, not merely a missing one:
+///   `gemma-4-26B-mixq2k-it` requantised the routed experts to Q2_K and decoded
+///   degenerate output on all three A/B prompts, at 14.89 tok/s (`qa/perf/HANDOFF.md`
+///   §5). Note `gemma4_projection_tensors` includes `ffn_gate_up_exps`/`ffn_down_exps`,
+///   so admitting Q2_K here would admit exactly the tensors that were measured bad.
+///
+/// **Q6_K is the one K-quant admitted**, because the 26B-A4B ghost row forces the
+/// question rather than because the format is trusted in general.
+/// `google_gemma-4-26B-A4B-it-Q4_0.gguf` is a MIXED export: 14 of its 30
+/// `attn_q.weight` tensors are Q6_K and the other 16 are Q4_0 (`ffn_down` is 27×Q4_0
+/// + 3×Q4_1, `ffn_down_exps` 23×Q4_0 + 7×Q4_1). Declining Q6_K declines the row this
+/// lane exists to serve. The admission is scoped to that evidence: it says Q6_K
+/// appears in a receipted row, NOT that a Q6_K-throughout row is receipted.
 fn gemma4_projection_quant_admitted(gguf: &GgufFile) -> Result<(), String> {
-    const RECEIPTED_PROJECTION_FORMATS: [GgufTensorType; 5] = [
+    const RECEIPTED_PROJECTION_FORMATS: [GgufTensorType; 4] = [
         GgufTensorType::Q8_0,
         GgufTensorType::Q4_0,
         GgufTensorType::Q4_1,
         GgufTensorType::Q6K,
-        GgufTensorType::Q2K,
     ];
     match gemma4_projection_tensors(gguf)
         .find(|t| !RECEIPTED_PROJECTION_FORMATS.contains(&t.tensor_type))
@@ -2936,6 +2948,62 @@ mod tests {
             GgufTensorType::Q6K,
         ))
         .expect_err("NVFP4 has kernel parity but no gemma4 end-to-end receipt");
+    }
+
+    #[test]
+    fn gemma4_quant_admission_declines_q2_k_and_admits_the_mixed_26b_row() {
+        // Q2_K carries a NEGATIVE receipt, not merely a missing one: `mixq2k` requantised
+        // the routed experts to Q2_K and decoded degenerate output on all three A/B
+        // prompts. `gemma4_projection_tensors` covers `ffn_*_exps`, so admitting Q2_K
+        // here would admit precisely the tensors that were measured bad.
+        let err = gemma4_projection_quant_admitted(&gemma4_row(
+            "26b-q2_k",
+            GgufTensorType::Q2K,
+            GgufTensorType::Q8_0,
+        ))
+        .expect_err("Q2_K projections decoded degenerate output; they are not receipted");
+        assert!(err.contains("Q2K"), "the decline must name the format: {err}");
+
+        // The real 26B-A4B ghost row is MIXED and must stay admitted: 14/30 attn_q are
+        // Q6_K and 16/30 are Q4_0, ffn_down is 27xQ4_0 + 3xQ4_1, ffn_down_exps is
+        // 23xQ4_0 + 7xQ4_1. Pinning the mix is the point — a single-format fixture
+        // cannot catch a regression that declines only the Q6_K half of the row.
+        let mut mixed = gemma4_row("26b-a4b-q4_0", GgufTensorType::Q4_0, GgufTensorType::Q8_0);
+        for (layer, suffix, ty) in [
+            (1_usize, "attn_q.weight", GgufTensorType::Q6K),
+            (2, "ffn_down.weight", GgufTensorType::Q4_1),
+            (3, "ffn_gate_up_exps.weight", GgufTensorType::Q4_0),
+            (4, "ffn_down_exps.weight", GgufTensorType::Q4_1),
+        ] {
+            mixed.tensors.push(GgufTensorDescriptor {
+                name: format!("blk.{layer}.{suffix}"),
+                dimensions: vec![32, 32],
+                tensor_type: ty,
+                relative_offset: 0,
+                absolute_offset: 0,
+                n_bytes: 34,
+            });
+        }
+        mixed.tensor_count = mixed.tensors.len() as i64;
+        gemma4_projection_quant_admitted(&mixed)
+            .expect("the mixed Q4_0/Q4_1/Q6_K 26B-A4B row is the row this lane exists to serve");
+
+        // And a single Q2_K expert tensor anywhere in that row must still sink it.
+        mixed.tensors.push(GgufTensorDescriptor {
+            name: "blk.5.ffn_down_exps.weight".into(),
+            dimensions: vec![32, 32],
+            tensor_type: GgufTensorType::Q2K,
+            relative_offset: 0,
+            absolute_offset: 0,
+            n_bytes: 34,
+        });
+        mixed.tensor_count = mixed.tensors.len() as i64;
+        let err = gemma4_projection_quant_admitted(&mixed)
+            .expect_err("one Q2_K expert tensor is still unreceipted");
+        assert!(
+            err.contains("ffn_down_exps") && err.contains("Q2K"),
+            "the decline must name the offending expert tensor: {err}"
+        );
     }
 
     #[test]
