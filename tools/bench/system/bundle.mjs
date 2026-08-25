@@ -163,6 +163,68 @@ export async function writeNativeAgentBundle(input, options = {}) {
   return { outputDir, manifest }
 }
 
+export async function writePiAgentBundle(input, options = {}) {
+  const outputDir = resolve(input.outputDir)
+  await requireEmptyDirectory(outputDir)
+  validateAgentAttempt(input.result.attempt)
+  if (input.result.attempt.adapter !== 'pi') throw new TypeError('Pi bundle requires a Pi agent attempt')
+  if (input.result.events !== null
+    && (!Array.isArray(input.result.events.events) || input.result.events.session?.version !== 3)) {
+    throw new TypeError('Pi bundle events must be a parsed Pi JSON v3 stream or null')
+  }
+  await mkdir(outputDir, { recursive: true })
+  await writeCanonical(join(outputDir, 'attempt.json'), input.result.attempt)
+  await writeCanonical(join(outputDir, 'score.json'), input.result.repository_score)
+  await writeCanonical(join(outputDir, 'identity.json'), input.result.identity)
+  await writeCanonical(join(outputDir, 'models.json'), input.result.pi_config)
+  const configSha256 = await sha256File(join(outputDir, 'models.json'))
+  if (configSha256 !== input.result.identity.pi_config_sha256) {
+    throw new TypeError(`Pi config digest is ${configSha256}, identity pins ${input.result.identity.pi_config_sha256}`)
+  }
+  await writeCanonical(join(outputDir, 'adapter.json'), {
+    boundary: input.result.boundary,
+    gpu_enabled: input.result.gpu_enabled,
+    tool_profile: input.result.tool_profile,
+    max_output_tokens_per_step: input.result.max_output_tokens_per_step,
+    address: input.result.address,
+    event_error: input.result.event_error,
+  })
+  if (input.result.events !== null) await writeCanonical(join(outputDir, 'events.json'), input.result.events)
+  await writeCanonical(join(outputDir, 'execution.json'), boundedExecution(input.result.execution))
+
+  const manifest = {
+    schema: 'camelid.benchmark.pi-bundle/v1',
+    campaign_id: input.result.attempt.campaign_id,
+    task_id: input.result.attempt.task_id,
+    generated_utc: options.generatedUtc ?? new Date().toISOString(),
+    state: input.result.attempt.score.outcome.startsWith('INVALID_')
+      ? 'INCOMPLETE'
+      : 'COMPLETE',
+    outcome: input.result.attempt.score.outcome,
+    terminal_class: input.result.attempt.terminal.class,
+    cleanup_passed: input.result.attempt.process.cleanup_passed,
+    files: {
+      attempt: 'attempt.json',
+      score: 'score.json',
+      identity: 'identity.json',
+      config: 'models.json',
+      adapter: 'adapter.json',
+      execution: 'execution.json',
+      events: input.result.events === null ? null : 'events.json',
+    },
+    workspace_included: false,
+    boundary: input.result.boundary,
+    gpu_enabled: input.result.gpu_enabled,
+    tool_profile: input.result.tool_profile,
+    max_output_tokens_per_step: input.result.max_output_tokens_per_step,
+    claim_boundary: 'Local Phase 4 Pi-through-Camelid evidence only; scorer outcome is authoritative and no public model-quality or cross-agent claim is made.',
+  }
+  await writeCanonical(join(outputDir, 'manifest.json'), manifest)
+  await writeFile(join(outputDir, 'summary.md'), renderPiSummary(manifest), 'utf8')
+  await writeChecksums(outputDir)
+  return { outputDir, manifest }
+}
+
 function boundedExecution(execution) {
   return {
     state: execution.state,
@@ -195,12 +257,29 @@ function renderNativeSummary(manifest) {
   ].join('\n')
 }
 
+function renderPiSummary(manifest) {
+  return [
+    '# Camelid Phase 4 Pi Agent Attempt',
+    '',
+    `- Campaign: \`${manifest.campaign_id}\``,
+    `- Task: \`${manifest.task_id}\``,
+    `- State: **${manifest.state}**`,
+    `- Terminal: \`${manifest.terminal_class}\``,
+    `- Scorer outcome: **${manifest.outcome}**`,
+    `- Cleanup passed: ${manifest.cleanup_passed}`,
+    `- Boundary: \`${manifest.boundary}\``,
+    `- Workspace included: ${manifest.workspace_included}`,
+    `- Claim boundary: ${manifest.claim_boundary}`,
+    '',
+  ].join('\n')
+}
+
 async function requireEmptyDirectory(path) {
   try {
     const info = await stat(path)
-    if (!info.isDirectory()) throw new Error(`native bundle output exists and is not a directory: ${path}`)
+    if (!info.isDirectory()) throw new Error(`agent bundle output exists and is not a directory: ${path}`)
     const entries = await readdir(path)
-    if (entries.length > 0) throw new Error(`native bundle output directory is not empty: ${path}`)
+    if (entries.length > 0) throw new Error(`agent bundle output directory is not empty: ${path}`)
   } catch (error) {
     if (error.code === 'ENOENT') return
     throw error
