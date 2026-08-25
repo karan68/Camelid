@@ -107,6 +107,10 @@ try {
   const gpuProbe = piBoundaryProbeCommand(true)
   assert.equal(gpuProbe.includes('$('), false)
   assert.match(gpuProbe, /nvidia-smi -L/)
+
+  const supervisor = await readFile(resolve(import.meta.dirname, 'process/pi-camelid-supervisor.sh'), 'utf8')
+  assert.match(supervisor, /else 2 if len\(data\) == 0 else 1/)
+  assert.match(supervisor, /model_status.*-ne 2/s)
 } finally {
   await rm(tempRoot, { recursive: true, force: true })
 }
