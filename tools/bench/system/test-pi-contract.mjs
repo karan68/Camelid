@@ -6,6 +6,7 @@ import { resolve } from 'node:path'
 import {
   parsePiJsonLines,
   PiEventError,
+  PI_BENCHMARK_SYSTEM_PROMPT,
   piJsonArgs,
   PINNED_PI_RELEASE,
   piProviderConfig,
@@ -64,6 +65,11 @@ for (const flag of [
 assert.equal(args[args.indexOf('--mode') + 1], 'json')
 assert.equal(args[args.indexOf('--tools') + 1], PI_SHARED_TOOLS.join(','))
 assert.equal(args[args.indexOf('--extension') + 1], '/opt/controller/pi-camelid-provider.mjs')
+assert.equal(args[args.indexOf('--append-system-prompt') + 1], PI_BENCHMARK_SYSTEM_PROMPT)
+assert.match(PI_BENCHMARK_SYSTEM_PROMPT, /Inspect the workspace/)
+assert.match(PI_BENCHMARK_SYSTEM_PROMPT, /Never invent workspace facts/)
+assert.equal(PI_BENCHMARK_SYSTEM_PROMPT.includes('pricing.cjs'), false)
+assert.equal(PI_BENCHMARK_SYSTEM_PROMPT.includes('10000'), false)
 assert.equal(args.at(-1), 'fix the exact task')
 
 assert.deepEqual(piSandboxEnvironment({ apiKey: 'benchmark-secret' }), {

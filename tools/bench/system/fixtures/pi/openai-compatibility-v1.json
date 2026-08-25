@@ -6,6 +6,7 @@
     "executable_sha256": "ca858fde375ab91531353b22fac6ebdf29c0a153efe754f5f9b8a72a7423ed08"
   },
   "provider_api": "openai-completions",
+  "system_prompt_append_sha256": "baece18797824ed0f6bfa73a7e8a839adec45cfb05683680ec2d6f657eaad582",
   "observed_requests": [
     {
       "turn": "initial",

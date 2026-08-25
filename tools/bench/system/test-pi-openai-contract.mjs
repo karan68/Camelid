@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
 import { resolve } from 'node:path'
 
-import { PINNED_PI_RELEASE, PI_SHARED_TOOLS } from './adapters/pi-camelid.mjs'
+import { PINNED_PI_RELEASE, PI_BENCHMARK_SYSTEM_PROMPT, PI_SHARED_TOOLS } from './adapters/pi-camelid.mjs'
 
 const fixture = JSON.parse(await readFile(
   resolve(import.meta.dirname, 'fixtures/pi/openai-compatibility-v1.json'),
@@ -15,6 +16,10 @@ assert.equal(fixture.pi.version, PINNED_PI_RELEASE.version)
 assert.equal(fixture.pi.archive_sha256, PINNED_PI_RELEASE.archiveSha256)
 assert.equal(fixture.pi.executable_sha256, PINNED_PI_RELEASE.executableSha256)
 assert.equal(fixture.provider_api, 'openai-completions')
+assert.equal(
+  fixture.system_prompt_append_sha256,
+  createHash('sha256').update(PI_BENCHMARK_SYSTEM_PROMPT).digest('hex'),
+)
 assert.equal(fixture.observed_requests.length, 2)
 
 const [initial, continuation] = fixture.observed_requests

@@ -158,6 +158,8 @@ for (const flag of ['--no-session','--no-approve','--no-extensions','--no-skills
 assert.equal(value('--mode'), 'json')
 assert.equal(value('--provider'), 'camelid-benchmark')
 assert.equal(value('--model'), 'synthetic-model')
+assert.match(value('--append-system-prompt'), /Never invent workspace facts/)
+assert.equal(value('--append-system-prompt').includes('pricing.cjs'), false)
 assert.equal(value('--tools'), 'read,bash,edit,write,ls')
 assert.equal(value('--extension'), '/opt/controller/pi-camelid-provider.mjs')
 const configPath = process.env.PI_CODING_AGENT_DIR + '/models.json'
@@ -201,6 +203,7 @@ function emit(event) { process.stdout.write(JSON.stringify(event) + '\\n') }
 function assertPiArgs(args) {
   assert.equal(args[args.indexOf('--mode') + 1], 'json')
   assert.equal(args[args.indexOf('--provider') + 1], 'camelid-benchmark')
+  assert.match(args[args.indexOf('--append-system-prompt') + 1], /Inspect the workspace/)
   assert.equal(args[args.indexOf('--tools') + 1], 'read,bash,edit,write,ls')
 }
 

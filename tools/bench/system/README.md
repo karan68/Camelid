@@ -149,6 +149,11 @@ implements them through `fd` and `rg`, which are absent and cannot be downloaded
 inside the offline boundary. The allowed `bash` tool retains search capability
 through preflight-verified `/usr/bin/find` and `/usr/bin/grep`.
 
+The controller appends task-independent benchmark workflow rules to Pi's stock
+system prompt: inspect and read before editing, never invent workspace facts,
+recover from tool errors, verify changes, and continue until done or genuinely
+blocked. The appended text contains no task path, source text, or expected answer.
+
 CPU remains the default. `--wsl-gpu true` adds only the WSL GPU device and
 driver-library search path to the otherwise unchanged network-unshared
 bubblewrap boundary, requires a successful in-boundary GPU preflight, and is

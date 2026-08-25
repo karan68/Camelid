@@ -15,6 +15,15 @@ export const PI_EVENT_STREAM_VERSION = 3
 export const PI_PROVIDER_ID = 'camelid-benchmark'
 export const PI_SHARED_TOOLS = Object.freeze(['read', 'bash', 'edit', 'write', 'ls'])
 export const PI_PROVIDER_EXTENSION_PATH = '/opt/controller/pi-camelid-provider.mjs'
+export const PI_BENCHMARK_SYSTEM_PROMPT = [
+  'Benchmark execution rules:',
+  '- Inspect the workspace with available tools before editing.',
+  '- Read a target file and nearby conventions before changing it.',
+  '- Never invent workspace facts, file paths, APIs, or source text. Look first.',
+  '- If a tool reports an error, inspect the workspace and continue unless genuinely blocked.',
+  '- Verify changes with the relevant test or check before claiming completion.',
+  '- Keep working until the goal is met or you are genuinely blocked.',
+].join('\n')
 
 export function piProviderConfig({ baseUrl, modelId, contextWindow, maxTokens }) {
   assertLoopbackV1Url(baseUrl)
@@ -66,6 +75,7 @@ export function piJsonArgs({ modelId, goal, extensionPath = PI_PROVIDER_EXTENSIO
     '--provider', PI_PROVIDER_ID,
     '--model', modelId,
     '--thinking', 'off',
+    '--append-system-prompt', PI_BENCHMARK_SYSTEM_PROMPT,
     '--no-session',
     '--no-approve',
     '--no-extensions',
