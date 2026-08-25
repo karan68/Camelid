@@ -20,7 +20,11 @@ param(
     [Parameter(Mandatory = $true)][string]$ArmA,
     [Parameter(Mandatory = $true)][string]$ArmB,
     [int]$Pairs = 3,
-    [int]$MinFreeMiB = 4500,
+    [string]$Binary = (Join-Path $PSScriptRoot '..\..\..\target\release\camelid.exe'),
+    [string]$Model = (Join-Path $PSScriptRoot '..\..\..\models\google_gemma-4-26B-A4B-it-Q4_0.hot'),
+    [string]$Cghost = (Join-Path $PSScriptRoot '..\..\..\models\google_gemma-4-26B-A4B-it-Q4_0.cghost'),
+    [string]$Assistant = (Join-Path $PSScriptRoot '..\..\..\models\gemma-4-26B-A4B-it-assistant'),
+    [int]$MinFreeMiB = 6500,
     [int]$MaxIdleTempC = 60,
     [int]$CoolSeconds = 45,
     [string]$Label = 'paired'
@@ -45,7 +49,8 @@ function Invoke-Arm {
     param([string]$Arm, [int]$Index)
     $temp = Wait-ForCool -MaxTempC $MaxIdleTempC -Budget $CoolSeconds
     Write-Host ('[paired] {0} run {1} (GPU {2} C)' -f $Arm, $Index, $temp)
-    & (Join-Path $PSScriptRoot 'run-h40.ps1') -Arm $Arm -MinFreeMiB $MinFreeMiB `
+    & (Join-Path $PSScriptRoot 'run-h40.ps1') -Arm $Arm -Binary $Binary -Model $Model `
+        -Cghost $Cghost -Assistant $Assistant -MinFreeMiB $MinFreeMiB `
         -MaxIdleTempC ($MaxIdleTempC + 5) -Label ('{0}-{1}{2}' -f $Label, $Arm, $Index) | Out-Null
     $exit = $LASTEXITCODE
     $dir = Get-ChildItem (Join-Path $PSScriptRoot 'runs') -Directory |

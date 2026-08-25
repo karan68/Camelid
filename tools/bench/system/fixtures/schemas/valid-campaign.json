@@ -1,0 +1,66 @@
+{
+  "schema": "camelid.benchmark.campaign/v1",
+  "campaign_id": "phase1-planner-test",
+  "mode": "ablation",
+  "created_utc": "2026-08-23T00:00:00Z",
+  "controller": {
+    "source_manifest_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "version": "phase1-w04"
+  },
+  "repository_root": "<repo>",
+  "source_arms": [
+    {
+      "id": "base",
+      "source_dir": "<repo>/base",
+      "expected_git_sha": "1111111111111111111111111111111111111111",
+      "cargo_path": "<cargo>",
+      "toolchain": "1.89.0",
+      "features": [],
+      "target_dir": "<target>/base"
+    },
+    {
+      "id": "head",
+      "source_dir": "<repo>/head",
+      "expected_git_sha": "2222222222222222222222222222222222222222",
+      "cargo_path": "<cargo>",
+      "toolchain": "1.89.0",
+      "features": [],
+      "target_dir": "<target>/head"
+    }
+  ],
+  "models": [
+    {
+      "id": "synthetic-q8-row",
+      "artifact_path": "<models>/synthetic-Q8_0.gguf",
+      "expected_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "quantization": "Q8_0"
+    }
+  ],
+  "workloads": [
+    {
+      "id": "rt_decode_128",
+      "adapter": "runtime-camelid",
+      "model_id": "synthetic-q8-row",
+      "prompt_file": "<prompts>/decode.txt",
+      "max_tokens": 128,
+      "warmup": true,
+      "deterministic": true,
+      "threads": 8,
+      "backend": {
+        "requested": "cpu_deterministic",
+        "assertion": "deterministic_no_offload"
+      },
+      "primary_metrics": ["tokens_per_second"],
+      "schedule": "balanced_rotation",
+      "repetitions": 2,
+      "timeout_ms": 600000
+    }
+  ],
+  "resources": {
+    "minimum_free_disk_bytes": 1
+  },
+  "security": {
+    "network": "deny",
+    "trust_tier": "local_exploratory"
+  }
+}

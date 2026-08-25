@@ -46,14 +46,16 @@ Both comparisons appear in every `verdict.json`, so neither can be quietly skipp
 ## Arms
 
 Arms live in `arms/*.json` and carry both the environment and the CLI shape, so an arm
-is reproducible from one file. All arms share the same environment; only the drafter
-differs, which is what keeps them comparable.
+is reproducible from one file. Each experiment changes only the named mechanism from
+its control; pair bounded-context arms against the matching plain/MTP control.
 
 | arm | what it is |
 |---|---|
 | `plain` | Plain greedy decode. The reference every MTP arm has to beat. |
 | `mtp-k8` | Speculative decode at K=8, the width the Metal campaign promoted. |
 | `mtp-k1` | One draft per round. A correctness gate, not a speed arm — it exercises the whole speculative path with a single-position verify batch, so its ids must equal `plain`. |
+| `plain-kv192` | Plain decode with a 192-position f16 KV reservation, matching the Mac fixture's bounded memory lane. It is valid only for requests that fit. |
+| `mtp-k8-kv192` | MTP K=8 under the same 192-position reservation, for a like-for-like bounded comparison. |
 
 ## What a run produces
 

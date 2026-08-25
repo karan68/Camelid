@@ -6193,14 +6193,15 @@ mod gpu_ssm_layer_tests {
         let mut d_k = s.alloc_zeros::<f32>(kv_width).unwrap();
         let mut d_v = s.alloc_zeros::<f32>(kv_width).unwrap();
         let mut d_attn = s.alloc_zeros::<f32>(q_width).unwrap();
+        let mut d_scores = s.alloc_zeros::<f32>(n_head * max_pos).unwrap();
         let mut mix_q = s.alloc_zeros::<i8>(q_width).unwrap();
         let mut mix_s = s.alloc_zeros::<f32>(qb).unwrap();
         let mut d_mix = s.alloc_zeros::<f32>(hidden_dim).unwrap();
 
         // persistent KV cache (f16 bits, layout [kv_head][position][head_dim]) +
         // device position + per-pair RoPE tables.
-        let mut cache_k = s.alloc_zeros::<u16>(kv_width * max_pos).unwrap();
-        let mut cache_v = s.alloc_zeros::<u16>(kv_width * max_pos).unwrap();
+        let mut cache_k = s.alloc_zeros::<u8>(kv_width * max_pos * 2).unwrap();
+        let mut cache_v = s.alloc_zeros::<u8>(kv_width * max_pos * 2).unwrap();
         let mut d_pos = s.alloc_zeros::<i32>(1).unwrap();
         let mut d_cos = s.alloc_zeros::<f32>(half).unwrap();
         let mut d_sin = s.alloc_zeros::<f32>(half).unwrap();
@@ -6362,6 +6363,7 @@ mod gpu_ssm_layer_tests {
                 n_pos,
                 max_pos,
                 scale,
+                &mut d_scores,
             )
             .unwrap();
 

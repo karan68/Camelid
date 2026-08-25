@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
+import { apiSurfaceAllowsTab, isLanChatOnly } from '../lib/apiSurface.js'
 
 /* Command palette (Phase 7). Cmd/Ctrl+K. Actions are built from live app
    state: views, conversations, theme, models (labels stay gate-honest — a
@@ -22,14 +23,15 @@ const VIEW_LABELS = [
   ['settings', 'Settings'],
 ]
 
-export function buildPaletteActions({ setTab, showNewChatLanding, cyclePreference, models = [], capabilities = [], setSelectedModelId, close }) {
+export function buildPaletteActions({ setTab, showNewChatLanding, cyclePreference, models = [], capabilities = [], setSelectedModelId, apiSurface = 'full', close }) {
   const actions = []
   for (const [tab, label] of VIEW_LABELS) {
+    if (!apiSurfaceAllowsTab(apiSurface, tab)) continue
     actions.push({ id: `nav-${tab}`, group: 'Navigate', label, hint: `#${tab}`, run: () => { setTab(tab); close() } })
   }
   actions.push({ id: 'new-chat', group: 'Chat', label: 'New conversation', hint: 'fresh thread', run: () => { showNewChatLanding(); close() } })
   actions.push({ id: 'toggle-theme', group: 'Appearance', label: 'Toggle theme', hint: 'dark → light → system', run: () => { cyclePreference(); close() } })
-  for (const model of models) {
+  for (const model of isLanChatOnly(apiSurface) ? [] : models) {
     actions.push({
       id: `model-${model.id}`,
       group: 'Switch model',
@@ -38,7 +40,7 @@ export function buildPaletteActions({ setTab, showNewChatLanding, cyclePreferenc
       run: () => { setSelectedModelId(model.id); setTab('chat'); close() },
     })
   }
-  for (const row of capabilities) {
+  for (const row of isLanChatOnly(apiSurface) ? [] : capabilities) {
     actions.push({
       id: `row-${row.id}`,
       group: 'Compatibility',

@@ -51,24 +51,158 @@ That startup path loads the model immediately and applies the default `auto` exe
 
 ## Production HTTP policy
 
-Anonymous loopback serving remains the default. A non-loopback address is refused unless you
-configure `--api-key` / `--api-key-file`, or deliberately acknowledge an externally protected
-deployment with `--allow-unauthenticated-remote`. Prefer a key file because a literal command-line
-key can be visible to other local users:
+Anonymous loopback serving remains the default. A non-loopback address has to answer two separate
+questions, because they are two separate risks and answering one does not answer the other:
+
+| | anonymous | authenticated |
+|---|---|---|
+| **cleartext** | refused: needs both acknowledgements | refused: needs `--tls-cert`/`--tls-key` or `--allow-cleartext-remote` |
+| **TLS** | refused: needs `--api-key`, `--api-key-file`, or `--allow-unauthenticated-remote` | serves |
+
+Loopback is unaffected and needs neither. This is the same policy `camelid fabric serve` applies,
+for the same reason: a key travels on every request, so over cleartext the credential that is meant
+to protect a routable bind is itself given away, along with every prompt and completion.
+
+The recommended production shape is therefore TLS plus a key. Prefer a key file because a literal
+command-line key can be visible to other local users:
+
+```bash
+target/release/camelid serve \
+  --addr 0.0.0.0:8443 \
+  --api-key-file ./camelid-api.key \
+  --tls-cert ./server-cert-chain \
+  --tls-key ./server-private-key \
+  --cors-origin https://chat.example
+```
+
+If TLS is terminated in front of Camelid — a reverse proxy, a service mesh, an SSH tunnel — then the
+hop Camelid itself serves is still cleartext, and it has no way to know what is in front of it. Say
+so explicitly:
 
 ```bash
 target/release/camelid serve \
   --addr 0.0.0.0:8181 \
   --api-key-file ./camelid-api.key \
-  --cors-origin https://chat.example
+  --allow-cleartext-remote
 ```
 
 API clients can send either `Authorization: Bearer <key>` or `X-API-Key: <key>`. Health and embedded
 same-origin UI assets remain public; API routes, including `/metrics`, require the key. CORS is
 disabled by default and accepts only explicit `http://` or `https://` origins—wildcard and `null`
-origins are refused. The bundled browser UI does not persist or inject the server API key, so use
-an API client or an authenticating reverse proxy for authenticated remote deployments. The existing
-frictionless browser UI remains the anonymous-loopback experience.
+origins are refused. The bundled browser UI stores an entered key in that browser and injects it
+only for the configured API origin. A fresh browser that reaches an authenticated listener opens
+the Settings credential field; a wrong key remains there instead of reporting the server offline.
+
+### Trusted-LAN browser Chat
+
+Create the LAN credential on the laptop first:
+
+```bash
+camelid lan-key
+```
+
+The command creates a 256-bit key under the platform app-data directory, or displays the existing
+key without changing it. Share the displayed key directly with the phone user and treat it like a
+password. Do not put it in a URL, screenshot, issue, or chat message. Run `camelid lan-key --rotate`
+only when you intend to invalidate every browser holding the old key.
+
+`--lan-chat-only` exposes the minimum authenticated backend surface used by the embedded Chat UI.
+It permits Chat and switching among direct regular `.gguf` files already present in the configured
+models directory. The switch request carries an explicit filename; absolute paths, traversal,
+prefixed paths, symlinks/reparse points, missing files, and non-GGUF files are rejected before any
+model transition. Downloads, deletion, arbitrary-path loading, unload-only operations, runtime
+controls, Workspace, Responses/Conversations, metrics, and every unknown protected route remain
+refused. Missing or wrong credentials still get `401` before route scope is considered. Bind the
+laptop's specific private address rather than every adapter:
+
+```bash
+target/release/camelid serve \
+  --addr <LAPTOP-LAN-IP>:8181 \
+  --model /path/to/model.gguf \
+  --api-key-file ./camelid-api.key \
+  --lan-chat-only \
+  --allow-cleartext-remote \
+  --no-open
+```
+
+Open `http://<LAPTOP-LAN-IP>:8181` on the phone, then enter the same key under Settings. Both devices
+use inference on the laptop; the phone only runs the browser interface. The Chat model selector can
+switch to another local GGUF from that host's configured model directory. No CORS flag is needed for
+the embedded same-origin UI. Permit the port only on the operating system's private-network firewall
+profile.
+
+This mode authenticates but does not encrypt plain HTTP. `--allow-cleartext-remote` is the explicit
+acknowledgement required for that direct-LAN shape; it does not protect the credential, prompts, or
+responses from anyone on the path. Use it only on a trusted private LAN, or put the listener behind
+an encrypted private transport. Ordinary Chat conversations still live in each browser's storage,
+so laptop and phone history do not synchronize in this phase.
+
+Both acknowledgements also read from the environment, as `CAMELID_ALLOW_UNAUTHENTICATED_REMOTE` and
+`CAMELID_ALLOW_CLEARTEXT_REMOTE`.
+
+### Private cross-network browser Chat with Tailscale
+
+Use this path when the browser and the Camelid host are on different networks. Install Tailscale
+1.52 or newer on the host and the phone, sign both devices in, and grant the phone access to the
+host in the tailnet policy. Camelid uses Tailscale Serve, not Tailscale Funnel: the generated HTTPS
+URL is reachable only by devices permitted through Tailscale.
+
+Keep Camelid on loopback. In the first terminal, provision the key and start the restricted surface:
+
+```bash
+camelid lan-key
+camelid serve \
+  --addr 127.0.0.1:8181 \
+  --model /path/to/model.gguf \
+  --api-key-file <PATH-PRINTED-BY-LAN-KEY> \
+  --lan-chat-only \
+  --no-open
+```
+
+In a second terminal, publish that verified listener through private tailnet HTTPS:
+
+```bash
+camelid remote-chat start
+```
+
+The first start may take up to two minutes while Tailscale provisions HTTPS. That longer allowance
+applies only to Serve creation; version, status, verification, and stop commands remain bounded to
+30 seconds.
+
+The command prints a URL such as `https://<DEVICE>.<TAILNET>.ts.net/`. Open it on the phone and enter
+the same Camelid key under Settings. The key is still required even though Tailscale authenticates
+the device. The key is never passed to the Tailscale CLI, placed in the URL, or written into the
+Serve configuration.
+
+The command fails closed unless all of these are true:
+
+- the backend address is exactly IPv4 loopback (`127.0.0.1`);
+- `/v1/health` reports `api_surface=lan_chat_only`, which also proves Camelid resolved an API key;
+- Tailscale is connected and reports an online device DNS name;
+- HTTPS port 443 is unused or already maps `/` to this exact Camelid listener; and
+- no Tailscale Funnel mapping is enabled on HTTPS port 443.
+
+After creating a mapping, Camelid reads Tailscale's Serve configuration back and removes the new
+mapping if the expected private proxy is not present. It never replaces another service already on
+port 443. No CORS flag is needed: the embedded UI and API remain same-origin at the Tailscale URL,
+while Tailscale terminates HTTPS and forwards only to loopback.
+
+Inspect or remove the mapping with:
+
+```bash
+camelid remote-chat status
+camelid remote-chat status --json
+camelid remote-chat stop
+```
+
+`start` is idempotent for the exact Camelid mapping. `stop` removes only that root mapping and leaves
+unrelated Tailscale Serve configuration alone. The `--bg` mapping survives a Tailscale restart, but
+the Camelid server must also be running for the URL to answer. If Tailscale is installed outside its
+standard location, pass `--tailscale-bin <ABSOLUTE_PATH>` or set `CAMELID_TAILSCALE_BIN`.
+
+This is private cross-network access, not an anonymous public link. A recipient needs both Tailscale
+access to the host and the Camelid API key. Funnel and direct router port forwarding are outside this
+workflow. Browser-local Chat histories still do not synchronize between devices.
 
 Direct TLS is optional and requires a PEM certificate chain and private key together:
 
@@ -88,6 +222,11 @@ Resource ceilings are resolved once at startup. Their CLI names and environment 
 | `--max-prompt-tokens` | 131,072 | `CAMELID_MAX_PROMPT_TOKENS` |
 | `--max-generation-tokens` | 8,192 | `CAMELID_MAX_GENERATION_TOKENS` |
 | `--max-download-bytes` | 64 GiB | `CAMELID_MAX_DOWNLOAD_BYTES` |
+
+`--lan-chat-only` also has the environment alias `CAMELID_LAN_CHAT_ONLY=1` and always requires
+`CAMELID_API_KEY` or `CAMELID_API_KEY_FILE`. The command line refuses it alongside
+`--allow-unauthenticated-remote`. Setting both through the environment is not refused there, but it
+changes nothing: this mode has no anonymous form, so the listener still will not start without a key.
 
 `GET /metrics` exposes bounded-name Prometheus counters and gauges for HTTP/generation latency,
 prompt/decode tokens, prompt and weight cache outcomes, engine queue/slot progress, process RSS,
@@ -139,10 +278,114 @@ Three limits are deliberate and worth knowing before you deploy it:
   `fabric status|route|run`. A node started with `--api-key` needs it: `/v1/health` is exempt from
   that node's auth, so without a token the node observes as ready and then answers every forwarded
   request with 401.
-- **TLS covers the client's hop only.** What the proxy speaks to a node is whatever that node's
-  listener speaks, and the proxy has no way to speak TLS to one. On a fabric whose nodes are not
-  loopback, the bearer above and every prompt and completion still cross that network unencrypted,
-  whatever the proxy presents to its own clients. Keep those hops on a trusted link.
+- Client-facing TLS (`--tls-cert`/`--tls-key`) and node-facing TLS (`--node-tls-ca`) are independent.
+  Configuring one does not protect the other hop.
+
+### Encrypting the node hop
+
+Every Fabric command applies the same node transport policy to health probes, buffered requests,
+streaming requests, failover attempts, and nodes added later through `--nodes-file`.
+
+| Node transport | Required option | Reachable nodes |
+|---|---|---|
+| CA-pinned TLS | `--node-tls-ca <PATH>` | any address whose certificate SAN matches the configured host/IP |
+| tunnel/local cleartext | none | loopback resolutions only |
+| direct cleartext | `--allow-cleartext-node-transport` | any resolution, explicitly unencrypted |
+
+Without extra flags, cleartext node transport is restricted after DNS resolution to loopback
+addresses. That preserves local nodes and encrypted tunnels while refusing a hostname that resolves
+only to another machine. Direct cleartext requires the explicit
+`--allow-cleartext-node-transport` acknowledgement (or
+`CAMELID_ALLOW_CLEARTEXT_NODE_TRANSPORT=1`). This is separate from
+`--allow-cleartext-remote`, which controls the client-facing proxy listener.
+
+Named nodes use the host operating system's resolver, preserving its hosts-file, split-DNS, VPN, and
+multicast-discovery behavior. Resolution runs in a fixed-size process-wide pool and shares the
+command's deadline, so a stuck resolver cannot hold the calling request indefinitely or grow one
+thread per request. IP literals bypass resolution and remain usable even while DNS is unavailable.
+
+For direct connections between machines, issue each node a certificate from one private CA. The
+certificate SAN must match the exact host or IP literal in `LABEL=HOST[:PORT]`; a DNS name is not
+accepted merely because it resolves to the certificate's IP. Start each node with the normal engine
+TLS and API-key options, then pin that CA at the Fabric:
+
+```bash
+# On each node (use that node's own certificate and key):
+camelid serve \
+  --addr <NODE-HOST>:8181 \
+  --model /path/to/model.gguf \
+  --api-key-file ./node-api.key \
+  --tls-cert ./node-cert-chain \
+  --tls-key ./node-private-key \
+  --no-open
+
+# On the proxy host:
+export CAMELID_API_KEY="$(cat ./node-api.key)"
+camelid fabric serve \
+  --node a=node-a.example:8181 --node b=node-b.example:8181 \
+  --node-tls-ca ./fabric-node-ca \
+  --addr 127.0.0.1:8282
+```
+
+The CA bundle is loaded before the first probe. Missing, empty, malformed, or unusable bundles stop
+the command. TLS verifies the node certificate and host/IP SAN before the HTTP request head is sent,
+so a failed handshake sends neither the bearer nor prompt bytes. The existing bearer authenticates
+the Fabric to the node; mutual TLS is not a second required client-identity system.
+
+A tunnel remains a supported alternative. Bind each node to loopback, forward a distinct local port
+to it with SSH, Tailscale, or another authenticated encrypted transport, and name the local tunnel
+endpoints (for example `a=127.0.0.1:18181`). No cleartext acknowledgement is needed because the
+Fabric sees only loopback; the tunnel owns encryption and remote identity.
+
+One Fabric uses one transport posture for all nodes: either one pinned CA or guarded cleartext. This
+prevents a node from silently downgrading while a node file reloads. CA rotation or changing posture
+requires restarting the Fabric; adding or removing nodes does not.
+
+### Placement modes
+
+`--mode throughput` is the default and preserves the established policy: choose the smallest
+`max(node-reported in-flight jobs, requests this proxy has reserved)`, breaking ties by node label.
+`--mode affinity` prefers the node named by `x-camelid-fabric-sticky` and falls back to that same
+least-load rule if the node is unavailable or no longer serves the requested model. A sticky header
+requests affinity whatever default mode the proxy was started with.
+
+`--mode completion-time` is opt-in. It learns an exponentially weighted service time from clean,
+successful requests completed during this proxy process, then minimizes:
+
+```text
+(observed-or-reserved load + 1) * learned service time
+```
+
+The estimate is scoped to the node's label, address, backend and version; the model; the API route;
+streaming versus buffered delivery; and coarse power-of-two buckets for request bytes and requested
+output tokens. That prevents a node which happened to receive a longer prompt or generation from
+being labelled intrinsically slow. Only a completion placed while the node's observed-or-reserved
+load was zero is sampled. A busy completion includes unknown queueing from other workload classes,
+so dividing its wall time by total in-flight work would invent a service time the proxy did not
+observe. No prompt or response content is retained.
+
+Every eligible node needs five successful completions in the same workload class before an estimate
+may decide placement. Until then the proxy uses least-load, rotating equal-load cold candidates by
+least-recent selection so sequential traffic samples all of them. The response header says
+`x-camelid-fabric-reason: LeastLoaded` while cold and `EstimatedCompletion` once learned timing made
+the decision.
+
+Only a clean, queue-free success is a speed sample. A node-attributable 5xx, unreadable answer,
+transport failure, or truncated stream invalidates that node's estimate for the workload
+immediately. A queue-full refusal does not: it says the load bound worked, not that service became
+slow. Client cancellation does not either, because it says nothing about the node. A stream is
+sampled only at clean EOF, and not if the bounded relay channel filled behind a slow client. A
+request carrying a sticky header is not sampled either: affinity, rather than this policy, chose its
+node.
+
+Estimates older than five minutes become cold and have to be sampled again. They are memory-only,
+bounded to 1,024 node/workload entries, and disappear when the proxy restarts. `fabric route` and
+`fabric run` reject `completion-time`: as one-shot commands they have no resident history and could
+only pretend to make a learned decision.
+
+This mode changes placement, not node capacity or admission. A sole eligible node still receives the
+request, and a genuinely full node still owns its typed 503. Treat performance improvement as a
+measurement question: use a paired, interleaved fabric campaign before making a deployment claim.
 
 ### Naming clients, and cutting one off
 
@@ -252,8 +495,9 @@ way is not interrupted, but it is bounded by `--timeout-ms` and costs a node a h
 than its generation slot.
 
 Request bodies are bounded at the same 16 MiB default the node itself uses. A streaming request is
-relayed as it arrives; `fabric run`, which returns one complete answer, refuses `stream: true` with
-400 instead.
+relayed as it arrives. `--forward-timeout-s` bounds the wait for the first response head and each
+later silent gap; every event resets the latter, so it is not a cap on total stream duration.
+`fabric run`, which returns one complete answer, refuses `stream: true` with 400 instead.
 
 ### What the proxy serves
 

@@ -1,0 +1,1 @@
+Camelid is a local inference engine whose performance claims are tied to exact model artifacts, exact execution lanes, and bounded workloads. Summarize why a trustworthy benchmark records model identity, source identity, backend engagement, output correctness, and raw timing together. Keep the answer factual and compact.

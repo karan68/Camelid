@@ -24,7 +24,7 @@ mod agent_tui;
 mod audit;
 mod banner;
 mod checkpoint;
-mod client;
+pub(crate) mod client;
 mod clipboard;
 mod inline;
 mod markdown;

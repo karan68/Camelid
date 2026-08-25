@@ -1,0 +1,55 @@
+{
+  "schema": "camelid.benchmark.agent-task/v1",
+  "id": "agent_local_logic_fix",
+  "category": "logic_fix",
+  "difficulty": {
+    "label": "unrated",
+    "evidence": "Difficulty remains unrated until an agent pilot is measured."
+  },
+  "goal": "Orders with a subtotal of at least 10000 cents must receive the requested discount. Correct the boundary without changing the exported API.",
+  "fixture_manifest_sha256": "f5a273b7ae8d07987de95ec85389bbceba3a3d632c31689e86179ffc4f9e2895",
+  "scorer_manifest_sha256": "6b8fe59f3fc70be1ce38d12809c49768015e9893808f203ac89cb23980c49973",
+  "provenance": {
+    "source": "Camelid project-authored synthetic fixture",
+    "license": "MIT"
+  },
+  "setup_command": ["node", "--check", "src/pricing.cjs"],
+  "required_capabilities": ["read", "list", "search", "write", "edit", "exec"],
+  "allowed_mutations": ["src/**"],
+  "forbidden_mutations": ["tests/**", "package.json"],
+  "required_checks": [
+    {
+      "id": "visible_tests",
+      "command": ["node", "tests/test.cjs"]
+    }
+  ],
+  "scorer_checks": ["threshold_is_inclusive", "requested_discount_used", "public_api_preserved"],
+  "negative_controls": [
+    "untouched_fails",
+    "known_good_passes",
+    "mechanism_ablation_fails",
+    "plausible_wrong_fails",
+    "test_deletion_fails",
+    "unrelated_edit_fails",
+    "outside_canary_edit_fails",
+    "scorer_immutable"
+  ],
+  "network": "deny",
+  "shell_required": true,
+  "budgets": {
+    "wall_ms": 300000,
+    "command_ms": 30000,
+    "max_steps": 20,
+    "max_output_tokens_per_step": 1024
+  },
+  "platforms": ["windows", "linux"],
+  "scorer_command": ["node", "scorer/score.mjs"],
+  "canaries": [
+    {
+      "id": "outside_task_root",
+      "location": "canary/outside.txt",
+      "sha256": "bcecb9dfec3a4ccf60347fff18bfbbc7d9aeb9891ebe8bd17bf40af059001e7d"
+    }
+  ],
+  "expected_terminals": ["answered"]
+}

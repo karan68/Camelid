@@ -20,12 +20,13 @@ use std::collections::HashSet;
 use std::fs;
 use std::io::{Error, ErrorKind, Result};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime};
+use std::sync::Arc;
+use std::time::Duration;
 
 use axum::http::HeaderMap;
 use serde::Deserialize;
 
+use super::watch::{Change, WatchedFile};
 use crate::api::ApiAuth;
 
 /// Longest client name this proxy will accept.
@@ -72,49 +73,12 @@ struct KeyFileEntry {
     key: String,
 }
 
-/// What the file looked like when it was last read.
-///
-/// Length as well as modification time, because a revocation usually shortens
-/// the file and mtime alone can be too coarse to notice a rewrite within one
-/// tick. It narrows that window rather than closing it: a key swapped for one
-/// of the same length inside a single tick still looks unchanged. Closing it
-/// would mean reading the file every interval, which is the cost this exists
-/// to avoid.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct FileStamp {
-    modified: Option<SystemTime>,
-    len: u64,
-}
-
-impl FileStamp {
-    fn of(path: &Path) -> Result<Self> {
-        let metadata = fs::metadata(path)?;
-        Ok(Self {
-            modified: metadata.modified().ok(),
-            len: metadata.len(),
-        })
-    }
-}
-
-struct ReloadState {
-    clients: Arc<[ClientKey]>,
-    stamp: Option<FileStamp>,
-    last_checked: Option<Instant>,
-    /// Whether the last re-read failed, so the notice below is printed once
-    /// per transition rather than once per request.
-    stale: bool,
-}
-
 enum Source {
     /// A single key given on the command line or in a one-key file. It cannot
     /// change while the process runs, so there is nothing to re-read.
     Fixed(Arc<[ClientKey]>),
     /// A key set on disk, re-read when it changes.
-    File {
-        path: PathBuf,
-        interval: Duration,
-        state: Mutex<ReloadState>,
-    },
+    File(WatchedFile<Arc<[ClientKey]>>),
 }
 
 /// The credential a client must present to this proxy.
@@ -172,18 +136,10 @@ impl ClientAuth {
         // Loaded once here so an unusable file stops the proxy at startup
         // rather than at the first request.
         let clients = load_key_file(&path)?;
-        let stamp = FileStamp::of(&path).ok();
         Ok(Self {
-            source: Some(Arc::new(Source::File {
-                path,
-                interval,
-                state: Mutex::new(ReloadState {
-                    clients,
-                    stamp,
-                    last_checked: Some(Instant::now()),
-                    stale: false,
-                }),
-            })),
+            source: Some(Arc::new(Source::File(WatchedFile::new(
+                path, interval, clients,
+            )))),
         })
     }
 
@@ -193,7 +149,7 @@ impl ClientAuth {
 
     /// Whether revoking a client takes effect without a restart.
     pub fn is_reloadable(&self) -> bool {
-        matches!(self.source.as_deref(), Some(Source::File { .. }))
+        matches!(self.source.as_deref(), Some(Source::File(_)))
     }
 
     /// How many clients are currently served. Reported at startup, never per
@@ -202,7 +158,7 @@ impl ClientAuth {
         match self.source.as_deref() {
             None => 0,
             Some(Source::Fixed(clients)) => clients.len(),
-            Some(Source::File { state, .. }) => state.lock().expect("client keys").clients.len(),
+            Some(Source::File(watched)) => current_clients(watched).len(),
         }
     }
 
@@ -213,11 +169,7 @@ impl ClientAuth {
         };
         let clients = match source {
             Source::Fixed(clients) => Arc::clone(clients),
-            Source::File {
-                path,
-                interval,
-                state,
-            } => current_clients(path, *interval, state),
+            Source::File(watched) => current_clients(watched),
         };
         match_client(&clients, headers)
     }
@@ -247,69 +199,44 @@ fn match_client(clients: &[ClientKey], headers: &HeaderMap) -> Admission {
 }
 
 /// The key set as it stands, re-reading the file if it may have changed.
-fn current_clients(
-    path: &Path,
-    interval: Duration,
-    state: &Mutex<ReloadState>,
-) -> Arc<[ClientKey]> {
-    let mut state = state.lock().expect("client keys");
-
-    let due = match state.last_checked {
-        Some(checked) if interval > Duration::ZERO => checked.elapsed() >= interval,
-        Some(_) => true,
-        None => true,
-    };
-    if !due {
-        return Arc::clone(&state.clients);
-    }
-    state.last_checked = Some(Instant::now());
-
-    let stamp = FileStamp::of(path).ok();
-    if stamp.is_some() && stamp == state.stamp {
-        return Arc::clone(&state.clients);
-    }
-
-    match load_key_file(path) {
-        Ok(clients) => {
+fn current_clients(watched: &WatchedFile<Arc<[ClientKey]>>) -> Arc<[ClientKey]> {
+    let (clients, change) = watched.look(load_key_file);
+    match change {
+        Change::None => {}
+        Change::Loaded { recovered, .. } => {
+            // Logged on every re-read, not only when the count changes: a key
+            // rotated for another would otherwise leave no trace at any level.
             tracing::info!(
                 clients = clients.len(),
-                path = %path.display(),
+                path = %watched.path().display(),
                 "client key set reloaded"
             );
-            if state.stale {
+            if recovered {
                 eprintln!(
                     "fabric: client keys reloaded from {}; now serving {}",
-                    path.display(),
+                    watched.path().display(),
                     clients_phrase(clients.len())
                 );
             }
-            state.clients = clients;
-            state.stamp = stamp;
-            state.stale = false;
         }
-        Err(error) => {
-            // The previous set is kept on purpose. A key file is often replaced
-            // by writing a new one and renaming it over the old, so a read that
-            // lands mid-swap sees a partial or missing file; refusing every
-            // client on that would turn an ordinary edit into an outage. The
+        Change::Failed { error, first } => {
+            // The previous set is kept on purpose; see [`super::watch`]. The
             // cost is that a revocation written into a broken or deleted file
             // has not taken effect, so the operator has to hear about it.
             tracing::warn!(
-                path = %path.display(),
+                path = %watched.path().display(),
                 %error,
                 "could not reload client keys; the previous set is still in force"
             );
             // Printed, not only traced: `RUST_LOG` is unset on a stock proxy,
             // so a revocation that has silently not happened would otherwise
-            // be invisible to the operator who just wrote it. Once per
-            // transition, so a file left broken does not fill the terminal.
-            if !state.stale {
-                eprintln!("{}", stale_key_set_notice(&error, state.clients.len()));
+            // be invisible to the operator who just wrote it.
+            if first {
+                eprintln!("{}", stale_key_set_notice(&error, clients.len()));
             }
-            state.stale = true;
         }
     }
-    Arc::clone(&state.clients)
+    clients
 }
 
 /// What an operator is told when a re-read fails. Pure, so it is tested rather

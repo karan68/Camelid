@@ -39,8 +39,12 @@
 //! * Without a [`ClientAuth`], anything that can reach this address can drive
 //!   every node in the fabric, so [`bind`] refuses a non-loopback address
 //!   unless a key is configured or the risk is acknowledged explicitly.
-//! * Authentication is all-or-nothing: there is one key, it is not per-client,
-//!   and nothing here revokes or rotates it while the proxy is running.
+//! * `--api-key` and `--api-key-file` configure one fixed key that cannot be
+//!   rotated without restarting. `--client-keys` instead names clients and
+//!   re-reads its file when it changes, so one client's key can be revoked or
+//!   rotated without disturbing the others — but a re-read that fails keeps
+//!   the previous set in force, so a revocation written into a file that no
+//!   longer parses has not taken effect until it does.
 //! * A [`ProxyTls`] pair encrypts what clients send. It is a separate refusal
 //!   from the one above and neither stands in for the other: a key sent over
 //!   cleartext is a key given away, and TLS says nothing about who may drive
@@ -104,8 +108,8 @@ use serde_json::Value;
 
 use super::client_keys::Admission;
 use super::policy::{route, RouteDecision, RouteError, RouteMode, RouteRequest};
-use super::{self as fabric, Cancel, DispatchError, Fabric, ForwardError, StreamOutcome};
 use crate::api::{ApiAuth, DEFAULT_MAX_REQUEST_BODY_BYTES};
+use crate::fabric::{self as fabric, Cancel, DispatchError, Fabric, ForwardError, StreamOutcome};
 use crate::tls_pair::resolve_tls;
 
 /// Optional header a client sends to request affinity to a specific node.
@@ -510,7 +514,7 @@ fn refuse_unauthenticated_remote(
         format!(
             "refusing unauthenticated non-loopback listener {addr}; this would expose every \
              configured node to the network. Bind a loopback address, configure \
-             --api-key/--api-key-file, or explicitly acknowledge the risk with \
+             --api-key/--api-key-file/--client-keys, or explicitly acknowledge the risk with \
              --allow-unauthenticated-remote"
         ),
     ))
@@ -1118,7 +1122,7 @@ async fn stream_completion(
             &dispatch_cancel,
         );
 
-        let (mut streaming, _placement) = match outcome {
+        let (mut streaming, mut placement) = match outcome {
             Err(error) => {
                 let _ = start_tx.send(StreamStart::Failed(error));
                 return;
@@ -1152,19 +1156,38 @@ async fn stream_completion(
                 }
             }
         };
+        let mut client_backpressured = false;
 
         loop {
             match streaming.next_chunk() {
-                Ok(None) => return,
+                Ok(None) => {
+                    if !client_backpressured {
+                        placement.record_success(streaming.elapsed());
+                    }
+                    return;
+                }
                 Ok(Some(chunk)) => {
                     // A closed channel means the client hung up. Returning drops
                     // the node's socket with it, so the generation is not left
                     // running for nobody.
-                    if chunk_tx.blocking_send(Ok(chunk)).is_err() {
-                        return;
+                    match chunk_tx.try_send(Ok(chunk)) {
+                        Ok(()) => {}
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(chunk)) => {
+                            // Once the channel fills, elapsed wall time includes
+                            // client backpressure rather than only node service.
+                            // Finish relaying, but never train placement on it.
+                            client_backpressured = true;
+                            if chunk_tx.blocking_send(chunk).is_err() {
+                                return;
+                            }
+                        }
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return,
                     }
                 }
                 Err(error) => {
+                    if !matches!(error, ForwardError::Cancelled { .. }) {
+                        placement.invalidate_service_time();
+                    }
                     let _ = chunk_tx.blocking_send(Err(error.to_string()));
                     return;
                 }
@@ -2264,8 +2287,9 @@ mod tests {
             error.to_string().contains("--allow-unauthenticated-remote"),
             "{error}"
         );
-        // ...including the way out that does not give up authentication.
+        // ...including both ways out that do not give up authentication.
         assert!(error.to_string().contains("--api-key"), "{error}");
+        assert!(error.to_string().contains("--client-keys"), "{error}");
     }
 
     #[test]

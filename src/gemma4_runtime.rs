@@ -6855,10 +6855,12 @@ pub struct Gemma4MtpRound {
     pub assistant_ns: u64,
     /// Wall spent in the target's batched verify pass.
     pub verify_ns: u64,
-    /// Expert-cache misses charged to this round's verify pass. The single most
-    /// load-bearing number for the lane: each miss is one ~3.19 MiB record read off the
-    /// `.cghost`, so this is what says whether a round is compute-bound or storage-bound.
+    /// VRAM expert-arena misses charged to this round's verify pass. A miss can be served
+    /// by the pinned host tier, so this is a residency metric rather than a disk-read count.
     pub misses: u64,
+    /// Expert records actually read from `.cghost` during this round. This equals
+    /// `misses` when no host tier exists and excludes misses served from pinned RAM.
+    pub storage_reads: u64,
 }
 
 /// Accepted-draft statistics for an MTP generation. `accepted / rounds` is alpha, the
@@ -8593,9 +8595,10 @@ pub struct Gemma4CudaResident {
     /// on the GPU (writing `d_pli` directly), replacing the ~27.5M-mult CPU matvec that
     /// was the remaining prep bottleneck. `None` falls back to the CPU pli compute.
     gpu_ple_ctx: Option<Gemma4PleCtxDev>,
-    // Per-owning-layer f16 KV caches ([kv_head][pos][head_dim]); None on shared layers.
-    cache_k: Vec<Option<cudarc::driver::CudaSlice<u16>>>,
-    cache_v: Vec<Option<cudarc::driver::CudaSlice<u16>>>,
+    // Per-owning-layer byte-addressed f16 KV caches
+    // ([kv_head][pos][head_dim]); None on shared layers.
+    cache_k: Vec<Option<cudarc::driver::CudaSlice<u8>>>,
+    cache_v: Vec<Option<cudarc::driver::CudaSlice<u8>>>,
     /// Token sequence currently represented in the persistent KV cache: the last request's
     /// prompt plus only generated tokens that were actually forwarded. The final sampled
     /// token is intentionally absent until a later request forwards it. On the next request
@@ -8622,6 +8625,7 @@ pub struct Gemma4CudaResident {
     d_k: cudarc::driver::CudaSlice<f32>,
     d_v: cudarc::driver::CudaSlice<f32>,
     d_attn: cudarc::driver::CudaSlice<f32>,
+    d_attention_scores: cudarc::driver::CudaSlice<f32>,
     d_attnq: cudarc::driver::CudaSlice<i8>,
     d_attns: cudarc::driver::CudaSlice<f32>,
     d_o: cudarc::driver::CudaSlice<f32>,
@@ -8741,7 +8745,10 @@ impl Gemma4CudaResident {
         let max_positions = std::env::var("CAMELID_GEMMA4_GHOST_CUDA_CONTEXT")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
-            .filter(|v| *v >= 512)
+            // Small bounded lanes are useful on constrained GPUs (the matched H40
+            // fixture needs 152 positions and the Mac campaign reserves 192). The
+            // request path still fails closed when prompt + generation exceeds this.
+            .filter(|v| *v >= 128)
             .unwrap_or(max_positions);
         let cpu = Gemma4Runtime::load_ghost_moe(path, cghost, cache_mib, strict_reads)?;
         Self::from_cpu_runtime(cpu, max_positions, tier_bytes)
@@ -9028,8 +9035,8 @@ impl Gemma4CudaResident {
         for p in &plan {
             if p.owns_kv {
                 let n = p.kv_dim * gemma4_kv_capacity(p.window, max_positions);
-                cache_k.push(Some(s.alloc_zeros::<u16>(n).map_err(cu)?));
-                cache_v.push(Some(s.alloc_zeros::<u16>(n).map_err(cu)?));
+                cache_k.push(Some(s.alloc_zeros::<u8>(n * 2).map_err(cu)?));
+                cache_v.push(Some(s.alloc_zeros::<u8>(n * 2).map_err(cu)?));
             } else {
                 cache_k.push(None);
                 cache_v.push(None);
@@ -9327,6 +9334,7 @@ impl Gemma4CudaResident {
             d_k: alloc_f(kv_dim_max).map_err(cu)?,
             d_v: alloc_f(kv_dim_max).map_err(cu)?,
             d_attn: alloc_f(q_dim_max).map_err(cu)?,
+            d_attention_scores: alloc_f(heads * max_positions).map_err(cu)?,
             d_attnq: alloc_i(q_dim_max).map_err(cu)?,
             d_attns: alloc_f(q_dim_max / 32).map_err(cu)?,
             d_o: alloc_f(hidden).map_err(cu)?,
@@ -11387,7 +11395,7 @@ impl Gemma4CudaResident {
                     let cfg = LaunchConfig {
                         grid_dim: (heads as u32, 1, 1),
                         block_dim: (hd as u32, 1, 1),
-                        shared_mem_bytes: ((2 * hd + self.max_positions) as u32) * 4,
+                        shared_mem_bytes: ((2 * hd) as u32) * 4,
                     };
                     let (nh, nkv, hdi, mp) =
                         (heads as i32, kv_heads as i32, hd as i32, src_cap as i32);
@@ -11403,7 +11411,8 @@ impl Gemma4CudaResident {
                         .arg(&self.d_position)
                         .arg(&mp)
                         .arg(&scale)
-                        .arg(&window);
+                        .arg(&window)
+                        .arg(&mut self.d_attention_scores);
                     unsafe { b.launch(cfg) }.map_err(cu)?;
                 }
 
@@ -12411,12 +12420,23 @@ impl Gemma4CudaResident {
         if tokens.is_empty() {
             return Ok(Vec::new());
         }
+        let end = start.checked_add(tokens.len()).ok_or_else(|| {
+            BackendError::InvalidModelMetadata(
+                "MTP verify position overflow while checking the CUDA KV range".into(),
+            )
+        })?;
+        if end > self.max_positions {
+            return Err(BackendError::InvalidModelMetadata(format!(
+                "MTP verify range {start}..{end} exceeds the CUDA context limit {}",
+                self.max_positions
+            )));
+        }
         // `position` indexes BOTH the token array and the KV cache inside the sweep, so the
         // two must line up. Pad the front so index == absolute position; the padding is
         // never read because the sweep starts at `start`.
         let mut padded = vec![0u32; start];
         padded.extend_from_slice(tokens);
-        let last = start + tokens.len() - 1;
+        let last = end - 1;
         // A verify batch must land in ONE chunk, or the single-weight-pass property is lost.
         let chunk = tokens.len();
         // Decode regime: reuse-dominated, so keep the mapped read path (bulk_reads is the
@@ -12489,6 +12509,7 @@ impl Gemma4CudaResident {
         draft_k: usize,
     ) -> Result<(String, Vec<u32>, Gemma4MtpStats)> {
         let prompt_tokens = self.cpu.tokenizer.encode(prompt, true, true)?;
+        let generation_limit = max_new.min(self.max_positions.saturating_sub(prompt_tokens.len()));
         let eot = gemma4_stop_token_ids(&self.cpu.tokenizer);
         let t_prefill = std::time::Instant::now();
         let mut logits = self.prefill_reusing_cache(&prompt_tokens)?;
@@ -12502,17 +12523,17 @@ impl Gemma4CudaResident {
         // decodes one token plainly and picks up drafting from the next round.
         let mut final_hidden: Option<Vec<f32>> = None;
 
-        while generated.len() < max_new {
+        while generated.len() < generation_limit {
             let t0 = argmax_u32(&logits);
             if eot.contains(&t0) {
                 break;
             }
             generated.push(t0);
-            if generated.len() >= max_new {
+            if generated.len() >= generation_limit {
                 break;
             }
 
-            let budget = max_new - generated.len();
+            let budget = generation_limit - generated.len();
             let t_assistant = std::time::Instant::now();
             let drafts = match final_hidden.as_ref() {
                 Some(hidden) if draft_k > 0 => {
@@ -12526,10 +12547,23 @@ impl Gemma4CudaResident {
             batch.push(t0);
             batch.extend_from_slice(&drafts);
             let misses_before = self.sser_counters().map(|(_, m)| m).unwrap_or(0);
+            let tier_enabled = self.host_tier.is_some();
+            let storage_before = if tier_enabled {
+                self.host_tier_counters().1
+            } else {
+                misses_before
+            };
             let t_verify = std::time::Instant::now();
             let rows = self.verify_chunk_logits(&batch, position)?;
             let verify_ns = t_verify.elapsed().as_nanos() as u64;
-            let round_misses = self.sser_counters().map(|(_, m)| m).unwrap_or(0) - misses_before;
+            let misses_after = self.sser_counters().map(|(_, m)| m).unwrap_or(0);
+            let round_misses = misses_after - misses_before;
+            let storage_after = if tier_enabled {
+                self.host_tier_counters().1
+            } else {
+                misses_after
+            };
+            let round_storage_reads = storage_after - storage_before;
             if rows.len() != batch.len() {
                 return Err(BackendError::InvalidModelMetadata(format!(
                     "MTP verify returned {} rows for a {}-token batch",
@@ -12574,6 +12608,7 @@ impl Gemma4CudaResident {
                 assistant_ns,
                 verify_ns,
                 misses: round_misses,
+                storage_reads: round_storage_reads,
             });
 
             let mut stopped = false;
@@ -12583,7 +12618,7 @@ impl Gemma4CudaResident {
                     break;
                 }
                 generated.push(*token);
-                if generated.len() >= max_new {
+                if generated.len() >= generation_limit {
                     stopped = true;
                     break;
                 }
@@ -12663,10 +12698,10 @@ impl Gemma4CudaResident {
         let kv_heads = plan.kv_heads;
         let head_dim = plan.head_dim;
         let s = self.cap_stream.clone();
-        let mut k_bits = vec![0u16; ck.len()];
-        let mut v_bits = vec![0u16; cv.len()];
-        s.memcpy_dtoh(ck, k_bits.as_mut_slice()).map_err(cu)?;
-        s.memcpy_dtoh(cv, v_bits.as_mut_slice()).map_err(cu)?;
+        let mut k_bytes = vec![0u8; ck.len()];
+        let mut v_bytes = vec![0u8; cv.len()];
+        s.memcpy_dtoh(ck, k_bytes.as_mut_slice()).map_err(cu)?;
+        s.memcpy_dtoh(cv, v_bytes.as_mut_slice()).map_err(cu)?;
         let mut key = vec![0.0f32; kv_heads * kv_len * head_dim];
         let mut value = vec![0.0f32; kv_heads * kv_len * head_dim];
         for h in 0..kv_heads {
@@ -12674,8 +12709,15 @@ impl Gemma4CudaResident {
                 let src = (h * capacity + pos) * head_dim;
                 let dst = (h * kv_len + pos) * head_dim;
                 for d in 0..head_dim {
-                    key[dst + d] = crate::inference::f16_bits_to_f32(k_bits[src + d]);
-                    value[dst + d] = crate::inference::f16_bits_to_f32(v_bits[src + d]);
+                    let byte = (src + d) * 2;
+                    key[dst + d] = crate::inference::f16_bits_to_f32(u16::from_le_bytes([
+                        k_bytes[byte],
+                        k_bytes[byte + 1],
+                    ]));
+                    value[dst + d] = crate::inference::f16_bits_to_f32(u16::from_le_bytes([
+                        v_bytes[byte],
+                        v_bytes[byte + 1],
+                    ]));
                 }
             }
         }

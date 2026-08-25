@@ -344,6 +344,111 @@ mod ghost_moe_cli_tests {
             }
         });
     }
+
+    #[test]
+    fn serve_parses_lan_chat_only_and_refuses_the_anonymous_override() {
+        on_cli_test_stack(|| {
+            let cli = Cli::try_parse_from([
+                "camelid",
+                "serve",
+                "--lan-chat-only",
+                "--api-key-file",
+                "camelid.key",
+                "--allow-cleartext-remote",
+                "--no-open",
+            ])
+            .expect("parse authenticated LAN Chat flags");
+            match cli.command {
+                Some(Command::Serve {
+                    server, no_open, ..
+                }) => {
+                    assert!(server.lan_chat_only);
+                    assert!(server.allow_cleartext_remote);
+                    assert_eq!(server.api_key_file, Some(PathBuf::from("camelid.key")));
+                    assert!(no_open);
+                }
+                other => panic!("expected Serve, got {other:?}"),
+            }
+
+            Cli::try_parse_from([
+                "camelid",
+                "serve",
+                "--lan-chat-only",
+                "--allow-unauthenticated-remote",
+            ])
+            .expect_err("LAN Chat accepted the anonymous remote override");
+        });
+    }
+
+    #[test]
+    fn lan_key_parses_with_rotation_explicit_and_off_by_default() {
+        on_cli_test_stack(|| {
+            for (args, expected) in [
+                (vec!["camelid", "lan-key"], false),
+                (vec!["camelid", "lan-key", "--rotate"], true),
+            ] {
+                let cli = Cli::try_parse_from(args).unwrap();
+                match cli.command {
+                    Some(Command::LanKey { rotate }) => assert_eq!(rotate, expected),
+                    other => panic!("expected LanKey, got {other:?}"),
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn lan_key_prints_a_server_command_that_passes_both_remote_guards() {
+        assert_eq!(
+            lan_chat_serve_command(std::path::Path::new("camelid.key")),
+            "camelid serve --lan-chat-only --api-key-file \"camelid.key\" \
+             --allow-cleartext-remote --addr <LAPTOP-LAN-IP>:8181 --model <MODEL.gguf>"
+        );
+    }
+
+    #[test]
+    fn remote_chat_actions_parse_a_loopback_backend_and_explicit_tailscale_binary() {
+        on_cli_test_stack(|| {
+            let start = Cli::try_parse_from(["camelid", "remote-chat", "start"])
+                .expect("parse remote Chat start");
+            match start.command {
+                Some(Command::RemoteChat {
+                    action: RemoteChatAction::Start { remote },
+                }) => {
+                    assert_eq!(remote.backend, "127.0.0.1:8181".parse().unwrap());
+                    assert_eq!(remote.tailscale_bin, None);
+                }
+                other => panic!("expected remote Chat start, got {other:?}"),
+            }
+
+            let status = Cli::try_parse_from([
+                "camelid",
+                "remote-chat",
+                "status",
+                "--backend",
+                "127.0.0.1:9191",
+                "--tailscale-bin",
+                "tailscale-test-bin",
+                "--json",
+            ])
+            .expect("parse remote Chat status");
+            match status.command {
+                Some(Command::RemoteChat {
+                    action: RemoteChatAction::Status { remote, json },
+                }) => {
+                    assert_eq!(remote.backend, "127.0.0.1:9191".parse().unwrap());
+                    assert_eq!(
+                        remote.tailscale_bin,
+                        Some(PathBuf::from("tailscale-test-bin"))
+                    );
+                    assert!(json);
+                }
+                other => panic!("expected remote Chat status, got {other:?}"),
+            }
+
+            Cli::try_parse_from(["camelid", "remote-chat"])
+                .expect_err("remote Chat accepted no lifecycle action");
+        });
+    }
 }
 
 use camelid::{
@@ -367,6 +472,14 @@ use camelid::{
     tensor::{CpuTensor, Q8_0TensorBlocks, TensorStore},
     tokenizer::Tokenizer,
 };
+
+fn lan_chat_serve_command(key_path: &std::path::Path) -> String {
+    format!(
+        "camelid serve --lan-chat-only --api-key-file \"{}\" \
+         --allow-cleartext-remote --addr <LAPTOP-LAN-IP>:8181 --model <MODEL.gguf>",
+        key_path.display()
+    )
+}
 use clap::{Args, Parser, Subcommand};
 use rayon::ThreadPoolBuilder;
 use serde::Serialize;
@@ -465,6 +578,21 @@ struct ServerPolicyArgs {
         default_value_t = false
     )]
     allow_unauthenticated_remote: bool,
+    /// Expose only the authenticated read surface needed by the embedded Chat
+    /// UI plus chat completions. Model mutation, Workspace, Responses, runtime
+    /// controls, and every other protected route return a typed 403.
+    #[arg(
+        long,
+        env = "CAMELID_LAN_CHAT_ONLY",
+        default_value_t = false,
+        conflicts_with = "allow_unauthenticated_remote"
+    )]
+    lan_chat_only: bool,
+    /// Explicitly permit a cleartext non-loopback listener. Without this
+    /// acknowledgement or TLS, Camelid refuses the bind, because the API key
+    /// and every prompt would otherwise cross the network unencrypted.
+    #[arg(long, env = "CAMELID_ALLOW_CLEARTEXT_REMOTE", default_value_t = false)]
+    allow_cleartext_remote: bool,
     /// PEM certificate chain for HTTPS. Requires --tls-key.
     #[arg(long, env = "CAMELID_TLS_CERT", requires = "tls_key")]
     tls_cert: Option<PathBuf>,
@@ -526,6 +654,8 @@ impl ServerPolicyArgs {
                 })
                 .unwrap_or_default(),
             allow_unauthenticated_remote: enabled("CAMELID_ALLOW_UNAUTHENTICATED_REMOTE"),
+            lan_chat_only: enabled("CAMELID_LAN_CHAT_ONLY"),
+            allow_cleartext_remote: enabled("CAMELID_ALLOW_CLEARTEXT_REMOTE"),
             tls_cert: std::env::var_os("CAMELID_TLS_CERT").map(PathBuf::from),
             tls_key: std::env::var_os("CAMELID_TLS_KEY").map(PathBuf::from),
             max_request_body_bytes: parsed("CAMELID_MAX_REQUEST_BODY_BYTES", 16 * 1024 * 1024),
@@ -541,12 +671,39 @@ impl ServerPolicyArgs {
             api_key_file: self.api_key_file,
             cors_origins: self.cors_origins,
             allow_unauthenticated_remote: self.allow_unauthenticated_remote,
+            allow_cleartext_remote: self.allow_cleartext_remote,
             tls_cert: self.tls_cert,
             tls_key: self.tls_key,
             max_request_body_bytes: self.max_request_body_bytes,
             max_prompt_tokens: self.max_prompt_tokens,
             max_generation_tokens: self.max_generation_tokens,
             max_download_bytes: self.max_download_bytes,
+            api_surface: if self.lan_chat_only {
+                api::ApiSurface::LanChatOnly
+            } else {
+                api::ApiSurface::Full
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, Args)]
+struct RemoteChatArgs {
+    /// Existing authenticated LAN Chat listener to publish privately. Tailscale
+    /// Serve supports a local HTTP proxy only on 127.0.0.1.
+    #[arg(long, default_value = "127.0.0.1:8181")]
+    backend: SocketAddr,
+    /// Absolute path to the Tailscale CLI. Normally discovered from the standard
+    /// install location or PATH.
+    #[arg(long, env = "CAMELID_TAILSCALE_BIN")]
+    tailscale_bin: Option<PathBuf>,
+}
+
+impl RemoteChatArgs {
+    fn into_options(self) -> camelid::remote_chat::RemoteChatOptions {
+        camelid::remote_chat::RemoteChatOptions {
+            backend: self.backend,
+            tailscale_bin: self.tailscale_bin,
         }
     }
 }
@@ -1047,13 +1204,59 @@ fn read_tokenizer_gguf(
     Ok(gguf)
 }
 
-/// Parse the `--mode` flag shared by `fabric route` and `fabric run`.
+/// Parse the placement mode used by a resident or request-sending fabric.
 fn route_mode(raw: &str) -> anyhow::Result<camelid::fabric::RouteMode> {
     match raw {
         "throughput" => Ok(camelid::fabric::RouteMode::Throughput),
+        "completion-time" => Ok(camelid::fabric::RouteMode::CompletionTime),
         "affinity" => Ok(camelid::fabric::RouteMode::Affinity),
-        other => anyhow::bail!("unknown mode `{other}`; expected `throughput` or `affinity`"),
+        other => anyhow::bail!(
+            "unknown mode `{other}`; expected `throughput`, `completion-time` or `affinity`"
+        ),
     }
+}
+
+/// A one-shot command owns no reusable service history, so it cannot honestly
+/// offer the resident completion-time policy.
+fn stateless_route_mode(raw: &str) -> anyhow::Result<camelid::fabric::RouteMode> {
+    match route_mode(raw)? {
+        camelid::fabric::RouteMode::CompletionTime => anyhow::bail!(
+            "mode `completion-time` learns across completed requests and is available only to the resident `fabric serve` command"
+        ),
+        mode => Ok(mode),
+    }
+}
+
+/// Build a fabric from whichever way the operator named its nodes.
+///
+/// Every `fabric` subcommand takes both forms, so the file an operator already
+/// maintains for `fabric serve` is the same one they can inspect with
+/// `fabric status`. Clap makes the two mutually exclusive and requires one, so
+/// exactly one arrives populated here.
+///
+/// A file that cannot be read is an error rather than an empty fabric: on the
+/// CLI that is a message instead of a table of nothing, and on `serve` it stops
+/// the proxy before it announces an address.
+fn fabric_from(
+    nodes: Vec<String>,
+    nodes_file: Option<PathBuf>,
+) -> anyhow::Result<camelid::fabric::Fabric> {
+    match nodes_file {
+        Some(path) => Ok(camelid::fabric::Fabric::from_node_file(path)?),
+        None => Ok(camelid::fabric::Fabric::new(
+            camelid::fabric::parse_fabric(&nodes).map_err(|error| anyhow::anyhow!("{error}"))?,
+        )),
+    }
+}
+
+fn configure_node_transport(
+    fabric: camelid::fabric::Fabric,
+    transport: &NodeTransportArgs,
+) -> anyhow::Result<camelid::fabric::Fabric> {
+    Ok(fabric.with_node_transport(
+        transport.node_tls_ca.as_deref(),
+        transport.allow_cleartext_node_transport,
+    )?)
 }
 
 /// Resolve the token the fabric authenticates to its nodes with.
@@ -1084,18 +1287,51 @@ fn resolve_bearer(flag: Option<String>, from_env: Option<String>) -> Option<Stri
 /// session, so nothing crosses the network inside the token loop. This is the
 /// throughput complement to `serve-distributed`, which shards one model's layers
 /// across machines and is slower than a single node by construction.
+#[derive(Debug, Clone, Args)]
+struct NodeTransportArgs {
+    /// PEM CA bundle that authenticates every node. Node hostnames and IP
+    /// literals are verified against the certificate SAN before any bearer or
+    /// request bytes are sent.
+    #[arg(
+        long,
+        value_name = "PATH",
+        conflicts_with = "allow_cleartext_node_transport"
+    )]
+    node_tls_ca: Option<PathBuf>,
+    /// Permit direct cleartext transport to a node that resolves outside
+    /// loopback. Without this acknowledgement, plaintext is limited to local
+    /// nodes and operator-owned tunnels.
+    #[arg(
+        long,
+        env = "CAMELID_ALLOW_CLEARTEXT_NODE_TRANSPORT",
+        default_value_t = false
+    )]
+    allow_cleartext_node_transport: bool,
+}
+
 #[derive(Debug, Subcommand)]
 enum FabricAction {
     /// Probe every node once and report what the fabric can serve.
     Status {
         /// A node, as `LABEL=HOST[:PORT]`. Repeat for each node.
-        #[arg(long = "node", required = true, value_name = "LABEL=HOST[:PORT]")]
+        #[arg(
+            long = "node",
+            required_unless_present = "nodes_file",
+            conflicts_with = "nodes_file",
+            value_name = "LABEL=HOST[:PORT]"
+        )]
         nodes: Vec<String>,
+        /// Read the nodes from the same file `fabric serve` takes, one
+        /// `LABEL=HOST[:PORT]` per line.
+        #[arg(long, value_name = "PATH")]
+        nodes_file: Option<PathBuf>,
         /// Bearer token for nodes started with an API key. Falls back to
         /// CAMELID_API_KEY. Prefer the variable on a shared machine, so the
         /// secret is not in the process command line.
         #[arg(long, value_name = "TOKEN")]
         bearer: Option<String>,
+        #[command(flatten)]
+        transport: NodeTransportArgs,
         /// Per-node probe budget. Nodes are probed concurrently, so this bounds
         /// the whole command, not each node in turn.
         #[arg(long, default_value_t = 2000)]
@@ -1108,10 +1344,19 @@ enum FabricAction {
     ///
     /// Placement is deterministic, so this dry run predicts the real decision.
     Route {
-        #[arg(long = "node", required = true, value_name = "LABEL=HOST[:PORT]")]
+        #[arg(
+            long = "node",
+            required_unless_present = "nodes_file",
+            conflicts_with = "nodes_file",
+            value_name = "LABEL=HOST[:PORT]"
+        )]
         nodes: Vec<String>,
+        /// Read the nodes from the same file `fabric serve` takes.
+        #[arg(long, value_name = "PATH")]
+        nodes_file: Option<PathBuf>,
         /// `throughput` spreads independent requests; `affinity` keeps a session
-        /// on the node whose prefix and KV cache are already warm.
+        /// on the node whose prefix and KV cache are already warm. The learned
+        /// `completion-time` mode is unavailable to this stateless dry run.
         #[arg(long, default_value = "throughput")]
         mode: String,
         /// Only consider nodes serving this exact model id.
@@ -1124,6 +1369,8 @@ enum FabricAction {
         /// CAMELID_API_KEY.
         #[arg(long, value_name = "TOKEN")]
         bearer: Option<String>,
+        #[command(flatten)]
+        transport: NodeTransportArgs,
         #[arg(long, default_value_t = 2000)]
         timeout_ms: u64,
         #[arg(long)]
@@ -1134,11 +1381,21 @@ enum FabricAction {
     /// Placement, then forward: the request crosses the network once, not once
     /// per token.
     Run {
-        #[arg(long = "node", required = true, value_name = "LABEL=HOST[:PORT]")]
+        #[arg(
+            long = "node",
+            required_unless_present = "nodes_file",
+            conflicts_with = "nodes_file",
+            value_name = "LABEL=HOST[:PORT]"
+        )]
         nodes: Vec<String>,
+        /// Read the nodes from the same file `fabric serve` takes.
+        #[arg(long, value_name = "PATH")]
+        nodes_file: Option<PathBuf>,
         /// The user message to send.
         #[arg(long)]
         prompt: String,
+        /// `throughput` ranks queue depth; `affinity` prefers the requested
+        /// sticky node. Use resident `fabric serve` for learned placement.
         #[arg(long, default_value = "throughput")]
         mode: String,
         /// Require a node serving this exact model id. When omitted, the fabric
@@ -1152,6 +1409,8 @@ enum FabricAction {
         /// ready and then answers this request with 401.
         #[arg(long, value_name = "TOKEN")]
         bearer: Option<String>,
+        #[command(flatten)]
+        transport: NodeTransportArgs,
         #[arg(long, default_value_t = 64)]
         max_tokens: u32,
         /// Per-node health probe budget.
@@ -1171,9 +1430,10 @@ enum FabricAction {
     /// asking for `stream: true` is relayed as server-sent events, so a stock
     /// OpenAI client works against this address unchanged.
     ///
-    /// The proxy has no authentication of its own, so it binds loopback by
-    /// default and refuses a routable address unless the exposure is
-    /// acknowledged explicitly.
+    /// Client authentication is separate from the bearer the proxy sends to
+    /// its nodes. The proxy binds loopback by default; a routable address is
+    /// refused unless it is both authenticated and encrypted, or whichever of
+    /// those it is missing is acknowledged explicitly.
     Serve {
         #[arg(
             long = "node",
@@ -1192,8 +1452,9 @@ enum FabricAction {
         nodes_file: Option<PathBuf>,
         #[arg(long, default_value = "127.0.0.1:8282")]
         addr: SocketAddr,
-        /// Default placement mode; a client can still request affinity to a
-        /// specific node via the `x-camelid-fabric-sticky` request header.
+        /// Default placement mode. `completion-time` learns successful service
+        /// time per node, model and route; it falls back to queue depth until
+        /// every candidate is warm. A sticky header still requests affinity.
         #[arg(long, default_value = "throughput")]
         mode: String,
         /// Bearer token for nodes started with an API key. Falls back to
@@ -1201,6 +1462,8 @@ enum FabricAction {
         /// answers every forwarded request with 401.
         #[arg(long, value_name = "TOKEN")]
         bearer: Option<String>,
+        #[command(flatten)]
+        transport: NodeTransportArgs,
         /// Require this key from clients of the proxy. This is the opposite
         /// direction to --bearer, and deliberately does NOT read CAMELID_API_KEY:
         /// on this command that variable already names the token sent to nodes,
@@ -1322,6 +1585,28 @@ mod fabric_command_tests {
     }
 
     #[test]
+    fn completion_time_is_available_only_to_the_resident_command() {
+        assert_eq!(
+            route_mode("completion-time").expect("resident mode parses"),
+            camelid::fabric::RouteMode::CompletionTime
+        );
+        assert!(stateless_route_mode("completion-time").is_err());
+
+        on_cli_test_stack(|| {
+            let argv = [
+                "camelid",
+                "fabric",
+                "serve",
+                "--node",
+                "a=127.0.0.1",
+                "--mode",
+                "completion-time",
+            ];
+            Cli::try_parse_from(argv).expect("resident mode must parse");
+        });
+    }
+
+    #[test]
     fn every_fabric_subcommand_accepts_a_bearer() {
         // `run` and `serve` are the ones that 401 without it, but `status` and
         // `route` must take it too or they would keep predicting what the
@@ -1346,6 +1631,115 @@ mod fabric_command_tests {
                     other => panic!("expected a fabric command, got {other:?}"),
                 };
                 assert_eq!(bearer.as_deref(), Some("s3cret"), "{argv:?}");
+            }
+        });
+    }
+
+    #[test]
+    fn every_fabric_subcommand_has_the_same_node_transport_contract() {
+        on_cli_test_stack(|| {
+            for argv in [
+                vec!["camelid", "fabric", "status"],
+                vec!["camelid", "fabric", "route"],
+                vec!["camelid", "fabric", "run", "--prompt", "hi"],
+                vec!["camelid", "fabric", "serve"],
+            ] {
+                let mut tls = argv.clone();
+                tls.extend(["--node", "a=node.example", "--node-tls-ca", "node-ca"]);
+                let cli = Cli::try_parse_from(&tls).expect("TLS mode parses");
+                let transport = match cli.command {
+                    Some(Command::Fabric { action }) => match action {
+                        FabricAction::Status { transport, .. }
+                        | FabricAction::Route { transport, .. }
+                        | FabricAction::Run { transport, .. }
+                        | FabricAction::Serve { transport, .. } => transport,
+                    },
+                    other => panic!("expected a fabric command, got {other:?}"),
+                };
+                assert_eq!(
+                    transport.node_tls_ca.as_deref(),
+                    Some(std::path::Path::new("node-ca")),
+                    "{tls:?}"
+                );
+                assert!(!transport.allow_cleartext_node_transport, "{tls:?}");
+
+                let mut contradictory = argv;
+                contradictory.extend([
+                    "--node",
+                    "a=node.example",
+                    "--node-tls-ca",
+                    "node-ca",
+                    "--allow-cleartext-node-transport",
+                ]);
+                Cli::try_parse_from(&contradictory)
+                    .expect_err("TLS and cleartext acknowledgement conflict");
+            }
+        });
+    }
+
+    /// The node file is the set an operator maintains for `fabric serve`.
+    /// Every subcommand has to read it, or inspecting the fabric means retyping
+    /// by hand the machines the proxy already knows about — and the two answers
+    /// can then disagree.
+    #[test]
+    fn every_fabric_subcommand_accepts_a_node_file() {
+        on_cli_test_stack(|| {
+            for argv in [
+                vec!["camelid", "fabric", "status"],
+                vec!["camelid", "fabric", "route"],
+                vec!["camelid", "fabric", "run", "--prompt", "hi"],
+                vec!["camelid", "fabric", "serve"],
+            ] {
+                let mut argv = argv;
+                argv.extend(["--nodes-file", "fabric.nodes"]);
+                let cli = Cli::try_parse_from(&argv).expect("parses");
+                let nodes_file = match cli.command {
+                    Some(Command::Fabric { action }) => match action {
+                        FabricAction::Status { nodes_file, .. }
+                        | FabricAction::Route { nodes_file, .. }
+                        | FabricAction::Run { nodes_file, .. }
+                        | FabricAction::Serve { nodes_file, .. } => nodes_file,
+                    },
+                    other => panic!("expected a fabric command, got {other:?}"),
+                };
+                assert_eq!(
+                    nodes_file.as_deref(),
+                    Some(std::path::Path::new("fabric.nodes")),
+                    "{argv:?}"
+                );
+            }
+        });
+    }
+
+    /// Two answers to "which machines" must not be configurable at once: the
+    /// file is the one that can change while the proxy runs, so a stray
+    /// `--node` silently winning would leave an operator editing a file that
+    /// nothing reads.
+    #[test]
+    fn naming_nodes_twice_is_refused_and_naming_them_not_at_all_is_too() {
+        on_cli_test_stack(|| {
+            for subcommand in [
+                vec!["status"],
+                vec!["route"],
+                vec!["run", "--prompt", "hi"],
+                vec!["serve"],
+            ] {
+                let both: Vec<&str> = ["camelid", "fabric"]
+                    .into_iter()
+                    .chain(subcommand.iter().copied())
+                    .chain(["--node", "a=127.0.0.1", "--nodes-file", "fabric.nodes"])
+                    .collect();
+                Cli::try_parse_from(&both)
+                    .err()
+                    .unwrap_or_else(|| panic!("{both:?} named its nodes twice and was accepted"));
+
+                let neither: Vec<&str> = ["camelid", "fabric"]
+                    .into_iter()
+                    .chain(subcommand.iter().copied())
+                    .collect();
+                Cli::try_parse_from(&neither).err().unwrap_or_else(|| {
+                    panic!("{neither:?} named no nodes at all and was accepted")
+                });
             }
         });
     }
@@ -1435,7 +1829,41 @@ mod fabric_command_tests {
 }
 
 #[derive(Debug, Subcommand)]
+enum RemoteChatAction {
+    /// Publish the verified loopback listener through private tailnet-only HTTPS.
+    Start {
+        #[command(flatten)]
+        remote: RemoteChatArgs,
+    },
+    /// Show the private URL, local backend readiness, and transport state.
+    Status {
+        #[command(flatten)]
+        remote: RemoteChatArgs,
+        /// Emit a machine-readable status object.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Remove only the exact Camelid root mapping from Tailscale Serve.
+    Stop {
+        #[command(flatten)]
+        remote: RemoteChatArgs,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum Command {
+    /// Create or display the local credential used by authenticated LAN Chat.
+    LanKey {
+        /// Replace the existing key, immediately invalidating browsers that
+        /// still hold it. Without this flag the existing key is reused.
+        #[arg(long, default_value_t = false)]
+        rotate: bool,
+    },
+    /// Reach authenticated Chat from another network through private Tailscale HTTPS.
+    RemoteChat {
+        #[command(subcommand)]
+        action: RemoteChatAction,
+    },
     /// Start the local HTTP API server.
     Serve {
         #[arg(long, default_value = "127.0.0.1:8181", env = "CAMELID_ADDR")]
@@ -2791,11 +3219,15 @@ impl Gemma4HarnessRun<'_> {
                         "assistant_ms": round.assistant_ns as f64 / 1e6,
                         "verify_ms": round.verify_ns as f64 / 1e6,
                         "misses": round.misses,
-                        // One miss is one ~3.19 MiB record off the .cghost. Reported as
-                        // bytes as well because the question this answers -- is the round
-                        // storage-bound? -- is about bytes against read rate, and doing
-                        // that arithmetic by hand each time invites getting it wrong.
+                        // Backward-compatible v1 alias. This was historically described as
+                        // storage, but it has always counted VRAM-arena misses.
                         "miss_mib": round.misses as f64 * 3.19,
+                        "arena_miss_mib": round.misses as f64 * 3.19,
+                        // A VRAM miss served by the pinned host tier never reaches disk.
+                        // Keep actual storage traffic separate so the per-round trace can
+                        // answer whether verification is I/O- or compute-bound.
+                        "storage_reads": round.storage_reads,
+                        "storage_mib": round.storage_reads as f64 * 3.19,
                     })
                 })
                 .collect::<Vec<_>>()
@@ -2997,6 +3429,67 @@ async fn main() -> anyhow::Result<()> {
     }
 
     match command {
+        Command::RemoteChat { action } => match action {
+            RemoteChatAction::Start { remote } => {
+                let status = camelid::remote_chat::start(remote.into_options())?;
+                println!("Remote Chat is available within your Tailscale network:");
+                println!("  {}", status.url);
+                println!("Camelid remains on http://{}.", status.backend);
+                println!("The LAN Chat API key is still required in every browser.");
+                println!("Tailscale Funnel was not enabled.");
+            }
+            RemoteChatAction::Status { remote, json } => {
+                let status = camelid::remote_chat::status(remote.into_options())?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&status)?);
+                } else {
+                    println!("Remote Chat URL: {}", status.url);
+                    println!("Backend: http://{}", status.backend);
+                    println!(
+                        "Backend policy: {}",
+                        if status.backend_ready {
+                            "ready (authenticated LAN Chat only)"
+                        } else {
+                            "not ready"
+                        }
+                    );
+                    println!("Tailscale transport: {}", status.transport);
+                }
+            }
+            RemoteChatAction::Stop { remote } => {
+                let status = camelid::remote_chat::stop(remote.into_options())?;
+                println!("Camelid's remote Chat mapping is stopped.");
+                if status.transport != camelid::remote_chat::TransportState::Inactive {
+                    println!(
+                        "Other Tailscale configuration remains on HTTPS port 443 ({}).",
+                        status.transport
+                    );
+                }
+            }
+        },
+        Command::LanKey { rotate } => {
+            let credential = camelid::lan_key::provision(rotate)?;
+            println!(
+                "LAN Chat key {} at {}",
+                if credential.created() {
+                    "created"
+                } else {
+                    "loaded"
+                },
+                credential.path().display()
+            );
+            println!("\n{}\n", credential.secret());
+            println!("Treat this key like a password. Share it directly with the phone user.");
+            println!("Never put it in a URL, screenshot, issue, or chat message.");
+            println!(
+                "\nTrusted LAN:\n  {}",
+                lan_chat_serve_command(credential.path())
+            );
+            println!(
+                "\nPrivate access from another network:\n  camelid serve --lan-chat-only --api-key-file \"{}\" --addr 127.0.0.1:8181 --model <MODEL.gguf>\n  camelid remote-chat start",
+                credential.path().display()
+            );
+        }
         Command::Serve {
             addr,
             model,
@@ -3379,14 +3872,14 @@ async fn main() -> anyhow::Result<()> {
         Command::Fabric { action } => match action {
             FabricAction::Status {
                 nodes,
+                nodes_file,
                 bearer,
+                transport,
                 timeout_ms,
                 json,
             } => {
                 let bearer = fabric_bearer(bearer);
-                let specs = camelid::fabric::parse_fabric(&nodes)
-                    .map_err(|error| anyhow::anyhow!("{error}"))?;
-                let fabric = camelid::fabric::Fabric::new(specs)
+                let fabric = configure_node_transport(fabric_from(nodes, nodes_file)?, &transport)?
                     .with_timeout(std::time::Duration::from_millis(timeout_ms))
                     .with_bearer(bearer.as_deref());
                 let snapshots = fabric.observe();
@@ -3398,18 +3891,18 @@ async fn main() -> anyhow::Result<()> {
             }
             FabricAction::Route {
                 nodes,
+                nodes_file,
                 mode,
                 model,
                 sticky,
                 bearer,
+                transport,
                 timeout_ms,
                 json,
             } => {
                 let bearer = fabric_bearer(bearer);
-                let mode = route_mode(&mode)?;
-                let specs = camelid::fabric::parse_fabric(&nodes)
-                    .map_err(|error| anyhow::anyhow!("{error}"))?;
-                let fabric = camelid::fabric::Fabric::new(specs)
+                let mode = stateless_route_mode(&mode)?;
+                let fabric = configure_node_transport(fabric_from(nodes, nodes_file)?, &transport)?
                     .with_timeout(std::time::Duration::from_millis(timeout_ms))
                     .with_bearer(bearer.as_deref());
                 let snapshots = fabric.observe();
@@ -3443,21 +3936,21 @@ async fn main() -> anyhow::Result<()> {
             }
             FabricAction::Run {
                 nodes,
+                nodes_file,
                 prompt,
                 mode,
                 model,
                 sticky,
                 bearer,
+                transport,
                 max_tokens,
                 timeout_ms,
                 forward_timeout_s,
                 json,
             } => {
                 let bearer = fabric_bearer(bearer);
-                let mode = route_mode(&mode)?;
-                let specs = camelid::fabric::parse_fabric(&nodes)
-                    .map_err(|error| anyhow::anyhow!("{error}"))?;
-                let fabric = camelid::fabric::Fabric::new(specs)
+                let mode = stateless_route_mode(&mode)?;
+                let fabric = configure_node_transport(fabric_from(nodes, nodes_file)?, &transport)?
                     .with_timeout(std::time::Duration::from_millis(timeout_ms))
                     .with_bearer(bearer.as_deref());
 
@@ -3488,17 +3981,17 @@ async fn main() -> anyhow::Result<()> {
                 };
 
                 let body = camelid::fabric::forward::chat_request(&model_id, &prompt, max_tokens);
-                let answer = camelid::fabric::forward::forward(
-                    &chosen.spec,
-                    "/v1/chat/completions",
-                    &body,
-                    bearer.as_deref(),
-                    std::time::Duration::from_secs(forward_timeout_s),
-                    // One request per process: this ends when the process does,
-                    // so there is no client that can leave while it runs.
-                    &camelid::fabric::Cancel::never(),
-                )
-                .map_err(|error| anyhow::anyhow!("{error}"))?;
+                let answer = fabric
+                    .forward_to(
+                        &chosen.spec,
+                        "/v1/chat/completions",
+                        &body,
+                        std::time::Duration::from_secs(forward_timeout_s),
+                        // One request per process: this ends when the process does,
+                        // so there is no client that can leave while it runs.
+                        &camelid::fabric::Cancel::never(),
+                    )
+                    .map_err(|error| anyhow::anyhow!("{error}"))?;
 
                 if json {
                     println!(
@@ -3543,6 +4036,7 @@ async fn main() -> anyhow::Result<()> {
                 addr,
                 mode,
                 bearer,
+                transport,
                 api_key,
                 api_key_file,
                 timeout_ms,
@@ -3568,17 +4062,13 @@ async fn main() -> anyhow::Result<()> {
                 let tls = camelid::fabric::server::ProxyTls::resolve(tls_cert, tls_key).await?;
                 // Same reason: a node file that cannot be read is a refusal,
                 // and it has to arrive before the listening line.
-                let fabric = match nodes_file {
-                    Some(path) => camelid::fabric::Fabric::from_node_file(path)?,
-                    None => camelid::fabric::Fabric::new(
-                        camelid::fabric::parse_fabric(&nodes)
-                            .map_err(|error| anyhow::anyhow!("{error}"))?,
-                    ),
-                }
-                .with_timeout(std::time::Duration::from_millis(timeout_ms))
-                .with_bearer(bearer.as_deref())
-                .with_max_observation_age(std::time::Duration::from_millis(observation_max_age_ms))
-                .with_max_forward_attempts(max_forward_attempts);
+                let fabric = configure_node_transport(fabric_from(nodes, nodes_file)?, &transport)?
+                    .with_timeout(std::time::Duration::from_millis(timeout_ms))
+                    .with_bearer(bearer.as_deref())
+                    .with_max_observation_age(std::time::Duration::from_millis(
+                        observation_max_age_ms,
+                    ))
+                    .with_max_forward_attempts(max_forward_attempts);
 
                 // Bind before announcing, so a refused or already-taken address
                 // never prints a listening line it did not earn.
@@ -3595,6 +4085,7 @@ async fn main() -> anyhow::Result<()> {
                 let bound = listener.local_addr()?;
                 let scheme = if tls.is_some() { "https" } else { "http" };
                 println!("fabric serve listening on {scheme}://{bound}");
+                println!("node transport: {}", fabric.node_transport_description());
                 // A key set is the only thing here an operator can get subtly
                 // wrong without being told: a file that parsed but named one
                 // client when they meant three looks exactly like success.

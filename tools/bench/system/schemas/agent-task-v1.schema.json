@@ -1,0 +1,194 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://camelid.ai/schemas/benchmark/agent-task-v1.schema.json",
+  "title": "Camelid agent benchmark task v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "id",
+    "category",
+    "difficulty",
+    "goal",
+    "fixture_manifest_sha256",
+    "scorer_manifest_sha256",
+    "provenance",
+    "setup_command",
+    "required_capabilities",
+    "allowed_mutations",
+    "forbidden_mutations",
+    "required_checks",
+    "scorer_checks",
+    "negative_controls",
+    "network",
+    "shell_required",
+    "budgets",
+    "platforms",
+    "scorer_command",
+    "canaries",
+    "expected_terminals"
+  ],
+  "properties": {
+    "schema": { "const": "camelid.benchmark.agent-task/v1" },
+    "id": { "$ref": "#/$defs/id" },
+    "category": { "$ref": "#/$defs/id" },
+    "difficulty": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["label", "evidence"],
+      "properties": {
+        "label": { "enum": ["unrated", "easy", "medium", "hard"] },
+        "evidence": { "$ref": "#/$defs/non_empty" }
+      }
+    },
+    "goal": { "$ref": "#/$defs/non_empty" },
+    "fixture_manifest_sha256": { "$ref": "#/$defs/sha256" },
+    "scorer_manifest_sha256": { "$ref": "#/$defs/sha256" },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "license"],
+      "properties": {
+        "source": { "$ref": "#/$defs/non_empty" },
+        "license": { "$ref": "#/$defs/non_empty" }
+      }
+    },
+    "setup_command": { "$ref": "#/$defs/command" },
+    "required_capabilities": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "enum": ["read", "list", "search", "write", "edit", "exec"] }
+    },
+    "allowed_mutations": { "$ref": "#/$defs/path_patterns" },
+    "forbidden_mutations": { "$ref": "#/$defs/path_patterns" },
+    "required_checks": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "command"],
+        "properties": {
+          "id": { "$ref": "#/$defs/id" },
+          "command": { "$ref": "#/$defs/command" }
+        }
+      }
+    },
+    "scorer_checks": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/id" }
+    },
+    "negative_controls": {
+      "type": "array",
+      "minItems": 8,
+      "maxItems": 8,
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "untouched_fails",
+          "known_good_passes",
+          "mechanism_ablation_fails",
+          "plausible_wrong_fails",
+          "test_deletion_fails",
+          "unrelated_edit_fails",
+          "outside_canary_edit_fails",
+          "scorer_immutable"
+        ]
+      }
+    },
+    "network": { "const": "deny" },
+    "shell_required": { "type": "boolean" },
+    "budgets": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["wall_ms", "command_ms", "max_steps", "max_output_tokens_per_step"],
+      "properties": {
+        "wall_ms": { "$ref": "#/$defs/positive_integer" },
+        "command_ms": { "$ref": "#/$defs/positive_integer" },
+        "max_steps": { "$ref": "#/$defs/positive_integer" },
+        "max_output_tokens_per_step": { "$ref": "#/$defs/positive_integer" }
+      }
+    },
+    "platforms": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "enum": ["windows", "macos", "linux"] }
+    },
+    "scorer_command": { "$ref": "#/$defs/command" },
+    "canaries": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "location", "sha256"],
+        "properties": {
+          "id": { "$ref": "#/$defs/id" },
+          "location": { "$ref": "#/$defs/relative_path" },
+          "sha256": { "$ref": "#/$defs/sha256" }
+        }
+      }
+    },
+    "expected_terminals": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "enum": ["answered", "failed", "inconclusive", "timed_out", "cancelled", "adapter_error"] }
+    }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$"
+    },
+    "non_empty": { "type": "string", "minLength": 1 },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "positive_integer": { "type": "integer", "minimum": 1 },
+    "command": {
+      "oneOf": [
+        {
+          "type": "array",
+          "prefixItems": [
+            { "const": "node" },
+            { "$ref": "#/$defs/script_path" }
+          ],
+          "minItems": 2,
+          "maxItems": 2
+        },
+        {
+          "type": "array",
+          "prefixItems": [
+            { "const": "node" },
+            { "const": "--check" },
+            { "$ref": "#/$defs/script_path" }
+          ],
+          "minItems": 3,
+          "maxItems": 3
+        }
+      ]
+    },
+    "script_path": {
+      "allOf": [
+        { "$ref": "#/$defs/relative_path" },
+        { "pattern": "[.](?:cjs|mjs|js)$" }
+      ]
+    },
+    "relative_path": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?![A-Za-z]:)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\).+$"
+    },
+    "path_patterns": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/relative_path" }
+    }
+  }
+}

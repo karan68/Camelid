@@ -1,0 +1,174 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://camelid.ai/schemas/benchmark/runtime-sample-v1.schema.json",
+  "title": "Camelid runtime benchmark sample v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "campaign_id",
+    "workload_id",
+    "arm_id",
+    "process_block",
+    "request_index",
+    "validity",
+    "invalid_reason",
+    "identity",
+    "backend",
+    "metrics",
+    "metrics_unavailable_reason",
+    "correctness",
+    "process"
+  ],
+  "properties": {
+    "schema": { "const": "camelid.benchmark.runtime-sample/v1" },
+    "campaign_id": { "$ref": "#/$defs/id" },
+    "workload_id": { "$ref": "#/$defs/id" },
+    "arm_id": { "$ref": "#/$defs/id" },
+    "process_block": { "type": "integer", "minimum": 0 },
+    "request_index": { "type": "integer", "minimum": 0 },
+    "validity": {
+      "enum": [
+        "valid",
+        "invalid_parse",
+        "invalid_hash",
+        "invalid_backend",
+        "invalid_environment",
+        "invalid_concurrent_load",
+        "invalid_timeout",
+        "invalid_cleanup",
+        "invalid_correctness",
+        "unsupported"
+      ]
+    },
+    "invalid_reason": { "type": ["string", "null"] },
+    "identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_sha", "binary_sha256", "model_sha256", "prompt_sha256"],
+      "properties": {
+        "source_sha": { "$ref": "#/$defs/git_sha" },
+        "binary_sha256": { "$ref": "#/$defs/sha256" },
+        "model_sha256": { "$ref": "#/$defs/sha256" },
+        "prompt_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "backend": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requested", "observed", "assertion_passed"],
+      "properties": {
+        "requested": { "$ref": "#/$defs/non_empty" },
+        "observed": { "type": ["string", "null"] },
+        "assertion_passed": { "type": "boolean" }
+      }
+    },
+    "metrics": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": [
+        "load_ms",
+        "prefill_ms",
+        "ttft_ms",
+        "decode_ms",
+        "tokens_per_second",
+        "prompt_tokens",
+        "generated_tokens",
+        "peak_rss_bytes",
+        "peak_vram_bytes",
+        "peak_vram_unavailable_reason"
+      ],
+      "properties": {
+        "load_ms": { "$ref": "#/$defs/non_negative_number" },
+        "prefill_ms": { "$ref": "#/$defs/non_negative_number" },
+        "ttft_ms": { "$ref": "#/$defs/non_negative_number" },
+        "decode_ms": { "$ref": "#/$defs/non_negative_number" },
+        "tokens_per_second": { "$ref": "#/$defs/non_negative_number" },
+        "prompt_tokens": { "type": "integer", "minimum": 1 },
+        "generated_tokens": { "type": "integer", "minimum": 1 },
+        "peak_rss_bytes": { "type": "integer", "minimum": 1 },
+        "peak_vram_bytes": { "type": ["integer", "null"], "minimum": 0 },
+        "peak_vram_unavailable_reason": { "type": ["string", "null"] }
+      }
+    },
+    "metrics_unavailable_reason": { "type": ["string", "null"] },
+    "correctness": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "output_token_ids_sha256",
+        "parity_required",
+        "parity_passed",
+        "unavailable_reason",
+        "parity_unavailable_reason"
+      ],
+      "properties": {
+        "output_token_ids_sha256": {
+          "oneOf": [
+            { "$ref": "#/$defs/sha256" },
+            { "type": "null" }
+          ]
+        },
+        "parity_required": { "type": "boolean" },
+        "parity_passed": { "type": ["boolean", "null"] },
+        "unavailable_reason": { "type": ["string", "null"] },
+        "parity_unavailable_reason": { "type": ["string", "null"] }
+      }
+    },
+    "process": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "exit_code", "timed_out", "cleanup_passed"],
+      "properties": {
+        "state": {
+          "enum": ["not_started", "running", "exited", "timed_out", "cancelled", "killed", "spawn_failed", "cleanup_failed"]
+        },
+        "exit_code": { "type": ["integer", "null"] },
+        "timed_out": { "type": "boolean" },
+        "cleanup_passed": { "type": "boolean" }
+      }
+    }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$"
+    },
+    "non_empty": { "type": "string", "minLength": 1 },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "git_sha": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "non_negative_number": { "type": "number", "minimum": 0 }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "validity": { "const": "valid" } } },
+      "then": {
+        "properties": {
+          "invalid_reason": { "type": "null" },
+          "metrics": { "type": "object" },
+          "metrics_unavailable_reason": { "type": "null" },
+          "backend": { "properties": { "assertion_passed": { "const": true } } },
+          "correctness": {
+            "properties": {
+              "output_token_ids_sha256": { "$ref": "#/$defs/sha256" },
+              "parity_passed": { "type": "boolean" },
+              "unavailable_reason": { "type": "null" },
+              "parity_unavailable_reason": { "type": "null" }
+            }
+          },
+          "process": {
+            "properties": {
+              "state": { "const": "exited" },
+              "exit_code": { "const": 0 },
+              "timed_out": { "const": false },
+              "cleanup_passed": { "const": true }
+            }
+          }
+        }
+      },
+      "else": { "properties": { "invalid_reason": { "type": "string", "minLength": 1 } } }
+    }
+  ]
+}

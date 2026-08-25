@@ -1,0 +1,22 @@
+{
+  "schema": "camelid.benchmark.comparison/v1",
+  "campaign_id": "phase1-schema-test",
+  "runtime": [
+    {
+      "workload_id": "rt_decode_128",
+      "metric": "tokens_per_second",
+      "valid_pairs": 2,
+      "excluded_pairs": [],
+      "base_median": 38.5,
+      "head_median": 38.5,
+      "median_ratio_head_over_base": 1.0,
+      "bootstrap_ci95": [0.99, 1.01],
+      "practical_margin": null,
+      "observed_direction": "no_clear_direction",
+      "bootstrap_seed": 1128353093,
+      "bootstrap_samples": 5000,
+      "verdict": "INCONCLUSIVE_NOISE"
+    }
+  ],
+  "agents": []
+}

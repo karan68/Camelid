@@ -26,7 +26,7 @@ everyone on 16 GiB, so no "buy more RAM" solutions.
 | **Camelid now** | **27.53** | **11.35** |
 
 We are ahead on both **at matched conditions**. A CUDA llama.cpp build is installed at
-`C:\Users\timto\tools\llama-cpp-cuda` (the older `tools\llama-cpp` is **CPU-only** — no
+`$env:USERPROFILE\tools\llama-cpp-cuda` (the older `tools\llama-cpp` is **CPU-only** — no
 `ggml-cuda.dll` — do not benchmark against it). Add
 `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9\bin` to PATH for its runtime DLLs.
 
@@ -43,7 +43,7 @@ one.** I made that mistake in both directions before catching it.
 ## 2. Reproduce
 
 ```powershell
-Set-Location C:\Users\timto\Projects\Camelid
+# Run from the Camelid repository root.
 $env:CAMELID_GEMMA4_CUDA_BATCH_EXPERT_COPIES = "1"
 $env:CAMELID_GEMMA4_SPECULATIVE = "0"
 $env:CAMELID_GEMMA4_GHOST_TIER_PREFILL = "1"

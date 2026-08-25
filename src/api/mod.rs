@@ -37,13 +37,13 @@ mod responses_store;
 mod server;
 mod workspace;
 
-pub use server::ServeOptions;
 /// Re-exported so anything else in the crate that fronts this server bounds
 /// request bodies at the same size the server itself does.
 pub(crate) use server::DEFAULT_MAX_REQUEST_BODY_BYTES;
 /// Re-exported so another front door authenticates its clients with this
 /// server's check rather than a second implementation of one.
 pub(crate) use server::{resolve_api_key, ApiAuth};
+pub use server::{ApiSurface, ServeOptions};
 
 use crate::{
     embedding::{
@@ -60,9 +60,9 @@ use crate::{
         output_projection_diagnostics, q8_schedule_telemetry_enabled, reset_q8_schedule_telemetry,
         rope_pairing_for_config, snapshot_q8_schedule_telemetry,
         speculative::{
-            accepted_draft_prefix, ModelDrafter, NGramDrafter, SpecLatch, SpeculativeDrafter,
-            DEFAULT_MODEL_DRAFT_TOKENS, DEFAULT_NGRAM_DRAFT_TOKENS, DEFAULT_NGRAM_MAX_MATCH,
-            DEFAULT_NGRAM_MIN_MATCH,
+            accepted_draft_prefix, seeded_rejection_rng, speculative_rejection_sample,
+            ModelDrafter, NGramDrafter, SpecLatch, SpeculativeDrafter, DEFAULT_MODEL_DRAFT_TOKENS,
+            DEFAULT_NGRAM_DRAFT_TOKENS, DEFAULT_NGRAM_MAX_MATCH, DEFAULT_NGRAM_MIN_MATCH,
         },
         DeltaZeroTarget, LlamaForwardDiagnostics, LlamaForwardTimings, LlamaGenerationStep,
         LlamaInferenceSession, LlamaLayerMemoryTimings, LlamaLayerTimings, LlamaLoadedWeights,
@@ -214,6 +214,8 @@ pub struct AppState {
     distributed_model_sha256: Option<String>,
     /// Immutable request/token/download ceilings resolved at startup.
     server_limits: server::ServerLimits,
+    /// Authenticated route surface resolved once before the listener starts.
+    api_surface: ApiSurface,
     /// Lock-free process metrics shared by middleware and decode jobs.
     metrics: metrics::ServerMetrics,
 }
@@ -253,6 +255,7 @@ impl Default for AppState {
             models_dir: resolve_models_dir(None),
             distributed_model_sha256: None,
             server_limits: server::ServerPolicy::loopback_default().limits,
+            api_surface: ApiSurface::Full,
             metrics: metrics::ServerMetrics::default(),
         }
     }
@@ -313,6 +316,7 @@ impl AppState {
 
     fn with_server_policy(mut self, policy: &server::ServerPolicy) -> Self {
         self.server_limits = policy.limits;
+        self.api_surface = policy.api_surface();
         self
     }
 
@@ -512,6 +516,10 @@ pub struct TokenizerConfigSummary {
 #[derive(Debug, Deserialize)]
 pub struct LoadModelRequest {
     pub path: PathBuf,
+    /// Exact direct-child filename from `GET /api/models/local`. Required by
+    /// the LAN Chat surface, which never trusts the broader operator path.
+    #[serde(default)]
+    pub filename: Option<String>,
     pub id: Option<String>,
     /// Release every OTHER resident model before loading this one ("switch
     /// model" semantics), then re-probe live memory and re-run the fit
@@ -565,6 +573,7 @@ pub enum Gemma4GhostExecutionMode {
 pub struct HealthResponse {
     pub ok: bool,
     pub engine: &'static str,
+    pub api_surface: ApiSurface,
     /// Release version of the running engine (the crate version, e.g. `0.4.7`), so an
     /// operator can tell which build is answering without reading the binary's metadata.
     /// Unlike [`HealthResponse::executable`] this is safe off-box: it names a public
@@ -2304,9 +2313,28 @@ fn resolve_request_model_path(
     })
 }
 
+fn resolve_lan_chat_model_path(
+    models_dir: &std::path::Path,
+    filename: Option<&str>,
+) -> Result<PathBuf, &'static str> {
+    let filename = filename.ok_or("select a model listed by this Camelid host")?;
+    if !validate_local_model_filename(filename) {
+        return Err("model selection must be one local GGUF filename");
+    }
+    let path = models_dir.join(filename);
+    let metadata = std::fs::symlink_metadata(&path)
+        .map_err(|_| "selected model is not present in the configured models directory")?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(
+            "selected model is not a direct regular file in the configured models directory",
+        );
+    }
+    Ok(path)
+}
+
 #[cfg(test)]
 mod models_dir_resolution_tests {
-    use super::{resolve_models_dir, resolve_request_model_path};
+    use super::{resolve_lan_chat_model_path, resolve_models_dir, resolve_request_model_path};
     use crate::BackendError;
     use std::path::PathBuf;
 
@@ -2417,6 +2445,45 @@ mod models_dir_resolution_tests {
         };
         assert_eq!(resolve_models_dir(Some(explicit.clone())), explicit);
     }
+
+    #[test]
+    fn lan_chat_model_selection_accepts_only_a_direct_local_gguf() {
+        let tmp = tempfile::tempdir().unwrap();
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).unwrap();
+        let model = models_dir.join("local.gguf");
+        std::fs::write(&model, b"gguf-stub").unwrap();
+        std::fs::write(models_dir.join("notes.txt"), b"not a model").unwrap();
+
+        assert_eq!(
+            resolve_lan_chat_model_path(&models_dir, Some("local.gguf")).unwrap(),
+            model
+        );
+        for filename in [
+            None,
+            Some("../local.gguf"),
+            Some("models/local.gguf"),
+            Some("notes.txt"),
+            Some("missing.gguf"),
+        ] {
+            assert!(
+                resolve_lan_chat_model_path(&models_dir, filename).is_err(),
+                "accepted {filename:?}"
+            );
+        }
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&model, models_dir.join("linked.gguf")).unwrap();
+            assert!(resolve_lan_chat_model_path(&models_dir, Some("linked.gguf")).is_err());
+        }
+        #[cfg(windows)]
+        {
+            if std::os::windows::fs::symlink_file(&model, models_dir.join("linked.gguf")).is_ok() {
+                assert!(resolve_lan_chat_model_path(&models_dir, Some("linked.gguf")).is_err());
+            }
+        }
+    }
 }
 
 pub fn router() -> Router {
@@ -2433,7 +2500,7 @@ pub fn router_with_state(state: AppState) -> Router {
 }
 
 fn router_with_state_and_policy(state: AppState, policy: server::ServerPolicy) -> Router {
-    let auth = policy.auth.clone();
+    let request_policy = policy.request_policy();
     let cors = policy.cors_layer();
     let body_limit = policy.limits.max_request_body_bytes;
     let metrics = state.metrics.clone();
@@ -2572,7 +2639,10 @@ fn router_with_state_and_policy(state: AppState, policy: server::ServerPolicy) -
         // fallback to the app shell. API routes are matched first.
         .fallback(crate::web_ui::handler)
         .layer(DefaultBodyLimit::max(body_limit))
-        .layer(middleware::from_fn_with_state(auth, server::authenticate))
+        .layer(middleware::from_fn_with_state(
+            request_policy,
+            server::authenticate,
+        ))
         .layer(middleware::from_fn_with_state(
             metrics,
             metrics::observe_http,
@@ -3259,6 +3329,7 @@ async fn health_registry_snapshot(state: &AppState) -> HealthResponse {
     HealthResponse {
         ok: true,
         engine: "camelid",
+        api_surface: state.api_surface,
         version: env!("CARGO_PKG_VERSION"),
         build: crate::receipt::camelid_version(),
         loaded_now,
@@ -3288,8 +3359,11 @@ async fn health_registry_snapshot(state: &AppState) -> HealthResponse {
         engine_active_elapsed_seconds: slot.active_elapsed_seconds,
         engine_stalled_seconds: slot.stalled_seconds,
         continuous_batch_slots: state.engine.continuous_batch_slots(),
-        executable: loopback_executable_path(state.serve_addr),
-        listen_addr: (state.serve_addr.ip().is_loopback()).then(|| state.serve_addr.to_string()),
+        executable: discloses_host_details(state.serve_addr, state.api_surface)
+            .then(|| loopback_executable_path(state.serve_addr))
+            .flatten(),
+        listen_addr: discloses_host_details(state.serve_addr, state.api_surface)
+            .then(|| state.serve_addr.to_string()),
     }
 }
 
@@ -3373,6 +3447,7 @@ fn busy_health_response(state: &AppState) -> HealthResponse {
     HealthResponse {
         ok: true,
         engine: "camelid",
+        api_surface: state.api_surface,
         version: env!("CARGO_PKG_VERSION"),
         build: crate::receipt::camelid_version(),
         loaded_now: false,
@@ -3401,9 +3476,22 @@ fn busy_health_response(state: &AppState) -> HealthResponse {
         engine_active_elapsed_seconds: slot.active_elapsed_seconds,
         engine_stalled_seconds: slot.stalled_seconds,
         continuous_batch_slots: state.engine.continuous_batch_slots(),
-        executable: loopback_executable_path(state.serve_addr),
-        listen_addr: (state.serve_addr.ip().is_loopback()).then(|| state.serve_addr.to_string()),
+        executable: discloses_host_details(state.serve_addr, state.api_surface)
+            .then(|| loopback_executable_path(state.serve_addr))
+            .flatten(),
+        listen_addr: discloses_host_details(state.serve_addr, state.api_surface)
+            .then(|| state.serve_addr.to_string()),
     }
+}
+
+/// Whether the public health route may name this machine. Pure.
+///
+/// A loopback bind used to mean the reader is sitting at the keyboard.
+/// `--lan-chat-only` exists to serve a remote browser, and reaching it through
+/// a tunnel or a reverse proxy leaves the listener on loopback, so the surface
+/// has to be consulted as well as the address.
+fn discloses_host_details(serve_addr: SocketAddr, api_surface: ApiSurface) -> bool {
+    serve_addr.ip().is_loopback() && matches!(api_surface, ApiSurface::Full)
 }
 
 /// Resolve the running binary's path for [`HealthResponse::executable`].
@@ -3424,7 +3512,7 @@ fn loopback_executable_path(serve_addr: SocketAddr) -> Option<String> {
 
 #[cfg(test)]
 mod executable_disclosure_tests {
-    use super::loopback_executable_path;
+    use super::{discloses_host_details, loopback_executable_path, ApiSurface};
     use std::net::SocketAddr;
 
     #[test]
@@ -3455,6 +3543,17 @@ mod executable_disclosure_tests {
                 "{addr} must not disclose the binary path"
             );
         }
+    }
+
+    /// A LAN Chat listener is read by a phone, and it stays on loopback when it
+    /// is reached through a tunnel, so the address alone cannot answer this.
+    #[test]
+    fn a_lan_chat_listener_names_this_machine_to_nobody() {
+        let loopback: SocketAddr = "127.0.0.1:8181".parse().unwrap();
+        let reachable: SocketAddr = "192.0.2.10:8181".parse().unwrap();
+        assert!(discloses_host_details(loopback, ApiSurface::Full));
+        assert!(!discloses_host_details(loopback, ApiSurface::LanChatOnly));
+        assert!(!discloses_host_details(reachable, ApiSurface::Full));
     }
 }
 
@@ -7993,19 +8092,44 @@ fn enforce_distributed_model_sha256(state: &AppState, path: &std::path::Path) ->
 }
 
 async fn load_model(State(state): State<AppState>, Json(req): Json<LoadModelRequest>) -> Response {
-    // Resolve relative request paths against the configured models dir BEFORE
-    // the fit guard, so the guard sizes the file that will actually be loaded.
-    let path = match resolve_request_model_path(&state.models_dir, req.path) {
-        Ok(path) => path,
-        Err(err) => {
-            return api_error(
-                StatusCode::BAD_REQUEST,
-                backend_error_code(&err),
-                err.to_string(),
-                Some("path"),
-            )
+    let LoadModelRequest {
+        path: requested_path,
+        filename,
+        id,
+        replace,
+        set_active,
+    } = req;
+    let lan_chat_only = state.api_surface == ApiSurface::LanChatOnly;
+    // Full mode keeps the operator's historical path semantics. LAN Chat uses
+    // only a direct-child filename from the host's local scan; the broader
+    // path is deliberately ignored so a remote key cannot select arbitrary
+    // files from the laptop.
+    let path = if lan_chat_only {
+        match resolve_lan_chat_model_path(&state.models_dir, filename.as_deref()) {
+            Ok(path) => path,
+            Err(message) => {
+                return api_error(
+                    StatusCode::FORBIDDEN,
+                    "lan_model_not_local",
+                    message.to_string(),
+                    Some("filename"),
+                )
+            }
+        }
+    } else {
+        match resolve_request_model_path(&state.models_dir, requested_path) {
+            Ok(path) => path,
+            Err(err) => {
+                return api_error(
+                    StatusCode::BAD_REQUEST,
+                    backend_error_code(&err),
+                    err.to_string(),
+                    Some("path"),
+                )
+            }
         }
     };
+    let id = if lan_chat_only { filename } else { id };
     if let Err(err) = enforce_distributed_model_sha256(&state, &path) {
         return api_error(
             StatusCode::CONFLICT,
@@ -8018,7 +8142,7 @@ async fn load_model(State(state): State<AppState>, Json(req): Json<LoadModelRequ
     // load pipeline's idempotent fast path will reuse (and, where needed, heal)
     // the existing runtime, so the live-memory fit preflight must not reject it
     // as though a second copy were about to be allocated.
-    let idempotent_resident = match req.id.as_deref() {
+    let idempotent_resident = match id.as_deref() {
         Some(requested_id) => state
             .loaded_models
             .read()
@@ -8033,14 +8157,14 @@ async fn load_model(State(state): State<AppState>, Json(req): Json<LoadModelRequ
     // startup hash id with the catalog row id for the same GGUF; that is a real
     // switch and must release the old resident runtime before the fit check.
     let mut reclaim = ResidentReclaim::default();
-    for (id, loaded) in state.loaded_models.read().await.iter() {
-        if resident_load_is_idempotent(id, &loaded.path, req.id.as_deref(), &path) {
+    for (resident_id, loaded) in state.loaded_models.read().await.iter() {
+        if resident_load_is_idempotent(resident_id, &loaded.path, id.as_deref(), &path) {
             continue;
         }
         reclaim.bytes += std::fs::metadata(&loaded.path)
             .map(|m| m.len())
             .unwrap_or(0);
-        reclaim.ids.push(id.clone());
+        reclaim.ids.push(resident_id.clone());
     }
     reclaim.ids.sort();
 
@@ -8049,7 +8173,7 @@ async fn load_model(State(state): State<AppState>, Json(req): Json<LoadModelRequ
     // ever estimating reclaimable bytes: the memory is genuinely back before the
     // decision is made, so this cannot manufacture a false "fits" (this host has
     // OOM'd under memory pressure, so the guard must never be optimistic).
-    if req.replace && !reclaim.ids.is_empty() {
+    if (replace || lan_chat_only) && !reclaim.ids.is_empty() {
         if state.workspace_sessions.blocks_model_transition().await {
             return api_error(
                 StatusCode::CONFLICT,
@@ -8097,7 +8221,18 @@ async fn load_model(State(state): State<AppState>, Json(req): Json<LoadModelRequ
             }
         }
     }
-    match load_model_from_path(&state, path, req.id, req.set_active.unwrap_or(true)).await {
+    match load_model_from_path(
+        &state,
+        path,
+        id,
+        if lan_chat_only {
+            true
+        } else {
+            set_active.unwrap_or(true)
+        },
+    )
+    .await
+    {
         Ok(loaded) => (StatusCode::OK, Json(loaded)).into_response(),
         // Fail closed with the exact typed reason and a stable, switchable code.
         // The message already carries the offending architecture/quant and any
@@ -8158,6 +8293,7 @@ mod distributed_model_pin_tests {
             State(state),
             Json(LoadModelRequest {
                 path: other,
+                filename: None,
                 id: None,
                 replace: true,
                 set_active: None,
@@ -17002,11 +17138,9 @@ fn mixtral_long_generation_is_blocked(
         && !explicitly_enabled
 }
 
-/// Whether lossless greedy speculation may engage for this request.
+/// Whether lossless greedy or distribution-preserving stochastic speculation may engage.
 ///
-/// The first four disqualifiers are the long-standing ones: speculation is a
-/// plain-greedy optimization, it cannot service per-step logit consumers, and
-/// it has no pipeline-sharded verify.
+/// Per-step logit consumers and pipeline-sharded verify remain unsupported.
 ///
 /// The windowed-arch disqualifier is Phase 3c finding F4. `serve --spec-decode`
 /// (CPU speculation) pins the target off the resident paths so the chunk-verify
@@ -17024,14 +17158,13 @@ fn mixtral_long_generation_is_blocked(
 /// plain resident lane, instead of failing every request. Lossless speculation
 /// only ever adds throughput, so dropping it costs correctness nothing.
 fn speculation_admissible(
-    sampling: &SamplingConfig,
+    _sampling: &SamplingConfig,
     collect_dense_diagnostics: bool,
     has_logit_diagnostics: bool,
     pipeline_sharded: bool,
     config: &LlamaModelConfig,
 ) -> bool {
-    *sampling == SamplingConfig::default()
-        && !collect_dense_diagnostics
+    !collect_dense_diagnostics
         && !has_logit_diagnostics
         && !pipeline_sharded
         && !crate::model::arch_has_windowed_attention(config)
@@ -17499,10 +17632,9 @@ async fn prepare_generation(
         }
     }
 
-    // for plain greedy requests with no per-step logit consumers; anything
-    // else keeps the unchanged vanilla decode loop.
-    // Lossless greedy speculation is a server-level opt-in; see
-    // `speculation_admissible` for the disqualifiers.
+    // for requests with no per-step logit consumers; anything else keeps the unchanged vanilla
+    // decode loop. Lossless speculation is a server-level opt-in; see
+    // `speculation_admissible` for the remaining disqualifiers.
     let speculative = match speculative_mode {
         None => None,
         Some(_)
@@ -17536,10 +17668,12 @@ async fn prepare_generation(
             accepted_drafts: 0,
         }),
     };
-    // CPU speculation needs CPU-authoritative KV for the chunk-verify rollback, so
-    // the target stays off the resident paths. GPU speculation (CAMELID_SPEC_GPU)
-    // keeps the target resident and verifies drafts via the batched GPU verify.
-    session.set_resident_paths_disabled(speculative.is_some() && !spec_gpu_enabled());
+    // CPU speculation needs CPU-authoritative KV for chunk-verify rollback. The GPU verifier
+    // currently returns greedy token IDs rather than full target distributions, so stochastic
+    // speculation also uses the CPU verify path even when CAMELID_SPEC_GPU is enabled.
+    session.set_resident_paths_disabled(
+        speculative.is_some() && (!spec_gpu_enabled() || sampling != SamplingConfig::default()),
+    );
 
     let telemetry_backend = {
         let plans = state.execution_plans.read().await;
@@ -18970,16 +19104,13 @@ fn generate_token_ids(
         } else {
             LlamaSampler::Sampling(sampling)
         };
-        // Lossless greedy speculation: draft tokens, verify them in ONE
-        // batched forward (one weight read for the whole batch), accept the
-        // longest matching prefix plus the target's own next token, and roll
-        // rejected KV entries back. Every emitted token is the target's own
-        // greedy argmax given its accepted prefix. Engages only after the
-        // first step (prompt evaluated, first-step diagnostics captured) and
-        // never alongside per-step logit consumers.
+        // Lossless speculation: draft tokens and verify them in one batched target forward.
+        // Greedy requests accept the longest exact-match prefix. Sampling requests use exact
+        // rejection sampling with the deterministic drafter treated as a delta distribution,
+        // preserving the target distribution while requiring no hidden drafter probabilities.
+        // Engages only after the first step and never alongside per-step logit consumers.
         if let Some(spec) = prepared.speculative.as_mut().filter(|_| {
             input.len() == 1
-                && matches!(sampler, LlamaSampler::Greedy)
                 && !collect_dense_for_step
                 && !collect_step_top_logits
                 && prepared.logprobs_top_n.is_none()
@@ -19019,21 +19150,22 @@ fn generate_token_ids(
                     // back to the CPU chunk verify when the engine isn't resident-ready.
                     // Lossless either way — the emitted tokens are the target's own greedy
                     // argmax given the accepted prefix.
-                    let gpu_accepted = if spec_gpu_enabled() {
-                        prepared
-                            .session
-                            .verify_drafts_gpu(input[0], &drafts)
-                            .map_err(|err| {
-                                Box::new(api_error(
-                                    StatusCode::SERVICE_UNAVAILABLE,
-                                    "speculative_verify_failed",
-                                    err.to_string(),
-                                    None,
-                                ))
-                            })?
-                    } else {
-                        None
-                    };
+                    let gpu_accepted =
+                        if matches!(sampler, LlamaSampler::Greedy) && spec_gpu_enabled() {
+                            prepared
+                                .session
+                                .verify_drafts_gpu(input[0], &drafts)
+                                .map_err(|err| {
+                                    Box::new(api_error(
+                                        StatusCode::SERVICE_UNAVAILABLE,
+                                        "speculative_verify_failed",
+                                        err.to_string(),
+                                        None,
+                                    ))
+                                })?
+                        } else {
+                            None
+                        };
                     let emitted: Vec<u32> = if let Some(acc) = gpu_accepted {
                         let accepted_count = (acc.len() as u64).saturating_sub(1);
                         spec.rounds += 1;
@@ -19046,18 +19178,72 @@ fn generate_token_ids(
                         let mut batch = Vec::with_capacity(1 + drafts.len());
                         batch.push(input[0]);
                         batch.extend_from_slice(&drafts);
-                        let (predictions, round_timings) = prepared
-                            .session
-                            .forward_greedy_verify_chunk(&batch)
-                            .map_err(|err| {
-                                Box::new(api_error(
-                                    StatusCode::SERVICE_UNAVAILABLE,
-                                    "speculative_verify_failed",
-                                    err.to_string(),
-                                    None,
-                                ))
-                            })?;
-                        let accepted = accepted_draft_prefix(&drafts, &predictions);
+                        let (round_emitted, accepted, round_timings) = match &sampler {
+                            LlamaSampler::Greedy => {
+                                let (predictions, timings) = prepared
+                                    .session
+                                    .forward_greedy_verify_chunk(&batch)
+                                    .map_err(|err| {
+                                        Box::new(api_error(
+                                            StatusCode::SERVICE_UNAVAILABLE,
+                                            "speculative_verify_failed",
+                                            err.to_string(),
+                                            None,
+                                        ))
+                                    })?;
+                                let accepted = accepted_draft_prefix(&drafts, &predictions);
+                                (predictions[..=accepted].to_vec(), accepted, timings)
+                            }
+                            LlamaSampler::Sampling(sampling) => {
+                                let (target_probabilities, timings) = prepared
+                                    .session
+                                    .forward_sampling_verify_chunk(&batch, sampling, &history)
+                                    .map_err(|err| {
+                                        Box::new(api_error(
+                                            StatusCode::SERVICE_UNAVAILABLE,
+                                            "speculative_verify_failed",
+                                            err.to_string(),
+                                            None,
+                                        ))
+                                    })?;
+                                let vocab = target_probabilities
+                                    .first()
+                                    .map(Vec::len)
+                                    .expect("verify batch is non-empty");
+                                let mut draft_probabilities = Vec::with_capacity(drafts.len());
+                                for &draft in &drafts {
+                                    let mut probabilities = vec![0.0f32; vocab];
+                                    let Some(probability) = probabilities.get_mut(draft as usize)
+                                    else {
+                                        return Err(Box::new(api_error(
+                                            StatusCode::SERVICE_UNAVAILABLE,
+                                            "speculative_draft_failed",
+                                            format!(
+                                                "draft token {draft} is outside vocabulary size {vocab}"
+                                            ),
+                                            None,
+                                        )));
+                                    };
+                                    *probability = 1.0;
+                                    draft_probabilities.push(probabilities);
+                                }
+                                let draft_refs: Vec<&[f32]> =
+                                    draft_probabilities.iter().map(Vec::as_slice).collect();
+                                let target_refs: Vec<&[f32]> =
+                                    target_probabilities.iter().map(Vec::as_slice).collect();
+                                let rng = seeded_rejection_rng(
+                                    sampling.seed.unwrap_or(0),
+                                    history.len() as u64,
+                                );
+                                let result = speculative_rejection_sample(
+                                    &drafts,
+                                    &draft_refs,
+                                    &target_refs,
+                                    rng,
+                                );
+                                (result.emitted_tokens, result.accepted_draft_count, timings)
+                            }
+                        };
                         prepared
                             .session
                             .rollback_to_position(base_position + 1 + accepted)
@@ -19074,7 +19260,7 @@ fn generate_token_ids(
                         spec.accepted_drafts += accepted as u64;
                         spec.latch.note_verified(accepted as u32);
                         forward_timings.add_assign(&round_timings);
-                        predictions[..=accepted].to_vec()
+                        round_emitted
                     };
                     for &token in &emitted {
                         generated.push(token);
@@ -29004,7 +29190,7 @@ mod tests {
             !speculation_admissible(&greedy, false, false, false, &tiny_gemma3_config()),
             "a windowed arch must never speculate: neither verify lane has a window"
         );
-        // The pre-existing disqualifiers keep biting (they had no test either).
+        // The remaining disqualifiers keep biting.
         assert!(!speculation_admissible(
             &greedy,
             true,
@@ -29026,7 +29212,7 @@ mod tests {
             true,
             &tiny_config()
         ));
-        assert!(!speculation_admissible(
+        assert!(speculation_admissible(
             &SamplingConfig {
                 temperature: 0.7,
                 ..SamplingConfig::default()
@@ -30939,6 +31125,44 @@ mod tests {
     }
 
     #[test]
+    fn sampling_verify_chunk_returns_normalized_target_rows() {
+        let _guard = crate::test_support::env_lock();
+        let config = tiny_spec_config();
+        let weights = Arc::new(tiny_weights());
+        let prompt = vec![0u32, 1, 2, 0];
+        let mut session = LlamaInferenceSession::new(config, weights).unwrap();
+        let first = session
+            .generate_next_token_with_history_diagnostics(
+                &prompt,
+                LlamaSampler::Greedy,
+                &prompt,
+                false,
+                None,
+            )
+            .unwrap();
+        let mut history = prompt;
+        history.push(first.next_token_id);
+        let batch = [first.next_token_id, 1, 2];
+        let sampling = SamplingConfig {
+            temperature: 0.8,
+            top_k: Some(2),
+            presence_penalty: 0.2,
+            seed: Some(7),
+            ..SamplingConfig::default()
+        };
+
+        let (rows, _timings) = session
+            .forward_sampling_verify_chunk(&batch, &sampling, &history)
+            .unwrap();
+
+        assert_eq!(rows.len(), batch.len());
+        for row in rows {
+            assert!((row.iter().sum::<f32>() - 1.0).abs() < 1e-5);
+            assert!(row.iter().filter(|probability| **probability > 0.0).count() <= 2);
+        }
+    }
+
+    #[test]
     fn verify_chunk_rollback_restores_decode_state() {
         let _guard = crate::test_support::env_lock();
         let config = tiny_spec_config();
@@ -32408,7 +32632,11 @@ pub struct LocalModelsResponse {
     /// display form of the absolute path resolved at startup. The frontend
     /// builds load paths from this, so they stay valid whatever CWD the server
     /// process inherited.
-    pub models_dir: String,
+    ///
+    /// Absent on a LAN Chat listener: that surface selects a model by filename
+    /// and has no use for the path, which names the host it runs on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub models_dir: Option<String>,
     pub models: Vec<LocalModelEntry>,
 }
 
@@ -34505,7 +34733,8 @@ async fn local_models(
         }
     }
     Json(LocalModelsResponse {
-        models_dir: dir.display().to_string(),
+        models_dir: (state.api_surface != ApiSurface::LanChatOnly)
+            .then(|| dir.display().to_string()),
         models,
     })
 }

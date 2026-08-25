@@ -1,0 +1,160 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://camelid.ai/schemas/benchmark/campaign-v1.schema.json",
+  "title": "Camelid benchmark campaign request v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "campaign_id",
+    "mode",
+    "created_utc",
+    "controller",
+    "repository_root",
+    "source_arms",
+    "models",
+    "workloads",
+    "resources",
+    "security"
+  ],
+  "properties": {
+    "schema": { "const": "camelid.benchmark.campaign/v1" },
+    "campaign_id": { "$ref": "#/$defs/id" },
+    "mode": {
+      "enum": ["pr", "main_trend", "release", "external_comparator", "ablation"]
+    },
+    "created_utc": { "type": "string", "format": "date-time" },
+    "controller": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_manifest_sha256", "version"],
+      "properties": {
+        "source_manifest_sha256": { "$ref": "#/$defs/sha256" },
+        "version": { "$ref": "#/$defs/non_empty" }
+      }
+    },
+    "repository_root": { "$ref": "#/$defs/non_empty" },
+    "source_arms": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/source_arm" }
+    },
+    "models": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/model" }
+    },
+    "workloads": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/workload" }
+    },
+    "resources": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["minimum_free_disk_bytes"],
+      "properties": {
+        "minimum_free_disk_bytes": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "security": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["network", "trust_tier"],
+      "properties": {
+        "network": { "enum": ["deny", "loopback_only", "explicit"] },
+        "trust_tier": {
+          "enum": ["hosted_validation", "trusted_benchmark", "release", "local_exploratory"]
+        }
+      }
+    }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$"
+    },
+    "non_empty": { "type": "string", "minLength": 1 },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "git_sha": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "source_arm": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "source_dir", "expected_git_sha", "cargo_path", "toolchain", "features", "target_dir"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "source_dir": { "$ref": "#/$defs/non_empty" },
+        "expected_git_sha": { "$ref": "#/$defs/git_sha" },
+        "cargo_path": { "$ref": "#/$defs/non_empty" },
+        "toolchain": { "$ref": "#/$defs/non_empty" },
+        "features": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/non_empty" }
+        },
+        "target_dir": { "$ref": "#/$defs/non_empty" }
+      }
+    },
+    "model": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "artifact_path", "expected_sha256", "quantization"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "artifact_path": { "$ref": "#/$defs/non_empty" },
+        "expected_sha256": { "$ref": "#/$defs/sha256" },
+        "quantization": { "$ref": "#/$defs/non_empty" }
+      }
+    },
+    "backend": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requested", "assertion"],
+      "properties": {
+        "requested": { "enum": ["cpu_deterministic"] },
+        "assertion": { "enum": ["deterministic_no_offload"] }
+      }
+    },
+    "workload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "adapter",
+        "model_id",
+        "prompt_file",
+        "max_tokens",
+        "warmup",
+        "deterministic",
+        "threads",
+        "backend",
+        "primary_metrics",
+        "schedule",
+        "repetitions",
+        "timeout_ms"
+      ],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "adapter": { "enum": ["runtime-camelid"] },
+        "model_id": { "$ref": "#/$defs/id" },
+        "prompt_file": { "$ref": "#/$defs/non_empty" },
+        "max_tokens": { "type": "integer", "minimum": 1 },
+        "warmup": { "type": "boolean" },
+        "deterministic": { "const": true },
+        "threads": { "type": ["integer", "null"], "minimum": 1 },
+        "backend": { "$ref": "#/$defs/backend" },
+        "primary_metrics": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/non_empty" }
+        },
+        "schedule": { "enum": ["balanced_rotation"] },
+        "repetitions": { "type": "integer", "minimum": 1 },
+        "timeout_ms": { "type": "integer", "minimum": 1 }
+      }
+    }
+  }
+}

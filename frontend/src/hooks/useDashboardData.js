@@ -543,6 +543,7 @@ function makeDashboard({ health, models, currentModel, capabilities, conversatio
     models,
     runtime: {
       engine: normalizeEngineName(health?.engine),
+      api_surface: health?.api_surface || 'full',
       // Which build is answering. `runtime` is an explicit projection of health, not a
       // pass-through, so a field absent here is invisible to every view no matter what
       // /v1/health serializes.
@@ -581,6 +582,7 @@ function makeDashboard({ health, models, currentModel, capabilities, conversatio
 
 export function useDashboardData({ showNotice, clearNotice }) {
   const [dashboard, setDashboard] = useState(null)
+  const [authRequired, setAuthRequired] = useState(false)
   const [apiBase, setApiBaseState] = useState(getApiBase)
   const [tab, setTab] = useState(getInitialTab)
   const [selectedConversationId, setSelectedConversationIdState] = useState(getInitialConversationId)
@@ -677,19 +679,21 @@ export function useDashboardData({ showNotice, clearNotice }) {
   }
 
   const loadDashboard = async ({ silent = false, localModelsOverride = null } = {}) => {
+    let observedHealth = null
     try {
       const currentLocalModels = localModelsOverride || localModelsRef.current
       const currentLocalConversations = localConversationsRef.current
       const currentLocalMemories = localMemoriesRef.current
       const healthStartedAt = performance.now()
-      const [health, modelList, capabilities, downloads, localList] = await Promise.all([
-        fetchJson(`${normalizedApiBase}/v1/health`).then((result) => {
-          recordHealthPoll({ ok: true, latencyMs: performance.now() - healthStartedAt })
-          return result
-        }, (error) => {
-          recordHealthPoll({ ok: false, latencyMs: performance.now() - healthStartedAt })
-          throw error
-        }),
+      const health = await fetchJson(`${normalizedApiBase}/v1/health`).then((result) => {
+        recordHealthPoll({ ok: true, latencyMs: performance.now() - healthStartedAt })
+        observedHealth = result
+        return result
+      }, (error) => {
+        recordHealthPoll({ ok: false, latencyMs: performance.now() - healthStartedAt })
+        throw error
+      })
+      const [modelList, capabilities, downloads, localList] = await Promise.all([
         fetchJson(`${normalizedApiBase}/v1/models`),
         fetchJson(`${normalizedApiBase}/api/capabilities`).catch(() => null),
         fetchJson(`${normalizedApiBase}/api/models/catalog/downloads`).catch(() => []),
@@ -818,6 +822,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
         memories: currentLocalMemories,
         apiBase: normalizedApiBase,
       })
+      setAuthRequired(false)
       setDashboard(nextDashboard)
       if (!silent) clearNotice()
       setSelectedConversationId((current) => {
@@ -845,11 +850,14 @@ export function useDashboardData({ showNotice, clearNotice }) {
         return chatUnlockedModel?.id || firstChatModel?.id || ''
       })
     } catch (error) {
+      const requiresAuth = error?.status === 401
+      setAuthRequired(requiresAuth)
+      const fallbackHealth = observedHealth || { ok: false, engine: 'camelid', generation_ready: false, active_model_id: null }
       const fallbackDashboard = makeDashboard({
-        health: { ok: false, engine: 'camelid', generation_ready: false, active_model_id: null },
+        health: fallbackHealth,
         models: mergeModelLists({
           modelItems: [],
-          health: { ok: false, engine: 'camelid', generation_ready: false, active_model_id: null },
+          health: fallbackHealth,
           currentModel: null,
           localModels: localModelsOverride || localModelsRef.current,
           apiBase: normalizedApiBase,
@@ -861,7 +869,14 @@ export function useDashboardData({ showNotice, clearNotice }) {
         apiBase: normalizedApiBase,
       })
       setDashboard(fallbackDashboard)
-      if (!silent) showNotice(`Could not reach Camelid at ${normalizedApiBase}: ${getErrorMessage(error)}`, 'error')
+      if (!silent) {
+        showNotice(
+          requiresAuth
+            ? 'Camelid is reachable, but this browser needs the server API key.'
+            : `Could not reach Camelid at ${normalizedApiBase}: ${getErrorMessage(error)}`,
+          requiresAuth ? 'info' : 'error',
+        )
+      }
     }
   }
 
@@ -1674,7 +1689,12 @@ export function useDashboardData({ showNotice, clearNotice }) {
       // fit preflight judges this model against a host that has released the last one.
       const loaded = await fetchJson(`${normalizedApiBase}/api/models/load`, {
         method: 'POST',
-        body: JSON.stringify({ id, path: model.model_path, replace: true }),
+        body: JSON.stringify({
+          id,
+          path: model.model_path,
+          filename: modelFilenameFromPath(model.model_path),
+          replace: true,
+        }),
       })
       const loadedId = loaded?.id || id
       const loadedPath = getModelPath(loaded) || model.model_path
@@ -1828,6 +1848,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
 
   return {
     dashboard,
+    authRequired,
     tab,
     setTab,
     selectedConversationId,

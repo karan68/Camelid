@@ -4,8 +4,9 @@ import { access, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { spawnSync } from 'node:child_process'
+import { fileURLToPath } from 'node:url'
 
-const repo = resolve(new URL('../..', import.meta.url).pathname)
+const repo = resolve(fileURLToPath(new URL('../..', import.meta.url)))
 const script = 'tools/bench/v0.1-benchmark-harness.mjs'
 const tmp = await mkdtemp(join(tmpdir(), 'camelid-v01-bench-'))
 
@@ -20,7 +21,7 @@ try {
   assert.equal(plan.dry_run, false)
   assert.equal(plan.entries.length, 4)
   assert.deepEqual(plan.harness.supported_engines, ['camelid', 'llama.cpp', 'ollama', 'mlx'])
-  assert.match(plan.bundle_dir, /plan-out\/plan-stamp$/)
+  assert.match(plan.bundle_dir, /plan-out[\\/]plan-stamp$/)
   await assert.rejects(access(join(tmp, 'plan-out', 'plan-stamp')))
 
   const dryRun = runHarness(['--config', configPath, '--out-root', join(tmp, 'dry-out'), '--timestamp', 'dry-stamp', '--dry-run'])

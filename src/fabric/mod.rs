@@ -21,6 +21,7 @@
 //! * [`policy`] — pure placement decisions; the correctness of the fabric.
 //! * [`forward`] — sending a placed request to the node that will serve it.
 //! * [`cancel`] — telling that send it is no longer wanted.
+//! * `transport` — authenticating or explicitly constraining the node hop.
 
 pub mod cancel;
 pub(crate) mod client_keys;
@@ -31,6 +32,8 @@ pub(crate) mod nodes;
 pub mod policy;
 pub mod probe;
 pub mod server;
+mod transport;
+pub(crate) mod watch;
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -47,11 +50,13 @@ pub use node::{
     NodeStatus, DEFAULT_NODE_PORT,
 };
 use nodes::NodeSet;
+use policy::{load_of, route_reserved_with_estimates, ServiceTimeEstimates};
 pub use policy::{
     route, route_reserved, Reservations, RouteDecision, RouteError, RouteMode, RouteReason,
     RouteRequest,
 };
 pub use probe::{probe_fabric, probe_node, Observation, ProbeError, DEFAULT_PROBE_TIMEOUT};
+use transport::NodeTransport;
 
 /// How many nodes one request may be sent to before it fails.
 ///
@@ -72,12 +77,19 @@ pub struct Fabric {
     nodes: NodeSet,
     timeout: Duration,
     bearer: Option<String>,
+    transport: NodeTransport,
     /// Requests this fabric has placed and not yet finished.
     ///
     /// Shared across clones on purpose: the resident proxy hands a `Fabric` to
     /// every request, and they have to be counting into the same place or they
     /// cannot see each other.
     reserved: Arc<Mutex<Reservations>>,
+    /// Successful service times learned by this resident fabric.
+    ///
+    /// Shared across clones because each proxy request receives a clone and
+    /// all of them must learn one policy. The estimates are consulted only by
+    /// the opt-in completion-time mode.
+    service_times: Arc<Mutex<ServiceTimeEstimates>>,
     /// The most recent observation, with the node-set generation it was taken
     /// over, reused while it is fresh enough *and* still describes the set.
     ///
@@ -98,6 +110,7 @@ impl std::fmt::Debug for Fabric {
             .field("nodes", &self.nodes)
             .field("timeout", &self.timeout)
             .field("bearer", &self.bearer.as_ref().map(|_| "[REDACTED]"))
+            .field("transport", &self.transport)
             .field("max_observation_age", &self.max_observation_age)
             .field("max_forward_attempts", &self.max_forward_attempts)
             .finish()
@@ -130,7 +143,9 @@ impl Fabric {
             nodes,
             timeout: DEFAULT_PROBE_TIMEOUT,
             bearer: None,
+            transport: NodeTransport::default(),
             reserved: Arc::new(Mutex::new(Reservations::none())),
+            service_times: Arc::new(Mutex::new(ServiceTimeEstimates::default())),
             observed: Arc::new(Mutex::new(None)),
             max_observation_age: Duration::ZERO,
             max_forward_attempts: DEFAULT_MAX_FORWARD_ATTEMPTS,
@@ -173,6 +188,21 @@ impl Fabric {
         self
     }
 
+    /// Configure how every probe and forwarded request reaches a node.
+    ///
+    /// A CA bundle enables server-authenticated TLS for every node. Without
+    /// one, cleartext is restricted to loopback unless the operator explicitly
+    /// acknowledges direct cleartext node transport. The two modes cannot be
+    /// combined.
+    pub fn with_node_transport(
+        mut self,
+        ca_file: Option<&std::path::Path>,
+        allow_cleartext_remote: bool,
+    ) -> std::io::Result<Self> {
+        self.transport = NodeTransport::resolve(ca_file, allow_cleartext_remote)?;
+        Ok(self)
+    }
+
     /// The machines this fabric places on, as they stand right now.
     pub fn specs(&self) -> Vec<NodeSpec> {
         self.nodes.current().0.to_vec()
@@ -185,6 +215,11 @@ impl Fabric {
 
     pub fn is_empty(&self) -> bool {
         self.nodes.current().0.is_empty()
+    }
+
+    /// A secret-free description suitable for startup logs.
+    pub fn node_transport_description(&self) -> &'static str {
+        self.transport.description()
     }
 
     /// Observe every node.
@@ -238,7 +273,12 @@ impl Fabric {
 
     /// Probe every node in `specs`, whatever was observed before.
     fn probe(&self, specs: &[NodeSpec]) -> Vec<NodeSnapshot> {
-        probe_fabric(specs, self.bearer.as_deref(), self.timeout)
+        probe::probe_fabric_with_transport(
+            specs,
+            self.bearer.as_deref(),
+            self.timeout,
+            &self.transport,
+        )
     }
 
     /// Drop the current observation, so the next one is taken fresh.
@@ -322,13 +362,53 @@ impl Fabric {
             .filter(|snapshot| !excluded.iter().any(|label| label == snapshot.label()))
             .collect();
 
-        // Deciding and recording are one step. Split them and two concurrent
-        // placements both decide before either records, which is the pile-up
-        // this reservation exists to prevent.
-        let mut reserved = lock(&self.reserved);
-        let decision = route_reserved(&snapshots, request, &reserved)?;
-        reserved.take(&decision.label);
-        drop(reserved);
+        let (decision, service_model, service_ahead) = if request.mode == RouteMode::CompletionTime
+        {
+            // Deciding, reserving and recording cold-selection recency are one
+            // step. Split them and concurrent placements can all decide from
+            // the same policy state. These are the only nested fabric locks,
+            // always in service-times -> reservations order; completion
+            // recording takes only service-times and Placement::drop takes
+            // only reservations.
+            let mut service_times = lock(&self.service_times);
+            let mut reserved = lock(&self.reserved);
+            let decision =
+                route_reserved_with_estimates(&snapshots, request, &reserved, &service_times)?;
+            let selected = snapshots
+                .iter()
+                .find(|snapshot| snapshot.label() == decision.label)
+                .expect("placement returns a label it was given");
+            let service_ahead = selected.status.ready().map_or(0, |ready| {
+                load_of(ready.in_flight, reserved.get(&decision.label))
+            });
+            reserved.take(&decision.label);
+            let service_model = request
+                .model
+                .or_else(|| selected.active_model_id())
+                .map(str::to_string);
+            if let (Some(model), Some(route)) = (&service_model, request.service_class) {
+                service_times.selected(selected, model, route);
+            }
+            drop(reserved);
+            drop(service_times);
+            (decision, service_model, service_ahead)
+        } else {
+            // Exactly the pre-existing throughput/affinity path: those modes
+            // neither allocate nor lock service-time state during placement.
+            let mut reserved = lock(&self.reserved);
+            let decision = route_reserved(&snapshots, request, &reserved)?;
+            reserved.take(&decision.label);
+            drop(reserved);
+            let selected = snapshots
+                .iter()
+                .find(|snapshot| snapshot.label() == decision.label)
+                .expect("placement returns a label it was given");
+            let service_model = request
+                .model
+                .or_else(|| selected.active_model_id())
+                .map(str::to_string);
+            (decision, service_model, 0)
+        };
 
         let node = snapshots
             .into_iter()
@@ -338,6 +418,12 @@ impl Fabric {
             decision,
             node,
             reserved: Arc::clone(&self.reserved),
+            service_times: Arc::clone(&self.service_times),
+            service_model,
+            service_class: request.service_class.map(str::to_string),
+            service_mode: request.mode,
+            service_ahead,
+            service_recorded: false,
         })
     }
 
@@ -345,6 +431,30 @@ impl Fabric {
     /// for reporting. A copy, so reading it holds the lock no longer than that.
     pub fn reserved(&self) -> Reservations {
         lock(&self.reserved).clone()
+    }
+
+    /// Send a request to a node already chosen by this fabric.
+    ///
+    /// This exists for the one-shot `fabric run` path, whose request body uses
+    /// the chosen node's active model. Keeping the send here ensures it cannot
+    /// bypass the fabric's bearer or transport policy.
+    pub fn forward_to(
+        &self,
+        spec: &NodeSpec,
+        path: &str,
+        body: &Value,
+        timeout: Duration,
+        cancel: &Cancel,
+    ) -> Result<Forwarded, ForwardError> {
+        forward::forward_with_transport(
+            spec,
+            path,
+            body,
+            self.bearer.as_deref(),
+            timeout,
+            cancel,
+            &self.transport,
+        )
     }
 
     /// Observe, place, and send — the whole path a caller actually wants.
@@ -364,16 +474,25 @@ impl Fabric {
         // Refuse an unsupported request before spending any probes on it.
         forward::reject_streaming(body)?;
 
-        let sent = self.send_until_a_node_takes_it(request, |spec| {
-            forward::forward(
+        let service_class =
+            (request.mode != RouteMode::Throughput).then(|| service_class(path, body));
+        let request = request.with_service_class(service_class.as_deref());
+        let mut sent = self.send_until_a_node_takes_it(&request, |spec| {
+            forward::forward_with_transport(
                 spec,
                 path,
                 body,
                 self.bearer.as_deref(),
                 forward_timeout,
                 cancel,
+                &self.transport,
             )
         })?;
+        if sent.value.is_success() {
+            sent.placement.record_success(sent.value.elapsed);
+        } else if sent.value.status >= 500 && !sent.value.refused_for_backpressure() {
+            sent.placement.invalidate_service_time();
+        }
         Ok(Dispatched {
             decision: sent.placement.decision.clone(),
             answer: sent.value,
@@ -400,8 +519,11 @@ impl Fabric {
         idle_timeout: Duration,
         cancel: &Cancel,
     ) -> Result<DispatchedStream, DispatchError> {
-        let sent = self.send_until_a_node_takes_it(request, |spec| {
-            forward::forward_streaming(
+        let service_class =
+            (request.mode != RouteMode::Throughput).then(|| service_class(path, body));
+        let request = request.with_service_class(service_class.as_deref());
+        let mut sent = self.send_until_a_node_takes_it(&request, |spec| {
+            forward::forward_streaming_with_transport(
                 spec,
                 path,
                 body,
@@ -409,8 +531,16 @@ impl Fabric {
                 head_timeout,
                 idle_timeout,
                 cancel,
+                &self.transport,
             )
         })?;
+        if let StreamOutcome::Buffered(answer) = &sent.value {
+            if answer.is_success() {
+                sent.placement.record_success(answer.elapsed);
+            } else if answer.status >= 500 && !answer.refused_for_backpressure() {
+                sent.placement.invalidate_service_time();
+            }
+        }
         Ok(DispatchedStream {
             outcome: sent.value,
             placement: sent.placement,
@@ -460,7 +590,7 @@ impl Fabric {
 
         for attempt in 1..=self.max_forward_attempts.max(1) {
             let excluded: Vec<String> = gone.iter().chain(saturated.iter()).cloned().collect();
-            let placement = match self.place_excluding(request, &excluded) {
+            let mut placement = match self.place_excluding(request, &excluded) {
                 Ok(placement) => placement,
                 Err(refusal) => {
                     if let Some((value, placement)) = refused {
@@ -494,6 +624,7 @@ impl Fabric {
                     });
                 }
                 Err(error) if error.node_never_received_it() => {
+                    placement.invalidate_service_time();
                     gone.push(placement.decision.label.clone());
                     first_failure.get_or_insert(error);
                 }
@@ -503,6 +634,9 @@ impl Fabric {
                 // fabric successfully routed around, and say nothing about the
                 // one actually failing requests.
                 Err(error) => {
+                    if !matches!(error, ForwardError::Cancelled { .. }) {
+                        placement.invalidate_service_time();
+                    }
                     if gone.is_empty() {
                         self.forget_observation_if_node_vanished(&error);
                     } else {
@@ -570,6 +704,33 @@ impl Fabric {
     }
 }
 
+/// Group requests whose service cost is comparable enough to learn together.
+///
+/// Raw wall time without a workload class would teach the policy that the node
+/// receiving longer prompts or generations is intrinsically slower. Powers of
+/// two keep the number of classes bounded while separating order-of-magnitude
+/// differences. Streaming is distinct because its measured lifetime ends at
+/// body EOF rather than at one buffered response.
+fn service_class(path: &str, body: &Value) -> String {
+    fn bucket(value: usize) -> usize {
+        value.checked_next_power_of_two().unwrap_or(usize::MAX)
+    }
+
+    let request_bytes = serde_json::to_vec(body).map_or(0, |encoded| encoded.len());
+    let output_tokens = body
+        .get("max_completion_tokens")
+        .or_else(|| body.get("max_tokens"))
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(0);
+    format!(
+        "{path}|stream={}|bytes={}|output={}",
+        wants_streaming(body),
+        bucket(request_bytes),
+        bucket(output_tokens),
+    )
+}
+
 /// A request that a node took, and what it cost to get there.
 struct Sent<T> {
     value: T,
@@ -617,6 +778,12 @@ pub struct Placement {
     decision: RouteDecision,
     node: NodeSnapshot,
     reserved: Arc<Mutex<Reservations>>,
+    service_times: Arc<Mutex<ServiceTimeEstimates>>,
+    service_model: Option<String>,
+    service_class: Option<String>,
+    service_mode: RouteMode,
+    service_ahead: usize,
+    service_recorded: bool,
 }
 
 impl Placement {
@@ -628,6 +795,38 @@ impl Placement {
     /// already serving before building a request body for it.
     pub fn node(&self) -> &NodeSnapshot {
         &self.node
+    }
+
+    /// Record one successful, fully completed request.
+    ///
+    /// Failures and cancellations never call this. Idempotence is defensive:
+    /// one request must never outweigh another because two completion paths
+    /// happened to report it.
+    pub(crate) fn record_success(&mut self, elapsed: Duration) {
+        if self.service_recorded || self.service_mode != RouteMode::CompletionTime {
+            return;
+        }
+        self.service_recorded = true;
+        // A busy completion's wall time includes queueing from work whose
+        // workload class is not exposed by node health. Dividing by the total
+        // in-flight count would fabricate this class's service time, so only a
+        // request placed with nobody ahead becomes a sample.
+        if self.service_ahead != 0 {
+            return;
+        }
+        let (Some(model), Some(service_class)) = (&self.service_model, &self.service_class) else {
+            return;
+        };
+        lock(&self.service_times).observe(&self.node, model, service_class, elapsed);
+    }
+
+    /// Forget a learned speed after the node itself fails this workload.
+    /// Selection recency is retained so cold fallback explores a sibling next.
+    pub(crate) fn invalidate_service_time(&mut self) {
+        let (Some(model), Some(service_class)) = (&self.service_model, &self.service_class) else {
+            return;
+        };
+        lock(&self.service_times).invalidate(&self.node, model, service_class);
     }
 }
 
@@ -879,6 +1078,265 @@ mod tests {
             in_flight: 1,
             waiting: 0,
         })
+    }
+
+    fn ready_snapshot(spec: NodeSpec, model: &str) -> NodeSnapshot {
+        NodeSnapshot {
+            spec,
+            status: ready_status(model),
+            latency: Some(Duration::from_millis(4)),
+        }
+    }
+
+    #[test]
+    fn a_tls_authentication_failure_fails_over_without_leaking_the_bearer() {
+        use std::io::{Read, Write};
+
+        let issued = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+            .expect("generate trusted node certificate");
+        let key = rustls_pki_types::PrivatePkcs8KeyDer::from(issued.key_pair.serialize_der());
+        let server = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![issued.cert.der().clone()], key.into())
+            .expect("trusted certificate and key agree");
+        let directory = tempfile::tempdir().expect("temp dir");
+        let ca_path = directory.path().join("node-ca");
+        std::fs::write(&ca_path, rcgen::Certificate::pem(&issued.cert)).expect("write CA");
+
+        let impostor = std::net::TcpListener::bind("127.0.0.1:0").expect("bind impostor");
+        let impostor_port = impostor.local_addr().expect("impostor address").port();
+        let (captured_tx, captured_rx) = std::sync::mpsc::channel();
+        let impostor_thread = std::thread::spawn(move || {
+            let (mut socket, _) = impostor.accept().expect("accept first attempt");
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("bound impostor read");
+            let mut bytes = vec![0_u8; 8192];
+            let read = socket.read(&mut bytes).expect("read ClientHello");
+            bytes.truncate(read);
+            captured_tx.send(bytes).expect("send captured bytes");
+        });
+
+        let trusted = std::net::TcpListener::bind("127.0.0.1:0").expect("bind trusted node");
+        let trusted_port = trusted.local_addr().expect("trusted address").port();
+        let trusted_thread = std::thread::spawn(move || {
+            let (socket, _) = trusted.accept().expect("accept failover attempt");
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("bound trusted read");
+            socket
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .expect("bound trusted write");
+            let connection =
+                rustls::ServerConnection::new(Arc::new(server)).expect("create TLS server");
+            let mut stream = rustls::StreamOwned::new(connection, socket);
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream
+                    .read(&mut buffer)
+                    .expect("read authenticated request");
+                assert_ne!(read, 0, "request ended before its headers");
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let header_end = request
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .expect("request headers end")
+                + 4;
+            let content_length = std::str::from_utf8(&request[..header_end])
+                .expect("ASCII request headers")
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length").then(|| {
+                        value
+                            .trim()
+                            .parse::<usize>()
+                            .expect("numeric content length")
+                    })
+                })
+                .unwrap_or(0);
+            while request.len() - header_end < content_length {
+                let read = stream
+                    .read(&mut buffer)
+                    .expect("read authenticated request body");
+                assert_ne!(read, 0, "request ended before its body");
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let body = r#"{"choices":[{"message":{"role":"assistant","content":"served"}}]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write authenticated answer");
+            stream.flush().expect("flush authenticated answer");
+        });
+
+        let bad = NodeSpec {
+            label: "a-impostor".to_string(),
+            host: "localhost".to_string(),
+            port: impostor_port,
+        };
+        let good = NodeSpec {
+            label: "b-trusted".to_string(),
+            host: "localhost".to_string(),
+            port: trusted_port,
+        };
+        let bearer = "must-not-cross-before-authentication-74d1";
+        let fabric = Fabric::new(vec![bad.clone(), good.clone()])
+            .with_bearer(Some(bearer))
+            .with_node_transport(Some(&ca_path), false)
+            .expect("TLS transport resolves")
+            .with_max_observation_age(Duration::from_secs(30))
+            .with_max_forward_attempts(2);
+        *lock(&fabric.observed) = Some((
+            0,
+            Observation::taken_at(
+                vec![ready_snapshot(bad, "m"), ready_snapshot(good, "m")],
+                Instant::now(),
+            ),
+        ));
+
+        let dispatched = fabric
+            .dispatch(
+                "/v1/chat/completions",
+                &forward::chat_request("m", "ping", 8),
+                &RouteRequest::new(RouteMode::Throughput).with_model(Some("m")),
+                Duration::from_secs(3),
+                &Cancel::never(),
+            )
+            .expect("the authenticated sibling serves after TLS refusal");
+        assert_eq!(dispatched.answer.label, "b-trusted");
+        assert_eq!(dispatched.attempts, 2);
+
+        let captured = captured_rx.recv().expect("captured ClientHello");
+        assert!(
+            !captured
+                .windows(bearer.len())
+                .any(|window| window == bearer.as_bytes()),
+            "bearer crossed before server authentication"
+        );
+        impostor_thread.join().expect("impostor exits");
+        trusted_thread.join().expect("trusted node exits");
+    }
+
+    #[test]
+    fn service_classes_separate_workloads_with_different_cost_shapes() {
+        let base = serde_json::json!({
+            "model": "m",
+            "messages": [{ "role": "user", "content": "short" }],
+            "max_tokens": 64,
+            "stream": false,
+        });
+        let base_class = service_class("/v1/chat/completions", &base);
+
+        let mut streaming = base.clone();
+        streaming["stream"] = true.into();
+        assert_ne!(
+            base_class,
+            service_class("/v1/chat/completions", &streaming)
+        );
+
+        let mut larger_output = base.clone();
+        larger_output["max_tokens"] = 65.into();
+        assert_ne!(
+            base_class,
+            service_class("/v1/chat/completions", &larger_output)
+        );
+
+        let mut larger_input = base.clone();
+        larger_input["messages"][0]["content"] = "x".repeat(1_024).into();
+        assert_ne!(
+            base_class,
+            service_class("/v1/chat/completions", &larger_input)
+        );
+        assert_ne!(base_class, service_class("/v1/embeddings", &base));
+    }
+
+    #[test]
+    fn a_busy_completion_is_not_a_service_sample() {
+        let node = snapshot(
+            "a",
+            NodeStatus::Ready(NodeReady {
+                active_model_id: Some("m".to_string()),
+                backend: "llama".to_string(),
+                version: "0.5.4".to_string(),
+                in_flight: 0,
+                waiting: 0,
+            }),
+        );
+        let measured = node.clone();
+        let fabric = Fabric::new(Vec::new());
+        {
+            let mut reserved = lock(&fabric.reserved);
+            reserved.take("a");
+            reserved.take("a");
+        }
+        let request = RouteRequest::new(RouteMode::CompletionTime)
+            .with_model(Some("m"))
+            .with_service_class(Some("class"));
+
+        let mut placement = fabric
+            .place_observed(vec![node], &request, &[])
+            .expect("routes");
+
+        assert_eq!(
+            placement.service_ahead, 2,
+            "sampling must use the same max(observed, reserved) load as selection"
+        );
+        assert_eq!(fabric.reserved().get("a"), 3);
+        placement.record_success(Duration::from_millis(300));
+        let (_, samples) = lock(&fabric.service_times)
+            .sample_for(&measured, "m", "class")
+            .expect("selection recency keeps the class present");
+        assert_eq!(samples, 0, "busy queueing became a speed sample");
+        drop(placement);
+        assert_eq!(fabric.reserved().get("a"), 2);
+    }
+
+    #[test]
+    fn a_queue_free_completion_records_its_observed_wall_time() {
+        let node = snapshot(
+            "a",
+            NodeStatus::Ready(NodeReady {
+                active_model_id: Some("m".to_string()),
+                backend: "llama".to_string(),
+                version: "0.5.4".to_string(),
+                in_flight: 0,
+                waiting: 0,
+            }),
+        );
+        let measured = node.clone();
+        let fabric = Fabric::new(Vec::new());
+        let request = RouteRequest::new(RouteMode::CompletionTime)
+            .with_model(Some("m"))
+            .with_service_class(Some("class"));
+        let mut placement = fabric
+            .place_observed(vec![node], &request, &[])
+            .expect("routes");
+
+        placement.record_success(Duration::from_millis(400));
+
+        let (mean_nanos, samples) = lock(&fabric.service_times)
+            .sample_for(&measured, "m", "class")
+            .expect("the queue-free completion was sampled");
+        assert_eq!(samples, 1);
+        assert_eq!(mean_nanos, Duration::from_millis(400).as_nanos());
+    }
+
+    #[test]
+    fn service_classes_do_not_record_request_content() {
+        let body = serde_json::json!({
+            "model": "m",
+            "messages": [{ "role": "user", "content": "private prompt" }],
+            "max_tokens": 64,
+        });
+        let class = service_class("/v1/chat/completions", &body);
+        assert!(!class.contains("private"), "{class}");
+        assert!(!class.contains("prompt"), "{class}");
     }
 
     #[test]

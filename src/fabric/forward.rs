@@ -17,6 +17,7 @@ use serde_json::{json, Value};
 
 use super::http::{self, HttpError};
 use super::node::NodeSpec;
+use super::transport::NodeTransport;
 use super::Cancel;
 
 /// Generation can legitimately take minutes, so this is far longer than a probe
@@ -238,6 +239,27 @@ pub fn forward(
     timeout: Duration,
     cancel: &Cancel,
 ) -> Result<Forwarded, ForwardError> {
+    forward_with_transport(
+        spec,
+        path,
+        body,
+        bearer,
+        timeout,
+        cancel,
+        &NodeTransport::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn forward_with_transport(
+    spec: &NodeSpec,
+    path: &str,
+    body: &Value,
+    bearer: Option<&str>,
+    timeout: Duration,
+    cancel: &Cancel,
+    transport: &NodeTransport,
+) -> Result<Forwarded, ForwardError> {
     reject_streaming(body)?;
 
     let encoded = serde_json::to_vec(body).map_err(|error| ForwardError::Json {
@@ -246,7 +268,7 @@ pub fn forward(
     })?;
 
     let started = Instant::now();
-    let response = http::request(
+    let response = http::request_with_transport(
         &spec.host,
         spec.port,
         "POST",
@@ -256,6 +278,7 @@ pub fn forward(
         timeout,
         MAX_RESPONSE_BYTES,
         cancel,
+        transport,
     )
     .map_err(|error| attribute(&spec.label, error))?;
     let elapsed = started.elapsed();
@@ -294,6 +317,7 @@ pub struct Streaming {
     /// The node's `Content-Type`, so the client is told what it is reading.
     pub content_type: Option<String>,
     stream: http::ResponseStream,
+    started: Instant,
 }
 
 impl std::fmt::Debug for Streaming {
@@ -317,6 +341,11 @@ impl Streaming {
         self.stream
             .next_chunk()
             .map_err(|error| after_the_head(&self.label, error))
+    }
+
+    /// Time from starting the request through the latest body read.
+    pub(crate) fn elapsed(&self) -> Duration {
+        self.started.elapsed()
     }
 }
 
@@ -360,13 +389,36 @@ pub fn forward_streaming(
     idle_timeout: Duration,
     cancel: &Cancel,
 ) -> Result<StreamOutcome, ForwardError> {
+    forward_streaming_with_transport(
+        spec,
+        path,
+        body,
+        bearer,
+        head_timeout,
+        idle_timeout,
+        cancel,
+        &NodeTransport::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn forward_streaming_with_transport(
+    spec: &NodeSpec,
+    path: &str,
+    body: &Value,
+    bearer: Option<&str>,
+    head_timeout: Duration,
+    idle_timeout: Duration,
+    cancel: &Cancel,
+    transport: &NodeTransport,
+) -> Result<StreamOutcome, ForwardError> {
     let encoded = serde_json::to_vec(body).map_err(|error| ForwardError::Json {
         label: spec.label.clone(),
         detail: format!("request body could not be encoded: {error}"),
     })?;
 
     let started = Instant::now();
-    let stream = http::open_stream(
+    let stream = http::open_stream_with_transport(
         &spec.host,
         spec.port,
         "POST",
@@ -377,6 +429,7 @@ pub fn forward_streaming(
         idle_timeout,
         MAX_RESPONSE_BYTES,
         cancel,
+        transport,
     )
     .map_err(|error| attribute(&spec.label, error))?;
 
@@ -408,6 +461,7 @@ pub fn forward_streaming(
         status: head.status,
         content_type: head.content_type,
         stream,
+        started,
     }))
 }
 

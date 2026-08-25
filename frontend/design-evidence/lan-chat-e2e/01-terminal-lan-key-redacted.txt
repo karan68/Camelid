@@ -1,0 +1,15 @@
+PS C:\Camelid> .\target\release\camelid.exe lan-key
+LAN Chat key loaded at %LOCALAPPDATA%\Camelid\lan-chat.key
+
+[REDACTED 256-BIT LAN KEY]
+
+Treat this key like a password. Share it directly with the phone user.
+Never put it in a URL, screenshot, issue, or chat message.
+
+Start the server with:
+  camelid serve --lan-chat-only --api-key-file "%LOCALAPPDATA%\Camelid\lan-chat.key" \
+    --addr 127.0.0.1:8187 --model <MODEL.gguf> --no-open
+
+Evidence redaction: the command's 64-hex-character credential was replaced with
+[REDACTED 256-BIT LAN KEY], and the user-specific app-data prefix was replaced
+with %LOCALAPPDATA%. No credential value is stored in this repository.

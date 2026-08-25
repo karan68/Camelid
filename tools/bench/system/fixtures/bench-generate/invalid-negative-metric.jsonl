@@ -1,0 +1,1 @@
+{"runtime":"camelid","commit":"2222222222222222222222222222222222222222","model":"<model>/negative-Q8_0.gguf","quantization":"Q8_0","iteration":0,"prompt_tokens":19,"generated_tokens":4,"load_ms":925.5,"prefill_ms":43.25,"ttft_ms":47.75,"decode_ms":1625.0,"tokens_per_second":-1,"peak_memory_bytes":1447034880,"output_text":"Invalid metric.","output_token_ids":[1,450,901,2]}

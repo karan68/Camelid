@@ -51,6 +51,8 @@ struct StubConfig {
     health: String,
     completion: String,
     completion_status: u16,
+    /// Mutable status for a node that degrades after the policy has learned it.
+    live_completion_status: Option<Arc<AtomicUsize>>,
     /// Held before answering `/v1/chat/completions`, to stand in for a real
     /// generation that takes a while. Health is never delayed.
     completion_delay: Duration,
@@ -70,6 +72,8 @@ struct StubConfig {
     /// Hang up after the events instead of writing the terminal chunk, which is
     /// what a node that dies mid-generation leaves on the wire.
     stream_truncated: bool,
+    /// Mutable truncation for a stream that degrades after warm-up.
+    live_stream_truncated: Option<Arc<AtomicBool>>,
     /// Events actually written to the socket. It stops advancing once the peer
     /// has gone, which is how a cancellation test observes the hang-up.
     events_written: Arc<AtomicUsize>,
@@ -86,6 +90,9 @@ struct StubConfig {
     /// write until it is finished, so unlike `events_written` there is no
     /// failing write to reveal a hang-up — it has to be looked for.
     completion_watch: Duration,
+    /// Mutable work duration for a node that is made long-running only for a
+    /// cancellation probe after quick policy warm-up.
+    live_completion_watch: Option<Arc<Mutex<Duration>>>,
     /// How far into `completion_watch` the caller went away, if it did.
     caller_left_after: Arc<Mutex<Option<Duration>>>,
 }
@@ -102,16 +109,19 @@ impl StubConfig {
                 r#"{{"choices":[{{"message":{{"role":"assistant","content":"served by {model}"}}}}]}}"#
             ),
             completion_status: 200,
+            live_completion_status: None,
             completion_delay: Duration::ZERO,
             required_key: None,
             hangs_up_on_completion: false,
             stream_events: Vec::new(),
             stream_gap: Duration::ZERO,
             stream_truncated: false,
+            live_stream_truncated: None,
             events_written: Arc::new(AtomicUsize::new(0)),
             live_in_flight: None,
             live_model: None,
             completion_watch: Duration::ZERO,
+            live_completion_watch: None,
             caller_left_after: Arc::new(Mutex::new(None)),
         }
     }
@@ -330,14 +340,14 @@ fn serve_once(stream: &mut TcpStream, config: &StubConfig, requests: &Mutex<Vec<
     }
 
     if authorized
-        && !config.completion_watch.is_zero()
+        && !completion_watch(config).is_zero()
         && PLACED_ROUTES.contains(&received.path.as_str())
     {
         // Recorded before the work starts, so a test can wait until the node
         // really holds the request before taking its caller away.
         requests.lock().expect("stub lock").push(received);
         if caller_stayed(stream, config) {
-            write_json(stream, config.completion_status, &config.completion);
+            write_json(stream, completion_status(config), &config.completion);
         }
         return;
     }
@@ -361,7 +371,7 @@ fn serve_once(stream: &mut TcpStream, config: &StubConfig, requests: &Mutex<Vec<
             if let Some(count) = busy {
                 count.fetch_sub(1, Ordering::SeqCst);
             }
-            (config.completion_status, config.completion.clone())
+            (completion_status(config), config.completion.clone())
         }
         _ => (404, "{}".to_string()),
     };
@@ -381,6 +391,15 @@ fn write_json(stream: &mut TcpStream, status: u16, body: &str) {
     let _ = stream.flush();
 }
 
+fn completion_status(config: &StubConfig) -> u16 {
+    config
+        .live_completion_status
+        .as_ref()
+        .map_or(config.completion_status, |status| {
+            status.load(Ordering::SeqCst) as u16
+        })
+}
+
 /// Work on a placed request for `completion_watch`, watching the socket for the
 /// caller going away, and report whether it was still there at the end.
 ///
@@ -390,6 +409,7 @@ fn write_json(stream: &mut TcpStream, status: u16, body: &str) {
 /// handler frame is dropped when the connection is.
 fn caller_stayed(stream: &mut TcpStream, config: &StubConfig) -> bool {
     let started = Instant::now();
+    let hold = completion_watch(config);
     if stream
         .set_read_timeout(Some(Duration::from_millis(20)))
         .is_err()
@@ -397,7 +417,7 @@ fn caller_stayed(stream: &mut TcpStream, config: &StubConfig) -> bool {
         return false;
     }
     let mut scratch = [0_u8; 64];
-    while started.elapsed() < config.completion_watch {
+    while started.elapsed() < hold {
         let gone = match stream.read(&mut scratch) {
             // A graceful close reads as end-of-file and an abortive one as an
             // error; both mean the caller has gone.
@@ -416,6 +436,15 @@ fn caller_stayed(stream: &mut TcpStream, config: &StubConfig) -> bool {
         }
     }
     true
+}
+
+fn completion_watch(config: &StubConfig) -> Duration {
+    config
+        .live_completion_watch
+        .as_ref()
+        .map_or(config.completion_watch, |watch| {
+            *watch.lock().expect("stub watch lock")
+        })
 }
 
 /// What `/v1/health` answers: the configured body, carrying whatever load and
@@ -454,7 +483,12 @@ fn serve_event_stream(stream: &mut TcpStream, config: &StubConfig) {
         }
         config.events_written.fetch_add(1, Ordering::SeqCst);
     }
-    if config.stream_truncated {
+    if config.stream_truncated
+        || config
+            .live_stream_truncated
+            .as_ref()
+            .is_some_and(|truncated| truncated.load(Ordering::SeqCst))
+    {
         return;
     }
     let _ = stream.write_all(b"0\r\n\r\n");
@@ -1454,6 +1488,7 @@ async fn a_client_hanging_up_stops_the_node_generating() {
 /// there is anything to abandon. Polling the node beats sleeping a guess: the
 /// point of the measurement afterwards is that it is not a timing coincidence.
 async fn post_then_hang_up(addr: SocketAddr, node: &StubNode, path: &str, body: Value) {
+    let already_received = served_on(std::slice::from_ref(node), path)[0];
     let mut stream = tokio::net::TcpStream::connect(addr)
         .await
         .expect("connect to proxy");
@@ -1468,7 +1503,7 @@ async fn post_then_hang_up(addr: SocketAddr, node: &StubNode, path: &str, body: 
         .expect("write request");
 
     let deadline = Instant::now() + Duration::from_secs(10);
-    while served_on(std::slice::from_ref(node), path)[0] == 0 {
+    while served_on(std::slice::from_ref(node), path)[0] <= already_received {
         assert!(
             Instant::now() < deadline,
             "the node never received the request, so there was nothing to abandon"
@@ -1476,6 +1511,46 @@ async fn post_then_hang_up(addr: SocketAddr, node: &StubNode, path: &str, body: 
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     drop(stream);
+}
+
+/// Send one request and return which candidate held it before hanging up.
+async fn post_then_hang_up_on_one(
+    addr: SocketAddr,
+    nodes: &[&StubNode],
+    path: &str,
+    body: Value,
+) -> usize {
+    let before: Vec<usize> = nodes
+        .iter()
+        .map(|node| served_on(std::slice::from_ref(*node), path)[0])
+        .collect();
+    let mut stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("connect to proxy");
+    let payload = body.to_string();
+    let request = format!(
+        "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+        payload.len()
+    );
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write request");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(index) = nodes.iter().enumerate().find_map(|(index, node)| {
+            (served_on(std::slice::from_ref(*node), path)[0] > before[index]).then_some(index)
+        }) {
+            drop(stream);
+            return index;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no node received the request, so there was nothing to abandon"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 /// What the node observed, once it observes anything, or `None` if it never did.
@@ -1645,6 +1720,290 @@ async fn a_burst_of_requests_spreads_across_the_nodes_serving_the_model() {
     assert!(
         served.iter().all(|count| *count > 0),
         "a node serving the model was never used: {served:?}"
+    );
+}
+
+/// Completion-time placement learns only from completed requests, then uses
+/// the measured service difference instead of treating equal queue depths as
+/// equal machines.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn completion_time_learns_buffered_service_speed_over_real_sockets() {
+    const WARMUP_REQUESTS: usize = 10;
+    const MEASURED_REQUESTS: usize = 6;
+    let nodes = vec![
+        StubNode::start(StubConfig::slow("shared-model", Duration::from_millis(20))),
+        StubNode::start(StubConfig::slow("shared-model", Duration::from_millis(200))),
+    ];
+    let fabric = fabric_reusing_observations(
+        vec![nodes[0].spec("fast"), nodes[1].spec("slow")],
+        Duration::from_secs(30),
+    );
+    let addr = start_proxy(fabric, RouteMode::CompletionTime).await;
+    let body = serde_json::json!({ "model": "shared-model" });
+
+    for _ in 0..WARMUP_REQUESTS {
+        let (status, _, headers) = post_chat(addr, &body, &[]).await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            header(&headers, "x-camelid-fabric-reason"),
+            Some("LeastLoaded"),
+            "the policy must say when it is still using the cold fallback"
+        );
+    }
+    assert_eq!(
+        completions_served(&nodes),
+        [5, 5],
+        "cold exploration must collect the same number of samples from both nodes"
+    );
+
+    for _ in 0..MEASURED_REQUESTS {
+        let (status, _, headers) = post_chat(addr, &body, &[]).await;
+        assert_eq!(status, 200);
+        assert_eq!(header(&headers, "x-camelid-fabric-node"), Some("fast"));
+        assert_eq!(
+            header(&headers, "x-camelid-fabric-reason"),
+            Some("EstimatedCompletion")
+        );
+    }
+    assert_eq!(completions_served(&nodes), [5 + MEASURED_REQUESTS, 5]);
+}
+
+/// A quick failure is not quick service. Counting it would teach the policy to
+/// prefer the node that fails fastest, which is worse than speed-blind routing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn completion_time_never_learns_from_http_failures() {
+    let failing = StubNode::start(StubConfig {
+        completion_status: 500,
+        completion: r#"{"error":{"message":"generation failed"}}"#.to_string(),
+        ..StubConfig::ready("shared-model", 0)
+    });
+    let serving = StubNode::start(StubConfig::slow("shared-model", Duration::from_millis(60)));
+    let fabric = fabric_reusing_observations(
+        vec![failing.spec("a-failing"), serving.spec("b-serving")],
+        Duration::from_secs(30),
+    );
+    let addr = start_proxy(fabric, RouteMode::CompletionTime).await;
+    let body = serde_json::json!({ "model": "shared-model" });
+
+    let mut statuses = Vec::new();
+    for _ in 0..12 {
+        let (status, _, headers) = post_chat(addr, &body, &[]).await;
+        statuses.push(status);
+        assert_eq!(
+            header(&headers, "x-camelid-fabric-reason"),
+            Some("LeastLoaded"),
+            "a failed request must never mature the completion-time policy"
+        );
+    }
+    assert_eq!(statuses.iter().filter(|status| **status == 500).count(), 6);
+    assert_eq!(statuses.iter().filter(|status| **status == 200).count(), 6);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn completion_time_invalidates_a_learned_node_on_5xx() {
+    let fast_status = Arc::new(AtomicUsize::new(200));
+    let fast = StubNode::start(StubConfig {
+        completion_delay: Duration::from_millis(20),
+        live_completion_status: Some(Arc::clone(&fast_status)),
+        ..StubConfig::ready("shared-model", 0)
+    });
+    let slow = StubNode::start(StubConfig::slow("shared-model", Duration::from_millis(200)));
+    let fabric = fabric_reusing_observations(
+        vec![fast.spec("fast"), slow.spec("slow")],
+        Duration::from_secs(30),
+    );
+    let addr = start_proxy(fabric, RouteMode::CompletionTime).await;
+    let body = serde_json::json!({ "model": "shared-model" });
+
+    for _ in 0..10 {
+        assert_eq!(post_chat(addr, &body, &[]).await.0, 200);
+    }
+    fast_status.store(500, Ordering::SeqCst);
+
+    // Force the failure through affinity: invalidation describes the node's
+    // health, not the policy that happened to select it.
+    let (failed, _, failed_headers) =
+        post_chat(addr, &body, &[("x-camelid-fabric-sticky", "fast")]).await;
+    assert_eq!(failed, 500);
+    assert_eq!(
+        header(&failed_headers, "x-camelid-fabric-node"),
+        Some("fast")
+    );
+    assert_eq!(
+        header(&failed_headers, "x-camelid-fabric-reason"),
+        Some("Affinity")
+    );
+
+    let (recovered, _, recovered_headers) = post_chat(addr, &body, &[]).await;
+    assert_eq!(recovered, 200);
+    assert_eq!(
+        header(&recovered_headers, "x-camelid-fabric-node"),
+        Some("slow")
+    );
+    assert_eq!(
+        header(&recovered_headers, "x-camelid-fabric-reason"),
+        Some("LeastLoaded"),
+        "the 5xx must return the class to cold fallback"
+    );
+}
+
+/// Streaming service time ends at clean EOF, not when the response head
+/// arrives. Otherwise a slow decoder that flushes an early role frame would
+/// look identical to a fast one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn completion_time_learns_streaming_service_through_clean_eof() {
+    const EVENTS: [&str; 2] = ["data: token\n\n", "data: [DONE]\n\n"];
+    let fast = StubNode::start(StubConfig::streaming(
+        "shared-model",
+        &EVENTS,
+        Duration::from_millis(5),
+    ));
+    let slow = StubNode::start(StubConfig::streaming(
+        "shared-model",
+        &EVENTS,
+        Duration::from_millis(50),
+    ));
+    let fabric = fabric_reusing_observations(
+        vec![fast.spec("fast"), slow.spec("slow")],
+        Duration::from_secs(30),
+    );
+    let addr = start_proxy(fabric, RouteMode::CompletionTime).await;
+    let body = serde_json::json!({ "model": "shared-model", "stream": true });
+
+    for _ in 0..10 {
+        let (status, headers, pieces) = post_chat_streaming(addr, &body).await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            header(&headers, "x-camelid-fabric-reason"),
+            Some("LeastLoaded")
+        );
+        let framed: String = pieces.iter().map(|piece| piece.text.as_str()).collect();
+        assert_eq!(dechunk(&framed), EVENTS.concat());
+    }
+
+    for _ in 0..4 {
+        let (status, headers, pieces) = post_chat_streaming(addr, &body).await;
+        assert_eq!(status, 200);
+        assert_eq!(header(&headers, "x-camelid-fabric-node"), Some("fast"));
+        assert_eq!(
+            header(&headers, "x-camelid-fabric-reason"),
+            Some("EstimatedCompletion")
+        );
+        let framed: String = pieces.iter().map(|piece| piece.text.as_str()).collect();
+        assert_eq!(dechunk(&framed), EVENTS.concat());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn completion_time_invalidates_a_stream_that_stops_before_clean_eof() {
+    const EVENTS: [&str; 2] = ["data: token\n\n", "data: [DONE]\n\n"];
+    let fast_truncated = Arc::new(AtomicBool::new(false));
+    let fast = StubNode::start(StubConfig {
+        live_stream_truncated: Some(Arc::clone(&fast_truncated)),
+        ..StubConfig::streaming("shared-model", &EVENTS, Duration::from_millis(5))
+    });
+    let slow = StubNode::start(StubConfig::streaming(
+        "shared-model",
+        &EVENTS,
+        Duration::from_millis(50),
+    ));
+    let fabric = fabric_reusing_observations(
+        vec![fast.spec("fast"), slow.spec("slow")],
+        Duration::from_secs(30),
+    );
+    let addr = start_proxy(fabric, RouteMode::CompletionTime).await;
+    let body = serde_json::json!({ "model": "shared-model", "stream": true });
+
+    for _ in 0..10 {
+        assert_eq!(post_chat_streaming(addr, &body).await.0, 200);
+    }
+    fast_truncated.store(true, Ordering::SeqCst);
+
+    let (status, failed_headers, failed_pieces) = post_chat_streaming(addr, &body).await;
+    assert_eq!(status, 200, "the response head arrived before truncation");
+    assert_eq!(
+        header(&failed_headers, "x-camelid-fabric-node"),
+        Some("fast")
+    );
+    let failed: String = failed_pieces
+        .iter()
+        .map(|piece| piece.text.as_str())
+        .collect();
+    assert!(
+        !failed.ends_with("0\r\n\r\n"),
+        "the failed stream looked complete"
+    );
+
+    let (recovered, recovered_headers, _) = post_chat_streaming(addr, &body).await;
+    assert_eq!(recovered, 200);
+    assert_eq!(
+        header(&recovered_headers, "x-camelid-fabric-node"),
+        Some("slow")
+    );
+    assert_eq!(
+        header(&recovered_headers, "x-camelid-fabric-reason"),
+        Some("LeastLoaded")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn completion_time_keeps_a_learned_estimate_when_only_the_client_leaves() {
+    let fast_watch = Arc::new(Mutex::new(Duration::from_millis(50)));
+    let fast_config = StubConfig {
+        live_completion_watch: Some(Arc::clone(&fast_watch)),
+        ..StubConfig::ready("shared-model", 0)
+    };
+    let fast_left = Arc::clone(&fast_config.caller_left_after);
+    let fast = StubNode::start(fast_config);
+    let slow_watch = Arc::new(Mutex::new(Duration::from_millis(300)));
+    let slow_config = StubConfig {
+        live_completion_watch: Some(Arc::clone(&slow_watch)),
+        ..StubConfig::ready("shared-model", 0)
+    };
+    let slow_left = Arc::clone(&slow_config.caller_left_after);
+    let slow = StubNode::start(slow_config);
+    let fabric = fabric_reusing_observations(
+        vec![fast.spec("fast"), slow.spec("slow")],
+        Duration::from_secs(30),
+    );
+    let addr = start_proxy_waiting(
+        fabric,
+        RouteMode::CompletionTime,
+        ClientAuth::none(),
+        Duration::from_secs(5),
+    )
+    .await;
+    let body = serde_json::json!({ "model": "shared-model" });
+
+    for _ in 0..10 {
+        assert_eq!(post_chat(addr, &body, &[]).await.0, 200);
+    }
+
+    *fast_watch.lock().expect("fast watch lock") = Duration::from_secs(30);
+    *slow_watch.lock().expect("slow watch lock") = Duration::from_secs(30);
+
+    let candidates = [&fast, &slow];
+    let left = [&fast_left, &slow_left];
+    let labels = ["fast", "slow"];
+    let winner =
+        post_then_hang_up_on_one(addr, &candidates, "/v1/chat/completions", body.clone()).await;
+    caller_left_within(left[winner], Duration::from_secs(3))
+        .await
+        .expect("the learned node never observed the client cancellation");
+
+    *fast_watch.lock().expect("fast watch lock") = Duration::from_millis(50);
+    *slow_watch.lock().expect("slow watch lock") = Duration::from_millis(300);
+
+    let (status, _, headers) = post_chat(addr, &body, &[]).await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        header(&headers, "x-camelid-fabric-node"),
+        Some(labels[winner])
+    );
+    assert_eq!(
+        header(&headers, "x-camelid-fabric-reason"),
+        Some("EstimatedCompletion"),
+        "client cancellation must not invalidate a healthy node's estimate"
     );
 }
 
