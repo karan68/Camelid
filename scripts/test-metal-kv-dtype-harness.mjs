@@ -126,7 +126,7 @@ ${emissions}
 async function invokeHarness(name, stub, armSet = 'full', rounds = '10') {
   const log = join(temp, `${name}.log`)
   const output = join(temp, `${name}.jsonl`)
-  const result = spawnSync('zsh', [harness, stub, log, 'short', '4', rounds, output, armSet], {
+  const result = spawnSync('bash', [harness, stub, log, 'short', '4', rounds, output, armSet], {
     cwd: process.cwd(),
     encoding: 'utf8',
     timeout: 30_000,

@@ -1,4 +1,4 @@
-#!/bin/zsh
+#!/bin/bash
 # metal-kv-dtype-ab.sh — same-host A/B of the Metal resident KV primary format.
 #
 # Governed by ../BENCHMARK_TREATY.md. Produces the JSONL that
@@ -61,11 +61,11 @@ ROUNDS="$5"
 OUT="$6"
 ARM_SET="${7:-full}"
 
-if [[ ! "$MAXTOK" =~ '^[1-9][0-9]*$' ]] || (( MAXTOK < 2 )); then
+if [[ ! "$MAXTOK" =~ ^[1-9][0-9]*$ ]] || (( MAXTOK < 2 )); then
   echo "max_tokens must be an integer >= 2 so decode metrics are positive: $MAXTOK" >&2
   exit 2
 fi
-if [[ ! "$ROUNDS" =~ '^[1-9][0-9]*$' ]]; then
+if [[ ! "$ROUNDS" =~ ^[1-9][0-9]*$ ]]; then
   echo "rounds must be a positive integer: $ROUNDS" >&2
   exit 2
 fi
@@ -83,7 +83,7 @@ if [[ "$ARM_SET" == "prefill" ]] && (( ROUNDS < 10 || ROUNDS % 2 != 0 )); then
 fi
 
 PROMPT="$(dirname "$OUT")/prompt-$PROBE.txt"
-SCRIPT_DIR="${0:A:h}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # Prompts are derived, not committed: the filler probes regenerate byte-for-byte from
 # seed 677, and `realtext` reads an in-tree doc.
@@ -124,11 +124,11 @@ PY
 
 if [[ "$ARM_SET" == "full" ]]; then
   ARMS=("f32:f32:1:1" "f16:f16:1:1" "q8:q8:1:1" "f32-nosplitk:f32:0:1" "q8-nosplitk:q8:0:1")
-  # One-based form of [0, 1, 4, 2, 3], the first row of the odd-N Williams design.
-  BASE_ORDER=(1 2 5 3 4)
+  # First row of the odd-N Williams design.
+  BASE_ORDER=(0 1 4 2 3)
 else
   ARMS=("q8:q8:1:1" "q8-noattnmm:q8:1:0")
-  BASE_ORDER=(1 2)
+  BASE_ORDER=(0 1)
 fi
 N=${#ARMS[@]}
 
@@ -177,11 +177,11 @@ for r in $(seq 1 "$ROUNDS"); do
   shift=$(( pair_index % N ))
   order=()
   for base_idx in "${BASE_ORDER[@]}"; do
-    order+=( $(( (base_idx - 1 + shift) % N + 1 )) )
+    order+=( $(( (base_idx + shift) % N )) )
   done
   if (( r % 2 == 0 )); then
     reversed=()
-    for pos in $(seq "$N" -1 1); do
+    for pos in $(seq $((N - 1)) -1 0); do
       reversed+=( "${order[$pos]}" )
     done
     order=( "${reversed[@]}" )
