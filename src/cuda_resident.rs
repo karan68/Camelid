@@ -4933,6 +4933,105 @@ extern "C" __global__ void attention_batched(
     }
 }
 
+// Sliding-window causal attention for K tokens: token t (at position base+t) attends
+// [start_t, base+t], where start_t crops the window exactly as attention_decode_sw does.
+//
+// This is the batched counterpart of `attention_decode_sw`, and it exists because
+// `attention_batched` above has no window: gemma4 runs 5 sliding layers to every full
+// one, so a speculative verify batch cannot use `attention_batched` for 5/6 of the stack.
+//
+// BIT-EXACTNESS AGAINST DECODE, AND ITS PRECONDITION. `attention_decode_sw` reduces with
+// G = blockDim.x / head_dim groups, so the reduction it performs depends on the width its
+// launcher chose. There are two different callers in this tree and only one of them is
+// this kernel's reference:
+//
+//   * the gemma4 runtime launches `attention_decode_sw` directly at blockDim.x == head_dim,
+//     so G == 1 there unconditionally -- one ascending accumulation per output dimension,
+//     no group split. THAT is what this kernel reproduces.
+//   * `launch_attention_sw` (the gemma3 path) sizes G from the position count, so its G
+//     varies with context length. This kernel is NOT bit-identical to that launcher and
+//     must not be substituted for it.
+//
+// `launch_attention_sw_batched` therefore fixes blockDim.x at head_dim rather than taking
+// it as a parameter: a wider block would silently reorder the weighted-V sum and let a
+// verified token's argmax disagree with the same token's greedy argmax.
+//
+// `scores` is indexed RELATIVE to the window start, not by absolute position. That is
+// pure addressing -- the loop bounds, visit order and accumulation order are unchanged --
+// and it bounds shared memory by the window rather than by the whole context.
+extern "C" __global__ void attention_sw_batched(
+    const float* __restrict__ q, const unsigned short* __restrict__ cache_k,
+    const unsigned short* __restrict__ cache_v, float* __restrict__ out,
+    int n_heads, int n_kv_heads, int head_dim, int base_position, int max_pos, float scale,
+    int window, int q_per_token, int k_tokens
+) {
+    int t = blockIdx.x / n_heads;
+    int head = blockIdx.x % n_heads;
+    if (t >= k_tokens) return;
+    int position_count = base_position + t + 1;
+    int start = (window > 0 && position_count > window) ? (position_count - window) : 0;
+    int active = position_count - start;
+    int repeats = n_heads / n_kv_heads;
+    int kv_head = head / repeats;
+    const float* qh = q + (long)t * q_per_token + (long)head * head_dim;
+    const unsigned short* kbase = cache_k + (long)kv_head * max_pos * head_dim;
+    const unsigned short* vbase = cache_v + (long)kv_head * max_pos * head_dim;
+
+    extern __shared__ float shared_swb[];
+    float* qsh = shared_swb;              // head_dim
+    float* scores = shared_swb + head_dim; // active, indexed p - start
+    int tid = threadIdx.x;
+    for (int d = tid; d < head_dim; d += blockDim.x) qsh[d] = qh[d];
+    __syncthreads();
+
+    // Same uint4 (8 keys/load) f16 read and same d-order accumulation as
+    // attention_decode_sw, so the dot product is byte-identical under fmad=false.
+    int kd8 = ((head_dim & 7) == 0) ? head_dim : 0;
+    for (int p = start + tid; p < position_count; p += blockDim.x) {
+        const unsigned short* kp = kbase + (long)(p % max_pos) * head_dim;
+        float dot = 0.0f;
+        int d = 0;
+        for (; d < kd8; d += 8) {
+            uint4 kv = *reinterpret_cast<const uint4*>(kp + d);
+            const unsigned short* k8 = reinterpret_cast<const unsigned short*>(&kv);
+            dot += qsh[d + 0] * f16_bits_to_f32(k8[0]); dot += qsh[d + 1] * f16_bits_to_f32(k8[1]);
+            dot += qsh[d + 2] * f16_bits_to_f32(k8[2]); dot += qsh[d + 3] * f16_bits_to_f32(k8[3]);
+            dot += qsh[d + 4] * f16_bits_to_f32(k8[4]); dot += qsh[d + 5] * f16_bits_to_f32(k8[5]);
+            dot += qsh[d + 6] * f16_bits_to_f32(k8[6]); dot += qsh[d + 7] * f16_bits_to_f32(k8[7]);
+        }
+        for (; d < head_dim; d++) dot += qsh[d] * f16_bits_to_f32(kp[d]);
+        scores[p - start] = dot * scale;
+    }
+    __syncthreads();
+
+    __shared__ float s_max_swb, s_sum_swb;
+    if (tid == 0) {
+        float m = scores[0];
+        for (int i = 1; i < active; i++) if (scores[i] > m) m = scores[i];
+        s_max_swb = m;
+    }
+    __syncthreads();
+    for (int i = tid; i < active; i += blockDim.x) scores[i] = expf(scores[i] - s_max_swb);
+    __syncthreads();
+    if (tid == 0) {
+        float sum = 0.0f;
+        for (int i = 0; i < active; i++) sum += scores[i];
+        s_sum_swb = sum;
+    }
+    __syncthreads();
+    float inv = 1.0f / s_sum_swb;
+    // G == 1: one thread per output dimension walks the whole window in ascending order,
+    // which is the p_lo..p_hi loop attention_decode_sw runs when blockDim.x == head_dim.
+    for (int did = tid; did < head_dim; did += blockDim.x) {
+        float acc = 0.0f;
+        for (int i = 0; i < active; i++) {
+            int p = start + i;
+            acc += (scores[i] * inv) * f16_bits_to_f32(vbase[(long)(p % max_pos) * head_dim + did]);
+        }
+        out[(long)t * q_per_token + (long)head * head_dim + did] = acc;
+    }
+}
+
 // ---- Tree-verify kernels (lossless GPU tree speculation, Lane A) -----------
 // Generalize the linear batched verify to a draft TREE: the N nodes no longer
 // occupy consecutive positions on one branch. Each node t lives at its own KV
@@ -6565,6 +6664,7 @@ pub struct CudaResidentKernels {
     pub(crate) rope_batched: CudaFunction,
     pub(crate) kv_scatter_batched: CudaFunction,
     pub(crate) attention_batched: CudaFunction,
+    pub(crate) attention_sw_batched: CudaFunction,
     pub(crate) kv_scatter_tree_batched: CudaFunction,
     pub(crate) attention_tree_batched: CudaFunction,
     pub(crate) argmax_batched: CudaFunction,
@@ -6776,6 +6876,7 @@ impl CudaResidentKernels {
             rope_batched: f("rope_batched")?,
             kv_scatter_batched: f("kv_scatter_batched")?,
             attention_batched: f("attention_batched")?,
+            attention_sw_batched: f("attention_sw_batched")?,
             kv_scatter_tree_batched: f("kv_scatter_tree_batched")?,
             attention_tree_batched: f("attention_tree_batched")?,
             argmax_batched: f("argmax_batched")?,
@@ -9078,6 +9179,79 @@ pub(crate) fn launch_attention_batched(
         .arg(&qpt)
         .arg(&ki)
         .arg(&splitk_active);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+/// Batched sliding-window attention (`attention_sw_batched`), the windowed counterpart of
+/// [`launch_attention_batched`]. `window == 0` means no crop, i.e. plain causal.
+///
+/// `block_dim` is fixed at `head_dim` rather than exposed, because the scalar
+/// `attention_decode_sw` this must stay bit-identical to derives its reduction group count
+/// as `blockDim.x / head_dim`. The reference is the **gemma4** call site, which launches the
+/// scalar kernel at exactly `head_dim` (G = 1); [`launch_attention_sw`] sizes G from the
+/// position count instead and is a different reduction, so this is not a drop-in for it.
+///
+/// Lands ahead of its production caller, the same way `q4_0_gemm_routed` did: certified by
+/// `attention_sw_batched_matches_gemma4_scalar_decode` first, wired into
+/// `Gemma4CudaResident::verify_batch_moe` second. Proving the kernel bitwise against decode
+/// is the part that is hard to get right and easy to get wrong quietly, so it is worth
+/// having settled before any plumbing depends on it.
+#[allow(clippy::too_many_arguments, dead_code)]
+pub(crate) fn launch_attention_sw_batched(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    q: &CudaSlice<f32>,
+    cache_k: &CudaSlice<u16>,
+    cache_v: &CudaSlice<u16>,
+    out: &mut CudaSlice<f32>,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    base_position: usize,
+    max_pos: usize,
+    scale: f32,
+    window: usize,
+    q_per_token: usize,
+    k: usize,
+) -> Result<(), cudarc::driver::DriverError> {
+    // Shared = query (head_dim) + scores over the widest window any token in the batch
+    // sees. The last token has the longest prefix, and the window crops it.
+    let widest = base_position + k;
+    let span = if window > 0 {
+        widest.min(window)
+    } else {
+        widest
+    };
+    let shared = ((head_dim + span) as u32) * 4;
+    let cfg = LaunchConfig {
+        grid_dim: ((k * n_heads) as u32, 1, 1),
+        block_dim: (head_dim as u32, 1, 1),
+        shared_mem_bytes: shared,
+    };
+    let (nh, nkv, hd, bp, mp, win, qpt, ki) = (
+        n_heads as i32,
+        n_kv_heads as i32,
+        head_dim as i32,
+        base_position as i32,
+        max_pos as i32,
+        window as i32,
+        q_per_token as i32,
+        k as i32,
+    );
+    let mut b = s.launch_builder(f);
+    b.arg(q)
+        .arg(cache_k)
+        .arg(cache_v)
+        .arg(out)
+        .arg(&nh)
+        .arg(&nkv)
+        .arg(&hd)
+        .arg(&bp)
+        .arg(&mp)
+        .arg(&scale)
+        .arg(&win)
+        .arg(&qpt)
+        .arg(&ki);
     unsafe { b.launch(cfg) }.map(|_| ())
 }
 

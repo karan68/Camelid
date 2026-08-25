@@ -7911,3 +7911,161 @@ fn flash_attention_prefill_tiled_parity() {
         }
     }
 }
+
+// `attention_sw_batched` must be BITWISE identical to the scalar `attention_decode_sw` as
+// the gemma4 runtime launches it -- blockDim.x == head_dim, i.e. G == 1 -- for every token
+// in a verify batch. Anything less than bitwise here is not a rounding detail: gemma4 folds
+// the attention scale (scale == 1.0), so its softmax is extremely peaked and a one-ulp
+// score difference can flip an argmax, which would make speculative verify disagree with
+// plain decode and silently break losslessness.
+//
+// Both gemma4 layer types are covered: sliding (window crops the prefix, and the KV ring
+// wraps modulo a window+1 capacity) and full (window == 0, no crop). The batch sweep
+// includes K == 1 because that is the structural gate the H40 harness runs, and widths
+// where `base + K` straddles the window edge so some tokens in one batch crop and others
+// do not.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn attention_sw_batched_matches_gemma4_scalar_decode() {
+    use cudarc::driver::{LaunchConfig, PushKernelArg};
+
+    let Some(k) = kernels() else {
+        return;
+    };
+    // gemma4 26B-A4B geometry: sliding layers 16 q-heads x 256 over 8 KV heads, the full
+    // layer 16 x 512 over 2. `scale` is 1.0 on both -- gemma folds it into q_norm.
+    //
+    // `kv_capacity` and `context` are deliberately separate. A sliding cache is a ring of
+    // only `window + 1` slots, while the scalar kernel's `scores[]` is indexed by ABSOLUTE
+    // position and sized by the context limit -- that is exactly how the gemma4 runtime
+    // launches it (`mp = src_cap`, shared from `self.max_positions`). Collapsing the two
+    // would make every position land inside the ring and never exercise `p % max_pos`.
+    let cases: [(usize, usize, usize, usize, usize, usize); 2] = [
+        // (n_heads, n_kv, head_dim, window, kv_capacity, context)
+        (16, 8, 256, 1024, 1025, 4096),
+        (16, 2, 512, 0, 4096, 4096),
+    ];
+    let scale = 1.0f32;
+
+    for (n_heads, n_kv, head_dim, window, max_pos, context) in cases {
+        let mut rng = Lcg(0x5eed_1234 ^ (head_dim as u64));
+        let mut cache_k = vec![0f32; n_kv * max_pos * head_dim];
+        let mut cache_v = vec![0f32; n_kv * max_pos * head_dim];
+        for x in cache_k.iter_mut() {
+            *x = rng.next_f32();
+        }
+        for x in cache_v.iter_mut() {
+            *x = rng.next_f32();
+        }
+        let cache_k_bits: Vec<u16> = cache_k
+            .iter()
+            .map(|&x| crate::inference::f32_to_f16_bits(x))
+            .collect();
+        let cache_v_bits: Vec<u16> = cache_v
+            .iter()
+            .map(|&x| crate::inference::f32_to_f16_bits(x))
+            .collect();
+        let dk = k.stream.clone_htod(&cache_k_bits).unwrap();
+        let dv = k.stream.clone_htod(&cache_v_bits).unwrap();
+
+        // Inside the window; straddling its edge (so tokens in ONE batch disagree about
+        // whether the prefix is cropped); and past the ring's capacity, where `p % max_pos`
+        // starts doing real work. That last group matters most: a sliding cache holds only
+        // `window + 1` slots, so every verify batch past position 1025 reads wrapped
+        // history, and it is where a relative-indexed batched kernel is most likely to part
+        // company with an absolute-indexed scalar one.
+        let mut bases: Vec<usize> = vec![7, 64];
+        if window > 0 {
+            bases.extend([window - 3, window, max_pos + 475, 2 * max_pos + 13]);
+        } else {
+            bases.extend([512, 2000]);
+        }
+        for base in bases {
+            for kt in [1usize, 2, 4, 8, 9] {
+                // Bounded by the CONTEXT, not the ring: the scalar kernel's shared
+                // `scores[]` is indexed by absolute position.
+                if base + kt >= context {
+                    continue;
+                }
+                let q_per_token = n_heads * head_dim;
+                let q: Vec<f32> = (0..kt * q_per_token).map(|_| rng.next_f32()).collect();
+                let dq = k.stream.clone_htod(&q).unwrap();
+
+                // Reference: the scalar kernel run once per token, launched EXACTLY the way
+                // `Gemma4CudaResident::forward_token_impl` launches it.
+                let mut reference = vec![0f32; kt * q_per_token];
+                for t in 0..kt {
+                    let position = base + t;
+                    let dpos = k.stream.clone_htod(&[position as i32]).unwrap();
+                    let dq_t = k
+                        .stream
+                        .clone_htod(&q[t * q_per_token..][..q_per_token])
+                        .unwrap();
+                    let mut dout = k.stream.alloc_zeros::<f32>(q_per_token).unwrap();
+                    let cfg = LaunchConfig {
+                        grid_dim: (n_heads as u32, 1, 1),
+                        block_dim: (head_dim as u32, 1, 1),
+                        shared_mem_bytes: ((2 * head_dim + context) as u32) * 4,
+                    };
+                    let (nh, nkv, hd, mp, win) = (
+                        n_heads as i32,
+                        n_kv as i32,
+                        head_dim as i32,
+                        max_pos as i32,
+                        window as i32,
+                    );
+                    let mut b = k.stream.launch_builder(&k.attention_sw);
+                    b.arg(&dq_t)
+                        .arg(&dk)
+                        .arg(&dv)
+                        .arg(&mut dout)
+                        .arg(&nh)
+                        .arg(&nkv)
+                        .arg(&hd)
+                        .arg(&dpos)
+                        .arg(&mp)
+                        .arg(&scale)
+                        .arg(&win);
+                    unsafe { b.launch(cfg) }.unwrap();
+                    k.stream
+                        .memcpy_dtoh(&dout, &mut reference[t * q_per_token..][..q_per_token])
+                        .unwrap();
+                }
+
+                let mut dbatched = k.stream.alloc_zeros::<f32>(kt * q_per_token).unwrap();
+                super::launch_attention_sw_batched(
+                    &k.stream,
+                    &k.attention_sw_batched,
+                    &dq,
+                    &dk,
+                    &dv,
+                    &mut dbatched,
+                    n_heads,
+                    n_kv,
+                    head_dim,
+                    base,
+                    max_pos,
+                    scale,
+                    window,
+                    q_per_token,
+                    kt,
+                )
+                .unwrap();
+                let mut batched = vec![0f32; kt * q_per_token];
+                k.stream.memcpy_dtoh(&dbatched, &mut batched).unwrap();
+
+                for (i, (got, want)) in batched.iter().zip(&reference).enumerate() {
+                    assert_eq!(
+                        got.to_bits(),
+                        want.to_bits(),
+                        "head_dim {head_dim} window {window} base {base} K {kt}: element {i} \
+                         (token {}, head {}, dim {}) is {got} but scalar decode gives {want}",
+                        i / q_per_token,
+                        (i % q_per_token) / head_dim,
+                        i % head_dim,
+                    );
+                }
+            }
+        }
+    }
+}
