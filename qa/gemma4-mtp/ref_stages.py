@@ -1,8 +1,8 @@
 import numpy as np, torch, sys
-sys.path.insert(0, r'C:\Users\timto\AppData\Local\Temp\claude\C--Users-timto\b5a0fa2e-2b45-41c9-8bca-f2b517e201ad\scratchpad')
+from paths import assistant_dir, workdir
 from mtp_inputs import gen, KV_LEN, POSITION_ID
 from transformers import Gemma4AssistantForCausalLM
-MD = r'C:\Users\timto\Projects\Camelid\models\gemma-4-26B-A4B-it-assistant'
+MD = str(assistant_dir())
 torch.set_num_threads(4)
 def as_bf16(b): return torch.from_numpy(b.astype('<u2',copy=False)).view(torch.bfloat16)
 g = gen()
@@ -33,7 +33,7 @@ with torch.inference_mode():
     m(inputs_embeds=torch.cat((as_bf16(g["target_scaled_embedding"]),as_bf16(g["target_final_normalized_hidden"])),dim=-1),
       position_ids=torch.tensor([[POSITION_ID]],dtype=torch.long),
       attention_mask=torch.ones((1,KV_LEN),dtype=torch.long), shared_kv_states=shared, use_cache=False)
-np.savez(r'C:\Users\timto\AppData\Local\Temp\claude\C--Users-timto\b5a0fa2e-2b45-41c9-8bca-f2b517e201ad\scratchpad\stages.npz', **cap)
+np.savez(workdir() / 'stages.npz', **cap)
 print(f"captured {len(cap)} stages")
 for k in ['pre_projection','L0.input_norm','L0.q_proj','L0.q_norm','L0.o_proj','L0.output','final_norm','post_projection']:
     print(f"  {k:22s} n={cap[k].size:6d} |.|={np.linalg.norm(cap[k]):.4f}")

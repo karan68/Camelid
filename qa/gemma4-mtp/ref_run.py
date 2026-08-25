@@ -1,8 +1,8 @@
 import numpy as np, torch, sys, json
-sys.path.insert(0, r'C:\Users\timto\AppData\Local\Temp\claude\C--Users-timto\b5a0fa2e-2b45-41c9-8bca-f2b517e201ad\scratchpad')
+from paths import assistant_dir, oracle_npz, workdir
 from mtp_inputs import gen, INPUT_SPECS, KV_LEN, POSITION_ID
 from transformers import Gemma4AssistantForCausalLM
-MD = r'C:\Users\timto\Projects\Camelid\models\gemma-4-26B-A4B-it-assistant'
+MD = str(assistant_dir())
 torch.set_num_threads(4); torch.use_deterministic_algorithms(True)
 def as_bf16(bits):
     return torch.from_numpy(bits.astype('<u2', copy=False)).view(torch.bfloat16)
@@ -21,7 +21,7 @@ with torch.inference_mode():
                 shared_kv_states=shared, use_cache=False)
 logits = out.logits[0,0].float().numpy()
 recur  = out.last_hidden_state[0,0].float().numpy()
-z = np.load(r'C:\Users\timto\AppData\Local\Temp\claude\C--Users-timto\b5a0fa2e-2b45-41c9-8bca-f2b517e201ad\scratchpad\oracle.npz')
+z = np.load(oracle_npz())
 def bf(b): return (b.astype(np.uint32)<<16).view(np.float32)
 wr = bf(z['recurrent_hidden_bf16_le']); wl = bf(z['logits_bf16_le'])
 cr = float(recur@wr/(np.linalg.norm(recur)*np.linalg.norm(wr)))
@@ -30,4 +30,4 @@ top = np.argsort(-logits)[:16]
 print(f"top8 ours  : {top[:8].tolist()}")
 print(f"top8 oracle: {z['top16_token_ids'][:8].tolist()}")
 print(f"top16 match: {list(top)==list(z['top16_token_ids'])}")
-np.save(r'C:\Users\timto\AppData\Local\Temp\claude\C--Users-timto\b5a0fa2e-2b45-41c9-8bca-f2b517e201ad\scratchpad\ref_recur.npy', recur)
+np.save(workdir() / 'ref_recur.npy', recur)

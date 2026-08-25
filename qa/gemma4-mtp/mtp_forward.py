@@ -1,8 +1,8 @@
-import numpy as np, json, struct, sys, math
-sys.path.insert(0, r'C:\Users\timto\AppData\Local\Temp\claude\C--Users-timto\b5a0fa2e-2b45-41c9-8bca-f2b517e201ad\scratchpad')
+import numpy as np, json, os, struct, sys, math
+from paths import assistant_dir, oracle_npz
 from mtp_inputs import gen, bf16_to_f32, KV_LEN, POSITION_ID
 
-MD = r'C:\Users\timto\Projects\Camelid\models\gemma-4-26B-A4B-it-assistant'
+MD = str(assistant_dir())
 EPS = 1e-6
 
 class ST:
@@ -88,10 +88,10 @@ def forward(st, g, dbg=False):
     return h, recur
 
 if __name__ == '__main__':
-    st = ST(MD + r'\model.safetensors')
+    st = ST(os.path.join(MD, 'model.safetensors'))
     g = gen()
     h, recur = forward(st, g, dbg=True)
-    z = np.load(r'C:\Users\timto\AppData\Local\Temp\claude\C--Users-timto\b5a0fa2e-2b45-41c9-8bca-f2b517e201ad\scratchpad\oracle.npz')
+    z = np.load(oracle_npz())
     want_recur = bf16_to_f32(z['recurrent_hidden_bf16_le'])
     print(f"\nrecurrent_hidden: ours |.|={np.linalg.norm(recur):.4f}  oracle |.|={np.linalg.norm(want_recur):.4f}")
     print(f"  cosine = {float(recur@want_recur/(np.linalg.norm(recur)*np.linalg.norm(want_recur))):.6f}")
