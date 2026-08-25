@@ -5605,6 +5605,50 @@ struct BenchGenerateRecord {
     output_token_ids: Vec<u32>,
 }
 
+/// Commit label carried by benchmark JSONL records. An explicit runtime override
+/// remains useful for externally orchestrated comparisons, but ordinary runs
+/// must identify the binary that actually produced the record.
+fn benchmark_commit() -> String {
+    let runtime_override = std::env::var("CAMELID_COMMIT").ok();
+    resolve_benchmark_commit(
+        runtime_override.as_deref(),
+        &camelid::receipt::camelid_commit(),
+    )
+}
+
+fn resolve_benchmark_commit(runtime_override: Option<&str>, embedded_commit: &str) -> String {
+    runtime_override
+        .map(str::trim)
+        .filter(|commit| !commit.is_empty())
+        .unwrap_or(embedded_commit)
+        .to_string()
+}
+
+#[cfg(test)]
+mod benchmark_commit_tests {
+    use super::resolve_benchmark_commit;
+
+    #[test]
+    fn benchmark_commit_defaults_to_the_binarys_embedded_commit() {
+        assert_eq!(
+            resolve_benchmark_commit(None, "0123456789abcdef"),
+            "0123456789abcdef"
+        );
+        assert_eq!(
+            resolve_benchmark_commit(Some(" \t"), "0123456789abcdef"),
+            "0123456789abcdef"
+        );
+    }
+
+    #[test]
+    fn benchmark_commit_honors_a_nonempty_runtime_override() {
+        assert_eq!(
+            resolve_benchmark_commit(Some("  campaign-label  "), "0123456789abcdef"),
+            "campaign-label"
+        );
+    }
+}
+
 /// §5: set (or clear) the three managed x86 Q8 `groups_per_chunk` env knobs for a
 /// trial. `None` clears them so the trial measures the profile's default tiling;
 /// `Some` pins the search candidate's values. Must be called AFTER
@@ -6568,7 +6612,7 @@ fn run_bench_owner_sweep(
     };
 
     let model_label = model.display().to_string();
-    let commit = std::env::var("CAMELID_COMMIT").unwrap_or_else(|_| "unknown".to_string());
+    let commit = benchmark_commit();
     let total_rounds = warmup_rounds + rounds;
     eprintln!(
         "[bench-owner-sweep] lane={} {prompt_tokens} prompt tokens, {} configs, {warmup_rounds} warmup + {rounds} measured rounds interleaved",
@@ -6726,7 +6770,7 @@ fn run_bench_generate(
         })
     };
 
-    let commit = std::env::var("CAMELID_COMMIT").unwrap_or_else(|_| "unknown".to_string());
+    let commit = benchmark_commit();
     let quantization = camelid::receipt::quantization_label(&gguf);
     let model_label = model.display().to_string();
 
@@ -6832,7 +6876,7 @@ fn run_bench_generate_runnable(
         let _ = runnable.generate(&prompt_token_ids, max_tokens)?;
     }
 
-    let commit = std::env::var("CAMELID_COMMIT").unwrap_or_else(|_| "unknown".to_string());
+    let commit = benchmark_commit();
     let quantization = camelid::receipt::quantization_label(&gguf);
     let model_label = model.display().to_string();
     let stdout = std::io::stdout();
@@ -7808,7 +7852,7 @@ fn run_bench_speculative(
 
     let record = BenchSpeculativeRecord {
         runtime: "camelid",
-        commit: std::env::var("CAMELID_COMMIT").unwrap_or_else(|_| "unknown".to_string()),
+        commit: benchmark_commit(),
         workload,
         model: model.display().to_string(),
         draft_model: draft_model.as_ref().map(|p| p.display().to_string()),
