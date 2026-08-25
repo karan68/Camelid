@@ -2403,6 +2403,85 @@ extern "C" __global__ void q4_0_gemm_routed(
     }
 }
 
+// ---- Routed Q4_1 GEMM: the mixed-format half of the same lever -------------
+// The 26B-A4B `.cghost` is MIXED — `down_exps` is Q4_1 in layers 0..=6 and Q4_0 in
+// 7..=29 — so batching only the Q4_0 form would leave a seventh of the stack on the
+// redundant GEMV path. A speculative verify pays that on every round, which is why
+// this twin exists rather than a fallback.
+//
+// Identical to `q4_0_gemm_routed` in every structural respect: same CSR assignment
+// (`token_offsets[e]..token_offsets[e+1]` indexes `token_ids`), same weight-in-registers
+// reuse across an expert's tokens, same per-ASSIGNMENT output so the caller's route-order
+// weighted sum keeps its accumulation order, same one-lane fold over increasing b. Only
+// the block decode differs: 20 wire bytes, two f16 scales, and the
+// `(w_d*isum + w_m*asum) * input_scale` term.
+//
+// BIT-IDENTICAL to `q4_1_gemv_routed`. That kernel spells the block out as a scalar
+// 16-iteration nibble loop; `q4_1_dot32_dp4a_packed` consumes the same bytes with the same
+// low/high nibble split and the same activation pairing (y[j] with lo, y[16+j] with hi),
+// and integer sums are exact regardless of grouping, so `isum` and `asum` are the same
+// integers. The float term is then the same expression on the same values. Pinned by
+// `q4_1_gemm_routed_matches_gemv`.
+extern "C" __global__ void q4_1_gemm_routed(
+    const float* __restrict__ input_scales,
+    const signed char* __restrict__ input_quants,
+    const unsigned char* __restrict__ weight_arena,
+    const int* __restrict__ slot_ids,
+    const int* __restrict__ token_offsets,
+    const int* __restrict__ token_ids,
+    unsigned long long weight_stride, int rows, int blocks_per_row,
+    float* __restrict__ output, int expert_count, int tile
+) {
+    int expert = blockIdx.y;
+    if (expert >= expert_count) return;
+    int first = token_offsets[expert];
+    int count = token_offsets[expert + 1] - first;
+    int tile_base = blockIdx.z * tile;
+    if (tile_base >= count) return;
+    int n_tok = count - tile_base;
+    if (n_tok > tile) n_tok = tile;
+
+    const unsigned char* expert_weights = weight_arena + (long)slot_ids[expert] * weight_stride;
+
+    extern __shared__ float smem41gr[];
+    int warp = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    int warps_per_block = blockDim.x >> 5;
+    int row = blockIdx.x * warps_per_block + warp;
+    float* myterms = smem41gr + (long)warp * tile * blocks_per_row;
+    const int WIRE = 20;
+
+    if (row < rows) {
+        long row_block0 = (long)row * blocks_per_row;
+        for (int b = lane; b < blocks_per_row; b += 32) {
+            const unsigned char* blk = expert_weights + (row_block0 + b) * WIRE;
+            float w_d = f16_bits_to_f32((unsigned short)(blk[0] | (blk[1] << 8)));
+            float w_m = f16_bits_to_f32((unsigned short)(blk[2] | (blk[3] << 8)));
+            uint4 packed = make_uint4(
+                q4_pack4_le(blk + 4), q4_pack4_le(blk + 8),
+                q4_pack4_le(blk + 12), q4_pack4_le(blk + 16));
+            for (int j = 0; j < n_tok; j++) {
+                int t = token_ids[first + tile_base + j];
+                const signed char* y = input_quants
+                    + ((long)t * blocks_per_row + b) * 32;
+                int2 sums = q4_1_dot32_dp4a_packed(packed, y);
+                myterms[(long)j * blocks_per_row + b] =
+                    (w_d * (float)sums.x + w_m * (float)sums.y)
+                    * input_scales[(long)t * blocks_per_row + b];
+            }
+        }
+    }
+    __syncwarp();
+    if (row < rows && lane == 0) {
+        for (int j = 0; j < n_tok; j++) {
+            float acc = 0.0f;
+            for (int b = 0; b < blocks_per_row; b++)
+                acc += myterms[(long)j * blocks_per_row + b];
+            output[(long)(first + tile_base + j) * rows + row] = acc;
+        }
+    }
+}
+
 extern "C" __global__ void q4_1_gemm_batched(
     const float* __restrict__ input_scales, const signed char* __restrict__ input_quants,
     const unsigned char* __restrict__ weight_bytes, int rows, int blocks_per_row,
@@ -6651,6 +6730,7 @@ pub struct CudaResidentKernels {
     pub(crate) q4_0_gemv_routed_rows: CudaFunction,
     /// Prefill counterpart of `q4_0_gemv_routed`: one expert against its CSR token list.
     pub(crate) q4_0_gemm_routed: CudaFunction,
+    pub(crate) q4_1_gemm_routed: CudaFunction,
     pub(crate) q4_1_gemv_routed: CudaFunction,
     pub(crate) q2k_gemv_routed: CudaFunction,
     pub(crate) geglu_quantize_routed: CudaFunction,
@@ -6863,6 +6943,7 @@ impl CudaResidentKernels {
             q4_0_gemv_routed: f("q4_0_gemv_routed")?,
             q4_0_gemv_routed_rows: f("q4_0_gemv_routed_rows")?,
             q4_0_gemm_routed: f("q4_0_gemm_routed")?,
+            q4_1_gemm_routed: f("q4_1_gemm_routed")?,
             q4_1_gemv_routed: f("q4_1_gemv_routed")?,
             q2k_gemv_routed: f("q2k_gemv_routed")?,
             geglu_quantize_routed: f("geglu_quantize_routed")?,

@@ -3014,8 +3014,36 @@ fn q1t_fixture(rows: usize, cols: usize, rng: &mut Lcg) -> Vec<u8> {
     super::repack_q1_t128(&wire, rows, cols).unwrap()
 }
 
+/// Bring up the resident kernels, or skip when this machine has no CUDA device.
+///
+/// The distinction matters. `CudaResidentKernels::new().ok()` collapsed "there is no GPU
+/// here" and "the GPU is here and the module failed to build" into the same `None`, and
+/// every `#[ignore]`d parity test in this file then returned early and reported **ok**. A
+/// bitwise gate that passes in 0.3 s because the kernels never compiled is worse than no
+/// gate: it is a green tick over an untested claim, and it took a suspiciously fast test
+/// run to notice.
+///
+/// So: no device -> skip, which is the honest outcome on a CI box without a GPU. Device
+/// present but bring-up failed -> panic with the driver's own message, because on a
+/// machine that can run these tests, not running them is a failure.
 fn kernels() -> Option<CudaResidentKernels> {
-    CudaResidentKernels::new().ok()
+    match CudaResidentKernels::new() {
+        Ok(kernels) => Some(kernels),
+        Err(error) => {
+            let ordinal = crate::cuda::selected_device_ordinal();
+            match cudarc::driver::CudaContext::new(ordinal) {
+                Ok(_) => panic!(
+                    "CUDA device {ordinal} is present but the resident kernel module failed to \
+                     build, so this test would otherwise have reported a pass without running: \
+                     {error}"
+                ),
+                Err(_) => {
+                    eprintln!("skip: no usable CUDA device (ordinal {ordinal}): {error}");
+                    None
+                }
+            }
+        }
+    }
 }
 
 fn close(a: &[f32], b: &[f32], tol: f32) -> bool {
@@ -8067,5 +8095,168 @@ fn attention_sw_batched_matches_gemma4_scalar_decode() {
                 }
             }
         }
+    }
+}
+
+/// `q4_1_gemm_routed` must be BITWISE identical to per-assignment `q4_1_gemv_routed`.
+///
+/// The Q4_1 twin of `q4_0_gemm_routed_matches_gemv`, and it needs its own gate rather than
+/// riding on that one: the two kernels agree structurally but decode blocks differently,
+/// and the Q4_1 term `(w_d*isum + w_m*asum)` has a second scale and a second integer sum
+/// that the Q4_0 form simply does not have. The reference spells that block out as a
+/// scalar 16-iteration nibble loop while this kernel uses the packed dp4a helper, so what
+/// is really being pinned here is that the two produce the same integers.
+///
+/// Real geometries (the 26B-A4B `down_exps` shapes), a ragged CSR including an expert with
+/// zero tokens and one with more than a tile, a permuted slot map, and `tile` small enough
+/// that the `blockIdx.z` path runs.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn q4_1_gemm_routed_matches_gemv() {
+    let Some(k) = kernels() else {
+        return;
+    };
+    for (rows, bpr, seed) in [(2816usize, 22usize, 0x6e_11u64), (1408, 88, 0x6e_12)] {
+        let experts = 4usize;
+        let n_tokens = 7usize;
+        let kdim = bpr * 32;
+        let mut rng = Lcg(seed);
+
+        let per_slot = rows * bpr * 20;
+        let mut arena = Vec::with_capacity(experts * per_slot);
+        for _ in 0..experts {
+            arena.extend_from_slice(&synth_q4_1_wire(rows, bpr, &mut rng));
+        }
+        let mut in_s = vec![0f32; n_tokens * bpr];
+        let mut in_q = vec![0i8; n_tokens * kdim];
+        for t in 0..n_tokens {
+            let act: Vec<f32> = (0..kdim).map(|_| rng.next_f32()).collect();
+            let q8 = crate::inference::quantize_q8_0_blocks(&act);
+            for (b, blk) in q8.iter().enumerate() {
+                in_s[t * bpr + b] = blk.scale;
+                in_q[t * kdim + b * 32..t * kdim + (b + 1) * 32].copy_from_slice(&blk.quants);
+            }
+        }
+        // Ragged: expert 0 -> 3 tokens, 1 -> none, 2 -> 1, 3 -> 4. A repeated token id
+        // (5 appears twice) checks that output is keyed by ASSIGNMENT, not by token.
+        let token_offsets: Vec<i32> = vec![0, 3, 3, 4, 8];
+        let token_ids: Vec<i32> = vec![5, 0, 3, 6, 2, 4, 1, 5];
+        let slots: Vec<i32> = vec![2, 0, 3, 1];
+        let assignments = *token_offsets.last().unwrap() as usize;
+
+        let d_s = k.stream.clone_htod(&in_s).unwrap();
+        let d_q = k.stream.clone_htod(&in_q).unwrap();
+        let d_w = k.stream.clone_htod(&arena).unwrap();
+        let d_slots = k.stream.clone_htod(&slots).unwrap();
+        let d_off = k.stream.clone_htod(&token_offsets).unwrap();
+        let d_tok = k.stream.clone_htod(&token_ids).unwrap();
+
+        // Reference: the shipped GEMV, once per assignment, single-token activation view.
+        let mut reference = vec![0f32; assignments * rows];
+        for e in 0..experts {
+            let (lo, hi) = (token_offsets[e] as usize, token_offsets[e + 1] as usize);
+            for a in lo..hi {
+                let t = token_ids[a] as usize;
+                let d_s1 = k.stream.clone_htod(&in_s[t * bpr..(t + 1) * bpr]).unwrap();
+                let d_q1 = k
+                    .stream
+                    .clone_htod(&in_q[t * kdim..(t + 1) * kdim])
+                    .unwrap();
+                let one_slot: Vec<i32> = vec![slots[e]];
+                let one_route: Vec<i32> = vec![0];
+                let d_s1s = k.stream.clone_htod(&one_slot).unwrap();
+                let d_r1 = k.stream.clone_htod(&one_route).unwrap();
+                let mut d_out = k.stream.alloc_zeros::<f32>(rows).unwrap();
+                use cudarc::driver::{LaunchConfig, PushKernelArg};
+                let block = 256u32;
+                let warps = block / 32;
+                let cfg = LaunchConfig {
+                    grid_dim: ((rows as u32).div_ceil(warps), 1, 1),
+                    block_dim: (block, 1, 1),
+                    shared_mem_bytes: bpr as u32 * 32 + bpr as u32 * 4 + warps * bpr as u32 * 4,
+                };
+                let (stride, rows_i, bpr_i, one, zero) =
+                    (per_slot as u64, rows as i32, bpr as i32, 1i32, 0i32);
+                let mut b = k.stream.launch_builder(&k.q4_1_gemv_routed);
+                b.arg(&d_s1)
+                    .arg(&d_q1)
+                    .arg(&d_w)
+                    .arg(&d_s1s)
+                    .arg(&d_r1)
+                    .arg(&stride)
+                    .arg(&rows_i)
+                    .arg(&bpr_i)
+                    .arg(&mut d_out)
+                    .arg(&one)
+                    .arg(&zero);
+                unsafe { b.launch(cfg) }.unwrap();
+                k.stream
+                    .memcpy_dtoh(&d_out, &mut reference[a * rows..(a + 1) * rows])
+                    .unwrap();
+                k.ctx.synchronize().unwrap();
+            }
+        }
+
+        let tile = 2usize;
+        let max_count = (0..experts)
+            .map(|e| token_offsets[e + 1] - token_offsets[e])
+            .max()
+            .unwrap() as usize;
+        let mut d_out = k.stream.alloc_zeros::<f32>(assignments * rows).unwrap();
+        {
+            use cudarc::driver::{LaunchConfig, PushKernelArg};
+            let block = 256u32;
+            let warps = block / 32;
+            let cfg = LaunchConfig {
+                grid_dim: (
+                    (rows as u32).div_ceil(warps),
+                    experts as u32,
+                    max_count.div_ceil(tile) as u32,
+                ),
+                block_dim: (block, 1, 1),
+                shared_mem_bytes: warps * tile as u32 * bpr as u32 * 4,
+            };
+            let (stride, rows_i, bpr_i, experts_i, tile_i) = (
+                per_slot as u64,
+                rows as i32,
+                bpr as i32,
+                experts as i32,
+                tile as i32,
+            );
+            let mut b = k.stream.launch_builder(&k.q4_1_gemm_routed);
+            b.arg(&d_s)
+                .arg(&d_q)
+                .arg(&d_w)
+                .arg(&d_slots)
+                .arg(&d_off)
+                .arg(&d_tok)
+                .arg(&stride)
+                .arg(&rows_i)
+                .arg(&bpr_i)
+                .arg(&mut d_out)
+                .arg(&experts_i)
+                .arg(&tile_i);
+            unsafe { b.launch(cfg) }.unwrap();
+        }
+        let mut got = vec![0f32; assignments * rows];
+        k.stream.memcpy_dtoh(&d_out, &mut got).unwrap();
+        k.ctx.synchronize().unwrap();
+
+        let mismatches = got
+            .iter()
+            .zip(&reference)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        assert_eq!(
+            mismatches,
+            0,
+            "q4_1_gemm_routed must be BITWISE identical to per-assignment q4_1_gemv_routed \
+             (rows {rows}, blocks/row {bpr}): {mismatches}/{} outputs differ",
+            got.len()
+        );
+        assert!(
+            reference.iter().any(|v| *v != 0.0),
+            "degenerate fixture: the reference produced all zeros"
+        );
     }
 }
