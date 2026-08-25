@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url'
 const root = resolve(fileURLToPath(new URL('..', import.meta.url)))
 const tests = [
   'tools/bench/system/test-pi-contract.mjs',
+  'tools/bench/system/test-pi-openai-contract.mjs',
   'tools/bench/system/test-pi-adapter.mjs',
   'tools/bench/system/test-pi-bundle.mjs',
   'tools/bench/system/test-pi-cli.mjs',

@@ -35,6 +35,10 @@ namespace. Pi receives an isolated ephemeral config/home, no session, no
 project trust, no context/resource discovery, offline startup, and an exact
 shared-tool allowlist. Pi JSON stream v3 is parsed from full stdout after both
 processes are terminal; repository scoring remains independent of final prose.
+The checked compatibility fixture records the real pinned release sending
+`max_tokens`, SSE usage frames, non-strict function tools, and a nameless tool
+result continuation. `developer`, `max_completion_tokens`, `reasoning_effort`,
+`store`, strict tools, and grammar tools remain explicitly unqualified.
 
 ## Safety and validity
 
@@ -181,6 +185,7 @@ node tools/bench/system/test-runtime-adapter.mjs
 node tools/bench/system/test-bundle.mjs
 node tools/bench/system/test-cli.mjs
 node tools/bench/system/test-pi-contract.mjs
+node tools/bench/system/test-pi-openai-contract.mjs
 node tools/bench/system/test-pi-adapter.mjs
 node tools/bench/system/test-pi-bundle.mjs
 node tools/bench/system/test-pi-cli.mjs
