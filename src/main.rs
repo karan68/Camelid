@@ -2743,6 +2743,9 @@ struct Gemma4HarnessRun<'a> {
     /// prompt sweep -- a layer-major prefill touches most of the 12 GiB payload once --
     /// so decode traffic is only visible as the difference.
     sser_prefill: (u64, u64),
+    /// Host expert tier `(hits, storage reads)`, lifetime and at the prefill boundary.
+    tier: (u64, u64),
+    tier_prefill: (u64, u64),
     /// Throughput over the second half of the decode forwards, past the arena warm-up.
     ///
     /// Layer-major prefill leaves the expert arena holding the LAST layer's union, so
@@ -2839,41 +2842,78 @@ impl Gemma4HarnessRun<'_> {
                     0.0
                 },
             })),
-            "expert_cache": self.sser.map(|(hits, misses, resident, capacity)| {
-                let rounds = self.stats.map(|stats| stats.rounds).unwrap_or(0);
-                let (prefill_hits, prefill_misses) = self.sser_prefill;
-                let decode_misses = misses.saturating_sub(prefill_misses);
-                let decode_hits = hits.saturating_sub(prefill_hits);
-                serde_json::json!({
-                    "hits": hits,
-                    "misses": misses,
-                    "prefill_hits": prefill_hits,
-                    "prefill_misses": prefill_misses,
-                    "decode_hits": decode_hits,
-                    "decode_misses": decode_misses,
-                    "decode_misses_per_token": decode_misses as f64 / (self.ids.len().max(1)) as f64,
-                    "decode_hit_rate": if decode_hits + decode_misses > 0 {
-                        decode_hits as f64 / (decode_hits + decode_misses) as f64
-                    } else {
-                        0.0
-                    },
-                    "decode_miss_mib": decode_misses as f64 * 3.19,
-                    // Per ROUND is incomparable across lanes, because a round commits one
-                    // token plain and `1 + alpha` speculatively. Per committed token is
-                    // the figure that answers "did batching change what we read?", so it
-                    // is emitted for both lanes and the round figure only where a round
-                    // exists.
-                    "misses_per_committed_token": misses as f64 / (self.ids.len().max(1)) as f64,
-                    "misses_per_round": if rounds > 0 {
-                        serde_json::json!(misses as f64 / rounds as f64)
-                    } else {
-                        serde_json::Value::Null
-                    },
-                    "resident_experts": resident,
-                    "capacity": capacity,
-                })
-            }),
+            "expert_cache": self.expert_cache_json(),
             "rounds": rounds,
+        })
+    }
+
+    /// Expert-cache and host-tier counters for the receipt.
+    ///
+    /// Split out of `receipt` because that whole value is one `json!`, which expands
+    /// recursively -- adding the tier fields inline pushed it past the macro's recursion
+    /// limit. Every derived figure is also computed as a local first: a braced block at a
+    /// `json!` value position is parsed as a nested JSON OBJECT, not as a Rust block, so
+    /// inlining the arithmetic there fails with a confusing "missing tokens" error.
+    fn expert_cache_json(&self) -> Option<serde_json::Value> {
+        let ratio = |hits: u64, misses: u64| -> f64 {
+            if hits + misses > 0 {
+                hits as f64 / (hits + misses) as f64
+            } else {
+                0.0
+            }
+        };
+        self.sser.map(|(hits, misses, resident, capacity)| {
+            let emitted = self.ids.len().max(1) as f64;
+            let rounds = self.stats.map(|stats| stats.rounds).unwrap_or(0);
+            let (prefill_hits, prefill_misses) = self.sser_prefill;
+            let decode_misses = misses.saturating_sub(prefill_misses);
+            let decode_hits = hits.saturating_sub(prefill_hits);
+            // A layer-major prefill streams most of the payload once, so its tier lookups
+            // are first touches that cannot hit. Mixing them into a lifetime rate makes a
+            // tier decode never benefits from look merely mediocre instead of absent.
+            let tier_decode_hits = self.tier.0.saturating_sub(self.tier_prefill.0);
+            let tier_decode_reads = self.tier.1.saturating_sub(self.tier_prefill.1);
+            // With no tier every arena miss is a disk read; with one, only the tier's own
+            // storage reads are.
+            let decode_storage_reads = if self.tier.0 + self.tier.1 > 0 {
+                tier_decode_reads
+            } else {
+                decode_misses
+            };
+            // Per ROUND is incomparable across lanes, because a round commits one token
+            // plain and `1 + alpha` speculatively. Per committed token is the figure that
+            // answers "did batching change what we read?", so it is emitted for both lanes
+            // and the round figure only where a round exists.
+            let misses_per_round = if rounds > 0 {
+                serde_json::json!(misses as f64 / rounds as f64)
+            } else {
+                serde_json::Value::Null
+            };
+            serde_json::json!({
+                "hits": hits,
+                "misses": misses,
+                "prefill_hits": prefill_hits,
+                "prefill_misses": prefill_misses,
+                "decode_hits": decode_hits,
+                "decode_misses": decode_misses,
+                "decode_misses_per_token": decode_misses as f64 / emitted,
+                "decode_hit_rate": ratio(decode_hits, decode_misses),
+                // A VRAM-arena miss is not necessarily a disk read: with a host tier in
+                // front of storage, 30.7% of them were served from RAM on the measured
+                // run. Report the arena miss and the actual storage read separately --
+                // conflating them overstated decode storage by 1.5 GiB.
+                "decode_storage_reads": decode_storage_reads,
+                "decode_storage_mib": decode_storage_reads as f64 * 3.19,
+                "tier_hits": self.tier.0,
+                "tier_storage_reads": self.tier.1,
+                "tier_decode_hits": tier_decode_hits,
+                "tier_decode_storage_reads": tier_decode_reads,
+                "tier_decode_hit_rate": ratio(tier_decode_hits, tier_decode_reads),
+                "misses_per_committed_token": misses as f64 / emitted,
+                "misses_per_round": misses_per_round,
+                "resident_experts": resident,
+                "capacity": capacity,
+            })
         })
     }
 
@@ -4104,6 +4144,8 @@ async fn main() -> anyhow::Result<()> {
                     stats: Some(&stats),
                     sser: runtime.sser_stats(),
                     sser_prefill: runtime.sser_prefill_mark(),
+                    tier: runtime.host_tier_counters(),
+                    tier_prefill: runtime.host_tier_prefill_mark(),
                     // Speculative rounds are not per-token forwards, so there is no
                     // second-half token rate to quote here.
                     steady_tokens_per_second: None,
@@ -4208,6 +4250,8 @@ async fn main() -> anyhow::Result<()> {
                 stats: None,
                 sser,
                 sser_prefill: runtime.sser_prefill_mark(),
+                tier: runtime.host_tier_counters(),
+                tier_prefill: runtime.host_tier_prefill_mark(),
                 steady_tokens_per_second: {
                     let half = per_token.len() / 2;
                     let tail: f64 = per_token[half..].iter().sum();

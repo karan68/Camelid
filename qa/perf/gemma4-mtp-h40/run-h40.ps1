@@ -401,10 +401,15 @@ if ($null -ne $receipt.expert_cache) {
     Write-Host ('[h40] expert cache {0}/{1} resident | prefill {2} misses | decode {3} misses = {4:N1}/token, {5:P1} hit' -f `
             $ec.resident_experts, $ec.capacity, $ec.prefill_misses, $ec.decode_misses, `
             $ec.decode_misses_per_token, $ec.decode_hit_rate)
-    # One miss is one ~3.19 MiB record off the .cghost at 1.3-1.9 GB/s, so this is the
-    # floor a storage-bound round cannot beat.
-    Write-Host ('[h40] decode storage: {0:N0} MiB, i.e. >= {1:N0} ms at 1.9 GB/s' -f `
-            $ec.decode_miss_mib, ($ec.decode_miss_mib / 1900.0 * 1000.0))
+    # One storage read is one ~3.19 MiB record off the .cghost at 1.3-1.9 GB/s, so this
+    # is the floor a storage-bound decode cannot beat. Arena misses served by the host
+    # tier are RAM, not disk, and are excluded.
+    Write-Host ('[h40] decode storage: {0} reads = {1:N0} MiB, i.e. >= {2:N0} ms at 1.9 GB/s' -f `
+            $ec.decode_storage_reads, $ec.decode_storage_mib, ($ec.decode_storage_mib / 1900.0 * 1000.0))
+    if ($ec.tier_storage_reads -gt 0 -or $ec.tier_hits -gt 0) {
+        Write-Host ('[h40] host tier: {0} hits lifetime | DECODE {1} hits / {2} storage reads = {3:P1}' -f `
+                $ec.tier_hits, $ec.tier_decode_hits, $ec.tier_decode_storage_reads, $ec.tier_decode_hit_rate)
+    }
 }
 Write-Host ('[h40] host delta: available {0:+#;-#;0} MiB | pagefile {1:+#;-#;0} MiB | hard-fault pages in {2}' -f `
         $verdict.host_delta.available_mib, $verdict.host_delta.pagefile_current_mib, `

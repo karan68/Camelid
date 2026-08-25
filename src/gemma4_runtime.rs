@@ -8545,6 +8545,11 @@ pub struct Gemma4CudaResident {
     /// `(hits, misses)` as of the end of the last prefill, so a caller can attribute
     /// expert-cache traffic to decode instead of to the prompt sweep that preceded it.
     prefill_sser_mark: std::cell::Cell<(u64, u64)>,
+    /// Host expert tier `(hits, storage reads)` at the same boundary. Split for the same
+    /// reason and a sharper one: a layer-major prefill is a streaming scan of the whole
+    /// payload, so its misses can flush the tier before decode ever asks it anything, and
+    /// a lifetime hit rate cannot tell that apart from a tier that simply does not work.
+    prefill_tier_mark: std::cell::Cell<(u64, u64)>,
     /// Resolved decode read path, decided once on first use. See `decode_bulk_reads`.
     decode_bulk_reads: std::cell::Cell<Option<bool>>,
     // Reused per-token/per-layer device scratch (sized to per-layer maxima).
@@ -9251,6 +9256,7 @@ impl Gemma4CudaResident {
             cache_v,
             cached_tokens: Vec::new(),
             prefill_sser_mark: std::cell::Cell::new((0, 0)),
+            prefill_tier_mark: std::cell::Cell::new((0, 0)),
             decode_bulk_reads: std::cell::Cell::new(None),
             d_hidden: alloc_f(hidden).map_err(cu)?,
             d_normed: alloc_f(hidden).map_err(cu)?,
@@ -9437,6 +9443,20 @@ impl Gemma4CudaResident {
             let c = c.borrow();
             (c.hits, c.misses)
         })
+    }
+
+    /// Host expert tier `(hits, storage reads)` with no side effects. `(0, 0)` when no
+    /// tier was built.
+    pub fn host_tier_counters(&self) -> (u64, u64) {
+        self.host_tier.as_ref().map_or((0, 0), |tier| {
+            let (hits, misses, _, _) = tier.borrow().stats();
+            (hits, misses)
+        })
+    }
+
+    /// Host expert tier `(hits, storage reads)` at the end of the last prefill.
+    pub fn host_tier_prefill_mark(&self) -> (u64, u64) {
+        self.prefill_tier_mark.get()
     }
 
     /// Expert-cache `(hits, misses)` as they stood when the last prefill finished.
@@ -12170,6 +12190,7 @@ impl Gemma4CudaResident {
         // makes "misses per decoded token" a real number.
         self.prefill_sser_mark
             .set(self.sser_counters().unwrap_or((0, 0)));
+        self.prefill_tier_mark.set(self.host_tier_counters());
         Ok(logits)
     }
 
