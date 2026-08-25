@@ -80,7 +80,7 @@ export async function runPiAgentAttempt(options) {
   await writeFile(configPath, configBytes, { flag: 'wx' })
   const configSha256 = sha256Bytes(configBytes)
   const args = piJsonArgs({ modelId: normalized.modelId, goal: taskPackage.task.goal })
-  const launch = prepareLaunch(normalized, materialized.attemptRoot, configPath, args)
+  const launch = prepareLaunch(normalized, materialized.attemptRoot, configPath, args, modelSha256)
 
   const startedAt = performance.now()
   const execution = await runProcess({
@@ -170,7 +170,7 @@ export class PiAdapterError extends Error {
   }
 }
 
-function prepareLaunch(options, attemptRoot, configPath, piArgs) {
+function prepareLaunch(options, attemptRoot, configPath, piArgs, modelSha256) {
   if (options.boundary.kind === 'synthetic') {
     return {
       file: options.piExecutablePath,
@@ -197,6 +197,8 @@ function prepareLaunch(options, attemptRoot, configPath, piArgs) {
       linuxSupervisorPath: windowsPathToWsl(supervisorPath),
       modelId: options.modelId,
       contextWindow: options.contextWindow,
+      sourceSha: options.sourceSha,
+      modelSha256,
       piArgs,
       readyTimeoutSeconds: Math.max(1, Math.ceil(options.timeoutMs / 1000)),
       gpuEnabled: options.boundary.gpuEnabled,
@@ -291,6 +293,8 @@ export function piWslBwrapPrefix({
   linuxSupervisorPath,
   modelId,
   contextWindow,
+  sourceSha,
+  modelSha256,
   piArgs,
   readyTimeoutSeconds,
   gpuEnabled = false,
@@ -340,7 +344,7 @@ export function piWslBwrapPrefix({
     '--setenv', 'CAMELID_PI_READY_TIMEOUT_SECONDS', String(readyTimeoutSeconds),
     ...gpuEnvironmentArgs,
     '/bin/sh', '/opt/controller/pi-camelid-supervisor.sh',
-    '/opt/camelid/camelid', sandboxModelPath, SANDBOX_ADDR, modelId, String(contextWindow), '/opt/pi/pi',
+    '/opt/camelid/camelid', sandboxModelPath, SANDBOX_ADDR, modelId, String(contextWindow), sourceSha, modelSha256, '/opt/pi/pi',
     ...piArgs,
   ]
 }

@@ -1,8 +1,8 @@
 #!/bin/sh
 set -eu
 
-if [ "$#" -lt 7 ]; then
-  printf '%s\n' 'usage: pi-camelid-supervisor CANDIDATE MODEL ADDR MODEL_ID CONTEXT_WINDOW PI PI_ARGS...' >&2
+if [ "$#" -lt 9 ]; then
+  printf '%s\n' 'usage: pi-camelid-supervisor CANDIDATE MODEL ADDR MODEL_ID CONTEXT_WINDOW SOURCE_SHA MODEL_SHA PI PI_ARGS...' >&2
   exit 64
 fi
 
@@ -11,8 +11,10 @@ model=$2
 addr=$3
 model_id=$4
 context_window=$5
-pi=$6
-shift 6
+source_sha=$6
+model_sha=$7
+pi=$8
+shift 8
 
 server_pid=''
 
@@ -69,6 +71,16 @@ while true; do
   fi
   sleep 0.1
 done
+
+current_model=/tmp/camelid-pi-current-model.json
+if ! curl -fsS --max-time 15 "http://$addr/api/models/current" >"$current_model" 2>/dev/null; then
+  printf '%s\n' 'CAMELID_PI_PROVENANCE_UNAVAILABLE' >&2
+  exit 73
+fi
+if ! python3 -c 'import json,sys; model=json.load(sys.stdin); lane=model.get("lane", {}); ok=model.get("id") == sys.argv[1] and lane.get("camelid_commit") == sys.argv[2] and lane.get("gguf_sha256") == sys.argv[3]; raise SystemExit(0 if ok else 1)' "$model_id" "$source_sha" "$model_sha" <"$current_model"; then
+  printf '%s\n' 'CAMELID_PI_PROVENANCE_MISMATCH' >&2
+  exit 73
+fi
 
 printf '%s\n' 'CAMELID_PI_SERVER_READY' >&2
 set +e
