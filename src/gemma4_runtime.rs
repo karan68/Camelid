@@ -1195,6 +1195,45 @@ fn ghost_host_ram_at_load() -> (u64, u64) {
 #[cfg(feature = "cuda")]
 const GHOST_CUDA_HOST_TIER_TOTAL_RAM_DIVISOR: u64 = 5;
 
+/// The same cap when decode reads bypass the page cache. See the sizing function for why
+/// one of the three pressures the fifth was sized against is absent in that regime, and for
+/// the measurement that says a quarter is both faster and still far from the tier size that
+/// actually failed.
+#[cfg(feature = "cuda")]
+const GHOST_CUDA_HOST_TIER_TOTAL_RAM_DIVISOR_UNBUFFERED: u64 = 4;
+
+/// Whether DECODE-phase `.cghost` reads take the unbuffered path, for a payload of
+/// `payload_bytes`.
+///
+/// One definition, because two rules turn on it: the read path itself
+/// ([`Gemma4CudaResident::decode_bulk_reads`]) and the host tier's sizing, whose
+/// installed-RAM cap and coverage gate were both calibrated with the OS page cache as a
+/// live participant. If these two ever disagreed, the tier would be sized for one regime
+/// while the reads ran in the other.
+///
+/// `CAMELID_GEMMA4_GHOST_DECODE_BULK_READS=0/1` forces it; unset compares host RAM at load
+/// against the routed payload.
+#[cfg(feature = "cuda")]
+fn ghost_decode_reads_unbuffered(payload_bytes: u64) -> bool {
+    if let Some(forced) = std::env::var("CAMELID_GEMMA4_GHOST_DECODE_BULK_READS")
+        .ok()
+        .map(|value| {
+            !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no" | "disabled"
+            )
+        })
+    {
+        return forced;
+    }
+    if payload_bytes == 0 {
+        // Not Ghost-backed: there is no streamed payload to reason about.
+        return false;
+    }
+    let (_, available) = ghost_host_ram_at_load();
+    available > 0 && available < payload_bytes
+}
+
 /// Resolve the host expert-tier budget (MiB) for the Ghost-MoE CUDA lane.
 ///
 /// The tier is all-or-nothing by measurement, not by taste. On the tracked box
@@ -1243,7 +1282,28 @@ fn ghost_cuda_host_tier_mib(cghost: &Path, requested_mib: usize) -> usize {
     if payload_mib == 0 {
         return 0;
     }
-    let installed_cap_mib = (total / (1024 * 1024)) / GHOST_CUDA_HOST_TIER_TOTAL_RAM_DIVISOR;
+    // Whether the OS page cache is a live participant. Both the installed-RAM cap below
+    // and the coverage gate further down were calibrated with it in play, and both lose
+    // their premise when decode reads bypass it.
+    let page_cache_absorbs_reads = !ghost_decode_reads_unbuffered(payload_mib * 1024 * 1024);
+    // The divisor's own rationale names three things that squeezed a 5.98 GiB tier down to
+    // "tens of MiB available": WDDM commit, the mapped common weights, and **the `.cghost`
+    // page cache**. The third is gone in the unbuffered regime -- that payload is no longer
+    // being cached at all -- so one of the three pressures the fifth was sized against is
+    // absent, and a fifth leaves the tier stranded just under the reuse distance it exists
+    // to span (re-fetch age ~990 intervening misses against 974 records).
+    //
+    // A quarter selects 4.03 GiB on a 16 GiB host: measured at steady 20.32 tok/s against
+    // 18.7-18.8 at a fifth, with host delta +252 MiB available and pagefile -7 MiB, i.e. no
+    // pressure at all. It also stays well clear of the 5.98 GiB tier that actually failed.
+    // The `available - reserve` term still binds independently, so a host that is merely
+    // large but busy does not get a big tier out of this.
+    let divisor = if page_cache_absorbs_reads {
+        GHOST_CUDA_HOST_TIER_TOTAL_RAM_DIVISOR
+    } else {
+        GHOST_CUDA_HOST_TIER_TOTAL_RAM_DIVISOR_UNBUFFERED
+    };
+    let installed_cap_mib = (total / (1024 * 1024)) / divisor;
     let configured_cap_mib = std::env::var("CAMELID_GEMMA4_GHOST_HOST_TIER_MAX_MIB")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
@@ -1264,7 +1324,6 @@ fn ghost_cuda_host_tier_mib(cghost: &Path, requested_mib: usize) -> usize {
     // row at a 3 GiB tier (26% coverage, 12.2% tier hit rate): steady decode **+36.9%**,
     // 3/3 pairs sign-consistent, token ids identical. The gate is therefore relaxed to 20%
     // in exactly the regime whose premise it has lost, and left at 40% everywhere else.
-    let page_cache_absorbs_reads = available >= payload_mib.saturating_mul(1024 * 1024);
     let (coverage_num, coverage_pct) = if page_cache_absorbs_reads {
         (2u64, 40u64)
     } else {
@@ -12219,45 +12278,26 @@ impl Gemma4CudaResident {
     ///
     /// Decided once and cached, because available RAM drifts during a run and a read path
     /// that flips mid-generation would make every measurement on this lane unreadable.
+    /// Shares [`ghost_decode_reads_unbuffered`] with the host tier's sizing rather than
+    /// re-deriving the condition, so the tier cannot be sized for one regime while the
+    /// reads run in the other.
     fn decode_bulk_reads(&self) -> bool {
         if let Some(decided) = self.decode_bulk_reads.get() {
             return decided;
         }
-        let forced = std::env::var("CAMELID_GEMMA4_GHOST_DECODE_BULK_READS")
-            .ok()
-            .map(|value| {
-                !matches!(
-                    value.trim().to_ascii_lowercase().as_str(),
-                    "0" | "false" | "off" | "no" | "disabled"
-                )
-            });
-        let decided = match forced {
-            Some(forced) => forced,
-            None => {
-                let payload = self.ghost_payload_bytes();
-                if payload == 0 {
-                    // Not Ghost-backed: there is no streamed payload to reason about.
-                    false
-                } else {
-                    // Sampled before this process pinned its arenas -- see
-                    // `ghost_host_ram_at_load`. Reading it here instead would report the
-                    // few hundred MiB left after the tier and the resident core, and the
-                    // rule would answer "unbuffered" on every host alive.
-                    let (_, available) = ghost_host_ram_at_load();
-                    let unbuffered = available > 0 && available < payload;
-                    if unbuffered {
-                        eprintln!(
-                            "[ghost] decode reads: unbuffered ({} MiB available cannot cover the \
-                             {} MiB routed payload, so a mapped miss faults cold); set \
-                             CAMELID_GEMMA4_GHOST_DECODE_BULK_READS=0 to force the map",
-                            available / (1024 * 1024),
-                            payload / (1024 * 1024),
-                        );
-                    }
-                    unbuffered
-                }
-            }
-        };
+        let payload = self.ghost_payload_bytes();
+        let decided = ghost_decode_reads_unbuffered(payload);
+        if decided && payload > 0 {
+            // Sampled before this process pinned its arenas -- see `ghost_host_ram_at_load`.
+            let (_, available) = ghost_host_ram_at_load();
+            eprintln!(
+                "[ghost] decode reads: unbuffered ({} MiB available cannot cover the {} MiB \
+                 routed payload, so a mapped miss faults cold); set \
+                 CAMELID_GEMMA4_GHOST_DECODE_BULK_READS=0 to force the map",
+                available / (1024 * 1024),
+                payload / (1024 * 1024),
+            );
+        }
         self.decode_bulk_reads.set(Some(decided));
         decided
     }
