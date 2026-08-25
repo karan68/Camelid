@@ -1,0 +1,52 @@
+﻿{
+    "label":  "post-handoff-verify",
+    "coldCache":  false,
+    "maxTokens":  8,
+    "expertCacheMib":  64,
+    "rows":  [
+                 {
+                     "Case":  "tiny",
+                     "Rep":  1,
+                     "PreTempC":  52,
+                     "PromptTokens":  32,
+                     "PrefillSec":  4.15,
+                     "PrefillTokPerSec":  7.71,
+                     "Misses":  2281,
+                     "MissesPerToken":  71.3,
+                     "Log":  ".\\qa\\perf\\receipts\\prefill-post-handoff-verify-tiny-1.log"
+                 },
+                 {
+                     "Case":  "small",
+                     "Rep":  1,
+                     "PreTempC":  52,
+                     "PromptTokens":  92,
+                     "PrefillSec":  7.16,
+                     "PrefillTokPerSec":  12.85,
+                     "Misses":  2785,
+                     "MissesPerToken":  30.3,
+                     "Log":  ".\\qa\\perf\\receipts\\prefill-post-handoff-verify-small-1.log"
+                 },
+                 {
+                     "Case":  "medium",
+                     "Rep":  1,
+                     "PreTempC":  52,
+                     "PromptTokens":  362,
+                     "PrefillSec":  16.26,
+                     "PrefillTokPerSec":  22.27,
+                     "Misses":  3353,
+                     "MissesPerToken":  9.3,
+                     "Log":  ".\\qa\\perf\\receipts\\prefill-post-handoff-verify-medium-1.log"
+                 },
+                 {
+                     "Case":  "large",
+                     "Rep":  1,
+                     "PreTempC":  52,
+                     "PromptTokens":  1442,
+                     "PrefillSec":  70.45,
+                     "PrefillTokPerSec":  20.47,
+                     "Misses":  8412,
+                     "MissesPerToken":  5.8,
+                     "Log":  ".\\qa\\perf\\receipts\\prefill-post-handoff-verify-large-1.log"
+                 }
+             ]
+}
