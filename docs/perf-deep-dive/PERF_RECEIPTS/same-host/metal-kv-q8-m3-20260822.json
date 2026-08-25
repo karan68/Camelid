@@ -1,0 +1,2899 @@
+{
+ "schema": "camelid.metal-kv-dtype-ab/v1",
+ "generated_utc": "2026-08-22T21:18:28Z",
+ "status": "negative_receipt_with_identified_blocker",
+ "purpose": "First same-host receipt for the Metal Q8_0-primary resident KV cache. PERF_RECEIPTS/same-host/ carried f16 and f32 arms but no q8 arm, despite the Q8_0 cache and its four MSL kernels having shipped with the Metal appliance work. The question this answers is not 'is q8 faster' but 'what is q8 worth once you control for the split-K decode attention that enabling any compressed primary forfeits' -- a confound no previous receipt separated.",
+ "host": {
+  "cpu": "Apple M3",
+  "gpu": "Apple M3 (unified memory)",
+  "arch": "arm64",
+  "cores_logical": 8,
+  "ram_bytes": 8589934592,
+  "os": "macOS 26.3 (25D5112c)",
+  "note": "NOT an isolated bench host. vm.swapusage showed 1.84 GiB of swap in use and 5.4 GiB wired during the run, on 8 GiB total. Absolute throughput drifts substantially across rounds (f32 decode 41.8 -> 28.8 -> 30.1 tok/s), which is exactly why every verdict below rests on PAIRED WITHIN-ROUND ratios with a bootstrap CI rather than on cross-round absolutes."
+ },
+ "source": {
+  "measured_commit": "5cbee84cba2f59087a1e6a48b84e4ce45a046a67",
+  "branch_base": "1a61c12a3a32ffe781e64ee485a36d916ea051c8",
+  "staleness_check": "origin/main is 355 files ahead of the measured commit and changes src/metal.rs by +702/-20. Verified this does NOT invalidate the measurement: the KV-format gates (kvq8, kv16_enabled, splitk_attention_enabled, ResidentKvFormat, CAMELID_METAL_KV_DTYPE) are untouched, and the newly added attention_matmul_prefill_head_dim_supported returns true for head_dim 64, so the f32 arm retains attention-as-matmul prefill exactly as measured. The other additions are Q5_K, bf16 and BitNet kernels, unreachable for this model.",
+  "build": {
+   "cargo_profile": "release",
+   "bin": "camelid",
+   "rust_toolchain": "1.95.0 (pinned by rust-toolchain.toml)",
+   "version_string": "camelid v0.6.1-15-g5cbee84c"
+  },
+  "environment": "env -i with HOME and PATH only, plus the two arm variables. No other CAMELID_* set, so each arm runs its own zero-configuration defaults."
+ },
+ "model": {
+  "path": "Llama-3.2-1B-Instruct-Q8_0.gguf",
+  "bytes": 1321082528,
+  "sha256": "3f87a880027e7b9ea8e0da9e4009584336f352af444a0e6e5c20721ac4c7ffd1",
+  "dims": {
+   "block_count": 16,
+   "head_count": 32,
+   "head_count_kv": 8,
+   "key_length": 64
+  },
+  "why_this_model": "head_dim 64 satisfies the Q8 resident gate (head_dim % 32 == 0 and <= 128). Q8_0 weights are NOT in metal_f16_kv_tensor_type, so weights_use_kquant() is false and the zero-config resident KV default is F32 -- which makes F32 the honest baseline arm for this model, not F16."
+ },
+ "method": {
+  "harness": "docs/perf-deep-dive/scripts/metal-kv-dtype-ab.sh",
+  "stats": "docs/perf-deep-dive/scripts/metal-kv-dtype-stats.py",
+  "command": "camelid bench-generate MODEL --prompt-file P --max-tokens N --temperature 0 --iterations 1 --warmup --json",
+  "statistic": "median of per-round ratios; bootstrap 95% CI (20000 resamples, seed 677)",
+  "why_cross_process": "resident_kv_format_override() caches CAMELID_METAL_KV_DTYPE in a OnceLock, so the KV format is frozen at first read. `camelid bench-owner-sweep` -- the treaty's preferred harness for sub-5% effects -- re-reads the runtime plan from env per call and therefore cannot sweep KV dtype. One process can measure only one arm, which forces the cross-invocation A/B the treaty warns is drift-prone.",
+  "arms": {
+   "f32": "zero-config default for this model; split-K decode + matmul prefill active",
+   "f16": "CAMELID_METAL_KV_DTYPE=f16",
+   "q8": "CAMELID_METAL_KV_DTYPE=q8 -- the lane under test",
+   "f32-nosplitk": "CAMELID_METAL_ATTN_SPLITK=0 with an F32 primary. The mechanism control. Enabling f16/q8 forfeits split-K (it requires an F32 primary), so without this arm a q8 regression is uninterpretable: a slow quantized kernel and a forfeited split-K are indistinguishable in the totals."
+  },
+  "prompts": "generated from seed 677 by the harness; reproduces byte-for-byte"
+ },
+ "probes": {
+  "short_6tok": {
+   "prompt_tokens": 6,
+   "generated_tokens": 50,
+   "rounds": 5,
+   "runs": 20,
+   "arms": {
+    "f32": {
+     "prefill_ms": {
+      "values": [
+       58.362,
+       58.951,
+       58.219,
+       57.927,
+       58.056
+      ],
+      "median": 58.219
+     },
+     "ttft_ms": {
+      "values": [
+       74.619583,
+       76.220916,
+       74.338459,
+       74.11354200000001,
+       74.502375
+      ],
+      "median": 74.502375
+     },
+     "decode_ms": {
+      "values": [
+       750.127375,
+       749.608958,
+       740.965375,
+       729.4696670000001,
+       728.831417
+      ],
+      "median": 740.965375
+     },
+     "tokens_per_second": {
+      "values": [
+       65.3222394396685,
+       65.3674152063695,
+       66.12994568066017,
+       67.17208708830384,
+       67.23091082117828
+      ],
+      "median": 66.12994568066017
+     },
+     "peak_memory_bytes": {
+      "values": [
+       1521598464,
+       1523187712,
+       1522417664,
+       1523793920,
+       1522909184
+      ],
+      "median": 1522909184
+     }
+    },
+    "f16": {
+     "prefill_ms": {
+      "values": [
+       56.242,
+       55.898,
+       55.559,
+       54.853,
+       55.258
+      ],
+      "median": 55.559
+     },
+     "ttft_ms": {
+      "values": [
+       72.530833,
+       72.202292,
+       71.728125,
+       70.616458,
+       71.253208
+      ],
+      "median": 71.728125
+     },
+     "decode_ms": {
+      "values": [
+       752.053334,
+       741.644,
+       739.019167,
+       731.395583,
+       727.522083
+      ],
+      "median": 739.019167
+     },
+     "tokens_per_second": {
+      "values": [
+       65.15495349163628,
+       66.06943493104508,
+       66.30409898421485,
+       66.99520907552433,
+       67.35190744718604
+      ],
+      "median": 66.30409898421485
+     },
+     "peak_memory_bytes": {
+      "values": [
+       1497546752,
+       1497448448,
+       1497726976,
+       1497907200,
+       1498005504
+      ],
+      "median": 1497726976
+     }
+    },
+    "q8": {
+     "prefill_ms": {
+      "values": [
+       55.677,
+       56.645,
+       56.225,
+       55.708,
+       55.374
+      ],
+      "median": 55.708
+     },
+     "ttft_ms": {
+      "values": [
+       72.04787499999999,
+       72.97854199999999,
+       72.571417,
+       72.036333,
+       71.43950000000001
+      ],
+      "median": 72.04787499999999
+     },
+     "decode_ms": {
+      "values": [
+       747.2506249999999,
+       743.4030419999999,
+       748.741709,
+       730.4539589999999,
+       728.383834
+      ],
+      "median": 743.4030419999999
+     },
+     "tokens_per_second": {
+      "values": [
+       65.57371564593875,
+       65.91310128106794,
+       65.44312866641705,
+       67.08157221446452,
+       67.27222339753357
+      ],
+      "median": 65.91310128106794
+     },
+     "peak_memory_bytes": {
+      "values": [
+       1497956352,
+       1497923584,
+       1497513984,
+       1497825280,
+       1497759744
+      ],
+      "median": 1497825280
+     }
+    },
+    "f32-nosplitk": {
+     "prefill_ms": {
+      "values": [
+       58.363,
+       59.014,
+       57.883,
+       57.944,
+       58.645
+      ],
+      "median": 58.363
+     },
+     "ttft_ms": {
+      "values": [
+       74.800625,
+       75.693,
+       74.242458,
+       74.203042,
+       74.655084
+      ],
+      "median": 74.655084
+     },
+     "decode_ms": {
+      "values": [
+       746.9915000000001,
+       748.965042,
+       744.0197079999999,
+       736.3726670000001,
+       728.906958
+      ],
+      "median": 744.0197079999999
+     },
+     "tokens_per_second": {
+      "values": [
+       65.59646261035097,
+       65.42361425728599,
+       65.85847051245047,
+       66.54239381212663,
+       67.2239432786427
+      ],
+      "median": 65.85847051245047
+     },
+     "peak_memory_bytes": {
+      "values": [
+       1522384896,
+       1522925568,
+       1522728960,
+       1523236864,
+       1521745920
+      ],
+      "median": 1522728960
+     }
+    }
+   },
+   "paired_ratios_vs_f32_default": {
+    "f16.prefill_ms": {
+     "median_ratio": 0.9518,
+     "ci95": [
+      0.9469,
+      0.9637
+     ],
+     "significant": true,
+     "n_rounds": 5
+    },
+    "f16.ttft_ms": {
+     "median_ratio": 0.9564,
+     "ci95": [
+      0.9473,
+      0.972
+     ],
+     "significant": true,
+     "n_rounds": 5
+    },
+    "f16.decode_ms": {
+     "median_ratio": 0.9982,
+     "ci95": [
+      0.9894,
+      1.0026
+     ],
+     "significant": false,
+     "n_rounds": 5
+    },
+    "f16.tokens_per_second": {
+     "median_ratio": 1.0018,
+     "ci95": [
+      0.9974,
+      1.0107
+     ],
+     "significant": false,
+     "n_rounds": 5
+    },
+    "f16.peak_memory_bytes": {
+     "median_ratio": 0.9836,
+     "ci95": [
+      0.983,
+      0.9842
+     ],
+     "significant": true,
+     "n_rounds": 5
+    },
+    "q8.prefill_ms": {
+     "median_ratio": 0.9609,
+     "ci95": [
+      0.9538,
+      0.9658
+     ],
+     "significant": true,
+     "n_rounds": 5
+    },
+    "q8.ttft_ms": {
+     "median_ratio": 0.9655,
+     "ci95": [
+      0.9575,
+      0.9762
+     ],
+     "significant": true,
+     "n_rounds": 5
+    },
+    "q8.decode_ms": {
+     "median_ratio": 0.9994,
+     "ci95": [
+      0.9917,
+      1.0105
+     ],
+     "significant": false,
+     "n_rounds": 5
+    },
+    "q8.tokens_per_second": {
+     "median_ratio": 1.0006,
+     "ci95": [
+      0.9896,
+      1.0083
+     ],
+     "significant": false,
+     "n_rounds": 5
+    },
+    "q8.peak_memory_bytes": {
+     "median_ratio": 0.9835,
+     "ci95": [
+      0.983,
+      0.9845
+     ],
+     "significant": true,
+     "n_rounds": 5
+    },
+    "f32-nosplitk.prefill_ms": {
+     "median_ratio": 1.0003,
+     "ci95": [
+      0.9942,
+      1.0101
+     ],
+     "significant": false,
+     "n_rounds": 5
+    },
+    "f32-nosplitk.ttft_ms": {
+     "median_ratio": 1.0012,
+     "ci95": [
+      0.9931,
+      1.0024
+     ],
+     "significant": false,
+     "n_rounds": 5
+    },
+    "f32-nosplitk.decode_ms": {
+     "median_ratio": 1.0001,
+     "ci95": [
+      0.9958,
+      1.0095
+     ],
+     "significant": false,
+     "n_rounds": 5
+    },
+    "f32-nosplitk.tokens_per_second": {
+     "median_ratio": 0.9999,
+     "ci95": [
+      0.9906,
+      1.0042
+     ],
+     "significant": false,
+     "n_rounds": 5
+    },
+    "f32-nosplitk.peak_memory_bytes": {
+     "median_ratio": 0.9998,
+     "ci95": [
+      0.9992,
+      1.0005
+     ],
+     "significant": false,
+     "n_rounds": 5
+    }
+   },
+   "paired_ratios_vs_f32_nosplitk": {
+    "q8.prefill_ms": {
+     "median_ratio": 0.9599,
+     "ci95": [
+      0.9442,
+      0.9714
+     ],
+     "significant": true,
+     "n_rounds": 5
+    },
+    "q8.ttft_ms": {
+     "median_ratio": 0.9641,
+     "ci95": [
+      0.9569,
+      0.9775
+     ],
+     "significant": true,
+     "n_rounds": 5
+    },
+    "q8.decode_ms": {
+     "median_ratio": 0.9993,
+     "ci95": [
+      0.992,
+      1.0063
+     ],
+     "significant": false,
+     "n_rounds": 5
+    },
+    "q8.tokens_per_second": {
+     "median_ratio": 1.0007,
+     "ci95": [
+      0.9937,
+      1.0081
+     ],
+     "significant": false,
+     "n_rounds": 5
+    },
+    "q8.peak_memory_bytes": {
+     "median_ratio": 0.9836,
+     "ci95": [
+      0.9833,
+      0.9842
+     ],
+     "significant": true,
+     "n_rounds": 5
+    },
+    "f16.prefill_ms": {
+     "median_ratio": 0.9472,
+     "ci95": [
+      0.9422,
+      0.9637
+     ],
+     "significant": true,
+     "n_rounds": 5
+    },
+    "f16.ttft_ms": {
+     "median_ratio": 0.9544,
+     "ci95": [
+      0.9517,
+      0.9697
+     ],
+     "significant": true,
+     "n_rounds": 5
+    },
+    "f16.decode_ms": {
+     "median_ratio": 0.9933,
+     "ci95": [
+      0.9902,
+      1.0068
+     ],
+     "significant": false,
+     "n_rounds": 5
+    },
+    "f16.tokens_per_second": {
+     "median_ratio": 1.0068,
+     "ci95": [
+      0.9933,
+      1.0099
+     ],
+     "significant": false,
+     "n_rounds": 5
+    },
+    "f16.peak_memory_bytes": {
+     "median_ratio": 0.9836,
+     "ci95": [
+      0.9833,
+      0.9844
+     ],
+     "significant": true,
+     "n_rounds": 5
+    }
+   },
+   "greedy_parity_vs_f32": {
+    "f16": {
+     "first_divergent_generated_token_index": [
+      -1,
+      -1,
+      -1,
+      -1,
+      -1
+     ],
+     "token_identical_rounds": 5,
+     "rounds": 5
+    },
+    "q8": {
+     "first_divergent_generated_token_index": [
+      -1,
+      -1,
+      -1,
+      -1,
+      -1
+     ],
+     "token_identical_rounds": 5,
+     "rounds": 5
+    },
+    "f32-nosplitk": {
+     "first_divergent_generated_token_index": [
+      -1,
+      -1,
+      -1,
+      -1,
+      -1
+     ],
+     "token_identical_rounds": 5,
+     "rounds": 5
+    }
+   }
+  },
+  "depth_1024": {
+   "prompt_tokens": 1067,
+   "generated_tokens": 64,
+   "rounds": 3,
+   "runs": 12,
+   "arms": {
+    "f32": {
+     "prefill_ms": {
+      "values": [
+       1009.816,
+       974.692,
+       1373.212
+      ],
+      "median": 1009.816
+     },
+     "ttft_ms": {
+      "values": [
+       1035.120875,
+       998.079917,
+       1404.272958
+      ],
+      "median": 1035.120875
+     },
+     "decode_ms": {
+      "values": [
+       1059.8564159999999,
+       1059.555458,
+       1357.786959
+      ],
+      "median": 1059.8564159999999
+     },
+     "tokens_per_second": {
+      "values": [
+       59.44201407749935,
+       59.45889809195811,
+       46.39903158769402
+      ],
+      "median": 59.44201407749935
+     },
+     "peak_memory_bytes": {
+      "values": [
+       1590525952,
+       1590247424,
+       1590362112
+      ],
+      "median": 1590362112
+     }
+    },
+    "f16": {
+     "prefill_ms": {
+      "values": [
+       1724.626,
+       1727.017,
+       2887.086
+      ],
+      "median": 1727.017
+     },
+     "ttft_ms": {
+      "values": [
+       1761.629875,
+       1766.0058749999998,
+       2927.53725
+      ],
+      "median": 1766.0058749999998
+     },
+     "decode_ms": {
+      "values": [
+       1249.300417,
+       1249.5562499999999,
+       1288.167417
+      ],
+      "median": 1249.5562499999999
+     },
+     "tokens_per_second": {
+      "values": [
+       50.428222982014745,
+       50.417898353915646,
+       48.90668648235185
+      ],
+      "median": 50.417898353915646
+     },
+     "peak_memory_bytes": {
+      "values": [
+       1503592448,
+       1503756288,
+       1503903744
+      ],
+      "median": 1503756288
+     }
+    },
+    "q8": {
+     "prefill_ms": {
+      "values": [
+       1764.657,
+       1835.979,
+       1803.792
+      ],
+      "median": 1803.792
+     },
+     "ttft_ms": {
+      "values": [
+       1797.7141250000002,
+       1869.372958,
+       1837.97925
+      ],
+      "median": 1837.97925
+     },
+     "decode_ms": {
+      "values": [
+       1117.083208,
+       1121.365625,
+       1121.366625
+      ],
+      "median": 1121.365625
+     },
+     "tokens_per_second": {
+      "values": [
+       56.39687316828775,
+       56.18149744870234,
+       56.18144734778422
+      ],
+      "median": 56.18149744870234
+     },
+     "peak_memory_bytes": {
+      "values": [
+       1504083968,
+       1504329728,
+       1503690752
+      ],
+      "median": 1504083968
+     }
+    },
+    "f32-nosplitk": {
+     "prefill_ms": {
+      "values": [
+       972.603,
+       971.738,
+       1017.208
+      ],
+      "median": 972.603
+     },
+     "ttft_ms": {
+      "values": [
+       1001.241541,
+       997.169084,
+       1045.82675
+      ],
+      "median": 1001.241541
+     },
+     "decode_ms": {
+      "values": [
+       1273.711625,
+       1273.4255830000002,
+       1295.851542
+      ],
+      "median": 1273.711625
+     },
+     "tokens_per_second": {
+      "values": [
+       49.46174531460369,
+       49.472855611696936,
+       48.6166801968431
+      ],
+      "median": 49.46174531460369
+     },
+     "peak_memory_bytes": {
+      "values": [
+       1590116352,
+       1590263808,
+       1590919168
+      ],
+      "median": 1590263808
+     }
+    }
+   },
+   "paired_ratios_vs_f32_default": {
+    "f16.prefill_ms": {
+     "median_ratio": 1.7719,
+     "ci95": [
+      1.7079,
+      2.1024
+     ],
+     "significant": true,
+     "n_rounds": 3
+    },
+    "f16.ttft_ms": {
+     "median_ratio": 1.7694,
+     "ci95": [
+      1.7019,
+      2.0847
+     ],
+     "significant": true,
+     "n_rounds": 3
+    },
+    "f16.decode_ms": {
+     "median_ratio": 1.1787,
+     "ci95": [
+      0.9487,
+      1.1793
+     ],
+     "significant": false,
+     "n_rounds": 3
+    },
+    "f16.tokens_per_second": {
+     "median_ratio": 0.8484,
+     "ci95": [
+      0.8479,
+      1.054
+     ],
+     "significant": false,
+     "n_rounds": 3
+    },
+    "f16.peak_memory_bytes": {
+     "median_ratio": 0.9456,
+     "ci95": [
+      0.9453,
+      0.9456
+     ],
+     "significant": true,
+     "n_rounds": 3
+    },
+    "q8.prefill_ms": {
+     "median_ratio": 1.7475,
+     "ci95": [
+      1.3136,
+      1.8837
+     ],
+     "significant": true,
+     "n_rounds": 3
+    },
+    "q8.ttft_ms": {
+     "median_ratio": 1.7367,
+     "ci95": [
+      1.3088,
+      1.873
+     ],
+     "significant": true,
+     "n_rounds": 3
+    },
+    "q8.decode_ms": {
+     "median_ratio": 1.054,
+     "ci95": [
+      0.8259,
+      1.0583
+     ],
+     "significant": false,
+     "n_rounds": 3
+    },
+    "q8.tokens_per_second": {
+     "median_ratio": 0.9488,
+     "ci95": [
+      0.9449,
+      1.2108
+     ],
+     "significant": false,
+     "n_rounds": 3
+    },
+    "q8.peak_memory_bytes": {
+     "median_ratio": 0.9457,
+     "ci95": [
+      0.9455,
+      0.946
+     ],
+     "significant": true,
+     "n_rounds": 3
+    },
+    "f32-nosplitk.prefill_ms": {
+     "median_ratio": 0.9631,
+     "ci95": [
+      0.7408,
+      0.997
+     ],
+     "significant": true,
+     "n_rounds": 3
+    },
+    "f32-nosplitk.ttft_ms": {
+     "median_ratio": 0.9673,
+     "ci95": [
+      0.7447,
+      0.9991
+     ],
+     "significant": true,
+     "n_rounds": 3
+    },
+    "f32-nosplitk.decode_ms": {
+     "median_ratio": 1.2018,
+     "ci95": [
+      0.9544,
+      1.2018
+     ],
+     "significant": false,
+     "n_rounds": 3
+    },
+    "f32-nosplitk.tokens_per_second": {
+     "median_ratio": 0.8321,
+     "ci95": [
+      0.8321,
+      1.0478
+     ],
+     "significant": false,
+     "n_rounds": 3
+    },
+    "f32-nosplitk.peak_memory_bytes": {
+     "median_ratio": 1.0,
+     "ci95": [
+      0.9997,
+      1.0004
+     ],
+     "significant": false,
+     "n_rounds": 3
+    }
+   },
+   "paired_ratios_vs_f32_nosplitk": {
+    "q8.prefill_ms": {
+     "median_ratio": 1.8144,
+     "ci95": [
+      1.7733,
+      1.8894
+     ],
+     "significant": true,
+     "n_rounds": 3
+    },
+    "q8.ttft_ms": {
+     "median_ratio": 1.7955,
+     "ci95": [
+      1.7574,
+      1.8747
+     ],
+     "significant": true,
+     "n_rounds": 3
+    },
+    "q8.decode_ms": {
+     "median_ratio": 0.877,
+     "ci95": [
+      0.8654,
+      0.8806
+     ],
+     "significant": true,
+     "n_rounds": 3
+    },
+    "q8.tokens_per_second": {
+     "median_ratio": 1.1402,
+     "ci95": [
+      1.1356,
+      1.1556
+     ],
+     "significant": true,
+     "n_rounds": 3
+    },
+    "q8.peak_memory_bytes": {
+     "median_ratio": 0.9459,
+     "ci95": [
+      0.9452,
+      0.946
+     ],
+     "significant": true,
+     "n_rounds": 3
+    },
+    "f16.prefill_ms": {
+     "median_ratio": 1.7772,
+     "ci95": [
+      1.7732,
+      2.8382
+     ],
+     "significant": true,
+     "n_rounds": 3
+    },
+    "f16.ttft_ms": {
+     "median_ratio": 1.771,
+     "ci95": [
+      1.7594,
+      2.7993
+     ],
+     "significant": true,
+     "n_rounds": 3
+    },
+    "f16.decode_ms": {
+     "median_ratio": 0.9813,
+     "ci95": [
+      0.9808,
+      0.9941
+     ],
+     "significant": true,
+     "n_rounds": 3
+    },
+    "f16.tokens_per_second": {
+     "median_ratio": 1.0191,
+     "ci95": [
+      1.006,
+      1.0195
+     ],
+     "significant": true,
+     "n_rounds": 3
+    },
+    "f16.peak_memory_bytes": {
+     "median_ratio": 0.9456,
+     "ci95": [
+      0.9453,
+      0.9456
+     ],
+     "significant": true,
+     "n_rounds": 3
+    }
+   },
+   "greedy_parity_vs_f32": {
+    "f16": {
+     "first_divergent_generated_token_index": [
+      -1,
+      -1,
+      -1
+     ],
+     "token_identical_rounds": 3,
+     "rounds": 3
+    },
+    "q8": {
+     "first_divergent_generated_token_index": [
+      3,
+      3,
+      3
+     ],
+     "token_identical_rounds": 0,
+     "rounds": 3
+    },
+    "f32-nosplitk": {
+     "first_divergent_generated_token_index": [
+      -1,
+      -1,
+      -1
+     ],
+     "token_identical_rounds": 3,
+     "rounds": 3
+    }
+   }
+  },
+  "depth_2048": {
+   "prompt_tokens": 2066,
+   "generated_tokens": 64,
+   "rounds": 3,
+   "runs": 12,
+   "arms": {
+    "f32": {
+     "prefill_ms": {
+      "values": [
+       3380.044,
+       3001.439,
+       2955.836
+      ],
+      "median": 3001.439
+     },
+     "ttft_ms": {
+      "values": [
+       3428.239208,
+       3091.349,
+       2999.303875
+      ],
+      "median": 3091.349
+     },
+     "decode_ms": {
+      "values": [
+       2179.53675,
+       1408.151125,
+       1353.0048749999999
+      ],
+      "median": 1408.151125
+     },
+     "tokens_per_second": {
+      "values": [
+       28.905224929104772,
+       44.73951615100971,
+       46.5630251332243
+      ],
+      "median": 44.73951615100971
+     },
+     "peak_memory_bytes": {
+      "values": [
+       1608990720,
+       1321992192,
+       1608843264
+      ],
+      "median": 1608843264
+     }
+    },
+    "f16": {
+     "prefill_ms": {
+      "values": [
+       7305.198,
+       6510.387,
+       6623.44
+      ],
+      "median": 6623.44
+     },
+     "ttft_ms": {
+      "values": [
+       7338.43375,
+       6554.688459,
+       6668.993167
+      ],
+      "median": 6668.993167
+     },
+     "decode_ms": {
+      "values": [
+       2558.430042,
+       1689.0815830000001,
+       1683.411333
+      ],
+      "median": 1689.0815830000001
+     },
+     "tokens_per_second": {
+      "values": [
+       24.62447632562626,
+       37.2983760133746,
+       37.42400847909701
+      ],
+      "median": 37.2983760133746
+     },
+     "peak_memory_bytes": {
+      "values": [
+       1530265600,
+       1531002880,
+       1525137408
+      ],
+      "median": 1530265600
+     }
+    },
+    "q8": {
+     "prefill_ms": {
+      "values": [
+       7243.461,
+       6583.942,
+       7119.288
+      ],
+      "median": 7119.288
+     },
+     "ttft_ms": {
+      "values": [
+       7282.488125000001,
+       6623.211667,
+       7168.472042
+      ],
+      "median": 7168.472042
+     },
+     "decode_ms": {
+      "values": [
+       1613.668416,
+       1436.862834,
+       1430.821834
+      ],
+      "median": 1436.862834
+     },
+     "tokens_per_second": {
+      "values": [
+       39.04147802320251,
+       43.84552130464528,
+       44.0306392472901
+      ],
+      "median": 43.84552130464528
+     },
+     "peak_memory_bytes": {
+      "values": [
+       1530118144,
+       1530101760,
+       1324810240
+      ],
+      "median": 1530101760
+     }
+    },
+    "f32-nosplitk": {
+     "prefill_ms": {
+      "values": [
+       2958.644,
+       3630.581,
+       2693.668
+      ],
+      "median": 2958.644
+     },
+     "ttft_ms": {
+      "values": [
+       3008.7712500000002,
+       3750.836292,
+       2743.235958
+      ],
+      "median": 3008.7712500000002
+     },
+     "decode_ms": {
+      "values": [
+       2055.373458,
+       2046.872208,
+       1773.5105
+      ],
+      "median": 2046.872208
+     },
+     "tokens_per_second": {
+      "values": [
+       30.651363991681944,
+       30.778667937241348,
+       35.52276685139445
+      ],
+      "median": 30.778667937241348
+     },
+     "peak_memory_bytes": {
+      "values": [
+       1608925184,
+       1608941568,
+       1412808704
+      ],
+      "median": 1608925184
+     }
+    }
+   },
+   "paired_ratios_vs_f32_default": {
+    "f16.prefill_ms": {
+     "median_ratio": 2.1691,
+     "ci95": [
+      2.1613,
+      2.2408
+     ],
+     "significant": true,
+     "n_rounds": 3
+    },
+    "f16.ttft_ms": {
+     "median_ratio": 2.1406,
+     "ci95": [
+      2.1203,
+      2.2235
+     ],
+     "significant": true,
+     "n_rounds": 3
+    },
+    "f16.decode_ms": {
+     "median_ratio": 1.1995,
+     "ci95": [
+      1.1738,
+      1.2442
+     ],
+     "significant": true,
+     "n_rounds": 3
+    },
+    "f16.tokens_per_second": {
+     "median_ratio": 0.8337,
+     "ci95": [
+      0.8037,
+      0.8519
+     ],
+     "significant": true,
+     "n_rounds": 3
+    },
+    "f16.peak_memory_bytes": {
+     "median_ratio": 0.9511,
+     "ci95": [
+      0.948,
+      1.1581
+     ],
+     "significant": false,
+     "n_rounds": 3
+    },
+    "q8.prefill_ms": {
+     "median_ratio": 2.1936,
+     "ci95": [
+      2.143,
+      2.4086
+     ],
+     "significant": true,
+     "n_rounds": 3
+    },
+    "q8.ttft_ms": {
+     "median_ratio": 2.1425,
+     "ci95": [
+      2.1243,
+      2.39
+     ],
+     "significant": true,
+     "n_rounds": 3
+    },
+    "q8.decode_ms": {
+     "median_ratio": 1.0204,
+     "ci95": [
+      0.7404,
+      1.0575
+     ],
+     "significant": false,
+     "n_rounds": 3
+    },
+    "q8.tokens_per_second": {
+     "median_ratio": 0.98,
+     "ci95": [
+      0.9456,
+      1.3507
+     ],
+     "significant": false,
+     "n_rounds": 3
+    },
+    "q8.peak_memory_bytes": {
+     "median_ratio": 0.951,
+     "ci95": [
+      0.8235,
+      1.1574
+     ],
+     "significant": false,
+     "n_rounds": 3
+    },
+    "f32-nosplitk.prefill_ms": {
+     "median_ratio": 0.9113,
+     "ci95": [
+      0.8753,
+      1.2096
+     ],
+     "significant": false,
+     "n_rounds": 3
+    },
+    "f32-nosplitk.ttft_ms": {
+     "median_ratio": 0.9146,
+     "ci95": [
+      0.8776,
+      1.2133
+     ],
+     "significant": false,
+     "n_rounds": 3
+    },
+    "f32-nosplitk.decode_ms": {
+     "median_ratio": 1.3108,
+     "ci95": [
+      0.943,
+      1.4536
+     ],
+     "significant": false,
+     "n_rounds": 3
+    },
+    "f32-nosplitk.tokens_per_second": {
+     "median_ratio": 0.7629,
+     "ci95": [
+      0.688,
+      1.0604
+     ],
+     "significant": false,
+     "n_rounds": 3
+    },
+    "f32-nosplitk.peak_memory_bytes": {
+     "median_ratio": 1.0,
+     "ci95": [
+      0.8782,
+      1.2171
+     ],
+     "significant": false,
+     "n_rounds": 3
+    }
+   },
+   "paired_ratios_vs_f32_nosplitk": {
+    "q8.prefill_ms": {
+     "median_ratio": 2.4482,
+     "ci95": [
+      1.8135,
+      2.643
+     ],
+     "significant": true,
+     "n_rounds": 3
+    },
+    "q8.ttft_ms": {
+     "median_ratio": 2.4204,
+     "ci95": [
+      1.7658,
+      2.6131
+     ],
+     "significant": true,
+     "n_rounds": 3
+    },
+    "q8.decode_ms": {
+     "median_ratio": 0.7851,
+     "ci95": [
+      0.702,
+      0.8068
+     ],
+     "significant": true,
+     "n_rounds": 3
+    },
+    "q8.tokens_per_second": {
+     "median_ratio": 1.2737,
+     "ci95": [
+      1.2395,
+      1.4245
+     ],
+     "significant": true,
+     "n_rounds": 3
+    },
+    "q8.peak_memory_bytes": {
+     "median_ratio": 0.951,
+     "ci95": [
+      0.9377,
+      0.951
+     ],
+     "significant": true,
+     "n_rounds": 3
+    },
+    "f16.prefill_ms": {
+     "median_ratio": 2.4589,
+     "ci95": [
+      1.7932,
+      2.4691
+     ],
+     "significant": true,
+     "n_rounds": 3
+    },
+    "f16.ttft_ms": {
+     "median_ratio": 2.4311,
+     "ci95": [
+      1.7475,
+      2.439
+     ],
+     "significant": true,
+     "n_rounds": 3
+    },
+    "f16.decode_ms": {
+     "median_ratio": 0.9492,
+     "ci95": [
+      0.8252,
+      1.2448
+     ],
+     "significant": false,
+     "n_rounds": 3
+    },
+    "f16.tokens_per_second": {
+     "median_ratio": 1.0535,
+     "ci95": [
+      0.8034,
+      1.2118
+     ],
+     "significant": false,
+     "n_rounds": 3
+    },
+    "f16.peak_memory_bytes": {
+     "median_ratio": 0.9516,
+     "ci95": [
+      0.9511,
+      1.0795
+     ],
+     "significant": false,
+     "n_rounds": 3
+    }
+   },
+   "greedy_parity_vs_f32": {
+    "f16": {
+     "first_divergent_generated_token_index": [
+      -1,
+      -1,
+      -1
+     ],
+     "token_identical_rounds": 3,
+     "rounds": 3
+    },
+    "q8": {
+     "first_divergent_generated_token_index": [
+      13,
+      13,
+      13
+     ],
+     "token_identical_rounds": 0,
+     "rounds": 3
+    },
+    "f32-nosplitk": {
+     "first_divergent_generated_token_index": [
+      -1,
+      -1,
+      -1
+     ],
+     "token_identical_rounds": 3,
+     "rounds": 3
+    }
+   }
+  },
+  "depth_4096": {
+   "prompt_tokens": 4117,
+   "generated_tokens": 64,
+   "rounds": 3,
+   "runs": 12,
+   "arms": {
+    "f32": {
+     "prefill_ms": {
+      "values": [
+       6141.768,
+       6063.466,
+       6040.813
+      ],
+      "median": 6063.466
+     },
+     "ttft_ms": {
+      "values": [
+       6243.524417,
+       6178.150416,
+       6142.963457999999
+      ],
+      "median": 6178.150416
+     },
+     "decode_ms": {
+      "values": [
+       1818.8701250000001,
+       1856.853333,
+       1829.990667
+      ],
+      "median": 1829.990667
+     },
+     "tokens_per_second": {
+      "values": [
+       34.636887556773736,
+       33.92836627447301,
+       34.426405082862644
+      ],
+      "median": 34.426405082862644
+     },
+     "peak_memory_bytes": {
+      "values": [
+       1711030272,
+       1711292416,
+       1710784512
+      ],
+      "median": 1711030272
+     }
+    },
+    "f16": {
+     "prefill_ms": {
+      "values": [
+       19198.501,
+       18961.164,
+       19382.217
+      ],
+      "median": 19198.501
+     },
+     "ttft_ms": {
+      "values": [
+       19248.744792,
+       19008.818167,
+       19433.8565
+      ],
+      "median": 19248.744792
+     },
+     "decode_ms": {
+      "values": [
+       2159.636292,
+       2214.8357499999997,
+       2246.559834
+      ],
+      "median": 2214.8357499999997
+     },
+     "tokens_per_second": {
+      "values": [
+       29.171578674322443,
+       28.444547185948217,
+       28.042876511251645
+      ],
+      "median": 28.444547185948217
+     },
+     "peak_memory_bytes": {
+      "values": [
+       1559543808,
+       1559740416,
+       1559838720
+      ],
+      "median": 1559740416
+     }
+    },
+    "q8": {
+     "prefill_ms": {
+      "values": [
+       19985.832,
+       19240.332,
+       19522.451
+      ],
+      "median": 19522.451
+     },
+     "ttft_ms": {
+      "values": [
+       20043.259834,
+       19283.560292000002,
+       19561.557792
+      ],
+      "median": 19561.557792
+     },
+     "decode_ms": {
+      "values": [
+       1763.493333,
+       1726.2323749999998,
+       1789.972042
+      ],
+      "median": 1763.493333
+     },
+     "tokens_per_second": {
+      "values": [
+       35.72454673975226,
+       36.49566588623389,
+       35.19608045364096
+      ],
+      "median": 35.72454673975226
+     },
+     "peak_memory_bytes": {
+      "values": [
+       1559674880,
+       1559756800,
+       1559871488
+      ],
+      "median": 1559756800
+     }
+    },
+    "f32-nosplitk": {
+     "prefill_ms": {
+      "values": [
+       5857.912,
+       5690.59,
+       5720.115
+      ],
+      "median": 5720.115
+     },
+     "ttft_ms": {
+      "values": [
+       5919.618834,
+       5745.604875,
+       5769.92075
+      ],
+      "median": 5769.92075
+     },
+     "decode_ms": {
+      "values": [
+       2482.392625,
+       2472.6412079999996,
+       2657.3554590000003
+      ],
+      "median": 2482.392625
+     },
+     "tokens_per_second": {
+      "values": [
+       25.378741205372375,
+       25.478827982066054,
+       23.70778052542048
+      ],
+      "median": 25.378741205372375
+     },
+     "peak_memory_bytes": {
+      "values": [
+       1650933760,
+       1711292416,
+       1711063040
+      ],
+      "median": 1711063040
+     }
+    }
+   },
+   "paired_ratios_vs_f32_default": {
+    "f16.prefill_ms": {
+     "median_ratio": 3.1271,
+     "ci95": [
+      3.1259,
+      3.2085
+     ],
+     "significant": true,
+     "n_rounds": 3
+    },
+    "f16.ttft_ms": {
+     "median_ratio": 3.083,
+     "ci95": [
+      3.0768,
+      3.1636
+     ],
+     "significant": true,
+     "n_rounds": 3
+    },
+    "f16.decode_ms": {
+     "median_ratio": 1.1928,
+     "ci95": [
+      1.1874,
+      1.2276
+     ],
+     "significant": true,
+     "n_rounds": 3
+    },
+    "f16.tokens_per_second": {
+     "median_ratio": 0.8384,
+     "ci95": [
+      0.8146,
+      0.8422
+     ],
+     "significant": true,
+     "n_rounds": 3
+    },
+    "f16.peak_memory_bytes": {
+     "median_ratio": 0.9115,
+     "ci95": [
+      0.9114,
+      0.9118
+     ],
+     "significant": true,
+     "n_rounds": 3
+    },
+    "q8.prefill_ms": {
+     "median_ratio": 3.2318,
+     "ci95": [
+      3.1732,
+      3.2541
+     ],
+     "significant": true,
+     "n_rounds": 3
+    },
+    "q8.ttft_ms": {
+     "median_ratio": 3.1844,
+     "ci95": [
+      3.1213,
+      3.2102
+     ],
+     "significant": true,
+     "n_rounds": 3
+    },
+    "q8.decode_ms": {
+     "median_ratio": 0.9696,
+     "ci95": [
+      0.9297,
+      0.9781
+     ],
+     "significant": true,
+     "n_rounds": 3
+    },
+    "q8.tokens_per_second": {
+     "median_ratio": 1.0314,
+     "ci95": [
+      1.0224,
+      1.0757
+     ],
+     "significant": true,
+     "n_rounds": 3
+    },
+    "q8.peak_memory_bytes": {
+     "median_ratio": 0.9115,
+     "ci95": [
+      0.9114,
+      0.9118
+     ],
+     "significant": true,
+     "n_rounds": 3
+    },
+    "f32-nosplitk.prefill_ms": {
+     "median_ratio": 0.9469,
+     "ci95": [
+      0.9385,
+      0.9538
+     ],
+     "significant": true,
+     "n_rounds": 3
+    },
+    "f32-nosplitk.ttft_ms": {
+     "median_ratio": 0.9393,
+     "ci95": [
+      0.93,
+      0.9481
+     ],
+     "significant": true,
+     "n_rounds": 3
+    },
+    "f32-nosplitk.decode_ms": {
+     "median_ratio": 1.3648,
+     "ci95": [
+      1.3316,
+      1.4521
+     ],
+     "significant": true,
+     "n_rounds": 3
+    },
+    "f32-nosplitk.tokens_per_second": {
+     "median_ratio": 0.7327,
+     "ci95": [
+      0.6887,
+      0.751
+     ],
+     "significant": true,
+     "n_rounds": 3
+    },
+    "f32-nosplitk.peak_memory_bytes": {
+     "median_ratio": 1.0,
+     "ci95": [
+      0.9649,
+      1.0002
+     ],
+     "significant": false,
+     "n_rounds": 3
+    }
+   },
+   "paired_ratios_vs_f32_nosplitk": {
+    "q8.prefill_ms": {
+     "median_ratio": 3.4118,
+     "ci95": [
+      3.3811,
+      3.4129
+     ],
+     "significant": true,
+     "n_rounds": 3
+    },
+    "q8.ttft_ms": {
+     "median_ratio": 3.3859,
+     "ci95": [
+      3.3562,
+      3.3903
+     ],
+     "significant": true,
+     "n_rounds": 3
+    },
+    "q8.decode_ms": {
+     "median_ratio": 0.6981,
+     "ci95": [
+      0.6736,
+      0.7104
+     ],
+     "significant": true,
+     "n_rounds": 3
+    },
+    "q8.tokens_per_second": {
+     "median_ratio": 1.4324,
+     "ci95": [
+      1.4077,
+      1.4846
+     ],
+     "significant": true,
+     "n_rounds": 3
+    },
+    "q8.peak_memory_bytes": {
+     "median_ratio": 0.9116,
+     "ci95": [
+      0.9114,
+      0.9447
+     ],
+     "significant": true,
+     "n_rounds": 3
+    },
+    "f16.prefill_ms": {
+     "median_ratio": 3.332,
+     "ci95": [
+      3.2774,
+      3.3884
+     ],
+     "significant": true,
+     "n_rounds": 3
+    },
+    "f16.ttft_ms": {
+     "median_ratio": 3.3084,
+     "ci95": [
+      3.2517,
+      3.3681
+     ],
+     "significant": true,
+     "n_rounds": 3
+    },
+    "f16.decode_ms": {
+     "median_ratio": 0.87,
+     "ci95": [
+      0.8454,
+      0.8957
+     ],
+     "significant": true,
+     "n_rounds": 3
+    },
+    "f16.tokens_per_second": {
+     "median_ratio": 1.1494,
+     "ci95": [
+      1.1164,
+      1.1829
+     ],
+     "significant": true,
+     "n_rounds": 3
+    },
+    "f16.peak_memory_bytes": {
+     "median_ratio": 0.9116,
+     "ci95": [
+      0.9114,
+      0.9446
+     ],
+     "significant": true,
+     "n_rounds": 3
+    }
+   },
+   "greedy_parity_vs_f32": {
+    "f16": {
+     "first_divergent_generated_token_index": [
+      -1,
+      -1,
+      -1
+     ],
+     "token_identical_rounds": 3,
+     "rounds": 3
+    },
+    "q8": {
+     "first_divergent_generated_token_index": [
+      7,
+      7,
+      7
+     ],
+     "token_identical_rounds": 0,
+     "rounds": 3
+    },
+    "f32-nosplitk": {
+     "first_divergent_generated_token_index": [
+      -1,
+      -1,
+      -1
+     ],
+     "token_identical_rounds": 3,
+     "rounds": 3
+    }
+   }
+  },
+  "depth_8006": {
+   "prompt_tokens": 8006,
+   "generated_tokens": 64,
+   "rounds": 5,
+   "runs": 20,
+   "arms": {
+    "f32": {
+     "prefill_ms": {
+      "values": [
+       9698.002,
+       12936.751,
+       13122.597,
+       14130.269,
+       13602.842
+      ],
+      "median": 13122.597
+     },
+     "ttft_ms": {
+      "values": [
+       9772.833542,
+       13022.108375,
+       13222.191125,
+       14229.131625,
+       13703.538290999999
+      ],
+      "median": 13222.191125
+     },
+     "decode_ms": {
+      "values": [
+       1508.4698749999998,
+       2190.727958,
+       2092.162041,
+       2541.424208,
+       2227.57775
+      ],
+      "median": 2190.727958
+     },
+     "tokens_per_second": {
+      "values": [
+       41.76417510492214,
+       28.757564247052894,
+       30.112390324168015,
+       24.78924998104842,
+       28.28184111643241
+      ],
+      "median": 28.757564247052894
+     },
+     "peak_memory_bytes": {
+      "values": [
+       1894498304,
+       1894580224,
+       1894252544,
+       1894793216,
+       1894203392
+      ],
+      "median": 1894498304
+     }
+    },
+    "f16": {
+     "prefill_ms": {
+      "values": [
+       50375.53,
+       51079.054,
+       54628.625,
+       58398.658,
+       57966.333
+      ],
+      "median": 54628.625
+     },
+     "ttft_ms": {
+      "values": [
+       50447.160833,
+       51142.577542,
+       54703.170667,
+       58469.07375,
+       58031.386125
+      ],
+      "median": 54703.170667
+     },
+     "decode_ms": {
+      "values": [
+       3025.477583,
+       3043.65775,
+       3071.3730419999997,
+       3268.340875,
+       3239.4829999999997
+      ],
+      "median": 3071.3730419999997
+     },
+     "tokens_per_second": {
+      "values": [
+       20.823158748223324,
+       20.6987792894914,
+       20.511998750557506,
+       19.275835174322204,
+       19.447547648806925
+      ],
+      "median": 20.511998750557506
+     },
+     "peak_memory_bytes": {
+      "values": [
+       1625341952,
+       1625325568,
+       1625145344,
+       1625489408,
+       1625391104
+      ],
+      "median": 1625341952
+     }
+    },
+    "q8": {
+     "prefill_ms": {
+      "values": [
+       53472.937,
+       54816.114,
+       57755.292,
+       63347.541,
+       62591.966
+      ],
+      "median": 57755.292
+     },
+     "ttft_ms": {
+      "values": [
+       53570.063417,
+       54866.196542,
+       57819.657583,
+       63438.638333999996,
+       62645.39625
+      ],
+      "median": 57819.657583
+     },
+     "decode_ms": {
+      "values": [
+       2064.625583,
+       2524.517292,
+       2199.589208,
+       2384.3847920000003,
+       2556.7018749999997
+      ],
+      "median": 2384.3847920000003
+     },
+     "tokens_per_second": {
+      "values": [
+       30.514007246029553,
+       24.955265784727292,
+       28.641711720927848,
+       26.42190984080056,
+       24.64112089721059
+      ],
+      "median": 26.42190984080056
+     },
+     "peak_memory_bytes": {
+      "values": [
+       1625653248,
+       1625587712,
+       1625686016,
+       1625686016,
+       1625341952
+      ],
+      "median": 1625653248
+     }
+    },
+    "f32-nosplitk": {
+     "prefill_ms": {
+      "values": [
+       9752.529,
+       13376.718,
+       11968.897,
+       11271.381,
+       13569.323
+      ],
+      "median": 11968.897
+     },
+     "ttft_ms": {
+      "values": [
+       9866.713458,
+       13499.237208,
+       12080.822832999998,
+       11341.572542,
+       13696.904542
+      ],
+      "median": 12080.822832999998
+     },
+     "decode_ms": {
+      "values": [
+       3202.99375,
+       3706.682834,
+       3615.80025,
+       3522.330792,
+       3830.413583
+      ],
+      "median": 3615.80025
+     },
+     "tokens_per_second": {
+      "values": [
+       19.6690986362368,
+       16.996328744969713,
+       17.42352885782338,
+       17.885884012679067,
+       16.447310097166604
+      ],
+      "median": 17.42352885782338
+     },
+     "peak_memory_bytes": {
+      "values": [
+       1894612992,
+       1894580224,
+       1894612992,
+       1894514688,
+       1894596608
+      ],
+      "median": 1894596608
+     }
+    }
+   },
+   "paired_ratios_vs_f32_default": {
+    "f16.prefill_ms": {
+     "median_ratio": 4.1629,
+     "ci95": [
+      3.9484,
+      5.1944
+     ],
+     "significant": true,
+     "n_rounds": 5
+    },
+    "f16.ttft_ms": {
+     "median_ratio": 4.1372,
+     "ci95": [
+      3.9274,
+      5.162
+     ],
+     "significant": true,
+     "n_rounds": 5
+    },
+    "f16.decode_ms": {
+     "median_ratio": 1.4543,
+     "ci95": [
+      1.286,
+      2.0057
+     ],
+     "significant": true,
+     "n_rounds": 5
+    },
+    "f16.tokens_per_second": {
+     "median_ratio": 0.6876,
+     "ci95": [
+      0.4986,
+      0.7776
+     ],
+     "significant": true,
+     "n_rounds": 5
+    },
+    "f16.peak_memory_bytes": {
+     "median_ratio": 0.8579,
+     "ci95": [
+      0.8579,
+      0.8581
+     ],
+     "significant": true,
+     "n_rounds": 5
+    },
+    "q8.prefill_ms": {
+     "median_ratio": 4.4831,
+     "ci95": [
+      4.2372,
+      5.5138
+     ],
+     "significant": true,
+     "n_rounds": 5
+    },
+    "q8.ttft_ms": {
+     "median_ratio": 4.4584,
+     "ci95": [
+      4.2133,
+      5.4815
+     ],
+     "significant": true,
+     "n_rounds": 5
+    },
+    "q8.decode_ms": {
+     "median_ratio": 1.1477,
+     "ci95": [
+      0.9382,
+      1.3687
+     ],
+     "significant": false,
+     "n_rounds": 5
+    },
+    "q8.tokens_per_second": {
+     "median_ratio": 0.8713,
+     "ci95": [
+      0.7306,
+      1.0659
+     ],
+     "significant": false,
+     "n_rounds": 5
+    },
+    "q8.peak_memory_bytes": {
+     "median_ratio": 0.8581,
+     "ci95": [
+      0.858,
+      0.8582
+     ],
+     "significant": true,
+     "n_rounds": 5
+    },
+    "f32-nosplitk.prefill_ms": {
+     "median_ratio": 0.9975,
+     "ci95": [
+      0.7977,
+      1.034
+     ],
+     "significant": false,
+     "n_rounds": 5
+    },
+    "f32-nosplitk.ttft_ms": {
+     "median_ratio": 0.9995,
+     "ci95": [
+      0.7971,
+      1.0366
+     ],
+     "significant": false,
+     "n_rounds": 5
+    },
+    "f32-nosplitk.decode_ms": {
+     "median_ratio": 1.7195,
+     "ci95": [
+      1.386,
+      2.1233
+     ],
+     "significant": true,
+     "n_rounds": 5
+    },
+    "f32-nosplitk.tokens_per_second": {
+     "median_ratio": 0.5816,
+     "ci95": [
+      0.471,
+      0.7215
+     ],
+     "significant": true,
+     "n_rounds": 5
+    },
+    "f32-nosplitk.peak_memory_bytes": {
+     "median_ratio": 1.0001,
+     "ci95": [
+      0.9999,
+      1.0002
+     ],
+     "significant": false,
+     "n_rounds": 5
+    }
+   },
+   "paired_ratios_vs_f32_nosplitk": {
+    "q8.prefill_ms": {
+     "median_ratio": 4.8254,
+     "ci95": [
+      4.0979,
+      5.6202
+     ],
+     "significant": true,
+     "n_rounds": 5
+    },
+    "q8.ttft_ms": {
+     "median_ratio": 4.7861,
+     "ci95": [
+      4.0644,
+      5.5935
+     ],
+     "significant": true,
+     "n_rounds": 5
+    },
+    "q8.decode_ms": {
+     "median_ratio": 0.6675,
+     "ci95": [
+      0.6083,
+      0.6811
+     ],
+     "significant": true,
+     "n_rounds": 5
+    },
+    "q8.tokens_per_second": {
+     "median_ratio": 1.4982,
+     "ci95": [
+      1.4683,
+      1.6439
+     ],
+     "significant": true,
+     "n_rounds": 5
+    },
+    "q8.peak_memory_bytes": {
+     "median_ratio": 0.858,
+     "ci95": [
+      0.8579,
+      0.8581
+     ],
+     "significant": true,
+     "n_rounds": 5
+    },
+    "f16.prefill_ms": {
+     "median_ratio": 4.5642,
+     "ci95": [
+      3.8185,
+      5.1811
+     ],
+     "significant": true,
+     "n_rounds": 5
+    },
+    "f16.ttft_ms": {
+     "median_ratio": 4.5281,
+     "ci95": [
+      3.7886,
+      5.1553
+     ],
+     "significant": true,
+     "n_rounds": 5
+    },
+    "f16.decode_ms": {
+     "median_ratio": 0.8494,
+     "ci95": [
+      0.8211,
+      0.9446
+     ],
+     "significant": true,
+     "n_rounds": 5
+    },
+    "f16.tokens_per_second": {
+     "median_ratio": 1.1773,
+     "ci95": [
+      1.0587,
+      1.2178
+     ],
+     "significant": true,
+     "n_rounds": 5
+    },
+    "f16.peak_memory_bytes": {
+     "median_ratio": 0.8579,
+     "ci95": [
+      0.8578,
+      0.858
+     ],
+     "significant": true,
+     "n_rounds": 5
+    }
+   },
+   "greedy_parity_vs_f32": {
+    "f16": {
+     "first_divergent_generated_token_index": [
+      -1,
+      -1,
+      -1,
+      -1,
+      -1
+     ],
+     "token_identical_rounds": 5,
+     "rounds": 5
+    },
+    "q8": {
+     "first_divergent_generated_token_index": [
+      -1,
+      -1,
+      -1,
+      -1,
+      -1
+     ],
+     "token_identical_rounds": 5,
+     "rounds": 5
+    },
+    "f32-nosplitk": {
+     "first_divergent_generated_token_index": [
+      -1,
+      -1,
+      -1,
+      -1,
+      -1
+     ],
+     "token_identical_rounds": 5,
+     "rounds": 5
+    }
+   }
+  },
+  "realtext_treaty_md": {
+   "prompt_tokens": 1460,
+   "generated_tokens": 64,
+   "rounds": 3,
+   "runs": 12,
+   "arms": {
+    "f32": {
+     "prefill_ms": {
+      "values": [
+       1354.5,
+       2624.796,
+       2459.883
+      ],
+      "median": 2459.883
+     },
+     "ttft_ms": {
+      "values": [
+       1389.801416,
+       2664.3563750000003,
+       2495.8873329999997
+      ],
+      "median": 2495.8873329999997
+     },
+     "decode_ms": {
+      "values": [
+       1091.661666,
+       1209.1025,
+       1193.2008329999999
+      ],
+      "median": 1193.2008329999999
+     },
+     "tokens_per_second": {
+      "values": [
+       57.71018802083685,
+       52.10476365734088,
+       52.799158580540485
+      ],
+      "median": 52.799158580540485
+     },
+     "peak_memory_bytes": {
+      "values": [
+       1553301504,
+       1576304640,
+       1577959424
+      ],
+      "median": 1576304640
+     }
+    },
+    "f16": {
+     "prefill_ms": {
+      "values": [
+       2762.082,
+       4235.258,
+       4124.694
+      ],
+      "median": 4124.694
+     },
+     "ttft_ms": {
+      "values": [
+       2804.7550420000002,
+       4276.983292,
+       4164.334958
+      ],
+      "median": 4164.334958
+     },
+     "decode_ms": {
+      "values": [
+       1361.6028330000001,
+       1590.65425,
+       1445.601083
+      ],
+      "median": 1445.601083
+     },
+     "tokens_per_second": {
+      "values": [
+       46.26899891298919,
+       39.60634437056324,
+       43.580487550035954
+      ],
+      "median": 43.580487550035954
+     },
+     "peak_memory_bytes": {
+      "values": [
+       1507196928,
+       1502887936,
+       1509474304
+      ],
+      "median": 1507196928
+     }
+    },
+    "q8": {
+     "prefill_ms": {
+      "values": [
+       4180.327,
+       4322.118,
+       4363.318
+      ],
+      "median": 4322.118
+     },
+     "ttft_ms": {
+      "values": [
+       4212.045709,
+       4361.509,
+       4400.573334
+      ],
+      "median": 4361.509
+     },
+     "decode_ms": {
+      "values": [
+       1252.409333,
+       1456.242708,
+       1307.0483749999999
+      ],
+      "median": 1307.0483749999999
+     },
+     "tokens_per_second": {
+      "values": [
+       50.303042575617724,
+       43.26201920456243,
+       48.200205290795
+      ],
+      "median": 48.200205290795
+     },
+     "peak_memory_bytes": {
+      "values": [
+       1508442112,
+       1507688448,
+       1507229696
+      ],
+      "median": 1507688448
+     }
+    },
+    "f32-nosplitk": {
+     "prefill_ms": {
+      "values": [
+       2383.87,
+       2500.494,
+       2446.22
+      ],
+      "median": 2446.22
+     },
+     "ttft_ms": {
+      "values": [
+       2424.82375,
+       2545.094125,
+       2486.748542
+      ],
+      "median": 2486.748542
+     },
+     "decode_ms": {
+      "values": [
+       1551.4291249999999,
+       1554.5497080000002,
+       1485.8597499999998
+      ],
+      "median": 1551.4291249999999
+     },
+     "tokens_per_second": {
+      "values": [
+       40.60772031722687,
+       40.52620490408918,
+       42.399694856799236
+      ],
+      "median": 40.60772031722687
+     },
+     "peak_memory_bytes": {
+      "values": [
+       1553219584,
+       1553465344,
+       1553514496
+      ],
+      "median": 1553465344
+     }
+    }
+   },
+   "paired_ratios_vs_f32_default": {
+    "f16.prefill_ms": {
+     "median_ratio": 1.6768,
+     "ci95": [
+      1.6136,
+      2.0392
+     ],
+     "significant": true,
+     "n_rounds": 3
+    },
+    "f16.ttft_ms": {
+     "median_ratio": 1.6685,
+     "ci95": [
+      1.6053,
+      2.0181
+     ],
+     "significant": true,
+     "n_rounds": 3
+    },
+    "f16.decode_ms": {
+     "median_ratio": 1.2473,
+     "ci95": [
+      1.2115,
+      1.3156
+     ],
+     "significant": true,
+     "n_rounds": 3
+    },
+    "f16.tokens_per_second": {
+     "median_ratio": 0.8017,
+     "ci95": [
+      0.7601,
+      0.8254
+     ],
+     "significant": true,
+     "n_rounds": 3
+    },
+    "f16.peak_memory_bytes": {
+     "median_ratio": 0.9566,
+     "ci95": [
+      0.9534,
+      0.9703
+     ],
+     "significant": true,
+     "n_rounds": 3
+    },
+    "q8.prefill_ms": {
+     "median_ratio": 1.7738,
+     "ci95": [
+      1.6466,
+      3.0863
+     ],
+     "significant": true,
+     "n_rounds": 3
+    },
+    "q8.ttft_ms": {
+     "median_ratio": 1.7631,
+     "ci95": [
+      1.637,
+      3.0307
+     ],
+     "significant": true,
+     "n_rounds": 3
+    },
+    "q8.decode_ms": {
+     "median_ratio": 1.1473,
+     "ci95": [
+      1.0954,
+      1.2044
+     ],
+     "significant": true,
+     "n_rounds": 3
+    },
+    "q8.tokens_per_second": {
+     "median_ratio": 0.8716,
+     "ci95": [
+      0.8303,
+      0.9129
+     ],
+     "significant": true,
+     "n_rounds": 3
+    },
+    "q8.peak_memory_bytes": {
+     "median_ratio": 0.9565,
+     "ci95": [
+      0.9552,
+      0.9711
+     ],
+     "significant": true,
+     "n_rounds": 3
+    },
+    "f32-nosplitk.prefill_ms": {
+     "median_ratio": 0.9944,
+     "ci95": [
+      0.9526,
+      1.76
+     ],
+     "significant": false,
+     "n_rounds": 3
+    },
+    "f32-nosplitk.ttft_ms": {
+     "median_ratio": 0.9963,
+     "ci95": [
+      0.9552,
+      1.7447
+     ],
+     "significant": false,
+     "n_rounds": 3
+    },
+    "f32-nosplitk.decode_ms": {
+     "median_ratio": 1.2857,
+     "ci95": [
+      1.2453,
+      1.4212
+     ],
+     "significant": true,
+     "n_rounds": 3
+    },
+    "f32-nosplitk.tokens_per_second": {
+     "median_ratio": 0.7778,
+     "ci95": [
+      0.7036,
+      0.803
+     ],
+     "significant": true,
+     "n_rounds": 3
+    },
+    "f32-nosplitk.peak_memory_bytes": {
+     "median_ratio": 0.9855,
+     "ci95": [
+      0.9845,
+      0.9999
+     ],
+     "significant": true,
+     "n_rounds": 3
+    }
+   },
+   "paired_ratios_vs_f32_nosplitk": {
+    "q8.prefill_ms": {
+     "median_ratio": 1.7536,
+     "ci95": [
+      1.7285,
+      1.7837
+     ],
+     "significant": true,
+     "n_rounds": 3
+    },
+    "q8.ttft_ms": {
+     "median_ratio": 1.7371,
+     "ci95": [
+      1.7137,
+      1.7696
+     ],
+     "significant": true,
+     "n_rounds": 3
+    },
+    "q8.decode_ms": {
+     "median_ratio": 0.8797,
+     "ci95": [
+      0.8073,
+      0.9368
+     ],
+     "significant": true,
+     "n_rounds": 3
+    },
+    "q8.tokens_per_second": {
+     "median_ratio": 1.1368,
+     "ci95": [
+      1.0675,
+      1.2388
+     ],
+     "significant": true,
+     "n_rounds": 3
+    },
+    "q8.peak_memory_bytes": {
+     "median_ratio": 0.9705,
+     "ci95": [
+      0.9702,
+      0.9712
+     ],
+     "significant": true,
+     "n_rounds": 3
+    },
+    "f16.prefill_ms": {
+     "median_ratio": 1.6862,
+     "ci95": [
+      1.1587,
+      1.6938
+     ],
+     "significant": true,
+     "n_rounds": 3
+    },
+    "f16.ttft_ms": {
+     "median_ratio": 1.6746,
+     "ci95": [
+      1.1567,
+      1.6805
+     ],
+     "significant": true,
+     "n_rounds": 3
+    },
+    "f16.decode_ms": {
+     "median_ratio": 0.9729,
+     "ci95": [
+      0.8776,
+      1.0232
+     ],
+     "significant": false,
+     "n_rounds": 3
+    },
+    "f16.tokens_per_second": {
+     "median_ratio": 1.0278,
+     "ci95": [
+      0.9773,
+      1.1394
+     ],
+     "significant": false,
+     "n_rounds": 3
+    },
+    "f16.peak_memory_bytes": {
+     "median_ratio": 0.9704,
+     "ci95": [
+      0.9674,
+      0.9717
+     ],
+     "significant": true,
+     "n_rounds": 3
+    }
+   },
+   "greedy_parity_vs_f32": {
+    "f16": {
+     "first_divergent_generated_token_index": [
+      -1,
+      -1,
+      -1
+     ],
+     "token_identical_rounds": 3,
+     "rounds": 3
+    },
+    "q8": {
+     "first_divergent_generated_token_index": [
+      50,
+      50,
+      50
+     ],
+     "token_identical_rounds": 0,
+     "rounds": 3
+    },
+    "f32-nosplitk": {
+     "first_divergent_generated_token_index": [
+      -1,
+      -1,
+      -1
+     ],
+     "token_identical_rounds": 3,
+     "rounds": 3
+    }
+   }
+  }
+ },
+ "realtext_probe_note": "The only COHERENT-ENGLISH probe. Prompt is this repo's docs/perf-deep-dive/BENCHMARK_TREATY.md. The filler probes are correct for throughput -- bandwidth does not care what tokens mean -- but uninformative for parity: filler gives a nearly flat next-token distribution where a lossy KV flips the argmax on noise, and long filler runs collapse into a repetition attractor where both arms agree for free. This probe is what the parity verdict should rest on.",
+ "q8_advantage_by_context_depth": [
+  {
+   "probe": "short_6tok",
+   "prompt_tokens": 6,
+   "q8_over_f32nosplitk_tokens_per_second": {
+    "median_ratio": 1.0007,
+    "ci95": [
+     0.9937,
+     1.0081
+    ],
+    "significant": false,
+    "n_rounds": 5
+   },
+   "q8_over_f32default_tokens_per_second": {
+    "median_ratio": 1.0006,
+    "ci95": [
+     0.9896,
+     1.0083
+    ],
+    "significant": false,
+    "n_rounds": 5
+   }
+  },
+  {
+   "probe": "depth_1024",
+   "prompt_tokens": 1067,
+   "q8_over_f32nosplitk_tokens_per_second": {
+    "median_ratio": 1.1402,
+    "ci95": [
+     1.1356,
+     1.1556
+    ],
+    "significant": true,
+    "n_rounds": 3
+   },
+   "q8_over_f32default_tokens_per_second": {
+    "median_ratio": 0.9488,
+    "ci95": [
+     0.9449,
+     1.2108
+    ],
+    "significant": false,
+    "n_rounds": 3
+   }
+  },
+  {
+   "probe": "depth_2048",
+   "prompt_tokens": 2066,
+   "q8_over_f32nosplitk_tokens_per_second": {
+    "median_ratio": 1.2737,
+    "ci95": [
+     1.2395,
+     1.4245
+    ],
+    "significant": true,
+    "n_rounds": 3
+   },
+   "q8_over_f32default_tokens_per_second": {
+    "median_ratio": 0.98,
+    "ci95": [
+     0.9456,
+     1.3507
+    ],
+    "significant": false,
+    "n_rounds": 3
+   }
+  },
+  {
+   "probe": "depth_4096",
+   "prompt_tokens": 4117,
+   "q8_over_f32nosplitk_tokens_per_second": {
+    "median_ratio": 1.4324,
+    "ci95": [
+     1.4077,
+     1.4846
+    ],
+    "significant": true,
+    "n_rounds": 3
+   },
+   "q8_over_f32default_tokens_per_second": {
+    "median_ratio": 1.0314,
+    "ci95": [
+     1.0224,
+     1.0757
+    ],
+    "significant": true,
+    "n_rounds": 3
+   }
+  },
+  {
+   "probe": "depth_8006",
+   "prompt_tokens": 8006,
+   "q8_over_f32nosplitk_tokens_per_second": {
+    "median_ratio": 1.4982,
+    "ci95": [
+     1.4683,
+     1.6439
+    ],
+    "significant": true,
+    "n_rounds": 5
+   },
+   "q8_over_f32default_tokens_per_second": {
+    "median_ratio": 0.8713,
+    "ci95": [
+     0.7306,
+     1.0659
+    ],
+    "significant": false,
+    "n_rounds": 5
+   }
+  }
+ ],
+ "gpu_allocation": {
+  "method": "vmmap -summary sampled every 2s over a live run, taking the max of the 'IOAccelerator (graphics)' region. Sampling can miss a short-lived true peak, so treat these as lower bounds.",
+  "prompt_tokens": 8006,
+  "max_positions": 8192,
+  "measured_mb": {
+   "f32": {
+    "virtual": 2867.2,
+    "dirty": 2355.2
+   },
+   "f16": {
+    "virtual": 1638.4,
+    "dirty": 1331.2
+   },
+   "q8": {
+    "virtual": 1536.0,
+    "dirty": 1228.8
+   }
+  },
+  "predicted_kv_mb_from_allocator": {
+   "note": "From ResidentDecodeState::new in src/metal.rs: kv_row_bytes = (head_dim/32)*34; q8 buffer = n_kv_heads*max_positions*kv_row_bytes, else kv_slots*(kv16?2:4); cache_k and cache_v per layer; f32 ALSO allocates zero-filled f16 mirrors for split-K.",
+   "f32_primary": 512.0,
+   "f32_mirrors": 256.0,
+   "f16": 256.0,
+   "q8": 136.0
+  },
+  "finding": "f16 -> q8 measures 102.4 MB of GPU allocation saved against 120 MB predicted from the allocator -- the KV cache is shrinking as designed, directly measured. The f32 -> q8 gap (1228.8 MB measured vs 632 MB predicted from KV alone) is INFLATED by f32-only split-K and attention-as-matmul prefill scratch, so it must NOT be reported as a pure KV saving. Process peak RSS, which earlier probes used, does not separate f16 from q8 at all on this host (1,625,341,952 vs 1,625,653,248 B) and is the wrong instrument for this question."
+ },
+ "limitations": [
+  "Single host, single model, single architecture (llama, head_dim 64). No second host, so nothing here promotes a default under BENCHMARK_TREATY.",
+  "Arm order is rotated per round, not permuted. Rotation preserves cyclic order, so q8 always runs immediately after f16 and never gets a cold-cache slot. This cancels linear thermal drift but not order-adjacency effects.",
+  "The host swaps. Wall-clock per run is unreliable (one q8 round took 241 s against a 56 s measured generation); only the in-process post-warmup metrics are trustworthy.",
+  "Q4_0 KV was not measured: Metal has no Q4 resident format (ResidentKvFormat is F32|F16|Q8), so --kv-quant q4_0 has no resident lane to test.",
+  "gpu_allocation numbers come from 2 s sampling and are lower bounds on the true peak."
+ ],
+ "q8_advantage_by_context_depth_note": "Filler prompts only -- one prompt type, so the curve is internally comparable. The realtext probe (1460 tok, coherent English) is reported separately under probes; its q8/f32-nosplitk tokens_per_second is 1.1368, consistent with the filler curve at comparable depth."
+}

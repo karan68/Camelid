@@ -35,9 +35,46 @@ fn attention_matmul_prefill_head_dim_supported(head_dim: usize) -> bool {
     head_dim <= 128 && head_dim.is_multiple_of(64)
 }
 
+/// Whether the attention-as-matmul path's padded K/V rows fit the resident cache stride.
+///
+/// The path dispatches its V transpose, and for Q8 its dequant staging pass, over a
+/// 128-row-padded height. Near a context cap that is not itself 128-aligned, `n_tokens`
+/// can fit the cache while that padded dispatch does not. Fail closed to the row-attention
+/// fallback instead of reading or writing past the cache/staging allocation.
+#[cfg(any(target_os = "macos", test))]
+fn attention_matmul_prefill_rows_fit(n_tokens: usize, max_positions: usize) -> bool {
+    n_tokens
+        .div_ceil(128)
+        .checked_mul(128)
+        .is_some_and(|n_pad| n_pad <= max_positions)
+}
+
+/// Return the byte length of one transient half K/V staging buffer when it can be
+/// represented and allocated by this Metal device.
+///
+/// Q8 attention-as-matmul allocates two buffers of this size. Each allocation must
+/// independently fit `max_buffer_length`; returning `None` keeps the prefill on the
+/// existing row-attention fallback before either allocation is attempted.
+#[cfg(any(target_os = "macos", test))]
+fn attention_matmul_prefill_q8_stage_bytes(
+    n_kv_heads: usize,
+    max_positions: usize,
+    head_dim: usize,
+    max_buffer_length: usize,
+) -> Option<usize> {
+    let bytes = n_kv_heads
+        .checked_mul(max_positions)?
+        .checked_mul(head_dim)?
+        .checked_mul(std::mem::size_of::<u16>())?;
+    (bytes > 0 && bytes <= max_buffer_length).then_some(bytes)
+}
+
 #[cfg(test)]
 mod attention_matmul_prefill_shape_tests {
-    use super::attention_matmul_prefill_head_dim_supported;
+    use super::{
+        attention_matmul_prefill_head_dim_supported, attention_matmul_prefill_q8_stage_bytes,
+        attention_matmul_prefill_rows_fit,
+    };
 
     #[test]
     fn partial_64_row_pv_tiles_fail_closed() {
@@ -48,6 +85,39 @@ mod attention_matmul_prefill_shape_tests {
         assert!(!attention_matmul_prefill_head_dim_supported(96));
         assert!(!attention_matmul_prefill_head_dim_supported(32));
         assert!(!attention_matmul_prefill_head_dim_supported(192));
+    }
+
+    #[test]
+    fn padded_rows_must_fit_the_resident_cache_stride() {
+        assert!(attention_matmul_prefill_rows_fit(896, 1_000));
+        assert!(!attention_matmul_prefill_rows_fit(897, 1_000));
+        assert!(!attention_matmul_prefill_rows_fit(999, 1_000));
+        assert!(!attention_matmul_prefill_rows_fit(1_000, 1_000));
+        assert!(attention_matmul_prefill_rows_fit(1_000, 1_024));
+        assert!(!attention_matmul_prefill_rows_fit(usize::MAX, usize::MAX));
+    }
+
+    #[test]
+    fn q8_staging_fails_closed_before_an_oversized_or_overflowed_allocation() {
+        let needed = 2 * 1_000 * 64 * std::mem::size_of::<u16>();
+        assert_eq!(
+            attention_matmul_prefill_q8_stage_bytes(2, 1_000, 64, needed),
+            Some(needed)
+        );
+        assert_eq!(
+            attention_matmul_prefill_q8_stage_bytes(2, 1_000, 64, needed - 1),
+            None,
+            "a cache-fitting prompt must fall back when either half staging allocation cannot fit"
+        );
+        assert_eq!(
+            attention_matmul_prefill_q8_stage_bytes(usize::MAX, 2, 128, usize::MAX),
+            None,
+            "checked shape arithmetic must reject overflow"
+        );
+        assert_eq!(
+            attention_matmul_prefill_q8_stage_bytes(0, 1_000, 64, usize::MAX),
+            None
+        );
     }
 }
 
@@ -196,6 +266,10 @@ struct MetalLinearKernel {
     attention_decode_splitk_pipeline: ComputePipelineState,
     attention_decode_splitk_kv16_pipeline: ComputePipelineState,
     attention_decode_splitk_kv16_direct_pipeline: ComputePipelineState,
+    attention_decode_splitk_kvq8_pipeline: ComputePipelineState,
+    kv_dequant_q8_to_h_pipeline: ComputePipelineState,
+    rope_rotate_batch_h_pipeline: ComputePipelineState,
+    kv_scatter_batch_kvq8_h_pipeline: ComputePipelineState,
     #[allow(dead_code)] // stage-bandwidth probe variant; exercised by the depth-probe test
     attention_splitk_kv16_stageonly_pipeline: ComputePipelineState,
     attention_decode_splitk_merge_pipeline: ComputePipelineState,
@@ -4238,6 +4312,211 @@ kernel void attention_decode_splitk_kv16(
     }
 }
 
+// Q8_0-KV twin of attention_decode_splitk_kv16.
+//
+// Why this exists: enabling a Q8_0 primary used to forfeit split-K decode entirely
+// (the gate required an F32 primary), so a q8 session traded split-K's ~2.1x for the
+// KV-bandwidth win alone and came out behind the shipped default. Measured on M3 /
+// Llama-3.2-1B-Q8_0, q8 without split-K is 1.14x-1.50x over f32-without-split-K but
+// only ~0.87x-1.03x of the f32 default. See METAL_KV_Q8_RESULT.md. This kernel is the
+// missing half: split-K parallelism AND GQA amortization over a cache that is 1.88x
+// smaller than the f16 mirrors the kv16 split-K reads.
+//
+// Staging strategy differs from the kv16 twin on purpose. That kernel stages
+// dequantized `half`, costing 8 KiB of threadgroup memory. Here we stage the RAW int8
+// codes plus one f16 scale per 32-value block and dequantize in f32 at use:
+//
+//   * ~4.3 KiB total (PT*128 bytes per cache + PT*MAX_DPL scales), roughly half the
+//     kv16 twin, so more threadgroups stay resident per core -- which is the whole
+//     point of split-K.
+//   * The dequantized value never round-trips through `half`, so the arithmetic is
+//     the same `scale * float(code)` in f32 that attention_decode_v2_kvq8 performs.
+//     Staging dequantized halves would add ~5e-4 relative error and miss the 2e-4
+//     parity tolerance the Q8 lane is already held to.
+//
+// The cost is dequantizing once per consuming query head rather than once per stage
+// (group-way redundant ALU). Decode is bandwidth-bound, so trading a convert+multiply
+// for occupancy and DRAM traffic is the right side of that bargain.
+//
+// Byte strides: under a Q8 primary, position_stride / kv_head_stride / kv_base_offset
+// are all denominated in BYTES (see kv_position_stride at the encode site), unlike the
+// f32/f16 kernels which take element strides. Blocks are 34 bytes: f16 scale then 32
+// signed codes. Dim d lives at block d/32, code d%32.
+kernel void attention_decode_splitk_kvq8(
+    device const float* query [[buffer(0)]],
+    device const uchar* keys [[buffer(1)]],
+    device const uchar* values [[buffer(2)]],
+    device float* partials [[buffer(3)]], // [n_heads][n_splits][head_dim + 2]
+    constant uint& n_heads [[buffer(5)]],
+    constant uint& head_dim [[buffer(6)]],
+    constant uint& position_count [[buffer(7)]],
+    constant uint& group [[buffer(8)]],
+    constant float& scale [[buffer(9)]],
+    constant uint& position_stride [[buffer(10)]],
+    constant uint& kv_head_stride [[buffer(11)]],
+    constant uint& kv_base_offset [[buffer(12)]],
+    constant uint& n_splits [[buffer(13)]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    constexpr uint PT = 16;
+    constexpr uint MAX_DPL = 4;
+    constexpr uint MAX_HD = 128;
+    const uint kvh = tg.x;
+    const uint split = tg.y;
+    const uint dpl = head_dim / 32;
+    const uint kv_base = kv_base_offset + kvh * kv_head_stride;
+    const uint chunk = (position_count + n_splits - 1) / n_splits;
+    const uint p0 = min(split * chunk, position_count);
+    const uint p1 = min(p0 + chunk, position_count);
+
+    const uint qh = kvh * group + sg;
+    const bool active = sg < group && qh < n_heads;
+    float q[MAX_DPL];
+    if (active) {
+        for (uint i = 0; i < dpl; ++i) {
+            q[i] = query[qh * head_dim + lane + i * 32] * scale;
+        }
+    }
+    float m = -INFINITY;
+    float l = 0.0f;
+    float acc[MAX_DPL] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    threadgroup char k_q[PT * MAX_HD];
+    threadgroup char v_q[PT * MAX_HD];
+    threadgroup half k_sc[PT * MAX_DPL];
+    threadgroup half v_sc[PT * MAX_DPL];
+    const uint tid = sg * 32 + lane;
+
+    for (uint pt = p0; pt < p1; pt += PT) {
+        const uint count = min(PT, p1 - pt);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // Codes: one byte per (position, dim). Adjacent lanes take adjacent dims, so the
+        // byte reads coalesce within a block. Vector loads are NOT available -- the code
+        // array starts 2 bytes into each 34-byte block, so it is never 4-byte aligned.
+        for (uint idx = tid; idx < count * head_dim; idx += 128) {
+            const uint p = idx / head_dim;
+            const uint d = idx - p * head_dim;
+            const uint boff = (d >> 5) * 34;
+            const uint off = d & 31;
+            const uint row = kv_base + (pt + p) * position_stride + boff;
+            k_q[idx] = reinterpret_cast<device const char*>(keys + row + 2)[off];
+            v_q[idx] = reinterpret_cast<device const char*>(values + row + 2)[off];
+        }
+        // Scales: one f16 per (position, block).
+        for (uint idx = tid; idx < count * dpl; idx += 128) {
+            const uint p = idx / dpl;
+            const uint b = idx - p * dpl;
+            const uint row = kv_base + (pt + p) * position_stride + b * 34;
+            k_sc[p * MAX_DPL + b] = *reinterpret_cast<device const half*>(keys + row);
+            v_sc[p * MAX_DPL + b] = *reinterpret_cast<device const half*>(values + row);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (active) {
+            // Online softmax batched 4 positions per round, identical in shape and order
+            // to the kv16 twin: the 4 dots and simd_sums are independent, and (m, l, acc)
+            // rescale once per round instead of once per position. Tail slots pad with
+            // -INF (w = 0) and their value reads are guarded so staged garbage cannot
+            // poison the accumulator.
+            for (uint j0 = 0; j0 < count; j0 += 4) {
+                float s4[4];
+                for (uint jj = 0; jj < 4; ++jj) {
+                    const uint j = j0 + jj;
+                    if (j < count) {
+                        float s = 0.0f;
+                        for (uint i = 0; i < dpl; ++i) {
+                            const float kd = float(k_sc[j * MAX_DPL + i]);
+                            s += q[i] * (kd * float(k_q[j * head_dim + lane + i * 32]));
+                        }
+                        s4[jj] = simd_sum(s);
+                    } else {
+                        s4[jj] = -INFINITY;
+                    }
+                }
+                const float m4 = max(max(s4[0], s4[1]), max(s4[2], s4[3]));
+                const float m_new = max(m, m4);
+                const float corr = exp(m - m_new);
+                float w4[4];
+                for (uint jj = 0; jj < 4; ++jj) {
+                    w4[jj] = (s4[jj] == -INFINITY) ? 0.0f : exp(s4[jj] - m_new);
+                }
+                for (uint i = 0; i < dpl; ++i) {
+                    float a = acc[i] * corr;
+                    for (uint jj = 0; jj < 4; ++jj) {
+                        const uint j = j0 + jj;
+                        if (j < count) {
+                            const float vd = float(v_sc[j * MAX_DPL + i]);
+                            a += w4[jj] * (vd * float(v_q[j * head_dim + lane + i * 32]));
+                        }
+                    }
+                    acc[i] = a;
+                }
+                l = l * corr + w4[0] + w4[1] + w4[2] + w4[3];
+                m = m_new;
+            }
+        }
+    }
+    if (active) {
+        device float* dst = partials + ((ulong)qh * n_splits + split) * (head_dim + 2);
+        for (uint i = 0; i < dpl; ++i) {
+            dst[lane + i * 32] = acc[i];
+        }
+        if (lane == 0) {
+            dst[head_dim] = m;
+            dst[head_dim + 1] = l;
+        }
+    }
+}
+
+// Dequantize one layer's Q8_0 KV slice into a half [kv_head][max_positions][head_dim]
+// staging buffer, laid out byte-identically to the f32 lane's persistent cache_k16 /
+// cache_v16 mirrors so the attention-as-matmul prefill consumes it with no stride changes.
+//
+// Why this exists: the attn-mm prefill (transpose_v16 -> half_mm_batched_f16o ->
+// softmax_causal_rows -> half_mm_batched_f16o, on simdgroup matrix units) reads half K/V.
+// Under a Q8 primary the mirrors are empty Vecs, which is the mechanical reason kvq8 was
+// excluded from that path -- and that exclusion, not the Q8 dequant, is what made q8
+// prefill 2.2x-4.5x slower. Measured: q8/f16 prefill is 1.00-1.07x at every depth while
+// both trail f32 by 1.8x-4.4x, i.e. f16 and q8 are excluded by the same predicate and land
+// on top of each other. Staging is O(n*d) per layer against the O(n^2) attention it
+// unblocks, and unlike the f32 lane's mirrors it is transient scratch (~16.8 MB)
+// rather than a persistent second cache (~256 MB at 8192 positions), so the Q8 memory win
+// survives.
+//
+// One thread per element: adjacent lanes read adjacent code bytes and write adjacent
+// halves (both coalesced), and the 34-byte block's f16 scale is broadcast across the 32
+// lanes that share it. Positions past `valid_rows` are zero-filled rather than left
+// undefined -- causal masking would drop them, but an additive -inf mask cannot rescue a
+// NaN, so garbage in the pad rows could poison a whole row of scores.
+kernel void kv_dequant_q8_to_h(
+    device const uchar* src [[buffer(0)]],
+    device half* dst [[buffer(1)]],
+    constant uint& head_dim [[buffer(2)]],
+    constant uint& rows [[buffer(3)]],                // positions to fill (n_pad)
+    constant uint& valid_rows [[buffer(4)]],          // positions actually materialized
+    constant uint& src_position_stride [[buffer(5)]], // BYTES
+    constant uint& src_kv_head_stride [[buffer(6)]],  // BYTES
+    constant uint& dst_position_stride [[buffer(7)]], // elements
+    constant uint& dst_kv_head_stride [[buffer(8)]],  // elements
+    uint3 gid [[thread_position_in_grid]]
+) {
+    const uint d = gid.x;
+    const uint p = gid.y;
+    const uint kvh = gid.z;
+    if (d >= head_dim || p >= rows) return;
+    device half* out = dst + kvh * dst_kv_head_stride + p * dst_position_stride + d;
+    if (p >= valid_rows) {
+        *out = half(0.0f);
+        return;
+    }
+    device const uchar* b =
+        src + kvh * src_kv_head_stride + p * src_position_stride + (d >> 5) * 34;
+    const float scale = float(*reinterpret_cast<device const half*>(b));
+    const float code = float(reinterpret_cast<device const char*>(b + 2)[d & 31]);
+    *out = half(scale * code);
+}
+
 // f16-KV twin of attention_decode_v2_f32.
 kernel void attention_decode_v2_kv16(
     device const float* query [[buffer(0)]],
@@ -4931,6 +5210,131 @@ kernel void rope_rotate_batch_f32(
     float x1 = row[dim1];
     row[dim0] = x0 * c - x1 * s;
     row[dim1] = x0 * s + x1 * c;
+}
+
+// Half twin of rope_rotate_batch_f32, with SEPARATE source and destination pointers so one
+// kernel covers both roles the es=2 Q8 lane needs:
+//
+//   * K, rotated in place       (src == dst == k_buf)
+//   * Q, rotated straight into the half query panel the attention-as-matmul score GEMM
+//     consumes (src = q_buf, dst = q_h)
+//
+// The f32 lane gets the second job from rope_scatter_qh_batch_h, which a Q8 primary cannot
+// use: that kernel writes K/V into the f32 + half caches, and a Q8 cache needs an amax
+// across each 32-element block, which is a different thread mapping than one-thread-per-
+// RoPE-pair. Splitting RoPE from the scatter is exactly what the Q8 lane already does.
+//
+// Writing Q into a separate destination is what makes es=2 reachable at all: the generic
+// `convert` helper is hardwired to f32_to_f16, so with a half q_buf it would reinterpret
+// half bytes as f32 and the sampler would see non-finite logits.
+//
+// Only rotated dims are written, so a distinct destination is safe ONLY under full rotary
+// coverage (half_rope * 2 == head_dim) — which is precisely the condition use_h16 already
+// requires. Arithmetic mirrors the f32 twin: widen to float, rotate, narrow once on store,
+// so the half round trip costs one rounding rather than two.
+kernel void rope_rotate_batch_h(
+    device const half* src [[buffer(0)]],
+    device half* dst [[buffer(1)]],
+    device const float* cos_table [[buffer(2)]],
+    device const float* sin_table [[buffer(3)]],
+    constant uint& head_count [[buffer(4)]],
+    constant uint& head_dim [[buffer(5)]],
+    constant uint& half_rope [[buffer(6)]],
+    constant uint& pairing [[buffer(7)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    const uint total = head_count * half_rope;
+    if (gid.x >= total) return;
+    const uint t = gid.y;
+    const uint row_base = t * head_count * head_dim;
+    device const half* srow = src + row_base;
+    device half* drow = dst + row_base;
+    device const float* ct = cos_table + t * half_rope;
+    device const float* st = sin_table + t * half_rope;
+    const uint head = gid.x / half_rope;
+    const uint pair = gid.x - head * half_rope;
+    const float c = ct[pair];
+    const float s = st[pair];
+    const uint head_start = head * head_dim;
+    uint dim0;
+    uint dim1;
+    if (pairing == 0u) {
+        dim0 = head_start + pair * 2u;
+        dim1 = dim0 + 1u;
+    } else {
+        dim0 = head_start + pair;
+        dim1 = head_start + pair + half_rope;
+    }
+    const float x0 = float(srow[dim0]);
+    const float x1 = float(srow[dim1]);
+    drow[dim0] = half(x0 * c - x1 * s);
+    drow[dim1] = half(x0 * s + x1 * c);
+}
+
+// Half-input twin of kv_scatter_batch_kvq8, for the es=2 activation stream: identical block
+// quantization, only the source operands widen from half instead of being read as f32.
+//
+// It deliberately does NOT also populate the half staging buffers, even though its
+// one-thread-per-32-element-block mapping is exactly the right granularity and the
+// dequantized values would be free here. Two reasons, both load-bearing:
+//
+//   * The staging buffer must cover the whole history [0, n_pad) that attention reads,
+//     whereas this kernel only writes [base_position, base_position + n_tokens). Folding
+//     staging in would be correct for a fresh prefill and silently wrong for an incremental
+//     one, and it would also drop the pad-row zero fill that keeps a garbage half from
+//     decoding to NaN and poisoning a whole score row.
+//   * The scatter stores `half(kd)` but quantizes with the UNROUNDED `1.0f/kd`, while every
+//     reader (kv_dequant_q8_to_h, attention_decode_v2_kvq8) uses the half-rounded scale. A
+//     staging write that reused `kd` here would not match what any dequant of the cache
+//     produces. This asymmetry is inherited verbatim from the f32 twin; do not "fix" it in
+//     one place only.
+//
+// So kv_dequant_q8_to_h stays as the single source of the staging buffer.
+//
+// NOTE ON BIT-EXACTNESS: under es=2 the amax is taken over K/V that were already rounded to
+// half by the QKV GEMM, so the Q8 codes this writes differ slightly from what the es=4 lane
+// produces. That is inherent to the half activation stream, not to this kernel, but it means
+// the Q8 cache is not byte-identical across the es axis -- relevant to any golden test that
+// pins cache bytes.
+kernel void kv_scatter_batch_kvq8_h(
+    device const half* src_k [[buffer(0)]],
+    device const half* src_v [[buffer(1)]],
+    device uchar* cache_k [[buffer(2)]],
+    device uchar* cache_v [[buffer(3)]],
+    constant uint& head_dim [[buffer(4)]],
+    constant uint& max_positions [[buffer(5)]],
+    constant uint& base_position [[buffer(6)]],
+    constant uint& total_blocks [[buffer(7)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    if (gid.x >= total_blocks) return;
+    const uint blocks_per_head = head_dim / 32;
+    const uint head = gid.x / blocks_per_head;
+    const uint block = gid.x - head * blocks_per_head;
+    const uint token = gid.y;
+    const uint total_values = total_blocks * 32;
+    const uint src = token * total_values + head * head_dim + block * 32;
+    const uint row_bytes = blocks_per_head * 34;
+    const uint dst =
+        (head * max_positions + base_position + token) * row_bytes + block * 34;
+    float kmax = 0.0f;
+    float vmax = 0.0f;
+    for (uint i = 0; i < 32; ++i) {
+        kmax = max(kmax, fabs(float(src_k[src + i])));
+        vmax = max(vmax, fabs(float(src_v[src + i])));
+    }
+    const float kd = kmax / 127.0f;
+    const float vd = vmax / 127.0f;
+    *reinterpret_cast<device half*>(cache_k + dst) = half(kd);
+    *reinterpret_cast<device half*>(cache_v + dst) = half(vd);
+    const float kinv = kd == 0.0f ? 0.0f : 1.0f / kd;
+    const float vinv = vd == 0.0f ? 0.0f : 1.0f / vd;
+    for (uint i = 0; i < 32; ++i) {
+        cache_k[dst + 2 + i] =
+            uchar(char(clamp(int(round(float(src_k[src + i]) * kinv)), -127, 127)));
+        cache_v[dst + 2 + i] =
+            uchar(char(clamp(int(round(float(src_v[src + i]) * vinv)), -127, 127)));
+    }
 }
 
 // kv_scatter_f32 over n_tokens rows: gid.y = token, written at base_position + token.
@@ -7740,6 +8144,30 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
             let attention_splitk_kv16_stageonly_pipeline = device
                 .new_compute_pipeline_state_with_function(&attention_splitk_kv16_stageonly_function)
                 .ok()?;
+            let rope_rotate_batch_h_function = elementwise_library
+                .get_function("rope_rotate_batch_h", None)
+                .ok()?;
+            let rope_rotate_batch_h_pipeline = device
+                .new_compute_pipeline_state_with_function(&rope_rotate_batch_h_function)
+                .ok()?;
+            let kv_scatter_batch_kvq8_h_function = elementwise_library
+                .get_function("kv_scatter_batch_kvq8_h", None)
+                .ok()?;
+            let kv_scatter_batch_kvq8_h_pipeline = device
+                .new_compute_pipeline_state_with_function(&kv_scatter_batch_kvq8_h_function)
+                .ok()?;
+            let kv_dequant_q8_to_h_function = elementwise_library
+                .get_function("kv_dequant_q8_to_h", None)
+                .ok()?;
+            let kv_dequant_q8_to_h_pipeline = device
+                .new_compute_pipeline_state_with_function(&kv_dequant_q8_to_h_function)
+                .ok()?;
+            let attention_decode_splitk_kvq8_function = elementwise_library
+                .get_function("attention_decode_splitk_kvq8", None)
+                .ok()?;
+            let attention_decode_splitk_kvq8_pipeline = device
+                .new_compute_pipeline_state_with_function(&attention_decode_splitk_kvq8_function)
+                .ok()?;
             let attention_decode_splitk_merge_function = elementwise_library
                 .get_function("attention_decode_splitk_merge_f32", None)
                 .ok()?;
@@ -8180,6 +8608,10 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 attention_decode_splitk_pipeline,
                 attention_decode_splitk_kv16_pipeline,
                 attention_decode_splitk_kv16_direct_pipeline,
+                attention_decode_splitk_kvq8_pipeline,
+                kv_dequant_q8_to_h_pipeline,
+                rope_rotate_batch_h_pipeline,
+                kv_scatter_batch_kvq8_h_pipeline,
                 attention_splitk_kv16_stageonly_pipeline,
                 attention_decode_splitk_merge_pipeline,
                 attention_decode_f32_tree_pipeline,
@@ -12521,6 +12953,40 @@ fn mm_prefill_enabled() -> bool {
     })
 }
 
+/// Admit a Q8_0 primary to the attention-as-matmul prefill by staging its blocks into a
+/// transient half K/V buffer (`kv_dequant_q8_to_h`).
+///
+/// Default ON within the (already opt-in) Q8 lane; `CAMELID_METAL_Q8_ATTN_MM=0` disables.
+///
+/// Without it a Q8 primary is excluded from the attention-as-matmul prefill, which measured
+/// **4.48x slower prefill than the f32 default at 8006 tokens** (CI [4.39, 4.68]). With it,
+/// q8 prefill is statistically indistinguishable from that default (0.986, CI [0.924,
+/// 1.132]) — a 4.5x improvement, CI [0.198, 0.252]. Leaving it off would mean everyone who
+/// opts into q8 keeps paying that regression, which is why the escape hatch is the opt-out
+/// rather than the opt-in. Receipt: `METAL_KV_Q8_RESULT.md`.
+///
+/// Note the Q8 dequant was never the problem: q8/f16 prefill measured 1.00-1.07x at every
+/// depth while both trailed f32 by 1.8x-4.4x, i.e. f16 and q8 were excluded by the same
+/// predicate and landed on top of each other.
+///
+/// The Q8 lane also keeps the half activation stream end to end: `rope_rotate_batch_h`
+/// rotates Q directly into the half query panel and K in place, then
+/// `kv_scatter_batch_kvq8_h` quantizes the half K/V operands. This deliberately remains a
+/// split path: Q8 needs an amax across each 32-element block, which does not match the
+/// one-thread-per-RoPE-pair mapping of the fused f32-primary kernel.
+///
+/// Validated on one host (M3) and one model shape (llama, head_dim 64, GQA group 4). Under
+/// BENCHMARK_TREATY that is not enough to promote a *default*; it is enough to improve an
+/// already opt-in lane, which is all this does.
+#[cfg(target_os = "macos")]
+fn q8_attn_mm_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !std::env::var("CAMELID_METAL_Q8_ATTN_MM")
+            .is_ok_and(|v| v == "0" || v.eq_ignore_ascii_case("false"))
+    })
+}
+
 /// K-split GEMV over an f32 activation vector (see q8_0_block_linear_row_ksplit_f32y).
 /// The weight buffer must match the active format: decoded 36-byte blocks normally, wire
 /// 34-byte blocks when CAMELID_METAL_WIRE is on (prepare_token resolves accordingly).
@@ -16415,9 +16881,12 @@ fn encode_attention(
     // covers (kv_heads x splits) threadgroups with the K/V tile staged once per group.
     // Below the threshold the fixed scratch/merge cost outweighs the win.
     let group = n_heads.checked_div(n_kv_heads).unwrap_or(0);
+    // A Q8 primary now has its own split-K kernel (attention_decode_splitk_kvq8), so it
+    // no longer has to forfeit split-K the way a kv16 primary still does. kv16-primary
+    // stays excluded: it keeps no separate mirrors, and its primary IS the half cache the
+    // f32 lane's mirrors provide, so there is nothing here to reuse for it yet.
     let splitk = v2
         && !kv16_enabled()
-        && !kvq8_enabled()
         && splitk_attention_enabled()
         && (1..=4).contains(&group)
         && position_count >= 128;
@@ -16433,7 +16902,16 @@ fn encode_attention(
         let use_mirrors = kv16_mirrors.is_some()
             && !std::env::var("CAMELID_METAL_ATTN_SPLITK_KV16")
                 .is_ok_and(|v| v == "0" || v.eq_ignore_ascii_case("false"));
-        if use_mirrors {
+        if kvq8_enabled() {
+            // Q8 primary: read the 34-byte-block cache directly. No mirrors exist on this
+            // lane (cache_k16/cache_v16 are empty under a compressed primary), and none are
+            // wanted -- the whole point is that the Q8 cache is 1.88x smaller than the f16
+            // mirrors this path reads on the f32 lane.
+            e.set_compute_pipeline_state(&k.attention_decode_splitk_kvq8_pipeline);
+            e.set_buffer(0, Some(query), query_off);
+            e.set_buffer(1, Some(keys), 0);
+            e.set_buffer(2, Some(values), 0);
+        } else if use_mirrors {
             let (mk, mv) = kv16_mirrors.expect("checked is_some above");
             // Direct-read variant for head_dim 128: no threadgroup staging or
             // barriers -> more resident threadgroups; GQA re-reads hit the SLC.
@@ -22602,7 +23080,7 @@ impl ResidentDecodeState {
     /// prefill, not once per token. KV lands directly in the resident caches (positions
     /// 0..n); generation then continues with the resident decode, no CPU seeding. Returns
     /// the logits of the LAST prefilled token. Requirements mirror forward_token plus:
-    /// f32 KV cache only, wire weights, head_dim % 32 == 0.
+    /// f32 or Q8 KV cache, wire weights, head_dim % 32 == 0.
     #[allow(clippy::too_many_arguments)]
     pub fn prefill_tokens(
         &mut self,
@@ -22689,11 +23167,25 @@ impl ResidentDecodeState {
         // norms, silu), halving activation traffic.
         let n_pad = n_tokens.next_multiple_of(128);
         let gqa_group = self.n_heads / self.n_kv_heads;
+        // A Q8 primary is admitted here by staging its blocks into a transient half K/V
+        // buffer below (`kv_dequant_q8_to_h`); kv16-primary is still excluded because its
+        // primary IS half and wants a direct binding rather than a staging pass.
+        let stage_q8_kv = self.kvq8 && q8_attn_mm_enabled();
+        let q8_stage_bytes = stage_q8_kv.then_some(()).and_then(|()| {
+            attention_matmul_prefill_q8_stage_bytes(
+                self.n_kv_heads,
+                self.max_positions,
+                self.head_dim,
+                k.device.max_buffer_length() as usize,
+            )
+        });
         let use_attn_mm = !self.kv16
-            && !self.kvq8
+            && (!self.kvq8 || stage_q8_kv)
+            && (!stage_q8_kv || q8_stage_bytes.is_some())
             && all_q8
             && mm_prefill_enabled()
             && !has_qk_norm
+            && attention_matmul_prefill_rows_fit(n_tokens, self.max_positions)
             && q_dim.is_multiple_of(128)
             && kv_dim.is_multiple_of(128)
             && self.hidden.is_multiple_of(128)
@@ -22714,6 +23206,17 @@ impl ResidentDecodeState {
         } else {
             0
         };
+        // Element size of the whole activation stream. This once had to track
+        // `use_fused_rope` rather than `use_attn_mm`, because with the fused RoPE off the
+        // attn-mm block rebuilt `q_h` via a convert hardwired to f32->f16 -- so a half
+        // `q_buf` was reinterpreted as f32 and the sampler saw non-finite logits.
+        //
+        // The Q8 lane no longer needs that restriction: `rope_rotate_batch_h` rotates Q
+        // straight into the half panel (and K in place), and `kv_scatter_batch_kvq8_h`
+        // quantizes from half operands, so the es=2 stream is closed end to end without a
+        // fused rope+scatter kernel -- which would have been the wrong shape anyway, since
+        // Q8 needs a per-32-element-block amax and the fused kernel runs one thread per
+        // RoPE pair. The convert is now guarded on `!use_h16` to match.
         let use_h16 = use_attn_mm && half_rope * 2 == self.head_dim;
         let es = if use_h16 { 2 } else { 4 }; // element size of the activation stream
         let seq = nb(n_tokens * self.hidden * es);
@@ -22895,6 +23398,34 @@ impl ResidentDecodeState {
         } else {
             2
         });
+        // Transient half K/V staging for the Q8 lane, laid out exactly like the f32 lane's
+        // persistent cache_k16/cache_v16 mirrors (max_positions stride) so every consumer
+        // below binds it without a stride change. Reused across all layers: one layer is
+        // live at a time, so this is ~16.8 MB at 8192 positions rather than the ~256 MB of
+        // permanent mirrors the f32 lane carries.
+        let q8_k_stage = nb(if use_attn_mm && stage_q8_kv {
+            q8_stage_bytes.expect("Q8 staging admission checked above")
+        } else {
+            2
+        });
+        let q8_v_stage = nb(if use_attn_mm && stage_q8_kv {
+            q8_stage_bytes.expect("Q8 staging admission checked above")
+        } else {
+            2
+        });
+        let q8_stage_scalar = nb(28);
+        if use_attn_mm && stage_q8_kv {
+            unsafe {
+                let p = q8_stage_scalar.contents() as *mut u32;
+                *p = self.head_dim as u32;
+                *p.add(1) = n_pad as u32; // rows to fill
+                *p.add(2) = n_tokens as u32; // rows actually materialized
+                *p.add(3) = ((self.head_dim / 32) * 34) as u32; // src position stride (bytes)
+                *p.add(4) = (self.max_positions * (self.head_dim / 32) * 34) as u32; // src kv-head stride (bytes)
+                *p.add(5) = self.head_dim as u32; // dst position stride (elements)
+                *p.add(6) = (self.max_positions * self.head_dim) as u32; // dst kv-head stride (elements)
+            }
+        }
         let fused_rope_scalar = nb(24);
         let vt_scalar = nb(16);
         unsafe {
@@ -23219,7 +23750,12 @@ impl ResidentDecodeState {
                 );
                 stage!("2b:qk_norm");
             }
-            let use_fused_rope = use_attn_mm && half_rope * 2 == self.head_dim;
+            // Deliberately excludes the Q8 lane: rope_scatter_qh_h writes rotated K straight
+            // into cache_k/cache_k16, which a Q8 primary cannot accept without a quantizing
+            // twin of that kernel. Decoupling it from use_attn_mm keeps this change to the
+            // attention path; the unfused RoPE costs three dispatches instead of one per
+            // layer, which is small next to the O(n^2) attention win being unblocked.
+            let use_fused_rope = use_attn_mm && !stage_q8_kv && half_rope * 2 == self.head_dim;
             if use_fused_rope {
                 // Fused rope(Q)->half panel + rope(K)->caches + V scatter, one dispatch.
                 e.set_compute_pipeline_state(if use_h16 {
@@ -23248,6 +23784,48 @@ impl ResidentDecodeState {
                         &k.rope_scatter_qh_pipeline
                     },
                     (self.n_heads + self.n_kv_heads) * half_rope + kv_dim,
+                    n_tokens,
+                );
+            } else if use_h16 && stage_q8_kv {
+                // es=2 Q8 lane: q_buf/k_buf/v_buf are half here, so the f32 RoPE would
+                // reinterpret them. Q rotates straight into the half query panel rather
+                // than in place, because the `convert` that would otherwise build q_h is
+                // hardwired f32->f16 and would misread a half q_buf. Safe only under full
+                // rotary coverage (half_rope * 2 == head_dim), which use_h16 requires.
+                let rope_h = |e: &metal::ComputeCommandEncoderRef,
+                              src: &Buffer,
+                              dst: &Buffer,
+                              scalar: &Buffer,
+                              heads: usize| {
+                    e.set_compute_pipeline_state(&k.rope_rotate_batch_h_pipeline);
+                    e.set_buffer(0, Some(src), 0);
+                    e.set_buffer(1, Some(dst), 0);
+                    e.set_buffer(2, Some(&cos_buf), 0);
+                    e.set_buffer(3, Some(&sin_buf), 0);
+                    for j in 0..4u64 {
+                        e.set_buffer(4 + j, Some(scalar), j * 4);
+                    }
+                    dispatch_rows(
+                        e,
+                        &k.rope_rotate_batch_h_pipeline,
+                        heads * half_rope,
+                        n_tokens,
+                    );
+                };
+                rope_h(&e, &q_buf, &q_h, &rope_q_scalar, self.n_heads);
+                rope_h(&e, &k_buf, &k_buf, &rope_k_scalar, self.n_kv_heads);
+                e.set_compute_pipeline_state(&k.kv_scatter_batch_kvq8_h_pipeline);
+                e.set_buffer(0, Some(&k_buf), 0);
+                e.set_buffer(1, Some(&v_buf), 0);
+                e.set_buffer(2, Some(&self.cache_k[i]), 0);
+                e.set_buffer(3, Some(&self.cache_v[i]), 0);
+                for j in 0..4u64 {
+                    e.set_buffer(4 + j, Some(&scatter_scalar), j * 4);
+                }
+                dispatch_rows(
+                    &e,
+                    &k.kv_scatter_batch_kvq8_h_pipeline,
+                    self.n_kv_heads * (self.head_dim / 32),
                     n_tokens,
                 );
             } else {
@@ -23331,7 +23909,10 @@ impl ResidentDecodeState {
                 // weight GEMMs, with upper-triangle S tiles culled and the PV k-range
                 // clamped to the causal limit.
                 // q -> half (already produced by the fused rope pass when eligible)
-                if !use_fused_rope {
+                // q -> half. Produced by the fused rope pass when eligible, and by
+                // rope_rotate_batch_h on the es=2 Q8 lane. This convert is hardwired
+                // f32->f16, so it is correct ONLY when q_buf is genuinely f32 (es=4).
+                if !use_fused_rope && !use_h16 {
                     convert(&e, &q_buf, &q_h, &n_elems, 8, n_tokens * q_dim);
                 }
                 // S = Q K^T (per query head; K shared per KV head)
@@ -23402,10 +23983,48 @@ impl ResidentDecodeState {
                         },
                     );
                 };
+                // Q8 primary: materialize this layer's K/V as half into the staging pair
+                // before anything reads them. Must precede transpose_v16 (V) and the S=QK^T
+                // panel (K), both of which expect the f32 lane's mirror layout.
+                if stage_q8_kv {
+                    for (src, dst) in [
+                        (&self.cache_k[i], &q8_k_stage),
+                        (&self.cache_v[i], &q8_v_stage),
+                    ] {
+                        e.set_compute_pipeline_state(&k.kv_dequant_q8_to_h_pipeline);
+                        e.set_buffer(0, Some(src), 0);
+                        e.set_buffer(1, Some(dst), 0);
+                        for j in 0..7u64 {
+                            e.set_buffer(2 + j, Some(&q8_stage_scalar), j * 4);
+                        }
+                        e.dispatch_threads(
+                            metal::MTLSize {
+                                width: self.head_dim as u64,
+                                height: n_pad as u64,
+                                depth: self.n_kv_heads as u64,
+                            },
+                            metal::MTLSize {
+                                width: 32,
+                                height: 4,
+                                depth: 1,
+                            },
+                        );
+                    }
+                }
+                let attn_k16: &Buffer = if stage_q8_kv {
+                    &q8_k_stage
+                } else {
+                    &self.cache_k16[i]
+                };
+                let attn_v16: &Buffer = if stage_q8_kv {
+                    &q8_v_stage
+                } else {
+                    &self.cache_v16[i]
+                };
                 // Transpose this layer's V slice ONCE so every query block's PV
                 // A-staging reads contiguously.
                 e.set_compute_pipeline_state(&k.transpose_v16_pipeline);
-                e.set_buffer(0, Some(&self.cache_v16[i]), 0);
+                e.set_buffer(0, Some(attn_v16), 0);
                 e.set_buffer(1, Some(&vt_scratch), 0);
                 for j in 0..4u64 {
                     e.set_buffer(2 + j, Some(&vt_scalar), j * 4);
@@ -23432,7 +24051,7 @@ impl ResidentDecodeState {
                     // S = Q K^T (per query head; K shared per KV head)
                     smm(
                         &e,
-                        &self.cache_k16[i],
+                        attn_k16,
                         &q_h,
                         qh_off,
                         &s_big,
@@ -27092,8 +27711,9 @@ mod tests {
 
     /// Capability gate for the whole macOS Metal test lane.
     ///
-    /// 56 device-gated tests in this file open with `if !detect_metal_device().available {
-    /// return; }`, and `metal_resident_rollback_moves_filled_with_the_kv_position`
+    /// The device-gated tests in this file either return when Metal is unavailable or,
+    /// for the focused Q8 qualification tests, call `required_q8_kernel`; and
+    /// `metal_resident_rollback_moves_filled_with_the_kv_position`
     /// (`src/inference/tests.rs`) — the only guard for the draft-rollback regression that needs
     /// no model file — skips the same way on `ResidentDecodeState::new(..) -> None`. If the host
     /// reports no device, or reports one whose driver cannot build the resident pipelines, every
@@ -28232,6 +28852,549 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn required_q8_kernel(test_name: &str) -> Option<&'static MetalLinearKernel> {
+        if !detect_metal_device().available {
+            assert_ne!(
+                std::env::var("CAMELID_REQUIRE_METAL_TESTS").as_deref(),
+                Ok("1"),
+                "CAMELID_REQUIRE_METAL_TESTS=1 but {test_name} cannot run without a Metal device"
+            );
+            return None;
+        }
+        Some(
+            metal_linear_kernel()
+                .unwrap_or_else(|| panic!("{test_name}: Metal device exists but pipelines failed")),
+        )
+    }
+
+    /// Deterministic Q8 cache bytes plus their exact f32 dequantization. The returned
+    /// f32 layout is `[kv_head][max_positions][head_dim]`.
+    #[cfg(target_os = "macos")]
+    fn q8_cache_fixture(
+        n_kv_heads: usize,
+        max_positions: usize,
+        head_dim: usize,
+        seed: usize,
+    ) -> (Vec<u8>, Vec<f32>) {
+        let blocks_per_head = head_dim / 32;
+        let row_bytes = blocks_per_head * 34;
+        let mut wire = vec![0u8; n_kv_heads * max_positions * row_bytes];
+        let mut dequant = vec![0.0f32; n_kv_heads * max_positions * head_dim];
+        for head in 0..n_kv_heads {
+            for position in 0..max_positions {
+                for block in 0..blocks_per_head {
+                    // A power-of-two scale makes the CPU dequant oracle exact while the
+                    // signed, non-repeating codes still exercise every byte stride.
+                    let scale = (1 + (head * 3 + position + block + seed) % 4) as f32 / 1_024.0;
+                    let scale_bits = f32_to_f16_bits(scale);
+                    let stored_scale = f16_bits_to_f32(scale_bits);
+                    let wire_base = (head * max_positions + position) * row_bytes + block * 34;
+                    wire[wire_base..wire_base + 2].copy_from_slice(&scale_bits.to_le_bytes());
+                    for lane in 0..32 {
+                        let code =
+                            (((head * 97 + position * 53 + block * 31 + lane * 17 + seed * 11)
+                                % 255) as i32
+                                - 127) as i8;
+                        wire[wire_base + 2 + lane] = code as u8;
+                        let dst = (head * max_positions + position) * head_dim + block * 32 + lane;
+                        dequant[dst] = stored_scale * f32::from(code);
+                    }
+                }
+            }
+        }
+        (wire, dequant)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_attention_decode_splitk_kvq8_matches_cpu_at_every_admitted_shape() {
+        let Some(kernel) = required_q8_kernel("Q8 split-K attention qualification") else {
+            return;
+        };
+        let opts = MTLResourceOptions::StorageModeShared;
+
+        // Every head width admitted by encode_attention and every supported GQA group.
+        // All depths select split-K (>=128), use a nonzero cache base, and leave a
+        // non-four/non-sixteen tail in at least one split tile.
+        for (head_dim, group, positions) in [
+            (32usize, 1usize, 129usize),
+            (64, 2, 131),
+            (96, 3, 143),
+            (128, 4, 191),
+        ] {
+            let n_kv_heads = 2usize;
+            let n_heads = n_kv_heads * group;
+            let base_position = 3usize;
+            let max_positions = base_position + positions + 5;
+            let row_bytes = (head_dim / 32) * 34;
+            let (keys, keys_f32) =
+                q8_cache_fixture(n_kv_heads, max_positions, head_dim, 7 + head_dim);
+            let (values, values_f32) =
+                q8_cache_fixture(n_kv_heads, max_positions, head_dim, 19 + group);
+            let query: Vec<f32> = (0..n_heads * head_dim)
+                .map(|i| (((i * 29 + head_dim + group) % 127) as f32 - 63.0) / 256.0)
+                .collect();
+            let scale = 1.0 / (head_dim as f32).sqrt();
+
+            let mut expected = vec![0.0f32; n_heads * head_dim];
+            for head in 0..n_heads {
+                let kv_head = head / group;
+                let q = &query[head * head_dim..(head + 1) * head_dim];
+                let mut scores = vec![0.0f32; positions];
+                for (relative_position, score) in scores.iter_mut().enumerate() {
+                    let position = base_position + relative_position;
+                    let kv_base = (kv_head * max_positions + position) * head_dim;
+                    *score = q
+                        .iter()
+                        .zip(&keys_f32[kv_base..kv_base + head_dim])
+                        .map(|(a, b)| a * b)
+                        .sum::<f32>()
+                        * scale;
+                }
+                let max_score = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let weights: Vec<f32> = scores
+                    .iter()
+                    .map(|score| (*score - max_score).exp())
+                    .collect();
+                let denominator = weights.iter().sum::<f32>();
+                for dim in 0..head_dim {
+                    expected[head * head_dim + dim] = weights
+                        .iter()
+                        .enumerate()
+                        .map(|(relative_position, weight)| {
+                            let position = base_position + relative_position;
+                            let value =
+                                values_f32[(kv_head * max_positions + position) * head_dim + dim];
+                            weight * value / denominator
+                        })
+                        .sum();
+                }
+            }
+            assert!(expected.iter().any(|value| value.abs() > 1.0e-3));
+
+            let query_buf = kernel.device.new_buffer_with_data(
+                query.as_ptr().cast(),
+                std::mem::size_of_val(query.as_slice()) as u64,
+                opts,
+            );
+            let key_buf =
+                kernel
+                    .device
+                    .new_buffer_with_data(keys.as_ptr().cast(), keys.len() as u64, opts);
+            let value_buf = kernel.device.new_buffer_with_data(
+                values.as_ptr().cast(),
+                values.len() as u64,
+                opts,
+            );
+            let output_buf = kernel
+                .device
+                .new_buffer((n_heads * head_dim * 4) as u64, opts);
+            write_buffer_f32(&output_buf, &vec![f32::NAN; n_heads * head_dim]);
+            let n_splits = positions.div_ceil(64).clamp(2, 64);
+            let partials = kernel
+                .device
+                .new_buffer((n_heads * n_splits * (head_dim + 2) * 4) as u64, opts);
+            let scalar = kernel.device.new_buffer(32, opts);
+            let splits_scalar = kernel.device.new_buffer(4, opts);
+            unsafe {
+                let p = scalar.contents().cast::<u32>();
+                *p = n_heads as u32;
+                *p.add(1) = head_dim as u32;
+                *p.add(2) = positions as u32;
+                *p.add(3) = group as u32;
+                *p.add(4).cast::<f32>() = scale;
+                *p.add(5) = row_bytes as u32;
+                *p.add(6) = (max_positions * row_bytes) as u32;
+                *p.add(7) = (base_position * row_bytes) as u32;
+                *splits_scalar.contents().cast::<u32>() = n_splits as u32;
+            }
+
+            let command = kernel.queue.new_command_buffer();
+            let encoder = command.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(&kernel.attention_decode_splitk_kvq8_pipeline);
+            encoder.set_buffer(0, Some(&query_buf), 0);
+            encoder.set_buffer(1, Some(&key_buf), 0);
+            encoder.set_buffer(2, Some(&value_buf), 0);
+            encoder.set_buffer(3, Some(&partials), 0);
+            for index in 0..8u64 {
+                encoder.set_buffer(5 + index, Some(&scalar), index * 4);
+            }
+            encoder.set_buffer(13, Some(&splits_scalar), 0);
+            encoder.dispatch_thread_groups(
+                metal::MTLSize {
+                    width: n_kv_heads as u64,
+                    height: n_splits as u64,
+                    depth: 1,
+                },
+                metal::MTLSize {
+                    width: 128,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            encoder.set_compute_pipeline_state(&kernel.attention_decode_splitk_merge_pipeline);
+            encoder.set_buffer(0, Some(&partials), 0);
+            encoder.set_buffer(1, Some(&output_buf), 0);
+            encoder.set_buffer(2, Some(&scalar), 4);
+            encoder.set_buffer(3, Some(&splits_scalar), 0);
+            encoder.dispatch_thread_groups(
+                metal::MTLSize {
+                    width: n_heads as u64,
+                    height: 1,
+                    depth: 1,
+                },
+                metal::MTLSize {
+                    width: 128,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            encoder.end_encoding();
+            command.commit();
+            command.wait_until_completed();
+            assert_eq!(command.status(), metal::MTLCommandBufferStatus::Completed);
+
+            let mut actual = vec![0.0f32; expected.len()];
+            read_buffer_f32(&output_buf, &mut actual);
+            for (index, (&got, &want)) in actual.iter().zip(&expected).enumerate() {
+                let tolerance = 5.0e-4f32.max(want.abs() * 5.0e-4);
+                assert!(
+                    got.is_finite() && (got - want).abs() <= tolerance,
+                    "hd={head_dim} group={group} positions={positions} dim={index}: got={got} want={want} tolerance={tolerance}"
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_kv_dequant_q8_to_h_matches_wire_and_zero_fills_padding() {
+        let Some(kernel) = required_q8_kernel("Q8-to-half staging qualification") else {
+            return;
+        };
+        let opts = MTLResourceOptions::StorageModeShared;
+        let n_kv_heads = 2usize;
+        let max_positions = 10usize;
+        let rows = 8usize;
+        let valid_rows = 5usize;
+
+        for head_dim in [32usize, 64, 96, 128] {
+            let row_bytes = (head_dim / 32) * 34;
+            let (wire, dequant) =
+                q8_cache_fixture(n_kv_heads, max_positions, head_dim, 41 + head_dim);
+            let src =
+                kernel
+                    .device
+                    .new_buffer_with_data(wire.as_ptr().cast(), wire.len() as u64, opts);
+            let dst_elements = n_kv_heads * max_positions * head_dim;
+            let dst = kernel.device.new_buffer((dst_elements * 2) as u64, opts);
+            let poison = vec![0x7e00u16; dst_elements];
+            write_buffer_bytes(&dst, &poison);
+            let scalar = kernel.device.new_buffer(28, opts);
+            unsafe {
+                let p = scalar.contents().cast::<u32>();
+                *p = head_dim as u32;
+                *p.add(1) = rows as u32;
+                *p.add(2) = valid_rows as u32;
+                *p.add(3) = row_bytes as u32;
+                *p.add(4) = (max_positions * row_bytes) as u32;
+                *p.add(5) = head_dim as u32;
+                *p.add(6) = (max_positions * head_dim) as u32;
+            }
+
+            let command = kernel.queue.new_command_buffer();
+            let encoder = command.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(&kernel.kv_dequant_q8_to_h_pipeline);
+            encoder.set_buffer(0, Some(&src), 0);
+            encoder.set_buffer(1, Some(&dst), 0);
+            for index in 0..7u64 {
+                encoder.set_buffer(2 + index, Some(&scalar), index * 4);
+            }
+            encoder.dispatch_threads(
+                metal::MTLSize {
+                    width: head_dim as u64,
+                    height: rows as u64,
+                    depth: n_kv_heads as u64,
+                },
+                metal::MTLSize {
+                    width: 32,
+                    height: 4,
+                    depth: 1,
+                },
+            );
+            encoder.end_encoding();
+            command.commit();
+            command.wait_until_completed();
+            assert_eq!(command.status(), metal::MTLCommandBufferStatus::Completed);
+
+            let actual =
+                unsafe { std::slice::from_raw_parts(dst.contents().cast::<u16>(), dst_elements) };
+            for head in 0..n_kv_heads {
+                for position in 0..max_positions {
+                    for dim in 0..head_dim {
+                        let index = (head * max_positions + position) * head_dim + dim;
+                        let want = if position < valid_rows {
+                            f32_to_f16_bits(dequant[index])
+                        } else if position < rows {
+                            0
+                        } else {
+                            0x7e00
+                        };
+                        assert_eq!(
+                            actual[index], want,
+                            "hd={head_dim} head={head} position={position} dim={dim}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_rope_rotate_batch_h_matches_reference_for_both_pairings_and_alias_modes() {
+        let Some(kernel) = required_q8_kernel("half RoPE qualification") else {
+            return;
+        };
+        let opts = MTLResourceOptions::StorageModeShared;
+        let head_count = 3usize;
+        let head_dim = 64usize;
+        let half_rope = head_dim / 2;
+        let tokens = 3usize;
+        let elements = tokens * head_count * head_dim;
+        let input: Vec<u16> = (0..elements)
+            .map(|index| {
+                let value = ((index * 13 + 5) % 31) as i32 - 15;
+                f32_to_f16_bits(value as f32 / 16.0)
+            })
+            .collect();
+        let cos: Vec<f32> = (0..tokens * half_rope)
+            .map(|index| [1.0, 0.5, -0.5, 0.25][index % 4])
+            .collect();
+        let sin: Vec<f32> = (0..tokens * half_rope)
+            .map(|index| [0.0, 0.25, 0.5, -0.25][index % 4])
+            .collect();
+        let cos_buf = kernel.device.new_buffer_with_data(
+            cos.as_ptr().cast(),
+            std::mem::size_of_val(cos.as_slice()) as u64,
+            opts,
+        );
+        let sin_buf = kernel.device.new_buffer_with_data(
+            sin.as_ptr().cast(),
+            std::mem::size_of_val(sin.as_slice()) as u64,
+            opts,
+        );
+
+        for pairing in [0u32, 1] {
+            let mut expected = input.clone();
+            for token in 0..tokens {
+                for head in 0..head_count {
+                    let row = (token * head_count + head) * head_dim;
+                    for pair in 0..half_rope {
+                        let (dim0, dim1) = if pairing == 0 {
+                            (pair * 2, pair * 2 + 1)
+                        } else {
+                            (pair, pair + half_rope)
+                        };
+                        let x0 = f16_bits_to_f32(input[row + dim0]);
+                        let x1 = f16_bits_to_f32(input[row + dim1]);
+                        let table = token * half_rope + pair;
+                        expected[row + dim0] = f32_to_f16_bits(x0 * cos[table] - x1 * sin[table]);
+                        expected[row + dim1] = f32_to_f16_bits(x0 * sin[table] + x1 * cos[table]);
+                    }
+                }
+            }
+
+            for in_place in [false, true] {
+                let src = kernel.device.new_buffer_with_data(
+                    input.as_ptr().cast(),
+                    std::mem::size_of_val(input.as_slice()) as u64,
+                    opts,
+                );
+                let separate_dst = (!in_place).then(|| {
+                    let buffer = kernel.device.new_buffer((elements * 2) as u64, opts);
+                    write_buffer_bytes(&buffer, &vec![0x7e00u16; elements]);
+                    buffer
+                });
+                let dst = separate_dst.as_ref().unwrap_or(&src);
+                let scalar = kernel.device.new_buffer(16, opts);
+                unsafe {
+                    let p = scalar.contents().cast::<u32>();
+                    *p = head_count as u32;
+                    *p.add(1) = head_dim as u32;
+                    *p.add(2) = half_rope as u32;
+                    *p.add(3) = pairing;
+                }
+
+                let command = kernel.queue.new_command_buffer();
+                let encoder = command.new_compute_command_encoder();
+                encoder.set_compute_pipeline_state(&kernel.rope_rotate_batch_h_pipeline);
+                encoder.set_buffer(0, Some(&src), 0);
+                encoder.set_buffer(1, Some(dst), 0);
+                encoder.set_buffer(2, Some(&cos_buf), 0);
+                encoder.set_buffer(3, Some(&sin_buf), 0);
+                for index in 0..4u64 {
+                    encoder.set_buffer(4 + index, Some(&scalar), index * 4);
+                }
+                let width = kernel
+                    .rope_rotate_batch_h_pipeline
+                    .thread_execution_width()
+                    .max(1);
+                encoder.dispatch_thread_groups(
+                    metal::MTLSize {
+                        width: ((head_count * half_rope) as u64).div_ceil(width),
+                        height: tokens as u64,
+                        depth: 1,
+                    },
+                    metal::MTLSize {
+                        width,
+                        height: 1,
+                        depth: 1,
+                    },
+                );
+                encoder.end_encoding();
+                command.commit();
+                command.wait_until_completed();
+                assert_eq!(command.status(), metal::MTLCommandBufferStatus::Completed);
+
+                let actual =
+                    unsafe { std::slice::from_raw_parts(dst.contents().cast::<u16>(), elements) };
+                assert_eq!(actual, expected, "pairing={pairing} in_place={in_place}");
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_kv_scatter_batch_kvq8_h_matches_exact_wire_reference() {
+        let Some(kernel) = required_q8_kernel("half-input Q8 scatter qualification") else {
+            return;
+        };
+        let opts = MTLResourceOptions::StorageModeShared;
+        let n_kv_heads = 2usize;
+        let head_dim = 128usize;
+        let blocks_per_head = head_dim / 32;
+        let total_blocks = n_kv_heads * blocks_per_head;
+        let positions = 3usize;
+        let base_position = 2usize;
+        let max_positions = 7usize;
+        let row_bytes = blocks_per_head * 34;
+        let cache_bytes = n_kv_heads * max_positions * row_bytes;
+        let mut src_k = vec![0u16; positions * n_kv_heads * head_dim];
+        let mut src_v = vec![0u16; src_k.len()];
+        let mut expected_k = vec![0xa5u8; cache_bytes];
+        let mut expected_v = vec![0xa5u8; cache_bytes];
+
+        for token in 0..positions {
+            for head in 0..n_kv_heads {
+                for block in 0..blocks_per_head {
+                    let zero_block = token == 1 && head == 0 && block == 0;
+                    for (is_value, (src, expected)) in [
+                        (false, (&mut src_k, &mut expected_k)),
+                        (true, (&mut src_v, &mut expected_v)),
+                    ] {
+                        let step = if (head + block + usize::from(is_value)).is_multiple_of(2) {
+                            1.0 / 128.0
+                        } else {
+                            1.0 / 64.0
+                        };
+                        let dst =
+                            (head * max_positions + base_position + token) * row_bytes + block * 34;
+                        let scale_bits = if zero_block {
+                            f32_to_f16_bits(0.0)
+                        } else {
+                            f32_to_f16_bits(step)
+                        };
+                        expected[dst..dst + 2].copy_from_slice(&scale_bits.to_le_bytes());
+                        for lane in 0..32 {
+                            let code = if zero_block {
+                                0i8
+                            } else if lane == 0 {
+                                -127
+                            } else if lane == 31 {
+                                127
+                            } else {
+                                (((token * 61
+                                    + head * 43
+                                    + block * 29
+                                    + lane * 11
+                                    + usize::from(is_value) * 17)
+                                    % 253) as i32
+                                    - 126) as i8
+                            };
+                            let src_index =
+                                token * n_kv_heads * head_dim + head * head_dim + block * 32 + lane;
+                            src[src_index] = f32_to_f16_bits(f32::from(code) * step);
+                            expected[dst + 2 + lane] = code as u8;
+                        }
+                    }
+                }
+            }
+        }
+
+        let src_k_buf = kernel.device.new_buffer_with_data(
+            src_k.as_ptr().cast(),
+            std::mem::size_of_val(src_k.as_slice()) as u64,
+            opts,
+        );
+        let src_v_buf = kernel.device.new_buffer_with_data(
+            src_v.as_ptr().cast(),
+            std::mem::size_of_val(src_v.as_slice()) as u64,
+            opts,
+        );
+        let cache_k = kernel.device.new_buffer(cache_bytes as u64, opts);
+        let cache_v = kernel.device.new_buffer(cache_bytes as u64, opts);
+        write_buffer_u8(&cache_k, &vec![0xa5; cache_bytes]);
+        write_buffer_u8(&cache_v, &vec![0xa5; cache_bytes]);
+        let scalar = kernel.device.new_buffer(16, opts);
+        unsafe {
+            let p = scalar.contents().cast::<u32>();
+            *p = head_dim as u32;
+            *p.add(1) = max_positions as u32;
+            *p.add(2) = base_position as u32;
+            *p.add(3) = total_blocks as u32;
+        }
+
+        let command = kernel.queue.new_command_buffer();
+        let encoder = command.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&kernel.kv_scatter_batch_kvq8_h_pipeline);
+        encoder.set_buffer(0, Some(&src_k_buf), 0);
+        encoder.set_buffer(1, Some(&src_v_buf), 0);
+        encoder.set_buffer(2, Some(&cache_k), 0);
+        encoder.set_buffer(3, Some(&cache_v), 0);
+        for index in 0..4u64 {
+            encoder.set_buffer(4 + index, Some(&scalar), index * 4);
+        }
+        let width = kernel
+            .kv_scatter_batch_kvq8_h_pipeline
+            .thread_execution_width()
+            .max(1);
+        encoder.dispatch_thread_groups(
+            metal::MTLSize {
+                width: (total_blocks as u64).div_ceil(width),
+                height: positions as u64,
+                depth: 1,
+            },
+            metal::MTLSize {
+                width,
+                height: 1,
+                depth: 1,
+            },
+        );
+        encoder.end_encoding();
+        command.commit();
+        command.wait_until_completed();
+        assert_eq!(command.status(), metal::MTLCommandBufferStatus::Completed);
+
+        let actual_k =
+            unsafe { std::slice::from_raw_parts(cache_k.contents().cast::<u8>(), cache_bytes) };
+        let actual_v =
+            unsafe { std::slice::from_raw_parts(cache_v.contents().cast::<u8>(), cache_bytes) };
+        assert_eq!(actual_k, expected_k, "K cache wire bytes");
+        assert_eq!(actual_v, expected_v, "V cache wire bytes");
     }
 
     #[cfg(target_os = "macos")]
