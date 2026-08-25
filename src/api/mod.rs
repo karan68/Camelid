@@ -9796,9 +9796,15 @@ mod gemma4_template_tests {
     }
 }
 
-/// Test-only re-export of the gemma4 marker renderer (the template-shapes
-/// integration test asserts byte parity against the committed reference pack).
-pub fn gemma4_chat_prompt_for_tests(messages: &[ChatMessage], thinking: bool) -> String {
+/// The gemma4 marker renderer, exposed as the ONE way anything outside the serve lane
+/// may template a gemma4 chat prompt.
+///
+/// The template-shapes integration test asserts byte parity against the committed
+/// reference pack through here, and the offline MTP harness
+/// (`gemma4-cuda-generate --request-json`) renders through here too — an offline
+/// throughput number is only comparable to a served one if both walked the same
+/// renderer, and a second copy of this logic would silently drift.
+pub fn render_gemma4_chat_prompt(messages: &[ChatMessage], thinking: bool) -> String {
     gemma4_chat_prompt(messages, thinking)
 }
 

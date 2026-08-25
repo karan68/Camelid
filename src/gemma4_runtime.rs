@@ -6742,19 +6742,51 @@ fn gemma4_head_upload(lane: HeadLane, wire: &[u8]) -> Vec<u8> {
     }
 }
 
-/// Resident GPU tied head. `weight` is the vocab-major projection in its lane's GPU
-/// layout (always via [`gemma4_head_upload`]); input is quantized by the fused
-/// rms_norm+quantize into `inq`/`ins`; `logits` is dtoh'd once per token. `blocks` is
-/// blocks-per-row passed to the GEMV (`hidden/32` for Q8_0, `hidden/256` for K-quants).
+/// One speculative round's evidence, recorded so an alpha shortfall can be *attributed*
+/// rather than guessed at.
+///
+/// `drafts[i]` is the assistant's proposal and `target[i]` is the target's own argmax at
+/// the same position, both read out of the SAME verify pass — so a mismatch here is a
+/// drafter disagreement, never a bookkeeping skew. `target` is one longer than `drafts`
+/// because the verify batch also carries the bonus token's own row, whose argmax is the
+/// token emitted when nothing is accepted.
 #[cfg(feature = "cuda")]
+#[derive(Clone, Debug, Default)]
+pub struct Gemma4MtpRound {
+    /// KV position of the round's bonus token; `drafts[i]` is proposed for `position+1+i`.
+    pub position: usize,
+    /// The target-chosen token the drafter was conditioned on.
+    pub bonus_token: u32,
+    pub drafts: Vec<u32>,
+    /// Target argmax at every verified position, `1 + drafts.len()` entries.
+    pub target: Vec<u32>,
+    /// Length of the agreeing prefix, i.e. the extra tokens this round yielded.
+    pub accepted: usize,
+    /// Wall spent in the drafter (assistant forward × K).
+    pub assistant_ns: u64,
+    /// Wall spent in the target's batched verify pass.
+    pub verify_ns: u64,
+}
+
 /// Accepted-draft statistics for an MTP generation. `accepted / rounds` is alpha, the
 /// number of extra tokens each verify pass yielded, and it is the drafter's real quality
 /// signal — output correctness is guaranteed by the target regardless.
-#[derive(Clone, Copy, Debug, Default)]
+///
+/// The wall splits are recorded next to alpha because they are the two halves of the same
+/// break-even question: a round only pays if `assistant + verify` beats `1 + alpha` plain
+/// decode steps, and a number for one without the other cannot answer it.
+#[cfg(feature = "cuda")]
+#[derive(Clone, Debug, Default)]
 pub struct Gemma4MtpStats {
     pub rounds: u64,
     pub drafted: u64,
     pub accepted: u64,
+    /// Prompt prefill, excluded from the decode rate.
+    pub prefill_ns: u64,
+    pub assistant_ns: u64,
+    pub verify_ns: u64,
+    /// Per-round evidence, in emission order.
+    pub trace: Vec<Gemma4MtpRound>,
 }
 
 impl Gemma4MtpStats {
@@ -6808,6 +6840,10 @@ enum ChunkLogits {
     EveryPosition,
 }
 
+/// Resident GPU tied head. `weight` is the vocab-major projection in its lane's GPU
+/// layout (always via [`gemma4_head_upload`]); input is quantized by the fused
+/// rms_norm+quantize into `inq`/`ins`; `logits` is dtoh'd once per token. `blocks` is
+/// blocks-per-row passed to the GEMV (`hidden/32` for Q8_0, `hidden/256` for K-quants).
 struct Gemma4HeadDev {
     lane: HeadLane,
     weight: cudarc::driver::CudaSlice<u8>,
@@ -12245,10 +12281,14 @@ impl Gemma4CudaResident {
     ) -> Result<(String, Vec<u32>, Gemma4MtpStats)> {
         let prompt_tokens = self.cpu.tokenizer.encode(prompt, true, true)?;
         let eot = gemma4_stop_token_ids(&self.cpu.tokenizer);
+        let t_prefill = std::time::Instant::now();
         let mut logits = self.prefill_reusing_cache(&prompt_tokens)?;
         let mut position = prompt_tokens.len();
         let mut generated: Vec<u32> = Vec::new();
-        let mut stats = Gemma4MtpStats::default();
+        let mut stats = Gemma4MtpStats {
+            prefill_ns: t_prefill.elapsed().as_nanos() as u64,
+            ..Gemma4MtpStats::default()
+        };
         // The first round has no target hidden yet (prefill does not hand one back), so it
         // decodes one token plainly and picks up drafting from the next round.
         let mut final_hidden: Option<Vec<f32>> = None;
@@ -12264,17 +12304,21 @@ impl Gemma4CudaResident {
             }
 
             let budget = max_new - generated.len();
+            let t_assistant = std::time::Instant::now();
             let drafts = match final_hidden.as_ref() {
                 Some(hidden) if draft_k > 0 => {
                     self.mtp_draft(assistant, hidden, t0, position, draft_k.min(budget))?
                 }
                 _ => Vec::new(),
             };
+            let assistant_ns = t_assistant.elapsed().as_nanos() as u64;
 
             let mut batch = Vec::with_capacity(1 + drafts.len());
             batch.push(t0);
             batch.extend_from_slice(&drafts);
+            let t_verify = std::time::Instant::now();
             let rows = self.verify_chunk_logits(&batch, position)?;
+            let verify_ns = t_verify.elapsed().as_nanos() as u64;
             if rows.len() != batch.len() {
                 return Err(BackendError::InvalidModelMetadata(format!(
                     "MTP verify returned {} rows for a {}-token batch",
@@ -12296,15 +12340,29 @@ impl Gemma4CudaResident {
                 }
             }
 
+            // The target's own argmax at every verified position, computed once and used
+            // BOTH to accept and to record — so the trace can never disagree with the gate
+            // it is meant to explain.
+            let target: Vec<u32> = rows.iter().map(|row| argmax_u32(&row.logits)).collect();
             // Accept the longest prefix of drafts that equals the target's own argmax.
             let mut accepted = 0usize;
-            while accepted < drafts.len() && argmax_u32(&rows[accepted].logits) == drafts[accepted]
-            {
+            while accepted < drafts.len() && target[accepted] == drafts[accepted] {
                 accepted += 1;
             }
             stats.rounds += 1;
             stats.drafted += drafts.len() as u64;
             stats.accepted += accepted as u64;
+            stats.assistant_ns += assistant_ns;
+            stats.verify_ns += verify_ns;
+            stats.trace.push(Gemma4MtpRound {
+                position,
+                bonus_token: t0,
+                drafts: drafts.clone(),
+                target,
+                accepted,
+                assistant_ns,
+                verify_ns,
+            });
 
             let mut stopped = false;
             for token in &drafts[..accepted] {

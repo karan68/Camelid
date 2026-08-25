@@ -1,0 +1,12 @@
+{
+  "description": "Plain greedy decode on the CUDA ghost lane. The reference every MTP arm has to beat, and the source of the Windows expected-token-id file.",
+  "mtp": false,
+  "draft_k": 0,
+  "env": {
+    "CAMELID_GEMMA4_CUDA_BATCH_EXPERT_COPIES": "1",
+    "CAMELID_GEMMA4_GHOST_TIER_PREFILL": "1",
+    "CAMELID_GEMMA4_PREFILL_CHUNK_TOKENS": "512",
+    "CAMELID_GEMMA4_Q4_0_SOA": "1",
+    "CAMELID_GEMMA4_SPECULATIVE": "0"
+  }
+}
