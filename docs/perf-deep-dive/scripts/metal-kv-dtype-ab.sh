@@ -34,12 +34,11 @@
 #   f32          zero-config default for a Q8_0 model (weights_use_kquant() == false, so
 #                resident_kv_format() returns F32).
 #   f16          opt-in half KV.
-#   q8           opt-in Q8_0 KV — the lane under test.
-#   f32-nosplitk mechanism control: f32 with split-K decode forced off. Enabling f16/q8
-#                already forfeits split-K (the gate requires an F32 primary), so this is
-#                the apples-to-apples baseline for q8; the plain f32 arm is the
-#                real-world one. Without this arm a q8 regression is uninterpretable —
-#                you cannot tell a slow KV kernel from a forfeited split-K.
+#   q8           opt-in Q8_0 KV with its current split-K decode path enabled.
+#   f32-nosplitk f32 with split-K decode forced off.
+#   q8-nosplitk  Q8_0 with split-K decode forced off. Comparing the two no-split-K arms
+#                isolates the KV-format effect; comparing q8 with q8-nosplitk isolates
+#                the Q8 split-K effect. The plain f32/q8 arms are the real-world pair.
 
 set -u
 BIN="$1"; MODEL="$2"; PROBE="$3"; MAXTOK="$4"; ROUNDS="$5"; OUT="$6"
@@ -85,7 +84,7 @@ else:
     open(path, "w").write(filler(int(8000 * CHARS_PER_TOKEN)))
 PY
 
-ARMS=("f32:f32:1" "f16:f16:1" "q8:q8:1" "f32-nosplitk:f32:0")
+ARMS=("f32:f32:1" "f16:f16:1" "q8:q8:1" "f32-nosplitk:f32:0" "q8-nosplitk:q8:0")
 N=${#ARMS[@]}
 : > "$OUT"
 

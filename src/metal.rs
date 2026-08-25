@@ -35,9 +35,23 @@ fn attention_matmul_prefill_head_dim_supported(head_dim: usize) -> bool {
     head_dim <= 128 && head_dim.is_multiple_of(64)
 }
 
+/// Whether the attention-as-matmul path's padded K/V rows fit the resident cache stride.
+///
+/// The path dispatches its V transpose, and for Q8 its dequant staging pass, over a
+/// 128-row-padded height. Near a context cap that is not itself 128-aligned, `n_tokens`
+/// can fit the cache while that padded dispatch does not. Fail closed to the row-attention
+/// fallback instead of reading or writing past the cache/staging allocation.
+#[cfg(any(target_os = "macos", test))]
+fn attention_matmul_prefill_rows_fit(n_tokens: usize, max_positions: usize) -> bool {
+    n_tokens
+        .div_ceil(128)
+        .checked_mul(128)
+        .is_some_and(|n_pad| n_pad <= max_positions)
+}
+
 #[cfg(test)]
 mod attention_matmul_prefill_shape_tests {
-    use super::attention_matmul_prefill_head_dim_supported;
+    use super::{attention_matmul_prefill_head_dim_supported, attention_matmul_prefill_rows_fit};
 
     #[test]
     fn partial_64_row_pv_tiles_fail_closed() {
@@ -48,6 +62,16 @@ mod attention_matmul_prefill_shape_tests {
         assert!(!attention_matmul_prefill_head_dim_supported(96));
         assert!(!attention_matmul_prefill_head_dim_supported(32));
         assert!(!attention_matmul_prefill_head_dim_supported(192));
+    }
+
+    #[test]
+    fn padded_rows_must_fit_the_resident_cache_stride() {
+        assert!(attention_matmul_prefill_rows_fit(896, 1_000));
+        assert!(!attention_matmul_prefill_rows_fit(897, 1_000));
+        assert!(!attention_matmul_prefill_rows_fit(999, 1_000));
+        assert!(!attention_matmul_prefill_rows_fit(1_000, 1_000));
+        assert!(attention_matmul_prefill_rows_fit(1_000, 1_024));
+        assert!(!attention_matmul_prefill_rows_fit(usize::MAX, usize::MAX));
     }
 }
 
@@ -4410,7 +4434,7 @@ kernel void attention_decode_splitk_kvq8(
 // prefill 2.2x-4.5x slower. Measured: q8/f16 prefill is 1.00-1.07x at every depth while
 // both trail f32 by 1.8x-4.4x, i.e. f16 and q8 are excluded by the same predicate and land
 // on top of each other. Staging is O(n*d) per layer against the O(n^2) attention it
-// unblocks, and unlike the f32 lane's mirrors it is transient scratch (~16.8 MB pooled)
+// unblocks, and unlike the f32 lane's mirrors it is transient scratch (~16.8 MB)
 // rather than a persistent second cache (~256 MB at 8192 positions), so the Q8 memory win
 // survives.
 //
@@ -12899,14 +12923,11 @@ fn mm_prefill_enabled() -> bool {
 /// depth while both trailed f32 by 1.8x-4.4x, i.e. f16 and q8 were excluded by the same
 /// predicate and landed on top of each other.
 ///
-/// **Still missing: the half activation stream.** `use_h16` must track `use_fused_rope`,
-/// not `use_attn_mm` — when the fused RoPE is off, the attn-mm block rebuilds `q_h` with a
-/// convert that reads `q_buf` as f32, so setting `use_h16` there reinterprets half bytes as
-/// f32 and the sampler sees non-finite logits. The Q8 lane therefore keeps es=4 activations
-/// and takes only the attention win. Recovering es=2 needs a `rope_scatter_qh_h_q8` variant
-/// that emits `q_h` alongside a quantized K/V scatter; a Q8 scatter needs an amax across
-/// each 32-element block, which is a different thread mapping than the per-element RoPE
-/// kernel uses, which is exactly why the Q8 lane splits those dispatches today.
+/// The Q8 lane also keeps the half activation stream end to end: `rope_rotate_batch_h`
+/// rotates Q directly into the half query panel and K in place, then
+/// `kv_scatter_batch_kvq8_h` quantizes the half K/V operands. This deliberately remains a
+/// split path: Q8 needs an amax across each 32-element block, which does not match the
+/// one-thread-per-RoPE-pair mapping of the fused f32-primary kernel.
 ///
 /// Validated on one host (M3) and one model shape (llama, head_dim 64, GQA group 4). Under
 /// BENCHMARK_TREATY that is not enough to promote a *default*; it is enough to improve an
@@ -23013,7 +23034,7 @@ impl ResidentDecodeState {
     /// prefill, not once per token. KV lands directly in the resident caches (positions
     /// 0..n); generation then continues with the resident decode, no CPU seeding. Returns
     /// the logits of the LAST prefilled token. Requirements mirror forward_token plus:
-    /// f32 KV cache only, wire weights, head_dim % 32 == 0.
+    /// f32 or Q8 KV cache, wire weights, head_dim % 32 == 0.
     #[allow(clippy::too_many_arguments)]
     pub fn prefill_tokens(
         &mut self,
@@ -23109,6 +23130,7 @@ impl ResidentDecodeState {
             && all_q8
             && mm_prefill_enabled()
             && !has_qk_norm
+            && attention_matmul_prefill_rows_fit(n_tokens, self.max_positions)
             && q_dim.is_multiple_of(128)
             && kv_dim.is_multiple_of(128)
             && self.hidden.is_multiple_of(128)
@@ -23675,8 +23697,7 @@ impl ResidentDecodeState {
             // twin of that kernel. Decoupling it from use_attn_mm keeps this change to the
             // attention path; the unfused RoPE costs three dispatches instead of one per
             // layer, which is small next to the O(n^2) attention win being unblocked.
-            let use_fused_rope =
-                use_attn_mm && !stage_q8_kv && half_rope * 2 == self.head_dim;
+            let use_fused_rope = use_attn_mm && !stage_q8_kv && half_rope * 2 == self.head_dim;
             if use_fused_rope {
                 // Fused rope(Q)->half panel + rope(K)->caches + V scatter, one dispatch.
                 e.set_compute_pipeline_state(if use_h16 {
@@ -23726,7 +23747,12 @@ impl ResidentDecodeState {
                     for j in 0..4u64 {
                         e.set_buffer(4 + j, Some(scalar), j * 4);
                     }
-                    dispatch_rows(e, &k.rope_rotate_batch_h_pipeline, heads * half_rope, n_tokens);
+                    dispatch_rows(
+                        e,
+                        &k.rope_rotate_batch_h_pipeline,
+                        heads * half_rope,
+                        n_tokens,
+                    );
                 };
                 rope_h(&e, &q_buf, &q_h, &rope_q_scalar, self.n_heads);
                 rope_h(&e, &k_buf, &k_buf, &rope_k_scalar, self.n_kv_heads);

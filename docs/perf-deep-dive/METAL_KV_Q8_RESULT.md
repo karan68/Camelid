@@ -10,10 +10,10 @@ and none for **q8** — even though the Q8_0-primary cache and its four MSL kern
 `attention_prefill_v3_kvq8`) shipped with the Metal appliance work, complete with a
 numeric parity test.
 
-[METAL_KQUANT_ROADMAP_RESULT.md](METAL_KQUANT_ROADMAP_RESULT.md) already documents that a
-compressed primary KV forfeits split-K decode attention and attention-as-matmul prefill,
-both of which require an F32 primary. What had never been measured is the question that
-actually decides whether to invest in this lane:
+[METAL_KQUANT_ROADMAP_RESULT.md](METAL_KQUANT_ROADMAP_RESULT.md) documents that, at the
+receipt's measured commit, a compressed primary KV forfeited split-K decode attention and
+attention-as-matmul prefill. What had never been measured was the question that actually
+decided whether to invest in this lane:
 
 > **What is q8 worth once you control for the split-K forfeit?**
 
@@ -26,8 +26,9 @@ On an equal footing — both arms without split-K — q8 decode is **1.14× → 
 f32, rising monotonically with context depth**. That is the KV-bandwidth win landing exactly
 where theory says it should, and it is the central result.
 
-But *enabling* q8 forfeits split-K, which is itself worth **2.1×**, so the shipped trade is
-a 2.1× win swapped for a 1.5× one. Against the zero-config default that nets out to:
+At the measured commit, *enabling* q8 forfeited split-K, which was itself worth **2.1×**, so
+the shipped trade was a 2.1× win swapped for a 1.5× one. Against the zero-config default
+that netted out to:
 decode unresolved at most depths, **significantly better at 4117 tokens (1.031×)**, and
 prefill **2.2× → 4.5× worse** — which is significant at every depth and is the real blocker.
 
@@ -35,7 +36,8 @@ On quality, the two compressed formats part company: **f16 is a token-identical 
 every probe; q8 is not** — it diverges deterministically from f32 on coherent English,
 though the divergence is benign (fluent alternative continuation, not degradation).
 
-Three sentences for anyone who reads no further:
+The original receipt's three action items (the first two are implemented and re-measured
+later in this document):
 
 1. Build **`attention_decode_splitk_kvq8`** — split-K and Q8 are independent wins that are
    mutually exclusive today for no reason but a missing kernel.
@@ -66,8 +68,8 @@ honest baseline arm here.
 | `q8` | `CAMELID_METAL_KV_DTYPE=q8` — the lane under test |
 | **`f32-nosplitk`** | `CAMELID_METAL_ATTN_SPLITK=0`, F32 primary — **the mechanism control** |
 
-Enabling f16 or q8 forfeits split-K. The gate in `encode_attention_block` (`src/metal.rs`)
-is explicit about it:
+At the measured commit, enabling f16 or q8 forfeited split-K. The gate in
+`encode_attention_block` (`src/metal.rs`) was explicit about it:
 
 ```rust
 let splitk = v2
@@ -244,7 +246,7 @@ out of the simdgroup-matrix attention (`transpose_v16 → half_mm_batched_f16o �
 softmax_causal_rows → half_mm_batched_f16o`) and transitively out of the es=2 activation
 stream. Admitting q8 required a source of half K/V, since `cache_k16`/`cache_v16` are empty
 under a compressed primary — supplied by the new `kv_dequant_q8_to_h` staging kernel
-(transient pooled scratch, ~16.8 MB, against the ~256 MB of permanent mirrors the f32 lane
+(transient scratch, ~16.8 MB, against the ~256 MB of permanent mirrors the f32 lane
 carries at 8192 positions).
 
 | Depth | q8-both / q8-old | q8-both / f32 default |
@@ -331,14 +333,6 @@ pre-existing q8 lane already diverged. The change costs no fidelity.
 
 ### Still open
 
-- **The es=2 activation stream.** `use_h16` must track `use_fused_rope`, not `use_attn_mm`:
-  when the fused RoPE is off the attn-mm block rebuilds `q_h` with a convert that reads
-  `q_buf` as f32, so setting `use_h16` there reinterprets half bytes as f32 and the sampler
-  sees non-finite logits (this was hit, diagnosed, and fixed by keeping es=4). Recovering it
-  needs a `rope_scatter_qh_h_q8` that emits `q_h` alongside a quantized scatter — awkward
-  because Q8 quantization needs an amax across each 32-element block, a different thread
-  mapping than the per-element RoPE kernel, which is why the Q8 lane splits those dispatches
-  today.
 - **`src/fit.rs` `KvDtype` still has only `F32` and `F16`**, so the admission planner cannot
   represent the 34/32 block overhead and sizes q8 as f16 — a 1.88× over-estimate that can
   refuse a preload which would actually fit. Cheap and independent of everything above.

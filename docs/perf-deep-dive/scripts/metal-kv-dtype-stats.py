@@ -21,7 +21,7 @@ METRICS = [
     ("tokens_per_second", "higher"),
     ("peak_memory_bytes", "lower"),
 ]
-ARMS = ["f32", "f16", "q8", "f32-nosplitk"]
+ARMS = ["f32", "f16", "q8", "f32-nosplitk", "q8-nosplitk"]
 
 
 def first_divergence(a, b):
@@ -140,17 +140,27 @@ def main(path, label):
                 print(f"  {m:<24} {tag:>22} = {r:6.4f}  [{lo:6.4f}, {hi:6.4f}]  {sig:<13} {arrow}")
 
     # Real-world comparison: against the zero-config default (f32, split-K on).
-    paired("f32", ["f16", "q8", "f32-nosplitk"],
+    paired("f32", ["f16", "q8", "f32-nosplitk", "q8-nosplitk"],
            "paired per-round ratio vs f32 DEFAULT (median, bootstrap 95% CI); CI must exclude 1.0")
-    # Mechanism comparison: q8 vs f32 on the same no-split-K footing. This isolates
-    # the KV-bandwidth effect from the split-K forfeit that enabling q8 currently causes.
-    paired("f32-nosplitk", ["q8", "f16"],
-           "paired per-round ratio vs f32-nosplitk (APPLES-TO-APPLES: isolates KV bandwidth)")
+    # Mechanism comparison: current receipts carry an explicit q8-nosplitk arm. Receipts
+    # produced before attention_decode_splitk_kvq8 existed have no such arm; their `q8`
+    # arm was necessarily no-split-K even though the requested env value was enabled.
+    if by["q8-nosplitk"]:
+        q8_control = "q8-nosplitk"
+        control_note = "explicit no-split-K controls"
+    else:
+        q8_control = "q8"
+        control_note = "legacy receipt: q8 predates Q8 split-K"
+    paired("f32-nosplitk", [q8_control, "f16"],
+           f"paired per-round ratio vs f32-nosplitk (APPLES-TO-APPLES: {control_note})")
+    if by["q8-nosplitk"]:
+        paired("q8-nosplitk", ["q8"],
+               "paired per-round Q8 split-K effect (q8/q8-nosplitk)")
 
     # Quality: greedy output must be token-identical to be a lossless drop-in.
     # Q8 KV is lossy by construction, so this measures HOW lossy, per round.
     print("\ngreedy output parity vs f32 (first divergent generated token index; -1 = identical)")
-    for a in ("f16", "q8", "f32-nosplitk"):
+    for a in ("f16", "q8", "f32-nosplitk", "q8-nosplitk"):
         idxs = []
         for rnd in sorted({r["round"] for r in ok}):
             base = [get_seq(r, "output_token_ids") for r in by["f32"] if r["round"] == rnd]
