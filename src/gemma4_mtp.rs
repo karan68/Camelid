@@ -174,14 +174,33 @@ fn gelu_tanh(x: f32) -> f32 {
     0.5 * x * (1.0 + (C * (x + 0.044_715 * x * x * x)).tanh())
 }
 
+/// Rows below this run serially — a rayon fork/join costs more than a 1024-wide dot.
+const MATVEC_PARALLEL_MIN_ROWS: usize = 4096;
+
 /// `out = weight [rows, cols] * x [cols]`.
+///
+/// Parallel above `MATVEC_PARALLEL_MIN_ROWS`, which is what makes the drafter viable: the
+/// tied head alone is 262,144 x 1,024 = 268M MACs, and it runs once per proposal, so at K=8
+/// it is two thirds of a round's arithmetic. Serially that measured ~4.2 s per round and
+/// made MTP *slower* than plain decode; the row split is embarrassingly parallel and each
+/// row's summation order is unchanged, so this is numerically identical to the serial form.
 fn matvec(weight: &[f32], x: &[f32], rows: usize, cols: usize, out: &mut [f32]) {
     debug_assert_eq!(weight.len(), rows * cols);
     debug_assert_eq!(x.len(), cols);
     debug_assert_eq!(out.len(), rows);
-    for (r, o) in out.iter_mut().enumerate() {
+    let dot = |r: usize| -> f32 {
         let row = &weight[r * cols..(r + 1) * cols];
-        *o = row.iter().zip(x).map(|(w, v)| w * v).sum();
+        row.iter().zip(x).map(|(w, v)| w * v).sum()
+    };
+    if rows >= MATVEC_PARALLEL_MIN_ROWS {
+        use rayon::prelude::*;
+        out.par_iter_mut()
+            .enumerate()
+            .for_each(|(r, o)| *o = dot(r));
+    } else {
+        for (r, o) in out.iter_mut().enumerate() {
+            *o = dot(r);
+        }
     }
 }
 
@@ -434,9 +453,17 @@ impl Gemma4MtpAssistant {
             rms_norm(&mut q, &layer.q_norm);
             apply_rope(&mut q, head_dim, position, inv);
 
-            // Sliding layers see only the last SLIDING_WINDOW host positions.
+            // Sliding layers see the last `window + 1` host positions — 1024 of history
+            // PLUS the current one, which is why the runtime's own KV ring is sized
+            // `gemma4_kv_capacity(window) = window + 1`. Verified against the reference:
+            // its bidirectional sliding mask leaves exactly 1025 of 1031 entries finite.
+            //
+            // This was off by one (1024) in the first implementation and it cost real
+            // acceptance, not just precision: the softmax here is unscaled (`scaling = 1.0`,
+            // Gemma 4 relies on q_norm), so it is extremely peaked and a single dropped
+            // position can move the argmax.
             let lo = if is_sliding {
-                kv.kv_len.saturating_sub(SLIDING_WINDOW)
+                kv.kv_len.saturating_sub(SLIDING_WINDOW + 1)
             } else {
                 0
             };

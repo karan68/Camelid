@@ -1911,6 +1911,16 @@ enum Command {
         prompt: String,
         #[arg(long, default_value_t = 24)]
         max_tokens: usize,
+        /// Hugging Face directory of the Gemma 4 MTP assistant (the drafter). When set,
+        /// decode runs lossless speculative rounds: the drafter proposes, the target
+        /// verifies the whole batch in ONE weight pass, and only the target's own argmax
+        /// is ever emitted -- so this changes speed, never output.
+        #[arg(long)]
+        mtp_assistant: Option<PathBuf>,
+        /// Draft tokens proposed per verify round. The Metal campaign measured K=8 best,
+        /// with K=10 worse (the widened target work dominates).
+        #[arg(long, default_value_t = 8)]
+        mtp_draft_k: usize,
     },
     /// Generate text with a Gemma 4 model on the GPU (resident decode; macOS/Metal).
     Gemma4GenerateGpu {
@@ -3675,6 +3685,8 @@ async fn main() -> anyhow::Result<()> {
             expert_cache_mib,
             prompt,
             max_tokens,
+            mtp_assistant,
+            mtp_draft_k,
         } => {
             eprintln!("[gemma4-cuda] loading resident {}...", path.display());
             let t0 = std::time::Instant::now();
@@ -3693,6 +3705,40 @@ async fn main() -> anyhow::Result<()> {
                 t0.elapsed().as_secs_f32()
             );
             let t1 = std::time::Instant::now();
+            if let Some(assistant_dir) = mtp_assistant.as_deref() {
+                eprintln!(
+                    "[gemma4-mtp] loading MTP assistant from {}...",
+                    assistant_dir.display()
+                );
+                let t_load = std::time::Instant::now();
+                let assistant = camelid::gemma4_mtp::Gemma4MtpAssistant::load(assistant_dir)?;
+                eprintln!(
+                    "[gemma4-mtp] assistant loaded in {:.1}s (vocab {}); drafting K={mtp_draft_k}",
+                    t_load.elapsed().as_secs_f64(),
+                    assistant.vocab_size()
+                );
+                let t_gen = std::time::Instant::now();
+                let (out, ids, stats) =
+                    runtime.generate_greedy_mtp(&prompt, max_tokens, &assistant, mtp_draft_k)?;
+                let wall = t_gen.elapsed().as_secs_f64();
+                eprintln!(
+                    "[gemma4-mtp] generated {} tokens in {:.3}s = {:.2} tok/s",
+                    ids.len(),
+                    wall,
+                    ids.len() as f64 / wall.max(1e-9)
+                );
+                eprintln!(
+                    "[gemma4-mtp] rounds {} | drafted {} | accepted {} | alpha {:.2} | acceptance {:.1}%",
+                    stats.rounds,
+                    stats.drafted,
+                    stats.accepted,
+                    stats.alpha(),
+                    stats.acceptance_rate() * 100.0
+                );
+                eprintln!("[gemma4-mtp] token_ids: {ids:?}");
+                println!("{out}");
+                return Ok(());
+            }
             let (out, ids, per_token) = runtime.generate_greedy_timed(&prompt, max_tokens)?;
             let gen = t1.elapsed().as_secs_f64();
             let counts = Gemma4CudaBenchmarkCounts::new(max_tokens, ids.len(), per_token.len());

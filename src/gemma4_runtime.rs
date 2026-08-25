@@ -6747,6 +6747,67 @@ fn gemma4_head_upload(lane: HeadLane, wire: &[u8]) -> Vec<u8> {
 /// rms_norm+quantize into `inq`/`ins`; `logits` is dtoh'd once per token. `blocks` is
 /// blocks-per-row passed to the GEMV (`hidden/32` for Q8_0, `hidden/256` for K-quants).
 #[cfg(feature = "cuda")]
+/// Accepted-draft statistics for an MTP generation. `accepted / rounds` is alpha, the
+/// number of extra tokens each verify pass yielded, and it is the drafter's real quality
+/// signal — output correctness is guaranteed by the target regardless.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Gemma4MtpStats {
+    pub rounds: u64,
+    pub drafted: u64,
+    pub accepted: u64,
+}
+
+impl Gemma4MtpStats {
+    /// Extra tokens accepted per verify round.
+    pub fn alpha(&self) -> f64 {
+        if self.rounds == 0 {
+            0.0
+        } else {
+            self.accepted as f64 / self.rounds as f64
+        }
+    }
+    /// Fraction of proposed drafts the target agreed with.
+    pub fn acceptance_rate(&self) -> f64 {
+        if self.drafted == 0 {
+            0.0
+        } else {
+            self.accepted as f64 / self.drafted as f64
+        }
+    }
+}
+
+fn argmax_u32(logits: &[f32]) -> u32 {
+    let mut best = 0usize;
+    for (i, v) in logits.iter().enumerate() {
+        if *v > logits[best] {
+            best = i;
+        }
+    }
+    best as u32
+}
+
+/// One position's output from a layer-major chunk sweep.
+struct ChunkRow {
+    position: usize,
+    logits: Vec<f32>,
+    /// Post-layer hidden for this position, captured only for a verify batch. The final
+    /// norm is applied by the caller, so this is the raw layer-stack output.
+    hidden_state: Option<Vec<f32>>,
+}
+
+/// Which positions of a layer-major chunk should run the vocab head.
+///
+/// Prefill wants the last position only — the head is ~646 MiB of Q6_K per token, so running
+/// it for every prompt token would dominate. A speculative verify wants every position,
+/// because each drafted token has to be checked against the target's own argmax at its own
+/// position. The sweep is otherwise identical, and sharing it is what keeps a verify batch
+/// cheap: a layer's expert union is loaded once and every token in the chunk hits it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ChunkLogits {
+    LastOnly,
+    EveryPosition,
+}
+
 struct Gemma4HeadDev {
     lane: HeadLane,
     weight: cudarc::driver::CudaSlice<u8>,
@@ -12086,9 +12147,269 @@ impl Gemma4CudaResident {
         // decode is reuse-dominated and wants the map. Wrapped rather than set inline so
         // the decode setting is restored on every `?` early-return too.
         self.set_ghost_bulk_reads(true);
-        let out = self.prefill_chunked_inner(prompt_tokens, start, last, chunk);
+        let out =
+            self.prefill_chunked_inner(prompt_tokens, start, last, chunk, ChunkLogits::LastOnly);
         self.set_ghost_bulk_reads(false);
-        out
+        Ok(out?.pop().map(|row| row.logits).unwrap_or_default())
+    }
+
+    /// Run the layer-major chunked sweep over `tokens` and return the head's logits at
+    /// EVERY position, which is what a speculative verify needs: one weight pass over the
+    /// whole batch, then a per-position argmax to compare against the drafts.
+    ///
+    /// This is the same machinery prefill uses — the only difference is that prefill wants
+    /// logits at the final position and verify wants them everywhere. Sharing the sweep is
+    /// deliberate: the layer-major ordering is what makes a batch cheap (a layer's expert
+    /// union is loaded once and every token in the chunk hits it), and duplicating it would
+    /// mean maintaining that property twice.
+    fn verify_chunk_logits(&mut self, tokens: &[u32], start: usize) -> Result<Vec<ChunkRow>> {
+        if tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+        // `position` indexes BOTH the token array and the KV cache inside the sweep, so the
+        // two must line up. Pad the front so index == absolute position; the padding is
+        // never read because the sweep starts at `start`.
+        let mut padded = vec![0u32; start];
+        padded.extend_from_slice(tokens);
+        let last = start + tokens.len() - 1;
+        // A verify batch must land in ONE chunk, or the single-weight-pass property is lost.
+        let chunk = tokens.len();
+        // Decode regime: reuse-dominated, so keep the mapped read path (bulk_reads is the
+        // cold-sweep setting and measured -13% here).
+        self.prefill_chunked_inner(&padded, start, last, chunk, ChunkLogits::EveryPosition)
+    }
+
+    /// Propose `k` draft tokens from the MTP assistant, conditioned on the target's state.
+    ///
+    /// Every recurrent proposal runs at the SAME `position` — the still-unforwarded bonus
+    /// token's position, which equals the shared-KV logical length. That is the position
+    /// contract the assistant was trained against (and the one both Transformers and
+    /// llama.cpp implement); using an advancing position here silently degrades acceptance.
+    fn mtp_draft(
+        &self,
+        assistant: &crate::gemma4_mtp::Gemma4MtpAssistant,
+        final_hidden: &[f32],
+        bonus_token: u32,
+        position: usize,
+        k: usize,
+    ) -> Result<Vec<u32>> {
+        use crate::gemma4_mtp as mtp;
+        let (Some((sk, sv)), Some((fk, fv))) = (
+            self.mtp_shared_kv(mtp::SHARED_KV_SLIDING_HOST_LAYER, position)?,
+            self.mtp_shared_kv(mtp::SHARED_KV_FULL_HOST_LAYER, position)?,
+        ) else {
+            // Ring wrapped (or a layer owns no cache) — decode plainly this round.
+            return Ok(Vec::new());
+        };
+        let sliding = mtp::SharedKv {
+            key: &sk,
+            value: &sv,
+            kv_heads: self.plan[mtp::SHARED_KV_SLIDING_HOST_LAYER].kv_heads,
+            head_dim: self.plan[mtp::SHARED_KV_SLIDING_HOST_LAYER].head_dim,
+            kv_len: position,
+        };
+        let full = mtp::SharedKv {
+            key: &fk,
+            value: &fv,
+            kv_heads: self.plan[mtp::SHARED_KV_FULL_HOST_LAYER].kv_heads,
+            head_dim: self.plan[mtp::SHARED_KV_FULL_HOST_LAYER].head_dim,
+            kv_len: position,
+        };
+        let mut embedding = self.mtp_scaled_embedding(bonus_token)?;
+        let mut hidden = final_hidden.to_vec();
+        let mut drafts = Vec::with_capacity(k);
+        for _ in 0..k {
+            let step = assistant.step(&embedding, &hidden, &sliding, &full, position)?;
+            let token = argmax_u32(&step.logits);
+            drafts.push(token);
+            hidden = step.recurrent_hidden;
+            embedding = self.mtp_scaled_embedding(token)?;
+        }
+        Ok(drafts)
+    }
+
+    /// Greedy decode with MTP speculative drafting.
+    ///
+    /// LOSSLESS BY CONSTRUCTION: every emitted token is the target's own argmax. The drafter
+    /// only changes how many tokens fall out of a single weight pass, so its accuracy moves
+    /// the acceptance rate (speed) and never the output. That is why the drafter does not
+    /// need to be bit-exact against its reference.
+    ///
+    /// Returns the text, the tokens, and the accepted-draft statistics.
+    pub fn generate_greedy_mtp(
+        &mut self,
+        prompt: &str,
+        max_new: usize,
+        assistant: &crate::gemma4_mtp::Gemma4MtpAssistant,
+        draft_k: usize,
+    ) -> Result<(String, Vec<u32>, Gemma4MtpStats)> {
+        let prompt_tokens = self.cpu.tokenizer.encode(prompt, true, true)?;
+        let eot = gemma4_stop_token_ids(&self.cpu.tokenizer);
+        let mut logits = self.prefill_reusing_cache(&prompt_tokens)?;
+        let mut position = prompt_tokens.len();
+        let mut generated: Vec<u32> = Vec::new();
+        let mut stats = Gemma4MtpStats::default();
+        // The first round has no target hidden yet (prefill does not hand one back), so it
+        // decodes one token plainly and picks up drafting from the next round.
+        let mut final_hidden: Option<Vec<f32>> = None;
+
+        while generated.len() < max_new {
+            let t0 = argmax_u32(&logits);
+            if eot.contains(&t0) {
+                break;
+            }
+            generated.push(t0);
+            if generated.len() >= max_new {
+                break;
+            }
+
+            let budget = max_new - generated.len();
+            let drafts = match final_hidden.as_ref() {
+                Some(hidden) if draft_k > 0 => {
+                    self.mtp_draft(assistant, hidden, t0, position, draft_k.min(budget))?
+                }
+                _ => Vec::new(),
+            };
+
+            let mut batch = Vec::with_capacity(1 + drafts.len());
+            batch.push(t0);
+            batch.extend_from_slice(&drafts);
+            let rows = self.verify_chunk_logits(&batch, position)?;
+            if rows.len() != batch.len() {
+                return Err(BackendError::InvalidModelMetadata(format!(
+                    "MTP verify returned {} rows for a {}-token batch",
+                    rows.len(),
+                    batch.len()
+                )));
+            }
+            // `position` indexes both the token array and the KV cache inside the sweep. If
+            // those ever drift the drafts would be checked against the wrong positions'
+            // logits and the output would be silently wrong rather than merely slow, so
+            // this is asserted rather than assumed.
+            for (offset, row) in rows.iter().enumerate() {
+                if row.position != position + offset {
+                    return Err(BackendError::InvalidModelMetadata(format!(
+                        "MTP verify row {offset} is at position {}, expected {}",
+                        row.position,
+                        position + offset
+                    )));
+                }
+            }
+
+            // Accept the longest prefix of drafts that equals the target's own argmax.
+            let mut accepted = 0usize;
+            while accepted < drafts.len() && argmax_u32(&rows[accepted].logits) == drafts[accepted]
+            {
+                accepted += 1;
+            }
+            stats.rounds += 1;
+            stats.drafted += drafts.len() as u64;
+            stats.accepted += accepted as u64;
+
+            let mut stopped = false;
+            for token in &drafts[..accepted] {
+                if eot.contains(token) {
+                    stopped = true;
+                    break;
+                }
+                generated.push(*token);
+                if generated.len() >= max_new {
+                    stopped = true;
+                    break;
+                }
+            }
+            // The divergence position's logits carry the target's correct next token, so a
+            // rejected draft costs nothing beyond the work already done.
+            logits = rows[accepted].logits.clone();
+            final_hidden = match rows[accepted].hidden_state.as_ref() {
+                Some(h) => Some(self.mtp_final_norm(h)?),
+                None => None,
+            };
+            position += 1 + accepted;
+            if stopped {
+                break;
+            }
+        }
+
+        let text = self.cpu.tokenizer.decode(&generated, true)?;
+        Ok((text, generated, stats))
+    }
+
+    /// Scaled embedding for one token, matching the layer stack's own prep exactly.
+    fn mtp_scaled_embedding(&self, token: u32) -> Result<Vec<f32>> {
+        let hidden = self.hidden;
+        let scale = (hidden as f32).sqrt();
+        Ok(self
+            .cpu
+            .token_embd
+            .dequantize_elements(token as usize * hidden, hidden)?
+            .iter()
+            .map(|v| v * scale)
+            .collect())
+    }
+
+    /// Apply the model's final norm (`model.norm`) to a post-layer hidden.
+    ///
+    /// Gemma 4's RMSNorm is `normed * weight` — NOT Gemma 2/3's `normed * (1 + weight)`.
+    /// This matches the `rms_norm_quantize` kernel, which the head fuses; the fused form
+    /// never materialises the f32 result, which is why it is recomputed here.
+    fn mtp_final_norm(&self, post_layers: &[f32]) -> Result<Vec<f32>> {
+        let head = self.gpu_head.as_ref().ok_or_else(|| {
+            BackendError::InvalidModelMetadata(
+                "MTP needs the GPU head resident to read model.norm".into(),
+            )
+        })?;
+        let s = self.cap_stream.clone();
+        let mut weight = vec![0.0f32; self.hidden];
+        s.memcpy_dtoh(&head.output_norm, weight.as_mut_slice())
+            .map_err(cu)?;
+        let mean_sq = post_layers.iter().map(|v| v * v).sum::<f32>() / post_layers.len() as f32;
+        let inv = (mean_sq + self.eps).powf(-0.5);
+        Ok(post_layers
+            .iter()
+            .zip(&weight)
+            .map(|(v, w)| v * inv * w)
+            .collect())
+    }
+
+    /// Read one host layer's K/V back as f32 in `[kv_head][position][head_dim]` order —
+    /// the layout the MTP drafter consumes, and the same one `kv_scatter` writes.
+    ///
+    /// Returns `None` when the layer's ring has wrapped. Sliding layers keep only
+    /// `window + 1` slots, so past that the physical order no longer matches logical
+    /// position and the drafter would silently read rotated history. Failing closed is
+    /// correct: MTP is an optimisation, and the caller falls back to plain decode.
+    fn mtp_shared_kv(&self, layer: usize, kv_len: usize) -> Result<Option<(Vec<f32>, Vec<f32>)>> {
+        let plan = &self.plan[layer];
+        let source = plan.kv_source_layer;
+        let capacity = gemma4_kv_capacity(self.plan[source].window, self.max_positions);
+        if kv_len > capacity {
+            return Ok(None);
+        }
+        let (Some(ck), Some(cv)) = (self.cache_k[source].as_ref(), self.cache_v[source].as_ref())
+        else {
+            return Ok(None);
+        };
+        let kv_heads = plan.kv_heads;
+        let head_dim = plan.head_dim;
+        let s = self.cap_stream.clone();
+        let mut k_bits = vec![0u16; ck.len()];
+        let mut v_bits = vec![0u16; cv.len()];
+        s.memcpy_dtoh(ck, k_bits.as_mut_slice()).map_err(cu)?;
+        s.memcpy_dtoh(cv, v_bits.as_mut_slice()).map_err(cu)?;
+        let mut key = vec![0.0f32; kv_heads * kv_len * head_dim];
+        let mut value = vec![0.0f32; kv_heads * kv_len * head_dim];
+        for h in 0..kv_heads {
+            for pos in 0..kv_len {
+                let src = (h * capacity + pos) * head_dim;
+                let dst = (h * kv_len + pos) * head_dim;
+                for d in 0..head_dim {
+                    key[dst + d] = crate::inference::f16_bits_to_f32(k_bits[src + d]);
+                    value[dst + d] = crate::inference::f16_bits_to_f32(v_bits[src + d]);
+                }
+            }
+        }
+        Ok(Some((key, value)))
     }
 
     fn prefill_chunked_inner(
@@ -12097,14 +12418,15 @@ impl Gemma4CudaResident {
         start: usize,
         last: usize,
         chunk: usize,
-    ) -> Result<Vec<f32>> {
+        which: ChunkLogits,
+    ) -> Result<Vec<ChunkRow>> {
         let n = prompt_tokens.len();
         let hidden = self.hidden;
         let half_max = self.half_max;
         let blocks = self.block_count;
         let s = self.cap_stream.clone();
         let rope_len = blocks * half_max;
-        let mut logits = Vec::new();
+        let mut collected: Vec<ChunkRow> = Vec::new();
 
         let prefetch = gemma4_prefill_prefetch_enabled();
 
@@ -12184,8 +12506,14 @@ impl Gemma4CudaResident {
                 }
                 for t in 0..k {
                     let position = base + t;
-                    // Only the very last prompt token, at the very last layer, needs logits.
-                    let want_logits = position == last && li + 1 == blocks;
+                    // Prefill needs logits only at the very last prompt token; a speculative
+                    // verify needs them at EVERY position so each draft can be checked
+                    // against the target's own argmax. Both only ever at the last layer.
+                    let want_logits = li + 1 == blocks
+                        && match which {
+                            ChunkLogits::LastOnly => position == last,
+                            ChunkLogits::EveryPosition => true,
+                        };
                     std::mem::swap(&mut self.d_hidden, &mut hidden_bufs[t]);
                     std::mem::swap(&mut self.d_cos_all, &mut cos_bufs[t]);
                     std::mem::swap(&mut self.d_sin_all, &mut sin_bufs[t]);
@@ -12202,14 +12530,32 @@ impl Gemma4CudaResident {
                     std::mem::swap(&mut self.d_hidden, &mut hidden_bufs[t]);
                     std::mem::swap(&mut self.d_cos_all, &mut cos_bufs[t]);
                     std::mem::swap(&mut self.d_sin_all, &mut sin_bufs[t]);
-                    if let Some(l) = out?.0 {
-                        logits = l;
+                    let produced = out?.0;
+                    if let Some(l) = produced {
+                        // For a verify batch the caller also needs this position's hidden,
+                        // because the NEXT draft round conditions on the target's final
+                        // normalized hidden at whichever position was accepted — not at the
+                        // last position of the batch. The buffers were rotated back above,
+                        // so token t's post-layer hidden is in `hidden_bufs[t]`.
+                        let hidden_state = if which == ChunkLogits::EveryPosition {
+                            let mut host = vec![0.0f32; hidden];
+                            s.memcpy_dtoh(&hidden_bufs[t], host.as_mut_slice())
+                                .map_err(cu)?;
+                            Some(host)
+                        } else {
+                            None
+                        };
+                        collected.push(ChunkRow {
+                            position,
+                            logits: l,
+                            hidden_state,
+                        });
                     }
                 }
             }
             base += k;
         }
-        Ok(logits)
+        Ok(collected)
     }
 
     pub fn generate_greedy(&mut self, prompt: &str, max_new: usize) -> Result<(String, Vec<u32>)> {
