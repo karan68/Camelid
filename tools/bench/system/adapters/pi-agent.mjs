@@ -196,6 +196,7 @@ function prepareLaunch(options, attemptRoot, configPath, piArgs) {
       linuxConfigPath: windowsPathToWsl(configPath),
       linuxSupervisorPath: windowsPathToWsl(supervisorPath),
       modelId: options.modelId,
+      contextWindow: options.contextWindow,
       piArgs,
       readyTimeoutSeconds: Math.max(1, Math.ceil(options.timeoutMs / 1000)),
       gpuEnabled: options.boundary.gpuEnabled,
@@ -289,6 +290,7 @@ export function piWslBwrapPrefix({
   linuxConfigPath,
   linuxSupervisorPath,
   modelId,
+  contextWindow,
   piArgs,
   readyTimeoutSeconds,
   gpuEnabled = false,
@@ -338,7 +340,7 @@ export function piWslBwrapPrefix({
     '--setenv', 'CAMELID_PI_READY_TIMEOUT_SECONDS', String(readyTimeoutSeconds),
     ...gpuEnvironmentArgs,
     '/bin/sh', '/opt/controller/pi-camelid-supervisor.sh',
-    '/opt/camelid/camelid', sandboxModelPath, SANDBOX_ADDR, modelId, '/opt/pi/pi',
+    '/opt/camelid/camelid', sandboxModelPath, SANDBOX_ADDR, modelId, String(contextWindow), '/opt/pi/pi',
     ...piArgs,
   ]
 }

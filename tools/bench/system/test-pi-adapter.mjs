@@ -77,6 +77,7 @@ try {
     linuxConfigPath: '/mnt/c/runs/task/control/pi-agent/models.json',
     linuxSupervisorPath: '/mnt/c/repo/tools/bench/system/process/pi-camelid-supervisor.sh',
     modelId: 'exact-model-id',
+    contextWindow: 40960,
     piArgs: ['--mode', 'json', '--', 'fix it'],
     readyTimeoutSeconds: 300,
   })
@@ -88,6 +89,7 @@ try {
   assert.ok(bwrap.includes('/tmp/pi-agent/models.json'))
   assert.ok(bwrap.includes('/workspace'))
   assert.ok(bwrap.includes('exact-model-id'))
+  assert.ok(bwrap.includes('40960'))
   assert.equal(bwrap.join(' ').includes('--bind /mnt/c /mnt/c'), false)
   assert.equal(bwrap.includes('/dev/dxg'), false)
   assert.equal(bwrap.at(-1), 'fix it')

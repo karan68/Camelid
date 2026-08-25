@@ -1,8 +1,8 @@
 #!/bin/sh
 set -eu
 
-if [ "$#" -lt 6 ]; then
-  printf '%s\n' 'usage: pi-camelid-supervisor CANDIDATE MODEL ADDR MODEL_ID PI PI_ARGS...' >&2
+if [ "$#" -lt 7 ]; then
+  printf '%s\n' 'usage: pi-camelid-supervisor CANDIDATE MODEL ADDR MODEL_ID CONTEXT_WINDOW PI PI_ARGS...' >&2
   exit 64
 fi
 
@@ -10,8 +10,9 @@ candidate=$1
 model=$2
 addr=$3
 model_id=$4
-pi=$5
-shift 5
+context_window=$5
+pi=$6
+shift 6
 
 server_pid=''
 
@@ -50,7 +51,7 @@ started=$(date +%s)
 models_response=/tmp/camelid-pi-models.json
 while true; do
   if curl -fsS --max-time 2 "http://$addr/v1/models" >"$models_response" 2>/dev/null; then
-    if python3 -c 'import json,sys; data=json.load(sys.stdin).get("data", []); raise SystemExit(0 if sum(item.get("id") == sys.argv[1] for item in data if isinstance(item, dict)) == 1 else 1)' "$model_id" <"$models_response"; then
+    if python3 -c 'import json,sys; data=json.load(sys.stdin).get("data", []); matches=[item for item in data if isinstance(item, dict) and item.get("id") == sys.argv[1]]; raise SystemExit(0 if len(matches) == 1 and matches[0].get("meta", {}).get("n_ctx_train") == int(sys.argv[2]) else 1)' "$model_id" "$context_window" <"$models_response"; then
       break
     fi
     printf '%s\n' 'CAMELID_PI_MODEL_ID_MISMATCH' >&2
