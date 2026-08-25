@@ -19,6 +19,7 @@ import {
 const systemRoot = resolve(import.meta.dirname, '..')
 const sharedTools = new Set(PI_SHARED_TOOLS)
 const supervisorPath = resolve(systemRoot, 'process/pi-camelid-supervisor.sh')
+const providerExtensionPath = resolve(systemRoot, 'adapters/pi-camelid-provider.mjs')
 const SANDBOX_ADDR = '127.0.0.1:8231'
 export const PI_SANDBOX_BASE_URL = `http://${SANDBOX_ADDR}/v1`
 
@@ -195,6 +196,7 @@ function prepareLaunch(options, attemptRoot, configPath, piArgs, modelSha256) {
       linuxAttemptPath: windowsPathToWsl(attemptRoot),
       linuxConfigPath: windowsPathToWsl(configPath),
       linuxSupervisorPath: windowsPathToWsl(supervisorPath),
+      linuxProviderExtensionPath: windowsPathToWsl(providerExtensionPath),
       modelId: options.modelId,
       contextWindow: options.contextWindow,
       sourceSha: options.sourceSha,
@@ -291,6 +293,7 @@ export function piWslBwrapPrefix({
   linuxAttemptPath,
   linuxConfigPath,
   linuxSupervisorPath,
+  linuxProviderExtensionPath,
   modelId,
   contextWindow,
   sourceSha,
@@ -330,6 +333,7 @@ export function piWslBwrapPrefix({
     '--ro-bind', linuxBinaryPath, '/opt/camelid/camelid',
     '--ro-bind', linuxModelPath, sandboxModelPath,
     '--ro-bind', linuxSupervisorPath, '/opt/controller/pi-camelid-supervisor.sh',
+    '--ro-bind', linuxProviderExtensionPath, '/opt/controller/pi-camelid-provider.mjs',
     '--ro-bind', linuxConfigPath, '/tmp/pi-agent/models.json',
     '--bind', linuxAttemptPath, '/workspace',
     '--chdir', '/workspace',
@@ -341,6 +345,7 @@ export function piWslBwrapPrefix({
     '--setenv', 'PI_SKIP_VERSION_CHECK', '1',
     '--setenv', 'PI_TELEMETRY', '0',
     '--setenv', 'CAMELID_PI_API_KEY', 'camelid-benchmark-local',
+    '--setenv', 'CAMELID_NO_REMOTE_DIMS', '1',
     '--setenv', 'CAMELID_PI_READY_TIMEOUT_SECONDS', String(readyTimeoutSeconds),
     ...gpuEnvironmentArgs,
     '/bin/sh', '/opt/controller/pi-camelid-supervisor.sh',

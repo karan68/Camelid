@@ -14,6 +14,7 @@ export const PINNED_PI_RELEASE = Object.freeze({
 export const PI_EVENT_STREAM_VERSION = 3
 export const PI_PROVIDER_ID = 'camelid-benchmark'
 export const PI_SHARED_TOOLS = Object.freeze(['read', 'bash', 'edit', 'write', 'grep', 'find', 'ls'])
+export const PI_PROVIDER_EXTENSION_PATH = '/opt/controller/pi-camelid-provider.mjs'
 
 export function piProviderConfig({ baseUrl, modelId, contextWindow, maxTokens }) {
   assertLoopbackV1Url(baseUrl)
@@ -57,7 +58,7 @@ export function piProviderConfig({ baseUrl, modelId, contextWindow, maxTokens })
   }
 }
 
-export function piJsonArgs({ modelId, goal }) {
+export function piJsonArgs({ modelId, goal, extensionPath = PI_PROVIDER_EXTENSION_PATH }) {
   assertNonEmpty(modelId, 'modelId')
   assertNonEmpty(goal, 'goal')
   return [
@@ -68,6 +69,7 @@ export function piJsonArgs({ modelId, goal }) {
     '--no-session',
     '--no-approve',
     '--no-extensions',
+    '--extension', extensionPath,
     '--no-skills',
     '--no-prompt-templates',
     '--no-themes',

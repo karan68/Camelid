@@ -39,6 +39,9 @@ The checked compatibility fixture records the real pinned release sending
 `max_tokens`, SSE usage frames, non-strict function tools, and a nameless tool
 result continuation. `developer`, `max_completion_tokens`, `reasoning_effort`,
 `store`, strict tools, and grammar tools remain explicitly unqualified.
+The only explicit extension is controller-owned and provider-scoped: it maps
+Camelid's typed prompt-limit error to Pi's documented
+`context_length_exceeded` marker. Extension discovery remains disabled.
 
 ## Safety and validity
 
@@ -186,6 +189,7 @@ node tools/bench/system/test-bundle.mjs
 node tools/bench/system/test-cli.mjs
 node tools/bench/system/test-pi-contract.mjs
 node tools/bench/system/test-pi-openai-contract.mjs
+node tools/bench/system/test-pi-provider-extension.mjs
 node tools/bench/system/test-pi-adapter.mjs
 node tools/bench/system/test-pi-bundle.mjs
 node tools/bench/system/test-pi-cli.mjs
@@ -200,5 +204,5 @@ The existing `validation-scripts` CI job runs the same set through
 `scripts/test-benchmark-system-phase1.mjs` and
 `scripts/test-benchmark-system-phase2.mjs`. The model-free Phase 3 adapter test
 is discovered through `scripts/test-benchmark-system-phase3.mjs`; the Phase 4
-Pi contract, adapter, bundle, and CLI tests are grouped by
+Pi contract, provider extension, adapter, bundle, and CLI tests are grouped by
 `scripts/test-benchmark-system-phase4.mjs`.

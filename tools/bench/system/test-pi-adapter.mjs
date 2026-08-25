@@ -76,6 +76,7 @@ try {
     linuxAttemptPath: '/mnt/c/runs/task/attempt',
     linuxConfigPath: '/mnt/c/runs/task/control/pi-agent/models.json',
     linuxSupervisorPath: '/mnt/c/repo/tools/bench/system/process/pi-camelid-supervisor.sh',
+    linuxProviderExtensionPath: '/mnt/c/repo/tools/bench/system/adapters/pi-camelid-provider.mjs',
     modelId: 'exact-model-id',
     contextWindow: 40960,
     sourceSha: 'a'.repeat(40),
@@ -88,6 +89,7 @@ try {
   assert.ok(bwrap.includes('/opt/pi'))
   assert.ok(bwrap.includes('/opt/camelid/camelid'))
   assert.ok(bwrap.includes('/opt/controller/pi-camelid-supervisor.sh'))
+  assert.ok(bwrap.includes('/opt/controller/pi-camelid-provider.mjs'))
   assert.ok(bwrap.includes('/tmp/pi-agent/models.json'))
   assert.ok(bwrap.includes('/workspace'))
   assert.ok(bwrap.includes('exact-model-id'))
@@ -96,6 +98,7 @@ try {
   assert.ok(bwrap.includes('b'.repeat(64)))
   assert.equal(bwrap.join(' ').includes('--bind /mnt/c /mnt/c'), false)
   assert.equal(bwrap.includes('/dev/dxg'), false)
+  assert.ok(bwrap.includes('CAMELID_NO_REMOTE_DIMS'))
   assert.equal(bwrap.at(-1), 'fix it')
 } finally {
   await rm(tempRoot, { recursive: true, force: true })
@@ -143,6 +146,7 @@ assert.equal(value('--mode'), 'json')
 assert.equal(value('--provider'), 'camelid-benchmark')
 assert.equal(value('--model'), 'synthetic-model')
 assert.equal(value('--tools'), 'read,bash,edit,write,grep,find,ls')
+assert.equal(value('--extension'), '/opt/controller/pi-camelid-provider.mjs')
 const configPath = process.env.PI_CODING_AGENT_DIR + '/models.json'
 const config = JSON.parse(await readFile(configPath, 'utf8'))
 assert.equal(config.providers['camelid-benchmark'].models[0].maxTokens, 256)

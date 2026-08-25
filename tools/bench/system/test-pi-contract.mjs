@@ -62,6 +62,7 @@ for (const flag of [
 }
 assert.equal(args[args.indexOf('--mode') + 1], 'json')
 assert.equal(args[args.indexOf('--tools') + 1], PI_SHARED_TOOLS.join(','))
+assert.equal(args[args.indexOf('--extension') + 1], '/opt/controller/pi-camelid-provider.mjs')
 assert.equal(args.at(-1), 'fix the exact task')
 
 assert.deepEqual(piSandboxEnvironment({ apiKey: 'benchmark-secret' }), {
