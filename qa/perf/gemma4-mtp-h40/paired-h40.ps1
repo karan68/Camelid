@@ -51,6 +51,14 @@ function Invoke-Arm {
     $dir = Get-ChildItem (Join-Path $PSScriptRoot 'runs') -Directory |
         Sort-Object Name -Descending | Select-Object -First 1
     $verdict = Get-Content (Join-Path $dir.FullName 'verdict.json') -Raw | ConvertFrom-Json
+    # A refused run writes a verdict with `admitted = false` and none of the measurement
+    # fields. Abort the whole comparison rather than reading through the gap: half a
+    # paired series is not a weaker result, it is no result, and continuing would leave
+    # the surviving arm looking like one.
+    if (-not $verdict.admitted) {
+        throw ("[paired] {0} run {1} was refused admission ({2}); aborting the series" -f `
+                $Arm, $Index, ($verdict.refusals -join '; '))
+    }
     return [ordered]@{
         arm     = $Arm
         exit    = $exit

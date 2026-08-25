@@ -1,10 +1,9 @@
 {
-  "description": "Plain decode with the decode read path forced to the memory map (CAMELID_GEMMA4_GHOST_DECODE_BULK_READS=0) — the behaviour before the auto rule landed. Keep this arm: it is the control the auto rule has to beat on a RAM-starved host, and the arm that should WIN on a host whose free RAM covers the routed payload. If it ever wins here, the auto rule's threshold is wrong.",
+  "description": "Plain decode with the decode read path forced to the memory map (CAMELID_GEMMA4_GHOST_DECODE_BULK_READS=0) \u2014 the behaviour before the auto rule landed. Keep this arm: it is the control the auto rule has to beat on a RAM-starved host, and the arm that should WIN on a host whose free RAM covers the routed payload. If it ever wins here, the auto rule's threshold is wrong.",
   "mtp": false,
   "draft_k": 0,
   "env": {
     "CAMELID_GEMMA4_CUDA_BATCH_EXPERT_COPIES": "1",
-    "CAMELID_GEMMA4_GHOST_TIER_PREFILL": "1",
     "CAMELID_GEMMA4_GHOST_DECODE_BULK_READS": "0",
     "CAMELID_GEMMA4_PREFILL_CHUNK_TOKENS": "512",
     "CAMELID_GEMMA4_Q4_0_SOA": "1",
