@@ -14,8 +14,8 @@
       "stream": true,
       "stream_include_usage": true,
       "max_tokens": 256,
-      "tools": ["read", "bash", "edit", "write", "grep", "find", "ls"],
-      "strict_tool_fields": [null, null, null, null, null, null, null]
+      "tools": ["read", "bash", "edit", "write", "ls"],
+      "strict_tool_fields": [null, null, null, null, null]
     },
     {
       "turn": "after_tool_result",

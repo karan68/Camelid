@@ -13,7 +13,7 @@ export const PINNED_PI_RELEASE = Object.freeze({
 
 export const PI_EVENT_STREAM_VERSION = 3
 export const PI_PROVIDER_ID = 'camelid-benchmark'
-export const PI_SHARED_TOOLS = Object.freeze(['read', 'bash', 'edit', 'write', 'grep', 'find', 'ls'])
+export const PI_SHARED_TOOLS = Object.freeze(['read', 'bash', 'edit', 'write', 'ls'])
 export const PI_PROVIDER_EXTENSION_PATH = '/opt/controller/pi-camelid-provider.mjs'
 
 export function piProviderConfig({ baseUrl, modelId, contextWindow, maxTokens }) {

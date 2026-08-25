@@ -410,7 +410,7 @@ async function verifyPiWslBoundary(boundary) {
 
 export function piBoundaryProbeCommand(gpuEnabled) {
   const gpuProbe = gpuEnabled ? ' && /usr/lib/wsl/lib/nvidia-smi -L >/dev/null 2>&1' : ''
-  return `test ! -e /mnt/c && ! /usr/bin/curl -fsS --max-time 2 https://example.com >/dev/null 2>&1${gpuProbe} && /opt/pi/pi --version`
+  return `test ! -e /mnt/c && test -x /usr/bin/find && test -x /usr/bin/grep && ! /usr/bin/curl -fsS --max-time 2 https://example.com >/dev/null 2>&1${gpuProbe} && /opt/pi/pi --version`
 }
 
 async function verifyPiWslIdentity(boundary, expected) {

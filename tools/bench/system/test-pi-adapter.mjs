@@ -103,6 +103,8 @@ try {
 
   const cpuProbe = piBoundaryProbeCommand(false)
   assert.equal(cpuProbe.includes('$('), false)
+  assert.match(cpuProbe, /test -x \/usr\/bin\/find/)
+  assert.match(cpuProbe, /test -x \/usr\/bin\/grep/)
   assert.equal(cpuProbe.endsWith('/opt/pi/pi --version'), true)
   const gpuProbe = piBoundaryProbeCommand(true)
   assert.equal(gpuProbe.includes('$('), false)
@@ -156,7 +158,7 @@ for (const flag of ['--no-session','--no-approve','--no-extensions','--no-skills
 assert.equal(value('--mode'), 'json')
 assert.equal(value('--provider'), 'camelid-benchmark')
 assert.equal(value('--model'), 'synthetic-model')
-assert.equal(value('--tools'), 'read,bash,edit,write,grep,find,ls')
+assert.equal(value('--tools'), 'read,bash,edit,write,ls')
 assert.equal(value('--extension'), '/opt/controller/pi-camelid-provider.mjs')
 const configPath = process.env.PI_CODING_AGENT_DIR + '/models.json'
 const config = JSON.parse(await readFile(configPath, 'utf8'))
@@ -199,7 +201,7 @@ function emit(event) { process.stdout.write(JSON.stringify(event) + '\\n') }
 function assertPiArgs(args) {
   assert.equal(args[args.indexOf('--mode') + 1], 'json')
   assert.equal(args[args.indexOf('--provider') + 1], 'camelid-benchmark')
-  assert.equal(args[args.indexOf('--tools') + 1], 'read,bash,edit,write,grep,find,ls')
+  assert.equal(args[args.indexOf('--tools') + 1], 'read,bash,edit,write,ls')
 }
 
 async function assertPortReusable(port) {

@@ -53,6 +53,7 @@ for (const invalid of [
 }
 
 const args = piJsonArgs({ modelId: 'exact-model-id', goal: 'fix the exact task' })
+assert.deepEqual(PI_SHARED_TOOLS, ['read', 'bash', 'edit', 'write', 'ls'])
 for (const flag of [
   '--mode', '--provider', '--model', '--thinking', '--no-session', '--no-approve',
   '--no-extensions', '--no-skills', '--no-prompt-templates', '--no-themes',

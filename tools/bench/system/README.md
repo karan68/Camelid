@@ -144,6 +144,11 @@ node tools/bench/system/cli.mjs pi-run \
 removes the disposable workspace. A failed scorer or model outcome is retained
 as evidence and returns nonzero; it is never retried until it passes.
 
+Pi's named `find` and `grep` tools are not advertised because the pinned release
+implements them through `fd` and `rg`, which are absent and cannot be downloaded
+inside the offline boundary. The allowed `bash` tool retains search capability
+through preflight-verified `/usr/bin/find` and `/usr/bin/grep`.
+
 CPU remains the default. `--wsl-gpu true` adds only the WSL GPU device and
 driver-library search path to the otherwise unchanged network-unshared
 bubblewrap boundary, requires a successful in-boundary GPU preflight, and is
