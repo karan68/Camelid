@@ -1,5 +1,5 @@
 {
-  "description": "Plain greedy decode on the CUDA ghost lane. The reference every MTP arm has to beat, and the source of the Windows expected-token-id file.",
+  "description": "Plain greedy decode on the CUDA ghost lane, at shipping defaults -- including the AUTO decode read path, which takes unbuffered reads when available RAM cannot cover the routed payload. The reference every MTP arm has to beat, and the source of the Windows expected-token-id file.",
   "mtp": false,
   "draft_k": 0,
   "env": {

@@ -1,0 +1,13 @@
+{
+  "description": "Plain decode, unbuffered decode reads, plus a forced 3 GiB host expert tier (CAMELID_GEMMA4_GHOST_HOST_TIER_MIB=3072). Auto-sizing refuses a tier under 40% payload coverage, and the reason it gives is that the tier 'starved the OS page cache that was previously absorbing those reads'. Unbuffered decode reads BYPASS the page cache, so that argument no longer applies and the gate is being asked with stale premises. The size is chosen from the churn measurement, not guessed: re-fetches arrive ~7,222 lookups after eviction, i.e. about 990 intervening misses, and ~960 records is 3 GiB — so a tier this size is roughly the window that would turn the measured 39.9% churn into RAM hits.",
+  "mtp": false,
+  "draft_k": 0,
+  "env": {
+    "CAMELID_GEMMA4_CUDA_BATCH_EXPERT_COPIES": "1",
+    "CAMELID_GEMMA4_GHOST_TIER_PREFILL": "1",
+    "CAMELID_GEMMA4_GHOST_HOST_TIER_MIB": "3072",
+    "CAMELID_GEMMA4_PREFILL_CHUNK_TOKENS": "512",
+    "CAMELID_GEMMA4_Q4_0_SOA": "1",
+    "CAMELID_GEMMA4_SPECULATIVE": "0"
+  }
+}

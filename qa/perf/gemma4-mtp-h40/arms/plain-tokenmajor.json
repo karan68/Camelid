@@ -1,0 +1,12 @@
+{
+  "description": "Plain decode with the token-major prefill (CAMELID_GEMMA4_PREFILL_CHUNK_TOKENS=0). A hypothesis probe, not a candidate: token-major prefill is ~2.2x slower, but it walks all 30 layers per token, so it leaves the expert arena holding a CROSS-LAYER set instead of the last layer's union. If the decode warm-up curve flattens against the layer-major arm, the warm-up is an arena-handoff artifact and worth fixing directly; if it does not, the warm-up is decode's own working set and this door is closed.",
+  "mtp": false,
+  "draft_k": 0,
+  "env": {
+    "CAMELID_GEMMA4_CUDA_BATCH_EXPERT_COPIES": "1",
+    "CAMELID_GEMMA4_GHOST_TIER_PREFILL": "1",
+    "CAMELID_GEMMA4_PREFILL_CHUNK_TOKENS": "0",
+    "CAMELID_GEMMA4_Q4_0_SOA": "1",
+    "CAMELID_GEMMA4_SPECULATIVE": "0"
+  }
+}

@@ -2737,8 +2737,19 @@ struct Gemma4HarnessRun<'a> {
     /// exactly the difference under test.
     decode_only_secs: f64,
     stats: Option<&'a camelid::gemma4_runtime::Gemma4MtpStats>,
-    /// `(hits, misses, resident, capacity)` from the expert cache.
+    /// `(hits, misses, resident, capacity)` from the expert cache, lifetime since load.
     sser: Option<(u64, u64, usize, usize)>,
+    /// `(hits, misses)` as of the end of prefill. Lifetime totals are dominated by the
+    /// prompt sweep -- a layer-major prefill touches most of the 12 GiB payload once --
+    /// so decode traffic is only visible as the difference.
+    sser_prefill: (u64, u64),
+    /// Throughput over the second half of the decode forwards, past the arena warm-up.
+    ///
+    /// Layer-major prefill leaves the expert arena holding the LAST layer's union, so
+    /// decode has to re-accumulate a cross-layer working set. On a 48-token request that
+    /// warm-up covers half the run, which makes the whole-run average say more about the
+    /// handoff from prefill than about how fast the lane decodes.
+    steady_tokens_per_second: Option<f64>,
 }
 
 #[cfg(feature = "cuda")]
@@ -2776,6 +2787,12 @@ impl Gemma4HarnessRun<'_> {
                         "accepted": round.accepted,
                         "assistant_ms": round.assistant_ns as f64 / 1e6,
                         "verify_ms": round.verify_ns as f64 / 1e6,
+                        "misses": round.misses,
+                        // One miss is one ~3.19 MiB record off the .cghost. Reported as
+                        // bytes as well because the question this answers -- is the round
+                        // storage-bound? -- is about bytes against read rate, and doing
+                        // that arithmetic by hand each time invites getting it wrong.
+                        "miss_mib": round.misses as f64 * 3.19,
                     })
                 })
                 .collect::<Vec<_>>()
@@ -2806,6 +2823,7 @@ impl Gemma4HarnessRun<'_> {
             "decode_only_secs": self.decode_only_secs,
             "end_to_end_tokens_per_second": self.ids.len() as f64 / self.generate_secs.max(1e-9),
             "decode_tokens_per_second": self.ids.len() as f64 / self.decode_only_secs.max(1e-9),
+            "steady_tokens_per_second": self.steady_tokens_per_second,
             "mtp": self.stats.map(|stats| serde_json::json!({
                 "rounds": stats.rounds,
                 "drafted": stats.drafted,
@@ -2823,9 +2841,23 @@ impl Gemma4HarnessRun<'_> {
             })),
             "expert_cache": self.sser.map(|(hits, misses, resident, capacity)| {
                 let rounds = self.stats.map(|stats| stats.rounds).unwrap_or(0);
+                let (prefill_hits, prefill_misses) = self.sser_prefill;
+                let decode_misses = misses.saturating_sub(prefill_misses);
+                let decode_hits = hits.saturating_sub(prefill_hits);
                 serde_json::json!({
                     "hits": hits,
                     "misses": misses,
+                    "prefill_hits": prefill_hits,
+                    "prefill_misses": prefill_misses,
+                    "decode_hits": decode_hits,
+                    "decode_misses": decode_misses,
+                    "decode_misses_per_token": decode_misses as f64 / (self.ids.len().max(1)) as f64,
+                    "decode_hit_rate": if decode_hits + decode_misses > 0 {
+                        decode_hits as f64 / (decode_hits + decode_misses) as f64
+                    } else {
+                        0.0
+                    },
+                    "decode_miss_mib": decode_misses as f64 * 3.19,
                     // Per ROUND is incomparable across lanes, because a round commits one
                     // token plain and `1 + alpha` speculatively. Per committed token is
                     // the figure that answers "did batching change what we read?", so it
@@ -4071,6 +4103,10 @@ async fn main() -> anyhow::Result<()> {
                     decode_only_secs: (wall - stats.prefill_ns as f64 / 1e9).max(0.0),
                     stats: Some(&stats),
                     sser: runtime.sser_stats(),
+                    sser_prefill: runtime.sser_prefill_mark(),
+                    // Speculative rounds are not per-token forwards, so there is no
+                    // second-half token rate to quote here.
+                    steady_tokens_per_second: None,
                 };
                 if !run.finish(receipt.as_deref())? {
                     std::process::exit(1);
@@ -4171,6 +4207,12 @@ async fn main() -> anyhow::Result<()> {
                 decode_only_secs: per_token.iter().sum(),
                 stats: None,
                 sser,
+                sser_prefill: runtime.sser_prefill_mark(),
+                steady_tokens_per_second: {
+                    let half = per_token.len() / 2;
+                    let tail: f64 = per_token[half..].iter().sum();
+                    ((per_token.len() - half) as f64 / tail.max(1e-9)).into()
+                },
             };
             if !run.finish(receipt.as_deref())? {
                 std::process::exit(1);

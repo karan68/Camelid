@@ -385,6 +385,11 @@ Write-Utf8NoBom $verdictPath ($verdict | ConvertTo-Json -Depth 12)
 Write-Host ''
 Write-Host ('[h40] {0} tokens | load {1:N1} s | decode {2:N2} s | {3:N2} tok/s decode-only' -f `
         $ids.Count, $receipt.load_secs, $receipt.decode_only_secs, $receipt.decode_tokens_per_second)
+if ($null -ne $receipt.steady_tokens_per_second) {
+    # The whole-run average includes the arena warm-up after prefill, which on a 48-token
+    # request is half the run. Quote both or neither.
+    Write-Host ('[h40] steady {0:N2} tok/s (2nd half of decode forwards)' -f $receipt.steady_tokens_per_second)
+}
 if ($null -ne $receipt.mtp) {
     Write-Host ('[h40] alpha {0:N2} over {1} rounds | acceptance {2:N1}%' -f `
             $receipt.mtp.alpha, $receipt.mtp.rounds, ($receipt.mtp.acceptance_rate * 100))
@@ -392,9 +397,14 @@ if ($null -ne $receipt.mtp) {
             $receipt.mtp.prefill_ms, $receipt.mtp.assistant_ms, $receipt.mtp.verify_ms, $receipt.mtp.verify_ms_per_round)
 }
 if ($null -ne $receipt.expert_cache) {
-    Write-Host ('[h40] expert cache {0} hits / {1} misses ({2:N1} misses/round), {3}/{4} resident' -f `
-            $receipt.expert_cache.hits, $receipt.expert_cache.misses, $receipt.expert_cache.misses_per_round, `
-            $receipt.expert_cache.resident_experts, $receipt.expert_cache.capacity)
+    $ec = $receipt.expert_cache
+    Write-Host ('[h40] expert cache {0}/{1} resident | prefill {2} misses | decode {3} misses = {4:N1}/token, {5:P1} hit' -f `
+            $ec.resident_experts, $ec.capacity, $ec.prefill_misses, $ec.decode_misses, `
+            $ec.decode_misses_per_token, $ec.decode_hit_rate)
+    # One miss is one ~3.19 MiB record off the .cghost at 1.3-1.9 GB/s, so this is the
+    # floor a storage-bound round cannot beat.
+    Write-Host ('[h40] decode storage: {0:N0} MiB, i.e. >= {1:N0} ms at 1.9 GB/s' -f `
+            $ec.decode_miss_mib, ($ec.decode_miss_mib / 1900.0 * 1000.0))
 }
 Write-Host ('[h40] host delta: available {0:+#;-#;0} MiB | pagefile {1:+#;-#;0} MiB | hard-fault pages in {2}' -f `
         $verdict.host_delta.available_mib, $verdict.host_delta.pagefile_current_mib, `

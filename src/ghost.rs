@@ -1111,9 +1111,15 @@ pub struct GhostFile {
     pub index: CghostIndex,
     file: File,
     /// Raised around a cold bulk sweep (layer-major prefill), where records are read
-    /// once and a map copy degenerates into ~816 demand faults per record. Lowered for
-    /// decode, where reuse makes the map copy a pure memcpy and the explicit read a
-    /// measured 13% regression. See `read_positioned_span_into` for both receipts.
+    /// once and a map copy degenerates into ~816 demand faults per record.
+    ///
+    /// For DECODE the runtime decides per host: reuse makes the map copy a pure memcpy
+    /// and the explicit read a measured 13% regression *when the page cache can serve*,
+    /// but where free RAM cannot cover the routed payload those same misses fault cold
+    /// and the map loses badly (measured 7.8 s -> 3.9 s of decode wall on the 26B-A4B row
+    /// at 7.4 GiB available against a 12.4 GiB payload). See
+    /// `Gemma4CudaResident::decode_bulk_reads` for the rule and
+    /// `read_positioned_span_into` for both receipts.
     bulk_reads: AtomicBool,
     /// Set by `--ghost-strict-cache`: every read bypasses the page cache. Distinct from
     /// `bulk_reads`, which is a per-phase hint; both route to the same unbuffered handle.
@@ -1297,6 +1303,13 @@ impl GhostFile {
     /// Select the read path for the phase that is about to run: `true` for a cold bulk
     /// sweep (prefill), `false` for reuse-dominated access (decode). Cheap and
     /// idempotent; the two paths return identical bytes.
+    /// Size of the routed payload on disk, or 0 if it cannot be probed. Used to decide
+    /// whether the page cache can plausibly serve decode misses; a stat per decision is
+    /// nothing next to the reads the decision governs.
+    pub(crate) fn payload_bytes(&self) -> u64 {
+        self.file.metadata().map(|m| m.len()).unwrap_or(0)
+    }
+
     pub(crate) fn set_bulk_reads(&self, on: bool) {
         self.bulk_reads.store(on, Ordering::Relaxed);
     }
@@ -2031,13 +2044,21 @@ impl GhostFile {
         // WHICH PATH IS FASTER DEPENDS ENTIRELY ON THE REGIME, and both regimes were
         // measured on this box:
         //
-        // DECODE (warm reuse): the map wins. Routing record-sized spans to an explicit
-        // `read_exact_at` measured a 13.0% REGRESSION (paired ABABAB, 3/3 pairs negative,
-        // token-ID and hit/miss identity PASS; qa/perf/receipts/paired-mmap-vs-pread.json).
-        // With ~52% of decode misses being re-fetches of evicted experts, most reads hit
-        // the page cache, where the map copy is a pure memcpy and a positioned read pays a
-        // syscall plus that same copy. The map arm also scaled with cache warmth
-        // (19.6 -> 23.0 steady across pairs) while the positioned arm stayed flat.
+        // DECODE, WARM HOST (free RAM covers the payload): the map wins. Routing
+        // record-sized spans to an explicit `read_exact_at` measured a 13.0% REGRESSION
+        // (paired ABABAB, 3/3 pairs negative, token-ID and hit/miss identity PASS;
+        // qa/perf/receipts/paired-mmap-vs-pread.json). With ~52% of decode misses being
+        // re-fetches of evicted experts, most reads hit the page cache, where the map copy
+        // is a pure memcpy and a positioned read pays a syscall plus that same copy. The
+        // map arm also scaled with cache warmth (19.6 -> 23.0 steady across pairs) while
+        // the positioned arm stayed flat.
+        //
+        // DECODE, STARVED HOST (free RAM well under the payload): the map loses, for the
+        // same reason prefill does. The premise above is "most reads hit the page cache",
+        // and it simply stops holding. Measured on the 26B-A4B row at 7.4 GiB available
+        // against a 12.4 GiB payload: decode wall 7.8 s -> 3.9 s, steady +34.8% (3/3
+        // pairs, sign consistent), demand faults 1.54M -> 0.45M, token ids identical.
+        // `Gemma4CudaResident::decode_bulk_reads` picks between the two at load.
         //
         // PREFILL (cold sweep): the map loses badly. Layer-major prefill streams the whole
         // ~12 GiB payload once, so nearly every record is a genuine cold fault, and

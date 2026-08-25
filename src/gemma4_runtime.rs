@@ -1173,6 +1173,19 @@ const GHOST_CUDA_HOST_TIER_MIN_BYTES: usize = 1024 * 1024 * 1024;
 #[cfg(feature = "cuda")]
 const GHOST_CUDA_HOST_TIER_RESERVE_MIB: u64 = 3072;
 
+/// Host RAM `(total, available)` sampled ONCE, before this process pins anything.
+///
+/// Every later sample is polluted by our own allocations: after the expert tier and the
+/// resident core are in place, "available" on this box reads a few hundred MiB, and any
+/// rule comparing that against the routed payload would answer the same way no matter what
+/// the machine actually has. The question these rules ask is how much the HOST could cache
+/// for us, so it has to be asked before we take our share.
+#[cfg(feature = "cuda")]
+fn ghost_host_ram_at_load() -> (u64, u64) {
+    static SAMPLE: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+    *SAMPLE.get_or_init(crate::capability::host_ram_total_available_bytes)
+}
+
 /// Auto-sized tiers may consume at most this fraction of installed RAM. The
 /// available-minus-reserve check alone was insufficient on a 16 GiB Windows
 /// host: a 5.98 GiB pinned tier left only tens of MiB available once WDDM commit,
@@ -1216,7 +1229,7 @@ fn ghost_cuda_host_tier_mib(cghost: &Path, requested_mib: usize) -> usize {
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or(GHOST_CUDA_HOST_TIER_RESERVE_MIB);
-    let (total, available) = crate::capability::host_ram_total_available_bytes();
+    let (total, available) = ghost_host_ram_at_load();
     if available == 0 {
         // No probe on this platform: do not pin an arena sized from nothing.
         return 0;
@@ -1239,13 +1252,30 @@ fn ghost_cuda_host_tier_mib(cghost: &Path, requested_mib: usize) -> usize {
     // Viability gate (see above): after direct pinned staging/batch DMA removed
     // the no-tier dispatch penalty, a 3.07 GiB tier covering roughly one quarter
     // of this artifact was both slower and 3 GiB larger than tier zero. Auto
-    // residency now requires 40% payload coverage; explicit overrides retain
+    // residency requires 40% payload coverage; explicit overrides retain
     // every smaller tier for long-session tuning and controlled measurement.
-    if auto_mib.saturating_mul(5) < payload_mib.saturating_mul(2) {
+    //
+    // BUT that 40% is calibrated for the MAPPED decode read path, and its stated reason
+    // is that a small tier "starved the OS page cache that was previously absorbing those
+    // reads". When available RAM cannot cover the payload, the runtime reads decode misses
+    // unbuffered (`Gemma4CudaResident::decode_bulk_reads`) and the page cache is absorbing
+    // nothing — so the tier is no longer taking RAM away from anything that was helping,
+    // and the only question left is whether its own hit rate pays. Measured on the 26B-A4B
+    // row at a 3 GiB tier (26% coverage, 12.2% tier hit rate): steady decode **+36.9%**,
+    // 3/3 pairs sign-consistent, token ids identical. The gate is therefore relaxed to 20%
+    // in exactly the regime whose premise it has lost, and left at 40% everywhere else.
+    let page_cache_absorbs_reads = available >= payload_mib.saturating_mul(1024 * 1024);
+    let (coverage_num, coverage_pct) = if page_cache_absorbs_reads {
+        (2u64, 40u64)
+    } else {
+        (1u64, 20u64)
+    };
+    if auto_mib.saturating_mul(5) < payload_mib.saturating_mul(coverage_num) {
         eprintln!(
-            "[ghost] host expert tier skipped: {auto_mib} MiB auto budget would cover under 40% of \
-             the {payload_mib} MiB routed payload (direct pinned staging measured faster with less \
-             RAM at this size); set CAMELID_GEMMA4_GHOST_HOST_TIER_MIB to force one"
+            "[ghost] host expert tier skipped: {auto_mib} MiB auto budget would cover under \
+             {coverage_pct}% of the {payload_mib} MiB routed payload (direct pinned staging \
+             measured faster with less RAM at this size); set \
+             CAMELID_GEMMA4_GHOST_HOST_TIER_MIB to force one"
         );
         return 0;
     }
@@ -6766,6 +6796,10 @@ pub struct Gemma4MtpRound {
     pub assistant_ns: u64,
     /// Wall spent in the target's batched verify pass.
     pub verify_ns: u64,
+    /// Expert-cache misses charged to this round's verify pass. The single most
+    /// load-bearing number for the lane: each miss is one ~3.19 MiB record read off the
+    /// `.cghost`, so this is what says whether a round is compute-bound or storage-bound.
+    pub misses: u64,
 }
 
 /// Accepted-draft statistics for an MTP generation. `accepted / rounds` is alpha, the
@@ -8508,6 +8542,11 @@ pub struct Gemma4CudaResident {
     /// token is intentionally absent until a later request forwards it. On the next request
     /// the longest matching prefix is reused, so only genuinely new tokens are prefilled.
     cached_tokens: Vec<u32>,
+    /// `(hits, misses)` as of the end of the last prefill, so a caller can attribute
+    /// expert-cache traffic to decode instead of to the prompt sweep that preceded it.
+    prefill_sser_mark: std::cell::Cell<(u64, u64)>,
+    /// Resolved decode read path, decided once on first use. See `decode_bulk_reads`.
+    decode_bulk_reads: std::cell::Cell<Option<bool>>,
     // Reused per-token/per-layer device scratch (sized to per-layer maxima).
     d_hidden: cudarc::driver::CudaSlice<f32>,
     d_normed: cudarc::driver::CudaSlice<f32>,
@@ -9211,6 +9250,8 @@ impl Gemma4CudaResident {
             cache_k,
             cache_v,
             cached_tokens: Vec::new(),
+            prefill_sser_mark: std::cell::Cell::new((0, 0)),
+            decode_bulk_reads: std::cell::Cell::new(None),
             d_hidden: alloc_f(hidden).map_err(cu)?,
             d_normed: alloc_f(hidden).map_err(cu)?,
             d_inq: alloc_i(hidden).map_err(cu)?,
@@ -9384,6 +9425,24 @@ impl Gemma4CudaResident {
     /// Reset KV cache representation so subsequent prompts begin from position 0.
     pub fn clear_cache(&mut self) {
         self.cached_tokens.clear();
+    }
+
+    /// Expert-cache `(hits, misses)` with no side effects.
+    ///
+    /// [`Self::sser_stats`] also prints the whole SSER profile when profiling is on, which
+    /// makes it unusable for the repeated sampling an attribution needs -- a per-round
+    /// snapshot through that would emit the breakdown once per round.
+    pub fn sser_counters(&self) -> Option<(u64, u64)> {
+        self.sser.as_ref().map(|c| {
+            let c = c.borrow();
+            (c.hits, c.misses)
+        })
+    }
+
+    /// Expert-cache `(hits, misses)` as they stood when the last prefill finished.
+    /// Subtract from [`Self::sser_counters`] to get decode-only traffic.
+    pub fn sser_prefill_mark(&self) -> (u64, u64) {
+        self.prefill_sser_mark.get()
     }
 
     /// Reset the SSER hit/miss counters (keeps resident weights). Lets the harness
@@ -12101,7 +12160,96 @@ impl Gemma4CudaResident {
         }
         self.cached_tokens.clear();
         self.cached_tokens.extend_from_slice(prompt_tokens);
+        // Hand the read path to the decode regime here rather than inside `prefill_chunked`,
+        // so the token-major prefill fallback (which never calls it) lands in the same state.
+        self.set_ghost_bulk_reads(self.decode_bulk_reads());
+        // Mark the expert-cache counters at the prefill/decode boundary. Lifetime totals
+        // conflate the two and the two are not comparable: a layer-major prefill touches
+        // most of the 12 GiB payload once, so it dominates the miss count while saying
+        // nothing about what a decode step costs. Differencing against this mark is what
+        // makes "misses per decoded token" a real number.
+        self.prefill_sser_mark
+            .set(self.sser_counters().unwrap_or((0, 0)));
         Ok(logits)
+    }
+
+    /// Whether DECODE-phase `.cghost` reads take the unbuffered path.
+    ///
+    /// `CAMELID_GEMMA4_GHOST_DECODE_BULK_READS=0/1` forces it; unset means AUTO.
+    ///
+    /// TWO PAIRED MEASUREMENTS DISAGREE, AND BOTH ARE RIGHT.
+    ///
+    /// * With free RAM able to cover the routed payload, a decode miss is usually a warm
+    ///   re-fetch that the page cache serves as a pure memcpy, and routing it to
+    ///   `read_exact_at` measured a **13.0% regression** (paired ABABAB, 3/3 pairs
+    ///   negative; `qa/perf/receipts/paired-mmap-vs-pread.json`).
+    /// * On a host where free RAM is well under the payload, most decode misses fault
+    ///   cold, and `copy_from_slice` over an unresident 3.19 MiB record degenerates into
+    ///   ~816 synchronous 4 KiB demand faults. Measured on the 26B-A4B row with 7.4 GiB
+    ///   available against a 12.4 GiB payload: decode wall **7.8 s -> 3.9 s**, steady
+    ///   **+34.8%** (3/3 pairs, sign consistent), demand faults 1.54M -> 0.45M, token ids
+    ///   identical in all six runs.
+    ///
+    /// So the question is not "which path is faster" but "can the page cache actually
+    /// serve this". Auto keeps the map only when available RAM at load covers the whole
+    /// routed payload; short of that the cache is being asked to hold something that does
+    /// not fit, and the explicit read wins. Byte-identical either way: same file, same
+    /// offset, same length, and the token-id gate is what says so.
+    ///
+    /// Decided once and cached, because available RAM drifts during a run and a read path
+    /// that flips mid-generation would make every measurement on this lane unreadable.
+    fn decode_bulk_reads(&self) -> bool {
+        if let Some(decided) = self.decode_bulk_reads.get() {
+            return decided;
+        }
+        let forced = std::env::var("CAMELID_GEMMA4_GHOST_DECODE_BULK_READS")
+            .ok()
+            .map(|value| {
+                !matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "0" | "false" | "off" | "no" | "disabled"
+                )
+            });
+        let decided = match forced {
+            Some(forced) => forced,
+            None => {
+                let payload = self.ghost_payload_bytes();
+                if payload == 0 {
+                    // Not Ghost-backed: there is no streamed payload to reason about.
+                    false
+                } else {
+                    // Sampled before this process pinned its arenas -- see
+                    // `ghost_host_ram_at_load`. Reading it here instead would report the
+                    // few hundred MiB left after the tier and the resident core, and the
+                    // rule would answer "unbuffered" on every host alive.
+                    let (_, available) = ghost_host_ram_at_load();
+                    let unbuffered = available > 0 && available < payload;
+                    if unbuffered {
+                        eprintln!(
+                            "[ghost] decode reads: unbuffered ({} MiB available cannot cover the \
+                             {} MiB routed payload, so a mapped miss faults cold); set \
+                             CAMELID_GEMMA4_GHOST_DECODE_BULK_READS=0 to force the map",
+                            available / (1024 * 1024),
+                            payload / (1024 * 1024),
+                        );
+                    }
+                    unbuffered
+                }
+            }
+        };
+        self.decode_bulk_reads.set(Some(decided));
+        decided
+    }
+
+    /// Size of the `.cghost` routed payload, or 0 when the row is not Ghost-backed.
+    fn ghost_payload_bytes(&self) -> u64 {
+        for lw in &self.cpu.layers {
+            if let Some(ghost) = lw.moe.as_ref().and_then(|m| m.ghost.as_ref()) {
+                // One `.cghost` backs every layer; the first is the whole story.
+                return ghost.cache.file.payload_bytes();
+            }
+        }
+        0
     }
 
     /// Switch the `.cghost` read path for the phase about to run. Prefill is a cold
@@ -12316,9 +12464,11 @@ impl Gemma4CudaResident {
             let mut batch = Vec::with_capacity(1 + drafts.len());
             batch.push(t0);
             batch.extend_from_slice(&drafts);
+            let misses_before = self.sser_counters().map(|(_, m)| m).unwrap_or(0);
             let t_verify = std::time::Instant::now();
             let rows = self.verify_chunk_logits(&batch, position)?;
             let verify_ns = t_verify.elapsed().as_nanos() as u64;
+            let round_misses = self.sser_counters().map(|(_, m)| m).unwrap_or(0) - misses_before;
             if rows.len() != batch.len() {
                 return Err(BackendError::InvalidModelMetadata(format!(
                     "MTP verify returned {} rows for a {}-token batch",
@@ -12362,6 +12512,7 @@ impl Gemma4CudaResident {
                 accepted,
                 assistant_ns,
                 verify_ns,
+                misses: round_misses,
             });
 
             let mut stopped = false;
