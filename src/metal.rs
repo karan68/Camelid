@@ -49,9 +49,32 @@ fn attention_matmul_prefill_rows_fit(n_tokens: usize, max_positions: usize) -> b
         .is_some_and(|n_pad| n_pad <= max_positions)
 }
 
+/// Return the byte length of one transient half K/V staging buffer when it can be
+/// represented and allocated by this Metal device.
+///
+/// Q8 attention-as-matmul allocates two buffers of this size. Each allocation must
+/// independently fit `max_buffer_length`; returning `None` keeps the prefill on the
+/// existing row-attention fallback before either allocation is attempted.
+#[cfg(any(target_os = "macos", test))]
+fn attention_matmul_prefill_q8_stage_bytes(
+    n_kv_heads: usize,
+    max_positions: usize,
+    head_dim: usize,
+    max_buffer_length: usize,
+) -> Option<usize> {
+    let bytes = n_kv_heads
+        .checked_mul(max_positions)?
+        .checked_mul(head_dim)?
+        .checked_mul(std::mem::size_of::<u16>())?;
+    (bytes > 0 && bytes <= max_buffer_length).then_some(bytes)
+}
+
 #[cfg(test)]
 mod attention_matmul_prefill_shape_tests {
-    use super::{attention_matmul_prefill_head_dim_supported, attention_matmul_prefill_rows_fit};
+    use super::{
+        attention_matmul_prefill_head_dim_supported, attention_matmul_prefill_q8_stage_bytes,
+        attention_matmul_prefill_rows_fit,
+    };
 
     #[test]
     fn partial_64_row_pv_tiles_fail_closed() {
@@ -72,6 +95,29 @@ mod attention_matmul_prefill_shape_tests {
         assert!(!attention_matmul_prefill_rows_fit(1_000, 1_000));
         assert!(attention_matmul_prefill_rows_fit(1_000, 1_024));
         assert!(!attention_matmul_prefill_rows_fit(usize::MAX, usize::MAX));
+    }
+
+    #[test]
+    fn q8_staging_fails_closed_before_an_oversized_or_overflowed_allocation() {
+        let needed = 2 * 1_000 * 64 * std::mem::size_of::<u16>();
+        assert_eq!(
+            attention_matmul_prefill_q8_stage_bytes(2, 1_000, 64, needed),
+            Some(needed)
+        );
+        assert_eq!(
+            attention_matmul_prefill_q8_stage_bytes(2, 1_000, 64, needed - 1),
+            None,
+            "a cache-fitting prompt must fall back when either half staging allocation cannot fit"
+        );
+        assert_eq!(
+            attention_matmul_prefill_q8_stage_bytes(usize::MAX, 2, 128, usize::MAX),
+            None,
+            "checked shape arithmetic must reject overflow"
+        );
+        assert_eq!(
+            attention_matmul_prefill_q8_stage_bytes(0, 1_000, 64, usize::MAX),
+            None
+        );
     }
 }
 
@@ -23125,8 +23171,17 @@ impl ResidentDecodeState {
         // buffer below (`kv_dequant_q8_to_h`); kv16-primary is still excluded because its
         // primary IS half and wants a direct binding rather than a staging pass.
         let stage_q8_kv = self.kvq8 && q8_attn_mm_enabled();
+        let q8_stage_bytes = stage_q8_kv.then_some(()).and_then(|()| {
+            attention_matmul_prefill_q8_stage_bytes(
+                self.n_kv_heads,
+                self.max_positions,
+                self.head_dim,
+                k.device.max_buffer_length() as usize,
+            )
+        });
         let use_attn_mm = !self.kv16
             && (!self.kvq8 || stage_q8_kv)
+            && (!stage_q8_kv || q8_stage_bytes.is_some())
             && all_q8
             && mm_prefill_enabled()
             && !has_qk_norm
@@ -23348,13 +23403,16 @@ impl ResidentDecodeState {
         // below binds it without a stride change. Reused across all layers: one layer is
         // live at a time, so this is ~16.8 MB at 8192 positions rather than the ~256 MB of
         // permanent mirrors the f32 lane carries.
-        let q8_stage_elems = if use_attn_mm && stage_q8_kv {
-            self.n_kv_heads * self.max_positions * self.head_dim
+        let q8_k_stage = nb(if use_attn_mm && stage_q8_kv {
+            q8_stage_bytes.expect("Q8 staging admission checked above")
         } else {
-            1
-        };
-        let q8_k_stage = nb(q8_stage_elems * 2);
-        let q8_v_stage = nb(q8_stage_elems * 2);
+            2
+        });
+        let q8_v_stage = nb(if use_attn_mm && stage_q8_kv {
+            q8_stage_bytes.expect("Q8 staging admission checked above")
+        } else {
+            2
+        });
         let q8_stage_scalar = nb(28);
         if use_attn_mm && stage_q8_kv {
             unsafe {
@@ -27653,8 +27711,9 @@ mod tests {
 
     /// Capability gate for the whole macOS Metal test lane.
     ///
-    /// 56 device-gated tests in this file open with `if !detect_metal_device().available {
-    /// return; }`, and `metal_resident_rollback_moves_filled_with_the_kv_position`
+    /// The device-gated tests in this file either return when Metal is unavailable or,
+    /// for the focused Q8 qualification tests, call `required_q8_kernel`; and
+    /// `metal_resident_rollback_moves_filled_with_the_kv_position`
     /// (`src/inference/tests.rs`) — the only guard for the draft-rollback regression that needs
     /// no model file — skips the same way on `ResidentDecodeState::new(..) -> None`. If the host
     /// reports no device, or reports one whose driver cannot build the resident pipelines, every
@@ -28793,6 +28852,549 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn required_q8_kernel(test_name: &str) -> Option<&'static MetalLinearKernel> {
+        if !detect_metal_device().available {
+            assert_ne!(
+                std::env::var("CAMELID_REQUIRE_METAL_TESTS").as_deref(),
+                Ok("1"),
+                "CAMELID_REQUIRE_METAL_TESTS=1 but {test_name} cannot run without a Metal device"
+            );
+            return None;
+        }
+        Some(
+            metal_linear_kernel()
+                .unwrap_or_else(|| panic!("{test_name}: Metal device exists but pipelines failed")),
+        )
+    }
+
+    /// Deterministic Q8 cache bytes plus their exact f32 dequantization. The returned
+    /// f32 layout is `[kv_head][max_positions][head_dim]`.
+    #[cfg(target_os = "macos")]
+    fn q8_cache_fixture(
+        n_kv_heads: usize,
+        max_positions: usize,
+        head_dim: usize,
+        seed: usize,
+    ) -> (Vec<u8>, Vec<f32>) {
+        let blocks_per_head = head_dim / 32;
+        let row_bytes = blocks_per_head * 34;
+        let mut wire = vec![0u8; n_kv_heads * max_positions * row_bytes];
+        let mut dequant = vec![0.0f32; n_kv_heads * max_positions * head_dim];
+        for head in 0..n_kv_heads {
+            for position in 0..max_positions {
+                for block in 0..blocks_per_head {
+                    // A power-of-two scale makes the CPU dequant oracle exact while the
+                    // signed, non-repeating codes still exercise every byte stride.
+                    let scale = (1 + (head * 3 + position + block + seed) % 4) as f32 / 1_024.0;
+                    let scale_bits = f32_to_f16_bits(scale);
+                    let stored_scale = f16_bits_to_f32(scale_bits);
+                    let wire_base = (head * max_positions + position) * row_bytes + block * 34;
+                    wire[wire_base..wire_base + 2].copy_from_slice(&scale_bits.to_le_bytes());
+                    for lane in 0..32 {
+                        let code =
+                            (((head * 97 + position * 53 + block * 31 + lane * 17 + seed * 11)
+                                % 255) as i32
+                                - 127) as i8;
+                        wire[wire_base + 2 + lane] = code as u8;
+                        let dst = (head * max_positions + position) * head_dim + block * 32 + lane;
+                        dequant[dst] = stored_scale * f32::from(code);
+                    }
+                }
+            }
+        }
+        (wire, dequant)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_attention_decode_splitk_kvq8_matches_cpu_at_every_admitted_shape() {
+        let Some(kernel) = required_q8_kernel("Q8 split-K attention qualification") else {
+            return;
+        };
+        let opts = MTLResourceOptions::StorageModeShared;
+
+        // Every head width admitted by encode_attention and every supported GQA group.
+        // All depths select split-K (>=128), use a nonzero cache base, and leave a
+        // non-four/non-sixteen tail in at least one split tile.
+        for (head_dim, group, positions) in [
+            (32usize, 1usize, 129usize),
+            (64, 2, 131),
+            (96, 3, 143),
+            (128, 4, 191),
+        ] {
+            let n_kv_heads = 2usize;
+            let n_heads = n_kv_heads * group;
+            let base_position = 3usize;
+            let max_positions = base_position + positions + 5;
+            let row_bytes = (head_dim / 32) * 34;
+            let (keys, keys_f32) =
+                q8_cache_fixture(n_kv_heads, max_positions, head_dim, 7 + head_dim);
+            let (values, values_f32) =
+                q8_cache_fixture(n_kv_heads, max_positions, head_dim, 19 + group);
+            let query: Vec<f32> = (0..n_heads * head_dim)
+                .map(|i| (((i * 29 + head_dim + group) % 127) as f32 - 63.0) / 256.0)
+                .collect();
+            let scale = 1.0 / (head_dim as f32).sqrt();
+
+            let mut expected = vec![0.0f32; n_heads * head_dim];
+            for head in 0..n_heads {
+                let kv_head = head / group;
+                let q = &query[head * head_dim..(head + 1) * head_dim];
+                let mut scores = vec![0.0f32; positions];
+                for (relative_position, score) in scores.iter_mut().enumerate() {
+                    let position = base_position + relative_position;
+                    let kv_base = (kv_head * max_positions + position) * head_dim;
+                    *score = q
+                        .iter()
+                        .zip(&keys_f32[kv_base..kv_base + head_dim])
+                        .map(|(a, b)| a * b)
+                        .sum::<f32>()
+                        * scale;
+                }
+                let max_score = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let weights: Vec<f32> = scores
+                    .iter()
+                    .map(|score| (*score - max_score).exp())
+                    .collect();
+                let denominator = weights.iter().sum::<f32>();
+                for dim in 0..head_dim {
+                    expected[head * head_dim + dim] = weights
+                        .iter()
+                        .enumerate()
+                        .map(|(relative_position, weight)| {
+                            let position = base_position + relative_position;
+                            let value =
+                                values_f32[(kv_head * max_positions + position) * head_dim + dim];
+                            weight * value / denominator
+                        })
+                        .sum();
+                }
+            }
+            assert!(expected.iter().any(|value| value.abs() > 1.0e-3));
+
+            let query_buf = kernel.device.new_buffer_with_data(
+                query.as_ptr().cast(),
+                std::mem::size_of_val(query.as_slice()) as u64,
+                opts,
+            );
+            let key_buf =
+                kernel
+                    .device
+                    .new_buffer_with_data(keys.as_ptr().cast(), keys.len() as u64, opts);
+            let value_buf = kernel.device.new_buffer_with_data(
+                values.as_ptr().cast(),
+                values.len() as u64,
+                opts,
+            );
+            let output_buf = kernel
+                .device
+                .new_buffer((n_heads * head_dim * 4) as u64, opts);
+            write_buffer_f32(&output_buf, &vec![f32::NAN; n_heads * head_dim]);
+            let n_splits = positions.div_ceil(64).clamp(2, 64);
+            let partials = kernel
+                .device
+                .new_buffer((n_heads * n_splits * (head_dim + 2) * 4) as u64, opts);
+            let scalar = kernel.device.new_buffer(32, opts);
+            let splits_scalar = kernel.device.new_buffer(4, opts);
+            unsafe {
+                let p = scalar.contents().cast::<u32>();
+                *p = n_heads as u32;
+                *p.add(1) = head_dim as u32;
+                *p.add(2) = positions as u32;
+                *p.add(3) = group as u32;
+                *p.add(4).cast::<f32>() = scale;
+                *p.add(5) = row_bytes as u32;
+                *p.add(6) = (max_positions * row_bytes) as u32;
+                *p.add(7) = (base_position * row_bytes) as u32;
+                *splits_scalar.contents().cast::<u32>() = n_splits as u32;
+            }
+
+            let command = kernel.queue.new_command_buffer();
+            let encoder = command.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(&kernel.attention_decode_splitk_kvq8_pipeline);
+            encoder.set_buffer(0, Some(&query_buf), 0);
+            encoder.set_buffer(1, Some(&key_buf), 0);
+            encoder.set_buffer(2, Some(&value_buf), 0);
+            encoder.set_buffer(3, Some(&partials), 0);
+            for index in 0..8u64 {
+                encoder.set_buffer(5 + index, Some(&scalar), index * 4);
+            }
+            encoder.set_buffer(13, Some(&splits_scalar), 0);
+            encoder.dispatch_thread_groups(
+                metal::MTLSize {
+                    width: n_kv_heads as u64,
+                    height: n_splits as u64,
+                    depth: 1,
+                },
+                metal::MTLSize {
+                    width: 128,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            encoder.set_compute_pipeline_state(&kernel.attention_decode_splitk_merge_pipeline);
+            encoder.set_buffer(0, Some(&partials), 0);
+            encoder.set_buffer(1, Some(&output_buf), 0);
+            encoder.set_buffer(2, Some(&scalar), 4);
+            encoder.set_buffer(3, Some(&splits_scalar), 0);
+            encoder.dispatch_thread_groups(
+                metal::MTLSize {
+                    width: n_heads as u64,
+                    height: 1,
+                    depth: 1,
+                },
+                metal::MTLSize {
+                    width: 128,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            encoder.end_encoding();
+            command.commit();
+            command.wait_until_completed();
+            assert_eq!(command.status(), metal::MTLCommandBufferStatus::Completed);
+
+            let mut actual = vec![0.0f32; expected.len()];
+            read_buffer_f32(&output_buf, &mut actual);
+            for (index, (&got, &want)) in actual.iter().zip(&expected).enumerate() {
+                let tolerance = 5.0e-4f32.max(want.abs() * 5.0e-4);
+                assert!(
+                    got.is_finite() && (got - want).abs() <= tolerance,
+                    "hd={head_dim} group={group} positions={positions} dim={index}: got={got} want={want} tolerance={tolerance}"
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_kv_dequant_q8_to_h_matches_wire_and_zero_fills_padding() {
+        let Some(kernel) = required_q8_kernel("Q8-to-half staging qualification") else {
+            return;
+        };
+        let opts = MTLResourceOptions::StorageModeShared;
+        let n_kv_heads = 2usize;
+        let max_positions = 10usize;
+        let rows = 8usize;
+        let valid_rows = 5usize;
+
+        for head_dim in [32usize, 64, 96, 128] {
+            let row_bytes = (head_dim / 32) * 34;
+            let (wire, dequant) =
+                q8_cache_fixture(n_kv_heads, max_positions, head_dim, 41 + head_dim);
+            let src =
+                kernel
+                    .device
+                    .new_buffer_with_data(wire.as_ptr().cast(), wire.len() as u64, opts);
+            let dst_elements = n_kv_heads * max_positions * head_dim;
+            let dst = kernel.device.new_buffer((dst_elements * 2) as u64, opts);
+            let poison = vec![0x7e00u16; dst_elements];
+            write_buffer_bytes(&dst, &poison);
+            let scalar = kernel.device.new_buffer(28, opts);
+            unsafe {
+                let p = scalar.contents().cast::<u32>();
+                *p = head_dim as u32;
+                *p.add(1) = rows as u32;
+                *p.add(2) = valid_rows as u32;
+                *p.add(3) = row_bytes as u32;
+                *p.add(4) = (max_positions * row_bytes) as u32;
+                *p.add(5) = head_dim as u32;
+                *p.add(6) = (max_positions * head_dim) as u32;
+            }
+
+            let command = kernel.queue.new_command_buffer();
+            let encoder = command.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(&kernel.kv_dequant_q8_to_h_pipeline);
+            encoder.set_buffer(0, Some(&src), 0);
+            encoder.set_buffer(1, Some(&dst), 0);
+            for index in 0..7u64 {
+                encoder.set_buffer(2 + index, Some(&scalar), index * 4);
+            }
+            encoder.dispatch_threads(
+                metal::MTLSize {
+                    width: head_dim as u64,
+                    height: rows as u64,
+                    depth: n_kv_heads as u64,
+                },
+                metal::MTLSize {
+                    width: 32,
+                    height: 4,
+                    depth: 1,
+                },
+            );
+            encoder.end_encoding();
+            command.commit();
+            command.wait_until_completed();
+            assert_eq!(command.status(), metal::MTLCommandBufferStatus::Completed);
+
+            let actual =
+                unsafe { std::slice::from_raw_parts(dst.contents().cast::<u16>(), dst_elements) };
+            for head in 0..n_kv_heads {
+                for position in 0..max_positions {
+                    for dim in 0..head_dim {
+                        let index = (head * max_positions + position) * head_dim + dim;
+                        let want = if position < valid_rows {
+                            f32_to_f16_bits(dequant[index])
+                        } else if position < rows {
+                            0
+                        } else {
+                            0x7e00
+                        };
+                        assert_eq!(
+                            actual[index], want,
+                            "hd={head_dim} head={head} position={position} dim={dim}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_rope_rotate_batch_h_matches_reference_for_both_pairings_and_alias_modes() {
+        let Some(kernel) = required_q8_kernel("half RoPE qualification") else {
+            return;
+        };
+        let opts = MTLResourceOptions::StorageModeShared;
+        let head_count = 3usize;
+        let head_dim = 64usize;
+        let half_rope = head_dim / 2;
+        let tokens = 3usize;
+        let elements = tokens * head_count * head_dim;
+        let input: Vec<u16> = (0..elements)
+            .map(|index| {
+                let value = ((index * 13 + 5) % 31) as i32 - 15;
+                f32_to_f16_bits(value as f32 / 16.0)
+            })
+            .collect();
+        let cos: Vec<f32> = (0..tokens * half_rope)
+            .map(|index| [1.0, 0.5, -0.5, 0.25][index % 4])
+            .collect();
+        let sin: Vec<f32> = (0..tokens * half_rope)
+            .map(|index| [0.0, 0.25, 0.5, -0.25][index % 4])
+            .collect();
+        let cos_buf = kernel.device.new_buffer_with_data(
+            cos.as_ptr().cast(),
+            std::mem::size_of_val(cos.as_slice()) as u64,
+            opts,
+        );
+        let sin_buf = kernel.device.new_buffer_with_data(
+            sin.as_ptr().cast(),
+            std::mem::size_of_val(sin.as_slice()) as u64,
+            opts,
+        );
+
+        for pairing in [0u32, 1] {
+            let mut expected = input.clone();
+            for token in 0..tokens {
+                for head in 0..head_count {
+                    let row = (token * head_count + head) * head_dim;
+                    for pair in 0..half_rope {
+                        let (dim0, dim1) = if pairing == 0 {
+                            (pair * 2, pair * 2 + 1)
+                        } else {
+                            (pair, pair + half_rope)
+                        };
+                        let x0 = f16_bits_to_f32(input[row + dim0]);
+                        let x1 = f16_bits_to_f32(input[row + dim1]);
+                        let table = token * half_rope + pair;
+                        expected[row + dim0] = f32_to_f16_bits(x0 * cos[table] - x1 * sin[table]);
+                        expected[row + dim1] = f32_to_f16_bits(x0 * sin[table] + x1 * cos[table]);
+                    }
+                }
+            }
+
+            for in_place in [false, true] {
+                let src = kernel.device.new_buffer_with_data(
+                    input.as_ptr().cast(),
+                    std::mem::size_of_val(input.as_slice()) as u64,
+                    opts,
+                );
+                let separate_dst = (!in_place).then(|| {
+                    let buffer = kernel.device.new_buffer((elements * 2) as u64, opts);
+                    write_buffer_bytes(&buffer, &vec![0x7e00u16; elements]);
+                    buffer
+                });
+                let dst = separate_dst.as_ref().unwrap_or(&src);
+                let scalar = kernel.device.new_buffer(16, opts);
+                unsafe {
+                    let p = scalar.contents().cast::<u32>();
+                    *p = head_count as u32;
+                    *p.add(1) = head_dim as u32;
+                    *p.add(2) = half_rope as u32;
+                    *p.add(3) = pairing;
+                }
+
+                let command = kernel.queue.new_command_buffer();
+                let encoder = command.new_compute_command_encoder();
+                encoder.set_compute_pipeline_state(&kernel.rope_rotate_batch_h_pipeline);
+                encoder.set_buffer(0, Some(&src), 0);
+                encoder.set_buffer(1, Some(dst), 0);
+                encoder.set_buffer(2, Some(&cos_buf), 0);
+                encoder.set_buffer(3, Some(&sin_buf), 0);
+                for index in 0..4u64 {
+                    encoder.set_buffer(4 + index, Some(&scalar), index * 4);
+                }
+                let width = kernel
+                    .rope_rotate_batch_h_pipeline
+                    .thread_execution_width()
+                    .max(1);
+                encoder.dispatch_thread_groups(
+                    metal::MTLSize {
+                        width: ((head_count * half_rope) as u64).div_ceil(width),
+                        height: tokens as u64,
+                        depth: 1,
+                    },
+                    metal::MTLSize {
+                        width,
+                        height: 1,
+                        depth: 1,
+                    },
+                );
+                encoder.end_encoding();
+                command.commit();
+                command.wait_until_completed();
+                assert_eq!(command.status(), metal::MTLCommandBufferStatus::Completed);
+
+                let actual =
+                    unsafe { std::slice::from_raw_parts(dst.contents().cast::<u16>(), elements) };
+                assert_eq!(actual, expected, "pairing={pairing} in_place={in_place}");
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_kv_scatter_batch_kvq8_h_matches_exact_wire_reference() {
+        let Some(kernel) = required_q8_kernel("half-input Q8 scatter qualification") else {
+            return;
+        };
+        let opts = MTLResourceOptions::StorageModeShared;
+        let n_kv_heads = 2usize;
+        let head_dim = 128usize;
+        let blocks_per_head = head_dim / 32;
+        let total_blocks = n_kv_heads * blocks_per_head;
+        let positions = 3usize;
+        let base_position = 2usize;
+        let max_positions = 7usize;
+        let row_bytes = blocks_per_head * 34;
+        let cache_bytes = n_kv_heads * max_positions * row_bytes;
+        let mut src_k = vec![0u16; positions * n_kv_heads * head_dim];
+        let mut src_v = vec![0u16; src_k.len()];
+        let mut expected_k = vec![0xa5u8; cache_bytes];
+        let mut expected_v = vec![0xa5u8; cache_bytes];
+
+        for token in 0..positions {
+            for head in 0..n_kv_heads {
+                for block in 0..blocks_per_head {
+                    let zero_block = token == 1 && head == 0 && block == 0;
+                    for (is_value, (src, expected)) in [
+                        (false, (&mut src_k, &mut expected_k)),
+                        (true, (&mut src_v, &mut expected_v)),
+                    ] {
+                        let step = if (head + block + usize::from(is_value)).is_multiple_of(2) {
+                            1.0 / 128.0
+                        } else {
+                            1.0 / 64.0
+                        };
+                        let dst =
+                            (head * max_positions + base_position + token) * row_bytes + block * 34;
+                        let scale_bits = if zero_block {
+                            f32_to_f16_bits(0.0)
+                        } else {
+                            f32_to_f16_bits(step)
+                        };
+                        expected[dst..dst + 2].copy_from_slice(&scale_bits.to_le_bytes());
+                        for lane in 0..32 {
+                            let code = if zero_block {
+                                0i8
+                            } else if lane == 0 {
+                                -127
+                            } else if lane == 31 {
+                                127
+                            } else {
+                                (((token * 61
+                                    + head * 43
+                                    + block * 29
+                                    + lane * 11
+                                    + usize::from(is_value) * 17)
+                                    % 253) as i32
+                                    - 126) as i8
+                            };
+                            let src_index =
+                                token * n_kv_heads * head_dim + head * head_dim + block * 32 + lane;
+                            src[src_index] = f32_to_f16_bits(f32::from(code) * step);
+                            expected[dst + 2 + lane] = code as u8;
+                        }
+                    }
+                }
+            }
+        }
+
+        let src_k_buf = kernel.device.new_buffer_with_data(
+            src_k.as_ptr().cast(),
+            std::mem::size_of_val(src_k.as_slice()) as u64,
+            opts,
+        );
+        let src_v_buf = kernel.device.new_buffer_with_data(
+            src_v.as_ptr().cast(),
+            std::mem::size_of_val(src_v.as_slice()) as u64,
+            opts,
+        );
+        let cache_k = kernel.device.new_buffer(cache_bytes as u64, opts);
+        let cache_v = kernel.device.new_buffer(cache_bytes as u64, opts);
+        write_buffer_u8(&cache_k, &vec![0xa5; cache_bytes]);
+        write_buffer_u8(&cache_v, &vec![0xa5; cache_bytes]);
+        let scalar = kernel.device.new_buffer(16, opts);
+        unsafe {
+            let p = scalar.contents().cast::<u32>();
+            *p = head_dim as u32;
+            *p.add(1) = max_positions as u32;
+            *p.add(2) = base_position as u32;
+            *p.add(3) = total_blocks as u32;
+        }
+
+        let command = kernel.queue.new_command_buffer();
+        let encoder = command.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&kernel.kv_scatter_batch_kvq8_h_pipeline);
+        encoder.set_buffer(0, Some(&src_k_buf), 0);
+        encoder.set_buffer(1, Some(&src_v_buf), 0);
+        encoder.set_buffer(2, Some(&cache_k), 0);
+        encoder.set_buffer(3, Some(&cache_v), 0);
+        for index in 0..4u64 {
+            encoder.set_buffer(4 + index, Some(&scalar), index * 4);
+        }
+        let width = kernel
+            .kv_scatter_batch_kvq8_h_pipeline
+            .thread_execution_width()
+            .max(1);
+        encoder.dispatch_thread_groups(
+            metal::MTLSize {
+                width: (total_blocks as u64).div_ceil(width),
+                height: positions as u64,
+                depth: 1,
+            },
+            metal::MTLSize {
+                width,
+                height: 1,
+                depth: 1,
+            },
+        );
+        encoder.end_encoding();
+        command.commit();
+        command.wait_until_completed();
+        assert_eq!(command.status(), metal::MTLCommandBufferStatus::Completed);
+
+        let actual_k =
+            unsafe { std::slice::from_raw_parts(cache_k.contents().cast::<u8>(), cache_bytes) };
+        let actual_v =
+            unsafe { std::slice::from_raw_parts(cache_v.contents().cast::<u8>(), cache_bytes) };
+        assert_eq!(actual_k, expected_k, "K cache wire bytes");
+        assert_eq!(actual_v, expected_v, "V cache wire bytes");
     }
 
     #[cfg(target_os = "macos")]
