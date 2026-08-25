@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { piWslBwrapPrefix, PiAdapterError, runPiAgentAttempt } from './adapters/pi-agent.mjs'
+import { piBoundaryProbeCommand, piWslBwrapPrefix, PiAdapterError, runPiAgentAttempt } from './adapters/pi-agent.mjs'
 
 const repositoryRoot = resolve(fileURLToPath(new URL('../../..', import.meta.url)))
 const taskRoot = resolve(repositoryRoot, 'qa/benchmarks/agent/tasks/agent_local_logic_fix')
@@ -100,6 +100,13 @@ try {
   assert.equal(bwrap.includes('/dev/dxg'), false)
   assert.ok(bwrap.includes('CAMELID_NO_REMOTE_DIMS'))
   assert.equal(bwrap.at(-1), 'fix it')
+
+  const cpuProbe = piBoundaryProbeCommand(false)
+  assert.equal(cpuProbe.includes('$('), false)
+  assert.equal(cpuProbe.endsWith('/opt/pi/pi --version'), true)
+  const gpuProbe = piBoundaryProbeCommand(true)
+  assert.equal(gpuProbe.includes('$('), false)
+  assert.match(gpuProbe, /nvidia-smi -L/)
 } finally {
   await rm(tempRoot, { recursive: true, force: true })
 }

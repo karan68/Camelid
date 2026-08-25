@@ -371,7 +371,7 @@ async function verifyPiWslBoundary(boundary) {
   const gpuEnvironmentArgs = boundary.gpuEnabled
     ? ['--setenv', 'LD_LIBRARY_PATH', '/usr/lib/wsl/lib:/usr/lib/x86_64-linux-gnu']
     : []
-  const gpuProbe = boundary.gpuEnabled ? ' && /usr/lib/wsl/lib/nvidia-smi -L >/dev/null 2>&1' : ''
+  const command = piBoundaryProbeCommand(boundary.gpuEnabled)
   const execution = await runProcess({
     file: boundary.wslExecutable,
     args: [
@@ -398,14 +398,19 @@ async function verifyPiWslBoundary(boundary) {
       '--setenv', 'PI_TELEMETRY', '0',
       ...gpuEnvironmentArgs,
       '/bin/sh', '-c',
-      `test ! -e /mnt/c && ! /usr/bin/curl -fsS --max-time 2 https://example.com >/dev/null 2>&1 && test "$(/opt/pi/pi --version)" = "${PINNED_PI_RELEASE.version}"${gpuProbe} && printf PI_BOUNDARY_OK`,
+      command,
     ],
     env: isolatedNativeEnv(process.env),
     timeoutMs: 20000,
   })
-  if (!processSucceeded(execution) || execution.stdout.preview !== 'PI_BOUNDARY_OK') {
+  if (!processSucceeded(execution) || execution.stdout.preview.trim() !== PINNED_PI_RELEASE.version) {
     throw new PiAdapterError('INVALID_INFRASTRUCTURE', `Pi WSL boundary preflight failed: ${execution.stderr.preview || execution.stdout.preview || execution.state}`)
   }
+}
+
+export function piBoundaryProbeCommand(gpuEnabled) {
+  const gpuProbe = gpuEnabled ? ' && /usr/lib/wsl/lib/nvidia-smi -L >/dev/null 2>&1' : ''
+  return `test ! -e /mnt/c && ! /usr/bin/curl -fsS --max-time 2 https://example.com >/dev/null 2>&1${gpuProbe} && /opt/pi/pi --version`
 }
 
 async function verifyPiWslIdentity(boundary, expected) {
