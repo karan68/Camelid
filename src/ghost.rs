@@ -139,7 +139,7 @@ const LAYER_ROLES: [&str; 9] = [
 
 /// Queue an asynchronous read-ahead over a mapped byte range. Best-effort by
 /// design: a failure just means the pages fault in on demand, as they did before.
-#[cfg(windows)]
+#[cfg(all(feature = "cuda", windows))]
 fn prefetch_range_best_effort(range: &[u8]) {
     use windows_sys::Win32::System::Memory::{PrefetchVirtualMemory, WIN32_MEMORY_RANGE_ENTRY};
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
@@ -158,7 +158,7 @@ fn prefetch_range_best_effort(range: &[u8]) {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(all(feature = "cuda", not(windows)))]
 fn prefetch_range_best_effort(range: &[u8]) {
     if range.is_empty() {
         return;
@@ -1309,10 +1309,12 @@ impl GhostFile {
     /// Size of the routed payload on disk, or 0 if it cannot be probed. Used to decide
     /// whether the page cache can plausibly serve decode misses; a stat per decision is
     /// nothing next to the reads the decision governs.
+    #[cfg(feature = "cuda")]
     pub(crate) fn payload_bytes(&self) -> u64 {
         self.file.metadata().map(|m| m.len()).unwrap_or(0)
     }
 
+    #[cfg(feature = "cuda")]
     pub(crate) fn set_bulk_reads(&self, on: bool) {
         self.bulk_reads.store(on, Ordering::Relaxed);
     }
@@ -1668,7 +1670,7 @@ impl GhostFile {
     /// Generic `.cghost` files may store the two tensors in either contiguous
     /// order, so callers that split a caller-owned record must use this metadata
     /// rather than a hard-coded offset.
-    #[cfg(any(feature = "cuda", test))]
+    #[cfg(feature = "cuda")]
     /// Ask the OS to begin faulting in one MoE layer's entire routed-expert span.
     ///
     /// The v2 layout stores experts layer-contiguous (`blk.L.exp.0 … blk.L.exp.E-1`),

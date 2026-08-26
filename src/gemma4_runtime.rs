@@ -7485,6 +7485,7 @@ impl Gemma4MtpStats {
     }
 }
 
+#[cfg(feature = "cuda")]
 fn argmax_u32(logits: &[f32]) -> u32 {
     let mut best = 0usize;
     for (i, v) in logits.iter().enumerate() {
@@ -7496,6 +7497,7 @@ fn argmax_u32(logits: &[f32]) -> u32 {
 }
 
 /// One position's output from a layer-major chunk sweep.
+#[cfg(feature = "cuda")]
 struct ChunkRow {
     position: usize,
     logits: Vec<f32>,
@@ -7523,6 +7525,7 @@ struct MtpVerifyRow {
 /// position. The sweep is otherwise identical, and sharing it is what keeps a verify batch
 /// cheap: a layer's expert union is loaded once and every token in the chunk hits it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[cfg(any(feature = "cuda", test))]
 enum ChunkLogits {
     LastOnly,
     /// Prefill's final-position head plus that exact row's raw post-layer hidden.
@@ -7531,6 +7534,7 @@ enum ChunkLogits {
     EveryPosition,
 }
 
+#[cfg(any(feature = "cuda", test))]
 impl ChunkLogits {
     fn wants_logits(self, position: usize, last: usize) -> bool {
         match self {
@@ -7900,6 +7904,7 @@ enum SserHostTierEvictionPolicy {
 
 #[cfg(any(feature = "cuda", test))]
 impl SserHostTierEvictionPolicy {
+    #[cfg(feature = "cuda")]
     const fn as_str(self) -> &'static str {
         match self {
             Self::Lru => "lru",
@@ -8316,7 +8321,7 @@ fn gemma4_mtp_kwide_enabled() -> bool {
 /// Windows NVMe. The completed prefix is submitted to the existing expert copy
 /// stream before the next group is joined, so storage and HtoD can overlap
 /// without adding an unbounded staging arena.
-#[cfg(any(feature = "cuda", test))]
+#[cfg(feature = "cuda")]
 const GEMMA4_MTP_IO_PIPELINE_READ_DEPTH: usize = 4;
 
 #[cfg(any(feature = "cuda", test))]
@@ -8370,6 +8375,7 @@ fn gemma4_mtp_io_pipeline_batches(
     batches
 }
 
+#[cfg(feature = "cuda")]
 const GEMMA4_MTP_WIDTH_SCHEDULE_ENV: &str = "CAMELID_GEMMA4_MTP_WIDTH_SCHEDULE";
 
 /// Parse a comma-separated sequence of verifier widths. Width includes the
