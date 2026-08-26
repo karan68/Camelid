@@ -10739,8 +10739,8 @@ fn launch_q4_wire_gemm_routed(
     in_scales: &CudaSlice<f32>,
     in_quants: &CudaSlice<i8>,
     weight_arena: &CudaSlice<u8>,
-    slot_ids: &CudaSlice<i32>,
-    token_offsets: &CudaSlice<i32>,
+    slot_ids: &CudaView<i32>,
+    token_offsets: &CudaView<i32>,
     token_ids: &CudaSlice<i32>,
     weight_stride: usize,
     rows: usize,
@@ -10856,8 +10856,92 @@ pub(crate) fn launch_q4_0_gemm_routed(
         in_scales,
         in_quants,
         weight_arena,
-        slot_ids,
-        token_offsets,
+        &slot_ids.slice(..),
+        &token_offsets.slice(..),
+        token_ids,
+        weight_stride,
+        rows,
+        blocks_per_row,
+        expert_count,
+        max_assignments_per_expert,
+        chunked,
+        out,
+    )
+}
+
+/// Sub-range twin of [`launch_q4_0_gemm_routed`] for a residents-first-ordered
+/// CSR: launches the identical kernel over the contiguous expert range
+/// `[expert_offset, expert_offset + expert_count)`. `token_offsets` values are
+/// absolute assignment indices, so every per-assignment output row lands at
+/// exactly the position the single full-union launch writes; each expert's
+/// per-row fold still happens whole inside one launch, which is what keeps a
+/// two-pass split bit-identical to the one-pass launch.
+#[allow(dead_code, clippy::too_many_arguments)]
+pub(crate) fn launch_q4_0_gemm_routed_range(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    in_scales: &CudaSlice<f32>,
+    in_quants: &CudaSlice<i8>,
+    weight_arena: &CudaSlice<u8>,
+    slot_ids: &CudaSlice<i32>,
+    token_offsets: &CudaSlice<i32>,
+    token_ids: &CudaSlice<i32>,
+    weight_stride: usize,
+    rows: usize,
+    blocks_per_row: usize,
+    expert_offset: usize,
+    expert_count: usize,
+    max_assignments_per_expert: usize,
+    chunked: bool,
+    out: &mut CudaSlice<f32>,
+) -> Result<(), cudarc::driver::DriverError> {
+    launch_q4_wire_gemm_routed(
+        s,
+        f,
+        in_scales,
+        in_quants,
+        weight_arena,
+        &slot_ids.slice(expert_offset..),
+        &token_offsets.slice(expert_offset..),
+        token_ids,
+        weight_stride,
+        rows,
+        blocks_per_row,
+        expert_count,
+        max_assignments_per_expert,
+        chunked,
+        out,
+    )
+}
+
+/// Q4_1 twin of [`launch_q4_0_gemm_routed_range`].
+#[allow(dead_code, clippy::too_many_arguments)]
+pub(crate) fn launch_q4_1_gemm_routed_range(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    in_scales: &CudaSlice<f32>,
+    in_quants: &CudaSlice<i8>,
+    weight_arena: &CudaSlice<u8>,
+    slot_ids: &CudaSlice<i32>,
+    token_offsets: &CudaSlice<i32>,
+    token_ids: &CudaSlice<i32>,
+    weight_stride: usize,
+    rows: usize,
+    blocks_per_row: usize,
+    expert_offset: usize,
+    expert_count: usize,
+    max_assignments_per_expert: usize,
+    chunked: bool,
+    out: &mut CudaSlice<f32>,
+) -> Result<(), cudarc::driver::DriverError> {
+    launch_q4_wire_gemm_routed(
+        s,
+        f,
+        in_scales,
+        in_quants,
+        weight_arena,
+        &slot_ids.slice(expert_offset..),
+        &token_offsets.slice(expert_offset..),
         token_ids,
         weight_stride,
         rows,
@@ -10893,8 +10977,8 @@ pub(crate) fn launch_q4_1_gemm_routed(
         in_scales,
         in_quants,
         weight_arena,
-        slot_ids,
-        token_offsets,
+        &slot_ids.slice(..),
+        &token_offsets.slice(..),
         token_ids,
         weight_stride,
         rows,

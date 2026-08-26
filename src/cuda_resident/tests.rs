@@ -6308,6 +6308,54 @@ fn q4_0_gemm_routed_matches_gemv() {
         k.ctx.synchronize().unwrap();
         assert_same_bits("Q4_0 routed launch helper", &helper, &reference);
 
+        // Two-pass range launch — the resident-first split's mechanism: experts
+        // [0,2) in one launch, [2,4) in a second, same CSR arrays, same output
+        // buffer. Each expert's per-row fold still happens whole inside exactly
+        // one launch, so the split must be BITWISE identical to the full launch.
+        let mut d_split = k.stream.alloc_zeros::<f32>(assignments * rows).unwrap();
+        super::launch_q4_0_gemm_routed_range(
+            &k.stream,
+            &k.q4_0_gemm_routed,
+            &d_s,
+            &d_q,
+            &d_w,
+            &d_slots,
+            &d_off,
+            &d_tok,
+            per_slot,
+            rows,
+            bpr,
+            0,
+            2,
+            max_count,
+            false,
+            &mut d_split,
+        )
+        .unwrap();
+        super::launch_q4_0_gemm_routed_range(
+            &k.stream,
+            &k.q4_0_gemm_routed,
+            &d_s,
+            &d_q,
+            &d_w,
+            &d_slots,
+            &d_off,
+            &d_tok,
+            per_slot,
+            rows,
+            bpr,
+            2,
+            experts - 2,
+            max_count,
+            false,
+            &mut d_split,
+        )
+        .unwrap();
+        let mut split = vec![0f32; assignments * rows];
+        k.stream.memcpy_dtoh(&d_split, &mut split).unwrap();
+        k.ctx.synchronize().unwrap();
+        assert_same_bits("Q4_0 routed two-pass range launch", &split, &reference);
+
         let mismatches = got
             .iter()
             .zip(&reference)

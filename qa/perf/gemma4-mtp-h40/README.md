@@ -64,7 +64,10 @@ its control; pair bounded-context arms against the matching plain/MTP control.
 | `mtp-k8-kv192-kwide-qd4-router-overlap` | Crossed K-wide probe that moves the batched router DtoH to its own stream while the dense shared branch runs. |
 | `mtp-k8-kv192-kwide-qd8` | Crossed K-wide storage probe with eight unbuffered positioned readers instead of four. |
 | `mtp-k6-kv192-kwide-qd4-seeded-cuda-assistant-host-mru-tier1024-io-q6-anchor-dp4a` | Minimum-memory exact hardware gate for the anchor-major Q6_K DP4A verifier lane. |
-| `mtp-k6-kv192-kwide-qd4-seeded-cuda-assistant-host-mru-tier1024-io-lfu-q6-anchor` | Current safe winner on the 16 GiB Windows host: QD4 I/O, lifetime-LFU VRAM eviction, CUDA assistant, and anchor-major Q6_K DP4A. |
+| `mtp-k6-kv192-kwide-qd4-seeded-cuda-assistant-host-mru-tier1024-io-lfu-q6-anchor` | §15 winner in the RAM-starved regime: QD4 I/O, lifetime-LFU VRAM eviction, CUDA assistant, and anchor-major Q6_K DP4A on a forced 1 GiB tier. |
+| `mtp-k6-kv192-kwide-qd4-seeded-cuda-assistant-host-mru-io-lfu-q6-anchor` | The same stack with the MRU tier free to auto-size. First arm to compose every promoted mechanism at a settled host. |
+| `mtp-k7-kv192-kwide-qd4-seeded-cuda-assistant-host-mru-io-lfu-q6-anchor` | K=7 sibling of the composed arm; alpha 7.00 with every draft accepted on this fixture. |
+| `mtp-k7-kv192-kwide-qd4-seeded-cuda-assistant-host-mru-io-lfu-q6-anchor-rsplit` | **Current best on the 16 GiB Windows host (25.6 decode tok/s at ~8 GiB available)**: the composed K=7 arm plus the resident-first verifier split (§16). |
 
 ## What a run produces
 
