@@ -1,0 +1,52 @@
+{
+    "label":  "chunked512",
+    "coldCache":  false,
+    "maxTokens":  8,
+    "expertCacheMib":  64,
+    "rows":  [
+                 {
+                     "Case":  "tiny",
+                     "Rep":  1,
+                     "PreTempC":  48,
+                     "PromptTokens":  32,
+                     "PrefillSec":  8.74,
+                     "PrefillTokPerSec":  3.66,
+                     "Misses":  2281,
+                     "MissesPerToken":  71.3,
+                     "Log":  ".\\qa\\perf\\receipts\\prefill-chunked512-tiny-1.log"
+                 },
+                 {
+                     "Case":  "small",
+                     "Rep":  1,
+                     "PreTempC":  52,
+                     "PromptTokens":  92,
+                     "PrefillSec":  7.88,
+                     "PrefillTokPerSec":  11.67,
+                     "Misses":  2785,
+                     "MissesPerToken":  30.3,
+                     "Log":  ".\\qa\\perf\\receipts\\prefill-chunked512-small-1.log"
+                 },
+                 {
+                     "Case":  "medium",
+                     "Rep":  1,
+                     "PreTempC":  52,
+                     "PromptTokens":  362,
+                     "PrefillSec":  24.02,
+                     "PrefillTokPerSec":  15.07,
+                     "Misses":  3353,
+                     "MissesPerToken":  9.3,
+                     "Log":  ".\\qa\\perf\\receipts\\prefill-chunked512-medium-1.log"
+                 },
+                 {
+                     "Case":  "large",
+                     "Rep":  1,
+                     "PreTempC":  52,
+                     "PromptTokens":  1442,
+                     "PrefillSec":  73.2,
+                     "PrefillTokPerSec":  19.7,
+                     "Misses":  8412,
+                     "MissesPerToken":  5.8,
+                     "Log":  ".\\qa\\perf\\receipts\\prefill-chunked512-large-1.log"
+                 }
+             ]
+}

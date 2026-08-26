@@ -1,0 +1,12 @@
+{
+  "description": "Plain decode, unbuffered decode reads, plus a forced 4 GiB host expert tier. The 3 GiB arm measured +36.9% steady (3/3 pairs); this asks whether the curve is still climbing at the size the auto path would actually pick (installed RAM / divisor), or whether pinning another gigabyte on a 16 GiB box starts costing more than it returns.",
+  "mtp": false,
+  "draft_k": 0,
+  "env": {
+    "CAMELID_GEMMA4_CUDA_BATCH_EXPERT_COPIES": "1",
+    "CAMELID_GEMMA4_GHOST_HOST_TIER_MIB": "4096",
+    "CAMELID_GEMMA4_PREFILL_CHUNK_TOKENS": "512",
+    "CAMELID_GEMMA4_Q4_0_SOA": "1",
+    "CAMELID_GEMMA4_SPECULATIVE": "0"
+  }
+}

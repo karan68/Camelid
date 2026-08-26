@@ -71,6 +71,73 @@ fn device_embed_gather_allowlist_matches_the_gather_dispatch() {
 }
 
 #[test]
+fn gemma4_expert_q8_warp_policy_accepts_only_supported_cta_shapes() {
+    for (raw, expected) in [
+        (None, 2),
+        (Some("1"), 1),
+        (Some(" 2 "), 2),
+        (Some("4"), 4),
+        (Some("8"), 8),
+        (Some(""), 2),
+        (Some("0"), 2),
+        (Some("3"), 2),
+        (Some("16"), 2),
+        (Some("-1"), 2),
+        (Some("not-a-number"), 2),
+    ] {
+        assert_eq!(
+            super::parse_gemma4_expert_q8_warps(raw),
+            expected,
+            "unexpected policy for {raw:?}"
+        );
+    }
+}
+
+#[test]
+fn gemma4_mtp_routed_q4_chunked_policy_is_strict() {
+    assert!(!super::parse_gemma4_mtp_routed_q4_chunked(None).unwrap());
+    assert!(!super::parse_gemma4_mtp_routed_q4_chunked(Some("0")).unwrap());
+    assert!(super::parse_gemma4_mtp_routed_q4_chunked(Some("1")).unwrap());
+    for invalid in ["", " 1", "1 ", "true", "2", "-1"] {
+        let error = super::parse_gemma4_mtp_routed_q4_chunked(Some(invalid)).unwrap_err();
+        assert!(error.contains("must be exactly 0 or 1"), "{error}");
+    }
+}
+
+#[test]
+fn gemma4_mtp_dense_q4_zero_shared_policy_defaults_to_shared_and_is_strict() {
+    assert!(!super::parse_gemma4_mtp_dense_q4_zero_shared(None).unwrap());
+    assert!(!super::parse_gemma4_mtp_dense_q4_zero_shared(Some("0")).unwrap());
+    assert!(super::parse_gemma4_mtp_dense_q4_zero_shared(Some("1")).unwrap());
+    for invalid in ["", " 1", "1 ", "true", "2", "-1"] {
+        let error = super::parse_gemma4_mtp_dense_q4_zero_shared(Some(invalid)).unwrap_err();
+        assert!(error.contains("must be exactly 0 or 1"), "{error}");
+    }
+}
+
+#[test]
+fn gemma4_mtp_dense_q4_imma_policy_defaults_off_and_is_strict() {
+    assert!(!super::parse_gemma4_mtp_dense_q4_imma(None).unwrap());
+    assert!(!super::parse_gemma4_mtp_dense_q4_imma(Some("0")).unwrap());
+    assert!(super::parse_gemma4_mtp_dense_q4_imma(Some("1")).unwrap());
+    for invalid in ["", " 1", "1 ", "true", "2", "-1"] {
+        let error = super::parse_gemma4_mtp_dense_q4_imma(Some(invalid)).unwrap_err();
+        assert!(error.contains("must be exactly 0 or 1"), "{error}");
+    }
+}
+
+#[test]
+fn gemma4_mtp_dense_q6_anchor_dp4a_policy_defaults_off_and_is_strict() {
+    assert!(!super::parse_gemma4_mtp_dense_q6_anchor_dp4a(None).unwrap());
+    assert!(!super::parse_gemma4_mtp_dense_q6_anchor_dp4a(Some("0")).unwrap());
+    assert!(super::parse_gemma4_mtp_dense_q6_anchor_dp4a(Some("1")).unwrap());
+    for invalid in ["", " 1", "1 ", "true", "2", "-1"] {
+        let error = super::parse_gemma4_mtp_dense_q6_anchor_dp4a(Some(invalid)).unwrap_err();
+        assert!(error.contains("must be exactly 0 or 1"), "{error}");
+    }
+}
+
+#[test]
 fn q1t128_roundtrip_is_same_size_and_tail_exact() {
     for &(rows, cols) in &[
         (1usize, 128usize),
@@ -3015,8 +3082,36 @@ fn q1t_fixture(rows: usize, cols: usize, rng: &mut Lcg) -> Vec<u8> {
     super::repack_q1_t128(&wire, rows, cols).unwrap()
 }
 
+/// Bring up the resident kernels, or skip when this machine has no CUDA device.
+///
+/// The distinction matters. `CudaResidentKernels::new().ok()` collapsed "there is no GPU
+/// here" and "the GPU is here and the module failed to build" into the same `None`, and
+/// every `#[ignore]`d parity test in this file then returned early and reported **ok**. A
+/// bitwise gate that passes in 0.3 s because the kernels never compiled is worse than no
+/// gate: it is a green tick over an untested claim, and it took a suspiciously fast test
+/// run to notice.
+///
+/// So: no device -> skip, which is the honest outcome on a CI box without a GPU. Device
+/// present but bring-up failed -> panic with the driver's own message, because on a
+/// machine that can run these tests, not running them is a failure.
 fn kernels() -> Option<CudaResidentKernels> {
-    CudaResidentKernels::new().ok()
+    match CudaResidentKernels::new() {
+        Ok(kernels) => Some(kernels),
+        Err(error) => {
+            let ordinal = crate::cuda::selected_device_ordinal();
+            match cudarc::driver::CudaContext::new(ordinal) {
+                Ok(_) => panic!(
+                    "CUDA device {ordinal} is present but the resident kernel module failed to \
+                     build, so this test would otherwise have reported a pass without running: \
+                     {error}"
+                ),
+                Err(_) => {
+                    eprintln!("skip: no usable CUDA device (ordinal {ordinal}): {error}");
+                    None
+                }
+            }
+        }
+    }
 }
 
 fn close(a: &[f32], b: &[f32], tol: f32) -> bool {
@@ -3292,6 +3387,236 @@ fn quantize_q8_0_matches_cpu() {
     assert!(close(&gs, &exp_scales, 1e-6), "quantize scales diverged");
 }
 
+// The Gemma 4 decode fusion must be an exact replacement for its two source
+// launches at the production hidden width. This covers all 88 Q8_0 blocks,
+// including exact-half inputs that exercise the generic kernel's rintf rounding.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn rms_norm_quantize_matches_composed_at_gemma4_hidden() {
+    let Some(k) = kernels() else {
+        return;
+    };
+    let n = 2816usize;
+
+    let run_case = |label: &str, x: &[f32], weight: &[f32], eps: f32| {
+        let d_x = k.stream.clone_htod(x).unwrap();
+        let d_weight = k.stream.clone_htod(weight).unwrap();
+
+        let mut d_normed = k.stream.alloc_zeros::<f32>(n).unwrap();
+        let mut d_expected_quants = k.stream.alloc_zeros::<i8>(n).unwrap();
+        let mut d_expected_scales = k.stream.alloc_zeros::<f32>(n / 32).unwrap();
+        super::launch_rmsnorm(
+            &k.stream,
+            &k.rms_norm,
+            &d_x,
+            &d_weight,
+            &mut d_normed,
+            n,
+            eps,
+        )
+        .unwrap();
+        super::launch_quantize(
+            &k.stream,
+            &k.quantize,
+            &d_normed,
+            &mut d_expected_quants,
+            &mut d_expected_scales,
+            n / 32,
+        )
+        .unwrap();
+
+        let mut d_actual_quants = k.stream.alloc_zeros::<i8>(n).unwrap();
+        let mut d_actual_scales = k.stream.alloc_zeros::<f32>(n / 32).unwrap();
+        super::launch_rmsnorm_quantize(
+            &k.stream,
+            &k.rms_norm_quantize,
+            &d_x,
+            &d_weight,
+            &mut d_actual_quants,
+            &mut d_actual_scales,
+            n,
+            eps,
+        )
+        .unwrap();
+
+        let mut expected_quants = vec![0i8; n];
+        let mut expected_scales = vec![0f32; n / 32];
+        let mut actual_quants = vec![0i8; n];
+        let mut actual_scales = vec![0f32; n / 32];
+        k.stream
+            .memcpy_dtoh(&d_expected_quants, &mut expected_quants)
+            .unwrap();
+        k.stream
+            .memcpy_dtoh(&d_expected_scales, &mut expected_scales)
+            .unwrap();
+        k.stream
+            .memcpy_dtoh(&d_actual_quants, &mut actual_quants)
+            .unwrap();
+        k.stream
+            .memcpy_dtoh(&d_actual_scales, &mut actual_scales)
+            .unwrap();
+        k.ctx.synchronize().unwrap();
+
+        assert_eq!(
+            actual_quants, expected_quants,
+            "{label}: fused RMSNorm Q8_0 quant bytes changed"
+        );
+        assert_same_bits(
+            &format!("{label}: fused RMSNorm Q8_0 scales"),
+            &actual_scales,
+            &expected_scales,
+        );
+    };
+
+    let mut rng = Lcg(0x4655_5345_445f_5138);
+    let x = (0..n).map(|_| rng.next_f32() * 3.0).collect::<Vec<_>>();
+    let weight = (0..n)
+        .map(|_| 1.0 + rng.next_f32() * 0.25)
+        .collect::<Vec<_>>();
+    run_case("nontrivial hidden row", &x, &weight, 1e-6);
+
+    // x=1 and eps=0 make the RMS scale exactly one. Every block has maxima
+    // +/-127 and exact +/-0.5 values, pinning ties-to-even in all 88 blocks.
+    let x = vec![1.0f32; n];
+    let mut weight = vec![0.0f32; n];
+    for block in weight.chunks_exact_mut(32) {
+        block[0] = 127.0;
+        block[1] = -127.0;
+        block[2] = 0.5;
+        block[3] = -0.5;
+    }
+    run_case("rounding ties across every block", &x, &weight, 0.0);
+}
+
+// Gemma's routed-expert input keeps the CPU's sequential RMS reduction/powf
+// scalar, but applies the weighted normalization and quantization to d_hidden.
+// Compare every resulting scale bit and quant byte with the Windows CPU path.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn rms_inv_norm_quantizers_match_windows_cpu_bytes() {
+    let Some(k) = kernels() else {
+        return;
+    };
+    let n = 2816usize; // Gemma 4 hidden size: 88 Q8_0 blocks / 11 Q8_K blocks.
+
+    let run_case = |label: &str, x: &[f32], weight: &[f32], eps: f32| {
+        // Deliberately spell this exactly like gemma4_runtime::rms_norm. The
+        // scalar is the only host result passed to the new kernels.
+        let mss = x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32;
+        let rms_inv = (mss + eps).powf(-0.5);
+        let normalized = x
+            .iter()
+            .zip(weight)
+            .map(|(&v, &w)| v * rms_inv * w)
+            .collect::<Vec<_>>();
+        let expected_q8_0 = crate::inference::quantize_q8_0_blocks(&normalized);
+        let expected_q8_0_scales = expected_q8_0
+            .iter()
+            .map(|block| block.scale)
+            .collect::<Vec<_>>();
+        let expected_q8_0_quants = expected_q8_0
+            .iter()
+            .flat_map(|block| block.quants.iter().copied())
+            .collect::<Vec<_>>();
+        let expected_q8k = crate::inference::quantize_q8_k_blocks(&normalized);
+        let expected_q8k_scales = expected_q8k.iter().map(|block| block.d).collect::<Vec<_>>();
+        let expected_q8k_quants = expected_q8k
+            .iter()
+            .flat_map(|block| block.qs.iter().copied())
+            .collect::<Vec<_>>();
+
+        let d_x = k.stream.clone_htod(x).unwrap();
+        let d_weight = k.stream.clone_htod(weight).unwrap();
+        let mut d_q8_0_quants = k.stream.alloc_zeros::<i8>(n).unwrap();
+        let mut d_q8_0_scales = k.stream.alloc_zeros::<f32>(n / 32).unwrap();
+        super::launch_rms_inv_norm_quantize_q8_0(
+            &k.stream,
+            &k.rms_inv_norm_quantize_q8_0,
+            &d_x,
+            &d_weight,
+            &mut d_q8_0_quants,
+            &mut d_q8_0_scales,
+            n,
+            rms_inv,
+        )
+        .unwrap();
+
+        let mut d_q8k_quants = k.stream.alloc_zeros::<i8>(n).unwrap();
+        let mut d_q8k_scales = k.stream.alloc_zeros::<f32>(n / 256).unwrap();
+        super::launch_rms_inv_norm_quantize_q8k(
+            &k.stream,
+            &k.rms_inv_norm_quantize_q8k,
+            &d_x,
+            &d_weight,
+            &mut d_q8k_quants,
+            &mut d_q8k_scales,
+            n,
+            rms_inv,
+        )
+        .unwrap();
+
+        let mut got_q8_0_quants = vec![0i8; n];
+        let mut got_q8_0_scales = vec![0f32; n / 32];
+        let mut got_q8k_quants = vec![0i8; n];
+        let mut got_q8k_scales = vec![0f32; n / 256];
+        k.stream
+            .memcpy_dtoh(&d_q8_0_quants, &mut got_q8_0_quants)
+            .unwrap();
+        k.stream
+            .memcpy_dtoh(&d_q8_0_scales, &mut got_q8_0_scales)
+            .unwrap();
+        k.stream
+            .memcpy_dtoh(&d_q8k_quants, &mut got_q8k_quants)
+            .unwrap();
+        k.stream
+            .memcpy_dtoh(&d_q8k_scales, &mut got_q8k_scales)
+            .unwrap();
+        k.ctx.synchronize().unwrap();
+
+        assert_eq!(
+            got_q8_0_quants, expected_q8_0_quants,
+            "{label}: Q8_0 quant bytes changed"
+        );
+        assert_same_bits(
+            &format!("{label}: Q8_0 scales"),
+            &got_q8_0_scales,
+            &expected_q8_0_scales,
+        );
+        assert_eq!(
+            got_q8k_quants, expected_q8k_quants,
+            "{label}: Q8_K quant bytes changed"
+        );
+        assert_same_bits(
+            &format!("{label}: Q8_K scales"),
+            &got_q8k_scales,
+            &expected_q8k_scales,
+        );
+    };
+
+    let mut rng = Lcg(0x524d_5349_4e56_5138);
+    let x = (0..n).map(|_| rng.next_f32() * 2.5).collect::<Vec<_>>();
+    let weight = (0..n)
+        .map(|_| 1.0 + rng.next_f32() * 0.25)
+        .collect::<Vec<_>>();
+    run_case("nontrivial RMS inverse", &x, &weight, 1e-6);
+
+    // With x=1 and eps=0, rms_inv is exactly 1. The first Q8_0 block's
+    // scale is exactly 1, so +/-0.5 must quantize to +/-1 (half away), not 0
+    // as rintf would. Equal +/-127 maxima also pin Q8_K's first-max sign.
+    let x = vec![1.0f32; n];
+    let mut weight = vec![0.0f32; n];
+    weight[0] = 127.0;
+    weight[1] = -127.0;
+    weight[2] = 0.5;
+    weight[3] = -0.5;
+    let tie_q8_0 = crate::inference::quantize_q8_0_blocks(&weight);
+    assert_eq!(tie_q8_0[0].quants[2], 1);
+    assert_eq!(tie_q8_0[0].quants[3], -1);
+    let tie_q8k = crate::inference::quantize_q8_k_blocks(&weight);
+    assert_eq!(tie_q8k[0].d.to_bits(), (-1.0f32).to_bits());
+    run_case("round/sign ties", &x, &weight, 0.0);
+}
+
 #[test]
 #[ignore = "requires a CUDA device"]
 fn rope_matches_cpu() {
@@ -3434,6 +3759,121 @@ fn geglu_mul_matches_cpu() {
     k.stream.memcpy_dtoh(&dout, &mut got).unwrap();
     k.ctx.synchronize().unwrap();
     assert!(close(&got, &expected, 1e-5), "geglu_mul diverged");
+}
+
+// The routed fusion must be bit-identical to the two kernels it replaces:
+// `geglu_mul` followed by the serial-reference `quantize_q8_0`. Besides parity,
+// nff=704 exercises the production 22-block shape and its six-warp final CTA;
+// reordered route IDs verify that outputs land in router-positioned scratch.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn geglu_quantize_routed_matches_composed_kernels_and_tail() {
+    let Some(k) = kernels() else {
+        return;
+    };
+    let nff = 704usize;
+    let blocks = nff / 32;
+    let route_capacity = 4usize;
+    let routes = [2i32, 0, 3];
+    let experts = routes.len();
+    let mut rng = Lcg(0x4745_474c_5551_3830);
+    let mut gate_up = (0..route_capacity * 2 * nff)
+        .map(|_| rng.next_f32() * 4.0)
+        .collect::<Vec<_>>();
+    // Pin one all-zero Q8 block as well as the non-zero random blocks.
+    for value in &mut gate_up[2 * 2 * nff..2 * 2 * nff + 32] {
+        *value = 0.0;
+    }
+
+    let d_gate_up = k.stream.clone_htod(&gate_up).unwrap();
+    let d_routes = k.stream.clone_htod(&routes).unwrap();
+    let mut d_quants = k.stream.alloc_zeros::<i8>(route_capacity * nff).unwrap();
+    let mut d_scales = k
+        .stream
+        .alloc_zeros::<f32>(route_capacity * blocks)
+        .unwrap();
+    let block = 256u32;
+    let warps = block / 32;
+    let routed_cfg = LaunchConfig {
+        grid_dim: ((blocks as u32).div_ceil(warps), experts as u32, 1),
+        block_dim: (block, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let nff_i = nff as i32;
+    let blocks_i = blocks as i32;
+    let experts_i = experts as i32;
+    let mut launch = k.stream.launch_builder(&k.geglu_quantize_routed);
+    launch
+        .arg(&d_gate_up)
+        .arg(&d_routes)
+        .arg(&mut d_quants)
+        .arg(&mut d_scales)
+        .arg(&nff_i)
+        .arg(&blocks_i)
+        .arg(&experts_i);
+    unsafe { launch.launch(routed_cfg).unwrap() };
+
+    let mut got_quants = vec![0i8; route_capacity * nff];
+    let mut got_scales = vec![0f32; route_capacity * blocks];
+    k.stream.memcpy_dtoh(&d_quants, &mut got_quants).unwrap();
+    k.stream.memcpy_dtoh(&d_scales, &mut got_scales).unwrap();
+
+    for &route in &routes {
+        let route = route as usize;
+        let base = route * 2 * nff;
+        let gate = d_gate_up.slice(base..base + nff);
+        let up = d_gate_up.slice(base + nff..base + 2 * nff);
+        let mut d_values = k.stream.alloc_zeros::<f32>(nff).unwrap();
+        let geglu_cfg = LaunchConfig {
+            grid_dim: ((nff as u32).div_ceil(block), 1, 1),
+            block_dim: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut geglu = k.stream.launch_builder(&k.geglu_mul);
+        geglu.arg(&gate).arg(&up).arg(&mut d_values).arg(&nff_i);
+        unsafe { geglu.launch(geglu_cfg).unwrap() };
+
+        let mut d_ref_quants = k.stream.alloc_zeros::<i8>(nff).unwrap();
+        let mut d_ref_scales = k.stream.alloc_zeros::<f32>(blocks).unwrap();
+        let quant_cfg = LaunchConfig {
+            grid_dim: ((blocks as u32).div_ceil(64), 1, 1),
+            block_dim: (64, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut quantize = k.stream.launch_builder(&k.quantize);
+        quantize
+            .arg(&d_values)
+            .arg(&mut d_ref_quants)
+            .arg(&mut d_ref_scales)
+            .arg(&blocks_i);
+        unsafe { quantize.launch(quant_cfg).unwrap() };
+
+        let mut ref_quants = vec![0i8; nff];
+        let mut ref_scales = vec![0f32; blocks];
+        k.stream
+            .memcpy_dtoh(&d_ref_quants, &mut ref_quants)
+            .unwrap();
+        k.stream
+            .memcpy_dtoh(&d_ref_scales, &mut ref_scales)
+            .unwrap();
+        k.ctx.synchronize().unwrap();
+        assert_eq!(
+            &got_quants[route * nff..(route + 1) * nff],
+            ref_quants,
+            "routed GeGLU quants diverged at route {route}"
+        );
+        assert_same_bits(
+            &format!("routed GeGLU scales at route {route}"),
+            &got_scales[route * blocks..(route + 1) * blocks],
+            &ref_scales,
+        );
+    }
+
+    // Route 1 was not selected and must remain untouched.
+    assert!(got_quants[nff..2 * nff].iter().all(|&q| q == 0));
+    assert!(got_scales[blocks..2 * blocks]
+        .iter()
+        .all(|&scale| scale == 0.0));
 }
 
 // Gemma final-logit soft-cap parity: x = cap*tanh(x/cap), cap=30, in place.
@@ -4039,6 +4479,76 @@ fn rms_norm_per_head_parity() {
         &got[..8],
         &expected[..8]
     );
+}
+
+/// Gemma 4 applies a weightless RMS norm to V for every KV head. The K-wide
+/// launcher flattens [token][head] into one grid; pin it bit-for-bit against the
+/// scalar-token launch used by decode, at both production head widths.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn rms_norm_per_head_weightless_batched_heads_match_scalar_tokens_bitwise() {
+    let Some(k) = kernels() else {
+        return;
+    };
+    let eps = 1e-6f32;
+    let k_tokens = crate::gemma4_runtime::MAX_MTP_VERIFY_ROWS;
+    for (kv_heads, head_dim, seed) in [(8usize, 256usize, 0x56_25u64), (2, 512, 0x56_51)] {
+        let mut rng = Lcg(seed);
+        let per_token = kv_heads * head_dim;
+        let input: Vec<f32> = (0..k_tokens * per_token)
+            .map(|_| rng.next_f32() * 3.0)
+            .collect();
+        let dummy_weight = k.stream.clone_htod(&vec![1.0f32; head_dim]).unwrap();
+
+        // Reference: the existing scalar-token dispatch, including its unused
+        // but valid weight pointer and use_weight=0 branch.
+        let mut scalar = vec![0f32; input.len()];
+        for token in 0..k_tokens {
+            let mut d_one = k
+                .stream
+                .clone_htod(&input[token * per_token..(token + 1) * per_token])
+                .unwrap();
+            let cfg = LaunchConfig {
+                grid_dim: (kv_heads as u32, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: (head_dim as u32) * 4,
+            };
+            let (head_dim_i, use_weight) = (head_dim as i32, 0i32);
+            let mut b = k.stream.launch_builder(&k.rms_norm_per_head);
+            b.arg(&mut d_one)
+                .arg(&dummy_weight)
+                .arg(&head_dim_i)
+                .arg(&eps)
+                .arg(&use_weight);
+            unsafe { b.launch(cfg) }.unwrap();
+            k.stream
+                .memcpy_dtoh(
+                    &d_one,
+                    &mut scalar[token * per_token..(token + 1) * per_token],
+                )
+                .unwrap();
+        }
+
+        let mut d_all = k.stream.clone_htod(&input).unwrap();
+        super::launch_rms_norm_per_head_weightless(
+            &k.stream,
+            &k.rms_norm_per_head,
+            &mut d_all,
+            k_tokens * kv_heads,
+            head_dim,
+            eps,
+        )
+        .unwrap();
+        let mut batched = vec![0f32; input.len()];
+        k.stream.memcpy_dtoh(&d_all, &mut batched).unwrap();
+        k.ctx.synchronize().unwrap();
+
+        assert_same_bits(
+            &format!("weightless V norm K={k_tokens}, heads={kv_heads}, dim={head_dim}"),
+            &batched,
+            &scalar,
+        );
+    }
 }
 
 // ---- Split-half RoPE parity ----
@@ -5297,6 +5807,76 @@ fn synth_q4_0_wire(rows: usize, bpr: usize, rng: &mut Lcg) -> Vec<u8> {
     out
 }
 
+/// Reference the native-f32 Q4_0 SoA lane with exactly the device kernel's
+/// rounding points: ordered low nibbles, ordered high nibbles, one scale
+/// multiply per block, then an increasing-block fold.
+fn q4_0_f32_soa_ordered_row_dot(
+    soa: &[u8],
+    rows: usize,
+    bpr: usize,
+    row: usize,
+    input: &[f32],
+) -> f32 {
+    let blocks = rows * bpr;
+    let quant_bytes = blocks * 16;
+    assert_eq!(soa.len(), blocks * 18);
+    assert!(row < rows);
+    assert_eq!(input.len(), bpr * 32);
+
+    let mut acc = 0.0f32;
+    for block in 0..bpr {
+        let index = row * bpr + block;
+        let quants = &soa[index * 16..index * 16 + 16];
+        let x = &input[block * 32..block * 32 + 32];
+        let mut block_dot = 0.0f32;
+        for column in 0..16 {
+            let quant = (quants[column] & 0x0f) as i32 - 8;
+            let product = quant as f32 * x[column];
+            block_dot += product;
+        }
+        for column in 0..16 {
+            let quant = (quants[column] >> 4) as i32 - 8;
+            let product = quant as f32 * x[16 + column];
+            block_dot += product;
+        }
+        let scale_offset = quant_bytes + index * 2;
+        let scale = crate::inference::f16_bits_to_f32(u16::from_le_bytes([
+            soa[scale_offset],
+            soa[scale_offset + 1],
+        ]));
+        let term = block_dot * scale;
+        acc += term;
+    }
+    acc
+}
+
+fn run_q4_0_f32_gemv_soa(
+    kernels: &CudaResidentKernels,
+    soa: &[u8],
+    input: &[f32],
+    rows: usize,
+    cols: usize,
+) -> Vec<f32> {
+    let d_input = kernels.stream.clone_htod(input).unwrap();
+    let d_weight = kernels.stream.clone_htod(soa).unwrap();
+    let mut d_output = kernels.stream.alloc_zeros::<f32>(rows).unwrap();
+    super::launch_q4_0_f32_gemv_soa(
+        &kernels.stream,
+        &kernels.q4_0_f32_gemv_soa,
+        &d_input,
+        &d_weight.slice(0..d_weight.len()),
+        rows,
+        cols,
+        &mut d_output,
+        0,
+    )
+    .unwrap();
+    let mut output = vec![0.0f32; rows];
+    kernels.stream.memcpy_dtoh(&d_output, &mut output).unwrap();
+    kernels.ctx.synchronize().unwrap();
+    output
+}
+
 // Bit-parity receipt for the Q4_0 resident GEMV. Generates synthetic Q4_0 wire bytes
 // + a Q8_0 activation, runs q4_0_gemv on the GPU, and asserts each output row
 // reproduces the validated CPU oracle `q4_0_wire_row_dot` on the SAME bytes. The
@@ -5469,6 +6049,859 @@ fn q4_1_gemv_matches_oracle() {
         close(&got, &expected, 1e-4),
         "q4_1_gemv diverged from q4_1_wire_row_dot oracle (worst rel {worst:.3e})"
     );
+}
+
+fn run_q4_0_gemm_batched_case(ktok: usize, bpr: usize, seed: u64) {
+    let Some(k) = kernels() else {
+        return;
+    };
+    let rows = 96usize;
+    let kdim = bpr * 32;
+    let mut rng = Lcg(seed);
+    let wire = synth_q4_0_wire(rows, bpr, &mut rng);
+    let mut in_scales = vec![0f32; ktok * bpr];
+    let mut in_quants = vec![0i8; ktok * kdim];
+    let mut cpu = vec![0f32; ktok * rows];
+    let mut scalar_gpu = vec![0f32; ktok * rows];
+    const WIRE: usize = 18;
+    let row_bytes = bpr * WIRE;
+
+    for t in 0..ktok {
+        let act: Vec<f32> = (0..kdim).map(|_| rng.next_f32()).collect();
+        let q8 = crate::inference::quantize_q8_0_blocks(&act);
+        let scales: Vec<f32> = q8.iter().map(|b| b.scale).collect();
+        let mut quants = vec![0i8; kdim];
+        for (b, blk) in q8.iter().enumerate() {
+            quants[b * 32..(b + 1) * 32].copy_from_slice(&blk.quants);
+        }
+        in_scales[t * bpr..(t + 1) * bpr].copy_from_slice(&scales);
+        in_quants[t * kdim..(t + 1) * kdim].copy_from_slice(&quants);
+        for r in 0..rows {
+            cpu[t * rows + r] =
+                crate::inference::q4_0_wire_row_dot(&wire[r * row_bytes..(r + 1) * row_bytes], &q8);
+        }
+
+        let d_s = k.stream.clone_htod(&scales).unwrap();
+        let d_q = k.stream.clone_htod(&quants).unwrap();
+        let d_w = k.stream.clone_htod(&wire).unwrap();
+        let mut d_out = k.stream.alloc_zeros::<f32>(rows).unwrap();
+        super::launch_q4_0_gemv(
+            &k.stream,
+            &k.q4_0_gemv,
+            &d_s,
+            &d_q,
+            &d_w.slice(0..wire.len()),
+            rows,
+            bpr,
+            &mut d_out,
+            0,
+        )
+        .unwrap();
+        k.stream
+            .memcpy_dtoh(&d_out, &mut scalar_gpu[t * rows..(t + 1) * rows])
+            .unwrap();
+    }
+
+    let d_is = k.stream.clone_htod(&in_scales).unwrap();
+    let d_iq = k.stream.clone_htod(&in_quants).unwrap();
+    let d_w = k.stream.clone_htod(&wire).unwrap();
+    let mut d_out = k.stream.alloc_zeros::<f32>(ktok * rows).unwrap();
+    super::launch_q4_0_gemm_batched(
+        &k.stream,
+        &k.q4_0_gemm_batched,
+        &d_is,
+        &d_iq,
+        &d_w,
+        rows,
+        bpr,
+        ktok,
+        &mut d_out,
+    )
+    .unwrap();
+    let mut batched = vec![0f32; ktok * rows];
+    k.stream.memcpy_dtoh(&d_out, &mut batched).unwrap();
+    k.ctx.synchronize().unwrap();
+
+    assert!(
+        batched
+            .iter()
+            .zip(&scalar_gpu)
+            .all(|(batch, scalar)| batch.to_bits() == scalar.to_bits()),
+        "Q4_0 batched GEMM must be bit-identical to K scalar GEMVs"
+    );
+    assert!(
+        close(&batched, &cpu, 1e-4),
+        "Q4_0 batched GEMM diverged from the CPU wire oracle"
+    );
+}
+
+/// `q4_0_gemm_routed` must be BITWISE identical to `q4_0_gemv_routed` run once per
+/// (expert, token) pair.
+///
+/// The GEMM hoists a weight block into registers and reuses it across the tokens
+/// routed to that expert, instead of re-fetching it per token. Nothing else moves:
+/// same `q4_0_dot32_dp4a_packed`, same per-block float term, same single-lane
+/// increasing-block fold. This test is what lets that ship as exact-parity.
+///
+/// Exercised with a RAGGED assignment (experts with 0, 1, and many tokens), a
+/// permuted slot map, and a tile smaller than the largest token count so the
+/// `blockIdx.z` tiling path is covered — those are exactly what a routed GEMM
+/// gets wrong and a uniform test would miss.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn q4_0_gemm_routed_matches_gemv() {
+    let Some(k) = kernels() else {
+        return;
+    };
+    for (rows, bpr, seed) in [(1408usize, 88usize, 0x6e_01u64), (2816, 22, 0x6e_02)] {
+        let experts = 4usize;
+        let n_tokens = 7usize;
+        let kdim = bpr * 32;
+        let mut rng = Lcg(seed);
+
+        let per_slot = rows * bpr * 18;
+        let mut arena = Vec::with_capacity(experts * per_slot);
+        for _ in 0..experts {
+            arena.extend_from_slice(&synth_q4_0_wire(rows, bpr, &mut rng));
+        }
+        // Activations for every token.
+        let mut in_s = vec![0f32; n_tokens * bpr];
+        let mut in_q = vec![0i8; n_tokens * kdim];
+        for t in 0..n_tokens {
+            let act: Vec<f32> = (0..kdim).map(|_| rng.next_f32()).collect();
+            let q8 = crate::inference::quantize_q8_0_blocks(&act);
+            for (b, blk) in q8.iter().enumerate() {
+                in_s[t * bpr + b] = blk.scale;
+                in_q[t * kdim + b * 32..t * kdim + (b + 1) * 32].copy_from_slice(&blk.quants);
+            }
+        }
+        // Ragged CSR: expert 0 -> 3 tokens, 1 -> 0, 2 -> 1, 3 -> 4. Total 8.
+        let token_offsets: Vec<i32> = vec![0, 3, 3, 4, 8];
+        let token_ids: Vec<i32> = vec![5, 0, 3, 6, 2, 4, 1, 5];
+        let slots: Vec<i32> = vec![2, 0, 3, 1];
+        let assignments = *token_offsets.last().unwrap() as usize;
+
+        let d_s = k.stream.clone_htod(&in_s).unwrap();
+        let d_q = k.stream.clone_htod(&in_q).unwrap();
+        let d_w = k.stream.clone_htod(&arena).unwrap();
+        let d_slots = k.stream.clone_htod(&slots).unwrap();
+        let d_off = k.stream.clone_htod(&token_offsets).unwrap();
+        let d_tok = k.stream.clone_htod(&token_ids).unwrap();
+
+        // Reference: the shipped GEMV, once per assignment, with a single-token
+        // activation view — exactly what prefill does today.
+        let mut reference = vec![0f32; assignments * rows];
+        for e in 0..experts {
+            let (lo, hi) = (token_offsets[e] as usize, token_offsets[e + 1] as usize);
+            for a in lo..hi {
+                let t = token_ids[a] as usize;
+                let d_s1 = k.stream.clone_htod(&in_s[t * bpr..(t + 1) * bpr]).unwrap();
+                let d_q1 = k
+                    .stream
+                    .clone_htod(&in_q[t * kdim..(t + 1) * kdim])
+                    .unwrap();
+                let one_slot: Vec<i32> = vec![slots[e]];
+                let one_route: Vec<i32> = vec![0];
+                let d_s1s = k.stream.clone_htod(&one_slot).unwrap();
+                let d_r1 = k.stream.clone_htod(&one_route).unwrap();
+                let mut d_out = k.stream.alloc_zeros::<f32>(rows).unwrap();
+                use cudarc::driver::{LaunchConfig, PushKernelArg};
+                let block = 256u32;
+                let warps = block / 32;
+                let cfg = LaunchConfig {
+                    grid_dim: ((rows as u32).div_ceil(warps), 1, 1),
+                    block_dim: (block, 1, 1),
+                    shared_mem_bytes: bpr as u32 * 32 + bpr as u32 * 4 + warps * bpr as u32 * 4,
+                };
+                let (stride, rows_i, bpr_i, one, zero) =
+                    (per_slot as u64, rows as i32, bpr as i32, 1i32, 0i32);
+                let mut b = k.stream.launch_builder(&k.q4_0_gemv_routed);
+                b.arg(&d_s1)
+                    .arg(&d_q1)
+                    .arg(&d_w)
+                    .arg(&d_s1s)
+                    .arg(&d_r1)
+                    .arg(&stride)
+                    .arg(&rows_i)
+                    .arg(&bpr_i)
+                    .arg(&mut d_out)
+                    .arg(&one)
+                    .arg(&zero);
+                unsafe { b.launch(cfg) }.unwrap();
+                k.stream
+                    .memcpy_dtoh(&d_out, &mut reference[a * rows..(a + 1) * rows])
+                    .unwrap();
+                k.ctx.synchronize().unwrap();
+            }
+        }
+
+        // Under test: one GEMM launch, tile 2 so the blockIdx.z path runs.
+        let tile = 2usize;
+        let max_count = (0..experts)
+            .map(|e| token_offsets[e + 1] - token_offsets[e])
+            .max()
+            .unwrap() as usize;
+        let mut d_out = k.stream.alloc_zeros::<f32>(assignments * rows).unwrap();
+        {
+            use cudarc::driver::{LaunchConfig, PushKernelArg};
+            let block = 256u32;
+            let warps = block / 32;
+            let cfg = LaunchConfig {
+                grid_dim: (
+                    (rows as u32).div_ceil(warps),
+                    experts as u32,
+                    max_count.div_ceil(tile) as u32,
+                ),
+                block_dim: (block, 1, 1),
+                shared_mem_bytes: warps * tile as u32 * bpr as u32 * 4,
+            };
+            let (stride, rows_i, bpr_i, experts_i, tile_i) = (
+                per_slot as u64,
+                rows as i32,
+                bpr as i32,
+                experts as i32,
+                tile as i32,
+            );
+            let mut b = k.stream.launch_builder(&k.q4_0_gemm_routed);
+            b.arg(&d_s)
+                .arg(&d_q)
+                .arg(&d_w)
+                .arg(&d_slots)
+                .arg(&d_off)
+                .arg(&d_tok)
+                .arg(&stride)
+                .arg(&rows_i)
+                .arg(&bpr_i)
+                .arg(&mut d_out)
+                .arg(&experts_i)
+                .arg(&tile_i);
+            unsafe { b.launch(cfg) }.unwrap();
+        }
+        let mut got = vec![0f32; assignments * rows];
+        k.stream.memcpy_dtoh(&d_out, &mut got).unwrap();
+        k.ctx.synchronize().unwrap();
+
+        // The production helper owns launch geometry selection. Keep the
+        // explicit tile-2 launch above to cover grid.z, and independently pin
+        // the helper to the same exact assignment output.
+        let mut d_helper = k.stream.alloc_zeros::<f32>(assignments * rows).unwrap();
+        super::launch_q4_0_gemm_routed(
+            &k.stream,
+            &k.q4_0_gemm_routed,
+            &d_s,
+            &d_q,
+            &d_w,
+            &d_slots,
+            &d_off,
+            &d_tok,
+            per_slot,
+            rows,
+            bpr,
+            experts,
+            max_count,
+            false,
+            &mut d_helper,
+        )
+        .unwrap();
+        let mut helper = vec![0f32; assignments * rows];
+        k.stream.memcpy_dtoh(&d_helper, &mut helper).unwrap();
+        k.ctx.synchronize().unwrap();
+        assert_same_bits("Q4_0 routed launch helper", &helper, &reference);
+
+        let mismatches = got
+            .iter()
+            .zip(&reference)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        assert_eq!(
+            mismatches,
+            0,
+            "q4_0_gemm_routed must be BITWISE identical to per-token q4_0_gemv_routed \
+             (rows {rows}, blocks/row {bpr}): {mismatches}/{} outputs differ",
+            got.len()
+        );
+        assert!(
+            reference.iter().any(|v| *v != 0.0),
+            "degenerate fixture: the reference produced all zeros"
+        );
+    }
+}
+
+/// `q4_0_gemv_routed_rows` must be BITWISE identical to `q4_0_gemv_routed`.
+///
+/// Step 08 moves the tail fold from one lane to R lanes, but each row is still
+/// summed by a single lane in increasing block order, so every row's f32
+/// association is unchanged. That is the whole parity argument, and this is what
+/// holds it. Exercised with >= 3 slots and a permuted route order, because the
+/// per-slot expert base and the `route * rows + row` output index are exactly
+/// what a rows-per-warp rewrite gets wrong, and a slot-0-only test cannot see it.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn q4_0_gemv_routed_rows_matches_scalar() {
+    let Some(k) = kernels() else {
+        return;
+    };
+    // Both real routed geometries: gate_up (1408 rows x 88 blocks) and down (2816 x 22).
+    for (rows, bpr, seed) in [(1408usize, 88usize, 0x08_a1u64), (2816, 22, 0x08_a2)] {
+        let experts = 4usize;
+        let kdim = bpr * 32;
+        let mut rng = Lcg(seed);
+
+        // One arena of `experts` slots, each a full independent weight block.
+        let per_slot = rows * bpr * 18;
+        let mut arena = Vec::with_capacity(experts * per_slot);
+        for _ in 0..experts {
+            arena.extend_from_slice(&synth_q4_0_wire(rows, bpr, &mut rng));
+        }
+        let act: Vec<f32> = (0..kdim).map(|_| rng.next_f32()).collect();
+        let q8 = crate::inference::quantize_q8_0_blocks(&act);
+        let scales: Vec<f32> = q8.iter().map(|b| b.scale).collect();
+        let mut quants = vec![0i8; kdim];
+        for (b, blk) in q8.iter().enumerate() {
+            quants[b * 32..(b + 1) * 32].copy_from_slice(&blk.quants);
+        }
+        // Permuted, non-identity slot/route mapping.
+        let slots: Vec<i32> = vec![2, 0, 3, 1];
+        let routes: Vec<i32> = vec![1, 3, 0, 2];
+
+        let d_s = k.stream.clone_htod(&scales).unwrap();
+        let d_q = k.stream.clone_htod(&quants).unwrap();
+        let d_w = k.stream.clone_htod(&arena).unwrap();
+        let d_slots = k.stream.clone_htod(&slots).unwrap();
+        let d_routes = k.stream.clone_htod(&routes).unwrap();
+
+        let run = |func: &cudarc::driver::CudaFunction, rows_per_warp: u32| -> Vec<f32> {
+            use cudarc::driver::{LaunchConfig, PushKernelArg};
+            let block = 256u32;
+            let warps = block / 32;
+            let mut d_out = k.stream.alloc_zeros::<f32>(experts * rows).unwrap();
+            let cfg = LaunchConfig {
+                grid_dim: (
+                    (rows as u32).div_ceil(warps * rows_per_warp),
+                    experts as u32,
+                    1,
+                ),
+                block_dim: (block, 1, 1),
+                shared_mem_bytes: bpr as u32 * 32
+                    + bpr as u32 * 4
+                    + if rows_per_warp > 1 {
+                        warps * rows_per_warp * 32
+                    } else {
+                        warps * bpr as u32
+                    } * 4,
+            };
+            let stride_u64 = per_slot as u64;
+            let (rows_i, bpr_i, experts_i, batched) =
+                (rows as i32, bpr as i32, experts as i32, 0i32);
+            let rows_per_warp_i = rows_per_warp as i32;
+            let mut b = k.stream.launch_builder(func);
+            b.arg(&d_s)
+                .arg(&d_q)
+                .arg(&d_w)
+                .arg(&d_slots)
+                .arg(&d_routes)
+                .arg(&stride_u64)
+                .arg(&rows_i)
+                .arg(&bpr_i)
+                .arg(&mut d_out)
+                .arg(&experts_i)
+                .arg(&batched);
+            if rows_per_warp > 1 {
+                b.arg(&rows_per_warp_i);
+            }
+            unsafe { b.launch(cfg) }.unwrap();
+            let mut host = vec![0f32; experts * rows];
+            k.stream.memcpy_dtoh(&d_out, &mut host).unwrap();
+            k.ctx.synchronize().unwrap();
+            host
+        };
+
+        let scalar = run(&k.q4_0_gemv_routed, 1);
+        let rowsk = run(&k.q4_0_gemv_routed_rows, 8);
+
+        let mismatches = scalar
+            .iter()
+            .zip(&rowsk)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        assert_eq!(
+            mismatches,
+            0,
+            "q4_0_gemv_routed_rows must be BITWISE identical to q4_0_gemv_routed \
+             (rows {rows}, blocks/row {bpr}): {mismatches}/{} outputs differ",
+            scalar.len()
+        );
+        // Guard against both kernels being trivially zero.
+        assert!(
+            scalar.iter().any(|v| *v != 0.0),
+            "the scalar routed GEMV produced all zeros; the test proves nothing"
+        );
+    }
+}
+
+/// The Q4_0 quants-first SoA repack is a pure byte permutation.
+///
+/// Asserted with explicit index arithmetic rather than by calling the helper
+/// back, so this still fails if `q4_0_wire_to_soa` is ever changed to agree with
+/// a broken kernel — the same convention as
+/// `gemma4_head_upload_matches_each_lane_gemv_layout`. No GPU required.
+#[test]
+fn q4_0_wire_to_soa_is_a_pure_permutation() {
+    const WIRE: usize = 18;
+    let (rows, bpr) = (7usize, 5usize);
+    let n = rows * bpr;
+    let mut rng = Lcg(0x40_50_a1);
+    let wire = synth_q4_0_wire(rows, bpr, &mut rng);
+    let soa = super::q4_0_wire_to_soa(&wire);
+
+    assert_eq!(
+        soa.len(),
+        wire.len(),
+        "SoA must not change size: residency and every slot budget depend on 18 B/block"
+    );
+    assert_ne!(
+        soa, wire,
+        "raw passthrough is the defect this repack exists to remove"
+    );
+
+    let (quants, scales) = soa.split_at(n * 16);
+    for b in 0..n {
+        assert_eq!(
+            &scales[b * 2..b * 2 + 2],
+            &wire[b * WIRE..b * WIRE + 2],
+            "block {b}: f16 scale bits must survive verbatim into the scale plane"
+        );
+        assert_eq!(
+            &quants[b * 16..b * 16 + 16],
+            &wire[b * WIRE + 2..b * WIRE + WIRE],
+            "block {b}: the 16 nibble bytes must survive verbatim into the quant plane"
+        );
+        assert_eq!(
+            (b * 16) % 16,
+            0,
+            "block {b}: quant plane offset must be 16-byte aligned for the uint4 load"
+        );
+    }
+
+    // Every input byte is accounted for exactly once.
+    let mut back = vec![0u8; wire.len()];
+    for b in 0..n {
+        back[b * WIRE..b * WIRE + 2].copy_from_slice(&scales[b * 2..b * 2 + 2]);
+        back[b * WIRE + 2..b * WIRE + WIRE].copy_from_slice(&quants[b * 16..b * 16 + 16]);
+    }
+    assert_eq!(back, wire, "the permutation must be exactly invertible");
+}
+
+/// `q4_0_gemv_soa` on repacked weights must be BITWISE identical to `q4_0_gemv`
+/// on the raw wire — not merely close.
+///
+/// This is the gate that lets the SoA repack ship as an exact-parity change: the
+/// integer `__dp4a` chain is exact regardless of how the 16 bytes were loaded,
+/// the per-block float term is unchanged, and the tail fold is still lane 0
+/// summing in increasing block order. If any of that stops being true, the
+/// greedy token stream moves and this test is what catches it.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn q4_0_gemv_soa_matches_wire() {
+    let Some(k) = kernels() else {
+        return;
+    };
+    for (rows, bpr, seed) in [(96usize, 8usize, 0x50_a1_01u64), (257, 88, 0x50_a1_02)] {
+        let kdim = bpr * 32;
+        let mut rng = Lcg(seed);
+        let wire = synth_q4_0_wire(rows, bpr, &mut rng);
+        let soa = super::q4_0_wire_to_soa(&wire);
+
+        let act: Vec<f32> = (0..kdim).map(|_| rng.next_f32()).collect();
+        let q8 = crate::inference::quantize_q8_0_blocks(&act);
+        let scales: Vec<f32> = q8.iter().map(|b| b.scale).collect();
+        let mut quants = vec![0i8; kdim];
+        for (b, blk) in q8.iter().enumerate() {
+            quants[b * 32..(b + 1) * 32].copy_from_slice(&blk.quants);
+        }
+
+        let d_s = k.stream.clone_htod(&scales).unwrap();
+        let d_q = k.stream.clone_htod(&quants).unwrap();
+
+        let run = |weights: &[u8], func: &cudarc::driver::CudaFunction| -> Vec<f32> {
+            let d_w = k.stream.clone_htod(weights).unwrap();
+            let mut d_out = k.stream.alloc_zeros::<f32>(rows).unwrap();
+            super::launch_q4_0_gemv(
+                &k.stream,
+                func,
+                &d_s,
+                &d_q,
+                &d_w.slice(0..weights.len()),
+                rows,
+                bpr,
+                &mut d_out,
+                0,
+            )
+            .unwrap();
+            let mut host = vec![0f32; rows];
+            k.stream.memcpy_dtoh(&d_out, &mut host).unwrap();
+            k.ctx.synchronize().unwrap();
+            host
+        };
+
+        let from_wire = run(&wire, &k.q4_0_gemv);
+        let from_soa = run(&soa, &k.q4_0_gemv_soa);
+
+        let mismatches = from_wire
+            .iter()
+            .zip(&from_soa)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        assert_eq!(
+            mismatches, 0,
+            "q4_0_gemv_soa must be BITWISE identical to q4_0_gemv \
+             (rows {rows}, blocks/row {bpr}): {mismatches}/{rows} rows differ"
+        );
+
+        // Second opinion: both must also track the CPU wire oracle.
+        const WIRE: usize = 18;
+        let row_bytes = bpr * WIRE;
+        let cpu: Vec<f32> = (0..rows)
+            .map(|r| {
+                crate::inference::q4_0_wire_row_dot(&wire[r * row_bytes..(r + 1) * row_bytes], &q8)
+            })
+            .collect();
+        assert!(
+            close(&from_soa, &cpu, 1e-4),
+            "q4_0_gemv_soa diverged from the CPU q4_0_wire_row_dot oracle"
+        );
+    }
+}
+
+/// Every contraction width used by the tracked Gemma 4 MTP assistant must
+/// reproduce the ordered native-f32 oracle bit for bit. The odd row count also
+/// exercises the final partially populated CTA for every launch geometry.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn q4_0_f32_gemv_soa_matches_ordered_oracle_all_assistant_widths_bitwise() {
+    let Some(kernels) = kernels() else {
+        return;
+    };
+    const ROWS: usize = 257;
+    for (case, cols) in [1024usize, 4096, 5632, 8192].into_iter().enumerate() {
+        let bpr = cols / 32;
+        let mut rng = Lcg(0x40_f3_20_00u64 + case as u64);
+        let wire = synth_q4_0_wire(ROWS, bpr, &mut rng);
+        let soa = super::q4_0_wire_to_soa(&wire);
+        let input: Vec<f32> = (0..cols).map(|_| rng.next_f32() * 1.75).collect();
+        let expected: Vec<f32> = (0..ROWS)
+            .map(|row| q4_0_f32_soa_ordered_row_dot(&soa, ROWS, bpr, row, &input))
+            .collect();
+        let actual = run_q4_0_f32_gemv_soa(&kernels, &soa, &input, ROWS, cols);
+        assert_same_bits(
+            &format!("q4_0_f32_gemv_soa {ROWS}x{cols}"),
+            &actual,
+            &expected,
+        );
+    }
+}
+
+/// Covers the seven distinct matrix geometries shared by all 23 matrices in
+/// the tracked assistant pack. The GPU executes every output row; sampling the
+/// first, middle, and last CPU rows keeps this production-size receipt useful
+/// on a 16 GiB host while still pinning row addressing and the tail CTA.
+#[test]
+#[ignore = "requires a CUDA device and allocates the production Q4_0 matrices"]
+fn q4_0_f32_gemv_soa_matches_ordered_oracle_production_shapes() {
+    let Some(kernels) = kernels() else {
+        return;
+    };
+    for (case, (rows, cols)) in [
+        (262_144usize, 1_024usize),
+        (4_096, 1_024),
+        (1_024, 4_096),
+        (8_192, 1_024),
+        (1_024, 8_192),
+        (1_024, 5_632),
+        (2_816, 1_024),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let bpr = cols / 32;
+        let mut rng = Lcg(0x40_f3_70_00u64 + case as u64);
+        let wire = synth_q4_0_wire(rows, bpr, &mut rng);
+        let soa = super::q4_0_wire_to_soa(&wire);
+        let input: Vec<f32> = (0..cols).map(|_| rng.next_f32() * 1.75).collect();
+        let actual = run_q4_0_f32_gemv_soa(&kernels, &soa, &input, rows, cols);
+        for row in [0usize, rows / 2, rows - 1] {
+            let expected = q4_0_f32_soa_ordered_row_dot(&soa, rows, bpr, row, &input);
+            assert_same_bits(
+                &format!("q4_0_f32_gemv_soa {rows}x{cols} row {row}"),
+                &actual[row..=row],
+                &[expected],
+            );
+        }
+    }
+}
+
+/// The verifier-width Q4_0 GEMM must consume the exact SoA layout used by
+/// Gemma 4's resident common projections and reproduce repeated scalar
+/// `q4_0_gemv_soa` launches bit for bit. Exercise the narrow, scheduled, and
+/// maximum verifier widths against the production hidden=2816 contraction.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn q4_0_gemm_batched_soa_variants_match_scalar_soa_bitwise() {
+    let Some(k) = kernels() else {
+        return;
+    };
+    let rows = 2816usize;
+    let bpr = 88usize;
+    let max_tokens = crate::gemma4_runtime::MAX_MTP_VERIFY_ROWS;
+    assert_eq!(max_tokens, 14, "test cases pin the production verifier cap");
+    let kdim = bpr * 32;
+    let mut rng = Lcg(0x40_50_b9);
+    let wire = synth_q4_0_wire(rows, bpr, &mut rng);
+    let soa = super::q4_0_wire_to_soa(&wire);
+    let d_w = k.stream.clone_htod(&soa).unwrap();
+
+    let mut in_scales = vec![0f32; max_tokens * bpr];
+    let mut in_quants = vec![0i8; max_tokens * kdim];
+    for t in 0..max_tokens {
+        let act: Vec<f32> = (0..kdim).map(|_| rng.next_f32()).collect();
+        let q8 = crate::inference::quantize_q8_0_blocks(&act);
+        for (b, block) in q8.iter().enumerate() {
+            in_scales[t * bpr + b] = block.scale;
+            in_quants[t * kdim + b * 32..t * kdim + (b + 1) * 32].copy_from_slice(&block.quants);
+        }
+    }
+
+    let mut scalar = vec![0f32; max_tokens * rows];
+    for t in 0..max_tokens {
+        let d_s = k
+            .stream
+            .clone_htod(&in_scales[t * bpr..(t + 1) * bpr])
+            .unwrap();
+        let d_q = k
+            .stream
+            .clone_htod(&in_quants[t * kdim..(t + 1) * kdim])
+            .unwrap();
+        let mut d_out = k.stream.alloc_zeros::<f32>(rows).unwrap();
+        super::launch_q4_0_gemv(
+            &k.stream,
+            &k.q4_0_gemv_soa,
+            &d_s,
+            &d_q,
+            &d_w.slice(0..d_w.len()),
+            rows,
+            bpr,
+            &mut d_out,
+            0,
+        )
+        .unwrap();
+        k.stream
+            .memcpy_dtoh(&d_out, &mut scalar[t * rows..(t + 1) * rows])
+            .unwrap();
+    }
+
+    let d_s = k.stream.clone_htod(&in_scales).unwrap();
+    let d_q = k.stream.clone_htod(&in_quants).unwrap();
+    if k.sm86 {
+        assert!(
+            k.q4_0_gemm_batched_soa_imma.is_some(),
+            "SM86 must load the exact Q4_0 IMMA comparison kernel"
+        );
+    }
+    for k_tokens in [1usize, 7, max_tokens] {
+        let mut d_shared = k.stream.alloc_zeros::<f32>(k_tokens * rows).unwrap();
+        super::launch_q4_0_gemm_batched_soa_shared(
+            &k.stream,
+            &k.q4_0_gemm_batched_soa_shared,
+            &d_s,
+            &d_q,
+            &d_w,
+            rows,
+            bpr,
+            k_tokens,
+            &mut d_shared,
+        )
+        .unwrap();
+        let mut d_zero_shared = k.stream.alloc_zeros::<f32>(k_tokens * rows).unwrap();
+        super::launch_q4_0_gemm_batched_soa(
+            &k.stream,
+            &k.q4_0_gemm_batched_soa,
+            &d_s,
+            &d_q,
+            &d_w,
+            rows,
+            bpr,
+            k_tokens,
+            &mut d_zero_shared,
+        )
+        .unwrap();
+        let mut d_imma = k
+            .q4_0_gemm_batched_soa_imma
+            .as_ref()
+            .map(|_| k.stream.alloc_zeros::<f32>(k_tokens * rows).unwrap());
+        if let (Some(kernel), Some(output)) =
+            (k.q4_0_gemm_batched_soa_imma.as_ref(), d_imma.as_mut())
+        {
+            super::launch_q4_0_gemm_batched_soa_imma(
+                &k.stream, kernel, &d_s, &d_q, &d_w, rows, bpr, k_tokens, output,
+            )
+            .unwrap();
+        }
+        let mut shared = vec![0f32; k_tokens * rows];
+        let mut zero_shared = vec![0f32; k_tokens * rows];
+        let mut imma = d_imma.as_ref().map(|_| vec![0f32; k_tokens * rows]);
+        k.stream.memcpy_dtoh(&d_shared, &mut shared).unwrap();
+        k.stream
+            .memcpy_dtoh(&d_zero_shared, &mut zero_shared)
+            .unwrap();
+        if let (Some(device), Some(host)) = (d_imma.as_ref(), imma.as_mut()) {
+            k.stream.memcpy_dtoh(device, host).unwrap();
+        }
+        k.ctx.synchronize().unwrap();
+
+        let scalar_prefix = &scalar[..k_tokens * rows];
+        for (variant, batched) in [("shared", &shared), ("zero-shared", &zero_shared)] {
+            let mismatches = batched
+                .iter()
+                .zip(scalar_prefix)
+                .filter(|(batch, one)| batch.to_bits() != one.to_bits())
+                .count();
+            assert_eq!(
+                mismatches,
+                0,
+                "Q4_0 SoA {variant} K={k_tokens} GEMM must be BITWISE identical to repeated \
+                 scalar SoA GEMV: {mismatches}/{} outputs differ",
+                batched.len()
+            );
+        }
+        assert_same_bits(
+            &format!("Q4_0 SoA shared vs zero-shared K={k_tokens}"),
+            &shared,
+            &zero_shared,
+        );
+        if let Some(imma) = imma.as_ref() {
+            let mismatches = imma
+                .iter()
+                .zip(scalar_prefix)
+                .filter(|(batch, one)| batch.to_bits() != one.to_bits())
+                .count();
+            assert_eq!(
+                mismatches,
+                0,
+                "Q4_0 SoA IMMA K={k_tokens} GEMM must be BITWISE identical to repeated \
+                 scalar SoA GEMV: {mismatches}/{} outputs differ",
+                imma.len()
+            );
+            assert_same_bits(
+                &format!("Q4_0 SoA shared vs IMMA K={k_tokens}"),
+                &shared,
+                imma,
+            );
+        }
+    }
+    assert!(
+        scalar.iter().any(|value| *value != 0.0),
+        "degenerate Q4_0 SoA fixture produced only zeros"
+    );
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn q4_0_gemm_batched_matches_scalar_bitwise() {
+    // Odd BPR exercises Q4_0's alternating 18-byte row/block alignment; BPR=88
+    // is the installed Gemma-4 target's hidden-width contraction geometry.
+    run_q4_0_gemm_batched_case(2, 23, 0x40_ba_72);
+    run_q4_0_gemm_batched_case(4, 88, 0x40_ba_74);
+}
+
+fn run_q4_1_gemm_batched_case(ktok: usize, bpr: usize, seed: u64) {
+    let Some(k) = kernels() else {
+        return;
+    };
+    let rows = 96usize;
+    let kdim = bpr * 32;
+    let mut rng = Lcg(seed);
+    let wire = synth_q4_1_wire(rows, bpr, &mut rng);
+    let mut in_scales = vec![0f32; ktok * bpr];
+    let mut in_quants = vec![0i8; ktok * kdim];
+    let mut cpu = vec![0f32; ktok * rows];
+    let mut scalar_gpu = vec![0f32; ktok * rows];
+    const WIRE: usize = 20;
+    let row_bytes = bpr * WIRE;
+
+    for t in 0..ktok {
+        let act: Vec<f32> = (0..kdim).map(|_| rng.next_f32()).collect();
+        let q8 = crate::inference::quantize_q8_0_blocks(&act);
+        let scales: Vec<f32> = q8.iter().map(|b| b.scale).collect();
+        let mut quants = vec![0i8; kdim];
+        for (b, blk) in q8.iter().enumerate() {
+            quants[b * 32..(b + 1) * 32].copy_from_slice(&blk.quants);
+        }
+        in_scales[t * bpr..(t + 1) * bpr].copy_from_slice(&scales);
+        in_quants[t * kdim..(t + 1) * kdim].copy_from_slice(&quants);
+        for r in 0..rows {
+            cpu[t * rows + r] =
+                crate::inference::q4_1_wire_row_dot(&wire[r * row_bytes..(r + 1) * row_bytes], &q8);
+        }
+
+        let d_s = k.stream.clone_htod(&scales).unwrap();
+        let d_q = k.stream.clone_htod(&quants).unwrap();
+        let d_w = k.stream.clone_htod(&wire).unwrap();
+        let mut d_out = k.stream.alloc_zeros::<f32>(rows).unwrap();
+        super::launch_q4_1_gemv(
+            &k.stream,
+            &k.q4_1_gemv,
+            &d_s,
+            &d_q,
+            &d_w.slice(0..wire.len()),
+            rows,
+            bpr,
+            &mut d_out,
+            0,
+        )
+        .unwrap();
+        k.stream
+            .memcpy_dtoh(&d_out, &mut scalar_gpu[t * rows..(t + 1) * rows])
+            .unwrap();
+    }
+
+    let d_is = k.stream.clone_htod(&in_scales).unwrap();
+    let d_iq = k.stream.clone_htod(&in_quants).unwrap();
+    let d_w = k.stream.clone_htod(&wire).unwrap();
+    let mut d_out = k.stream.alloc_zeros::<f32>(ktok * rows).unwrap();
+    super::launch_q4_1_gemm_batched(
+        &k.stream,
+        &k.q4_1_gemm_batched,
+        &d_is,
+        &d_iq,
+        &d_w,
+        rows,
+        bpr,
+        ktok,
+        &mut d_out,
+    )
+    .unwrap();
+    let mut batched = vec![0f32; ktok * rows];
+    k.stream.memcpy_dtoh(&d_out, &mut batched).unwrap();
+    k.ctx.synchronize().unwrap();
+
+    assert!(
+        batched
+            .iter()
+            .zip(&scalar_gpu)
+            .all(|(batch, scalar)| batch.to_bits() == scalar.to_bits()),
+        "Q4_1 batched GEMM must be bit-identical to K scalar GEMVs"
+    );
+    assert!(
+        close(&batched, &cpu, 1e-4),
+        "Q4_1 batched GEMM diverged from the CPU wire oracle"
+    );
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn q4_1_gemm_batched_matches_scalar_bitwise() {
+    run_q4_1_gemm_batched_case(2, 23, 0x41_ba_72);
+    run_q4_1_gemm_batched_case(4, 88, 0x41_ba_74);
 }
 
 // Synthetic NVFP4 weight wire: rows*n_sb superblocks of 36 bytes (d[4] UE4M3 scales
@@ -5840,62 +7273,165 @@ fn q6k_gemm_batched_matches_oracle() {
     let Some(k) = kernels() else {
         return;
     };
-    let (rows, n_sb, k_tokens) = (64usize, 3usize, 4usize);
-    let kdim = n_sb * 256;
-    let mut rng = Lcg(0x6b_47_45_4d_4d);
-    let wire = synth_q6k_wire(rows, n_sb, &mut rng);
-    let weights = super::pad_q6k_blocks(&wire);
-    let mut in_scales = Vec::with_capacity(k_tokens * n_sb);
-    let mut in_quants = Vec::with_capacity(k_tokens * kdim);
-    let mut expected = vec![0f32; k_tokens * rows];
-    for t in 0..k_tokens {
-        let act: Vec<f32> = (0..kdim).map(|_| rng.next_f32()).collect();
-        let q8k = crate::inference::quantize_q8_k_blocks(&act);
-        for block in &q8k {
-            in_scales.push(block.d);
-            in_quants.extend_from_slice(&block.qs);
+    for (rows, n_sb, k_tokens, seed) in [
+        (64usize, 3usize, 4usize, 0x6b_47_45_4d_4d),
+        // Production Gemma 4 tied-head contraction: hidden=2816 => 11
+        // Q8_K super-blocks, at the maximum 14-row verifier width.
+        (
+            64,
+            11,
+            crate::gemma4_runtime::MAX_MTP_VERIFY_ROWS,
+            0x6b_31_31_4b_31_34,
+        ),
+    ] {
+        let kdim = n_sb * 256;
+        let mut rng = Lcg(seed);
+        let wire = synth_q6k_wire(rows, n_sb, &mut rng);
+        let weights = super::pad_q6k_blocks(&wire);
+        let mut in_scales = Vec::with_capacity(k_tokens * n_sb);
+        let mut in_quants = Vec::with_capacity(k_tokens * kdim);
+        let mut expected = vec![0f32; k_tokens * rows];
+        for t in 0..k_tokens {
+            let act: Vec<f32> = (0..kdim).map(|_| rng.next_f32()).collect();
+            let q8k = crate::inference::quantize_q8_k_blocks(&act);
+            for block in &q8k {
+                in_scales.push(block.d);
+                in_quants.extend_from_slice(&block.qs);
+            }
+            for row in 0..rows {
+                let lo = row * n_sb * 210;
+                expected[t * rows + row] =
+                    crate::inference::q6_k_wire_row_dot(&wire[lo..lo + n_sb * 210], &q8k);
+            }
         }
-        for row in 0..rows {
-            let lo = row * n_sb * 210;
-            expected[t * rows + row] =
-                crate::inference::q6_k_wire_row_dot(&wire[lo..lo + n_sb * 210], &q8k);
-        }
+
+        let d_is = k.stream.clone_htod(&in_scales).unwrap();
+        let d_iq = k.stream.clone_htod(&in_quants).unwrap();
+        let d_w = k.stream.clone_htod(&weights).unwrap();
+        let mut d_out = k.stream.alloc_zeros::<f32>(k_tokens * rows).unwrap();
+        super::launch_kquant_gemm_batched(
+            &k.stream,
+            &k.q6k_gemm_batched,
+            &d_is,
+            &d_iq,
+            &d_w,
+            rows,
+            n_sb,
+            k_tokens,
+            8,
+            &mut d_out,
+        )
+        .unwrap();
+        let mut got = vec![0f32; k_tokens * rows];
+        k.stream.memcpy_dtoh(&d_out, &mut got).unwrap();
+        k.ctx.synchronize().unwrap();
+
+        let exact = got
+            .iter()
+            .zip(&expected)
+            .filter(|(g, e)| g.to_bits() == e.to_bits())
+            .count();
+        eprintln!(
+            "q6k_gemm_batched_matches_oracle: {exact}/{} outputs bit-identical",
+            got.len()
+        );
+        assert!(
+            close(&got, &expected, 1e-4),
+            "batched Q6_K diverged from q6_k_wire_row_dot"
+        );
     }
+}
 
-    let d_is = k.stream.clone_htod(&in_scales).unwrap();
-    let d_iq = k.stream.clone_htod(&in_quants).unwrap();
-    let d_w = k.stream.clone_htod(&weights).unwrap();
-    let mut d_out = k.stream.alloc_zeros::<f32>(k_tokens * rows).unwrap();
-    super::launch_kquant_gemm_batched(
-        &k.stream,
-        &k.q6k_gemm_batched,
-        &d_is,
-        &d_iq,
-        &d_w,
-        rows,
-        n_sb,
-        k_tokens,
-        8,
-        &mut d_out,
-    )
-    .unwrap();
-    let mut got = vec![0f32; k_tokens * rows];
-    k.stream.memcpy_dtoh(&d_out, &mut got).unwrap();
-    k.ctx.synchronize().unwrap();
+/// Exact A/B for the anchor-major Q6_K DP4A verifier kernel. The established
+/// batched kernel is the production bit-pattern anchor; the CPU wire oracle is
+/// retained as an independent numeric check because its test historically
+/// permits the same 1e-4 tolerance as scalar q6k_gemv.
+#[test]
+#[ignore = "requires an SM61+ CUDA device"]
+fn q6k_gemm_batched_anchor_dp4a_matches_production_bitwise() {
+    let Some(k) = kernels() else {
+        return;
+    };
+    let rows = 64usize;
+    let n_sb = 11usize; // Gemma 4 hidden=2816 production contraction.
+    let kdim = n_sb * 256;
+    for (k_tokens, seed) in [
+        (1usize, 0x6b_44_50_34_01u64),
+        (7usize, 0x6b_44_50_34_07u64),
+        (
+            crate::gemma4_runtime::MAX_MTP_VERIFY_ROWS,
+            0x6b_44_50_34_14u64,
+        ),
+    ] {
+        let mut rng = Lcg(seed);
+        let wire = synth_q6k_wire(rows, n_sb, &mut rng);
+        let weights = super::pad_q6k_blocks(&wire);
+        let mut in_scales = Vec::with_capacity(k_tokens * n_sb);
+        let mut in_quants = Vec::with_capacity(k_tokens * kdim);
+        let mut expected = vec![0f32; k_tokens * rows];
+        for t in 0..k_tokens {
+            let act: Vec<f32> = (0..kdim).map(|_| rng.next_f32()).collect();
+            let q8k = crate::inference::quantize_q8_k_blocks(&act);
+            for block in &q8k {
+                in_scales.push(block.d);
+                in_quants.extend_from_slice(&block.qs);
+            }
+            for row in 0..rows {
+                let lo = row * n_sb * 210;
+                expected[t * rows + row] =
+                    crate::inference::q6_k_wire_row_dot(&wire[lo..lo + n_sb * 210], &q8k);
+            }
+        }
 
-    let exact = got
-        .iter()
-        .zip(&expected)
-        .filter(|(g, e)| g.to_bits() == e.to_bits())
-        .count();
-    eprintln!(
-        "q6k_gemm_batched_matches_oracle: {exact}/{} outputs bit-identical",
-        got.len()
-    );
-    assert!(
-        close(&got, &expected, 1e-4),
-        "batched Q6_K diverged from q6_k_wire_row_dot"
-    );
+        let d_is = k.stream.clone_htod(&in_scales).unwrap();
+        let d_iq = k.stream.clone_htod(&in_quants).unwrap();
+        let d_w = k.stream.clone_htod(&weights).unwrap();
+        let mut d_production = k.stream.alloc_zeros::<f32>(k_tokens * rows).unwrap();
+        let mut d_anchor = k.stream.alloc_zeros::<f32>(k_tokens * rows).unwrap();
+        super::launch_kquant_gemm_batched(
+            &k.stream,
+            &k.q6k_gemm_batched,
+            &d_is,
+            &d_iq,
+            &d_w,
+            rows,
+            n_sb,
+            k_tokens,
+            8,
+            &mut d_production,
+        )
+        .unwrap();
+        super::launch_kquant_gemm_batched(
+            &k.stream,
+            &k.q6k_gemm_batched_anchor_dp4a,
+            &d_is,
+            &d_iq,
+            &d_w,
+            rows,
+            n_sb,
+            k_tokens,
+            0,
+            &mut d_anchor,
+        )
+        .unwrap();
+
+        let mut production = vec![0f32; k_tokens * rows];
+        let mut anchor = vec![0f32; k_tokens * rows];
+        k.stream
+            .memcpy_dtoh(&d_production, &mut production)
+            .unwrap();
+        k.stream.memcpy_dtoh(&d_anchor, &mut anchor).unwrap();
+        k.ctx.synchronize().unwrap();
+        assert_same_bits(
+            &format!("Q6_K production vs anchor DP4A K={k_tokens}"),
+            &anchor,
+            &production,
+        );
+        assert!(
+            close(&anchor, &expected, 1e-4),
+            "anchor-major Q6_K DP4A K={k_tokens} diverged from the CPU wire oracle"
+        );
+    }
 }
 
 fn synth_iq4xs_wire(rows: usize, n_sb: usize, rng: &mut Lcg) -> Vec<u8> {
@@ -7012,4 +8548,868 @@ fn flash_attention_prefill_tiled_parity() {
             }
         }
     }
+}
+
+// `attention_sw_batched` must be BITWISE identical to the scalar `attention_decode_sw` as
+// the gemma4 runtime launches it -- blockDim.x == head_dim, i.e. G == 1 -- for every token
+// in a verify batch. Anything less than bitwise here is not a rounding detail: gemma4 folds
+// the attention scale (scale == 1.0), so its softmax is extremely peaked and a one-ulp
+// score difference can flip an argmax, which would make speculative verify disagree with
+// plain decode and silently break losslessness.
+//
+// Both gemma4 layer types are covered: sliding (window crops the prefix, and the KV ring
+// wraps modulo its window-plus-verifier-slack capacity) and full (window == 0, no crop). The batch sweep
+// includes K == 1 because that is the structural gate the H40 harness runs, and widths
+// where `base + K` straddles the window edge so some tokens in one batch crop and others
+// do not.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn attention_sw_batched_matches_gemma4_scalar_decode() {
+    use cudarc::driver::{LaunchConfig, PushKernelArg};
+
+    let Some(k) = kernels() else {
+        return;
+    };
+    // gemma4 26B-A4B geometry: sliding layers 16 q-heads x 256 over 8 KV heads, the full
+    // layer 16 x 512 over 2. `scale` is 1.0 on both -- gemma folds it into q_norm.
+    //
+    // `kv_capacity` and `context` are deliberately separate. A sliding cache is a ring of
+    // only `window + MAX_MTP_VERIFY_ROWS` slots, while absolute positions can advance to the context limit.
+    // The score scratch is ring-sized and indexed relative to the active window; keeping
+    // the limits separate exercises both score bounds and `p % max_pos` after wraparound.
+    let cases: [(usize, usize, usize, usize, usize, usize); 2] = [
+        // (n_heads, n_kv, head_dim, window, kv_capacity, context)
+        (
+            16,
+            8,
+            256,
+            1024,
+            1024 + crate::gemma4_runtime::MAX_MTP_VERIFY_ROWS,
+            4096,
+        ),
+        (16, 2, 512, 0, 4096, 4096),
+    ];
+    let scale = 1.0f32;
+
+    for (n_heads, n_kv, head_dim, window, max_pos, context) in cases {
+        let mut rng = Lcg(0x5eed_1234 ^ (head_dim as u64));
+        let mut cache_k = vec![0f32; n_kv * max_pos * head_dim];
+        let mut cache_v = vec![0f32; n_kv * max_pos * head_dim];
+        for x in cache_k.iter_mut() {
+            *x = rng.next_f32();
+        }
+        for x in cache_v.iter_mut() {
+            *x = rng.next_f32();
+        }
+        let cache_k_bits: Vec<u16> = cache_k
+            .iter()
+            .map(|&x| crate::inference::f32_to_f16_bits(x))
+            .collect();
+        let cache_v_bits: Vec<u16> = cache_v
+            .iter()
+            .map(|&x| crate::inference::f32_to_f16_bits(x))
+            .collect();
+        let cache_k_bytes: Vec<u8> = cache_k_bits
+            .iter()
+            .flat_map(|bits| bits.to_le_bytes())
+            .collect();
+        let cache_v_bytes: Vec<u8> = cache_v_bits
+            .iter()
+            .flat_map(|bits| bits.to_le_bytes())
+            .collect();
+        let dk = k.stream.clone_htod(&cache_k_bytes).unwrap();
+        let dv = k.stream.clone_htod(&cache_v_bytes).unwrap();
+
+        // Inside the window; straddling its edge (so tokens in ONE batch disagree about
+        // whether the prefix is cropped); and past the ring's capacity, where `p % max_pos`
+        // starts doing real work. That last group matters most: a sliding cache holds only
+        // `window + MAX_MTP_VERIFY_ROWS` slots, so every later verify batch reads wrapped
+        // history, and it is where a relative-indexed batched kernel is most likely to part
+        // company with an absolute-indexed scalar one.
+        let mut bases: Vec<usize> = vec![7, 64];
+        if window > 0 {
+            bases.extend([window - 3, window, max_pos + 475, 2 * max_pos + 13]);
+        } else {
+            bases.extend([512, 2000]);
+        }
+        for base in bases {
+            for kt in [1usize, 2, 4, 8, 9, 13, 14] {
+                // Bounded by the CONTEXT, not the ring: the scalar kernel's shared
+                // `scores[]` is indexed by absolute position.
+                if base + kt >= context {
+                    continue;
+                }
+                let q_per_token = n_heads * head_dim;
+                let q: Vec<f32> = (0..kt * q_per_token).map(|_| rng.next_f32()).collect();
+                let dq = k.stream.clone_htod(&q).unwrap();
+
+                // Reference: the scalar kernel run once per token, launched EXACTLY the way
+                // `Gemma4CudaResident::forward_token_impl` launches it.
+                let mut reference = vec![0f32; kt * q_per_token];
+                for t in 0..kt {
+                    let position = base + t;
+                    let dpos = k.stream.clone_htod(&[position as i32]).unwrap();
+                    let dq_t = k
+                        .stream
+                        .clone_htod(&q[t * q_per_token..][..q_per_token])
+                        .unwrap();
+                    let mut dout = k.stream.alloc_zeros::<f32>(q_per_token).unwrap();
+                    let mut global_scores = k.stream.alloc_zeros::<f32>(n_heads * max_pos).unwrap();
+                    let cfg = LaunchConfig {
+                        grid_dim: (n_heads as u32, 1, 1),
+                        block_dim: (head_dim as u32, 1, 1),
+                        shared_mem_bytes: ((2 * head_dim) as u32) * 4,
+                    };
+                    let (nh, nkv, hd, mp, win) = (
+                        n_heads as i32,
+                        n_kv as i32,
+                        head_dim as i32,
+                        max_pos as i32,
+                        window as i32,
+                    );
+                    let mut b = k.stream.launch_builder(&k.attention_sw);
+                    b.arg(&dq_t)
+                        .arg(&dk)
+                        .arg(&dv)
+                        .arg(&mut dout)
+                        .arg(&nh)
+                        .arg(&nkv)
+                        .arg(&hd)
+                        .arg(&dpos)
+                        .arg(&mp)
+                        .arg(&scale)
+                        .arg(&win)
+                        .arg(&mut global_scores);
+                    unsafe { b.launch(cfg) }.unwrap();
+                    k.stream
+                        .memcpy_dtoh(&dout, &mut reference[t * q_per_token..][..q_per_token])
+                        .unwrap();
+                }
+
+                let mut dbatched = k.stream.alloc_zeros::<f32>(kt * q_per_token).unwrap();
+                super::launch_attention_sw_batched(
+                    &k.stream,
+                    &k.attention_sw_batched,
+                    &dq,
+                    &dk,
+                    &dv,
+                    &mut dbatched,
+                    n_heads,
+                    n_kv,
+                    head_dim,
+                    base,
+                    max_pos,
+                    scale,
+                    window,
+                    q_per_token,
+                    kt,
+                )
+                .unwrap();
+                let mut batched = vec![0f32; kt * q_per_token];
+                k.stream.memcpy_dtoh(&dbatched, &mut batched).unwrap();
+
+                for (i, (got, want)) in batched.iter().zip(&reference).enumerate() {
+                    assert_eq!(
+                        got.to_bits(),
+                        want.to_bits(),
+                        "head_dim {head_dim} window {window} base {base} K {kt}: element {i} \
+                         (token {}, head {}, dim {}) is {got} but scalar decode gives {want}",
+                        i / q_per_token,
+                        (i % q_per_token) / head_dim,
+                        i % head_dim,
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Drive the actual f16 batched scatter and sliding-attention kernels through
+/// more than two complete ring wraps, comparing every fourteen-row verifier batch
+/// against token-by-token Gemma decode. The cache comparison pins modulo writes;
+/// the output comparison pins the stronger lifetime rule: scattering later rows
+/// must not overwrite history still needed by an earlier row in the same batch.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn kv_scatter_batched_ring_wrap_preserves_attention_history() {
+    use cudarc::driver::{LaunchConfig, PushKernelArg};
+
+    let Some(k) = kernels() else {
+        return;
+    };
+    let n_heads = 2usize;
+    let n_kv_heads = 1usize;
+    let head_dim = 32usize;
+    let window = 7usize;
+    let context = 128usize;
+    let k_tokens = crate::gemma4_runtime::MAX_MTP_VERIFY_ROWS;
+    let max_pos = crate::gemma4_runtime::gemma4_kv_capacity(Some(window), context);
+    assert_eq!(
+        max_pos,
+        window + k_tokens,
+        "sliding KV must retain one full verifier width beyond the active window"
+    );
+
+    let kv_per_token = n_kv_heads * head_dim;
+    let q_per_token = n_heads * head_dim;
+    let cache_bytes = n_kv_heads * max_pos * head_dim * 2;
+    let mut scalar_k = k.stream.alloc_zeros::<u8>(cache_bytes).unwrap();
+    let mut scalar_v = k.stream.alloc_zeros::<u8>(cache_bytes).unwrap();
+    let mut batched_k = k.stream.alloc_zeros::<u8>(cache_bytes).unwrap();
+    let mut batched_v = k.stream.alloc_zeros::<u8>(cache_bytes).unwrap();
+    let scale = 1.0f32;
+    let rounds = 6usize;
+    let mut rng = Lcg(0x4b_56_72_39);
+
+    for round in 0..rounds {
+        let base = round * k_tokens;
+        let src_k: Vec<f32> = (0..k_tokens * kv_per_token)
+            .map(|_| rng.next_f32())
+            .collect();
+        let src_v: Vec<f32> = (0..k_tokens * kv_per_token)
+            .map(|_| rng.next_f32())
+            .collect();
+        let q: Vec<f32> = (0..k_tokens * q_per_token)
+            .map(|_| rng.next_f32())
+            .collect();
+
+        // Reference: exactly the scalar Gemma order -- scatter one position,
+        // attend that position, then advance to the next token.
+        let mut reference = vec![0f32; k_tokens * q_per_token];
+        for t in 0..k_tokens {
+            let position = base + t;
+            let d_position = k.stream.clone_htod(&[position as i32]).unwrap();
+            let d_src_k = k
+                .stream
+                .clone_htod(&src_k[t * kv_per_token..(t + 1) * kv_per_token])
+                .unwrap();
+            let d_src_v = k
+                .stream
+                .clone_htod(&src_v[t * kv_per_token..(t + 1) * kv_per_token])
+                .unwrap();
+            super::launch_kv_scatter(
+                &k.stream,
+                &k.kv_scatter,
+                &d_src_k,
+                &mut scalar_k,
+                &d_position,
+                n_kv_heads,
+                head_dim,
+                max_pos,
+            )
+            .unwrap();
+            super::launch_kv_scatter(
+                &k.stream,
+                &k.kv_scatter,
+                &d_src_v,
+                &mut scalar_v,
+                &d_position,
+                n_kv_heads,
+                head_dim,
+                max_pos,
+            )
+            .unwrap();
+
+            let d_q = k
+                .stream
+                .clone_htod(&q[t * q_per_token..(t + 1) * q_per_token])
+                .unwrap();
+            let mut d_out = k.stream.alloc_zeros::<f32>(q_per_token).unwrap();
+            let mut global_scores = k.stream.alloc_zeros::<f32>(n_heads * max_pos).unwrap();
+            let cfg = LaunchConfig {
+                grid_dim: (n_heads as u32, 1, 1),
+                block_dim: (head_dim as u32, 1, 1),
+                shared_mem_bytes: ((2 * head_dim) as u32) * 4,
+            };
+            let (nh, nkv, hd, mp, win) = (
+                n_heads as i32,
+                n_kv_heads as i32,
+                head_dim as i32,
+                max_pos as i32,
+                window as i32,
+            );
+            let mut launch = k.stream.launch_builder(&k.attention_sw);
+            launch
+                .arg(&d_q)
+                .arg(&scalar_k)
+                .arg(&scalar_v)
+                .arg(&mut d_out)
+                .arg(&nh)
+                .arg(&nkv)
+                .arg(&hd)
+                .arg(&d_position)
+                .arg(&mp)
+                .arg(&scale)
+                .arg(&win)
+                .arg(&mut global_scores);
+            unsafe { launch.launch(cfg) }.unwrap();
+            k.stream
+                .memcpy_dtoh(
+                    &d_out,
+                    &mut reference[t * q_per_token..(t + 1) * q_per_token],
+                )
+                .unwrap();
+        }
+
+        // Under test: scatter every speculative row first, then run the exact
+        // K-wide sliding-attention kernel over the same logical positions.
+        let d_src_k = k.stream.clone_htod(&src_k).unwrap();
+        let d_src_v = k.stream.clone_htod(&src_v).unwrap();
+        let d_q = k.stream.clone_htod(&q).unwrap();
+        super::launch_kv_scatter_batched(
+            &k.stream,
+            &k.kv_scatter_batched,
+            &d_src_k,
+            &mut batched_k,
+            base,
+            n_kv_heads,
+            head_dim,
+            max_pos,
+            kv_per_token,
+            k_tokens,
+        )
+        .unwrap();
+        super::launch_kv_scatter_batched(
+            &k.stream,
+            &k.kv_scatter_batched,
+            &d_src_v,
+            &mut batched_v,
+            base,
+            n_kv_heads,
+            head_dim,
+            max_pos,
+            kv_per_token,
+            k_tokens,
+        )
+        .unwrap();
+        let mut d_batched_out = k.stream.alloc_zeros::<f32>(k_tokens * q_per_token).unwrap();
+        super::launch_attention_sw_batched(
+            &k.stream,
+            &k.attention_sw_batched,
+            &d_q,
+            &batched_k,
+            &batched_v,
+            &mut d_batched_out,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            base,
+            max_pos,
+            scale,
+            window,
+            q_per_token,
+            k_tokens,
+        )
+        .unwrap();
+
+        let mut batched = vec![0f32; k_tokens * q_per_token];
+        let mut scalar_k_host = vec![0u8; cache_bytes];
+        let mut scalar_v_host = vec![0u8; cache_bytes];
+        let mut batched_k_host = vec![0u8; cache_bytes];
+        let mut batched_v_host = vec![0u8; cache_bytes];
+        k.stream.memcpy_dtoh(&d_batched_out, &mut batched).unwrap();
+        k.stream.memcpy_dtoh(&scalar_k, &mut scalar_k_host).unwrap();
+        k.stream.memcpy_dtoh(&scalar_v, &mut scalar_v_host).unwrap();
+        k.stream
+            .memcpy_dtoh(&batched_k, &mut batched_k_host)
+            .unwrap();
+        k.stream
+            .memcpy_dtoh(&batched_v, &mut batched_v_host)
+            .unwrap();
+        k.ctx.synchronize().unwrap();
+
+        assert_eq!(
+            batched_k_host, scalar_k_host,
+            "K cache differs after ring round {round} (base {base})"
+        );
+        assert_eq!(
+            batched_v_host, scalar_v_host,
+            "V cache differs after ring round {round} (base {base})"
+        );
+        for (i, (got, want)) in batched.iter().zip(&reference).enumerate() {
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "ring round {round} base {base}: output element {i} differs after batched scatter"
+            );
+        }
+    }
+
+    let last_base = (rounds - 1) * k_tokens;
+    assert!(
+        last_base > 2 * max_pos,
+        "fixture must cross more than two complete KV-ring wraps"
+    );
+}
+
+/// `q4_1_gemm_routed` must be BITWISE identical to per-assignment `q4_1_gemv_routed`.
+///
+/// The Q4_1 twin of `q4_0_gemm_routed_matches_gemv`, and it needs its own gate rather than
+/// riding on that one: the two kernels agree structurally but decode blocks differently,
+/// and the Q4_1 term `(w_d*isum + w_m*asum)` has a second scale and a second integer sum
+/// that the Q4_0 form simply does not have. The reference spells that block out as a
+/// scalar 16-iteration nibble loop while this kernel uses the packed dp4a helper, so what
+/// is really being pinned here is that the two produce the same integers.
+///
+/// Real geometries (the 26B-A4B `down_exps` shapes), a ragged CSR including an expert with
+/// zero tokens and one with more than a tile, a permuted slot map, and `tile` small enough
+/// that the `blockIdx.z` path runs.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn q4_1_gemm_routed_matches_gemv() {
+    let Some(k) = kernels() else {
+        return;
+    };
+    for (rows, bpr, seed) in [(2816usize, 22usize, 0x6e_11u64), (1408, 88, 0x6e_12)] {
+        let experts = 4usize;
+        let n_tokens = 7usize;
+        let kdim = bpr * 32;
+        let mut rng = Lcg(seed);
+
+        let per_slot = rows * bpr * 20;
+        let mut arena = Vec::with_capacity(experts * per_slot);
+        for _ in 0..experts {
+            arena.extend_from_slice(&synth_q4_1_wire(rows, bpr, &mut rng));
+        }
+        let mut in_s = vec![0f32; n_tokens * bpr];
+        let mut in_q = vec![0i8; n_tokens * kdim];
+        for t in 0..n_tokens {
+            let act: Vec<f32> = (0..kdim).map(|_| rng.next_f32()).collect();
+            let q8 = crate::inference::quantize_q8_0_blocks(&act);
+            for (b, blk) in q8.iter().enumerate() {
+                in_s[t * bpr + b] = blk.scale;
+                in_q[t * kdim + b * 32..t * kdim + (b + 1) * 32].copy_from_slice(&blk.quants);
+            }
+        }
+        // Ragged: expert 0 -> 3 tokens, 1 -> none, 2 -> 1, 3 -> 4. A repeated token id
+        // (5 appears twice) checks that output is keyed by ASSIGNMENT, not by token.
+        let token_offsets: Vec<i32> = vec![0, 3, 3, 4, 8];
+        let token_ids: Vec<i32> = vec![5, 0, 3, 6, 2, 4, 1, 5];
+        let slots: Vec<i32> = vec![2, 0, 3, 1];
+        let assignments = *token_offsets.last().unwrap() as usize;
+
+        let d_s = k.stream.clone_htod(&in_s).unwrap();
+        let d_q = k.stream.clone_htod(&in_q).unwrap();
+        let d_w = k.stream.clone_htod(&arena).unwrap();
+        let d_slots = k.stream.clone_htod(&slots).unwrap();
+        let d_off = k.stream.clone_htod(&token_offsets).unwrap();
+        let d_tok = k.stream.clone_htod(&token_ids).unwrap();
+
+        // Reference: the shipped GEMV, once per assignment, single-token activation view.
+        let mut reference = vec![0f32; assignments * rows];
+        for e in 0..experts {
+            let (lo, hi) = (token_offsets[e] as usize, token_offsets[e + 1] as usize);
+            for a in lo..hi {
+                let t = token_ids[a] as usize;
+                let d_s1 = k.stream.clone_htod(&in_s[t * bpr..(t + 1) * bpr]).unwrap();
+                let d_q1 = k
+                    .stream
+                    .clone_htod(&in_q[t * kdim..(t + 1) * kdim])
+                    .unwrap();
+                let one_slot: Vec<i32> = vec![slots[e]];
+                let one_route: Vec<i32> = vec![0];
+                let d_s1s = k.stream.clone_htod(&one_slot).unwrap();
+                let d_r1 = k.stream.clone_htod(&one_route).unwrap();
+                let mut d_out = k.stream.alloc_zeros::<f32>(rows).unwrap();
+                use cudarc::driver::{LaunchConfig, PushKernelArg};
+                let block = 256u32;
+                let warps = block / 32;
+                let cfg = LaunchConfig {
+                    grid_dim: ((rows as u32).div_ceil(warps), 1, 1),
+                    block_dim: (block, 1, 1),
+                    shared_mem_bytes: bpr as u32 * 32 + bpr as u32 * 4 + warps * bpr as u32 * 4,
+                };
+                let (stride, rows_i, bpr_i, one, zero) =
+                    (per_slot as u64, rows as i32, bpr as i32, 1i32, 0i32);
+                let mut b = k.stream.launch_builder(&k.q4_1_gemv_routed);
+                b.arg(&d_s1)
+                    .arg(&d_q1)
+                    .arg(&d_w)
+                    .arg(&d_s1s)
+                    .arg(&d_r1)
+                    .arg(&stride)
+                    .arg(&rows_i)
+                    .arg(&bpr_i)
+                    .arg(&mut d_out)
+                    .arg(&one)
+                    .arg(&zero);
+                unsafe { b.launch(cfg) }.unwrap();
+                k.stream
+                    .memcpy_dtoh(&d_out, &mut reference[a * rows..(a + 1) * rows])
+                    .unwrap();
+                k.ctx.synchronize().unwrap();
+            }
+        }
+
+        let tile = 2usize;
+        let max_count = (0..experts)
+            .map(|e| token_offsets[e + 1] - token_offsets[e])
+            .max()
+            .unwrap() as usize;
+        let mut d_out = k.stream.alloc_zeros::<f32>(assignments * rows).unwrap();
+        {
+            use cudarc::driver::{LaunchConfig, PushKernelArg};
+            let block = 256u32;
+            let warps = block / 32;
+            let cfg = LaunchConfig {
+                grid_dim: (
+                    (rows as u32).div_ceil(warps),
+                    experts as u32,
+                    max_count.div_ceil(tile) as u32,
+                ),
+                block_dim: (block, 1, 1),
+                shared_mem_bytes: warps * tile as u32 * bpr as u32 * 4,
+            };
+            let (stride, rows_i, bpr_i, experts_i, tile_i) = (
+                per_slot as u64,
+                rows as i32,
+                bpr as i32,
+                experts as i32,
+                tile as i32,
+            );
+            let mut b = k.stream.launch_builder(&k.q4_1_gemm_routed);
+            b.arg(&d_s)
+                .arg(&d_q)
+                .arg(&d_w)
+                .arg(&d_slots)
+                .arg(&d_off)
+                .arg(&d_tok)
+                .arg(&stride)
+                .arg(&rows_i)
+                .arg(&bpr_i)
+                .arg(&mut d_out)
+                .arg(&experts_i)
+                .arg(&tile_i);
+            unsafe { b.launch(cfg) }.unwrap();
+        }
+        let mut got = vec![0f32; assignments * rows];
+        k.stream.memcpy_dtoh(&d_out, &mut got).unwrap();
+        k.ctx.synchronize().unwrap();
+
+        let mut d_helper = k.stream.alloc_zeros::<f32>(assignments * rows).unwrap();
+        super::launch_q4_1_gemm_routed(
+            &k.stream,
+            &k.q4_1_gemm_routed,
+            &d_s,
+            &d_q,
+            &d_w,
+            &d_slots,
+            &d_off,
+            &d_tok,
+            per_slot,
+            rows,
+            bpr,
+            experts,
+            max_count,
+            false,
+            &mut d_helper,
+        )
+        .unwrap();
+        let mut helper = vec![0f32; assignments * rows];
+        k.stream.memcpy_dtoh(&d_helper, &mut helper).unwrap();
+        k.ctx.synchronize().unwrap();
+        assert_same_bits("Q4_1 routed launch helper", &helper, &reference);
+
+        let mismatches = got
+            .iter()
+            .zip(&reference)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        assert_eq!(
+            mismatches,
+            0,
+            "q4_1_gemm_routed must be BITWISE identical to per-assignment q4_1_gemv_routed \
+             (rows {rows}, blocks/row {bpr}): {mismatches}/{} outputs differ",
+            got.len()
+        );
+        assert!(
+            reference.iter().any(|v| *v != 0.0),
+            "degenerate fixture: the reference produced all zeros"
+        );
+    }
+}
+
+/// The 32-block low-shared A/B must remain bitwise identical to the current
+/// production routed GEMM at narrow, common, and maximum verifier widths. Cover
+/// Q4_0 gate_up and both down formats at their real 26B-A4B contractions; K14
+/// also crosses the launcher's nine-assignment tile boundary.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn q4_gemm_routed_chunked_matches_production_k1_k8_k14_bitwise() {
+    let Some(k) = kernels() else {
+        return;
+    };
+    let max_tokens = crate::gemma4_runtime::MAX_MTP_VERIFY_ROWS;
+    assert_eq!(max_tokens, 14, "test cases pin the production verifier cap");
+
+    for (q4_1, rows, bpr, seed, label) in [
+        (false, 1408usize, 88usize, 0x40_c8_14u64, "Q4_0 gate_up"),
+        (false, 2816usize, 22usize, 0x40_d0_14u64, "Q4_0 down"),
+        (true, 2816usize, 22usize, 0x41_d0_14u64, "Q4_1 down"),
+    ] {
+        let kdim = bpr * 32;
+        let mut rng = Lcg(seed);
+        let wire = if q4_1 {
+            synth_q4_1_wire(rows, bpr, &mut rng)
+        } else {
+            synth_q4_0_wire(rows, bpr, &mut rng)
+        };
+        let mut in_scales = vec![0f32; max_tokens * bpr];
+        let mut in_quants = vec![0i8; max_tokens * kdim];
+        for t in 0..max_tokens {
+            let act: Vec<f32> = (0..kdim).map(|_| rng.next_f32()).collect();
+            let q8 = crate::inference::quantize_q8_0_blocks(&act);
+            for (b, block) in q8.iter().enumerate() {
+                in_scales[t * bpr + b] = block.scale;
+                in_quants[t * kdim + b * 32..t * kdim + (b + 1) * 32]
+                    .copy_from_slice(&block.quants);
+            }
+        }
+
+        let d_s = k.stream.clone_htod(&in_scales).unwrap();
+        let d_q = k.stream.clone_htod(&in_quants).unwrap();
+        let d_w = k.stream.clone_htod(&wire).unwrap();
+        let slots = [0i32];
+        let d_slots = k.stream.clone_htod(&slots).unwrap();
+        for width in [1usize, 8, max_tokens] {
+            let token_offsets = [0i32, width as i32];
+            let token_ids = (0..width as i32).collect::<Vec<_>>();
+            let d_offsets = k.stream.clone_htod(&token_offsets).unwrap();
+            let d_tokens = k.stream.clone_htod(&token_ids).unwrap();
+            let mut d_production = k.stream.alloc_zeros::<f32>(width * rows).unwrap();
+            let mut d_chunked = k.stream.alloc_zeros::<f32>(width * rows).unwrap();
+            if q4_1 {
+                super::launch_q4_1_gemm_routed(
+                    &k.stream,
+                    &k.q4_1_gemm_routed,
+                    &d_s,
+                    &d_q,
+                    &d_w,
+                    &d_slots,
+                    &d_offsets,
+                    &d_tokens,
+                    wire.len(),
+                    rows,
+                    bpr,
+                    1,
+                    width,
+                    false,
+                    &mut d_production,
+                )
+                .unwrap();
+                super::launch_q4_1_gemm_routed(
+                    &k.stream,
+                    &k.q4_1_gemm_routed_chunked,
+                    &d_s,
+                    &d_q,
+                    &d_w,
+                    &d_slots,
+                    &d_offsets,
+                    &d_tokens,
+                    wire.len(),
+                    rows,
+                    bpr,
+                    1,
+                    width,
+                    true,
+                    &mut d_chunked,
+                )
+                .unwrap();
+            } else {
+                super::launch_q4_0_gemm_routed(
+                    &k.stream,
+                    &k.q4_0_gemm_routed,
+                    &d_s,
+                    &d_q,
+                    &d_w,
+                    &d_slots,
+                    &d_offsets,
+                    &d_tokens,
+                    wire.len(),
+                    rows,
+                    bpr,
+                    1,
+                    width,
+                    false,
+                    &mut d_production,
+                )
+                .unwrap();
+                super::launch_q4_0_gemm_routed(
+                    &k.stream,
+                    &k.q4_0_gemm_routed_chunked,
+                    &d_s,
+                    &d_q,
+                    &d_w,
+                    &d_slots,
+                    &d_offsets,
+                    &d_tokens,
+                    wire.len(),
+                    rows,
+                    bpr,
+                    1,
+                    width,
+                    true,
+                    &mut d_chunked,
+                )
+                .unwrap();
+            }
+            let mut production = vec![0f32; width * rows];
+            let mut chunked = vec![0f32; width * rows];
+            k.stream
+                .memcpy_dtoh(&d_production, &mut production)
+                .unwrap();
+            k.stream.memcpy_dtoh(&d_chunked, &mut chunked).unwrap();
+            k.ctx.synchronize().unwrap();
+            assert_same_bits(
+                &format!("{label} chunked vs production K={width}"),
+                &chunked,
+                &production,
+            );
+            assert!(
+                production.iter().any(|value| *value != 0.0),
+                "degenerate {label} K={width} fixture produced only zeros"
+            );
+        }
+    }
+}
+
+/// Routed GEMMs emit expert-major CSR assignment rows, but Gemma's exact MoE
+/// sum is token-major and router-rank ordered. Exercise the maximum planned
+/// verifier width with experts reused across tokens and a deliberately scrambled
+/// mapping, then compare bit-for-bit with the shipped rank-by-rank scaled-AXPY.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn moe_weighted_sum_batched_maps_csr_assignments_in_router_order_bitwise() {
+    let Some(k) = kernels() else {
+        return;
+    };
+    let k_tokens = 15usize;
+    let route_count = 8usize;
+    let expert_count = 32usize;
+    let hidden = 2816usize;
+    let assignments = k_tokens * route_count;
+
+    // Every token selects eight distinct experts, while the same experts recur
+    // across tokens. Grouping by expert produces the CSR assignment order that
+    // the routed GEMMs write, which is intentionally not router order.
+    let mut experts_by_route = vec![0usize; assignments];
+    for token in 0..k_tokens {
+        for route in 0..route_count {
+            experts_by_route[token * route_count + route] = (route * 7 + token * 3) % expert_count;
+        }
+        let mut one_token =
+            experts_by_route[token * route_count..(token + 1) * route_count].to_vec();
+        one_token.sort_unstable();
+        one_token.dedup();
+        assert_eq!(
+            one_token.len(),
+            route_count,
+            "fixture must not repeat an expert within one token"
+        );
+    }
+    assert!(
+        (0..expert_count).any(|expert| {
+            (0..k_tokens)
+                .filter(|token| {
+                    experts_by_route[*token * route_count..(*token + 1) * route_count]
+                        .contains(&expert)
+                })
+                .count()
+                > 1
+        }),
+        "fixture must reuse experts across different tokens"
+    );
+
+    let mut route_to_assignment = vec![-1i32; assignments];
+    let mut assignment_experts = Vec::with_capacity(assignments);
+    for expert in 0..expert_count {
+        for token in 0..k_tokens {
+            for route in 0..route_count {
+                let router_index = token * route_count + route;
+                if experts_by_route[router_index] == expert {
+                    route_to_assignment[router_index] = assignment_experts.len() as i32;
+                    assignment_experts.push(expert);
+                }
+            }
+        }
+    }
+    assert_eq!(assignment_experts.len(), assignments);
+    let mut checked_map = route_to_assignment.clone();
+    checked_map.sort_unstable();
+    assert_eq!(
+        checked_map,
+        (0..assignments as i32).collect::<Vec<_>>(),
+        "every router position must name one unique, in-range assignment row"
+    );
+    assert_ne!(
+        route_to_assignment,
+        (0..assignments as i32).collect::<Vec<_>>(),
+        "fixture must exercise a non-identity assignment mapping"
+    );
+
+    let mut rng = Lcg(0x4d_4f_45_4b_31_35);
+    let mut expert_y = vec![0f32; assignments * hidden];
+    for (assignment, expert) in assignment_experts.iter().copied().enumerate() {
+        for i in 0..hidden {
+            expert_y[assignment * hidden + i] = rng.next_f32()
+                * (1.0 + expert as f32 / expert_count as f32)
+                + (i % 17) as f32 * 0.000_31;
+        }
+    }
+    let route_scales: Vec<f32> = (0..assignments)
+        .map(|index| 0.0125 + (index % route_count) as f32 * 0.017 + rng.next_f32().abs() * 0.01)
+        .collect();
+
+    let d_y = k.stream.clone_htod(&expert_y).unwrap();
+    let mut scalar = vec![0f32; k_tokens * hidden];
+    let cfg = LaunchConfig {
+        grid_dim: ((hidden as u32).div_ceil(256), 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let hidden_i = hidden as i32;
+    for token in 0..k_tokens {
+        let mut d_acc = k.stream.alloc_zeros::<f32>(hidden).unwrap();
+        for route in 0..route_count {
+            let router_index = token * route_count + route;
+            let assignment = route_to_assignment[router_index] as usize;
+            let y = d_y.slice(assignment * hidden..(assignment + 1) * hidden);
+            let scale = route_scales[router_index];
+            let mut b = k.stream.launch_builder(&k.scaled_axpy);
+            b.arg(&mut d_acc).arg(&y).arg(&scale).arg(&hidden_i);
+            unsafe { b.launch(cfg) }.unwrap();
+        }
+        k.stream
+            .memcpy_dtoh(&d_acc, &mut scalar[token * hidden..(token + 1) * hidden])
+            .unwrap();
+    }
+
+    let d_map = k.stream.clone_htod(&route_to_assignment).unwrap();
+    let d_scales = k.stream.clone_htod(&route_scales).unwrap();
+    let mut d_out = k.stream.alloc_zeros::<f32>(k_tokens * hidden).unwrap();
+    super::launch_moe_weighted_sum_batched(
+        &k.stream,
+        &k.moe_weighted_sum_batched,
+        &d_y,
+        &d_map,
+        &d_scales,
+        &mut d_out,
+        hidden,
+        k_tokens,
+        route_count,
+    )
+    .unwrap();
+    let mut batched = vec![0f32; k_tokens * hidden];
+    k.stream.memcpy_dtoh(&d_out, &mut batched).unwrap();
+    k.ctx.synchronize().unwrap();
+
+    assert_same_bits(
+        "mapped K-wide MoE weighted sum vs router-order scaled AXPY",
+        &batched,
+        &scalar,
+    );
+    assert!(
+        scalar.iter().any(|value| *value != 0.0),
+        "degenerate mapped MoE fixture produced only zeros"
+    );
 }

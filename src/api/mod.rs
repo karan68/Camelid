@@ -8753,20 +8753,20 @@ fn gemma4_cuda_enabled() -> bool {
     crate::execution_plan::gemma4_cuda_lane_selectable()
 }
 
-/// Ghost-MoE CUDA remains an explicit experimental opt-in until the exact 26B
-/// row has a committed Windows parity receipt. The ordinary host-wide CUDA
-/// policy still has to admit the device after this narrow gate is enabled.
+/// Route Gemma 4 Ghost-MoE through the CUDA-resident decode engine.
+/// Enabled by default whenever CUDA decode is available; opt out with
+/// `CAMELID_GEMMA4_GHOST_CUDA=0`.
 #[cfg(feature = "cuda")]
 fn gemma4_ghost_cuda_enabled(catalog_managed: bool) -> bool {
-    let enabled = std::env::var("CAMELID_GEMMA4_GHOST_CUDA")
+    let disabled = std::env::var("CAMELID_GEMMA4_GHOST_CUDA")
         .ok()
         .is_some_and(|value| {
             matches!(
                 value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "on" | "yes" | "enabled"
+                "0" | "false" | "off" | "no" | "disabled"
             )
         });
-    (enabled || catalog_managed) && gemma4_cuda_enabled()
+    (catalog_managed || !disabled) && gemma4_cuda_enabled()
 }
 
 /// Per-file VRAM fit check for the gemma4 CUDA-resident lane.
@@ -9932,9 +9932,15 @@ mod gemma4_template_tests {
     }
 }
 
-/// Test-only re-export of the gemma4 marker renderer (the template-shapes
-/// integration test asserts byte parity against the committed reference pack).
-pub fn gemma4_chat_prompt_for_tests(messages: &[ChatMessage], thinking: bool) -> String {
+/// The gemma4 marker renderer, exposed as the ONE way anything outside the serve lane
+/// may template a gemma4 chat prompt.
+///
+/// The template-shapes integration test asserts byte parity against the committed
+/// reference pack through here, and the offline MTP harness
+/// (`gemma4-cuda-generate --request-json`) renders through here too — an offline
+/// throughput number is only comparable to a served one if both walked the same
+/// renderer, and a second copy of this logic would silently drift.
+pub fn render_gemma4_chat_prompt(messages: &[ChatMessage], thinking: bool) -> String {
     gemma4_chat_prompt(messages, thinking)
 }
 

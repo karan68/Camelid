@@ -1,0 +1,113 @@
+{
+    "armA":  "mmap",
+    "armB":  "pread",
+    "armAExe":  ".\\target\\release\\camelid.exe",
+    "armBExe":  ".\\target\\release\\camelid.exe",
+    "armAEnv":  {
+                    "CAMELID_GHOST_MMAP_READS":  "1",
+                    "CAMELID_GEMMA4_GHOST_TIER_PREFILL":  "1",
+                    "CAMELID_GEMMA4_CUDA_BATCH_EXPERT_COPIES":  "1",
+                    "CAMELID_GEMMA4_SPECULATIVE":  "0"
+                },
+    "armBEnv":  {
+                    "CAMELID_GEMMA4_GHOST_TIER_PREFILL":  "1",
+                    "CAMELID_GEMMA4_CUDA_BATCH_EXPERT_COPIES":  "1",
+                    "CAMELID_GEMMA4_SPECULATIVE":  "0"
+                },
+    "prompt":  "The capital of France is",
+    "maxTokens":  128,
+    "expertCacheMib":  64,
+    "pairsRequested":  3,
+    "pairsKept":  3,
+    "meanDeltaPct":  -13.019512046476914,
+    "pairSdPct":  8.75639897952414,
+    "positivePairs":  0,
+    "tokenIdentity":  true,
+    "counterIdentity":  true,
+    "runs":  [
+                 {
+                     "Arm":  "mmap",
+                     "Index":  1,
+                     "AllTps":  16.94,
+                     "SteadyTps":  19.56,
+                     "WallSec":  7.495,
+                     "PreTempC":  50,
+                     "PreClock":  210,
+                     "FreeRam":  8264,
+                     "TokenHash":  "65FA55A4CA3C9422",
+                     "Hits":  28010,
+                     "Misses":  3910,
+                     "Log":  ".\\qa\\perf\\receipts\\arm-mmap-01.log"
+                 },
+                 {
+                     "Arm":  "pread",
+                     "Index":  1,
+                     "AllTps":  19.33,
+                     "SteadyTps":  18.98,
+                     "WallSec":  6.571,
+                     "PreTempC":  52,
+                     "PreClock":  210,
+                     "FreeRam":  8595,
+                     "TokenHash":  "65FA55A4CA3C9422",
+                     "Hits":  28010,
+                     "Misses":  3910,
+                     "Log":  ".\\qa\\perf\\receipts\\arm-pread-01.log"
+                 },
+                 {
+                     "Arm":  "mmap",
+                     "Index":  2,
+                     "AllTps":  21.41,
+                     "SteadyTps":  22.78,
+                     "WallSec":  5.93,
+                     "PreTempC":  52,
+                     "PreClock":  210,
+                     "FreeRam":  8597,
+                     "TokenHash":  "65FA55A4CA3C9422",
+                     "Hits":  28010,
+                     "Misses":  3910,
+                     "Log":  ".\\qa\\perf\\receipts\\arm-mmap-02.log"
+                 },
+                 {
+                     "Arm":  "pread",
+                     "Index":  2,
+                     "AllTps":  19.32,
+                     "SteadyTps":  18.88,
+                     "WallSec":  6.572,
+                     "PreTempC":  52,
+                     "PreClock":  210,
+                     "FreeRam":  8597,
+                     "TokenHash":  "65FA55A4CA3C9422",
+                     "Hits":  28010,
+                     "Misses":  3910,
+                     "Log":  ".\\qa\\perf\\receipts\\arm-pread-02.log"
+                 },
+                 {
+                     "Arm":  "mmap",
+                     "Index":  3,
+                     "AllTps":  21.48,
+                     "SteadyTps":  22.98,
+                     "WallSec":  5.912,
+                     "PreTempC":  52,
+                     "PreClock":  210,
+                     "FreeRam":  8598,
+                     "TokenHash":  "65FA55A4CA3C9422",
+                     "Hits":  28010,
+                     "Misses":  3910,
+                     "Log":  ".\\qa\\perf\\receipts\\arm-mmap-03.log"
+                 },
+                 {
+                     "Arm":  "pread",
+                     "Index":  3,
+                     "AllTps":  19,
+                     "SteadyTps":  18.62,
+                     "WallSec":  6.685,
+                     "PreTempC":  52,
+                     "PreClock":  210,
+                     "FreeRam":  8552,
+                     "TokenHash":  "65FA55A4CA3C9422",
+                     "Hits":  28010,
+                     "Misses":  3910,
+                     "Log":  ".\\qa\\perf\\receipts\\arm-pread-03.log"
+                 }
+             ]
+}

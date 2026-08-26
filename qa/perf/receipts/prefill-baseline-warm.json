@@ -1,0 +1,52 @@
+{
+    "label":  "baseline",
+    "coldCache":  false,
+    "maxTokens":  8,
+    "expertCacheMib":  64,
+    "rows":  [
+                 {
+                     "Case":  "tiny",
+                     "Rep":  1,
+                     "PreTempC":  47,
+                     "PromptTokens":  32,
+                     "PrefillSec":  9.2,
+                     "PrefillTokPerSec":  3.48,
+                     "Misses":  2661,
+                     "MissesPerToken":  83.2,
+                     "Log":  ".\\qa\\perf\\receipts\\prefill-baseline-tiny-1.log"
+                 },
+                 {
+                     "Case":  "small",
+                     "Rep":  1,
+                     "PreTempC":  52,
+                     "PromptTokens":  92,
+                     "PrefillSec":  10.55,
+                     "PrefillTokPerSec":  8.72,
+                     "Misses":  6117,
+                     "MissesPerToken":  66.5,
+                     "Log":  ".\\qa\\perf\\receipts\\prefill-baseline-small-1.log"
+                 },
+                 {
+                     "Case":  "medium",
+                     "Rep":  1,
+                     "PreTempC":  52,
+                     "PromptTokens":  362,
+                     "PrefillSec":  42.67,
+                     "PrefillTokPerSec":  8.48,
+                     "Misses":  24191,
+                     "MissesPerToken":  66.8,
+                     "Log":  ".\\qa\\perf\\receipts\\prefill-baseline-medium-1.log"
+                 },
+                 {
+                     "Case":  "large",
+                     "Rep":  1,
+                     "PreTempC":  52,
+                     "PromptTokens":  1442,
+                     "PrefillSec":  159.28,
+                     "PrefillTokPerSec":  9.05,
+                     "Misses":  100220,
+                     "MissesPerToken":  69.5,
+                     "Log":  ".\\qa\\perf\\receipts\\prefill-baseline-large-1.log"
+                 }
+             ]
+}

@@ -1,0 +1,12 @@
+{
+  "description": "Plain decode with the installed-RAM tier cap forced back to a fifth (CAMELID_GEMMA4_GHOST_HOST_TIER_MAX_MIB=3224) -- the behaviour before the cap became regime-dependent. The control for the capacity-cliff change: the tier is a victim cache for the VRAM arena, re-fetches arrive ~990 intervening misses after eviction, and a fifth sizes it at 974 records, stranded just under the reuse distance it exists to span. If this arm ever wins, the quarter is too big.",
+  "mtp": false,
+  "draft_k": 0,
+  "env": {
+    "CAMELID_GEMMA4_CUDA_BATCH_EXPERT_COPIES": "1",
+    "CAMELID_GEMMA4_PREFILL_CHUNK_TOKENS": "512",
+    "CAMELID_GEMMA4_Q4_0_SOA": "1",
+    "CAMELID_GEMMA4_SPECULATIVE": "0",
+    "CAMELID_GEMMA4_GHOST_HOST_TIER_MAX_MIB": "3224"
+  }
+}

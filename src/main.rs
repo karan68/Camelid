@@ -2339,6 +2339,35 @@ enum Command {
         prompt: String,
         #[arg(long, default_value_t = 24)]
         max_tokens: usize,
+        /// Hugging Face directory of the Gemma 4 MTP assistant (the drafter). When set,
+        /// decode runs lossless speculative rounds: the drafter proposes, the target
+        /// verifies the whole batch in ONE weight pass, and only the target's own argmax
+        /// is ever emitted -- so this changes speed, never output.
+        #[arg(long)]
+        mtp_assistant: Option<PathBuf>,
+        /// Maximum draft tokens proposed per verify round. The default-off
+        /// `CAMELID_GEMMA4_MTP_WIDTH_SCHEDULE` instead names verifier widths
+        /// (current target row plus drafts), each bounded by this value plus one.
+        #[arg(long, default_value_t = 8)]
+        mtp_draft_k: usize,
+        /// OpenAI-shaped chat request to run instead of `--prompt`, templated through the
+        /// SAME renderer `/v1/chat/completions` uses. This is how an offline throughput
+        /// number stays comparable to a served one: a hand-built prompt string differs
+        /// from the served prompt by exactly the template, and then the token ids do not
+        /// match anyone's. The request must ask for greedy decoding; `max_tokens` in the
+        /// file wins over `--max-tokens`.
+        #[arg(long)]
+        request_json: Option<PathBuf>,
+        /// JSON array of the token ids this run is expected to emit. Turns the run into a
+        /// gate: the receipt records `exact_match` and the first divergence, and the
+        /// process exits non-zero on a mismatch. A tok/s number without this is not a
+        /// result.
+        #[arg(long)]
+        expect_token_ids: Option<PathBuf>,
+        /// Write a machine-readable receipt (ids, walls, alpha, expert misses, and the
+        /// per-round draft-vs-target trace) to this path.
+        #[arg(long)]
+        receipt: Option<PathBuf>,
     },
     /// Generate text with a Gemma 4 model on the GPU (resident decode; macOS/Metal).
     Gemma4GenerateGpu {
@@ -2953,6 +2982,447 @@ enum Command {
         #[arg(long, value_name = "PATH")]
         output: Option<PathBuf>,
     },
+}
+
+/// Counts reported by the CUDA Gemma 4 development benchmark.
+///
+/// These are deliberately separate: the timed runtime currently exposes one
+/// duration per decode forward, while its returned ID list contains tokens
+/// emitted from both prefill logits and decode logits. Treating either count as
+/// the other can overstate throughput (and hides generation-budget bugs).
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Gemma4CudaBenchmarkCounts {
+    requested_new_tokens: usize,
+    emitted_non_stop_tokens: usize,
+    timed_decode_forwards: usize,
+}
+
+#[cfg(feature = "cuda")]
+impl Gemma4CudaBenchmarkCounts {
+    fn new(
+        requested_new_tokens: usize,
+        emitted_non_stop_tokens: usize,
+        timed_decode_forwards: usize,
+    ) -> Self {
+        Self {
+            requested_new_tokens,
+            emitted_non_stop_tokens,
+            timed_decode_forwards,
+        }
+    }
+
+    fn emitted_budget_is_respected(self) -> bool {
+        self.emitted_non_stop_tokens <= self.requested_new_tokens
+    }
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod gemma4_cuda_benchmark_tests {
+    use super::Gemma4CudaBenchmarkCounts;
+
+    #[test]
+    fn accounting_does_not_conflate_emitted_tokens_with_decode_forwards() {
+        let counts = Gemma4CudaBenchmarkCounts::new(8, 9, 8);
+        assert_eq!(counts.requested_new_tokens, 8);
+        assert_eq!(counts.emitted_non_stop_tokens, 9);
+        assert_eq!(counts.timed_decode_forwards, 8);
+        assert!(!counts.emitted_budget_is_respected());
+    }
+
+    #[test]
+    fn early_stop_can_emit_fewer_tokens_than_requested() {
+        let counts = Gemma4CudaBenchmarkCounts::new(8, 3, 3);
+        assert!(counts.emitted_budget_is_respected());
+    }
+}
+
+/// The subset of an OpenAI chat request the offline gemma4 harness honors.
+///
+/// Deliberately strict. This exists so that a local `gemma4-cuda-generate` run and a
+/// served `/v1/chat/completions` run decode the SAME ids from the SAME prompt bytes.
+/// Anything in the request that would break that equivalence is rejected rather than
+/// quietly ignored: a receipt that silently dropped `temperature: 0.7` would report a
+/// comparable-looking number for an incomparable run.
+#[cfg(feature = "cuda")]
+#[derive(serde::Deserialize)]
+struct Gemma4HarnessRequest {
+    messages: Vec<Gemma4HarnessMessage>,
+    #[serde(default)]
+    max_tokens: Option<usize>,
+    #[serde(default)]
+    temperature: Option<f64>,
+    #[serde(default)]
+    top_k: Option<i64>,
+    #[serde(default)]
+    camelid_enable_thinking: Option<bool>,
+}
+
+#[cfg(feature = "cuda")]
+#[derive(serde::Deserialize)]
+struct Gemma4HarnessMessage {
+    role: String,
+    /// Plain-string content only. The OpenAI content-parts form is a served-lane
+    /// feature; a fixture using it would reach the model through a different path than
+    /// this one, which is exactly what this harness exists to rule out.
+    content: String,
+}
+
+/// Render a harness request into `(prompt, max_tokens)` through the serve lane's own
+/// template.
+///
+/// Errors on anything non-greedy. This lane implements argmax decoding only, so running
+/// a sampling request here would silently measure a different decode than the one the
+/// fixture describes.
+#[cfg(feature = "cuda")]
+fn gemma4_harness_request(
+    path: &std::path::Path,
+    fallback_max_tokens: usize,
+) -> anyhow::Result<(String, usize)> {
+    let raw = std::fs::read_to_string(path)
+        .map_err(|error| anyhow::anyhow!("reading {}: {error}", path.display()))?;
+    let request: Gemma4HarnessRequest = serde_json::from_str(&raw)
+        .map_err(|error| anyhow::anyhow!("parsing {}: {error}", path.display()))?;
+    anyhow::ensure!(
+        !request.messages.is_empty(),
+        "{} has no messages",
+        path.display()
+    );
+    if let Some(temperature) = request.temperature {
+        anyhow::ensure!(
+            temperature == 0.0,
+            "{} asks for temperature {temperature}; this lane decodes greedily only, so \
+             the measured run would not be the one the request describes",
+            path.display()
+        );
+    }
+    if let Some(top_k) = request.top_k {
+        anyhow::ensure!(
+            top_k == 1,
+            "{} asks for top_k {top_k}; this lane decodes greedily only",
+            path.display()
+        );
+    }
+    let messages: Vec<camelid::api::ChatMessage> = request
+        .messages
+        .into_iter()
+        .map(|message| camelid::api::ChatMessage {
+            role: message.role,
+            content: message.content,
+            image_urls: Vec::new(),
+            unsupported_content_parts: Vec::new(),
+        })
+        .collect();
+    let prompt = camelid::api::render_gemma4_chat_prompt(
+        &messages,
+        request.camelid_enable_thinking.unwrap_or(false),
+    );
+    Ok((
+        prompt,
+        request.max_tokens.unwrap_or(fallback_max_tokens).max(1),
+    ))
+}
+
+/// Read a JSON array of expected token ids.
+#[cfg(feature = "cuda")]
+fn gemma4_harness_expected(path: &std::path::Path) -> anyhow::Result<Vec<u32>> {
+    let raw = std::fs::read_to_string(path)
+        .map_err(|error| anyhow::anyhow!("reading {}: {error}", path.display()))?;
+    serde_json::from_str(&raw)
+        .map_err(|error| anyhow::anyhow!("parsing {}: {error}", path.display()))
+}
+
+#[cfg(feature = "cuda")]
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// One measured gemma4 harness run, and the receipt it writes.
+#[cfg(feature = "cuda")]
+struct Gemma4HarnessRun<'a> {
+    request_path: Option<&'a std::path::Path>,
+    model: &'a std::path::Path,
+    cghost: Option<&'a std::path::Path>,
+    prompt: &'a str,
+    prompt_tokens: usize,
+    max_tokens: usize,
+    /// `None` for the plain lane, `Some(k)` for a speculative run.
+    draft_k: Option<usize>,
+    ids: &'a [u32],
+    text: &'a str,
+    expected: Option<&'a [u32]>,
+    load_secs: f64,
+    /// Whole generate call, prefill included — the number a user feels.
+    generate_secs: f64,
+    /// Generate minus prefill. Reported separately because the two lanes are only
+    /// comparable on decode: MTP and plain share a prefill, so folding it in dilutes
+    /// exactly the difference under test.
+    decode_only_secs: f64,
+    stats: Option<&'a camelid::gemma4_runtime::Gemma4MtpStats>,
+    /// `(hits, misses, resident, capacity)` from the expert cache, lifetime since load.
+    sser: Option<(u64, u64, usize, usize)>,
+    /// `(hits, misses)` as of the end of prefill. Lifetime totals are dominated by the
+    /// prompt sweep -- a layer-major prefill touches most of the 12 GiB payload once --
+    /// so decode traffic is only visible as the difference.
+    sser_prefill: (u64, u64),
+    /// Host expert tier `(hits, storage reads)`, lifetime and at the prefill boundary.
+    tier: (u64, u64),
+    tier_prefill: (u64, u64),
+    tier_eviction_policy: Option<&'static str>,
+    tier_residency_prefill: Option<camelid::gemma4_runtime::Gemma4SserHostResidency>,
+    tier_residency_end: Option<camelid::gemma4_runtime::Gemma4SserHostResidency>,
+    /// Throughput over the second half of the decode forwards, past the arena warm-up.
+    ///
+    /// Layer-major prefill leaves the expert arena holding the LAST layer's union, so
+    /// decode has to re-accumulate a cross-layer working set. On a 48-token request that
+    /// warm-up covers half the run, which makes the whole-run average say more about the
+    /// handoff from prefill than about how fast the lane decodes.
+    steady_tokens_per_second: Option<f64>,
+}
+
+#[cfg(feature = "cuda")]
+impl Gemma4HarnessRun<'_> {
+    /// `(exact_match, first_divergence)` against the expectation, or `(true, None)` when
+    /// the run was not gated. A length difference counts as a divergence at the shorter
+    /// length, so a truncated run cannot pass by being a prefix.
+    fn verdict(&self) -> (bool, Option<usize>) {
+        let Some(expected) = self.expected else {
+            return (true, None);
+        };
+        let divergence = self
+            .ids
+            .iter()
+            .zip(expected)
+            .position(|(got, want)| got != want)
+            .or_else(|| {
+                (self.ids.len() != expected.len()).then_some(self.ids.len().min(expected.len()))
+            });
+        (divergence.is_none(), divergence)
+    }
+
+    fn receipt(&self) -> serde_json::Value {
+        let (exact_match, divergence) = self.verdict();
+        let kwide_rounds = self.stats.map_or(0, |stats| {
+            stats.trace.iter().filter(|round| round.kwide).count() as u64
+        });
+        let cuda_assistant_rounds = self.stats.map_or(0, |stats| {
+            stats
+                .trace
+                .iter()
+                .filter(|round| round.cuda_assistant)
+                .count() as u64
+        });
+        let rounds = self.stats.map(|stats| {
+            stats
+                .trace
+                .iter()
+                .map(|round| {
+                    serde_json::json!({
+                        "position": round.position,
+                        "bonus_token": round.bonus_token,
+                        "requested_verify_k": round.requested_verify_k,
+                        "verifier_k": round.verifier_k,
+                        "budget_truncated": round.budget_truncated,
+                        "drafts": round.drafts,
+                        "target": round.target,
+                        "accepted": round.accepted,
+                        "assistant_ms": round.assistant_ns as f64 / 1e6,
+                        "verify_ms": round.verify_ns as f64 / 1e6,
+                        "misses": round.misses,
+                        // Backward-compatible v1 alias. This was historically described as
+                        // storage, but it has always counted VRAM-arena misses.
+                        "miss_mib": round.misses as f64 * 3.19,
+                        "arena_miss_mib": round.misses as f64 * 3.19,
+                        // A VRAM miss served by the pinned host tier never reaches disk.
+                        // Keep actual storage traffic separate so the per-round trace can
+                        // answer whether verification is I/O- or compute-bound.
+                        "storage_reads": round.storage_reads,
+                        "storage_mib": round.storage_reads as f64 * 3.19,
+                        "kwide": round.kwide,
+                        "cuda_assistant": round.cuda_assistant,
+                    })
+                })
+                .collect::<Vec<_>>()
+        });
+        serde_json::json!({
+            "schema": "camelid.gemma4.harness.v1",
+            "unix_time": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or_default(),
+            "lane": if self.draft_k.is_some() { "mtp" } else { "plain" },
+            "request_json": self.request_path.map(|p| p.display().to_string()),
+            "model": self.model.display().to_string(),
+            "cghost": self.cghost.map(|p| p.display().to_string()),
+            // The prompt hash is the proof that templating matched: two runs with the
+            // same hash decoded the same bytes, whatever produced them.
+            "prompt_sha256": sha256_hex(self.prompt.as_bytes()),
+            "prompt_tokens": self.prompt_tokens,
+            "max_tokens": self.max_tokens,
+            "draft_k": self.draft_k,
+            "token_ids": self.ids,
+            "text": self.text,
+            "expected_token_ids": self.expected,
+            "exact_match": exact_match,
+            "first_divergence": divergence,
+            "load_secs": self.load_secs,
+            "generate_secs": self.generate_secs,
+            "decode_only_secs": self.decode_only_secs,
+            "end_to_end_tokens_per_second": self.ids.len() as f64 / self.generate_secs.max(1e-9),
+            "decode_tokens_per_second": self.ids.len() as f64 / self.decode_only_secs.max(1e-9),
+            "steady_tokens_per_second": self.steady_tokens_per_second,
+            "mtp": self.stats.map(|stats| serde_json::json!({
+                "rounds": stats.rounds,
+                "drafted": stats.drafted,
+                "accepted": stats.accepted,
+                "alpha": stats.alpha(),
+                "acceptance_rate": stats.acceptance_rate(),
+                "prefill_ms": stats.prefill_ns as f64 / 1e6,
+                "assistant_ms": stats.assistant_ns as f64 / 1e6,
+                "verify_ms": stats.verify_ns as f64 / 1e6,
+                "verify_ms_per_round": if stats.rounds > 0 {
+                    stats.verify_ns as f64 / 1e6 / stats.rounds as f64
+                } else {
+                    0.0
+                },
+                "kwide_rounds": kwide_rounds,
+                "cuda_assistant_rounds": cuda_assistant_rounds,
+                "cuda_assistant": stats.cuda_assistant,
+                "cpu_assistant_loaded": !stats.cuda_assistant,
+            })),
+            "expert_cache": self.expert_cache_json(),
+            "rounds": rounds,
+        })
+    }
+
+    /// Expert-cache and host-tier counters for the receipt.
+    ///
+    /// Split out of `receipt` because that whole value is one `json!`, which expands
+    /// recursively -- adding the tier fields inline pushed it past the macro's recursion
+    /// limit. Every derived figure is also computed as a local first: a braced block at a
+    /// `json!` value position is parsed as a nested JSON OBJECT, not as a Rust block, so
+    /// inlining the arithmetic there fails with a confusing "missing tokens" error.
+    fn expert_cache_json(&self) -> Option<serde_json::Value> {
+        let ratio = |hits: u64, misses: u64| -> f64 {
+            if hits + misses > 0 {
+                hits as f64 / (hits + misses) as f64
+            } else {
+                0.0
+            }
+        };
+        let residency_json =
+            |snapshot: Option<camelid::gemma4_runtime::Gemma4SserHostResidency>| {
+                snapshot.map(|snapshot| {
+                    serde_json::json!({
+                        "sser": snapshot.sser_records,
+                        "host": snapshot.host_records,
+                        "intersection": snapshot.intersection_records,
+                        "host_only": snapshot.host_only_records,
+                        "union": snapshot.union_records,
+                    })
+                })
+            };
+        self.sser.map(|(hits, misses, resident, capacity)| {
+            let emitted = self.ids.len().max(1) as f64;
+            let rounds = self.stats.map(|stats| stats.rounds).unwrap_or(0);
+            let (prefill_hits, prefill_misses) = self.sser_prefill;
+            let decode_misses = misses.saturating_sub(prefill_misses);
+            let decode_hits = hits.saturating_sub(prefill_hits);
+            // A layer-major prefill streams most of the payload once, so its tier lookups
+            // are first touches that cannot hit. Mixing them into a lifetime rate makes a
+            // tier decode never benefits from look merely mediocre instead of absent.
+            let tier_decode_hits = self.tier.0.saturating_sub(self.tier_prefill.0);
+            let tier_decode_reads = self.tier.1.saturating_sub(self.tier_prefill.1);
+            // With no tier every arena miss is a disk read; with one, only the tier's own
+            // storage reads are.
+            let decode_storage_reads = if self.tier.0 + self.tier.1 > 0 {
+                tier_decode_reads
+            } else {
+                decode_misses
+            };
+            // Per ROUND is incomparable across lanes, because a round commits one token
+            // plain and `1 + alpha` speculatively. Per committed token is the figure that
+            // answers "did batching change what we read?", so it is emitted for both lanes
+            // and the round figure only where a round exists.
+            let misses_per_round = if rounds > 0 {
+                serde_json::json!(misses as f64 / rounds as f64)
+            } else {
+                serde_json::Value::Null
+            };
+            serde_json::json!({
+                "hits": hits,
+                "misses": misses,
+                "prefill_hits": prefill_hits,
+                "prefill_misses": prefill_misses,
+                "decode_hits": decode_hits,
+                "decode_misses": decode_misses,
+                "decode_misses_per_token": decode_misses as f64 / emitted,
+                "decode_hit_rate": ratio(decode_hits, decode_misses),
+                // A VRAM-arena miss is not necessarily a disk read: with a host tier in
+                // front of storage, 30.7% of them were served from RAM on the measured
+                // run. Report the arena miss and the actual storage read separately --
+                // conflating them overstated decode storage by 1.5 GiB.
+                "decode_storage_reads": decode_storage_reads,
+                "decode_storage_mib": decode_storage_reads as f64 * 3.19,
+                "tier_hits": self.tier.0,
+                "tier_storage_reads": self.tier.1,
+                "tier_decode_hits": tier_decode_hits,
+                "tier_decode_storage_reads": tier_decode_reads,
+                "tier_decode_hit_rate": ratio(tier_decode_hits, tier_decode_reads),
+                "host_tier_eviction_policy": self.tier_eviction_policy,
+                "residency_prefill": residency_json(self.tier_residency_prefill),
+                "residency_end": residency_json(self.tier_residency_end),
+                "misses_per_committed_token": misses as f64 / emitted,
+                "misses_per_round": misses_per_round,
+                "resident_experts": resident,
+                "capacity": capacity,
+            })
+        })
+    }
+
+    /// Write the receipt (when asked) and report the gate to stderr. Returns the
+    /// exact-match verdict so the caller can set the process exit status: a harness that
+    /// prints FAIL and exits 0 is a harness nobody's CI will believe.
+    fn finish(&self, path: Option<&std::path::Path>) -> anyhow::Result<bool> {
+        let (exact_match, divergence) = self.verdict();
+        if let Some(path) = path {
+            if let Some(parent) = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+            {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(path, serde_json::to_vec_pretty(&self.receipt())?)?;
+            eprintln!("[gemma4-harness] receipt -> {}", path.display());
+        }
+        if let Some(expected) = self.expected {
+            if exact_match {
+                eprintln!(
+                    "[gemma4-harness] PASS exact {}/{} token ids",
+                    self.ids.len(),
+                    expected.len()
+                );
+            } else {
+                let at = divergence.unwrap_or(0);
+                eprintln!(
+                    "[gemma4-harness] FAIL: {} ids vs {} expected; first divergence at {at} \
+                     (got {:?}, expected {:?})",
+                    self.ids.len(),
+                    expected.len(),
+                    self.ids.get(at),
+                    expected.get(at),
+                );
+            }
+        }
+        Ok(exact_match)
+    }
 }
 
 #[tokio::main]
@@ -4109,7 +4579,22 @@ async fn main() -> anyhow::Result<()> {
             expert_cache_mib,
             prompt,
             max_tokens,
+            mtp_assistant,
+            mtp_draft_k,
+            request_json,
+            expect_token_ids,
+            receipt,
         } => {
+            // Resolve the fixture BEFORE the model load. A typo in the request file
+            // should cost a parse error, not ten seconds of resident load first.
+            let (prompt, max_tokens) = match request_json.as_deref() {
+                Some(request) => gemma4_harness_request(request, max_tokens)?,
+                None => (prompt, max_tokens),
+            };
+            let expected = expect_token_ids
+                .as_deref()
+                .map(gemma4_harness_expected)
+                .transpose()?;
             eprintln!("[gemma4-cuda] loading resident {}...", path.display());
             let t0 = std::time::Instant::now();
             let mut runtime = match cghost.as_deref() {
@@ -4122,23 +4607,126 @@ async fn main() -> anyhow::Result<()> {
                 )?,
                 None => camelid::gemma4_runtime::Gemma4CudaResident::load(&path, 4096)?,
             };
+            let load_secs = t0.elapsed().as_secs_f64();
             eprintln!(
-                "[gemma4-cuda] resident loaded in {:.1}s; generating {max_tokens} tokens...",
-                t0.elapsed().as_secs_f32()
+                "[gemma4-cuda] resident loaded in {load_secs:.1}s; generating {max_tokens} tokens..."
             );
+            let prompt_tokens = runtime.tokenizer().encode(&prompt, true, true)?.len();
             let t1 = std::time::Instant::now();
+            if let Some(assistant_dir) = mtp_assistant.as_deref() {
+                let t_load = std::time::Instant::now();
+                let cuda_assistant = runtime.try_load_mtp_cuda_assistant(assistant_dir)?;
+                let t_gen = std::time::Instant::now();
+                let (out, ids, stats) = if cuda_assistant {
+                    eprintln!(
+                        "[gemma4-mtp-cuda] assistant loaded in {:.1}s ({} resident bytes, cpu_assistant_loaded=0); drafting K={mtp_draft_k}",
+                        t_load.elapsed().as_secs_f64(),
+                        runtime.mtp_cuda_assistant_resident_bytes().unwrap_or(0),
+                    );
+                    runtime.generate_greedy_mtp_cuda(&prompt, max_tokens, mtp_draft_k)?
+                } else {
+                    eprintln!(
+                        "[gemma4-mtp] loading CPU MTP assistant from {}...",
+                        assistant_dir.display()
+                    );
+                    let assistant = camelid::gemma4_mtp::Gemma4MtpAssistant::load(assistant_dir)?;
+                    eprintln!(
+                        "[gemma4-mtp] CPU assistant loaded in {:.1}s (vocab {}); drafting K={mtp_draft_k}",
+                        t_load.elapsed().as_secs_f64(),
+                        assistant.vocab_size()
+                    );
+                    runtime.generate_greedy_mtp(&prompt, max_tokens, &assistant, mtp_draft_k)?
+                };
+                let wall = t_gen.elapsed().as_secs_f64();
+                eprintln!(
+                    "[gemma4-mtp] generated {} tokens in {:.3}s = {:.2} tok/s",
+                    ids.len(),
+                    wall,
+                    ids.len() as f64 / wall.max(1e-9)
+                );
+                eprintln!(
+                    "[gemma4-mtp] rounds {} | drafted {} | accepted {} | alpha {:.2} | acceptance {:.1}%",
+                    stats.rounds,
+                    stats.drafted,
+                    stats.accepted,
+                    stats.alpha(),
+                    stats.acceptance_rate() * 100.0
+                );
+                eprintln!(
+                    "[gemma4-mtp] prefill {:.0} ms | assistant {:.0} ms | verify {:.0} ms ({:.0} ms/round)",
+                    stats.prefill_ns as f64 / 1e6,
+                    stats.assistant_ns as f64 / 1e6,
+                    stats.verify_ns as f64 / 1e6,
+                    if stats.rounds > 0 {
+                        stats.verify_ns as f64 / 1e6 / stats.rounds as f64
+                    } else {
+                        0.0
+                    },
+                );
+                eprintln!("[gemma4-mtp] token_ids: {ids:?}");
+                println!("{out}");
+                let run = Gemma4HarnessRun {
+                    request_path: request_json.as_deref(),
+                    model: &path,
+                    cghost: cghost.as_deref(),
+                    prompt: &prompt,
+                    prompt_tokens,
+                    max_tokens,
+                    draft_k: Some(mtp_draft_k),
+                    ids: &ids,
+                    text: &out,
+                    expected: expected.as_deref(),
+                    load_secs,
+                    generate_secs: wall,
+                    decode_only_secs: (wall - stats.prefill_ns as f64 / 1e9).max(0.0),
+                    stats: Some(&stats),
+                    sser: runtime.sser_stats(),
+                    sser_prefill: runtime.sser_prefill_mark(),
+                    tier: runtime.host_tier_counters(),
+                    tier_prefill: runtime.host_tier_prefill_mark(),
+                    tier_eviction_policy: runtime.host_tier_eviction_policy(),
+                    tier_residency_prefill: runtime.sser_host_prefill_residency(),
+                    tier_residency_end: runtime.sser_host_residency(),
+                    // Speculative rounds are not per-token forwards, so there is no
+                    // second-half token rate to quote here.
+                    steady_tokens_per_second: None,
+                };
+                if !run.finish(receipt.as_deref())? {
+                    std::process::exit(1);
+                }
+                return Ok(());
+            }
             let (out, ids, per_token) = runtime.generate_greedy_timed(&prompt, max_tokens)?;
-            let gen = t1.elapsed().as_secs_f32();
+            let gen = t1.elapsed().as_secs_f64();
+            let counts = Gemma4CudaBenchmarkCounts::new(max_tokens, ids.len(), per_token.len());
+            let emitted_rate = if gen > 0.0 {
+                counts.emitted_non_stop_tokens as f64 / gen
+            } else {
+                0.0
+            };
             eprintln!(
-                "[gemma4-cuda] generated in {gen:.1}s ({:.2} tok/s overall incl. prefill)",
-                ids.len() as f32 / gen
+                "[gemma4-cuda] generated in {gen:.3}s ({emitted_rate:.2} emitted tok/s end-to-end, incl. prefill)"
             );
-            // Warm-up curve: mean tok/s over successive 8-token windows of decode-only
-            // wall time (excludes prefill). With the SSER cache ON this should accelerate
-            // as the hot experts populate VRAM.
+            eprintln!(
+                "[gemma4-cuda] accounting: requested_new_tokens={}, emitted_non_stop_tokens={}, timed_decode_forwards={}",
+                counts.requested_new_tokens,
+                counts.emitted_non_stop_tokens,
+                counts.timed_decode_forwards,
+            );
+            if !counts.emitted_budget_is_respected() {
+                eprintln!(
+                    "[gemma4-cuda] WARNING: runtime emitted {} non-stop tokens for a {}-token request; decode rates below count timed forwards, not returned IDs",
+                    counts.emitted_non_stop_tokens, counts.requested_new_tokens,
+                );
+            }
+            // Warm-up curve: forward/s over successive 8-forward windows of decode-only
+            // wall time (excludes prefill). This uses exactly the operations represented by
+            // `per_token`, rather than assuming every returned ID owns a decode duration.
             if !per_token.is_empty() {
                 let win = 8usize;
-                eprint!("[gemma4-cuda] warm-up curve (tok/s per {win}-tok window):");
+                eprint!(
+                    "[gemma4-cuda] decode warm-up curve (forwards/s per {win}-forward window):"
+                );
                 let mut i = 0;
                 while i < per_token.len() {
                     let end = (i + win).min(per_token.len());
@@ -4153,28 +4741,70 @@ async fn main() -> anyhow::Result<()> {
                     i = end;
                 }
                 eprintln!();
-                // Steady-state: decode-only tok/s over the SECOND HALF of the tokens
-                // (past warm-up) — the honest cache-warm rate.
+                // Steady-state: decode-forward throughput over the second half of the
+                // measured forwards (past warm-up) — the honest cache-warm rate.
                 let half = per_token.len() / 2;
                 let steady: f64 = per_token[half..].iter().sum();
                 let sn = (per_token.len() - half) as f64;
                 let decode_all: f64 = per_token.iter().sum();
                 eprintln!(
-                    "[gemma4-cuda] decode-only: {:.2} tok/s all, {:.2} tok/s steady (2nd half, {} tok)",
+                    "[gemma4-cuda] decode-only: {:.2} forwards/s all, {:.2} forwards/s steady (2nd half, {} forwards; {:.3}s timed decode wall)",
                     per_token.len() as f64 / decode_all.max(1e-9),
                     sn / steady.max(1e-9),
                     per_token.len() - half,
+                    decode_all,
                 );
             }
-            if let Some((hits, misses, resident, cap)) = runtime.sser_stats() {
+            // Read once: `sser_stats` also emits the SSER profile when it is enabled, and
+            // a second call would print the whole breakdown twice.
+            let sser = runtime.sser_stats();
+            if let Some((hits, misses, resident, cap)) = sser {
                 let total = hits + misses;
                 eprintln!(
-                    "[gemma4-cuda] SSER cache: {hits} hits / {misses} misses = {:.1}% hit-rate; {resident}/{cap} experts resident",
+                    "[gemma4-cuda] SSER cache (lifetime since load): {hits} hits / {misses} misses = {:.1}% hit-rate; {resident}/{cap} experts resident",
                     if total > 0 { 100.0 * hits as f64 / total as f64 } else { 0.0 }
                 );
+                if let Some(streamed) = runtime.sser_streamed_misses() {
+                    eprintln!(
+                        "[gemma4-cuda] SSER frequency admission: {streamed} misses streamed without cache admission"
+                    );
+                }
             }
             eprintln!("[gemma4-cuda] token_ids: {ids:?}");
             println!("{prompt}{out}");
+            let run = Gemma4HarnessRun {
+                request_path: request_json.as_deref(),
+                model: &path,
+                cghost: cghost.as_deref(),
+                prompt: &prompt,
+                prompt_tokens,
+                max_tokens,
+                draft_k: None,
+                ids: &ids,
+                text: &out,
+                expected: expected.as_deref(),
+                load_secs,
+                generate_secs: gen,
+                // `per_token` is the decode-forward wall, so this excludes prefill by
+                // construction rather than by subtracting an estimate.
+                decode_only_secs: per_token.iter().sum(),
+                stats: None,
+                sser,
+                sser_prefill: runtime.sser_prefill_mark(),
+                tier: runtime.host_tier_counters(),
+                tier_prefill: runtime.host_tier_prefill_mark(),
+                tier_eviction_policy: runtime.host_tier_eviction_policy(),
+                tier_residency_prefill: runtime.sser_host_prefill_residency(),
+                tier_residency_end: runtime.sser_host_residency(),
+                steady_tokens_per_second: {
+                    let half = per_token.len() / 2;
+                    let tail: f64 = per_token[half..].iter().sum();
+                    ((per_token.len() - half) as f64 / tail.max(1e-9)).into()
+                },
+            };
+            if !run.finish(receipt.as_deref())? {
+                std::process::exit(1);
+            }
         }
         Command::Gemma4GenerateGpu {
             path,
