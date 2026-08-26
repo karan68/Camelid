@@ -1167,11 +1167,14 @@ pub struct GhostFile {
     ///    scattered offsets being in flight; chopping one contiguous 3.19 MiB span adds
     ///    per-request and fan-out cost with no seek to overlap. Implementation removed.
     ///
-    /// The real fix is therefore at the CALLER, not here: batch a layer's *distinct* missing
-    /// records and issue them together, then stage them. That is invasive — the miss loop
-    /// interleaves per-expert layout validation, transfer-slot assignment and pinned-copy
-    /// bookkeeping with each read — which is why this pool exists but stays at 1: it is the
-    /// prerequisite half, landed and bit-exact, waiting on the caller half.
+    /// The matching scalar-caller transaction now exists behind
+    /// `CAMELID_GEMMA4_GHOST_BATCH_READS`: it reserves distinct page-locked tier slots and
+    /// issues one whole-record read per miss. On the H40 scalar route it was exact but did
+    /// not win (15.72 tok/s, or 15.82 with resident-hit overlap, against the adjacent 16.13
+    /// control) because 899 decode reads over 48 tokens and 30 layers expose fewer than one
+    /// disk miss per layer on average. The pool therefore stays at 1 by default. Its real
+    /// consumer is the K-wide verifier, which can expose as many as 112 distinct assignments
+    /// for a layer before issuing I/O; do not split individual records to manufacture depth.
     #[cfg(windows)]
     uncached: Vec<std::sync::Mutex<UncachedReader>>,
     /// Round-robin start index for pool selection. Relaxed: a stale value only changes which

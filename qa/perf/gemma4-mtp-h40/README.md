@@ -56,6 +56,15 @@ its control; pair bounded-context arms against the matching plain/MTP control.
 | `mtp-k1` | One draft per round. A correctness gate, not a speed arm — it exercises the whole speculative path with a single-position verify batch, so its ids must equal `plain`. |
 | `plain-kv192` | Plain decode with a 192-position f16 KV reservation, matching the Mac fixture's bounded memory lane. It is valid only for requests that fit. |
 | `mtp-k8-kv192` | MTP K=8 under the same 192-position reservation, for a like-for-like bounded comparison. |
+| `plain-kv192-qd4` | Opt-in four-reader distinct-record transaction on the scalar bounded lane. Exact but declined after 15.72 vs 16.13 adjacent-control steady tok/s. |
+| `plain-kv192-qd4-overlap` | Crossed QD4 plus resident-hit overlap probe. Exact but declined at 15.82 steady tok/s. |
+| `mtp-k8-kv192-qd4` | Standing QD4 arm for the MTP lane; useful only once verification exposes a true per-layer K-row union. |
+| `mtp-k8-kv192-kwide-qd4` | Exact, opt-in K-wide CUDA verifier at K=8, with one routed-expert union per layer and four-reader union fills. |
+| `mtp-k8-kv192-kwide-qd4-seeded` | K-wide arm plus request-local final-prefill-hidden seeding, so round zero drafts instead of paying a K=1 bootstrap. |
+| `mtp-k8-kv192-kwide-qd4-router-overlap` | Crossed K-wide probe that moves the batched router DtoH to its own stream while the dense shared branch runs. |
+| `mtp-k8-kv192-kwide-qd8` | Crossed K-wide storage probe with eight unbuffered positioned readers instead of four. |
+| `mtp-k6-kv192-kwide-qd4-seeded-cuda-assistant-host-mru-tier1024-io-q6-anchor-dp4a` | Minimum-memory exact hardware gate for the anchor-major Q6_K DP4A verifier lane. |
+| `mtp-k6-kv192-kwide-qd4-seeded-cuda-assistant-host-mru-tier1024-io-lfu-q6-anchor` | Current safe winner on the 16 GiB Windows host: QD4 I/O, lifetime-LFU VRAM eviction, CUDA assistant, and anchor-major Q6_K DP4A. |
 
 ## What a run produces
 
@@ -82,3 +91,6 @@ defect is target parity; if the drafts follow neither, it is assistant numerics.
 - **`decode_tokens_per_second` excludes prefill; `end_to_end_tokens_per_second` does
   not.** Say which one you are quoting.
 - **A tok/s number without `exact_match: true` is not a result.**
+- **Do not raise the host tier solely to chase a number.** On this 16 GiB box the 2 GiB
+  tier drove live available RAM below 0.8 GiB during load; use the 1 GiB gate unless the
+  admission snapshot has materially more headroom.

@@ -23,6 +23,7 @@ pub mod fit_dims;
 pub mod gait;
 pub mod gemma4_distributed;
 pub mod gemma4_mtp;
+pub mod gemma4_mtp_cuda;
 pub mod gemma4_runtime;
 pub mod gguf;
 pub mod ghost;

@@ -67,6 +67,279 @@ fn router_top_k(probabilities: &[f32], k: usize) -> Vec<usize> {
     selected
 }
 
+#[cfg(test)]
+mod gemma4_mtp_kwide_planner_tests {
+    use super::{
+        gemma4_mtp_kwide_policy, gemma4_mtp_scheduled_verify_width,
+        gemma4_mtp_width_schedule_value, gemma4_plan_route_union, GEMMA4_MTP_ROUTE_COUNT,
+        MAX_MTP_VERIFY_ROWS,
+    };
+
+    #[test]
+    fn opt_in_is_default_off_and_accepts_only_explicit_truthy_values() {
+        for disabled in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("false"),
+            Some("off"),
+            Some("no"),
+            Some("disabled"),
+            Some("garbage"),
+        ] {
+            assert!(!gemma4_mtp_kwide_policy(disabled));
+        }
+        for enabled in ["1", "true", "TRUE", " on ", "yes", "enabled"] {
+            assert!(gemma4_mtp_kwide_policy(Some(enabled)));
+        }
+    }
+
+    #[test]
+    fn union_is_stable_and_duplicate_experts_share_one_csr_group() {
+        let routes = vec![
+            vec![7, 2, 5, 11, 13, 17, 19, 23],
+            vec![2, 7, 29, 31, 13, 37, 41, 43],
+            vec![7, 47, 2, 53, 59, 61, 67, 71],
+        ];
+        let plan = gemma4_plan_route_union(&routes, 128).expect("valid top-8 routes");
+
+        assert_eq!(
+            plan.union_experts,
+            vec![7, 2, 5, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71,]
+        );
+        assert_eq!(
+            plan.token_offsets,
+            vec![0, 3, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24]
+        );
+        assert_eq!(
+            plan.token_ids,
+            vec![
+                0, 1, 2, // expert 7
+                0, 1, 2, // expert 2
+                0, // expert 5
+                0, // expert 11
+                0, 1, // expert 13
+                0, 0, 0, // experts 17, 19, 23
+                1, 1, 1, 1, 1, // experts 29, 31, 37, 41, 43
+                2, 2, 2, 2, 2, 2, // experts 47, 53, 59, 61, 67, 71
+            ]
+        );
+        assert_eq!(
+            plan.route_to_assignment,
+            vec![
+                0, 3, 6, 7, 8, 10, 11, 12, // token 0, router order
+                4, 1, 13, 14, 9, 15, 16, 17, // token 1
+                2, 18, 5, 19, 20, 21, 22, 23, // token 2
+            ]
+        );
+        assert_eq!(plan.max_assignments_per_expert, 3);
+
+        // Every dense router-rank entry names exactly one CSR assignment, with no
+        // accidental holes or duplicates even though experts 7/2/13 span rows.
+        let mut assignments = plan
+            .route_to_assignment
+            .iter()
+            .map(|&assignment| assignment as usize)
+            .collect::<Vec<_>>();
+        assignments.sort_unstable();
+        assert_eq!(
+            assignments,
+            (0..routes.len() * GEMMA4_MTP_ROUTE_COUNT).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn maximum_width_route_union_covers_all_112_assignments() {
+        let routes = (0..MAX_MTP_VERIFY_ROWS)
+            .map(|token| {
+                (0..GEMMA4_MTP_ROUTE_COUNT)
+                    .map(|rank| token * GEMMA4_MTP_ROUTE_COUNT + rank)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let plan = gemma4_plan_route_union(&routes, 128).expect("valid K14 top-8 routes");
+
+        assert_eq!(MAX_MTP_VERIFY_ROWS, 14);
+        assert_eq!(plan.union_experts.len(), 112);
+        assert_eq!(plan.token_ids.len(), 112);
+        assert_eq!(plan.route_to_assignment.len(), 112);
+        assert_eq!(plan.token_offsets.len(), 113);
+        assert_eq!(plan.max_assignments_per_expert, 1);
+    }
+
+    #[test]
+    fn width_schedule_is_default_off_strict_and_bounded_by_the_cli_draft_cap() {
+        assert_eq!(gemma4_mtp_width_schedule_value(None, 14), None);
+        for invalid in [
+            "",
+            "   ",
+            "1",
+            "14,1,14",
+            "14,,14",
+            "14,-1,14",
+            "14,nope,14",
+            "15",
+        ] {
+            assert_eq!(
+                gemma4_mtp_width_schedule_value(Some(invalid), 14),
+                None,
+                "{invalid:?}"
+            );
+        }
+        assert_eq!(
+            gemma4_mtp_width_schedule_value(Some(" 14, 13,14 "), 14),
+            Some(vec![14, 13, 14])
+        );
+        assert_eq!(
+            gemma4_mtp_width_schedule_value(Some("14,13,14"), 13),
+            None,
+            "a verify width may not exceed --mtp-draft-k + 1"
+        );
+    }
+
+    #[test]
+    fn width_schedule_drives_14_13_14_then_falls_back_and_truncates_the_tail() {
+        let schedule = [14, 13, 14];
+        let mut remaining = 48usize;
+        let mut widths = Vec::new();
+        let mut truncations = Vec::new();
+        while remaining > 0 {
+            let (width, truncated) =
+                gemma4_mtp_scheduled_verify_width(&schedule, widths.len(), 14, remaining);
+            widths.push(width);
+            truncations.push(truncated);
+            remaining -= width;
+        }
+        assert_eq!(widths, vec![14, 13, 14, 7]);
+        assert_eq!(truncations, vec![false, false, false, true]);
+    }
+
+    #[test]
+    fn invalid_routes_fail_closed_before_device_metadata_exists() {
+        let wrong_width = vec![vec![0; GEMMA4_MTP_ROUTE_COUNT - 1]];
+        assert!(gemma4_plan_route_union(&wrong_width, 128).is_err());
+
+        let duplicate = vec![vec![0, 1, 2, 3, 4, 5, 6, 0]];
+        assert!(gemma4_plan_route_union(&duplicate, 128).is_err());
+
+        let out_of_range = vec![vec![0, 1, 2, 3, 4, 5, 6, 128]];
+        assert!(gemma4_plan_route_union(&out_of_range, 128).is_err());
+
+        let too_wide = vec![vec![0, 1, 2, 3, 4, 5, 6, 7]; MAX_MTP_VERIFY_ROWS + 1];
+        assert!(gemma4_plan_route_union(&too_wide, 128).is_err());
+        assert!(gemma4_plan_route_union(&[], 128).is_err());
+    }
+}
+
+#[cfg(test)]
+mod gemma4_mtp_io_pipeline_tests {
+    use super::{gemma4_mtp_io_pipeline_batches, gemma4_mtp_io_pipeline_policy};
+
+    #[test]
+    fn gate_is_default_off_and_strictly_zero_or_one() {
+        assert_eq!(gemma4_mtp_io_pipeline_policy(None), Ok(false));
+        assert_eq!(gemma4_mtp_io_pipeline_policy(Some("0")), Ok(false));
+        assert_eq!(gemma4_mtp_io_pipeline_policy(Some(" 1 ")), Ok(true));
+        for invalid in ["", "true", "on", "2", "01", "disabled"] {
+            let error = gemma4_mtp_io_pipeline_policy(Some(invalid))
+                .expect_err("non-0/1 pipeline values must fail closed");
+            assert!(error.contains("must be exactly 0 or 1"), "{error}");
+        }
+    }
+
+    #[test]
+    fn qd4_batches_release_only_contiguous_ready_prefixes() {
+        // Storage misses are interleaved with host-tier hits. The first four
+        // reads make ordinals 0..=8 safe to upload; the fifth read releases the
+        // rest, including the trailing host-tier hits.
+        let batches = gemma4_mtp_io_pipeline_batches(&[0, 2, 5, 8, 10], 14, 4);
+        assert_eq!(batches, vec![(0..4, 0..9), (4..5, 9..14)]);
+    }
+
+    #[test]
+    fn all_hits_need_no_storage_batch_and_depth_never_becomes_zero() {
+        assert_eq!(
+            gemma4_mtp_io_pipeline_batches(&[], 7, 4),
+            vec![(0..0, 0..7)]
+        );
+        assert_eq!(
+            gemma4_mtp_io_pipeline_batches(&[0, 1, 2], 3, 0),
+            vec![(0..1, 0..1), (1..2, 1..2), (2..3, 2..3)]
+        );
+        assert!(gemma4_mtp_io_pipeline_batches(&[], 0, 4).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod gemma4_mtp_prefill_seed_tests {
+    use super::{gemma4_mtp_prefill_seed_policy, ChunkLogits};
+
+    #[test]
+    fn opt_in_is_default_off_and_accepts_only_explicit_truthy_values() {
+        for disabled in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("false"),
+            Some("off"),
+            Some("no"),
+            Some("disabled"),
+            Some("garbage"),
+        ] {
+            assert!(!gemma4_mtp_prefill_seed_policy(disabled));
+        }
+        for enabled in ["1", "true", "TRUE", " on ", "yes", "enabled"] {
+            assert!(gemma4_mtp_prefill_seed_policy(Some(enabled)));
+        }
+    }
+
+    #[test]
+    fn hidden_capture_is_confined_to_requested_rows() {
+        let last = 7;
+        for position in 0..=last {
+            assert_eq!(
+                ChunkLogits::LastOnly.wants_logits(position, last),
+                position == last
+            );
+            assert_eq!(
+                ChunkLogits::LastOnlyWithHidden.wants_logits(position, last),
+                position == last
+            );
+            assert!(ChunkLogits::EveryPosition.wants_logits(position, last));
+            assert!(!ChunkLogits::LastOnly.capture_hidden(position, last));
+            assert_eq!(
+                ChunkLogits::LastOnlyWithHidden.capture_hidden(position, last),
+                position == last
+            );
+            assert!(ChunkLogits::EveryPosition.capture_hidden(position, last));
+        }
+    }
+}
+
+#[cfg(test)]
+mod gemma4_mtp_cuda_assistant_policy_tests {
+    use super::gemma4_mtp_cuda_assistant_policy;
+
+    #[test]
+    fn cuda_assistant_is_default_off_and_requires_an_explicit_truthy_value() {
+        for disabled in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("false"),
+            Some("off"),
+            Some("no"),
+            Some("disabled"),
+            Some("garbage"),
+        ] {
+            assert!(!gemma4_mtp_cuda_assistant_policy(disabled));
+        }
+        for enabled in ["1", "true", "TRUE", " on ", "yes", "enabled"] {
+            assert!(gemma4_mtp_cuda_assistant_policy(Some(enabled)));
+        }
+    }
+}
+
 /// Result of a cooperatively-cancellable Gemma 4 generation.
 ///
 /// Cancellation is not an inference failure: the HTTP owner went away, so the
@@ -3214,9 +3487,8 @@ fn gemma4_metal_layer_fmt(tensor_type: GgufTensorType) -> Result<crate::metal::G
 /// review and lifted at Phase 4: the CUDA-resident gemma4 lane repacks layer
 /// projections via `GemmaLayerQuant::from_wire`, whose catch-all PANICS on any
 /// format outside its covered set. Phase 4 (BASALT G4) added the NVFP4 raw-wire
-/// GEMV (`nvfp4_gemv`), so the covered set is now Q8_0/Q4_0/Q4_1/NVFP4. Every
-/// remaining lane-uncovered format — the K-quants the CPU wire lane serves (the
-/// campaign's own Q4K-mm / Q4_K_M rows) — must still refuse with a typed, named
+/// GEMV (`nvfp4_gemv`), and the later K-quant lift added Q4_K/Q6_K. Every
+/// remaining lane-uncovered format (currently Q5_K) must still refuse with a typed, named
 /// error before that panic seam is reachable (invariant I-unknown-type, L3 cell).
 /// cfg-independent over [`WireFormat`]s so it unit-tests without CUDA hardware;
 /// the `cfg(feature = "cuda")` load site ([`Gemma4CudaResident::load`]) wires it.
@@ -6746,6 +7018,283 @@ fn gemma_proj_gemv(
     }
 }
 
+/// K-token counterpart of [`gemma_proj_gemv`] for the exact Gemma 4 verifier.
+///
+/// Common Q4_0 weights use the same load-time SoA policy as scalar decode;
+/// Q4_1 remains raw wire. K-quants consume the parallel Q8_K activation buffers.
+/// NVFP4 intentionally has no arm: eligibility declines it before allocating or
+/// mutating KV, preserving the scalar verifier as the correctness fallback.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn gemma_proj_gemm_batched(
+    s: &std::sync::Arc<cudarc::driver::CudaStream>,
+    kernels: &crate::cuda_resident::CudaResidentKernels,
+    quant: GemmaLayerQuant,
+    in_scales: &cudarc::driver::CudaSlice<f32>,
+    in_quants: &cudarc::driver::CudaSlice<i8>,
+    in_scales_k: &cudarc::driver::CudaSlice<f32>,
+    in_quants_k: &cudarc::driver::CudaSlice<i8>,
+    weight: &cudarc::driver::CudaSlice<u8>,
+    rows: usize,
+    cols: usize,
+    tokens: usize,
+    out: &mut cudarc::driver::CudaSlice<f32>,
+) -> Result<()> {
+    let driver_result = match quant {
+        GemmaLayerQuant::Q8_0 => {
+            if !cols.is_multiple_of(32) {
+                return Err(BackendError::InvalidModelMetadata(format!(
+                    "Gemma 4 K-wide Q8 projection input {cols} is not divisible by 32"
+                )));
+            }
+            crate::cuda_resident::launch_gemm_batched(
+                s,
+                &kernels.gemm_batched,
+                in_scales,
+                in_quants,
+                weight,
+                rows,
+                cols / 32,
+                tokens,
+                out,
+            )
+        }
+        GemmaLayerQuant::Q4_0 => {
+            if !cols.is_multiple_of(32) {
+                return Err(BackendError::InvalidModelMetadata(format!(
+                    "Gemma 4 K-wide Q4_0 projection input {cols} is not divisible by 32"
+                )));
+            }
+            if gemma4_q4_0_soa_enabled() {
+                if let Some(kernel) = kernels.gemma4_mtp_dense_q4_0_imma_kernel() {
+                    crate::cuda_resident::launch_q4_0_gemm_batched_soa_imma(
+                        s,
+                        kernel,
+                        in_scales,
+                        in_quants,
+                        weight,
+                        rows,
+                        cols / 32,
+                        tokens,
+                        out,
+                    )
+                } else {
+                    let (kernel, zero_shared) = kernels.gemma4_mtp_dense_q4_0_gemm_kernel();
+                    if zero_shared {
+                        crate::cuda_resident::launch_q4_0_gemm_batched_soa(
+                            s,
+                            kernel,
+                            in_scales,
+                            in_quants,
+                            weight,
+                            rows,
+                            cols / 32,
+                            tokens,
+                            out,
+                        )
+                    } else {
+                        crate::cuda_resident::launch_q4_0_gemm_batched_soa_shared(
+                            s,
+                            kernel,
+                            in_scales,
+                            in_quants,
+                            weight,
+                            rows,
+                            cols / 32,
+                            tokens,
+                            out,
+                        )
+                    }
+                }
+            } else {
+                crate::cuda_resident::launch_q4_0_gemm_batched(
+                    s,
+                    &kernels.q4_0_gemm_batched,
+                    in_scales,
+                    in_quants,
+                    weight,
+                    rows,
+                    cols / 32,
+                    tokens,
+                    out,
+                )
+            }
+        }
+        GemmaLayerQuant::Q4_1 => {
+            if !cols.is_multiple_of(32) {
+                return Err(BackendError::InvalidModelMetadata(format!(
+                    "Gemma 4 K-wide Q4_1 projection input {cols} is not divisible by 32"
+                )));
+            }
+            crate::cuda_resident::launch_q4_1_gemm_batched(
+                s,
+                &kernels.q4_1_gemm_batched,
+                in_scales,
+                in_quants,
+                weight,
+                rows,
+                cols / 32,
+                tokens,
+                out,
+            )
+        }
+        GemmaLayerQuant::Q4K | GemmaLayerQuant::Q6K => {
+            if !cols.is_multiple_of(256) {
+                return Err(BackendError::InvalidModelMetadata(format!(
+                    "Gemma 4 K-wide {quant:?} projection input {cols} is not divisible by 256"
+                )));
+            }
+            let (kernel, aux_lanes) = match quant {
+                GemmaLayerQuant::Q4K => (&kernels.q4k_gemm_batched, 9),
+                GemmaLayerQuant::Q6K => kernels.gemma4_mtp_dense_q6_gemm_kernel(),
+                _ => unreachable!(),
+            };
+            crate::cuda_resident::launch_kquant_gemm_batched(
+                s,
+                kernel,
+                in_scales_k,
+                in_quants_k,
+                weight,
+                rows,
+                cols / 256,
+                tokens,
+                aux_lanes,
+                out,
+            )
+        }
+        GemmaLayerQuant::Nvfp4 => {
+            return Err(BackendError::UnsupportedGguf(
+                "Gemma 4 K-wide CUDA verifier has no batched NVFP4 projection; use the scalar verifier"
+                    .into(),
+            ));
+        }
+    };
+    driver_result.map_err(cu)
+}
+
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn gemma4_launch_rope_batched(
+    s: &std::sync::Arc<cudarc::driver::CudaStream>,
+    kernel: &cudarc::driver::CudaFunction,
+    values: &mut cudarc::driver::CudaSlice<f32>,
+    cos: &cudarc::driver::CudaView<'_, f32>,
+    sin: &cudarc::driver::CudaView<'_, f32>,
+    heads: usize,
+    head_dim: usize,
+    per_token_dim: usize,
+    k_tokens: usize,
+) -> std::result::Result<(), cudarc::driver::DriverError> {
+    use cudarc::driver::{LaunchConfig, PushKernelArg};
+    let half = head_dim / 2;
+    let total = (k_tokens * heads * half) as u32;
+    let config = LaunchConfig {
+        grid_dim: (total.div_ceil(128).max(1), 1, 1),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let (heads, head_dim, rope_dim, per_token_dim, half, k_tokens, pairing) = (
+        heads as i32,
+        head_dim as i32,
+        head_dim as i32,
+        per_token_dim as i32,
+        half as i32,
+        k_tokens as i32,
+        1i32,
+    );
+    let mut builder = s.launch_builder(kernel);
+    builder
+        .arg(values)
+        .arg(cos)
+        .arg(sin)
+        .arg(&heads)
+        .arg(&head_dim)
+        .arg(&rope_dim)
+        .arg(&per_token_dim)
+        .arg(&half)
+        .arg(&k_tokens)
+        .arg(&pairing);
+    unsafe { builder.launch(config) }.map(|_| ())
+}
+
+#[cfg(feature = "cuda")]
+fn gemma4_launch_geglu(
+    s: &std::sync::Arc<cudarc::driver::CudaStream>,
+    kernel: &cudarc::driver::CudaFunction,
+    gate: &cudarc::driver::CudaSlice<f32>,
+    up: &cudarc::driver::CudaSlice<f32>,
+    out: &mut cudarc::driver::CudaSlice<f32>,
+    values: usize,
+) -> std::result::Result<(), cudarc::driver::DriverError> {
+    use cudarc::driver::{LaunchConfig, PushKernelArg};
+    let config = LaunchConfig {
+        grid_dim: ((values as u32).div_ceil(256).max(1), 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let values = values as i32;
+    let mut builder = s.launch_builder(kernel);
+    builder.arg(gate).arg(up).arg(out).arg(&values);
+    unsafe { builder.launch(config) }.map(|_| ())
+}
+
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn gemma4_launch_geglu_quantize_assignments(
+    s: &std::sync::Arc<cudarc::driver::CudaStream>,
+    kernel: &cudarc::driver::CudaFunction,
+    gate_up: &cudarc::driver::CudaSlice<f32>,
+    assignment_ids: &cudarc::driver::CudaSlice<i32>,
+    quants: &mut cudarc::driver::CudaSlice<i8>,
+    scales: &mut cudarc::driver::CudaSlice<f32>,
+    nff: usize,
+    assignments: usize,
+) -> std::result::Result<(), cudarc::driver::DriverError> {
+    use cudarc::driver::{LaunchConfig, PushKernelArg};
+    let blocks = nff / 32;
+    let warps = 8u32;
+    let config = LaunchConfig {
+        grid_dim: (
+            (blocks as u32).div_ceil(warps).max(1),
+            assignments as u32,
+            1,
+        ),
+        block_dim: (warps * 32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let (nff, blocks, assignments) = (nff as i32, blocks as i32, assignments as i32);
+    let mut builder = s.launch_builder(kernel);
+    builder
+        .arg(gate_up)
+        .arg(assignment_ids)
+        .arg(quants)
+        .arg(scales)
+        .arg(&nff)
+        .arg(&blocks)
+        .arg(&assignments);
+    unsafe { builder.launch(config) }.map(|_| ())
+}
+
+#[cfg(feature = "cuda")]
+fn gemma4_launch_soft_cap(
+    s: &std::sync::Arc<cudarc::driver::CudaStream>,
+    kernel: &cudarc::driver::CudaFunction,
+    values: &mut cudarc::driver::CudaSlice<f32>,
+    len: usize,
+    cap: f32,
+) -> std::result::Result<(), cudarc::driver::DriverError> {
+    use cudarc::driver::{LaunchConfig, PushKernelArg};
+    let config = LaunchConfig {
+        grid_dim: ((len as u32).div_ceil(256).max(1), 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let len = len as i32;
+    let mut builder = s.launch_builder(kernel);
+    builder.arg(values).arg(&len).arg(&cap);
+    unsafe { builder.launch(config) }.map(|_| ())
+}
+
 /// Per-layer PLE weights resident on the GPU (small f32 matrices), so the
 /// per-layer PLE injection runs entirely on the device — no host round-trip.
 #[cfg(feature = "cuda")]
@@ -6831,6 +7380,21 @@ fn gemma4_head_upload(lane: HeadLane, wire: &[u8]) -> Vec<u8> {
     }
 }
 
+/// Compact snapshot of the two routed-expert residency directories.
+///
+/// `intersection_records` are physically present in both page-locked host RAM
+/// and the SSER VRAM arena. `union_records` counts distinct `(layer, expert)`
+/// keys across both tiers, so it exposes inclusive-cache duplication directly.
+#[cfg(feature = "cuda")]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Gemma4SserHostResidency {
+    pub sser_records: usize,
+    pub host_records: usize,
+    pub intersection_records: usize,
+    pub host_only_records: usize,
+    pub union_records: usize,
+}
+
 /// One speculative round's evidence, recorded so an alpha shortfall can be *attributed*
 /// rather than guessed at.
 ///
@@ -6846,6 +7410,13 @@ pub struct Gemma4MtpRound {
     pub position: usize,
     /// The target-chosen token the drafter was conditioned on.
     pub bonus_token: u32,
+    /// Verifier width requested after schedule/fallback selection and tail
+    /// truncation. This includes the current target row.
+    pub requested_verify_k: usize,
+    /// Rows actually returned by the target verifier for this round.
+    pub verifier_k: usize,
+    /// True when the remaining output budget shortened the configured width.
+    pub budget_truncated: bool,
     pub drafts: Vec<u32>,
     /// Target argmax at every verified position, `1 + drafts.len()` entries.
     pub target: Vec<u32>,
@@ -6861,6 +7432,13 @@ pub struct Gemma4MtpRound {
     /// Expert records actually read from `.cghost` during this round. This equals
     /// `misses` when no host tier exists and excludes misses served from pinned RAM.
     pub storage_reads: u64,
+    /// True only when this round completed through the opt-in K-wide target
+    /// verifier. Harnesses use this receipt bit to reject silent scalar fallback.
+    pub kwide: bool,
+    /// True only when every proposal in this round completed on the resident
+    /// CUDA assistant. This is independent of `kwide`: the drafter and target
+    /// verifier are separately gated lanes.
+    pub cuda_assistant: bool,
 }
 
 /// Accepted-draft statistics for an MTP generation. `accepted / rounds` is alpha, the
@@ -6873,6 +7451,9 @@ pub struct Gemma4MtpRound {
 #[cfg(feature = "cuda")]
 #[derive(Clone, Debug, Default)]
 pub struct Gemma4MtpStats {
+    /// Requested drafter lane for this generation. When true, the dense CPU
+    /// assistant was never constructed by the CLI/runtime path.
+    pub cuda_assistant: bool,
     pub rounds: u64,
     pub drafted: u64,
     pub accepted: u64,
@@ -6922,6 +7503,17 @@ struct ChunkRow {
     hidden_state: Option<Vec<f32>>,
 }
 
+/// Compact result consumed by greedy MTP verification. The speculative gate needs
+/// only the target's argmax and the post-layer hidden row; exporting the full
+/// `K * vocab` logit matrix would otherwise force roughly 7 MiB through PCIe on
+/// every K=7 round.
+#[cfg(feature = "cuda")]
+struct MtpVerifyRow {
+    position: usize,
+    target: u32,
+    hidden_state: Option<Vec<f32>>,
+}
+
 /// Which positions of a layer-major chunk should run the vocab head.
 ///
 /// Prefill wants the last position only — the head is ~646 MiB of Q6_K per token, so running
@@ -6932,7 +7524,27 @@ struct ChunkRow {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ChunkLogits {
     LastOnly,
+    /// Prefill's final-position head plus that exact row's raw post-layer hidden.
+    /// The caller applies the canonical final norm before passing it to MTP.
+    LastOnlyWithHidden,
     EveryPosition,
+}
+
+impl ChunkLogits {
+    fn wants_logits(self, position: usize, last: usize) -> bool {
+        match self {
+            Self::LastOnly | Self::LastOnlyWithHidden => position == last,
+            Self::EveryPosition => true,
+        }
+    }
+
+    fn capture_hidden(self, position: usize, last: usize) -> bool {
+        match self {
+            Self::LastOnly => false,
+            Self::LastOnlyWithHidden => position == last,
+            Self::EveryPosition => true,
+        }
+    }
 }
 
 /// Resident GPU tied head. `weight` is the vocab-major projection in its lane's GPU
@@ -6971,6 +7583,29 @@ struct Gemma4PleCtxDev {
 #[cfg(any(feature = "cuda", test))]
 const SSER_FREQUENCY_SCRATCH_SLOTS: usize = 8;
 
+/// Replacement policy for the persistent SSER VRAM directory.
+///
+/// Lifetime LFU is deliberately separate from the older frequency-admission
+/// experiment: LFU still admits every miss and therefore keeps every physical
+/// arena slot available to a K-wide union. Only the victim ordering changes.
+#[cfg(any(feature = "cuda", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SserCudaEvictionPolicy {
+    Lru,
+    Lfu,
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn parse_sser_cuda_eviction_policy(value: Option<&str>) -> Result<SserCudaEvictionPolicy> {
+    match value {
+        None | Some("lru") => Ok(SserCudaEvictionPolicy::Lru),
+        Some("lfu") => Ok(SserCudaEvictionPolicy::Lfu),
+        Some(other) => Err(BackendError::InvalidModelMetadata(format!(
+            "CAMELID_GEMMA4_GHOST_CUDA_EVICTION must be exactly 'lru' or 'lfu'; got {other:?}"
+        ))),
+    }
+}
+
 /// Exact lifetime access counters for the opt-in SSER frequency-admission
 /// experiment. Counts include hits, admitted misses, and non-admitted misses.
 #[cfg(any(feature = "cuda", test))]
@@ -6992,6 +7627,26 @@ impl SserFrequencyAdmissionPolicy {
     fn count(&self, key: (u16, u16)) -> u64 {
         self.access_counts.get(&key).copied().unwrap_or(0)
     }
+}
+
+/// Select the least-frequently used unprotected resident, breaking equal
+/// lifetime counts by LRU and then by key for deterministic receipts.
+#[cfg(test)]
+fn sser_lfu_victim<I>(
+    residents: I,
+    protected_layer: u16,
+    protected_experts: &[usize],
+) -> Option<(u16, u16)>
+where
+    I: IntoIterator<Item = ((u16, u16), u64, u64)>,
+{
+    residents
+        .into_iter()
+        .filter(|(key, _, _)| {
+            key.0 != protected_layer || !protected_experts.contains(&(key.1 as usize))
+        })
+        .min_by_key(|(key, frequency, last_used)| (*frequency, *last_used, *key))
+        .map(|(key, _, _)| key)
 }
 
 #[cfg(any(feature = "cuda", test))]
@@ -7037,7 +7692,8 @@ fn sser_frequency_scratch_slot(hot_capacity: usize, scratch_ordinal: usize) -> O
 
 /// One cached MoE expert's slot in the fixed gate/up and down GPU arenas.
 /// `last_used` is the LRU recency stamp; `frequency` mirrors the exact lifetime
-/// count while frequency admission is enabled (and is zero otherwise).
+/// count while frequency admission or lifetime-LFU eviction is enabled (and is
+/// zero otherwise).
 #[cfg(feature = "cuda")]
 #[derive(Clone, Copy)]
 struct SserExpertDev {
@@ -7073,7 +7729,10 @@ struct SserPinnedSlab {
 // SAFETY: `ptr` is a page-locked host allocation owned solely by this struct and
 // freed on drop. The resident engine is only ever entered under the
 // process-global resident-cache mutex (the same discipline that lets its
-// `CudaGraph` be `Send`), so the pointer is never touched from two threads.
+// `CudaGraph` be `Send`). The QD reader transaction may write several DISJOINT
+// reserved slots concurrently; it joins every reader before the owning tier can
+// be accessed again, and the per-layer CUDA fence retires DMA before a source
+// slot can be recycled. No two threads receive the same byte range.
 #[cfg(feature = "cuda")]
 unsafe impl Send for SserPinnedSlab {}
 
@@ -7210,9 +7869,10 @@ impl Drop for RouterPinnedRow {
 /// The tier exists because storage cannot serve this workload. One decode step
 /// routes 240 records (806 MB on the 26B row); the VRAM cache holds ~21% of the
 /// 3840 slices, so ~73 records per token have to come from somewhere else. The
-/// tracked box's NVMe delivers 1.3 GB/s buffered / 1.9 GB/s unbuffered and — the
-/// decisive measurement — is FLAT from queue depth 1 to 16, so read parallelism
-/// buys nothing and storage alone pins decode near 5 tok/s.
+/// tracked box's whole-record QD sweep reaches 1.04 GB/s at QD1, 2.42 GB/s at
+/// QD4, and 3.03 GB/s at QD28. Scalar decode still declines caller-side QD4
+/// because it exposes only 0.62 distinct storage reads per layer; a K-wide union
+/// is the first path with enough independent misses to use that throughput.
 ///
 /// Records are held in fixed-stride slots inside ONE page-locked slab rather than
 /// as individual heap allocations, which is what makes a tier hit cost a single
@@ -7229,6 +7889,49 @@ impl Drop for RouterPinnedRow {
 #[cfg(feature = "cuda")]
 const GHOST_CUDA_HOST_TIER_SLOTS_PER_CHUNK: usize = 256;
 
+#[cfg(any(feature = "cuda", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SserHostTierEvictionPolicy {
+    Lru,
+    Mru,
+}
+
+#[cfg(any(feature = "cuda", test))]
+impl SserHostTierEvictionPolicy {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Lru => "lru",
+            Self::Mru => "mru",
+        }
+    }
+
+    fn select_victim(
+        self,
+        recency: &std::collections::BTreeSet<(u64, u16, u16)>,
+        protected_layer: u16,
+        protected_experts: &[usize],
+    ) -> Option<(u64, u16, u16)> {
+        let eligible = |(_, layer, expert): &(u64, u16, u16)| {
+            *layer != protected_layer || !protected_experts.contains(&(*expert as usize))
+        };
+        match self {
+            Self::Lru => recency.iter().copied().find(eligible),
+            Self::Mru => recency.iter().rev().copied().find(eligible),
+        }
+    }
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn parse_sser_host_tier_eviction_policy(value: Option<&str>) -> Result<SserHostTierEvictionPolicy> {
+    match value {
+        None | Some("lru") => Ok(SserHostTierEvictionPolicy::Lru),
+        Some("mru") => Ok(SserHostTierEvictionPolicy::Mru),
+        Some(other) => Err(BackendError::InvalidModelMetadata(format!(
+            "CAMELID_GEMMA4_GHOST_HOST_TIER_EVICTION must be exactly 'lru' or 'mru'; got {other:?}"
+        ))),
+    }
+}
+
 #[cfg(feature = "cuda")]
 struct SserHostTier {
     /// Page-locked chunks, each holding `slots_per_chunk` whole records. A record
@@ -7240,16 +7943,21 @@ struct SserHostTier {
     /// order without changing the slot geometry.
     stride: usize,
     entries: std::collections::HashMap<(u16, u16), SserHostEntry>,
-    /// Recency index keyed by `(last_used, layer, expert)`.  Unlike scanning
-    /// `entries` on every miss, the oldest recyclable record is at the front;
-    /// the route-protected set can hide at most top-k entries.
+    /// Recency index keyed by `(last_used, layer, expert)`. Unlike scanning
+    /// `entries` on every miss, a recyclable endpoint is found in O(log n), plus
+    /// at most the route-protected entries skipped by the selected policy.
     lru: std::collections::BTreeSet<(u64, u16, u16)>,
+    eviction_policy: SserHostTierEvictionPolicy,
     free_slots: Vec<usize>,
     clock: u64,
     hits: u64,
     misses: u64,
     bytes_read: u64,
 }
+
+#[cfg(feature = "cuda")]
+type SserHostTierReadyCallback<'a> =
+    dyn FnMut(&SserHostTier, std::ops::Range<usize>, &[usize]) -> Result<()> + 'a;
 
 #[cfg(feature = "cuda")]
 struct SserHostEntry {
@@ -7295,6 +8003,274 @@ struct MoeScratchDev {
     route_scales_host: Vec<f32>,
 }
 
+/// Lazily allocated storage for the exact Gemma 4 K-wide MTP verifier.
+///
+/// Every tensor is token-major unless its name says otherwise. The capacity is
+/// fixed at [`MAX_MTP_VERIFY_ROWS`] so the current target token plus all thirteen
+/// assistant drafts can share each common/expert weight read. Routed expert
+/// matrices remain assignment-major because their CSR kernels group work by the
+/// union expert; `route_to_assignment` restores token/router-rank order only at
+/// the final weighted sum.
+#[cfg(feature = "cuda")]
+struct Gemma4VerifyScratchDev {
+    cap: usize,
+    h: cudarc::driver::CudaSlice<f32>,
+    normed: cudarc::driver::CudaSlice<f32>,
+    in_q: cudarc::driver::CudaSlice<i8>,
+    in_s: cudarc::driver::CudaSlice<f32>,
+    in_qk: cudarc::driver::CudaSlice<i8>,
+    in_sk: cudarc::driver::CudaSlice<f32>,
+    q: cudarc::driver::CudaSlice<f32>,
+    k: cudarc::driver::CudaSlice<f32>,
+    v: cudarc::driver::CudaSlice<f32>,
+    attn: cudarc::driver::CudaSlice<f32>,
+    proj: cudarc::driver::CudaSlice<f32>,
+    gate: cudarc::driver::CudaSlice<f32>,
+    up: cudarc::driver::CudaSlice<f32>,
+    geglu: cudarc::driver::CudaSlice<f32>,
+    mlp: cudarc::driver::CudaSlice<f32>,
+    ffn_out: cudarc::driver::CudaSlice<f32>,
+    moe_acc: cudarc::driver::CudaSlice<f32>,
+    /// Layer-major compact RoPE tables. `rope_offsets[li]` begins a
+    /// `[cap][plan[li].head_dim/2]` region in each device allocation.
+    cos: cudarc::driver::CudaSlice<f32>,
+    sin: cudarc::driver::CudaSlice<f32>,
+    rope_offsets: Vec<usize>,
+    expert_gate_up: cudarc::driver::CudaSlice<f32>,
+    expert_geglu_q: cudarc::driver::CudaSlice<i8>,
+    expert_geglu_s: cudarc::driver::CudaSlice<f32>,
+    expert_y: cudarc::driver::CudaSlice<f32>,
+    union_slots: cudarc::driver::CudaSlice<i32>,
+    token_offsets: cudarc::driver::CudaSlice<i32>,
+    token_ids: cudarc::driver::CudaSlice<i32>,
+    assignment_ids: cudarc::driver::CudaSlice<i32>,
+    route_to_assignment: cudarc::driver::CudaSlice<i32>,
+    route_scales: cudarc::driver::CudaSlice<f32>,
+    logits: cudarc::driver::CudaSlice<f32>,
+    /// Device-side target argmax for each verifier row. Only this compact prefix
+    /// crosses PCIe; logits remain resident.
+    sampled: cudarc::driver::CudaSlice<u32>,
+    /// Cacheable page-locked K-row handoff for the exact CPU router.
+    router_host: RouterPinnedRow,
+    /// Reused host staging for the router's exact pre-norm-2 Q8_0 bytes.
+    expert_q_host: Vec<i8>,
+    expert_s_host: Vec<f32>,
+}
+
+/// Persistent device state for the host-fed, full-Q4 MTP assistant. The target
+/// embedding for the bonus token is still gathered on the CPU, but every model
+/// contraction, attention layer, recurrent projection, tied head, and argmax is
+/// executed on `cap_stream`. The recurrent hidden never leaves the device.
+#[cfg(feature = "cuda")]
+struct Gemma4MtpCudaScratchDev {
+    joined: cudarc::driver::CudaSlice<f32>,
+    hidden: cudarc::driver::CudaSlice<f32>,
+    normed: cudarc::driver::CudaSlice<f32>,
+    q: cudarc::driver::CudaSlice<f32>,
+    context: cudarc::driver::CudaSlice<f32>,
+    attn: cudarc::driver::CudaSlice<f32>,
+    gate: cudarc::driver::CudaSlice<f32>,
+    up: cudarc::driver::CudaSlice<f32>,
+    geglu: cudarc::driver::CudaSlice<f32>,
+    ffn: cudarc::driver::CudaSlice<f32>,
+    recurrent: cudarc::driver::CudaSlice<f32>,
+    logits: cudarc::driver::CudaSlice<f32>,
+    cos: cudarc::driver::CudaSlice<f32>,
+    sin: cudarc::driver::CudaSlice<f32>,
+    position: cudarc::driver::CudaSlice<i32>,
+    argmax: cudarc::driver::CudaSlice<u32>,
+    scores: cudarc::driver::CudaSlice<f32>,
+}
+
+#[cfg(feature = "cuda")]
+struct Gemma4MtpCudaResident {
+    weights: crate::gemma4_mtp_cuda::Gemma4MtpCudaWeights,
+    scratch: Gemma4MtpCudaScratchDev,
+    /// Four one-element BF16 checkpoint tensors, copied once during bring-up so
+    /// the ordinary scale kernel can keep its by-value ABI.
+    layer_scalars: [f32; crate::gemma4_mtp::NUM_LAYERS],
+}
+
+#[cfg(feature = "cuda")]
+#[allow(clippy::type_complexity)]
+fn gemma4_mtp_cuda_layer_ids(
+    layer: usize,
+) -> (
+    crate::gemma4_mtp_cuda::Gemma4MtpCudaMatrixId,
+    crate::gemma4_mtp_cuda::Gemma4MtpCudaMatrixId,
+    crate::gemma4_mtp_cuda::Gemma4MtpCudaMatrixId,
+    crate::gemma4_mtp_cuda::Gemma4MtpCudaMatrixId,
+    crate::gemma4_mtp_cuda::Gemma4MtpCudaMatrixId,
+    crate::gemma4_mtp_cuda::Gemma4MtpCudaF32Id,
+    crate::gemma4_mtp_cuda::Gemma4MtpCudaF32Id,
+    crate::gemma4_mtp_cuda::Gemma4MtpCudaF32Id,
+    crate::gemma4_mtp_cuda::Gemma4MtpCudaF32Id,
+    crate::gemma4_mtp_cuda::Gemma4MtpCudaF32Id,
+) {
+    use crate::gemma4_mtp_cuda::{Gemma4MtpCudaF32Id as F, Gemma4MtpCudaMatrixId as M};
+    match layer {
+        0 => (
+            M::Layer0QProj,
+            M::Layer0OProj,
+            M::Layer0GateProj,
+            M::Layer0UpProj,
+            M::Layer0DownProj,
+            F::Layer0InputNorm,
+            F::Layer0QNorm,
+            F::Layer0PostAttentionNorm,
+            F::Layer0PreFeedforwardNorm,
+            F::Layer0PostFeedforwardNorm,
+        ),
+        1 => (
+            M::Layer1QProj,
+            M::Layer1OProj,
+            M::Layer1GateProj,
+            M::Layer1UpProj,
+            M::Layer1DownProj,
+            F::Layer1InputNorm,
+            F::Layer1QNorm,
+            F::Layer1PostAttentionNorm,
+            F::Layer1PreFeedforwardNorm,
+            F::Layer1PostFeedforwardNorm,
+        ),
+        2 => (
+            M::Layer2QProj,
+            M::Layer2OProj,
+            M::Layer2GateProj,
+            M::Layer2UpProj,
+            M::Layer2DownProj,
+            F::Layer2InputNorm,
+            F::Layer2QNorm,
+            F::Layer2PostAttentionNorm,
+            F::Layer2PreFeedforwardNorm,
+            F::Layer2PostFeedforwardNorm,
+        ),
+        3 => (
+            M::Layer3QProj,
+            M::Layer3OProj,
+            M::Layer3GateProj,
+            M::Layer3UpProj,
+            M::Layer3DownProj,
+            F::Layer3InputNorm,
+            F::Layer3QNorm,
+            F::Layer3PostAttentionNorm,
+            F::Layer3PreFeedforwardNorm,
+            F::Layer3PostFeedforwardNorm,
+        ),
+        _ => unreachable!("the official MTP assistant has exactly four layers"),
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn gemma4_mtp_cuda_scalar_id(layer: usize) -> crate::gemma4_mtp_cuda::Gemma4MtpCudaF32Id {
+    use crate::gemma4_mtp_cuda::Gemma4MtpCudaF32Id as F;
+    match layer {
+        0 => F::Layer0Scalar,
+        1 => F::Layer1Scalar,
+        2 => F::Layer2Scalar,
+        3 => F::Layer3Scalar,
+        _ => unreachable!("the official MTP assistant has exactly four layers"),
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn gemma4_mtp_cuda_launch_rmsnorm(
+    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+    kernel: &cudarc::driver::CudaFunction,
+    input: &cudarc::driver::CudaSlice<f32>,
+    weight: &cudarc::driver::CudaView<'_, f32>,
+    output: &mut cudarc::driver::CudaSlice<f32>,
+    width: usize,
+    eps: f32,
+) -> std::result::Result<(), cudarc::driver::DriverError> {
+    use cudarc::driver::{LaunchConfig, PushKernelArg};
+    let config = LaunchConfig {
+        grid_dim: (1, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: width as u32 * 4,
+    };
+    let width = width as i32;
+    let mut builder = stream.launch_builder(kernel);
+    builder
+        .arg(input)
+        .arg(weight)
+        .arg(output)
+        .arg(&width)
+        .arg(&eps);
+    unsafe { builder.launch(config) }.map(|_| ())
+}
+
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn gemma4_mtp_cuda_launch_qnorm(
+    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+    kernel: &cudarc::driver::CudaFunction,
+    values: &mut cudarc::driver::CudaSlice<f32>,
+    weight: &cudarc::driver::CudaView<'_, f32>,
+    heads: usize,
+    head_dim: usize,
+    eps: f32,
+) -> std::result::Result<(), cudarc::driver::DriverError> {
+    use cudarc::driver::{LaunchConfig, PushKernelArg};
+    let config = LaunchConfig {
+        grid_dim: (heads as u32, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: head_dim as u32 * 4,
+    };
+    let (head_dim, use_weight) = (head_dim as i32, 1i32);
+    let mut builder = stream.launch_builder(kernel);
+    builder
+        .arg(values)
+        .arg(weight)
+        .arg(&head_dim)
+        .arg(&eps)
+        .arg(&use_weight);
+    unsafe { builder.launch(config) }.map(|_| ())
+}
+
+#[cfg(feature = "cuda")]
+fn gemma4_mtp_cuda_project(
+    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+    kernels: &crate::cuda_resident::CudaResidentKernels,
+    weights: &crate::gemma4_mtp_cuda::Gemma4MtpCudaWeights,
+    matrix_id: crate::gemma4_mtp_cuda::Gemma4MtpCudaMatrixId,
+    input: &cudarc::driver::CudaSlice<f32>,
+    output: &mut cudarc::driver::CudaSlice<f32>,
+) -> Result<()> {
+    let layout = weights.matrix_layout(matrix_id);
+    if input.len() < layout.cols || output.len() < layout.rows {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "Gemma 4 CUDA assistant matrix {} is {}x{}, but scratch is input={} output={}",
+            layout.name,
+            layout.rows,
+            layout.cols,
+            input.len(),
+            output.len(),
+        )));
+    }
+    let matrix = weights.matrix(matrix_id);
+    let matrix = matrix.slice(0..matrix.len());
+    crate::cuda_resident::launch_q4_0_f32_gemv_soa(
+        stream,
+        &kernels.q4_0_f32_gemv_soa,
+        input,
+        &matrix,
+        layout.rows,
+        layout.cols,
+        output,
+        0,
+    )
+    .map_err(cu)
+}
+
+#[cfg(feature = "cuda")]
+fn gemma4_mtp_round_to_bf16(value: f32) -> f32 {
+    let bits = value.to_bits();
+    let rounded = bits.wrapping_add(0x7fff + ((bits >> 16) & 1)) & 0xffff_0000;
+    f32::from_bits(rounded)
+}
+
 /// Default-off measurement state for the existing serial CUDA speculative lane.
 ///
 /// Enabling `CAMELID_GEMMA4_CUDA_SPEC_K4_TELEMETRY=1` caps each n-gram proposal
@@ -7308,6 +8284,384 @@ const GEMMA4_CUDA_SPEC_K4_DRAFT_CAP: usize = 4;
 
 #[cfg(any(feature = "cuda", test))]
 const GEMMA4_CUDA_SPEC_DEFAULT_DRAFT_CAP: usize = 6;
+
+/// Gemma 4's target verifier evaluates one current target token plus a bounded
+/// set of assistant drafts. Keep the routed fan-out beside the verifier policy
+/// so every host/device metadata allocation shares one bound.
+#[cfg(any(feature = "cuda", test))]
+const GEMMA4_MTP_ROUTE_COUNT: usize = 8;
+
+/// Default-off policy for the true K-wide CUDA verifier. This is deliberately a
+/// pure parser so the opt-in contract can be tested without mutating process-wide
+/// environment state in parallel tests.
+#[cfg(any(feature = "cuda", test))]
+fn gemma4_mtp_kwide_policy(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "on" | "yes" | "enabled"
+        )
+    })
+}
+
+#[cfg(feature = "cuda")]
+fn gemma4_mtp_kwide_enabled() -> bool {
+    gemma4_mtp_kwide_policy(std::env::var("CAMELID_GEMMA4_MTP_KWIDE").ok().as_deref())
+}
+
+/// Opt-in stage-1 storage-to-CUDA pipeline for the K-wide verifier. Four
+/// independent whole-record reads match the measured QD4 knee on the tracked
+/// Windows NVMe. The completed prefix is submitted to the existing expert copy
+/// stream before the next group is joined, so storage and HtoD can overlap
+/// without adding an unbounded staging arena.
+#[cfg(any(feature = "cuda", test))]
+const GEMMA4_MTP_IO_PIPELINE_READ_DEPTH: usize = 4;
+
+#[cfg(any(feature = "cuda", test))]
+const GEMMA4_MTP_IO_PIPELINE_ENV: &str = "CAMELID_GEMMA4_MTP_IO_PIPELINE";
+
+/// Strict parser for the experimental pipeline gate. Unlike older boolean
+/// knobs, misspellings fail model load instead of silently selecting a lane the
+/// receipt did not request.
+#[cfg(any(feature = "cuda", test))]
+fn gemma4_mtp_io_pipeline_policy(value: Option<&str>) -> std::result::Result<bool, String> {
+    match value.map(str::trim) {
+        None | Some("0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(other) => Err(format!(
+            "{GEMMA4_MTP_IO_PIPELINE_ENV} must be exactly 0 or 1; got {other:?}"
+        )),
+    }
+}
+
+/// Plan ordered read groups and the host-tier prefix made ready by each group.
+/// `pending_ordinals` is strictly increasing and names the storage misses among
+/// all VRAM misses; host-tier hits between them ride the next completed prefix.
+/// The final group also releases trailing hits. Keeping this pure pins the
+/// ordering contract without requiring CUDA hardware in unit tests.
+#[cfg(any(feature = "cuda", test))]
+fn gemma4_mtp_io_pipeline_batches(
+    pending_ordinals: &[usize],
+    total: usize,
+    depth: usize,
+) -> Vec<(std::ops::Range<usize>, std::ops::Range<usize>)> {
+    if total == 0 {
+        return Vec::new();
+    }
+    if pending_ordinals.is_empty() {
+        return vec![(0..0, 0..total)];
+    }
+    let depth = depth.max(1);
+    let mut batches = Vec::with_capacity(pending_ordinals.len().div_ceil(depth));
+    let mut ready_start = 0usize;
+    let pending_len = pending_ordinals.len();
+    for pending_start in (0..pending_len).step_by(depth) {
+        let pending_end = (pending_start + depth).min(pending_len);
+        let ready_end = if pending_end == pending_len {
+            total
+        } else {
+            pending_ordinals[pending_end - 1] + 1
+        };
+        batches.push((pending_start..pending_end, ready_start..ready_end));
+        ready_start = ready_end;
+    }
+    batches
+}
+
+const GEMMA4_MTP_WIDTH_SCHEDULE_ENV: &str = "CAMELID_GEMMA4_MTP_WIDTH_SCHEDULE";
+
+/// Parse a comma-separated sequence of verifier widths. Width includes the
+/// current target row, so `14` requests thirteen assistant proposals. Invalid
+/// input disables the optional schedule as a whole; entries are never clamped
+/// into a different schedule silently.
+#[cfg(any(feature = "cuda", test))]
+fn gemma4_mtp_width_schedule_value(value: Option<&str>, max_verify_k: usize) -> Option<Vec<usize>> {
+    let value = value?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    value
+        .split(',')
+        .map(|width| {
+            let width = width.trim().parse::<usize>().ok()?;
+            ((2..=MAX_MTP_VERIFY_ROWS).contains(&width) && width <= max_verify_k).then_some(width)
+        })
+        .collect()
+}
+
+#[cfg(feature = "cuda")]
+fn gemma4_mtp_width_schedule(max_verify_k: usize) -> Option<Vec<usize>> {
+    gemma4_mtp_width_schedule_value(
+        std::env::var(GEMMA4_MTP_WIDTH_SCHEDULE_ENV).ok().as_deref(),
+        max_verify_k,
+    )
+}
+
+/// Select this drafted round's verifier width. Once the explicit schedule is
+/// exhausted, return to the CLI's `draft_k + 1` width. The tail is shortened to
+/// the remaining output budget and records that truncation separately.
+#[cfg(any(feature = "cuda", test))]
+fn gemma4_mtp_scheduled_verify_width(
+    schedule: &[usize],
+    round_index: usize,
+    fallback_verify_k: usize,
+    remaining_verify_rows: usize,
+) -> (usize, bool) {
+    let configured = schedule
+        .get(round_index)
+        .copied()
+        .unwrap_or(fallback_verify_k);
+    (
+        configured.min(remaining_verify_rows),
+        remaining_verify_rows < configured,
+    )
+}
+
+/// Default-off policy for seeding MTP round zero from chunked prefill's final
+/// decoder row. Kept as a pure parser so tests never mutate process-wide env.
+#[cfg(any(feature = "cuda", test))]
+fn gemma4_mtp_prefill_seed_policy(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "on" | "yes" | "enabled"
+        )
+    })
+}
+
+#[cfg(feature = "cuda")]
+fn gemma4_mtp_prefill_seed_enabled() -> bool {
+    gemma4_mtp_prefill_seed_policy(
+        std::env::var("CAMELID_GEMMA4_MTP_PREFILL_SEED_BOOTSTRAP")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Default-off policy for the streamed Q4 CUDA assistant. Kept pure so tests do
+/// not race by changing the process environment.
+#[cfg(any(feature = "cuda", test))]
+fn gemma4_mtp_cuda_assistant_policy(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "on" | "yes" | "enabled"
+        )
+    })
+}
+
+#[cfg(feature = "cuda")]
+fn gemma4_mtp_cuda_assistant_enabled() -> bool {
+    gemma4_mtp_cuda_assistant_policy(
+        std::env::var("CAMELID_GEMMA4_MTP_CUDA_ASSISTANT")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Expert-major CSR metadata for one K-wide routed layer.
+///
+/// `token_ids` feeds the gate/up routed GEMM, whose activation rows remain
+/// token-major. The GEMM writes one row per CSR assignment, so
+/// `route_to_assignment[token * 8 + router_rank]` restores the exact router order
+/// for the final weighted sum. Experts shared by several tokens appear once in
+/// `union_experts` and therefore load once from the host/VRAM tiers.
+#[cfg(any(feature = "cuda", test))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Gemma4RouteUnionPlan {
+    union_experts: Vec<usize>,
+    token_offsets: Vec<i32>,
+    token_ids: Vec<i32>,
+    route_to_assignment: Vec<i32>,
+    max_assignments_per_expert: usize,
+}
+
+#[cfg(feature = "cuda")]
+struct Gemma4RouterBatchHost {
+    routes: Vec<Vec<usize>>,
+    csr: Gemma4RouteUnionPlan,
+    /// Token-major `[token][router_rank]`, preserving the scalar router's
+    /// multiplication and accumulation order.
+    route_scales: Vec<f32>,
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn gemma4_plan_route_union(
+    routes: &[Vec<usize>],
+    expert_count: usize,
+) -> Result<Gemma4RouteUnionPlan> {
+    if routes.is_empty() || routes.len() > MAX_MTP_VERIFY_ROWS {
+        return Err(BackendError::InvalidModelMetadata(format!(
+            "Gemma 4 K-wide router has {} rows; expected 1..={MAX_MTP_VERIFY_ROWS}",
+            routes.len()
+        )));
+    }
+
+    let mut union_experts = Vec::with_capacity(routes.len() * GEMMA4_MTP_ROUTE_COUNT);
+    let mut counts = Vec::<usize>::with_capacity(routes.len() * GEMMA4_MTP_ROUTE_COUNT);
+    for (token, route) in routes.iter().enumerate() {
+        if route.len() != GEMMA4_MTP_ROUTE_COUNT {
+            return Err(BackendError::InvalidModelMetadata(format!(
+                "Gemma 4 K-wide router row {token} selected {} experts; expected {GEMMA4_MTP_ROUTE_COUNT}",
+                route.len()
+            )));
+        }
+        for (rank, &expert) in route.iter().enumerate() {
+            if expert >= expert_count {
+                return Err(BackendError::InvalidModelMetadata(format!(
+                    "Gemma 4 K-wide router row {token} rank {rank} selected expert {expert}, outside 0..{expert_count}"
+                )));
+            }
+            if route[..rank].contains(&expert) {
+                return Err(BackendError::InvalidModelMetadata(format!(
+                    "Gemma 4 K-wide router row {token} selected expert {expert} more than once"
+                )));
+            }
+            match union_experts
+                .iter()
+                .position(|&candidate| candidate == expert)
+            {
+                Some(union_index) => counts[union_index] += 1,
+                None => {
+                    union_experts.push(expert);
+                    counts.push(1);
+                }
+            }
+        }
+    }
+
+    let mut token_offsets = Vec::with_capacity(union_experts.len() + 1);
+    token_offsets.push(0);
+    for &count in &counts {
+        let next = token_offsets
+            .last()
+            .copied()
+            .unwrap_or(0i32)
+            .checked_add(count as i32)
+            .ok_or_else(|| {
+                BackendError::InvalidModelMetadata(
+                    "Gemma 4 K-wide routed assignment count overflow".into(),
+                )
+            })?;
+        token_offsets.push(next);
+    }
+    let assignment_count = routes.len() * GEMMA4_MTP_ROUTE_COUNT;
+    debug_assert_eq!(token_offsets.last().copied(), Some(assignment_count as i32));
+
+    let mut cursors = token_offsets[..union_experts.len()]
+        .iter()
+        .map(|&offset| offset as usize)
+        .collect::<Vec<_>>();
+    let mut token_ids = vec![0i32; assignment_count];
+    let mut route_to_assignment = vec![0i32; assignment_count];
+    for (token, route) in routes.iter().enumerate() {
+        for (rank, &expert) in route.iter().enumerate() {
+            let union_index = union_experts
+                .iter()
+                .position(|&candidate| candidate == expert)
+                .expect("every validated route expert is in the union");
+            let assignment = cursors[union_index];
+            cursors[union_index] += 1;
+            token_ids[assignment] = token as i32;
+            route_to_assignment[token * GEMMA4_MTP_ROUTE_COUNT + rank] = assignment as i32;
+        }
+    }
+
+    Ok(Gemma4RouteUnionPlan {
+        union_experts,
+        token_offsets,
+        token_ids,
+        route_to_assignment,
+        max_assignments_per_expert: counts.into_iter().max().unwrap_or(0),
+    })
+}
+
+/// Run the exact scalar Gemma router for K post-attention rows and prepare the
+/// expert branch's pre-norm-2 Q8_0 activations. The CPU already has to inspect
+/// these rows for routing; doing the small quantization pass here avoids adding a
+/// second CUDA kernel before the K-wide lane has parity receipts.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn gemma4_router_batch_exact(
+    hidden_rows: &[f32],
+    k_tokens: usize,
+    hidden: usize,
+    eps: f32,
+    moe: &MoeWeights,
+    expert_q: &mut [i8],
+    expert_s: &mut [f32],
+) -> Result<Gemma4RouterBatchHost> {
+    let hidden_len = k_tokens.checked_mul(hidden).ok_or_else(|| {
+        BackendError::InvalidModelMetadata("Gemma 4 K-wide router row size overflow".into())
+    })?;
+    if hidden_rows.len() < hidden_len
+        || expert_q.len() < hidden_len
+        || expert_s.len() < k_tokens * (hidden / 32)
+        || !hidden.is_multiple_of(32)
+    {
+        return Err(BackendError::InvalidModelMetadata(
+            "Gemma 4 K-wide router scratch does not match the hidden geometry".into(),
+        ));
+    }
+
+    let mut routes = Vec::with_capacity(k_tokens);
+    let mut route_scales = Vec::with_capacity(k_tokens * GEMMA4_MTP_ROUTE_COUNT);
+    let router_inv = 1.0f32 / (hidden as f32).sqrt();
+    for token in 0..k_tokens {
+        let row = &hidden_rows[token * hidden..(token + 1) * hidden];
+        // Keep these expressions byte-for-byte aligned with
+        // `moe_layer_ffn_cached`: the sequential f32 sum and powf result define
+        // both router logits and expert activation bytes.
+        let mss = row.iter().map(|value| value * value).sum::<f32>() / hidden as f32;
+        let rms_inv = (mss + eps).powf(-0.5);
+        let mut router_input = row.iter().map(|value| value * rms_inv).collect::<Vec<_>>();
+        for (value, scale) in router_input.iter_mut().zip(&moe.gate_inp_scale) {
+            *value = *value * router_inv * scale;
+        }
+        let logits = f32_matvec(&moe.gate_inp, hidden, moe.n_expert, &router_input);
+        let max_logit = logits.iter().copied().fold(f32::MIN, f32::max);
+        let mut probabilities = logits
+            .iter()
+            .map(|&value| (value - max_logit).exp())
+            .collect::<Vec<_>>();
+        let probability_sum = probabilities.iter().sum::<f32>();
+        for probability in &mut probabilities {
+            *probability /= probability_sum;
+        }
+        let route = router_top_k(&probabilities, moe.n_expert_used);
+        let mut selected_sum = route
+            .iter()
+            .map(|&expert| probabilities[expert])
+            .sum::<f32>();
+        selected_sum = selected_sum.max(6.103_515e-5);
+        for &expert in &route {
+            let normalized = probabilities[expert] / selected_sum;
+            route_scales.push(moe.down_exps_scale[expert] * normalized);
+        }
+
+        let normalized = row
+            .iter()
+            .zip(&moe.pre_norm_2)
+            .map(|(value, weight)| value * rms_inv * weight)
+            .collect::<Vec<_>>();
+        let q8 = quantize_q8_0_blocks(&normalized);
+        let q_base = token * hidden;
+        let s_base = token * (hidden / 32);
+        for (block, quantized) in q8.iter().enumerate() {
+            expert_s[s_base + block] = quantized.scale;
+            expert_q[q_base + block * 32..q_base + (block + 1) * 32]
+                .copy_from_slice(&quantized.quants);
+        }
+        routes.push(route);
+    }
+
+    let csr = gemma4_plan_route_union(&routes, moe.n_expert)?;
+    Ok(Gemma4RouterBatchHost {
+        routes,
+        csr,
+        route_scales,
+    })
+}
 
 #[cfg(any(feature = "cuda", test))]
 fn gemma4_cuda_spec_k4_telemetry_policy(value: Option<&str>) -> bool {
@@ -7471,6 +8825,7 @@ impl SserHostTier {
         ctx: &std::sync::Arc<cudarc::driver::CudaContext>,
         ghost: &GhostFile,
         budget_bytes: usize,
+        eviction_policy: SserHostTierEvictionPolicy,
     ) -> Result<Option<Self>> {
         if budget_bytes == 0 {
             return Ok(None);
@@ -7504,6 +8859,7 @@ impl SserHostTier {
                 stride,
                 entries: std::collections::HashMap::with_capacity(want_slots),
                 lru: std::collections::BTreeSet::new(),
+                eviction_policy,
                 free_slots: (0..want_slots).rev().collect(),
                 clock: 0,
                 hits: 0,
@@ -7556,6 +8912,7 @@ impl SserHostTier {
             stride,
             entries: std::collections::HashMap::with_capacity(slots),
             lru: std::collections::BTreeSet::new(),
+            eviction_policy,
             free_slots: (0..slots).rev().collect(),
             clock: 0,
             hits: 0,
@@ -7606,13 +8963,8 @@ impl SserHostTier {
             Some(slot) => slot,
             None => {
                 let victim_stamp = self
-                    .lru
-                    .iter()
-                    .find(|(_, resident_layer, resident_expert)| {
-                        *resident_layer != layer as u16
-                            || !protected_experts.contains(&(*resident_expert as usize))
-                    })
-                    .copied()
+                    .eviction_policy
+                    .select_victim(&self.lru, layer as u16, protected_experts)
                     .ok_or_else(|| {
                         BackendError::InvalidModelMetadata(
                             "Ghost-MoE CUDA host tier has no recyclable slot for this route".into(),
@@ -7627,13 +8979,10 @@ impl SserHostTier {
             }
         };
         let stride = self.stride;
-        // Reads land straight in the page-locked slot: no intermediate Vec, and
-        // the copy stream can DMA from here without the CPU touching the bytes.
+        // Reads land in the page-locked tier slot without a caller-owned Vec. Windows'
+        // NO_BUFFERING reader still copies once from its sector-aligned private scratch.
         let (chunk_idx, chunk_off) = self.slot_location(slot);
         let expert_len = ghost.moe_expert_record_layout(layer, expert)?.byte_len;
-        // Blocking positioned read on the decode critical path with the GPU idle.
-        // Timed into its own bucket: it used to sit inside the miss path but
-        // outside `SSER_PROF_MISS_NS`, which covers only the GEMV submit.
         let t_read = sser_profile_enabled().then(std::time::Instant::now);
         let read_result = ghost.read_moe_expert_into(
             layer,
@@ -7649,8 +8998,6 @@ impl SserHostTier {
                 .fetch_add(expert_len as u64, std::sync::atomic::Ordering::Relaxed);
         }
         if let Err(error) = read_result {
-            // The slot was removed from either `free_slots` or a victim entry
-            // before I/O began. A failed read must not silently shrink the tier.
             self.free_slots.push(slot);
             return Err(error);
         }
@@ -7665,6 +9012,221 @@ impl SserHostTier {
         );
         self.lru.insert((stamp, key.0, key.1));
         Ok(slot)
+    }
+
+    /// Resolve a route's host-tier records as one transaction, issuing distinct storage
+    /// misses concurrently when `read_pool` is present. Each read owns a different reserved
+    /// slot, so it avoids a caller-owned staging allocation/copy and is immediately a
+    /// page-locked DMA source. Windows' unbuffered reader retains its aligned scratch copy.
+    /// Router order is restored in the returned slot vector and in LRU publication.
+    /// When `on_ready` is present, storage reads are joined in bounded QD4 groups
+    /// and the callback receives each newly complete contiguous expert prefix.
+    /// Every host slot is reserved before the first callback, so callback work
+    /// cannot perturb host-tier victim choice, hit accounting, or recency.
+    fn ensure_resident_many(
+        &mut self,
+        ghost: &GhostFile,
+        layer: usize,
+        experts: &[usize],
+        protected_experts: &[usize],
+        read_pool: Option<&rayon::ThreadPool>,
+        mut on_ready: Option<&mut SserHostTierReadyCallback<'_>>,
+    ) -> Result<Vec<usize>> {
+        #[derive(Clone, Copy)]
+        struct PendingRead {
+            ordinal: usize,
+            expert: usize,
+            slot: usize,
+            stamp: u64,
+            len: usize,
+            destination: usize,
+        }
+
+        // The route and future K-wide union both promise distinct experts. Enforce that
+        // contract here: duplicate misses would otherwise reserve two slots, overwrite the
+        // first directory entry at publication, and orphan one slot plus its LRU node.
+        for (ordinal, expert) in experts.iter().enumerate() {
+            if experts[..ordinal].contains(expert) {
+                return Err(BackendError::InvalidModelMetadata(format!(
+                    "Ghost-MoE CUDA host-tier batch contains duplicate expert {expert}"
+                )));
+            }
+        }
+
+        // Validate every record before mutating residency. A malformed later record must
+        // not leave earlier route slots reserved but unpublished.
+        let lengths = experts
+            .iter()
+            .map(|&expert| {
+                ghost
+                    .moe_expert_record_layout(layer, expert)
+                    .and_then(|layout| {
+                        if layout.byte_len > self.stride {
+                            Err(BackendError::InvalidModelMetadata(format!(
+                                "Ghost-MoE CUDA host-tier record layer={layer} expert={expert} is {} bytes, larger than stride {}",
+                                layout.byte_len, self.stride
+                            )))
+                        } else {
+                            Ok(layout.byte_len)
+                        }
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut resolved = vec![None; experts.len()];
+        let mut pending = Vec::<PendingRead>::with_capacity(experts.len());
+        for (ordinal, (&expert, &len)) in experts.iter().zip(&lengths).enumerate() {
+            let key = (layer as u16, expert as u16);
+            self.clock += 1;
+            let stamp = self.clock;
+            if let Some((slot, previous_stamp)) = self.entries.get_mut(&key).map(|entry| {
+                let previous_stamp = entry.last_used;
+                entry.last_used = stamp;
+                (entry.slot, previous_stamp)
+            }) {
+                self.lru.remove(&(previous_stamp, key.0, key.1));
+                self.lru.insert((stamp, key.0, key.1));
+                self.hits += 1;
+                resolved[ordinal] = Some(slot);
+                continue;
+            }
+
+            let slot = if let Some(slot) = self.free_slots.pop() {
+                slot
+            } else if let Some(victim_stamp) =
+                self.eviction_policy
+                    .select_victim(&self.lru, layer as u16, protected_experts)
+            {
+                self.lru.remove(&victim_stamp);
+                let victim = (victim_stamp.1, victim_stamp.2);
+                self.entries
+                    .remove(&victim)
+                    .expect("selected host-tier victim is resident")
+                    .slot
+            } else {
+                for read in &pending {
+                    self.free_slots.push(read.slot);
+                }
+                return Err(BackendError::InvalidModelMetadata(
+                    "Ghost-MoE CUDA host tier has no recyclable slot for this route".into(),
+                ));
+            };
+
+            let (chunk_idx, chunk_off) = self.slot_location(slot);
+            // SAFETY: every pending read owns a distinct slot removed from the free/LRU
+            // indexes above. The pinned chunks never move, and this method holds `&mut self`
+            // until the pool joins, so no other access can alias these byte ranges.
+            let destination = unsafe { self.chunks[chunk_idx].ptr.add(chunk_off) } as usize;
+            pending.push(PendingRead {
+                ordinal,
+                expert,
+                slot,
+                stamp,
+                len,
+                destination,
+            });
+            resolved[ordinal] = Some(slot);
+        }
+
+        if pending.is_empty() {
+            let resolved = resolved
+                .into_iter()
+                .map(|slot| slot.expect("every host-tier hit has a slot"))
+                .collect::<Vec<_>>();
+            if let Some(callback) = on_ready.as_mut() {
+                callback(self, 0..experts.len(), &resolved)?;
+            }
+            return Ok(resolved);
+        }
+
+        let read_one = |read: &PendingRead| {
+            // SAFETY: see the reservation invariant above. `destination..destination+len`
+            // is unique for this job and lies inside one live page-locked tier slot.
+            let destination =
+                unsafe { std::slice::from_raw_parts_mut(read.destination as *mut u8, read.len) };
+            ghost.read_moe_expert_into(layer, read.expert, destination)
+        };
+        let pending_ordinals = pending.iter().map(|read| read.ordinal).collect::<Vec<_>>();
+        let batches = if on_ready.is_some() {
+            gemma4_mtp_io_pipeline_batches(
+                &pending_ordinals,
+                experts.len(),
+                GEMMA4_MTP_IO_PIPELINE_READ_DEPTH,
+            )
+        } else {
+            vec![(0..pending.len(), 0..experts.len())]
+        };
+        let profile = sser_profile_enabled();
+        let mut storage_ns = 0u64;
+        let mut first_read_error = None;
+        let mut first_callback_error = None;
+        for (read_range, ready_range) in batches {
+            let reads = &pending[read_range];
+            let t_read = profile.then(std::time::Instant::now);
+            let results: Vec<Result<()>> = match read_pool {
+                Some(pool) if reads.len() > 1 => {
+                    pool.install(|| reads.par_iter().map(read_one).collect())
+                }
+                _ => reads.iter().map(read_one).collect(),
+            };
+            if let Some(t) = t_read {
+                storage_ns = storage_ns.saturating_add(t.elapsed().as_nanos() as u64);
+            }
+
+            for (read, result) in reads.iter().zip(results) {
+                let key = (layer as u16, read.expert as u16);
+                if let Err(error) = result {
+                    self.free_slots.push(read.slot);
+                    resolved[read.ordinal] = None;
+                    if first_read_error.is_none() {
+                        first_read_error = Some(error);
+                    }
+                    continue;
+                }
+                self.misses += 1;
+                self.bytes_read = self.bytes_read.saturating_add(read.len as u64);
+                self.entries.insert(
+                    key,
+                    SserHostEntry {
+                        slot: read.slot,
+                        last_used: read.stamp,
+                    },
+                );
+                self.lru.insert((read.stamp, key.0, key.1));
+            }
+
+            // Once either stage fails, finish every already-reserved storage read
+            // so publication/counters and first-error ordering stay deterministic,
+            // but never submit a later DMA prefix.
+            if first_read_error.is_none() && first_callback_error.is_none() {
+                if let Some(callback) = on_ready.as_mut() {
+                    let slots = resolved
+                        .iter()
+                        .map(|slot| slot.unwrap_or(usize::MAX))
+                        .collect::<Vec<_>>();
+                    if let Err(error) = callback(self, ready_range, &slots) {
+                        first_callback_error = Some(error);
+                    }
+                }
+            }
+        }
+        if profile {
+            SSER_PROF_STORAGE_NS.fetch_add(storage_ns, std::sync::atomic::Ordering::Relaxed);
+            SSER_PROF_STORAGE_BYTES.fetch_add(
+                pending.iter().map(|read| read.len as u64).sum(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+        if let Some(error) = first_read_error {
+            return Err(error);
+        }
+        if let Some(error) = first_callback_error {
+            return Err(error);
+        }
+        Ok(resolved
+            .into_iter()
+            .map(|slot| slot.expect("every successful host-tier route has a slot"))
+            .collect())
     }
 
     /// Fill free slots with records at load, striped uniformly across layers.
@@ -7903,6 +9465,27 @@ fn gemma4_prefill_prefetch_enabled() -> bool {
     })
 }
 
+/// Batch a layer's distinct host-tier storage misses across the positioned-read pool.
+///
+/// The Windows drive measured 1.04 GB/s at depth one and 2.42 GB/s at depth four for
+/// independent whole expert records. The reader pool already supplies independent handles;
+/// this switch gates the caller-side transaction that finally presents concurrent work.
+/// It remains opt-in until an exact paired H40 receipt promotes it.
+#[cfg(feature = "cuda")]
+fn gemma4_cuda_distinct_read_batch_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("CAMELID_GEMMA4_GHOST_BATCH_READS")
+            .ok()
+            .is_some_and(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "on" | "yes" | "enabled"
+                )
+            })
+    })
+}
+
 /// Blocks per pass in `q4_0_gemv_routed_rows`. MUST equal the kernel's
 /// `G4_ROUTED_CHUNK` — the launcher sizes the terms scratch from it.
 #[cfg(feature = "cuda")]
@@ -7948,7 +9531,7 @@ fn gemma4_cuda_routed_rows_per_warp() -> u32 {
 /// it is not a correctness or quality option. Sampled once per process, so set it
 /// before launch rather than between requests.
 #[cfg(feature = "cuda")]
-fn gemma4_q4_0_soa_enabled() -> bool {
+pub(crate) fn gemma4_q4_0_soa_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         std::env::var("CAMELID_GEMMA4_Q4_0_SOA")
@@ -7993,6 +9576,10 @@ struct SserCache {
     /// Ordered recency index.  This turns miss eviction from an O(capacity)
     /// HashMap walk into O(log capacity), plus at most top-k protected skips.
     lru: std::collections::BTreeSet<(u64, u16, u16)>,
+    /// Ordered lifetime-frequency index used only by explicit LFU eviction.
+    /// `(frequency, last_used, layer, expert)` gives deterministic LFU-then-LRU
+    /// selection in O(log capacity), plus the protected-union skips.
+    lfu: std::collections::BTreeSet<(u64, u64, u16, u16)>,
     /// Physical arena slots. Under frequency admission the final top-k slots are
     /// scratch and never appear in `entries`.
     capacity: usize,
@@ -8006,6 +9593,11 @@ struct SserCache {
     down_stride: usize,
     free_slots: Vec<usize>,
     transfer_slots: Vec<SserTransferSlot>,
+    eviction_policy: SserCudaEvictionPolicy,
+    /// Exact counts for always-admit lifetime LFU. Kept separate from the
+    /// scratch-based frequency-admission policy so LFU retains all arena slots
+    /// and remains eligible for K-wide verification.
+    lfu_access_counts: Option<SserFrequencyAdmissionPolicy>,
     frequency_admission: Option<SserFrequencyAdmissionPolicy>,
     // Diagnostics (per-generate; reset by the harness before each run).
     hits: u64,
@@ -8039,6 +9631,30 @@ struct SserMissSlot {
     admitted: bool,
 }
 
+#[cfg(any(feature = "cuda", test))]
+fn sser_cache_hot_capacity(
+    capacity: usize,
+    frequency_admission: bool,
+    eviction_policy: SserCudaEvictionPolicy,
+) -> Result<usize> {
+    if frequency_admission && eviction_policy == SserCudaEvictionPolicy::Lfu {
+        return Err(BackendError::InvalidModelMetadata(
+            "CAMELID_GEMMA4_GHOST_CUDA_EVICTION=lfu cannot be combined with CAMELID_GEMMA4_CUDA_FREQ_ADMISSION=1; lifetime LFU always admits and uses the full arena"
+                .into(),
+        ));
+    }
+    if frequency_admission && capacity < SSER_FREQUENCY_SCRATCH_SLOTS {
+        return Err(BackendError::InvalidModelMetadata(format!(
+            "CAMELID_GEMMA4_CUDA_FREQ_ADMISSION=1 requires at least {SSER_FREQUENCY_SCRATCH_SLOTS} physical SSER slots; only {capacity} fit"
+        )));
+    }
+    Ok(if frequency_admission {
+        capacity - SSER_FREQUENCY_SCRATCH_SLOTS
+    } else {
+        capacity
+    })
+}
+
 #[cfg(feature = "cuda")]
 impl SserCache {
     fn new(
@@ -8048,18 +9664,10 @@ impl SserCache {
         down_stride: usize,
         transfer_slot_count: usize,
         frequency_admission: bool,
+        eviction_policy: SserCudaEvictionPolicy,
     ) -> Result<Self> {
         let capacity = capacity.max(1);
-        if frequency_admission && capacity < SSER_FREQUENCY_SCRATCH_SLOTS {
-            return Err(BackendError::InvalidModelMetadata(format!(
-                "CAMELID_GEMMA4_CUDA_FREQ_ADMISSION=1 requires at least {SSER_FREQUENCY_SCRATCH_SLOTS} physical SSER slots; only {capacity} fit"
-            )));
-        }
-        let hot_capacity = if frequency_admission {
-            capacity - SSER_FREQUENCY_SCRATCH_SLOTS
-        } else {
-            capacity
-        };
+        let hot_capacity = sser_cache_hot_capacity(capacity, frequency_admission, eviction_policy)?;
         // SAFETY: a slot is initialized by HtoD before it is inserted into
         // `entries`, and only entries can be exposed to a GEMV.
         let gate_up_arena = unsafe { stream.alloc::<u8>(capacity * gate_up_stride) }.map_err(cu)?;
@@ -8081,6 +9689,7 @@ impl SserCache {
         Ok(Self {
             entries: std::collections::HashMap::with_capacity(capacity),
             lru: std::collections::BTreeSet::new(),
+            lfu: std::collections::BTreeSet::new(),
             capacity,
             hot_capacity,
             clock: 0,
@@ -8090,6 +9699,9 @@ impl SserCache {
             down_stride,
             free_slots: (0..hot_capacity).rev().collect(),
             transfer_slots,
+            eviction_policy,
+            lfu_access_counts: (eviction_policy == SserCudaEvictionPolicy::Lfu)
+                .then(SserFrequencyAdmissionPolicy::default),
             frequency_admission: frequency_admission.then(SserFrequencyAdmissionPolicy::default),
             hits: 0,
             misses: 0,
@@ -8132,23 +9744,38 @@ impl SserCache {
     }
 
     /// Record this route access, mark `key` most-recently-used, and return true
-    /// if resident. Frequency counting happens before the hit test so streamed
-    /// misses are counted exactly like hits and admitted misses.
+    /// if resident. Frequency counting happens before the hit test so streamed,
+    /// admitted, and later re-fetched misses retain the same lifetime evidence
+    /// as hits.
     fn touch(&mut self, key: (u16, u16)) -> bool {
-        let frequency = self
-            .frequency_admission
-            .as_mut()
-            .map_or(0, |policy| policy.record_access(key));
+        let frequency = if let Some(policy) = self.frequency_admission.as_mut() {
+            policy.record_access(key)
+        } else {
+            self.lfu_access_counts
+                .as_mut()
+                .map_or(0, |policy| policy.record_access(key))
+        };
         self.clock += 1;
         let clock = self.clock;
-        if let Some(previous_stamp) = self.entries.get_mut(&key).map(|entry| {
-            let previous_stamp = entry.last_used;
-            entry.last_used = clock;
-            entry.frequency = frequency;
-            previous_stamp
-        }) {
+        if let Some((previous_stamp, previous_frequency)) =
+            self.entries.get_mut(&key).map(|entry| {
+                let previous_stamp = entry.last_used;
+                let previous_frequency = entry.frequency;
+                entry.last_used = clock;
+                entry.frequency = frequency;
+                (previous_stamp, previous_frequency)
+            })
+        {
             self.lru.remove(&(previous_stamp, key.0, key.1));
             self.lru.insert((clock, key.0, key.1));
+            if self.eviction_policy == SserCudaEvictionPolicy::Lfu {
+                let removed = self
+                    .lfu
+                    .remove(&(previous_frequency, previous_stamp, key.0, key.1));
+                debug_assert!(removed);
+                let inserted = self.lfu.insert((frequency, clock, key.0, key.1));
+                debug_assert!(inserted);
+            }
             true
         } else {
             false
@@ -8171,10 +9798,13 @@ impl SserCache {
         }
         self.clock += 1;
         let stamp = self.clock;
-        let frequency = self
-            .frequency_admission
-            .as_ref()
-            .map_or(0, |policy| policy.count(key));
+        let frequency = if let Some(policy) = self.frequency_admission.as_ref() {
+            policy.count(key)
+        } else {
+            self.lfu_access_counts
+                .as_ref()
+                .map_or(0, |policy| policy.count(key))
+        };
         let previous = self.entries.insert(
             key,
             SserExpertDev {
@@ -8188,6 +9818,10 @@ impl SserCache {
             "an SSER miss cannot replace the same key"
         );
         self.lru.insert((stamp, key.0, key.1));
+        if self.eviction_policy == SserCudaEvictionPolicy::Lfu {
+            let inserted = self.lfu.insert((frequency, stamp, key.0, key.1));
+            debug_assert!(inserted);
+        }
     }
 
     /// Return an admitted-but-unpublished reservation to the hot free list.
@@ -8212,9 +9846,10 @@ impl SserCache {
 
     /// Reserve a hot slot or a unique per-layer scratch slot without evicting
     /// any expert selected by the current route. Under the default policy this
-    /// is the existing protected LRU. Under frequency admission a full cache
-    /// admits only a strictly hotter newcomer; every other miss streams through
-    /// `scratch_ordinal` and is never published in `entries`.
+    /// is the existing protected LRU. Explicit lifetime LFU changes only that
+    /// victim order and still admits every miss. Under frequency admission a
+    /// full cache admits only a strictly hotter newcomer; every other miss
+    /// streams through `scratch_ordinal` and is never published in `entries`.
     fn slot_for_miss_excluding(
         &mut self,
         incoming_key: (u16, u16),
@@ -8246,6 +9881,12 @@ impl SserCache {
                         .expect("the selected frequency-admission victim remains resident");
                     self.lru
                         .remove(&(victim_entry.last_used, victim.0, victim.1));
+                    self.lfu.remove(&(
+                        victim_entry.frequency,
+                        victim_entry.last_used,
+                        victim.0,
+                        victim.1,
+                    ));
                     self.note_eviction(victim);
                     return Some(SserMissSlot {
                         slot: victim_entry.slot,
@@ -8262,20 +9903,35 @@ impl SserCache {
                 }
             }
         }
-        let victim_stamp = self
-            .lru
-            .iter()
-            .find(|(_, layer, expert)| {
-                *layer != protected_layer || !protected_experts.contains(&(*expert as usize))
-            })
-            .copied()?;
-        self.lru.remove(&victim_stamp);
-        let victim = (victim_stamp.1, victim_stamp.2);
-        let slot = self
+        let victim = match self.eviction_policy {
+            SserCudaEvictionPolicy::Lru => self
+                .lru
+                .iter()
+                .find(|(_, layer, expert)| {
+                    *layer != protected_layer || !protected_experts.contains(&(*expert as usize))
+                })
+                .map(|&(_, layer, expert)| (layer, expert))?,
+            SserCudaEvictionPolicy::Lfu => self
+                .lfu
+                .iter()
+                .find(|(_, _, layer, expert)| {
+                    *layer != protected_layer || !protected_experts.contains(&(*expert as usize))
+                })
+                .map(|&(_, _, layer, expert)| (layer, expert))?,
+        };
+        let victim_entry = self
             .entries
             .remove(&victim)
-            .expect("the selected SSER victim remains resident")
-            .slot;
+            .expect("the selected SSER victim remains resident");
+        self.lru
+            .remove(&(victim_entry.last_used, victim.0, victim.1));
+        self.lfu.remove(&(
+            victim_entry.frequency,
+            victim_entry.last_used,
+            victim.0,
+            victim.1,
+        ));
+        let slot = victim_entry.slot;
         self.note_eviction(victim);
         Some(SserMissSlot {
             slot,
@@ -8612,6 +10268,8 @@ pub struct Gemma4CudaResident {
     /// payload, so its misses can flush the tier before decode ever asks it anything, and
     /// a lifetime hit rate cannot tell that apart from a tier that simply does not work.
     prefill_tier_mark: std::cell::Cell<(u64, u64)>,
+    /// SSER/host directory overlap at the same prefill/decode boundary.
+    prefill_residency_mark: std::cell::Cell<Option<Gemma4SserHostResidency>>,
     /// Resolved decode read path, decided once on first use. See `decode_bulk_reads`.
     decode_bulk_reads: std::cell::Cell<Option<bool>>,
     // Reused per-token/per-layer device scratch (sized to per-layer maxima).
@@ -8679,19 +10337,40 @@ pub struct Gemma4CudaResident {
     /// enabled for a generation. Route observations are accumulated through a
     /// `RefCell` because the MoE helper intentionally takes `&self`.
     spec_k4_telemetry: Option<std::cell::RefCell<Gemma4CudaSpecTelemetry>>,
+    /// Lazily allocated only after the explicit K-wide verifier opt-in passes
+    /// every model/arena eligibility check. `None` keeps ordinary decode's VRAM
+    /// footprint unchanged.
+    verify_scratch: Option<Gemma4VerifyScratchDev>,
+    /// Receipt latch for the most recent `verify_chunk_mtp` call. Reset before
+    /// eligibility is evaluated and set only after the K-wide pass completes.
+    mtp_kwide_last_completed: std::cell::Cell<bool>,
+    /// Opt-in QD4 read/HtoD pipeline for K-wide expert unions. Parsed strictly
+    /// once at load so a typo cannot vary behavior between verifier layers.
+    mtp_io_pipeline: bool,
+    /// Default-off 236 MiB full-Q4 assistant plus its persistent activation
+    /// scratch. Loaded only after the exact tracked geometry is admitted.
+    mtp_cuda_assistant: Option<Gemma4MtpCudaResident>,
 }
+
+/// Maximum target rows in one MTP verifier pass: the current target token plus
+/// thirteen assistant drafts. This also reserves the ring slack required by the
+/// opt-in K-wide verifier.
+#[cfg(any(feature = "cuda", test))]
+pub(crate) const MAX_MTP_VERIFY_ROWS: usize = 14;
 
 /// Per-layer KV cache capacity (positions) for the CUDA-resident lane. A sliding
 /// layer's `attention_decode_sw` read starts at `position_count - window`, so no key
-/// older than `window` positions back is ever read: its cache is a ring of
-/// `window + 1` slots (`kv_scatter` and the attention reads wrap with `% capacity`),
-/// while global layers keep the full `max_positions`. On the 26B ghost row this
-/// returns ~600 MiB of VRAM at the default 4096-position context (25 sliding layers
-/// × K+V × kv_dim 2048 × (4096−1025) positions × 2 B) — headroom the SSER expert
-/// cache's VRAM-fit sizing converts directly into more resident routed experts.
+/// older than `window` positions back is ever read. A K-wide verifier scatters all
+/// future rows before its earliest row attends; the ring therefore needs a full
+/// verify-width of slack so those future writes cannot replace live history. Both
+/// scalar and batched scatter/attention wrap with `% capacity`. Global layers keep
+/// the full `max_positions` instead. On the 26B ghost row the thirteen extra slots
+/// over the former `window + 1` ring cost about 2.5 MiB across 25 sliding layers.
 #[cfg(feature = "cuda")]
-fn gemma4_kv_capacity(window: Option<usize>, max_positions: usize) -> usize {
-    window.map_or(max_positions, |w| (w + 1).min(max_positions))
+pub(crate) fn gemma4_kv_capacity(window: Option<usize>, max_positions: usize) -> usize {
+    window.map_or(max_positions, |w| {
+        w.saturating_add(MAX_MTP_VERIFY_ROWS).min(max_positions)
+    })
 }
 
 #[cfg(feature = "cuda")]
@@ -8734,7 +10413,7 @@ impl Gemma4CudaResident {
         // a fill that the page cache can serve stays at memcpy speed.
         let strict_reads = evict_page_cache;
         // KV context is a direct trade against routed-expert residency, but since
-        // the sliding-layer caches became window+1-slot rings (gemma4_kv_capacity)
+        // the sliding-layer caches became window+verify-width rings (gemma4_kv_capacity)
         // only the 5 global layers still scale with `max_positions`: the 26B row's
         // KV is ~280 MiB at 4096 positions where it used to be 880 MiB. Every
         // 3.19 MiB returned here buys one more resident expert, so the knob still
@@ -8761,6 +10440,15 @@ impl Gemma4CudaResident {
         max_positions: usize,
         host_tier_budget_bytes: usize,
     ) -> Result<Self> {
+        let mtp_io_pipeline = gemma4_mtp_io_pipeline_policy(
+            std::env::var(GEMMA4_MTP_IO_PIPELINE_ENV).ok().as_deref(),
+        )
+        .map_err(BackendError::InvalidModelMetadata)?;
+        if mtp_io_pipeline {
+            eprintln!(
+                "[gemma4-mtp-cuda] K-wide expert I/O pipeline ON: QD{GEMMA4_MTP_IO_PIPELINE_READ_DEPTH} storage reads overlap expert HtoD"
+            );
+        }
         let ghost_moe = cpu.ghost_moe_cache.is_some();
         // BASALT Amendment 3 review fix: refuse NVFP4 layer projections with a
         // typed error BEFORE the `GemmaLayerQuant::from_wire` catch-all (`upw`
@@ -9028,7 +10716,7 @@ impl Gemma4CudaResident {
         }
 
         // Per-owning-layer f16 KV caches sized to that layer's kv geometry and
-        // position capacity: sliding layers ring on window+1 slots, only global
+        // position capacity: sliding layers include one verifier-width of ring slack; only global
         // layers pay for the full context (see gemma4_kv_capacity).
         let mut cache_k = Vec::with_capacity(block_count);
         let mut cache_v = Vec::with_capacity(block_count);
@@ -9093,6 +10781,11 @@ impl Gemma4CudaResident {
                 )
             })
             .unwrap_or(false);
+        let sser_eviction_policy = parse_sser_cuda_eviction_policy(
+            std::env::var("CAMELID_GEMMA4_GHOST_CUDA_EVICTION")
+                .ok()
+                .as_deref(),
+        )?;
         let mut sser = if let (Some(_), true) = (first_moe, sser_requested) {
             let max_gate_up_bytes = cpu
                 .layers
@@ -9124,11 +10817,28 @@ impl Gemma4CudaResident {
             // Budget: keep the cache under ~80% of the free VRAM after the resident set
             // (leaving headroom for the per-token scratch + the KV cache growth).
             let (free, _total) = cudarc::driver::result::mem_get_info().unwrap_or((0, 0));
-            let reserve_mib = std::env::var("CAMELID_GEMMA4_GHOST_CUDA_RESERVE_MIB")
+            let requested_reserve_mib = std::env::var("CAMELID_GEMMA4_GHOST_CUDA_RESERVE_MIB")
                 .ok()
                 .or_else(|| std::env::var("CAMELID_SSER_CACHE_RESERVE_MIB").ok())
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(160);
+            // The assistant is loaded after the target runtime. Reserve its exact
+            // 236,151,824-byte weight ledger, ~1.5 MiB scratch, and the ordinary
+            // 160 MiB runtime cushion before SSER greedily consumes free VRAM.
+            // Round to 448 MiB so allocator bookkeeping and driver modules cannot
+            // turn an otherwise-admitted lane into a late OOM.
+            let assistant_reserve_mib = if gemma4_mtp_cuda_assistant_enabled() {
+                448
+            } else {
+                0
+            };
+            let reserve_mib = requested_reserve_mib.max(assistant_reserve_mib);
+            if assistant_reserve_mib != 0 {
+                eprintln!(
+                    "[gemma4-mtp-cuda] preserving {reserve_mib} MiB before SSER allocation (assistant weights {} MiB + scratch/headroom)",
+                    crate::gemma4_mtp_cuda::GEMMA4_MTP_CUDA_RESIDENT_BYTES / (1024 * 1024),
+                );
+            }
             let reserve = reserve_mib * 1024 * 1024;
             let hard_cap = (free as f64 * 0.98) as usize;
             let budget = free.saturating_sub(reserve).min(hard_cap);
@@ -9158,6 +10868,11 @@ impl Gemma4CudaResident {
                     cap.saturating_sub(SSER_FREQUENCY_SCRATCH_SLOTS),
                 );
             }
+            if sser_eviction_policy == SserCudaEvictionPolicy::Lfu {
+                eprintln!(
+                    "[sser] lifetime-LFU eviction ON: all {cap} slots remain hot; equal counts break by LRU"
+                );
+            }
             Some(SserCache::new(
                 cap,
                 &cap_stream,
@@ -9165,6 +10880,7 @@ impl Gemma4CudaResident {
                 down_stride,
                 0,
                 frequency_admission,
+                sser_eviction_policy,
             )?)
         } else {
             None
@@ -9185,6 +10901,18 @@ impl Gemma4CudaResident {
                 )
             })
             .unwrap_or(true);
+        let host_tier_eviction_policy =
+            match std::env::var_os("CAMELID_GEMMA4_GHOST_HOST_TIER_EVICTION") {
+                None => parse_sser_host_tier_eviction_policy(None)?,
+                Some(raw) => {
+                    let value = raw.to_str().ok_or_else(|| {
+                        BackendError::InvalidModelMetadata(
+                            "CAMELID_GEMMA4_GHOST_HOST_TIER_EVICTION is not valid UTF-8".into(),
+                        )
+                    })?;
+                    parse_sser_host_tier_eviction_policy(Some(value))?
+                }
+            };
         let host_tier = match (sser.as_ref(), cpu.ghost_moe_cache.as_ref()) {
             (Some(_), Some(ghost_cache))
                 if routed_batch_enabled
@@ -9196,6 +10924,7 @@ impl Gemma4CudaResident {
                     cap_stream.context(),
                     &ghost_cache.file,
                     host_tier_budget_bytes,
+                    host_tier_eviction_policy,
                 ) {
                     Ok(tier) => tier,
                     Err(e) => {
@@ -9208,10 +10937,11 @@ impl Gemma4CudaResident {
                 if let Some(tier) = tier.as_mut() {
                     let (_, _, _, slots) = tier.stats();
                     eprintln!(
-                        "[ghost] host expert tier: {} slots ({} MiB page-locked, {:.1} MiB/record) covering the VRAM miss tail",
+                        "[ghost] host expert tier: {} slots ({} MiB page-locked, {:.1} MiB/record) covering the VRAM miss tail; eviction policy {}",
                         slots,
                         (slots * tier.stride) / (1024 * 1024),
                         tier.stride as f64 / (1024.0 * 1024.0),
+                        tier.eviction_policy.as_str(),
                     );
                     tier.prefill(&ghost_cache.file);
                 }
@@ -9304,6 +11034,10 @@ impl Gemma4CudaResident {
             overlap_miss_io,
             overlap_router_copy,
             spec_k4_telemetry: None,
+            verify_scratch: None,
+            mtp_kwide_last_completed: std::cell::Cell::new(false),
+            mtp_io_pipeline,
+            mtp_cuda_assistant: None,
             norms,
             lweights,
             ple,
@@ -9323,6 +11057,7 @@ impl Gemma4CudaResident {
             cached_tokens: Vec::new(),
             prefill_sser_mark: std::cell::Cell::new((0, 0)),
             prefill_tier_mark: std::cell::Cell::new((0, 0)),
+            prefill_residency_mark: std::cell::Cell::new(None),
             decode_bulk_reads: std::cell::Cell::new(None),
             d_hidden: alloc_f(hidden).map_err(cu)?,
             d_normed: alloc_f(hidden).map_err(cu)?,
@@ -9456,14 +11191,41 @@ impl Gemma4CudaResident {
             let total = hits + misses;
             eprintln!(
                 "[ghost] host tier: {hits} hits / {misses} storage reads = {:.1}% tier hit-rate; \
-                 {resident}/{slots} records resident; {:.2} GiB read from .cghost",
+                 {resident}/{slots} records resident; {:.2} GiB read from .cghost; eviction policy {}",
                 if total > 0 {
                     100.0 * hits as f64 / total as f64
                 } else {
                     0.0
                 },
                 tier.bytes_read as f64 / (1024.0 * 1024.0 * 1024.0),
+                tier.eviction_policy.as_str(),
             );
+        }
+        if let Some(end) = self.sser_host_residency() {
+            if let Some(prefill) = self.sser_host_prefill_residency() {
+                eprintln!(
+                    "[ghost] SSER/host residency: prefill sser={} host={} intersection={} host-only={} union={}; end sser={} host={} intersection={} host-only={} union={}",
+                    prefill.sser_records,
+                    prefill.host_records,
+                    prefill.intersection_records,
+                    prefill.host_only_records,
+                    prefill.union_records,
+                    end.sser_records,
+                    end.host_records,
+                    end.intersection_records,
+                    end.host_only_records,
+                    end.union_records,
+                );
+            } else {
+                eprintln!(
+                    "[ghost] SSER/host residency: end sser={} host={} intersection={} host-only={} union={}",
+                    end.sser_records,
+                    end.host_records,
+                    end.intersection_records,
+                    end.host_only_records,
+                    end.union_records,
+                );
+            }
         }
         self.sser.as_ref().map(|c| {
             let c = c.borrow();
@@ -9495,6 +11257,168 @@ impl Gemma4CudaResident {
         }
     }
 
+    fn mtp_cuda_assistant_decline_reason(&self) -> Option<String> {
+        use crate::gemma4_mtp as mtp;
+        if self.hidden != mtp::BACKBONE_HIDDEN
+            || self.heads != mtp::NUM_ATTENTION_HEADS
+            || self.vocab != 262_144
+        {
+            return Some(format!(
+                "target geometry is hidden={} heads={} vocab={}, expected {} / {} / 262144",
+                self.hidden,
+                self.heads,
+                self.vocab,
+                mtp::BACKBONE_HIDDEN,
+                mtp::NUM_ATTENTION_HEADS,
+            ));
+        }
+        if self.gpu_head.is_none() {
+            return Some("the target GPU tied head is unavailable".into());
+        }
+        if self.max_positions == 0 || self.max_positions > i32::MAX as usize {
+            return Some(format!(
+                "target context length {} is outside the CUDA assistant position ABI",
+                self.max_positions
+            ));
+        }
+
+        for (host_layer, expected_heads, expected_dim, expected_window, label) in [
+            (
+                mtp::SHARED_KV_SLIDING_HOST_LAYER,
+                mtp::SLIDING_KV_HEADS,
+                mtp::SLIDING_HEAD_DIM,
+                Some(mtp::SLIDING_WINDOW),
+                "sliding",
+            ),
+            (
+                mtp::SHARED_KV_FULL_HOST_LAYER,
+                mtp::FULL_KV_HEADS,
+                mtp::FULL_HEAD_DIM,
+                None,
+                "full",
+            ),
+        ] {
+            let Some(plan) = self.plan.get(host_layer) else {
+                return Some(format!("target has no host {label} layer {host_layer}"));
+            };
+            if plan.kv_heads != expected_heads
+                || plan.head_dim != expected_dim
+                || plan.window != expected_window
+            {
+                return Some(format!(
+                    "host {label} layer {host_layer} is kv_heads={} head_dim={} window={:?}, expected {expected_heads} / {expected_dim} / {expected_window:?}",
+                    plan.kv_heads, plan.head_dim, plan.window,
+                ));
+            }
+            let source = plan.kv_source_layer;
+            if self.cache_k.get(source).and_then(Option::as_ref).is_none()
+                || self.cache_v.get(source).and_then(Option::as_ref).is_none()
+            {
+                return Some(format!(
+                    "host {label} layer {host_layer} resolves to missing KV source {source}"
+                ));
+            }
+        }
+        None
+    }
+
+    /// Stream and upload the official BF16 assistant as a bounded 236 MiB Q4
+    /// device pack. `Ok(false)` means only that the env gate is off. Once the
+    /// user explicitly selects CUDA, an unsupported target is a typed
+    /// pre-generation decline rather than permission to allocate the dense CPU
+    /// assistant behind their back.
+    pub fn try_load_mtp_cuda_assistant(&mut self, assistant_dir: &Path) -> Result<bool> {
+        if !gemma4_mtp_cuda_assistant_enabled() {
+            return Ok(false);
+        }
+        if let Some(reason) = self.mtp_cuda_assistant_decline_reason() {
+            return Err(BackendError::UnsupportedGguf(format!(
+                "Gemma 4 CUDA assistant declined before generation: {reason}; unset CAMELID_GEMMA4_MTP_CUDA_ASSISTANT to select the CPU assistant"
+            )));
+        }
+        if self.mtp_cuda_assistant.is_some() {
+            return Ok(true);
+        }
+
+        use crate::gemma4_mtp as mtp;
+        use crate::gemma4_mtp_cuda::{Gemma4MtpCudaMatrixId as MatrixId, Gemma4MtpCudaSource};
+        let source = Gemma4MtpCudaSource::open(assistant_dir.join("model.safetensors"))?;
+        let weights = source.load_cuda_weights(&self.kernels.ctx, &self.cap_stream)?;
+        weights.validate_resident_accounting()?;
+        let embedding = weights.matrix_layout(MatrixId::Embedding);
+        if embedding.rows != self.vocab || embedding.cols != mtp::ASSISTANT_HIDDEN {
+            return Err(BackendError::RuntimeShapeMismatch(format!(
+                "CUDA assistant tied head is {}x{}, target expects vocab {} and assistant hidden {}",
+                embedding.rows,
+                embedding.cols,
+                self.vocab,
+                mtp::ASSISTANT_HIDDEN,
+            )));
+        }
+
+        let mut f32_parameters = vec![0.0f32; weights.f32_parameters().len()];
+        self.cap_stream
+            .memcpy_dtoh(weights.f32_parameters(), &mut f32_parameters)
+            .map_err(cu)?;
+        self.cap_stream.synchronize().map_err(cu)?;
+        let mut layer_scalars = [0.0f32; mtp::NUM_LAYERS];
+        for (layer, scalar) in layer_scalars.iter_mut().enumerate() {
+            let layout = weights.f32_layout(gemma4_mtp_cuda_scalar_id(layer));
+            if layout.elements != 1 {
+                return Err(BackendError::RuntimeShapeMismatch(format!(
+                    "CUDA assistant layer {layer} scalar contains {} values",
+                    layout.elements
+                )));
+            }
+            let offset = usize::try_from(layout.element_offset).map_err(|_| {
+                BackendError::RuntimeShapeMismatch(
+                    "CUDA assistant scalar offset exceeds this host".into(),
+                )
+            })?;
+            *scalar = f32_parameters[offset];
+        }
+        drop(f32_parameters);
+
+        let stream = &self.cap_stream;
+        let alloc_f = |values: usize| stream.alloc_zeros::<f32>(values.max(1)).map_err(cu);
+        let scratch = Gemma4MtpCudaScratchDev {
+            joined: alloc_f(2 * mtp::BACKBONE_HIDDEN)?,
+            hidden: alloc_f(mtp::ASSISTANT_HIDDEN)?,
+            normed: alloc_f(mtp::ASSISTANT_HIDDEN)?,
+            q: alloc_f(mtp::NUM_ATTENTION_HEADS * mtp::FULL_HEAD_DIM)?,
+            context: alloc_f(mtp::NUM_ATTENTION_HEADS * mtp::FULL_HEAD_DIM)?,
+            attn: alloc_f(mtp::ASSISTANT_HIDDEN)?,
+            gate: alloc_f(8_192)?,
+            up: alloc_f(8_192)?,
+            geglu: alloc_f(8_192)?,
+            ffn: alloc_f(mtp::ASSISTANT_HIDDEN)?,
+            recurrent: alloc_f(mtp::BACKBONE_HIDDEN)?,
+            logits: alloc_f(self.vocab)?,
+            cos: alloc_f(mtp::FULL_HEAD_DIM / 2)?,
+            sin: alloc_f(mtp::FULL_HEAD_DIM / 2)?,
+            position: stream.alloc_zeros::<i32>(1).map_err(cu)?,
+            argmax: stream.alloc_zeros::<u32>(1).map_err(cu)?,
+            scores: alloc_f(mtp::NUM_ATTENTION_HEADS * self.max_positions)?,
+        };
+        let bytes = weights.accounting().total_bytes;
+        self.mtp_cuda_assistant = Some(Gemma4MtpCudaResident {
+            weights,
+            scratch,
+            layer_scalars,
+        });
+        eprintln!(
+            "[gemma4-mtp-cuda] resident assistant ready: {} bytes Q4 weights, CPU assistant loaded=0",
+            bytes
+        );
+        Ok(true)
+    }
+
+    pub fn mtp_cuda_assistant_resident_bytes(&self) -> Option<u64> {
+        self.mtp_cuda_assistant
+            .as_ref()
+            .map(|assistant| assistant.weights.accounting().total_bytes)
+    }
+
     /// Reset KV cache representation so subsequent prompts begin from position 0.
     pub fn clear_cache(&mut self) {
         self.cached_tokens.clear();
@@ -9521,6 +11445,40 @@ impl Gemma4CudaResident {
         })
     }
 
+    /// Current distinct-record occupancy across SSER VRAM and the pinned host tier.
+    pub fn sser_host_residency(&self) -> Option<Gemma4SserHostResidency> {
+        let sser = self.sser.as_ref()?.borrow();
+        let host = self.host_tier.as_ref()?.borrow();
+        let sser_records = sser.entries.len();
+        let host_records = host.entries.len();
+        let intersection_records = sser
+            .entries
+            .keys()
+            .filter(|key| host.entries.contains_key(key))
+            .count();
+        Some(Gemma4SserHostResidency {
+            sser_records,
+            host_records,
+            intersection_records,
+            host_only_records: host_records.saturating_sub(intersection_records),
+            union_records: sser_records
+                .saturating_add(host_records)
+                .saturating_sub(intersection_records),
+        })
+    }
+
+    /// SSER/host occupancy captured at the end of the last prefill.
+    pub fn sser_host_prefill_residency(&self) -> Option<Gemma4SserHostResidency> {
+        self.prefill_residency_mark.get()
+    }
+
+    /// Selected host-tier victim endpoint. `None` when no tier was built.
+    pub fn host_tier_eviction_policy(&self) -> Option<&'static str> {
+        self.host_tier
+            .as_ref()
+            .map(|tier| tier.borrow().eviction_policy.as_str())
+    }
+
     /// Host expert tier `(hits, storage reads)` at the end of the last prefill.
     pub fn host_tier_prefill_mark(&self) -> (u64, u64) {
         self.prefill_tier_mark.get()
@@ -9541,6 +11499,1540 @@ impl Gemma4CudaResident {
             c.misses = 0;
             c.streamed_misses = 0;
         }
+    }
+
+    /// Return whether this exact model/request can enter the opt-in K-wide lane.
+    /// Any uncertainty declines before scratch allocation or KV mutation; the
+    /// caller then runs the established scalar layer-major verifier.
+    fn mtp_kwide_eligible(&self, k_tokens: usize, start: usize) -> bool {
+        if !gemma4_mtp_kwide_enabled()
+            || !(1..=MAX_MTP_VERIFY_ROWS).contains(&k_tokens)
+            || start
+                .checked_add(k_tokens)
+                .is_none_or(|end| end > self.max_positions)
+            || self.ple_dim != 0
+            || self.cpu.per_layer_token_embd.is_some()
+            || self.gpu_ple_ctx.is_some()
+            || self.ple.iter().any(Option::is_some)
+        {
+            return false;
+        }
+
+        let Some(host_tier) = self.host_tier.as_ref() else {
+            return false;
+        };
+        if host_tier.borrow().stats().3 < k_tokens * GEMMA4_MTP_ROUTE_COUNT {
+            return false;
+        }
+
+        let Some(sser) = self.sser.as_ref() else {
+            return false;
+        };
+        let sser = sser.borrow();
+        if sser.frequency_admission_enabled()
+            || sser.hot_capacity < k_tokens * GEMMA4_MTP_ROUTE_COUNT
+        {
+            return false;
+        }
+        drop(sser);
+
+        let Some(head) = self.gpu_head.as_ref() else {
+            return false;
+        };
+        // These are not merely divisibility checks. The exact batched kernels
+        // retain each token's ordered block terms in dynamic shared memory and
+        // intentionally assert when even one warp cannot fit under 46 KiB. Keep
+        // that assertion unreachable from production: an oversized K/shape must
+        // decline here, before this lane writes any speculative KV rows.
+        const SHARED_BUDGET: usize = 46 * 1024;
+        let projection_supported = |quant: GemmaLayerQuant, cols: usize| match quant {
+            GemmaLayerQuant::Q8_0 | GemmaLayerQuant::Q4_0 | GemmaLayerQuant::Q4_1 => {
+                cols.is_multiple_of(32)
+                    && k_tokens
+                        .checked_mul(cols / 32)
+                        .and_then(|values| values.checked_mul(std::mem::size_of::<f32>()))
+                        .is_some_and(|bytes| bytes <= SHARED_BUDGET)
+            }
+            GemmaLayerQuant::Q4K | GemmaLayerQuant::Q6K => {
+                let aux_lanes = if quant == GemmaLayerQuant::Q4K { 9 } else { 8 };
+                cols.is_multiple_of(256)
+                    && k_tokens
+                        .checked_mul(cols / 256)
+                        .and_then(|rows| {
+                            rows.checked_mul(260).and_then(|input_bytes| {
+                                rows.checked_mul(aux_lanes)
+                                    .and_then(|values| {
+                                        values.checked_mul(std::mem::size_of::<f32>())
+                                    })
+                                    .and_then(|term_bytes| input_bytes.checked_add(term_bytes))
+                            })
+                        })
+                        .is_some_and(|bytes| bytes <= SHARED_BUDGET)
+            }
+            GemmaLayerQuant::Nvfp4 => false,
+        };
+        let head_quant = match head.lane {
+            HeadLane::Q8_0 => GemmaLayerQuant::Q8_0,
+            HeadLane::Q4K => GemmaLayerQuant::Q4K,
+            HeadLane::Q6K => GemmaLayerQuant::Q6K,
+        };
+        if !projection_supported(head_quant, self.hidden)
+            || self.hidden.saturating_mul(std::mem::size_of::<f32>()) > SHARED_BUDGET
+        {
+            return false;
+        }
+        for (li, ((plan, weights), layer)) in self
+            .plan
+            .iter()
+            .zip(&self.lweights)
+            .zip(&self.cpu.layers)
+            .enumerate()
+        {
+            let ffn_dim = self.cpu.g.ffn_length_at(li) as usize;
+            if plan.head_dim == 0
+                || plan.head_dim > 1024
+                || plan.kv_heads == 0
+                || !self.heads.is_multiple_of(plan.kv_heads)
+                || !projection_supported(weights.q_q, self.hidden)
+                || !projection_supported(weights.o_q, plan.q_dim)
+                || !projection_supported(weights.gate_q, self.hidden)
+                || !projection_supported(weights.up_q, self.hidden)
+                || !projection_supported(weights.down_q, ffn_dim)
+                || (plan.owns_kv && !projection_supported(weights.k_q, self.hidden))
+                || (plan.owns_kv
+                    && weights.v.is_some()
+                    && !projection_supported(weights.v_q, self.hidden))
+            {
+                return false;
+            }
+
+            let span = plan
+                .window
+                .map_or(start + k_tokens, |window| (start + k_tokens).min(window));
+            if plan
+                .head_dim
+                .checked_add(span)
+                .and_then(|values| values.checked_mul(std::mem::size_of::<f32>()))
+                .is_none_or(|bytes| bytes > SHARED_BUDGET)
+            {
+                return false;
+            }
+
+            if let Some(moe) = layer.moe.as_ref() {
+                if moe.n_expert_used != GEMMA4_MTP_ROUTE_COUNT
+                    || !moe.n_ff_exp.is_multiple_of(32)
+                    || (self.hidden / 32).saturating_mul(std::mem::size_of::<f32>()) > SHARED_BUDGET
+                    || (moe.n_ff_exp / 32).saturating_mul(std::mem::size_of::<f32>())
+                        > SHARED_BUDGET
+                    || moe.gate_up_exps.format != WireFormat::Q4_0
+                    || !matches!(moe.down_exps.format, WireFormat::Q4_0 | WireFormat::Q4_1)
+                    || moe.ghost.is_none()
+                {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    fn alloc_mtp_verify_scratch(&self) -> Result<Gemma4VerifyScratchDev> {
+        let cap = MAX_MTP_VERIFY_ROWS;
+        let hidden = self.hidden;
+        let q_dim_max = self.plan.iter().map(|plan| plan.q_dim).max().unwrap_or(0);
+        let kv_dim_max = self.plan.iter().map(|plan| plan.kv_dim).max().unwrap_or(0);
+        let ffn_max = (0..self.block_count)
+            .map(|layer| self.cpu.g.ffn_length_at(layer) as usize)
+            .max()
+            .unwrap_or(0);
+        let expert_ffn_max = self
+            .cpu
+            .layers
+            .iter()
+            .filter_map(|layer| layer.moe.as_ref().map(|moe| moe.n_ff_exp))
+            .max()
+            .unwrap_or(0);
+        let max_in = hidden.max(q_dim_max).max(ffn_max);
+        let assignment_cap = cap * GEMMA4_MTP_ROUTE_COUNT;
+        let mut rope_offsets = Vec::with_capacity(self.block_count);
+        let mut rope_values = 0usize;
+        for plan in &self.plan {
+            rope_offsets.push(rope_values);
+            rope_values = rope_values
+                .checked_add(cap * (plan.head_dim / 2))
+                .ok_or_else(|| {
+                    BackendError::InvalidModelMetadata(
+                        "Gemma 4 K-wide RoPE scratch size overflow".into(),
+                    )
+                })?;
+        }
+
+        let s = &self.cap_stream;
+        let alloc_f = |n: usize| s.alloc_zeros::<f32>(n.max(1)).map_err(cu);
+        let alloc_i = |n: usize| s.alloc_zeros::<i8>(n.max(1)).map_err(cu);
+        let alloc_i32 = |n: usize| s.alloc_zeros::<i32>(n.max(1)).map_err(cu);
+        let assignment_ids = (0..assignment_cap as i32).collect::<Vec<_>>();
+        Ok(Gemma4VerifyScratchDev {
+            cap,
+            h: alloc_f(cap * hidden)?,
+            normed: alloc_f(cap * hidden)?,
+            in_q: alloc_i(cap * max_in)?,
+            in_s: alloc_f(cap * (max_in / 32).max(1))?,
+            in_qk: alloc_i(cap * max_in)?,
+            in_sk: alloc_f(cap * (max_in / 256).max(1))?,
+            q: alloc_f(cap * q_dim_max)?,
+            k: alloc_f(cap * kv_dim_max)?,
+            v: alloc_f(cap * kv_dim_max)?,
+            attn: alloc_f(cap * q_dim_max)?,
+            proj: alloc_f(cap * hidden)?,
+            gate: alloc_f(cap * ffn_max)?,
+            up: alloc_f(cap * ffn_max)?,
+            geglu: alloc_f(cap * ffn_max)?,
+            mlp: alloc_f(cap * hidden)?,
+            ffn_out: alloc_f(cap * hidden)?,
+            moe_acc: alloc_f(cap * hidden)?,
+            cos: alloc_f(rope_values)?,
+            sin: alloc_f(rope_values)?,
+            rope_offsets,
+            expert_gate_up: alloc_f(assignment_cap * 2 * expert_ffn_max)?,
+            expert_geglu_q: alloc_i(assignment_cap * expert_ffn_max)?,
+            expert_geglu_s: alloc_f(assignment_cap * (expert_ffn_max / 32).max(1))?,
+            expert_y: alloc_f(assignment_cap * hidden)?,
+            union_slots: alloc_i32(assignment_cap)?,
+            token_offsets: alloc_i32(assignment_cap + 1)?,
+            token_ids: alloc_i32(assignment_cap)?,
+            assignment_ids: s.clone_htod(&assignment_ids).map_err(cu)?,
+            route_to_assignment: alloc_i32(assignment_cap)?,
+            route_scales: alloc_f(assignment_cap)?,
+            logits: alloc_f(cap * self.vocab)?,
+            sampled: s.alloc_zeros::<u32>(cap).map_err(cu)?,
+            router_host: RouterPinnedRow::new(&self.kernels.ctx, cap * hidden)?,
+            expert_q_host: vec![0i8; cap * hidden],
+            expert_s_host: vec![0.0f32; cap * (hidden / 32)],
+        })
+    }
+
+    fn ensure_mtp_verify_scratch(&mut self) -> Result<()> {
+        if self.verify_scratch.is_none() {
+            self.verify_scratch = Some(self.alloc_mtp_verify_scratch()?);
+        }
+        Ok(())
+    }
+
+    /// Make a layer's distinct K-wide expert union resident and return arena
+    /// slots in `union_experts` order. By default all host-tier reads complete
+    /// before any VRAM victim is selected. The opt-in stage-1 pipeline reserves
+    /// the same host slots in the same order, then lets each completed QD4 prefix
+    /// begin HtoD while the next storage group runs. Both paths protect the full
+    /// union and publish only after every read and HtoD enqueue succeeds.
+    fn mtp_kwide_resolve_union(
+        &self,
+        li: usize,
+        moe: &MoeWeights,
+        union_experts: &[usize],
+    ) -> Result<Vec<i32>> {
+        let global_layer = self.cpu.first_layer + li;
+        let sser = self.sser.as_ref().ok_or_else(|| {
+            BackendError::InvalidModelMetadata(
+                "Gemma 4 K-wide verifier requires the SSER expert arena".into(),
+            )
+        })?;
+        let tier = self.host_tier.as_ref().ok_or_else(|| {
+            BackendError::InvalidModelMetadata(
+                "Gemma 4 K-wide verifier requires the page-locked expert tier".into(),
+            )
+        })?;
+        let ghost = moe.ghost.as_ref().ok_or_else(|| {
+            BackendError::InvalidModelMetadata(
+                "Gemma 4 K-wide verifier requires paired .cghost expert records".into(),
+            )
+        })?;
+        let ghost_file = ghost.cache.file.as_ref();
+        let ghost_layer = ghost.layer_idx;
+
+        let mut union_slots = vec![-1i32; union_experts.len()];
+        let mut missing = Vec::<(usize, usize)>::new();
+        {
+            let mut cache = sser.borrow_mut();
+            if cache.frequency_admission_enabled() {
+                return Err(BackendError::InvalidModelMetadata(
+                    "Gemma 4 K-wide verifier declines SSER frequency admission".into(),
+                ));
+            }
+            for (union_index, &expert) in union_experts.iter().enumerate() {
+                let key = (global_layer as u16, expert as u16);
+                if cache.touch(key) {
+                    cache.hits += 1;
+                    union_slots[union_index] = cache
+                        .entries
+                        .get(&key)
+                        .expect("touched K-wide expert remains resident")
+                        .slot as i32;
+                } else {
+                    missing.push((union_index, expert));
+                }
+            }
+        }
+        if missing.is_empty() {
+            return Ok(union_slots);
+        }
+        if self.mtp_io_pipeline {
+            return self.mtp_kwide_resolve_union_pipelined(
+                li,
+                moe,
+                union_experts,
+                union_slots,
+                &missing,
+            );
+        }
+
+        let missing_experts = missing
+            .iter()
+            .map(|&(_, expert)| expert)
+            .collect::<Vec<_>>();
+        let tier_slots = tier.borrow_mut().ensure_resident_many(
+            ghost_file,
+            ghost_layer,
+            &missing_experts,
+            union_experts,
+            ghost.cache.read_pool.as_ref(),
+            None,
+        )?;
+
+        let gu_format = moe.gate_up_exps.format;
+        let down_format = moe.down_exps.format;
+        let gu_row_bytes = self.hidden / gu_format.values_per_block() * gu_format.bytes_per_block();
+        let down_row_bytes =
+            moe.n_ff_exp / down_format.values_per_block() * down_format.bytes_per_block();
+        let expected_gu = 2 * moe.n_ff_exp * gu_row_bytes;
+        let expected_down = self.hidden * down_row_bytes;
+
+        let tier_guard = tier.borrow();
+        let mut cache = sser.borrow_mut();
+        let mut reservations = Vec::<(usize, (u16, u16), SserMissSlot)>::new();
+        let mut copies = Vec::<SserPinnedBatchCopy>::with_capacity(missing.len());
+        let prepare = (|| -> Result<()> {
+            for (pending_index, ((union_index, expert), tier_slot)) in missing
+                .iter()
+                .copied()
+                .zip(tier_slots.iter().copied())
+                .enumerate()
+            {
+                let key = (global_layer as u16, expert as u16);
+                let reservation = cache
+                    .slot_for_miss_excluding(key, global_layer as u16, union_experts, pending_index)
+                    .ok_or_else(|| {
+                        BackendError::InvalidModelMetadata(format!(
+                            "Gemma 4 K-wide expert union of {} exceeds the {}-slot SSER arena",
+                            union_experts.len(),
+                            cache.capacity
+                        ))
+                    })?;
+                if !reservation.admitted {
+                    cache.recycle_unpublished(reservation);
+                    return Err(BackendError::InvalidModelMetadata(
+                        "Gemma 4 K-wide verifier cannot use a non-resident SSER scratch slot"
+                            .into(),
+                    ));
+                }
+                reservations.push((union_index, key, reservation));
+
+                let layout = ghost_file.moe_expert_record_layout(ghost_layer, expert)?;
+                let (gate_up, down) = tier_guard.views(tier_slot, &layout);
+                if gate_up.len() != expected_gu
+                    || down.len() != expected_down
+                    || gemma4_ghost_expert_dtype(gu_format) != Some(layout.gate_up_dtype)
+                    || gemma4_ghost_expert_dtype(down_format) != Some(layout.down_dtype)
+                {
+                    return Err(BackendError::InvalidModelMetadata(format!(
+                        "Gemma 4 K-wide expert record mismatch at layer={global_layer} expert={expert}: gate_up={} {:?}, down={} {:?}",
+                        gate_up.len(),
+                        layout.gate_up_dtype,
+                        down.len(),
+                        layout.down_dtype,
+                    )));
+                }
+                copies.push(SserPinnedBatchCopy {
+                    key,
+                    slot: reservation.slot,
+                    gate_up_src: gate_up.as_ptr(),
+                    gate_up_start: reservation.slot * cache.gate_up_stride,
+                    gate_up_len: expected_gu,
+                    down_src: down.as_ptr(),
+                    down_start: reservation.slot * cache.down_stride,
+                    down_len: expected_down,
+                });
+            }
+            Ok(())
+        })();
+        if let Err(error) = prepare {
+            for &(_, _, reservation) in &reservations {
+                cache.recycle_unpublished(reservation);
+            }
+            return Err(error);
+        }
+
+        for chunk in copies.chunks(SSER_PINNED_BATCH_MAX_EXPERTS) {
+            if let Err(error) =
+                enqueue_sser_pinned_batch(&self.expert_copy_stream, &mut cache, chunk)
+            {
+                let sync_error = self.expert_copy_stream.synchronize().err().map(cu);
+                for &(_, _, reservation) in &reservations {
+                    cache.recycle_unpublished(reservation);
+                }
+                return Err(sync_error.unwrap_or(error));
+            }
+        }
+        let record_error = self
+            .expert_copy_done
+            .record(&self.expert_copy_stream)
+            .err()
+            .map(cu);
+        let sync_error = if record_error.is_some() {
+            self.expert_copy_stream.synchronize().err().map(cu)
+        } else {
+            None
+        };
+        if let Some(error) = sync_error {
+            for &(_, _, reservation) in &reservations {
+                cache.recycle_unpublished(reservation);
+            }
+            return Err(error);
+        }
+        for &(union_index, key, reservation) in &reservations {
+            cache.misses += 1;
+            cache.publish_resident(key, reservation.slot);
+            union_slots[union_index] = reservation.slot as i32;
+        }
+        drop(cache);
+        drop(tier_guard);
+        if let Some(error) = record_error {
+            return Err(error);
+        }
+        self.cap_stream.wait(&self.expert_copy_done).map_err(cu)?;
+        Ok(union_slots)
+    }
+
+    /// Stage-1 variant of [`Self::mtp_kwide_resolve_union`]. Host-tier slot
+    /// reservation and publication still happen in router order. Only the join
+    /// boundary moves: after four independent storage reads complete, that
+    /// contiguous prefix is enqueued on `expert_copy_stream`, then the CPU joins
+    /// the next four reads while the copy engine consumes the previous prefix.
+    #[allow(clippy::too_many_lines)]
+    fn mtp_kwide_resolve_union_pipelined(
+        &self,
+        li: usize,
+        moe: &MoeWeights,
+        union_experts: &[usize],
+        mut union_slots: Vec<i32>,
+        missing: &[(usize, usize)],
+    ) -> Result<Vec<i32>> {
+        let global_layer = self.cpu.first_layer + li;
+        let sser = self.sser.as_ref().ok_or_else(|| {
+            BackendError::InvalidModelMetadata(
+                "Gemma 4 K-wide verifier requires the SSER expert arena".into(),
+            )
+        })?;
+        let tier = self.host_tier.as_ref().ok_or_else(|| {
+            BackendError::InvalidModelMetadata(
+                "Gemma 4 K-wide verifier requires the page-locked expert tier".into(),
+            )
+        })?;
+        let ghost = moe.ghost.as_ref().ok_or_else(|| {
+            BackendError::InvalidModelMetadata(
+                "Gemma 4 K-wide verifier requires paired .cghost expert records".into(),
+            )
+        })?;
+        let ghost_file = ghost.cache.file.as_ref();
+        let ghost_layer = ghost.layer_idx;
+        let missing_experts = missing
+            .iter()
+            .map(|&(_, expert)| expert)
+            .collect::<Vec<_>>();
+
+        let gu_format = moe.gate_up_exps.format;
+        let down_format = moe.down_exps.format;
+        let gu_row_bytes = self.hidden / gu_format.values_per_block() * gu_format.bytes_per_block();
+        let down_row_bytes =
+            moe.n_ff_exp / down_format.values_per_block() * down_format.bytes_per_block();
+        let expected_gu = 2 * moe.n_ff_exp * gu_row_bytes;
+        let expected_down = self.hidden * down_row_bytes;
+
+        let mut cache = sser.borrow_mut();
+        let mut reservations = Vec::<(usize, (u16, u16), SserMissSlot)>::new();
+        let tier_result = {
+            let mut on_ready = |tier_guard: &SserHostTier,
+                                ready: std::ops::Range<usize>,
+                                tier_slots: &[usize]|
+             -> Result<()> {
+                let mut copies = Vec::<SserPinnedBatchCopy>::with_capacity(ready.len());
+                for pending_index in ready {
+                    let (union_index, expert) = missing[pending_index];
+                    let key = (global_layer as u16, expert as u16);
+                    let reservation = cache
+                        .slot_for_miss_excluding(
+                            key,
+                            global_layer as u16,
+                            union_experts,
+                            pending_index,
+                        )
+                        .ok_or_else(|| {
+                            BackendError::InvalidModelMetadata(format!(
+                                "Gemma 4 K-wide expert union of {} exceeds the {}-slot SSER arena",
+                                union_experts.len(),
+                                cache.capacity
+                            ))
+                        })?;
+                    if !reservation.admitted {
+                        cache.recycle_unpublished(reservation);
+                        return Err(BackendError::InvalidModelMetadata(
+                            "Gemma 4 K-wide verifier cannot use a non-resident SSER scratch slot"
+                                .into(),
+                        ));
+                    }
+                    reservations.push((union_index, key, reservation));
+
+                    let layout = ghost_file.moe_expert_record_layout(ghost_layer, expert)?;
+                    let (gate_up, down) = tier_guard.views(tier_slots[pending_index], &layout);
+                    if gate_up.len() != expected_gu
+                        || down.len() != expected_down
+                        || gemma4_ghost_expert_dtype(gu_format) != Some(layout.gate_up_dtype)
+                        || gemma4_ghost_expert_dtype(down_format) != Some(layout.down_dtype)
+                    {
+                        return Err(BackendError::InvalidModelMetadata(format!(
+                            "Gemma 4 K-wide expert record mismatch at layer={global_layer} expert={expert}: gate_up={} {:?}, down={} {:?}",
+                            gate_up.len(),
+                            layout.gate_up_dtype,
+                            down.len(),
+                            layout.down_dtype,
+                        )));
+                    }
+                    copies.push(SserPinnedBatchCopy {
+                        key,
+                        slot: reservation.slot,
+                        gate_up_src: gate_up.as_ptr(),
+                        gate_up_start: reservation.slot * cache.gate_up_stride,
+                        gate_up_len: expected_gu,
+                        down_src: down.as_ptr(),
+                        down_start: reservation.slot * cache.down_stride,
+                        down_len: expected_down,
+                    });
+                }
+                for chunk in copies.chunks(SSER_PINNED_BATCH_MAX_EXPERTS) {
+                    enqueue_sser_pinned_batch(&self.expert_copy_stream, &mut cache, chunk)?;
+                }
+                Ok(())
+            };
+
+            tier.borrow_mut().ensure_resident_many(
+                ghost_file,
+                ghost_layer,
+                &missing_experts,
+                union_experts,
+                ghost.cache.read_pool.as_ref(),
+                Some(&mut on_ready),
+            )
+        };
+        // The callback's mutable cache capture is now out of scope. Source
+        // pointers remain stable in the tier; this runtime's outer mutex
+        // prevents another tier mutation, and the cap-stream event below fences
+        // slot reuse before the next layer can recycle them.
+        if let Err(error) = tier_result {
+            // A prior prefix may already be in flight. Drain it before returning
+            // those unpublished arena slots to the cache free list. The first
+            // read/callback error remains authoritative unless the drain fails.
+            let sync_error = self.expert_copy_stream.synchronize().err().map(cu);
+            for &(_, _, reservation) in reservations.iter().rev() {
+                cache.recycle_unpublished(reservation);
+            }
+            return Err(sync_error.unwrap_or(error));
+        }
+
+        let record_error = self
+            .expert_copy_done
+            .record(&self.expert_copy_stream)
+            .err()
+            .map(cu);
+        let sync_error = if record_error.is_some() {
+            self.expert_copy_stream.synchronize().err().map(cu)
+        } else {
+            None
+        };
+        if let Some(error) = sync_error {
+            for &(_, _, reservation) in reservations.iter().rev() {
+                cache.recycle_unpublished(reservation);
+            }
+            return Err(error);
+        }
+        for &(union_index, key, reservation) in &reservations {
+            cache.misses += 1;
+            cache.publish_resident(key, reservation.slot);
+            union_slots[union_index] = reservation.slot as i32;
+        }
+        drop(cache);
+        if let Some(error) = record_error {
+            return Err(error);
+        }
+        self.cap_stream.wait(&self.expert_copy_done).map_err(cu)?;
+        Ok(union_slots)
+    }
+
+    /// Try the exact K-wide lane. Returning `None` is an ordinary, lossless
+    /// decline and leaves the established scalar verifier authoritative.
+    fn verify_batch_moe(
+        &mut self,
+        tokens: &[u32],
+        start: usize,
+    ) -> Result<Option<Vec<MtpVerifyRow>>> {
+        if !self.mtp_kwide_eligible(tokens.len(), start) {
+            return Ok(None);
+        }
+        if let Err(error) = self.ensure_mtp_verify_scratch() {
+            eprintln!(
+                "[gemma4] K-wide verifier scratch unavailable ({error}); using scalar verification"
+            );
+            return Ok(None);
+        }
+        let mut scratch = self
+            .verify_scratch
+            .take()
+            .expect("K-wide scratch was just ensured");
+        let result = self.verify_batch_moe_inner(tokens, start, &mut scratch);
+        self.verify_scratch = Some(scratch);
+        result.map(Some)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn verify_batch_moe_inner(
+        &mut self,
+        tokens: &[u32],
+        start: usize,
+        scratch: &mut Gemma4VerifyScratchDev,
+    ) -> Result<Vec<MtpVerifyRow>> {
+        let s = self.cap_stream.clone();
+        let kernels = &self.kernels;
+        let k_tokens = tokens.len();
+        let hidden = self.hidden;
+        let eps = self.eps;
+        debug_assert!((1..=scratch.cap).contains(&k_tokens));
+
+        // Token embeddings and dual-theta RoPE tables are the only per-batch CPU
+        // preparation. RoPE is layer-major and compact so every layer exposes a
+        // contiguous `[K][half]` view to the batched kernel.
+        let mut hidden_host = vec![0.0f32; k_tokens * hidden];
+        let mut cos_host = vec![0.0f32; scratch.cos.len()];
+        let mut sin_host = vec![0.0f32; scratch.sin.len()];
+        let embed_scale = (hidden as f32).sqrt();
+        for (token_row, &token) in tokens.iter().enumerate() {
+            let embedding = self
+                .cpu
+                .token_embd
+                .dequantize_elements(token as usize * hidden, hidden)?;
+            for (dst, value) in hidden_host[token_row * hidden..(token_row + 1) * hidden]
+                .iter_mut()
+                .zip(embedding)
+            {
+                *dst = value * embed_scale;
+            }
+            let position = start + token_row;
+            for (li, plan) in self.plan.iter().enumerate() {
+                let half = plan.head_dim / 2;
+                let factors = if plan.sliding {
+                    None
+                } else {
+                    self.cpu.rope_factors.as_deref()
+                };
+                let rope_base = scratch.rope_offsets[li] + token_row * half;
+                for i in 0..half {
+                    let mut frequency = plan.theta.powf(-(2.0 * i as f32) / plan.head_dim as f32);
+                    if let Some(factors) = factors {
+                        frequency /= factors[i];
+                    }
+                    let (sin, cos) = (position as f32 * frequency).sin_cos();
+                    cos_host[rope_base + i] = cos;
+                    sin_host[rope_base + i] = sin;
+                }
+            }
+        }
+        s.memcpy_htod(&hidden_host, &mut scratch.h.slice_mut(0..k_tokens * hidden))
+            .map_err(cu)?;
+        s.memcpy_htod(&cos_host, &mut scratch.cos).map_err(cu)?;
+        s.memcpy_htod(&sin_host, &mut scratch.sin).map_err(cu)?;
+
+        for li in 0..self.block_count {
+            let plan = self.plan[li].clone();
+            let head_dim = plan.head_dim;
+            let half = head_dim / 2;
+            let q_dim = plan.q_dim;
+            let kv_dim = plan.kv_dim;
+            let kv_heads = plan.kv_heads;
+            let ffn_dim = self.cpu.g.ffn_length_at(li) as usize;
+            let layer = &self.cpu.layers[li];
+            let norms = &self.norms[li];
+            let weights = &self.lweights[li];
+
+            crate::cuda_resident::launch_rms_norm_batched(
+                &s,
+                &kernels.rms_norm_batched,
+                &scratch.h,
+                &norms.attn_norm,
+                &mut scratch.normed,
+                hidden,
+                eps,
+                k_tokens,
+            )
+            .map_err(cu)?;
+            crate::cuda_resident::launch_quantize(
+                &s,
+                &kernels.quantize,
+                &scratch.normed,
+                &mut scratch.in_q,
+                &mut scratch.in_s,
+                k_tokens * (hidden / 32),
+            )
+            .map_err(cu)?;
+            let attention_needs_q8k = [weights.q_q, weights.k_q, weights.v_q]
+                .iter()
+                .any(|quant| matches!(quant, GemmaLayerQuant::Q4K | GemmaLayerQuant::Q6K));
+            if attention_needs_q8k {
+                crate::cuda_resident::launch_quantize_q8k(
+                    &s,
+                    &kernels.quantize_q8k,
+                    &scratch.normed,
+                    &mut scratch.in_qk,
+                    &mut scratch.in_sk,
+                    k_tokens * (hidden / 256),
+                )
+                .map_err(cu)?;
+            }
+
+            gemma_proj_gemm_batched(
+                &s,
+                kernels,
+                weights.q_q,
+                &scratch.in_s,
+                &scratch.in_q,
+                &scratch.in_sk,
+                &scratch.in_qk,
+                &weights.q,
+                q_dim,
+                hidden,
+                k_tokens,
+                &mut scratch.q,
+            )?;
+            crate::cuda_resident::launch_rms_norm_per_head(
+                &s,
+                &kernels.rms_norm_per_head,
+                &mut scratch.q,
+                &norms.q_norm,
+                k_tokens * self.heads,
+                head_dim,
+                eps,
+            )
+            .map_err(cu)?;
+            {
+                let rope_start = scratch.rope_offsets[li];
+                let cos = scratch.cos.slice(rope_start..rope_start + k_tokens * half);
+                let sin = scratch.sin.slice(rope_start..rope_start + k_tokens * half);
+                gemma4_launch_rope_batched(
+                    &s,
+                    &kernels.rope_batched,
+                    &mut scratch.q,
+                    &cos,
+                    &sin,
+                    self.heads,
+                    head_dim,
+                    q_dim,
+                    k_tokens,
+                )
+                .map_err(cu)?;
+            }
+
+            if plan.owns_kv {
+                gemma_proj_gemm_batched(
+                    &s,
+                    kernels,
+                    weights.k_q,
+                    &scratch.in_s,
+                    &scratch.in_q,
+                    &scratch.in_sk,
+                    &scratch.in_qk,
+                    weights
+                        .k
+                        .as_ref()
+                        .expect("owning K-wide layer has resident K"),
+                    kv_dim,
+                    hidden,
+                    k_tokens,
+                    &mut scratch.k,
+                )?;
+                match weights.v.as_ref() {
+                    Some(v_weight) => gemma_proj_gemm_batched(
+                        &s,
+                        kernels,
+                        weights.v_q,
+                        &scratch.in_s,
+                        &scratch.in_q,
+                        &scratch.in_sk,
+                        &scratch.in_qk,
+                        v_weight,
+                        kv_dim,
+                        hidden,
+                        k_tokens,
+                        &mut scratch.v,
+                    )?,
+                    None => {
+                        let source = scratch.k.slice(0..k_tokens * kv_dim);
+                        let mut destination = scratch.v.slice_mut(0..k_tokens * kv_dim);
+                        s.memcpy_dtod(&source, &mut destination).map_err(cu)?;
+                    }
+                }
+                crate::cuda_resident::launch_rms_norm_per_head(
+                    &s,
+                    &kernels.rms_norm_per_head,
+                    &mut scratch.k,
+                    norms
+                        .k_norm
+                        .as_ref()
+                        .expect("owning K-wide layer binds K norm"),
+                    k_tokens * kv_heads,
+                    head_dim,
+                    eps,
+                )
+                .map_err(cu)?;
+                crate::cuda_resident::launch_rms_norm_per_head_weightless(
+                    &s,
+                    &kernels.rms_norm_per_head,
+                    &mut scratch.v,
+                    k_tokens * kv_heads,
+                    head_dim,
+                    eps,
+                )
+                .map_err(cu)?;
+                {
+                    let rope_start = scratch.rope_offsets[li];
+                    let cos = scratch.cos.slice(rope_start..rope_start + k_tokens * half);
+                    let sin = scratch.sin.slice(rope_start..rope_start + k_tokens * half);
+                    gemma4_launch_rope_batched(
+                        &s,
+                        &kernels.rope_batched,
+                        &mut scratch.k,
+                        &cos,
+                        &sin,
+                        kv_heads,
+                        head_dim,
+                        kv_dim,
+                        k_tokens,
+                    )
+                    .map_err(cu)?;
+                }
+                let capacity = gemma4_kv_capacity(plan.window, self.max_positions);
+                crate::cuda_resident::launch_kv_scatter_batched(
+                    &s,
+                    &kernels.kv_scatter_batched,
+                    &scratch.k,
+                    self.cache_k[li]
+                        .as_mut()
+                        .expect("owning K-wide layer has K cache"),
+                    start,
+                    kv_heads,
+                    head_dim,
+                    capacity,
+                    kv_dim,
+                    k_tokens,
+                )
+                .map_err(cu)?;
+                crate::cuda_resident::launch_kv_scatter_batched(
+                    &s,
+                    &kernels.kv_scatter_batched,
+                    &scratch.v,
+                    self.cache_v[li]
+                        .as_mut()
+                        .expect("owning K-wide layer has V cache"),
+                    start,
+                    kv_heads,
+                    head_dim,
+                    capacity,
+                    kv_dim,
+                    k_tokens,
+                )
+                .map_err(cu)?;
+            }
+
+            let source_layer = plan.kv_source_layer;
+            let source_capacity =
+                gemma4_kv_capacity(self.plan[source_layer].window, self.max_positions);
+            crate::cuda_resident::launch_attention_sw_batched(
+                &s,
+                &kernels.attention_sw_batched,
+                &scratch.q,
+                self.cache_k[source_layer]
+                    .as_ref()
+                    .expect("K-wide KV source has K cache"),
+                self.cache_v[source_layer]
+                    .as_ref()
+                    .expect("K-wide KV source has V cache"),
+                &mut scratch.attn,
+                self.heads,
+                kv_heads,
+                head_dim,
+                start,
+                source_capacity,
+                1.0,
+                plan.window.unwrap_or(0),
+                q_dim,
+                k_tokens,
+            )
+            .map_err(cu)?;
+
+            crate::cuda_resident::launch_quantize(
+                &s,
+                &kernels.quantize,
+                &scratch.attn,
+                &mut scratch.in_q,
+                &mut scratch.in_s,
+                k_tokens * (q_dim / 32),
+            )
+            .map_err(cu)?;
+            if matches!(weights.o_q, GemmaLayerQuant::Q4K | GemmaLayerQuant::Q6K) {
+                crate::cuda_resident::launch_quantize_q8k(
+                    &s,
+                    &kernels.quantize_q8k,
+                    &scratch.attn,
+                    &mut scratch.in_qk,
+                    &mut scratch.in_sk,
+                    k_tokens * (q_dim / 256),
+                )
+                .map_err(cu)?;
+            }
+            gemma_proj_gemm_batched(
+                &s,
+                kernels,
+                weights.o_q,
+                &scratch.in_s,
+                &scratch.in_q,
+                &scratch.in_sk,
+                &scratch.in_qk,
+                &weights.o,
+                hidden,
+                q_dim,
+                k_tokens,
+                &mut scratch.proj,
+            )?;
+            crate::cuda_resident::launch_rms_norm_batched(
+                &s,
+                &kernels.rms_norm_batched,
+                &scratch.proj,
+                &norms.post_attn_norm,
+                &mut scratch.normed,
+                hidden,
+                eps,
+                k_tokens,
+            )
+            .map_err(cu)?;
+            crate::cuda_resident::launch_residual(
+                &s,
+                &kernels.residual_add,
+                &mut scratch.h,
+                &scratch.normed,
+                k_tokens * hidden,
+            )
+            .map_err(cu)?;
+
+            if let Some(moe) = layer.moe.as_ref() {
+                // Start the one K-row router handoff, then submit the independent
+                // dense shared-expert branch while that copy retires.
+                if self.overlap_router_copy {
+                    self.router_input_ready.record(&s).map_err(cu)?;
+                    self.router_copy_stream
+                        .wait(&self.router_input_ready)
+                        .map_err(cu)?;
+                    self.router_copy_stream
+                        .memcpy_dtoh(
+                            &scratch.h.slice(0..k_tokens * hidden),
+                            &mut scratch.router_host.as_mut_slice()[..k_tokens * hidden],
+                        )
+                        .map_err(cu)?;
+                    self.router_copy_done
+                        .record(&self.router_copy_stream)
+                        .map_err(cu)?;
+                } else {
+                    s.memcpy_dtoh(
+                        &scratch.h.slice(0..k_tokens * hidden),
+                        &mut scratch.router_host.as_mut_slice()[..k_tokens * hidden],
+                    )
+                    .map_err(cu)?;
+                    self.router_copy_done.record(&s).map_err(cu)?;
+                }
+
+                crate::cuda_resident::launch_rms_norm_batched(
+                    &s,
+                    &kernels.rms_norm_batched,
+                    &scratch.h,
+                    &norms.ffn_norm,
+                    &mut scratch.normed,
+                    hidden,
+                    eps,
+                    k_tokens,
+                )
+                .map_err(cu)?;
+                crate::cuda_resident::launch_quantize(
+                    &s,
+                    &kernels.quantize,
+                    &scratch.normed,
+                    &mut scratch.in_q,
+                    &mut scratch.in_s,
+                    k_tokens * (hidden / 32),
+                )
+                .map_err(cu)?;
+                let shared_needs_q8k = [weights.gate_q, weights.up_q]
+                    .iter()
+                    .any(|quant| matches!(quant, GemmaLayerQuant::Q4K | GemmaLayerQuant::Q6K));
+                if shared_needs_q8k {
+                    crate::cuda_resident::launch_quantize_q8k(
+                        &s,
+                        &kernels.quantize_q8k,
+                        &scratch.normed,
+                        &mut scratch.in_qk,
+                        &mut scratch.in_sk,
+                        k_tokens * (hidden / 256),
+                    )
+                    .map_err(cu)?;
+                }
+                gemma_proj_gemm_batched(
+                    &s,
+                    kernels,
+                    weights.gate_q,
+                    &scratch.in_s,
+                    &scratch.in_q,
+                    &scratch.in_sk,
+                    &scratch.in_qk,
+                    &weights.gate,
+                    ffn_dim,
+                    hidden,
+                    k_tokens,
+                    &mut scratch.gate,
+                )?;
+                gemma_proj_gemm_batched(
+                    &s,
+                    kernels,
+                    weights.up_q,
+                    &scratch.in_s,
+                    &scratch.in_q,
+                    &scratch.in_sk,
+                    &scratch.in_qk,
+                    &weights.up,
+                    ffn_dim,
+                    hidden,
+                    k_tokens,
+                    &mut scratch.up,
+                )?;
+                gemma4_launch_geglu(
+                    &s,
+                    &kernels.geglu_mul,
+                    &scratch.gate,
+                    &scratch.up,
+                    &mut scratch.geglu,
+                    k_tokens * ffn_dim,
+                )
+                .map_err(cu)?;
+                crate::cuda_resident::launch_quantize(
+                    &s,
+                    &kernels.quantize,
+                    &scratch.geglu,
+                    &mut scratch.in_q,
+                    &mut scratch.in_s,
+                    k_tokens * (ffn_dim / 32),
+                )
+                .map_err(cu)?;
+                if matches!(weights.down_q, GemmaLayerQuant::Q4K | GemmaLayerQuant::Q6K) {
+                    crate::cuda_resident::launch_quantize_q8k(
+                        &s,
+                        &kernels.quantize_q8k,
+                        &scratch.geglu,
+                        &mut scratch.in_qk,
+                        &mut scratch.in_sk,
+                        k_tokens * (ffn_dim / 256),
+                    )
+                    .map_err(cu)?;
+                }
+                gemma_proj_gemm_batched(
+                    &s,
+                    kernels,
+                    weights.down_q,
+                    &scratch.in_s,
+                    &scratch.in_q,
+                    &scratch.in_sk,
+                    &scratch.in_qk,
+                    &weights.down,
+                    hidden,
+                    ffn_dim,
+                    k_tokens,
+                    &mut scratch.ffn_out,
+                )?;
+                crate::cuda_resident::launch_rms_norm_batched(
+                    &s,
+                    &kernels.rms_norm_batched,
+                    &scratch.ffn_out,
+                    norms
+                        .moe_post_norm_1
+                        .as_ref()
+                        .expect("K-wide MoE layer binds post_norm_1"),
+                    &mut scratch.mlp,
+                    hidden,
+                    eps,
+                    k_tokens,
+                )
+                .map_err(cu)?;
+
+                self.router_copy_done.synchronize().map_err(cu)?;
+                let router = gemma4_router_batch_exact(
+                    scratch.router_host.as_slice(),
+                    k_tokens,
+                    hidden,
+                    eps,
+                    moe,
+                    &mut scratch.expert_q_host,
+                    &mut scratch.expert_s_host,
+                )?;
+                if std::env::var_os("CAMELID_GEMMA4_ROUTE_TRACE").is_some() {
+                    for route in &router.routes {
+                        eprintln!("[route] l={} e={route:?}", self.cpu.first_layer + li);
+                    }
+                }
+                if let Some(telemetry) = self.spec_k4_telemetry.as_ref() {
+                    for route in &router.routes {
+                        telemetry.borrow_mut().observe_routes(li, route);
+                    }
+                }
+
+                s.memcpy_htod(
+                    &scratch.expert_q_host[..k_tokens * hidden],
+                    &mut scratch.in_q.slice_mut(0..k_tokens * hidden),
+                )
+                .map_err(cu)?;
+                s.memcpy_htod(
+                    &scratch.expert_s_host[..k_tokens * (hidden / 32)],
+                    &mut scratch.in_s.slice_mut(0..k_tokens * (hidden / 32)),
+                )
+                .map_err(cu)?;
+                let union_slots =
+                    self.mtp_kwide_resolve_union(li, moe, &router.csr.union_experts)?;
+                let expert_count = router.csr.union_experts.len();
+                let assignment_count = k_tokens * GEMMA4_MTP_ROUTE_COUNT;
+                s.memcpy_htod(
+                    &union_slots,
+                    &mut scratch.union_slots.slice_mut(0..expert_count),
+                )
+                .map_err(cu)?;
+                s.memcpy_htod(
+                    &router.csr.token_offsets,
+                    &mut scratch
+                        .token_offsets
+                        .slice_mut(0..expert_count.saturating_add(1)),
+                )
+                .map_err(cu)?;
+                s.memcpy_htod(
+                    &router.csr.token_ids,
+                    &mut scratch.token_ids.slice_mut(0..assignment_count),
+                )
+                .map_err(cu)?;
+                s.memcpy_htod(
+                    &router.csr.route_to_assignment,
+                    &mut scratch.route_to_assignment.slice_mut(0..assignment_count),
+                )
+                .map_err(cu)?;
+                s.memcpy_htod(
+                    &router.route_scales,
+                    &mut scratch.route_scales.slice_mut(0..assignment_count),
+                )
+                .map_err(cu)?;
+
+                {
+                    let cache = self.sser.as_ref().unwrap().borrow();
+                    let (routed_kernel, chunked) = kernels.gemma4_mtp_q4_0_gemm_routed_kernel();
+                    crate::cuda_resident::launch_q4_0_gemm_routed(
+                        &s,
+                        routed_kernel,
+                        &scratch.in_s,
+                        &scratch.in_q,
+                        &cache.gate_up_arena,
+                        &scratch.union_slots,
+                        &scratch.token_offsets,
+                        &scratch.token_ids,
+                        cache.gate_up_stride,
+                        2 * moe.n_ff_exp,
+                        hidden / 32,
+                        expert_count,
+                        router.csr.max_assignments_per_expert,
+                        chunked,
+                        &mut scratch.expert_gate_up,
+                    )
+                    .map_err(cu)?;
+                }
+                gemma4_launch_geglu_quantize_assignments(
+                    &s,
+                    &kernels.geglu_quantize_routed,
+                    &scratch.expert_gate_up,
+                    &scratch.assignment_ids,
+                    &mut scratch.expert_geglu_q,
+                    &mut scratch.expert_geglu_s,
+                    moe.n_ff_exp,
+                    assignment_count,
+                )
+                .map_err(cu)?;
+                {
+                    let cache = self.sser.as_ref().unwrap().borrow();
+                    match moe.down_exps.format {
+                        WireFormat::Q4_0 => {
+                            let (routed_kernel, chunked) =
+                                kernels.gemma4_mtp_q4_0_gemm_routed_kernel();
+                            crate::cuda_resident::launch_q4_0_gemm_routed(
+                                &s,
+                                routed_kernel,
+                                &scratch.expert_geglu_s,
+                                &scratch.expert_geglu_q,
+                                &cache.down_arena,
+                                &scratch.union_slots,
+                                &scratch.token_offsets,
+                                &scratch.assignment_ids,
+                                cache.down_stride,
+                                hidden,
+                                moe.n_ff_exp / 32,
+                                expert_count,
+                                router.csr.max_assignments_per_expert,
+                                chunked,
+                                &mut scratch.expert_y,
+                            )
+                            .map_err(cu)?
+                        }
+                        WireFormat::Q4_1 => {
+                            let (routed_kernel, chunked) =
+                                kernels.gemma4_mtp_q4_1_gemm_routed_kernel();
+                            crate::cuda_resident::launch_q4_1_gemm_routed(
+                                &s,
+                                routed_kernel,
+                                &scratch.expert_geglu_s,
+                                &scratch.expert_geglu_q,
+                                &cache.down_arena,
+                                &scratch.union_slots,
+                                &scratch.token_offsets,
+                                &scratch.assignment_ids,
+                                cache.down_stride,
+                                hidden,
+                                moe.n_ff_exp / 32,
+                                expert_count,
+                                router.csr.max_assignments_per_expert,
+                                chunked,
+                                &mut scratch.expert_y,
+                            )
+                            .map_err(cu)?
+                        }
+                        unsupported => {
+                            return Err(BackendError::UnsupportedGguf(format!(
+                                "Gemma 4 K-wide routed down projection does not support {unsupported:?}"
+                            )))
+                        }
+                    }
+                }
+                crate::cuda_resident::launch_moe_weighted_sum_batched(
+                    &s,
+                    &kernels.moe_weighted_sum_batched,
+                    &scratch.expert_y,
+                    &scratch.route_to_assignment,
+                    &scratch.route_scales,
+                    &mut scratch.moe_acc,
+                    hidden,
+                    k_tokens,
+                    GEMMA4_MTP_ROUTE_COUNT,
+                )
+                .map_err(cu)?;
+                crate::cuda_resident::launch_rms_norm_batched(
+                    &s,
+                    &kernels.rms_norm_batched,
+                    &scratch.moe_acc,
+                    norms
+                        .moe_post_norm_2
+                        .as_ref()
+                        .expect("K-wide MoE layer binds post_norm_2"),
+                    &mut scratch.ffn_out,
+                    hidden,
+                    eps,
+                    k_tokens,
+                )
+                .map_err(cu)?;
+                crate::cuda_resident::launch_residual(
+                    &s,
+                    &kernels.residual_add,
+                    &mut scratch.ffn_out,
+                    &scratch.mlp,
+                    k_tokens * hidden,
+                )
+                .map_err(cu)?;
+                crate::cuda_resident::launch_rms_norm_batched(
+                    &s,
+                    &kernels.rms_norm_batched,
+                    &scratch.ffn_out,
+                    &norms.post_ffw_norm,
+                    &mut scratch.normed,
+                    hidden,
+                    eps,
+                    k_tokens,
+                )
+                .map_err(cu)?;
+                crate::cuda_resident::launch_residual(
+                    &s,
+                    &kernels.residual_add,
+                    &mut scratch.h,
+                    &scratch.normed,
+                    k_tokens * hidden,
+                )
+                .map_err(cu)?;
+            } else {
+                // Dense-only Gemma rows use the same K-wide common projections.
+                crate::cuda_resident::launch_rms_norm_batched(
+                    &s,
+                    &kernels.rms_norm_batched,
+                    &scratch.h,
+                    &norms.ffn_norm,
+                    &mut scratch.normed,
+                    hidden,
+                    eps,
+                    k_tokens,
+                )
+                .map_err(cu)?;
+                crate::cuda_resident::launch_quantize(
+                    &s,
+                    &kernels.quantize,
+                    &scratch.normed,
+                    &mut scratch.in_q,
+                    &mut scratch.in_s,
+                    k_tokens * (hidden / 32),
+                )
+                .map_err(cu)?;
+                if [weights.gate_q, weights.up_q]
+                    .iter()
+                    .any(|quant| matches!(quant, GemmaLayerQuant::Q4K | GemmaLayerQuant::Q6K))
+                {
+                    crate::cuda_resident::launch_quantize_q8k(
+                        &s,
+                        &kernels.quantize_q8k,
+                        &scratch.normed,
+                        &mut scratch.in_qk,
+                        &mut scratch.in_sk,
+                        k_tokens * (hidden / 256),
+                    )
+                    .map_err(cu)?;
+                }
+                gemma_proj_gemm_batched(
+                    &s,
+                    kernels,
+                    weights.gate_q,
+                    &scratch.in_s,
+                    &scratch.in_q,
+                    &scratch.in_sk,
+                    &scratch.in_qk,
+                    &weights.gate,
+                    ffn_dim,
+                    hidden,
+                    k_tokens,
+                    &mut scratch.gate,
+                )?;
+                gemma_proj_gemm_batched(
+                    &s,
+                    kernels,
+                    weights.up_q,
+                    &scratch.in_s,
+                    &scratch.in_q,
+                    &scratch.in_sk,
+                    &scratch.in_qk,
+                    &weights.up,
+                    ffn_dim,
+                    hidden,
+                    k_tokens,
+                    &mut scratch.up,
+                )?;
+                gemma4_launch_geglu(
+                    &s,
+                    &kernels.geglu_mul,
+                    &scratch.gate,
+                    &scratch.up,
+                    &mut scratch.geglu,
+                    k_tokens * ffn_dim,
+                )
+                .map_err(cu)?;
+                crate::cuda_resident::launch_quantize(
+                    &s,
+                    &kernels.quantize,
+                    &scratch.geglu,
+                    &mut scratch.in_q,
+                    &mut scratch.in_s,
+                    k_tokens * (ffn_dim / 32),
+                )
+                .map_err(cu)?;
+                if matches!(weights.down_q, GemmaLayerQuant::Q4K | GemmaLayerQuant::Q6K) {
+                    crate::cuda_resident::launch_quantize_q8k(
+                        &s,
+                        &kernels.quantize_q8k,
+                        &scratch.geglu,
+                        &mut scratch.in_qk,
+                        &mut scratch.in_sk,
+                        k_tokens * (ffn_dim / 256),
+                    )
+                    .map_err(cu)?;
+                }
+                gemma_proj_gemm_batched(
+                    &s,
+                    kernels,
+                    weights.down_q,
+                    &scratch.in_s,
+                    &scratch.in_q,
+                    &scratch.in_sk,
+                    &scratch.in_qk,
+                    &weights.down,
+                    hidden,
+                    ffn_dim,
+                    k_tokens,
+                    &mut scratch.ffn_out,
+                )?;
+                crate::cuda_resident::launch_rms_norm_batched(
+                    &s,
+                    &kernels.rms_norm_batched,
+                    &scratch.ffn_out,
+                    &norms.post_ffw_norm,
+                    &mut scratch.normed,
+                    hidden,
+                    eps,
+                    k_tokens,
+                )
+                .map_err(cu)?;
+                crate::cuda_resident::launch_residual(
+                    &s,
+                    &kernels.residual_add,
+                    &mut scratch.h,
+                    &scratch.normed,
+                    k_tokens * hidden,
+                )
+                .map_err(cu)?;
+            }
+
+            if layer.ple_output_scale != 1.0 {
+                crate::cuda_resident::launch_scale(
+                    &s,
+                    &kernels.scale_f32,
+                    &mut scratch.h,
+                    k_tokens * hidden,
+                    layer.ple_output_scale,
+                )
+                .map_err(cu)?;
+            }
+        }
+
+        let head = self
+            .gpu_head
+            .as_ref()
+            .expect("K-wide eligibility requires the GPU tied head");
+        crate::cuda_resident::launch_rms_norm_batched(
+            &s,
+            &kernels.rms_norm_batched,
+            &scratch.h,
+            &head.output_norm,
+            &mut scratch.normed,
+            hidden,
+            eps,
+            k_tokens,
+        )
+        .map_err(cu)?;
+        let head_quant = match head.lane {
+            HeadLane::Q8_0 => {
+                crate::cuda_resident::launch_quantize(
+                    &s,
+                    &kernels.quantize,
+                    &scratch.normed,
+                    &mut scratch.in_q,
+                    &mut scratch.in_s,
+                    k_tokens * (hidden / 32),
+                )
+                .map_err(cu)?;
+                GemmaLayerQuant::Q8_0
+            }
+            HeadLane::Q4K => {
+                crate::cuda_resident::launch_quantize_q8k(
+                    &s,
+                    &kernels.quantize_q8k,
+                    &scratch.normed,
+                    &mut scratch.in_qk,
+                    &mut scratch.in_sk,
+                    k_tokens * (hidden / 256),
+                )
+                .map_err(cu)?;
+                GemmaLayerQuant::Q4K
+            }
+            HeadLane::Q6K => {
+                crate::cuda_resident::launch_quantize_q8k(
+                    &s,
+                    &kernels.quantize_q8k,
+                    &scratch.normed,
+                    &mut scratch.in_qk,
+                    &mut scratch.in_sk,
+                    k_tokens * (hidden / 256),
+                )
+                .map_err(cu)?;
+                GemmaLayerQuant::Q6K
+            }
+        };
+        gemma_proj_gemm_batched(
+            &s,
+            kernels,
+            head_quant,
+            &scratch.in_s,
+            &scratch.in_q,
+            &scratch.in_sk,
+            &scratch.in_qk,
+            &head.weight,
+            self.vocab,
+            hidden,
+            k_tokens,
+            &mut scratch.logits,
+        )?;
+        if head.softcap != 0.0 {
+            gemma4_launch_soft_cap(
+                &s,
+                &kernels.soft_cap,
+                &mut scratch.logits,
+                k_tokens * self.vocab,
+                head.softcap,
+            )
+            .map_err(cu)?;
+        }
+
+        crate::cuda_resident::launch_argmax_batched(
+            &s,
+            &kernels.argmax_batched,
+            &scratch.logits,
+            self.vocab,
+            k_tokens,
+            &mut scratch.sampled,
+        )
+        .map_err(cu)?;
+        let mut target_host = vec![0u32; k_tokens];
+        let mut post_layers_host = vec![0.0f32; k_tokens * hidden];
+        s.memcpy_dtoh(&scratch.sampled.slice(0..k_tokens), &mut target_host)
+            .map_err(cu)?;
+        s.memcpy_dtoh(
+            &scratch.h.slice(0..k_tokens * hidden),
+            &mut post_layers_host,
+        )
+        .map_err(cu)?;
+        s.synchronize().map_err(cu)?;
+        Ok((0..k_tokens)
+            .map(|token_row| MtpVerifyRow {
+                position: start + token_row,
+                target: target_host[token_row],
+                hidden_state: Some(
+                    post_layers_host[token_row * hidden..(token_row + 1) * hidden].to_vec(),
+                ),
+            })
+            .collect())
     }
 
     /// Execute one top-k route as at most two CUDA batches: already-resident
@@ -9673,15 +13165,32 @@ impl Gemma4CudaResident {
                             "Ghost-MoE CUDA host tier requires the paired .cghost artifact".into(),
                         )
                     })?;
-                    // Resolve every stable tier source before evicting a VRAM
-                    // cache entry. If storage fails, no device slot has been
-                    // reserved and the existing cache remains usable.
-                    for (pending_index, &route) in miss_routes.iter().enumerate() {
-                        let route = route as usize;
-                        let expert = idx[route];
-                        let mut tier = tier.borrow_mut();
-                        let tier_slot =
-                            tier.ensure_resident(ghost_file, ghost_layer_idx, expert, idx)?;
+                    // Resolve the complete distinct miss set before evicting a VRAM cache
+                    // entry. With the opt-in caller batch, independent records land directly
+                    // in distinct pinned tier slots on up to four positioned readers.
+                    let missing_experts = miss_routes
+                        .iter()
+                        .map(|&route| idx[route as usize])
+                        .collect::<Vec<_>>();
+                    let read_pool = gemma4_cuda_distinct_read_batch_enabled()
+                        .then(|| {
+                            moe.ghost
+                                .as_ref()
+                                .and_then(|ghost| ghost.cache.read_pool.as_ref())
+                        })
+                        .flatten();
+                    let tier_slots = tier.borrow_mut().ensure_resident_many(
+                        ghost_file,
+                        ghost_layer_idx,
+                        &missing_experts,
+                        idx,
+                        read_pool,
+                        None,
+                    )?;
+                    let tier = tier.borrow();
+                    for (pending_index, (&expert, &tier_slot)) in
+                        missing_experts.iter().zip(&tier_slots).enumerate()
+                    {
                         let layout =
                             ghost_file.moe_expert_record_layout(ghost_layer_idx, expert)?;
                         let (gate_up, down) = tier.views(tier_slot, &layout);
@@ -11353,7 +14862,7 @@ impl Gemma4CudaResident {
                         unsafe { b.launch(cfg) }.map_err(cu)?;
                     }
                     // Scatter K/V into this layer's cache at `position` (ring slot
-                    // `position % capacity`; sliding layers keep only window+1 slots).
+                    // `position % capacity`; sliding layers keep the window plus verify slack).
                     let kv_cap = gemma4_kv_capacity(p.window, self.max_positions);
                     let ck = self.cache_k[li].as_mut().expect("owning layer has K cache");
                     crate::cuda_resident::launch_kv_scatter(
@@ -11386,7 +14895,7 @@ impl Gemma4CudaResident {
                 let window = p.window.map(|w| w as i32).unwrap_or(0);
                 // The source cache's position capacity (== this layer's: KV sharing is
                 // same-type, enforced by the layer_plan test). Sliding caches ring on
-                // window+1 slots; shared memory still spans the full context because
+                // window+verify-width slots; shared memory still spans the full context because
                 // the kernel's scores[] is indexed by absolute position.
                 let src_cap = gemma4_kv_capacity(self.plan[src].window, self.max_positions);
                 {
@@ -12112,6 +15621,18 @@ impl Gemma4CudaResident {
                     &mut head.d_sampled,
                 )
                 .map_err(cu)?;
+                let mut sampled = [0u32; 1];
+                s.memcpy_dtoh(&head.d_sampled, &mut sampled).map_err(cu)?;
+                let logits = if want_logits {
+                    let mut logits = vec![0f32; self.vocab];
+                    s.memcpy_dtoh(&head.logits, &mut logits).map_err(cu)?;
+                    Some(logits)
+                } else {
+                    None
+                };
+                // `memcpy_dtoh` is stream-ordered and may return before pageable host
+                // memory is populated. The fence must follow every requested copy and
+                // precede both the timer sample and any host read.
                 s.synchronize().map_err(cu)?;
                 if let Some(t) = head_prof {
                     SSER_PROF_HEAD_NS.fetch_add(
@@ -12119,28 +15640,21 @@ impl Gemma4CudaResident {
                         std::sync::atomic::Ordering::Relaxed,
                     );
                 }
-                let mut sampled = [0u32; 1];
-                s.memcpy_dtoh(&head.d_sampled, &mut sampled).map_err(cu)?;
-                if want_logits {
-                    let mut logits = vec![0f32; self.vocab];
-                    s.memcpy_dtoh(&head.logits, &mut logits).map_err(cu)?;
-                    return Ok((Some(logits), Some(sampled[0])));
-                }
-                return Ok((None, Some(sampled[0])));
+                return Ok((logits, Some(sampled[0])));
             }
 
             if want_logits {
-                s.synchronize().map_err(cu)?;
                 let mut logits = vec![0f32; self.vocab];
                 s.memcpy_dtoh(&head.logits, &mut logits).map_err(cu)?;
+                s.synchronize().map_err(cu)?;
                 return Ok((Some(logits), None));
             }
             return Ok((None, None));
         }
         // CPU head fallback (non-Q6_K head): final norm + tied matvec + soft-cap.
-        s.synchronize().map_err(cu)?;
         let mut last = vec![0f32; hidden];
         s.memcpy_dtoh(&self.d_hidden, &mut last).map_err(cu)?;
+        s.synchronize().map_err(cu)?;
         let normed = rms_norm(&last, Some(&self.cpu.output_norm), eps);
         let mut logits = self.cpu.token_embd.matvec(hidden, self.vocab, &normed);
         if let Some(cap) = self.cpu.g.final_logit_softcapping {
@@ -12198,6 +15712,20 @@ impl Gemma4CudaResident {
     /// a final sampled-but-unforwarded token is not represented in KV. Disable with
     /// `CAMELID_GEMMA4_NO_PREFIX_CACHE=1`.
     fn prefill_reusing_cache(&mut self, prompt_tokens: &[u32]) -> Result<Vec<f32>> {
+        self.prefill_reusing_cache_inner(prompt_tokens, false)
+            .map(|(logits, _)| logits)
+    }
+
+    /// Prefill sibling used only by official MTP. When requested, the chunked
+    /// path returns the final prompt token's raw post-layer hidden beside the
+    /// logits produced from that same row. Keeping the value request-local means
+    /// it cannot outlive or become detached from this runtime's authoritative KV.
+    /// Token-major prefill has no retained row and deliberately returns `None`.
+    fn prefill_reusing_cache_inner(
+        &mut self,
+        prompt_tokens: &[u32],
+        capture_final_hidden: bool,
+    ) -> Result<(Vec<f32>, Option<Vec<f32>>)> {
         let n = prompt_tokens.len();
         debug_assert!(n >= 1);
         // Hard cap: the prompt must leave at least one slot for a generated token, and the
@@ -12220,17 +15748,18 @@ impl Gemma4CudaResident {
             {
                 p += 1;
             }
-            // Sliding-layer caches are rings of window+1 positions: writing position x
-            // reclaims position x-(window+1)'s slot, so of the previous request only
-            // the last window+1 positions still exist. Resuming at `start = p.min(n-1)`
-            // reads sliding keys [start+1-window, start]; the oldest survivor is
-            // cached_len-(window+1), so reuse is sound iff start + 2 >= cached_len
-            // (pure extension, or regenerating the final token). A deeper rewind
-            // (edited history / shortened prompt) re-prefills from zero — same output,
-            // just no TTFT shortcut. While the cached sequence is still within
-            // window+1 positions nothing has been overwritten and any p is fine.
+            // Sliding-layer caches retain `window + verifier_slack` positions. Resuming at
+            // `start = p.min(n-1)` reads sliding keys [start+1-window, start], while the
+            // oldest survivor is `cached_len-capacity`; reuse is therefore sound iff
+            // `start + (capacity-window) + 1 >= cached_len`. A deeper rewind (edited
+            // history / shortened prompt) re-prefills from zero -- same output, just no
+            // TTFT shortcut. Before the cached sequence exceeds the ring, any p is fine.
             let win = self.cpu.g.sliding_window as usize;
-            if self.cached_tokens.len() > win + 1 && p.min(n - 1) + 2 < self.cached_tokens.len() {
+            let sliding_cap = gemma4_kv_capacity(Some(win), self.max_positions);
+            let rewind_slack = sliding_cap.saturating_sub(win).saturating_add(1);
+            if self.cached_tokens.len() > sliding_cap
+                && p.min(n - 1).saturating_add(rewind_slack) < self.cached_tokens.len()
+            {
                 p = 0;
             }
         }
@@ -12238,8 +15767,10 @@ impl Gemma4CudaResident {
         let start = p.min(n - 1);
         let last = n - 1;
         let mut logits = Vec::new();
+        let mut final_hidden = None;
         if let Some(chunk) = self.prefill_chunk_tokens() {
-            logits = self.prefill_chunked(prompt_tokens, start, last, chunk)?;
+            (logits, final_hidden) =
+                self.prefill_chunked(prompt_tokens, start, last, chunk, capture_final_hidden)?;
         } else {
             #[allow(clippy::needless_range_loop)]
             for pos in start..n {
@@ -12259,7 +15790,8 @@ impl Gemma4CudaResident {
         self.prefill_sser_mark
             .set(self.sser_counters().unwrap_or((0, 0)));
         self.prefill_tier_mark.set(self.host_tier_counters());
-        Ok(logits)
+        self.prefill_residency_mark.set(self.sser_host_residency());
+        Ok((logits, final_hidden))
     }
 
     /// Whether DECODE-phase `.cghost` reads take the unbuffered path.
@@ -12396,27 +15928,44 @@ impl Gemma4CudaResident {
         start: usize,
         last: usize,
         chunk: usize,
-    ) -> Result<Vec<f32>> {
+        capture_final_hidden: bool,
+    ) -> Result<(Vec<f32>, Option<Vec<f32>>)> {
         // Prefill streams the whole payload once, so it wants the explicit-read path;
         // decode is reuse-dominated and wants the map. Wrapped rather than set inline so
         // the decode setting is restored on every `?` early-return too.
         self.set_ghost_bulk_reads(true);
-        let out =
-            self.prefill_chunked_inner(prompt_tokens, start, last, chunk, ChunkLogits::LastOnly);
+        let which = if capture_final_hidden {
+            ChunkLogits::LastOnlyWithHidden
+        } else {
+            ChunkLogits::LastOnly
+        };
+        let out = self.prefill_chunked_inner(prompt_tokens, start, last, chunk, which);
         self.set_ghost_bulk_reads(false);
-        Ok(out?.pop().map(|row| row.logits).unwrap_or_default())
+        let row = out?.pop().ok_or_else(|| {
+            BackendError::RuntimeShapeMismatch(
+                "chunked prefill produced no final prompt row".into(),
+            )
+        })?;
+        if row.position != last {
+            return Err(BackendError::RuntimeShapeMismatch(format!(
+                "chunked prefill returned position {}, expected final prompt position {last}",
+                row.position
+            )));
+        }
+        Ok((row.logits, row.hidden_state))
     }
 
-    /// Run the layer-major chunked sweep over `tokens` and return the head's logits at
-    /// EVERY position, which is what a speculative verify needs: one weight pass over the
-    /// whole batch, then a per-position argmax to compare against the drafts.
+    /// Run the layer-major chunked sweep over `tokens` and return the target argmax plus
+    /// post-layer hidden at every position. The K-wide lane reduces logits on-device;
+    /// the scalar fallback computes the identical argmax from its host logits.
     ///
     /// This is the same machinery prefill uses — the only difference is that prefill wants
     /// logits at the final position and verify wants them everywhere. Sharing the sweep is
     /// deliberate: the layer-major ordering is what makes a batch cheap (a layer's expert
     /// union is loaded once and every token in the chunk hits it), and duplicating it would
     /// mean maintaining that property twice.
-    fn verify_chunk_logits(&mut self, tokens: &[u32], start: usize) -> Result<Vec<ChunkRow>> {
+    fn verify_chunk_mtp(&mut self, tokens: &[u32], start: usize) -> Result<Vec<MtpVerifyRow>> {
+        self.mtp_kwide_last_completed.set(false);
         if tokens.is_empty() {
             return Ok(Vec::new());
         }
@@ -12431,6 +15980,12 @@ impl Gemma4CudaResident {
                 self.max_positions
             )));
         }
+        if self.mtp_kwide_eligible(tokens.len(), start) {
+            if let Some(rows) = self.verify_batch_moe(tokens, start)? {
+                self.mtp_kwide_last_completed.set(true);
+                return Ok(rows);
+            }
+        }
         // `position` indexes BOTH the token array and the KV cache inside the sweep, so the
         // two must line up. Pad the front so index == absolute position; the padding is
         // never read because the sweep starts at `start`.
@@ -12441,7 +15996,15 @@ impl Gemma4CudaResident {
         let chunk = tokens.len();
         // Decode regime: reuse-dominated, so keep the mapped read path (bulk_reads is the
         // cold-sweep setting and measured -13% here).
-        self.prefill_chunked_inner(&padded, start, last, chunk, ChunkLogits::EveryPosition)
+        Ok(self
+            .prefill_chunked_inner(&padded, start, last, chunk, ChunkLogits::EveryPosition)?
+            .into_iter()
+            .map(|row| MtpVerifyRow {
+                position: row.position,
+                target: argmax_u32(&row.logits),
+                hidden_state: row.hidden_state,
+            })
+            .collect())
     }
 
     /// Propose `k` draft tokens from the MTP assistant, conditioned on the target's state.
@@ -12493,6 +16056,377 @@ impl Gemma4CudaResident {
         Ok(drafts)
     }
 
+    fn mtp_draft_cuda(
+        &mut self,
+        final_hidden: &[f32],
+        bonus_token: u32,
+        position: usize,
+        k: usize,
+    ) -> Result<Vec<u32>> {
+        let mut assistant = self.mtp_cuda_assistant.take().ok_or_else(|| {
+            BackendError::InvalidModelMetadata(
+                "CUDA MTP generation began without a resident assistant".into(),
+            )
+        })?;
+        let result =
+            self.mtp_draft_cuda_inner(&mut assistant, final_hidden, bonus_token, position, k);
+        self.mtp_cuda_assistant = Some(assistant);
+        result
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn mtp_draft_cuda_inner(
+        &self,
+        assistant: &mut Gemma4MtpCudaResident,
+        final_hidden: &[f32],
+        bonus_token: u32,
+        position: usize,
+        k: usize,
+    ) -> Result<Vec<u32>> {
+        use crate::gemma4_mtp as mtp;
+        use crate::gemma4_mtp_cuda::{
+            Gemma4MtpCudaF32Id as F32Id, Gemma4MtpCudaMatrixId as MatrixId,
+        };
+        if final_hidden.len() != mtp::BACKBONE_HIDDEN {
+            return Err(BackendError::RuntimeShapeMismatch(format!(
+                "CUDA MTP final hidden has {} values, expected {}",
+                final_hidden.len(),
+                mtp::BACKBONE_HIDDEN,
+            )));
+        }
+        if position == 0 || position > self.max_positions {
+            return Err(BackendError::RuntimeShapeMismatch(format!(
+                "CUDA MTP shared-KV length {position} is outside 1..={}",
+                self.max_positions
+            )));
+        }
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+
+        let stream = self.cap_stream.clone();
+        let kernels = &self.kernels;
+        let weights = &assistant.weights;
+        let scratch = &mut assistant.scratch;
+        let mut embedding = self.mtp_scaled_embedding(bonus_token)?;
+        let mut joined = Vec::with_capacity(2 * mtp::BACKBONE_HIDDEN);
+        joined.extend_from_slice(&embedding);
+        joined.extend_from_slice(final_hidden);
+        stream
+            .memcpy_htod(&joined, &mut scratch.joined)
+            .map_err(cu)?;
+        let last_cache_position = i32::try_from(position - 1).map_err(|_| {
+            BackendError::RuntimeShapeMismatch(
+                "CUDA MTP position exceeds the attention kernel ABI".into(),
+            )
+        })?;
+        stream
+            .memcpy_htod(&[last_cache_position], &mut scratch.position)
+            .map_err(cu)?;
+
+        let rope_table = |head_dim: usize, theta: f64, partial: Option<f64>| {
+            let half = head_dim / 2;
+            let rotated = partial.map_or(half, |factor| ((factor * head_dim as f64) as usize) / 2);
+            let mut cos = vec![1.0f32; half];
+            let mut sin = vec![0.0f32; half];
+            for index in 0..rotated {
+                let inv = 1.0 / theta.powf((2 * index) as f64 / head_dim as f64);
+                let (sine, cosine) = (position as f64 * inv).sin_cos();
+                cos[index] = gemma4_mtp_round_to_bf16(cosine as f32);
+                sin[index] = gemma4_mtp_round_to_bf16(sine as f32);
+            }
+            (cos, sin)
+        };
+        let sliding_rope = rope_table(mtp::SLIDING_HEAD_DIM, mtp::SLIDING_ROPE_THETA, None);
+        let full_rope = rope_table(
+            mtp::FULL_HEAD_DIM,
+            mtp::FULL_ROPE_THETA,
+            Some(mtp::FULL_PARTIAL_ROTARY_FACTOR),
+        );
+
+        let mut drafts = Vec::with_capacity(k);
+        for proposal in 0..k {
+            if proposal != 0 {
+                stream
+                    .memcpy_htod(
+                        &embedding,
+                        &mut scratch.joined.slice_mut(0..mtp::BACKBONE_HIDDEN),
+                    )
+                    .map_err(cu)?;
+                let recurrent = scratch.recurrent.slice(0..mtp::BACKBONE_HIDDEN);
+                let mut hidden_slot = scratch
+                    .joined
+                    .slice_mut(mtp::BACKBONE_HIDDEN..2 * mtp::BACKBONE_HIDDEN);
+                stream
+                    .memcpy_dtod(&recurrent, &mut hidden_slot)
+                    .map_err(cu)?;
+            }
+
+            gemma4_mtp_cuda_project(
+                &stream,
+                kernels,
+                weights,
+                MatrixId::PreProjection,
+                &scratch.joined,
+                &mut scratch.hidden,
+            )?;
+
+            for layer in 0..mtp::NUM_LAYERS {
+                let (
+                    q_proj,
+                    o_proj,
+                    gate_proj,
+                    up_proj,
+                    down_proj,
+                    input_norm,
+                    q_norm,
+                    post_attention_norm,
+                    pre_feedforward_norm,
+                    post_feedforward_norm,
+                ) = gemma4_mtp_cuda_layer_ids(layer);
+                let sliding = layer < mtp::SLIDING_LAYERS;
+                let (head_dim, host_layer, rope) = if sliding {
+                    (
+                        mtp::SLIDING_HEAD_DIM,
+                        mtp::SHARED_KV_SLIDING_HOST_LAYER,
+                        &sliding_rope,
+                    )
+                } else {
+                    (
+                        mtp::FULL_HEAD_DIM,
+                        mtp::SHARED_KV_FULL_HOST_LAYER,
+                        &full_rope,
+                    )
+                };
+                gemma4_mtp_cuda_launch_rmsnorm(
+                    &stream,
+                    &kernels.rms_norm,
+                    &scratch.hidden,
+                    &weights.f32_tensor(input_norm),
+                    &mut scratch.normed,
+                    mtp::ASSISTANT_HIDDEN,
+                    mtp::RMS_NORM_EPS,
+                )
+                .map_err(cu)?;
+                gemma4_mtp_cuda_project(
+                    &stream,
+                    kernels,
+                    weights,
+                    q_proj,
+                    &scratch.normed,
+                    &mut scratch.q,
+                )?;
+                gemma4_mtp_cuda_launch_qnorm(
+                    &stream,
+                    &kernels.rms_norm_per_head,
+                    &mut scratch.q,
+                    &weights.f32_tensor(q_norm),
+                    mtp::NUM_ATTENTION_HEADS,
+                    head_dim,
+                    mtp::RMS_NORM_EPS,
+                )
+                .map_err(cu)?;
+                stream
+                    .memcpy_htod(&rope.0, &mut scratch.cos.slice_mut(0..head_dim / 2))
+                    .map_err(cu)?;
+                stream
+                    .memcpy_htod(&rope.1, &mut scratch.sin.slice_mut(0..head_dim / 2))
+                    .map_err(cu)?;
+                crate::cuda_resident::launch_rope(
+                    &stream,
+                    &kernels.rope,
+                    &mut scratch.q,
+                    &scratch.cos,
+                    &scratch.sin,
+                    mtp::NUM_ATTENTION_HEADS,
+                    head_dim,
+                    head_dim,
+                    1,
+                )
+                .map_err(cu)?;
+
+                let plan = &self.plan[host_layer];
+                let source = plan.kv_source_layer;
+                let cache_k = self.cache_k[source]
+                    .as_ref()
+                    .expect("CUDA MTP eligibility pins the target K source");
+                let cache_v = self.cache_v[source]
+                    .as_ref()
+                    .expect("CUDA MTP eligibility pins the target V source");
+                let capacity = gemma4_kv_capacity(self.plan[source].window, self.max_positions);
+                let visible = if sliding {
+                    position.min(mtp::SLIDING_WINDOW + 1)
+                } else {
+                    position
+                };
+                crate::cuda_resident::launch_attention_sw(
+                    &stream,
+                    &kernels.attention_sw,
+                    &scratch.q,
+                    cache_k,
+                    cache_v,
+                    &mut scratch.context,
+                    mtp::NUM_ATTENTION_HEADS,
+                    plan.kv_heads,
+                    head_dim,
+                    &scratch.position,
+                    visible,
+                    capacity,
+                    1.0,
+                    if sliding { mtp::SLIDING_WINDOW + 1 } else { 0 },
+                    &mut scratch.scores,
+                )
+                .map_err(cu)?;
+
+                gemma4_mtp_cuda_project(
+                    &stream,
+                    kernels,
+                    weights,
+                    o_proj,
+                    &scratch.context,
+                    &mut scratch.attn,
+                )?;
+                gemma4_mtp_cuda_launch_rmsnorm(
+                    &stream,
+                    &kernels.rms_norm,
+                    &scratch.attn,
+                    &weights.f32_tensor(post_attention_norm),
+                    &mut scratch.normed,
+                    mtp::ASSISTANT_HIDDEN,
+                    mtp::RMS_NORM_EPS,
+                )
+                .map_err(cu)?;
+                crate::cuda_resident::launch_residual(
+                    &stream,
+                    &kernels.residual_add,
+                    &mut scratch.hidden,
+                    &scratch.normed,
+                    mtp::ASSISTANT_HIDDEN,
+                )
+                .map_err(cu)?;
+
+                gemma4_mtp_cuda_launch_rmsnorm(
+                    &stream,
+                    &kernels.rms_norm,
+                    &scratch.hidden,
+                    &weights.f32_tensor(pre_feedforward_norm),
+                    &mut scratch.normed,
+                    mtp::ASSISTANT_HIDDEN,
+                    mtp::RMS_NORM_EPS,
+                )
+                .map_err(cu)?;
+                gemma4_mtp_cuda_project(
+                    &stream,
+                    kernels,
+                    weights,
+                    gate_proj,
+                    &scratch.normed,
+                    &mut scratch.gate,
+                )?;
+                gemma4_mtp_cuda_project(
+                    &stream,
+                    kernels,
+                    weights,
+                    up_proj,
+                    &scratch.normed,
+                    &mut scratch.up,
+                )?;
+                gemma4_launch_geglu(
+                    &stream,
+                    &kernels.geglu_mul,
+                    &scratch.gate,
+                    &scratch.up,
+                    &mut scratch.geglu,
+                    8_192,
+                )
+                .map_err(cu)?;
+                gemma4_mtp_cuda_project(
+                    &stream,
+                    kernels,
+                    weights,
+                    down_proj,
+                    &scratch.geglu,
+                    &mut scratch.ffn,
+                )?;
+                gemma4_mtp_cuda_launch_rmsnorm(
+                    &stream,
+                    &kernels.rms_norm,
+                    &scratch.ffn,
+                    &weights.f32_tensor(post_feedforward_norm),
+                    &mut scratch.normed,
+                    mtp::ASSISTANT_HIDDEN,
+                    mtp::RMS_NORM_EPS,
+                )
+                .map_err(cu)?;
+                crate::cuda_resident::launch_residual(
+                    &stream,
+                    &kernels.residual_add,
+                    &mut scratch.hidden,
+                    &scratch.normed,
+                    mtp::ASSISTANT_HIDDEN,
+                )
+                .map_err(cu)?;
+                crate::cuda_resident::launch_scale(
+                    &stream,
+                    &kernels.scale_f32,
+                    &mut scratch.hidden,
+                    mtp::ASSISTANT_HIDDEN,
+                    assistant.layer_scalars[layer],
+                )
+                .map_err(cu)?;
+            }
+
+            gemma4_mtp_cuda_launch_rmsnorm(
+                &stream,
+                &kernels.rms_norm,
+                &scratch.hidden,
+                &weights.f32_tensor(F32Id::FinalNorm),
+                &mut scratch.normed,
+                mtp::ASSISTANT_HIDDEN,
+                mtp::RMS_NORM_EPS,
+            )
+            .map_err(cu)?;
+            gemma4_mtp_cuda_project(
+                &stream,
+                kernels,
+                weights,
+                MatrixId::PostProjection,
+                &scratch.normed,
+                &mut scratch.recurrent,
+            )?;
+            gemma4_mtp_cuda_project(
+                &stream,
+                kernels,
+                weights,
+                MatrixId::Embedding,
+                &scratch.normed,
+                &mut scratch.logits,
+            )?;
+            crate::cuda_resident::launch_argmax(
+                &stream,
+                &kernels.argmax,
+                &scratch.logits,
+                self.vocab,
+                &mut scratch.argmax,
+            )
+            .map_err(cu)?;
+            let mut token = [0u32; 1];
+            stream
+                .memcpy_dtoh(&scratch.argmax, &mut token)
+                .map_err(cu)?;
+            stream.synchronize().map_err(cu)?;
+            if token[0] as usize >= self.vocab {
+                return Err(BackendError::RuntimeShapeMismatch(format!(
+                    "CUDA assistant argmax {} exceeds target vocab {}",
+                    token[0], self.vocab
+                )));
+            }
+            drafts.push(token[0]);
+            embedding = self.mtp_scaled_embedding(token[0])?;
+        }
+        Ok(drafts)
+    }
+
     /// Greedy decode with MTP speculative drafting.
     ///
     /// LOSSLESS BY CONSTRUCTION: every emitted token is the target's own argmax. The drafter
@@ -12508,23 +16442,73 @@ impl Gemma4CudaResident {
         assistant: &crate::gemma4_mtp::Gemma4MtpAssistant,
         draft_k: usize,
     ) -> Result<(String, Vec<u32>, Gemma4MtpStats)> {
+        self.generate_greedy_mtp_inner(prompt, max_new, Some(assistant), draft_k, false)
+    }
+
+    /// Greedy MTP decode using the streamed resident Q4 CUDA assistant. This
+    /// refuses before prefill unless bring-up succeeded; once generation starts,
+    /// no proposal can silently execute through the dense CPU assistant.
+    pub fn generate_greedy_mtp_cuda(
+        &mut self,
+        prompt: &str,
+        max_new: usize,
+        draft_k: usize,
+    ) -> Result<(String, Vec<u32>, Gemma4MtpStats)> {
+        if self.mtp_cuda_assistant.is_none() {
+            return Err(BackendError::InvalidModelMetadata(
+                "CAMELID_GEMMA4_MTP_CUDA_ASSISTANT=1 was selected, but no resident CUDA assistant was loaded"
+                    .into(),
+            ));
+        }
+        self.generate_greedy_mtp_inner(prompt, max_new, None, draft_k, true)
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn generate_greedy_mtp_inner(
+        &mut self,
+        prompt: &str,
+        max_new: usize,
+        assistant: Option<&crate::gemma4_mtp::Gemma4MtpAssistant>,
+        draft_k: usize,
+        cuda_assistant_lane: bool,
+    ) -> Result<(String, Vec<u32>, Gemma4MtpStats)> {
         let prompt_tokens = self.cpu.tokenizer.encode(prompt, true, true)?;
         let generation_limit = max_new.min(self.max_positions.saturating_sub(prompt_tokens.len()));
         let eot = gemma4_stop_token_ids(&self.cpu.tokenizer);
         let t_prefill = std::time::Instant::now();
-        let mut logits = self.prefill_reusing_cache(&prompt_tokens)?;
+        let capture_prefill_seed = gemma4_mtp_prefill_seed_enabled() || cuda_assistant_lane;
+        let (prefill_logits, prefill_hidden) =
+            self.prefill_reusing_cache_inner(&prompt_tokens, capture_prefill_seed)?;
+        let mut next_token = argmax_u32(&prefill_logits);
+        drop(prefill_logits);
+        // The assistant consumes the target's final-normalized hidden immediately
+        // preceding the still-unforwarded bonus token. Chunked prefill already owns
+        // that exact post-layer row; normalizing it here removes the separate K=1
+        // bootstrap without exporting any state beyond this mutable generation call.
+        let mut final_hidden = match prefill_hidden {
+            Some(hidden) => Some(self.mtp_final_norm(&hidden)?),
+            None => None,
+        };
+        if cuda_assistant_lane && final_hidden.is_none() {
+            return Err(BackendError::InvalidModelMetadata(
+                "CUDA assistant prefill did not return the required final-hidden seed".into(),
+            ));
+        }
         let mut position = prompt_tokens.len();
         let mut generated: Vec<u32> = Vec::new();
         let mut stats = Gemma4MtpStats {
+            cuda_assistant: cuda_assistant_lane,
             prefill_ns: t_prefill.elapsed().as_nanos() as u64,
             ..Gemma4MtpStats::default()
         };
-        // The first round has no target hidden yet (prefill does not hand one back), so it
-        // decodes one token plainly and picks up drafting from the next round.
-        let mut final_hidden: Option<Vec<f32>> = None;
+        // `draft_k` counts proposals, while the schedule counts verifier rows
+        // including the current target token. Width 14 is therefore draft K13.
+        let fallback_verify_k = draft_k.saturating_add(1).min(MAX_MTP_VERIFY_ROWS);
+        let width_schedule = gemma4_mtp_width_schedule(fallback_verify_k);
+        let mut width_schedule_round_index = 0usize;
 
         while generated.len() < generation_limit {
-            let t0 = argmax_u32(&logits);
+            let t0 = next_token;
             if eot.contains(&t0) {
                 break;
             }
@@ -12534,14 +16518,43 @@ impl Gemma4CudaResident {
             }
 
             let budget = generation_limit - generated.len();
+            let has_draft_seed = final_hidden.is_some() && draft_k > 0;
+            let (requested_verify_k, budget_truncated) = if has_draft_seed {
+                gemma4_mtp_scheduled_verify_width(
+                    width_schedule.as_deref().unwrap_or(&[]),
+                    width_schedule_round_index,
+                    fallback_verify_k,
+                    budget.saturating_add(1),
+                )
+            } else {
+                // The legacy unseeded bootstrap verifies only the bonus token.
+                // It must not consume schedule entry zero.
+                (1, false)
+            };
+            let draft_limit = requested_verify_k.saturating_sub(1).min(budget);
             let t_assistant = std::time::Instant::now();
-            let drafts = match final_hidden.as_ref() {
-                Some(hidden) if draft_k > 0 => {
-                    self.mtp_draft(assistant, hidden, t0, position, draft_k.min(budget))?
-                }
-                _ => Vec::new(),
+            let (drafts, cuda_assistant) = match final_hidden.as_ref() {
+                Some(hidden) if draft_k > 0 && cuda_assistant_lane => (
+                    self.mtp_draft_cuda(hidden, t0, position, draft_limit)?,
+                    true,
+                ),
+                Some(hidden) if draft_k > 0 => (
+                    self.mtp_draft(
+                        assistant.expect("CPU MTP generation binds the dense assistant"),
+                        hidden,
+                        t0,
+                        position,
+                        draft_limit,
+                    )?,
+                    false,
+                ),
+                _ => (Vec::new(), cuda_assistant_lane),
             };
             let assistant_ns = t_assistant.elapsed().as_nanos() as u64;
+            let verifier_k = drafts.len().saturating_add(1);
+            if !drafts.is_empty() {
+                width_schedule_round_index = width_schedule_round_index.saturating_add(1);
+            }
 
             let mut batch = Vec::with_capacity(1 + drafts.len());
             batch.push(t0);
@@ -12554,7 +16567,8 @@ impl Gemma4CudaResident {
                 misses_before
             };
             let t_verify = std::time::Instant::now();
-            let rows = self.verify_chunk_logits(&batch, position)?;
+            let rows = self.verify_chunk_mtp(&batch, position)?;
+            let kwide = self.mtp_kwide_last_completed.get();
             let verify_ns = t_verify.elapsed().as_nanos() as u64;
             let misses_after = self.sser_counters().map(|(_, m)| m).unwrap_or(0);
             let round_misses = misses_after - misses_before;
@@ -12588,7 +16602,7 @@ impl Gemma4CudaResident {
             // The target's own argmax at every verified position, computed once and used
             // BOTH to accept and to record — so the trace can never disagree with the gate
             // it is meant to explain.
-            let target: Vec<u32> = rows.iter().map(|row| argmax_u32(&row.logits)).collect();
+            let target: Vec<u32> = rows.iter().map(|row| row.target).collect();
             // Accept the longest prefix of drafts that equals the target's own argmax.
             let mut accepted = 0usize;
             while accepted < drafts.len() && target[accepted] == drafts[accepted] {
@@ -12602,6 +16616,9 @@ impl Gemma4CudaResident {
             stats.trace.push(Gemma4MtpRound {
                 position,
                 bonus_token: t0,
+                requested_verify_k,
+                verifier_k,
+                budget_truncated,
                 drafts: drafts.clone(),
                 target,
                 accepted,
@@ -12609,6 +16626,8 @@ impl Gemma4CudaResident {
                 verify_ns,
                 misses: round_misses,
                 storage_reads: round_storage_reads,
+                kwide,
+                cuda_assistant,
             });
 
             let mut stopped = false;
@@ -12623,9 +16642,9 @@ impl Gemma4CudaResident {
                     break;
                 }
             }
-            // The divergence position's logits carry the target's correct next token, so a
-            // rejected draft costs nothing beyond the work already done.
-            logits = rows[accepted].logits.clone();
+            // The divergence row carries the target's correct next token, so a rejected
+            // draft costs nothing beyond the work already done.
+            next_token = rows[accepted].target;
             final_hidden = match rows[accepted].hidden_state.as_ref() {
                 Some(h) => Some(self.mtp_final_norm(h)?),
                 None => None,
@@ -12657,22 +16676,15 @@ impl Gemma4CudaResident {
     ///
     /// Gemma 4's RMSNorm is `normed * weight` — NOT Gemma 2/3's `normed * (1 + weight)`.
     /// This matches the `rms_norm_quantize` kernel, which the head fuses; the fused form
-    /// never materialises the f32 result, which is why it is recomputed here.
+    /// never materialises the f32 result, which is why it is recomputed here. Use the
+    /// authoritative host copy directly: a device-to-host copy on `cap_stream` would be
+    /// asynchronous and would add a synchronization to every accepted MTP round.
     fn mtp_final_norm(&self, post_layers: &[f32]) -> Result<Vec<f32>> {
-        let head = self.gpu_head.as_ref().ok_or_else(|| {
-            BackendError::InvalidModelMetadata(
-                "MTP needs the GPU head resident to read model.norm".into(),
-            )
-        })?;
-        let s = self.cap_stream.clone();
-        let mut weight = vec![0.0f32; self.hidden];
-        s.memcpy_dtoh(&head.output_norm, weight.as_mut_slice())
-            .map_err(cu)?;
         let mean_sq = post_layers.iter().map(|v| v * v).sum::<f32>() / post_layers.len() as f32;
         let inv = (mean_sq + self.eps).powf(-0.5);
         Ok(post_layers
             .iter()
-            .zip(&weight)
+            .zip(&self.cpu.output_norm)
             .map(|(v, w)| v * inv * w)
             .collect())
     }
@@ -12681,7 +16693,7 @@ impl Gemma4CudaResident {
     /// the layout the MTP drafter consumes, and the same one `kv_scatter` writes.
     ///
     /// Returns `None` when the layer's ring has wrapped. Sliding layers keep only
-    /// `window + 1` slots, so past that the physical order no longer matches logical
+    /// `window + MAX_MTP_VERIFY_ROWS` slots, so past that the physical order no longer matches logical
     /// position and the drafter would silently read rotated history. Failing closed is
     /// correct: MTP is an optimisation, and the caller falls back to plain decode.
     fn mtp_shared_kv(&self, layer: usize, kv_len: usize) -> Result<Option<(Vec<f32>, Vec<f32>)>> {
@@ -12702,6 +16714,7 @@ impl Gemma4CudaResident {
         let mut v_bytes = vec![0u8; cv.len()];
         s.memcpy_dtoh(ck, k_bytes.as_mut_slice()).map_err(cu)?;
         s.memcpy_dtoh(cv, v_bytes.as_mut_slice()).map_err(cu)?;
+        s.synchronize().map_err(cu)?;
         let mut key = vec![0.0f32; kv_heads * kv_len * head_dim];
         let mut value = vec![0.0f32; kv_heads * kv_len * head_dim];
         for h in 0..kv_heads {
@@ -12821,11 +16834,7 @@ impl Gemma4CudaResident {
                     // Prefill needs logits only at the very last prompt token; a speculative
                     // verify needs them at EVERY position so each draft can be checked
                     // against the target's own argmax. Both only ever at the last layer.
-                    let want_logits = li + 1 == blocks
-                        && match which {
-                            ChunkLogits::LastOnly => position == last,
-                            ChunkLogits::EveryPosition => true,
-                        };
+                    let want_logits = li + 1 == blocks && which.wants_logits(position, last);
                     std::mem::swap(&mut self.d_hidden, &mut hidden_bufs[t]);
                     std::mem::swap(&mut self.d_cos_all, &mut cos_bufs[t]);
                     std::mem::swap(&mut self.d_sin_all, &mut sin_bufs[t]);
@@ -12849,7 +16858,7 @@ impl Gemma4CudaResident {
                         // normalized hidden at whichever position was accepted — not at the
                         // last position of the batch. The buffers were rotated back above,
                         // so token t's post-layer hidden is in `hidden_bufs[t]`.
-                        let hidden_state = if which == ChunkLogits::EveryPosition {
+                        let hidden_state = if which.capture_hidden(position, last) {
                             let mut host = vec![0.0f32; hidden];
                             s.memcpy_dtoh(&hidden_bufs[t], host.as_mut_slice())
                                 .map_err(cu)?;
@@ -12867,6 +16876,10 @@ impl Gemma4CudaResident {
             }
             base += k;
         }
+        // Hidden captures above are stream-ordered DtoH copies into distinct stable
+        // Vec allocations. Retire them once, after the layer-major sweep, before the
+        // caller consumes a prefill seed or per-row verifier hidden state.
+        s.synchronize().map_err(cu)?;
         Ok(collected)
     }
 
@@ -13308,6 +17321,132 @@ mod cuda_spec_k4_telemetry_tests {
 }
 
 #[cfg(test)]
+mod sser_host_tier_eviction_tests {
+    use super::{parse_sser_host_tier_eviction_policy, SserHostTierEvictionPolicy};
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn defaults_to_lru_and_accepts_only_exact_policy_names() {
+        assert_eq!(
+            parse_sser_host_tier_eviction_policy(None).unwrap(),
+            SserHostTierEvictionPolicy::Lru
+        );
+        assert_eq!(
+            parse_sser_host_tier_eviction_policy(Some("lru")).unwrap(),
+            SserHostTierEvictionPolicy::Lru
+        );
+        assert_eq!(
+            parse_sser_host_tier_eviction_policy(Some("mru")).unwrap(),
+            SserHostTierEvictionPolicy::Mru
+        );
+        for invalid in ["", "MRU", " mru", "mru ", "fifo"] {
+            let error = parse_sser_host_tier_eviction_policy(Some(invalid)).unwrap_err();
+            assert!(
+                error.to_string().contains("must be exactly 'lru' or 'mru'"),
+                "unexpected error for {invalid:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn endpoint_selection_preserves_the_protected_set() {
+        let recency = BTreeSet::from([(1, 4, 1), (2, 4, 2), (3, 5, 9), (4, 4, 3)]);
+        let protected = [1, 3];
+        assert_eq!(
+            SserHostTierEvictionPolicy::Lru.select_victim(&recency, 4, &protected),
+            Some((2, 4, 2))
+        );
+        assert_eq!(
+            SserHostTierEvictionPolicy::Mru.select_victim(&recency, 4, &protected),
+            Some((3, 5, 9))
+        );
+
+        let same_layer = BTreeSet::from([(1, 4, 1), (2, 4, 3)]);
+        assert_eq!(
+            SserHostTierEvictionPolicy::Mru.select_victim(&same_layer, 4, &protected),
+            None
+        );
+    }
+}
+
+#[cfg(test)]
+mod sser_cuda_lfu_eviction_tests {
+    use super::{
+        parse_sser_cuda_eviction_policy, sser_cache_hot_capacity, sser_lfu_victim,
+        SserCudaEvictionPolicy, SserFrequencyAdmissionPolicy, SSER_FREQUENCY_SCRATCH_SLOTS,
+    };
+
+    #[test]
+    fn defaults_to_lru_and_requires_an_exact_explicit_lfu_name() {
+        assert_eq!(
+            parse_sser_cuda_eviction_policy(None).unwrap(),
+            SserCudaEvictionPolicy::Lru
+        );
+        assert_eq!(
+            parse_sser_cuda_eviction_policy(Some("lru")).unwrap(),
+            SserCudaEvictionPolicy::Lru
+        );
+        assert_eq!(
+            parse_sser_cuda_eviction_policy(Some("lfu")).unwrap(),
+            SserCudaEvictionPolicy::Lfu
+        );
+        for invalid in ["", "LFU", " lfu", "lfu ", "mru"] {
+            let error = parse_sser_cuda_eviction_policy(Some(invalid)).unwrap_err();
+            assert!(
+                error.to_string().contains("must be exactly 'lru' or 'lfu'"),
+                "unexpected error for {invalid:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn lfu_keeps_every_physical_slot_and_does_not_mix_with_frequency_admission() {
+        assert_eq!(
+            sser_cache_hot_capacity(880, false, SserCudaEvictionPolicy::Lru).unwrap(),
+            880
+        );
+        assert_eq!(
+            sser_cache_hot_capacity(880, false, SserCudaEvictionPolicy::Lfu).unwrap(),
+            880
+        );
+        assert_eq!(
+            sser_cache_hot_capacity(880, true, SserCudaEvictionPolicy::Lru).unwrap(),
+            880 - SSER_FREQUENCY_SCRATCH_SLOTS
+        );
+        let error = sser_cache_hot_capacity(880, true, SserCudaEvictionPolicy::Lfu).unwrap_err();
+        assert!(error.to_string().contains("cannot be combined"));
+    }
+
+    #[test]
+    fn victim_is_lifetime_lfu_then_lru_and_never_protected() {
+        let residents = [
+            ((4, 1), 1, 1), // coldest but protected by this union
+            ((4, 2), 2, 2),
+            ((3, 9), 2, 7),
+            ((2, 7), 3, 0), // older, but hotter than the frequency-2 rows
+        ];
+        assert_eq!(sser_lfu_victim(residents, 4, &[1]), Some((4, 2)));
+
+        let equal_frequency = [((0, 1), 3, 9), ((0, 2), 3, 3), ((0, 3), 4, 1)];
+        assert_eq!(sser_lfu_victim(equal_frequency, 7, &[]), Some((0, 2)));
+
+        let all_protected = [((4, 1), 1, 1), ((4, 3), 1, 2)];
+        assert_eq!(sser_lfu_victim(all_protected, 4, &[1, 3]), None);
+    }
+
+    #[test]
+    fn lifetime_count_survives_a_conceptual_eviction_and_refetch() {
+        let key = (6, 42);
+        let mut counts = SserFrequencyAdmissionPolicy::default();
+        assert_eq!(counts.record_access(key), 1);
+        assert_eq!(counts.record_access(key), 2);
+        // Residency metadata may be removed, but the policy directory is not.
+        assert_eq!(counts.record_access(key), 3);
+        assert_eq!(counts.count(key), 3);
+    }
+}
+
+#[cfg(test)]
 mod sser_frequency_admission_tests {
     use super::{
         sser_frequency_decision, sser_frequency_scratch_slot, SserFrequencyAdmissionPolicy,
@@ -13591,6 +17730,146 @@ mod cuda_parity_tests {
             gpu_ids.first(),
             cpu_ids.first(),
             "gemma4 CUDA first-token argmax diverged from the CPU oracle"
+        );
+    }
+
+    /// Opt-in architecture/quality gate for the resident Q4 assistant. This is
+    /// deliberately an ignored test instead of a production shadow: the normal
+    /// CUDA-assistant lane must never allocate or execute the 1.56 GiB dense CPU
+    /// assistant. Set `CAMELID_GEMMA4_GGUF` and
+    /// `CAMELID_GEMMA4_MTP_ASSISTANT`; set `CAMELID_GEMMA4_CGHOST` for the
+    /// streamed-expert target used on a 6 GiB card.
+    ///
+    /// The recurrent comparison is the sensitive oracle for architectural
+    /// mistakes that can be hidden by target-authoritative verification. It
+    /// also exposes the current numerical limitation: the generic CUDA RoPE
+    /// kernel does not BF16-round each rotated Q output as the CPU assistant
+    /// does, so cosine/max-error telemetry must accompany the token gate.
+    #[test]
+    #[ignore = "requires RTX CUDA + target GGUF/cghost + official Gemma 4 MTP safetensors"]
+    fn gemma4_mtp_cuda_one_step_matches_cpu_assistant_oracle() {
+        use crate::gemma4_mtp as mtp;
+
+        let Some(target_path) = std::env::var_os("CAMELID_GEMMA4_GGUF") else {
+            eprintln!("skip: set CAMELID_GEMMA4_GGUF");
+            return;
+        };
+        let Some(assistant_dir) = std::env::var_os("CAMELID_GEMMA4_MTP_ASSISTANT") else {
+            eprintln!("skip: set CAMELID_GEMMA4_MTP_ASSISTANT");
+            return;
+        };
+        let target_path = Path::new(&target_path);
+        let assistant_dir = Path::new(&assistant_dir);
+        if !target_path.exists() || !assistant_dir.join("model.safetensors").exists() {
+            eprintln!("skip: target or assistant safetensors path does not exist");
+            return;
+        }
+
+        // This must be set before target construction so SSER leaves the CUDA
+        // assistant's reserved VRAM unclaimed.
+        std::env::set_var("CAMELID_GEMMA4_MTP_CUDA_ASSISTANT", "1");
+        let mut gpu = if let Some(cghost) = std::env::var_os("CAMELID_GEMMA4_CGHOST") {
+            Gemma4CudaResident::load_ghost_moe(target_path, Path::new(&cghost), 512, false, 128)
+                .expect("load streamed target")
+        } else {
+            Gemma4CudaResident::load(target_path, 128).expect("load target")
+        };
+        assert!(gpu
+            .try_load_mtp_cuda_assistant(assistant_dir)
+            .expect("load resident CUDA assistant"));
+        let cpu = mtp::Gemma4MtpAssistant::load(assistant_dir).expect("load CPU oracle assistant");
+
+        let prompt = "The capital of France is";
+        let prompt_tokens = gpu
+            .cpu
+            .tokenizer
+            .encode(prompt, true, true)
+            .expect("tokenize");
+        let position = prompt_tokens.len();
+        let (logits, post_layers) = gpu
+            .prefill_reusing_cache_inner(&prompt_tokens, true)
+            .expect("target prefill");
+        let final_hidden = gpu
+            .mtp_final_norm(&post_layers.expect("prefill hidden receipt"))
+            .expect("target final norm");
+        let bonus_token = argmax_u32(&logits);
+        let embedding = gpu
+            .mtp_scaled_embedding(bonus_token)
+            .expect("target embedding");
+
+        let (sk, sv) = gpu
+            .mtp_shared_kv(mtp::SHARED_KV_SLIDING_HOST_LAYER, position)
+            .expect("read sliding KV")
+            .expect("short prompt has ordered sliding KV");
+        let (fk, fv) = gpu
+            .mtp_shared_kv(mtp::SHARED_KV_FULL_HOST_LAYER, position)
+            .expect("read full KV")
+            .expect("short prompt has ordered full KV");
+        let sliding = mtp::SharedKv {
+            key: &sk,
+            value: &sv,
+            kv_heads: mtp::SLIDING_KV_HEADS,
+            head_dim: mtp::SLIDING_HEAD_DIM,
+            kv_len: position,
+        };
+        let full = mtp::SharedKv {
+            key: &fk,
+            value: &fv,
+            kv_heads: mtp::FULL_KV_HEADS,
+            head_dim: mtp::FULL_HEAD_DIM,
+            kv_len: position,
+        };
+        let cpu_step = cpu
+            .step(&embedding, &final_hidden, &sliding, &full, position)
+            .expect("CPU assistant step");
+        let cpu_token = argmax_u32(&cpu_step.logits);
+        let cuda_token = gpu
+            .mtp_draft_cuda(&final_hidden, bonus_token, position, 1)
+            .expect("CUDA assistant step")[0];
+        let mut cuda_recurrent = vec![0.0f32; mtp::BACKBONE_HIDDEN];
+        gpu.cap_stream
+            .memcpy_dtoh(
+                &gpu.mtp_cuda_assistant
+                    .as_ref()
+                    .expect("resident assistant")
+                    .scratch
+                    .recurrent,
+                &mut cuda_recurrent,
+            )
+            .expect("copy CUDA recurrent hidden");
+        gpu.cap_stream.synchronize().expect("sync CUDA shadow");
+
+        let mut dot = 0.0f64;
+        let mut cpu_sq = 0.0f64;
+        let mut cuda_sq = 0.0f64;
+        let mut max_abs = 0.0f32;
+        let mut sum_abs = 0.0f64;
+        for (&expected, &actual) in cpu_step.recurrent_hidden.iter().zip(&cuda_recurrent) {
+            dot += f64::from(expected) * f64::from(actual);
+            cpu_sq += f64::from(expected) * f64::from(expected);
+            cuda_sq += f64::from(actual) * f64::from(actual);
+            let error = (expected - actual).abs();
+            max_abs = max_abs.max(error);
+            sum_abs += f64::from(error);
+        }
+        let cosine = dot / (cpu_sq.sqrt() * cuda_sq.sqrt());
+        let mean_abs = sum_abs / cuda_recurrent.len() as f64;
+        let finite = cpu_step
+            .recurrent_hidden
+            .iter()
+            .all(|value| value.is_finite())
+            && cuda_recurrent.iter().all(|value| value.is_finite())
+            && cosine.is_finite();
+        eprintln!(
+            "[gemma4-mtp-cuda-shadow] cpu_token={cpu_token} cuda_token={cuda_token} finite={finite} recurrent_cosine={cosine:.8} max_abs_error={max_abs:.8} mean_abs_error={mean_abs:.8}"
+        );
+        assert!(
+            finite,
+            "CUDA assistant produced a non-finite recurrent hidden"
+        );
+        assert_eq!(
+            cuda_token, cpu_token,
+            "resident Q4 CUDA assistant changed the one-step CPU-oracle token"
         );
     }
 }
@@ -14232,26 +18511,24 @@ mod gpu_lane_refusal_tests {
     #[test]
     fn cuda_lane_check_admits_the_supported_projection_formats() {
         // Every format from_wire actually supports must keep loading — Q8_0/Q4_0/
-        // Q4_1 (pre-BASALT) plus NVFP4 (Phase 4). I-carveout boundary-preservation:
-        // the K-quant refusal must not bleed onto the formats this lane serves.
+        // Q4_1 (pre-BASALT), NVFP4 (Phase 4), and the later Q4_K/Q6_K lift.
         nvfp4_cuda_lane_check([
             WireFormat::Q8_0,
             WireFormat::Q4_0,
             WireFormat::Q4_1,
             WireFormat::Nvfp4,
+            WireFormat::Q4K,
+            WireFormat::Q6K,
         ])
-        .expect("Q8_0/Q4_0/Q4_1/NVFP4 projections stay admitted");
+        .expect("Q8_0/Q4_0/Q4_1/NVFP4/Q4_K/Q6_K projections stay admitted");
         nvfp4_cuda_lane_check(std::iter::empty()).expect("no projections is vacuously fine");
     }
 
     #[test]
     fn cuda_lane_check_refuses_every_lane_uncovered_format_typed() {
-        // SHA_E review finding #1: the campaign's own K-quant rows (Q4K-mm,
-        // Q4_K_M-df/-im) load clean on the CPU wire lane but would hit the
-        // from_wire repack panic on the CUDA lane. Every format outside the
-        // lane's covered set must refuse TYPED and NAMED — never a panic
-        // (invariant I-unknown-type, L3 cell).
-        for uncovered in [WireFormat::Q4K, WireFormat::Q5K, WireFormat::Q6K] {
+        // Q4_K and Q6_K are now covered. Q5_K remains gather-only, so it must
+        // refuse TYPED and NAMED rather than reaching the repack panic seam.
+        for uncovered in [WireFormat::Q5K] {
             match nvfp4_cuda_lane_check([WireFormat::Q8_0, uncovered]) {
                 Err(BackendError::UnsupportedGguf(msg)) => {
                     assert!(
@@ -14259,7 +18536,7 @@ mod gpu_lane_refusal_tests {
                         "refusal must name the format: {msg}"
                     );
                     assert!(
-                        msg.contains("covers Q8_0/Q4_0/Q4_1/NVFP4"),
+                        msg.contains("covers Q8_0/Q4_0/Q4_1/NVFP4/Q6_K/Q4_K"),
                         "refusal must name the covered set: {msg}"
                     );
                 }

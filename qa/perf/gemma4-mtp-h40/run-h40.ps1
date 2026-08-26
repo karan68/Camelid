@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-  Windows/CUDA counterpart of the Mac H40 runner for the Gemma 4 26B-A4B MTP lane.
+  Windows/CUDA H40 runner for the Gemma 4 26B-A4B MTP lane.
 
 .DESCRIPTION
   Runs the frozen 48-token request through one named arm and writes a receipt that
@@ -17,15 +17,8 @@
   facts recorded beside every measurement.
 
 .NOTES
-  Two expectation files, deliberately:
-
-    expected-48-token-ids.mac.json      the frozen Metal/Mac reference. ALWAYS compared
-                                        and reported, NEVER the gate -- Windows agreeing
-                                        with it is a finding, not an assumption.
-    expected-48-token-ids.windows.json  this lane's own plain-decode output, written by
-                                        `-Establish`. This IS the gate: MTP is lossless
-                                        against the target it actually runs, so every
-                                        speculative arm must reproduce it exactly.
+  `expected-48-token-ids.windows.json` is this lane's own plain-decode output,
+  written by `-Establish`. It is the exactness gate for every measured arm.
 
   Sequential runs on this laptop drift thermally (a phantom 1.8x win was once
   manufactured that way), so a single run is a receipt, not evidence. Use paired
@@ -35,13 +28,15 @@
 param(
     # Absolute path to a prebuilt binary. Never builds -- a harness that builds cannot
     # say which source produced the number it reports.
-    [string]$Binary = (Join-Path $PSScriptRoot '..\..\..\target\release\camelid.exe'),
-    [string]$Model = (Join-Path $PSScriptRoot '..\..\..\models\google_gemma-4-26B-A4B-it-Q4_0.hot'),
-    [string]$Cghost = (Join-Path $PSScriptRoot '..\..\..\models\google_gemma-4-26B-A4B-it-Q4_0.cghost'),
-    [string]$Assistant = (Join-Path $PSScriptRoot '..\..\..\models\gemma-4-26B-A4B-it-assistant'),
+    # Resolve path defaults after parameter binding. Windows PowerShell 5 can leave
+    # `$PSScriptRoot` empty while evaluating default parameter expressions under `-File`.
+    [string]$Binary = '',
+    [string]$Model = '',
+    [string]$Cghost = '',
+    [string]$Assistant = '',
     [string]$Arm = 'mtp-k8',
-    [string]$Request = (Join-Path $PSScriptRoot 'request-48-plain.json'),
-    [string]$ReceiptRoot = (Join-Path $PSScriptRoot 'runs'),
+    [string]$Request = '',
+    [string]$ReceiptRoot = '',
     [string]$Label = '',
     [int]$ExpertCacheMib = 64,
     # Pre-spawn floor. The touched set is ~9.6 GiB on the 26B row and free RAM at load
@@ -63,6 +58,30 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2.0
+
+$scriptRoot = if (-not [string]::IsNullOrWhiteSpace($PSScriptRoot)) {
+    $PSScriptRoot
+} else {
+    Split-Path -Parent $MyInvocation.MyCommand.Path
+}
+if ([string]::IsNullOrWhiteSpace($Binary)) {
+    $Binary = Join-Path $scriptRoot '..\..\..\target\release\camelid.exe'
+}
+if ([string]::IsNullOrWhiteSpace($Model)) {
+    $Model = Join-Path $scriptRoot '..\..\..\models\google_gemma-4-26B-A4B-it-Q4_0.hot'
+}
+if ([string]::IsNullOrWhiteSpace($Cghost)) {
+    $Cghost = Join-Path $scriptRoot '..\..\..\models\google_gemma-4-26B-A4B-it-Q4_0.cghost'
+}
+if ([string]::IsNullOrWhiteSpace($Assistant)) {
+    $Assistant = Join-Path $scriptRoot '..\..\..\models\gemma-4-26B-A4B-it-assistant'
+}
+if ([string]::IsNullOrWhiteSpace($Request)) {
+    $Request = Join-Path $scriptRoot 'request-48-plain.json'
+}
+if ([string]::IsNullOrWhiteSpace($ReceiptRoot)) {
+    $ReceiptRoot = Join-Path $scriptRoot 'runs'
+}
 
 $EXIT_PASS = 0
 $EXIT_CHILD = 1
@@ -214,12 +233,7 @@ if ($armSpec.mtp) {
     $Assistant = Resolve-Required $Assistant 'MTP assistant directory'
 }
 
-$macExpectPath = Join-Path $PSScriptRoot 'expected-48-token-ids.mac.json'
 $winExpectPath = Join-Path $PSScriptRoot 'expected-48-token-ids.windows.json'
-$macExpect = $null
-if (Test-Path -LiteralPath $macExpectPath) {
-    $macExpect = Read-IdFile $macExpectPath
-}
 $gateFile = $null
 if ((Test-Path -LiteralPath $winExpectPath) -and (-not $Establish)) {
     $gateFile = (Resolve-Path -LiteralPath $winExpectPath).ProviderPath
@@ -330,12 +344,62 @@ if ($null -eq $receipt) {
 }
 
 $ids = @($receipt.token_ids)
-$vsMac = Compare-Ids $ids $macExpect
 $winExpect = $null
 if ($null -ne $gateFile) {
     $winExpect = Read-IdFile $gateFile
 }
 $vsWindows = Compare-Ids $ids $winExpect
+$kwideRequired = $armEnv.ContainsKey('CAMELID_GEMMA4_MTP_KWIDE') -and `
+    $armEnv['CAMELID_GEMMA4_MTP_KWIDE'] -eq '1'
+$kwideRounds = 0
+$kwideComplete = -not $kwideRequired
+if ($null -ne $receipt.mtp -and `
+        $receipt.mtp.PSObject.Properties.Name -contains 'kwide_rounds') {
+    $kwideRounds = [int]$receipt.mtp.kwide_rounds
+    $kwideComplete = (-not $kwideRequired) -or `
+        ($receipt.mtp.rounds -gt 0 -and $kwideRounds -eq [int]$receipt.mtp.rounds)
+}
+$cudaAssistantRequired = $armEnv.ContainsKey('CAMELID_GEMMA4_MTP_CUDA_ASSISTANT') -and `
+    $armEnv['CAMELID_GEMMA4_MTP_CUDA_ASSISTANT'] -eq '1'
+$cudaAssistantRounds = 0
+$cudaAssistantComplete = -not $cudaAssistantRequired
+if ($null -ne $receipt.mtp -and `
+        $receipt.mtp.PSObject.Properties.Name -contains 'cuda_assistant_rounds') {
+    $cudaAssistantRounds = [int]$receipt.mtp.cuda_assistant_rounds
+    $cudaAssistantFlag = $receipt.mtp.PSObject.Properties.Name -contains 'cuda_assistant' -and `
+        [bool]$receipt.mtp.cuda_assistant
+    $cpuAssistantSkipped = $receipt.mtp.PSObject.Properties.Name -contains 'cpu_assistant_loaded' -and `
+        -not [bool]$receipt.mtp.cpu_assistant_loaded
+    $cudaAssistantComplete = (-not $cudaAssistantRequired) -or `
+        ($receipt.mtp.rounds -gt 0 -and `
+            $cudaAssistantRounds -eq [int]$receipt.mtp.rounds -and `
+            $cudaAssistantFlag -and $cpuAssistantSkipped)
+}
+$expectedVerifyWidths = $null
+if ($armSpec.PSObject.Properties.Name -contains 'expected_verify_widths') {
+    $expectedVerifyWidths = @($armSpec.expected_verify_widths | ForEach-Object { [int]$_ })
+}
+$actualVerifyWidths = @()
+if ($null -ne $receipt.rounds) {
+    $actualVerifyWidths = @($receipt.rounds | ForEach-Object {
+            if ($_.PSObject.Properties.Name -contains 'verifier_k') {
+                [int]$_.verifier_k
+            } else {
+                @($_.target).Count
+            }
+        })
+}
+$vsVerifyWidths = Compare-Ids $actualVerifyWidths $expectedVerifyWidths
+$verifyWidthsComplete = $null -eq $expectedVerifyWidths -or `
+    ($null -ne $vsVerifyWidths -and $vsVerifyWidths.exact_match)
+$seedRequired = $armEnv.ContainsKey('CAMELID_GEMMA4_MTP_PREFILL_SEED_BOOTSTRAP') -and `
+    $armEnv['CAMELID_GEMMA4_MTP_PREFILL_SEED_BOOTSTRAP'] -eq '1'
+$seedFirstRoundDrafts = 0
+if ($null -ne $receipt.rounds -and @($receipt.rounds).Count -gt 0) {
+    $seedFirstRoundDrafts = @($receipt.rounds[0].drafts).Count
+}
+$seedComplete = (-not $seedRequired) -or `
+    ($null -ne $receipt.mtp -and $seedFirstRoundDrafts -eq [int]$armSpec.draft_k)
 
 if ($Establish) {
     # Built by hand rather than through ConvertTo-Json: that cmdlet renders a
@@ -365,7 +429,18 @@ $verdict = [ordered]@{
     busy_processes   = $busy
     gate_file        = $gateFile
     vs_windows_expected = $vsWindows
-    vs_mac_expected  = $vsMac
+    kwide_required   = $kwideRequired
+    kwide_rounds     = $kwideRounds
+    kwide_complete   = $kwideComplete
+    cuda_assistant_required = $cudaAssistantRequired
+    cuda_assistant_rounds = $cudaAssistantRounds
+    cuda_assistant_complete = $cudaAssistantComplete
+    expected_verify_widths = $expectedVerifyWidths
+    actual_verify_widths = $actualVerifyWidths
+    verify_widths_complete = $verifyWidthsComplete
+    prefill_seed_required = $seedRequired
+    prefill_seed_first_round_drafts = $seedFirstRoundDrafts
+    prefill_seed_complete = $seedComplete
     host_before      = $before
     host_after       = $after
     host_delta       = [ordered]@{
@@ -395,6 +470,20 @@ if ($null -ne $receipt.mtp) {
             $receipt.mtp.alpha, $receipt.mtp.rounds, ($receipt.mtp.acceptance_rate * 100))
     Write-Host ('[h40] prefill {0:N0} ms | assistant {1:N0} ms | verifier {2:N0} ms ({3:N0} ms/round)' -f `
             $receipt.mtp.prefill_ms, $receipt.mtp.assistant_ms, $receipt.mtp.verify_ms, $receipt.mtp.verify_ms_per_round)
+    if ($kwideRequired) {
+        Write-Host ('[h40] K-wide completed {0}/{1} verifier rounds' -f $kwideRounds, $receipt.mtp.rounds)
+    }
+    if ($cudaAssistantRequired) {
+        Write-Host ('[h40] CUDA assistant completed {0}/{1} rounds; CPU assistant loaded={2}' -f `
+                $cudaAssistantRounds, $receipt.mtp.rounds, $receipt.mtp.cpu_assistant_loaded)
+    }
+    if ($null -ne $expectedVerifyWidths) {
+        Write-Host ('[h40] verifier widths actual [{0}] | required [{1}]' -f `
+                ($actualVerifyWidths -join ','), ($expectedVerifyWidths -join ','))
+    }
+    if ($seedRequired) {
+        Write-Host ('[h40] prefill seed produced {0}/{1} first-round drafts' -f $seedFirstRoundDrafts, $armSpec.draft_k)
+    }
 }
 if ($null -ne $receipt.expert_cache) {
     $ec = $receipt.expert_cache
@@ -415,19 +504,6 @@ Write-Host ('[h40] host delta: available {0:+#;-#;0} MiB | pagefile {1:+#;-#;0} 
         $verdict.host_delta.available_mib, $verdict.host_delta.pagefile_current_mib, `
         $verdict.host_delta.hard_faults_pages_in)
 
-if ($null -ne $vsMac) {
-    if ($vsMac.exact_match) {
-        Write-Host ('[h40] vs Mac reference: IDENTICAL ({0} ids)' -f $vsMac.got_count)
-    } else {
-        $at = $vsMac.first_divergence
-        $from = [Math]::Max(0, $at - 3)
-        Write-Host ('[h40] vs Mac reference: diverges at index {0}; {1} vs {2} ids' -f `
-                $at, $vsMac.got_count, $vsMac.expected_count)
-        Write-Host ('[h40]   windows[{0}..] {1}' -f $from, (($ids[$from..([Math]::Min($ids.Count - 1, $at + 5))]) -join ' '))
-        Write-Host ('[h40]   mac[{0}..]     {1}' -f $from, (($macExpect[$from..([Math]::Min($macExpect.Count - 1, $at + 5))]) -join ' '))
-    }
-}
-
 $status = $EXIT_PASS
 if ($exitCode -ne 0) {
     $status = $EXIT_GATE
@@ -435,6 +511,18 @@ if ($exitCode -ne 0) {
 } elseif ($null -ne $vsWindows -and -not $vsWindows.exact_match) {
     $status = $EXIT_GATE
     Write-Host '[h40] FAIL: token ids differ from the Windows expectation'
+} elseif ($kwideRequired -and -not $kwideComplete) {
+    $status = $EXIT_GATE
+    Write-Host '[h40] FAIL: K-wide was requested but one or more rounds fell back to scalar verification'
+} elseif ($cudaAssistantRequired -and -not $cudaAssistantComplete) {
+    $status = $EXIT_GATE
+    Write-Host '[h40] FAIL: CUDA assistant was requested but a round fell back or the dense CPU assistant was loaded'
+} elseif (-not $verifyWidthsComplete) {
+    $status = $EXIT_GATE
+    Write-Host '[h40] FAIL: verifier widths did not match the arm schedule'
+} elseif ($seedRequired -and -not $seedComplete) {
+    $status = $EXIT_GATE
+    Write-Host '[h40] FAIL: prefill seeding was requested but round zero did not draft at the configured width'
 } elseif ($null -ne $gateFile) {
     Write-Host '[h40] PASS: exact against the Windows expectation'
 }

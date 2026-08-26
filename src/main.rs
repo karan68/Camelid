@@ -2345,8 +2345,9 @@ enum Command {
         /// is ever emitted -- so this changes speed, never output.
         #[arg(long)]
         mtp_assistant: Option<PathBuf>,
-        /// Draft tokens proposed per verify round. The Metal campaign measured K=8 best,
-        /// with K=10 worse (the widened target work dominates).
+        /// Maximum draft tokens proposed per verify round. The default-off
+        /// `CAMELID_GEMMA4_MTP_WIDTH_SCHEDULE` instead names verifier widths
+        /// (current target row plus drafts), each bounded by this value plus one.
         #[arg(long, default_value_t = 8)]
         mtp_draft_k: usize,
         /// OpenAI-shaped chat request to run instead of `--prompt`, templated through the
@@ -3174,6 +3175,9 @@ struct Gemma4HarnessRun<'a> {
     /// Host expert tier `(hits, storage reads)`, lifetime and at the prefill boundary.
     tier: (u64, u64),
     tier_prefill: (u64, u64),
+    tier_eviction_policy: Option<&'static str>,
+    tier_residency_prefill: Option<camelid::gemma4_runtime::Gemma4SserHostResidency>,
+    tier_residency_end: Option<camelid::gemma4_runtime::Gemma4SserHostResidency>,
     /// Throughput over the second half of the decode forwards, past the arena warm-up.
     ///
     /// Layer-major prefill leaves the expert arena holding the LAST layer's union, so
@@ -3205,6 +3209,16 @@ impl Gemma4HarnessRun<'_> {
 
     fn receipt(&self) -> serde_json::Value {
         let (exact_match, divergence) = self.verdict();
+        let kwide_rounds = self.stats.map_or(0, |stats| {
+            stats.trace.iter().filter(|round| round.kwide).count() as u64
+        });
+        let cuda_assistant_rounds = self.stats.map_or(0, |stats| {
+            stats
+                .trace
+                .iter()
+                .filter(|round| round.cuda_assistant)
+                .count() as u64
+        });
         let rounds = self.stats.map(|stats| {
             stats
                 .trace
@@ -3213,6 +3227,9 @@ impl Gemma4HarnessRun<'_> {
                     serde_json::json!({
                         "position": round.position,
                         "bonus_token": round.bonus_token,
+                        "requested_verify_k": round.requested_verify_k,
+                        "verifier_k": round.verifier_k,
+                        "budget_truncated": round.budget_truncated,
                         "drafts": round.drafts,
                         "target": round.target,
                         "accepted": round.accepted,
@@ -3228,6 +3245,8 @@ impl Gemma4HarnessRun<'_> {
                         // answer whether verification is I/O- or compute-bound.
                         "storage_reads": round.storage_reads,
                         "storage_mib": round.storage_reads as f64 * 3.19,
+                        "kwide": round.kwide,
+                        "cuda_assistant": round.cuda_assistant,
                     })
                 })
                 .collect::<Vec<_>>()
@@ -3273,6 +3292,10 @@ impl Gemma4HarnessRun<'_> {
                 } else {
                     0.0
                 },
+                "kwide_rounds": kwide_rounds,
+                "cuda_assistant_rounds": cuda_assistant_rounds,
+                "cuda_assistant": stats.cuda_assistant,
+                "cpu_assistant_loaded": !stats.cuda_assistant,
             })),
             "expert_cache": self.expert_cache_json(),
             "rounds": rounds,
@@ -3294,6 +3317,18 @@ impl Gemma4HarnessRun<'_> {
                 0.0
             }
         };
+        let residency_json =
+            |snapshot: Option<camelid::gemma4_runtime::Gemma4SserHostResidency>| {
+                snapshot.map(|snapshot| {
+                    serde_json::json!({
+                        "sser": snapshot.sser_records,
+                        "host": snapshot.host_records,
+                        "intersection": snapshot.intersection_records,
+                        "host_only": snapshot.host_only_records,
+                        "union": snapshot.union_records,
+                    })
+                })
+            };
         self.sser.map(|(hits, misses, resident, capacity)| {
             let emitted = self.ids.len().max(1) as f64;
             let rounds = self.stats.map(|stats| stats.rounds).unwrap_or(0);
@@ -3341,6 +3376,9 @@ impl Gemma4HarnessRun<'_> {
                 "tier_decode_hits": tier_decode_hits,
                 "tier_decode_storage_reads": tier_decode_reads,
                 "tier_decode_hit_rate": ratio(tier_decode_hits, tier_decode_reads),
+                "host_tier_eviction_policy": self.tier_eviction_policy,
+                "residency_prefill": residency_json(self.tier_residency_prefill),
+                "residency_end": residency_json(self.tier_residency_end),
                 "misses_per_committed_token": misses as f64 / emitted,
                 "misses_per_round": misses_per_round,
                 "resident_experts": resident,
@@ -4576,20 +4614,29 @@ async fn main() -> anyhow::Result<()> {
             let prompt_tokens = runtime.tokenizer().encode(&prompt, true, true)?.len();
             let t1 = std::time::Instant::now();
             if let Some(assistant_dir) = mtp_assistant.as_deref() {
-                eprintln!(
-                    "[gemma4-mtp] loading MTP assistant from {}...",
-                    assistant_dir.display()
-                );
                 let t_load = std::time::Instant::now();
-                let assistant = camelid::gemma4_mtp::Gemma4MtpAssistant::load(assistant_dir)?;
-                eprintln!(
-                    "[gemma4-mtp] assistant loaded in {:.1}s (vocab {}); drafting K={mtp_draft_k}",
-                    t_load.elapsed().as_secs_f64(),
-                    assistant.vocab_size()
-                );
+                let cuda_assistant = runtime.try_load_mtp_cuda_assistant(assistant_dir)?;
                 let t_gen = std::time::Instant::now();
-                let (out, ids, stats) =
-                    runtime.generate_greedy_mtp(&prompt, max_tokens, &assistant, mtp_draft_k)?;
+                let (out, ids, stats) = if cuda_assistant {
+                    eprintln!(
+                        "[gemma4-mtp-cuda] assistant loaded in {:.1}s ({} resident bytes, cpu_assistant_loaded=0); drafting K={mtp_draft_k}",
+                        t_load.elapsed().as_secs_f64(),
+                        runtime.mtp_cuda_assistant_resident_bytes().unwrap_or(0),
+                    );
+                    runtime.generate_greedy_mtp_cuda(&prompt, max_tokens, mtp_draft_k)?
+                } else {
+                    eprintln!(
+                        "[gemma4-mtp] loading CPU MTP assistant from {}...",
+                        assistant_dir.display()
+                    );
+                    let assistant = camelid::gemma4_mtp::Gemma4MtpAssistant::load(assistant_dir)?;
+                    eprintln!(
+                        "[gemma4-mtp] CPU assistant loaded in {:.1}s (vocab {}); drafting K={mtp_draft_k}",
+                        t_load.elapsed().as_secs_f64(),
+                        assistant.vocab_size()
+                    );
+                    runtime.generate_greedy_mtp(&prompt, max_tokens, &assistant, mtp_draft_k)?
+                };
                 let wall = t_gen.elapsed().as_secs_f64();
                 eprintln!(
                     "[gemma4-mtp] generated {} tokens in {:.3}s = {:.2} tok/s",
@@ -4637,6 +4684,9 @@ async fn main() -> anyhow::Result<()> {
                     sser_prefill: runtime.sser_prefill_mark(),
                     tier: runtime.host_tier_counters(),
                     tier_prefill: runtime.host_tier_prefill_mark(),
+                    tier_eviction_policy: runtime.host_tier_eviction_policy(),
+                    tier_residency_prefill: runtime.sser_host_prefill_residency(),
+                    tier_residency_end: runtime.sser_host_residency(),
                     // Speculative rounds are not per-token forwards, so there is no
                     // second-half token rate to quote here.
                     steady_tokens_per_second: None,
@@ -4743,6 +4793,9 @@ async fn main() -> anyhow::Result<()> {
                 sser_prefill: runtime.sser_prefill_mark(),
                 tier: runtime.host_tier_counters(),
                 tier_prefill: runtime.host_tier_prefill_mark(),
+                tier_eviction_policy: runtime.host_tier_eviction_policy(),
+                tier_residency_prefill: runtime.sser_host_prefill_residency(),
+                tier_residency_end: runtime.sser_host_residency(),
                 steady_tokens_per_second: {
                     let half = per_token.len() / 2;
                     let tail: f64 = per_token[half..].iter().sum();
