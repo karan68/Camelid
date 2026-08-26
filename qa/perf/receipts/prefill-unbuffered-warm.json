@@ -1,4 +1,4 @@
-﻿{
+{
     "label":  "unbuffered",
     "coldCache":  false,
     "maxTokens":  8,

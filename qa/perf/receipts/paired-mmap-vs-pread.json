@@ -1,4 +1,4 @@
-﻿{
+{
     "armA":  "mmap",
     "armB":  "pread",
     "armAExe":  ".\\target\\release\\camelid.exe",

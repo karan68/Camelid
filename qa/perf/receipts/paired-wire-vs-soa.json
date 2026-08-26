@@ -1,4 +1,4 @@
-﻿{
+{
     "armA":  "wire",
     "armB":  "soa",
     "armAExe":  ".\\target\\release\\camelid.exe",

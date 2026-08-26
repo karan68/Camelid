@@ -1,4 +1,4 @@
-﻿{
+{
     "label":  "chunked512",
     "coldCache":  false,
     "maxTokens":  8,

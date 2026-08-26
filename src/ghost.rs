@@ -1717,6 +1717,7 @@ impl GhostFile {
         prefetch_range_best_effort(range);
     }
 
+    #[cfg(any(feature = "cuda", test))]
     pub(crate) fn moe_expert_record_layout(
         &self,
         layer_idx: usize,

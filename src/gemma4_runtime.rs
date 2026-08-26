@@ -7465,6 +7465,7 @@ pub struct Gemma4MtpStats {
     pub trace: Vec<Gemma4MtpRound>,
 }
 
+#[cfg(feature = "cuda")]
 impl Gemma4MtpStats {
     /// Extra tokens accepted per verify round.
     pub fn alpha(&self) -> f64 {
@@ -7551,6 +7552,7 @@ impl ChunkLogits {
 /// layout (always via [`gemma4_head_upload`]); input is quantized by the fused
 /// rms_norm+quantize into `inq`/`ins`; `logits` is dtoh'd once per token. `blocks` is
 /// blocks-per-row passed to the GEMV (`hidden/32` for Q8_0, `hidden/256` for K-quants).
+#[cfg(feature = "cuda")]
 struct Gemma4HeadDev {
     lane: HeadLane,
     weight: cudarc::driver::CudaSlice<u8>,
