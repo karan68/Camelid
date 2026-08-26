@@ -201,7 +201,10 @@ export function linuxModelSandboxPath(path) {
 
 export function windowsPathToWsl(path) {
   const match = path.match(/^([A-Za-z]):[\\/](.*)$/)
-  if (!match) throw new NativeAdapterError('INVALID_INFRASTRUCTURE', `WSL boundary requires a drive-qualified Windows path: ${path}`)
+  if (!match) {
+    if (path.startsWith('/')) return path
+    throw new NativeAdapterError('INVALID_INFRASTRUCTURE', `WSL boundary requires a drive-qualified Windows path: ${path}`)
+  }
   return `/mnt/${match[1].toLowerCase()}/${match[2].replaceAll('\\', '/')}`
 }
 
@@ -309,7 +312,9 @@ function validateBoundary(options) {
     gpuEnabled: boundary.gpuEnabled ?? false,
     wslExecutable: boundary.wslExecutable
       ? resolve(boundary.wslExecutable)
-      : resolve(systemRoot, 'System32', 'wsl.exe'),
+      : process.platform === 'win32'
+        ? resolve(systemRoot, 'System32', 'wsl.exe')
+        : 'wsl',
   }
 }
 

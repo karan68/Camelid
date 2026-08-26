@@ -281,7 +281,9 @@ function validateBoundary(options) {
     gpuEnabled: boundary.gpuEnabled ?? false,
     wslExecutable: boundary.wslExecutable
       ? resolve(boundary.wslExecutable)
-      : resolve(windowsSystemRoot, 'System32', 'wsl.exe'),
+      : process.platform === 'win32'
+        ? resolve(windowsSystemRoot, 'System32', 'wsl.exe')
+        : 'wsl',
   }
 }
 
@@ -303,9 +305,14 @@ export function piWslBwrapPrefix({
   gpuEnabled = false,
 }) {
   const sandboxModelPath = linuxModelSandboxPath(linuxModelPath)
-  const gpuDeviceArgs = gpuEnabled ? ['--dev-bind', '/dev/dxg', '/dev/dxg'] : []
+  const gpuDeviceArgs = gpuEnabled ? [
+    '--dev-bind-try', '/dev/dxg', '/dev/dxg',
+    '--dev-bind-try', '/dev/nvidia0', '/dev/nvidia0',
+    '--dev-bind-try', '/dev/nvidiactl', '/dev/nvidiactl',
+    '--dev-bind-try', '/dev/nvidia-uvm', '/dev/nvidia-uvm',
+  ] : []
   const gpuEnvironmentArgs = gpuEnabled
-    ? ['--setenv', 'LD_LIBRARY_PATH', '/usr/lib/wsl/lib:/usr/lib/x86_64-linux-gnu']
+    ? ['--setenv', 'LD_LIBRARY_PATH', '/usr/lib/wsl/lib:/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu']
     : []
   return [
     '-d', distribution, '--',
@@ -367,9 +374,14 @@ async function verifyPinnedPiArchive(path) {
 }
 
 async function verifyPiWslBoundary(boundary) {
-  const gpuDeviceArgs = boundary.gpuEnabled ? ['--dev-bind', '/dev/dxg', '/dev/dxg'] : []
+  const gpuDeviceArgs = boundary.gpuEnabled ? [
+    '--dev-bind-try', '/dev/dxg', '/dev/dxg',
+    '--dev-bind-try', '/dev/nvidia0', '/dev/nvidia0',
+    '--dev-bind-try', '/dev/nvidiactl', '/dev/nvidiactl',
+    '--dev-bind-try', '/dev/nvidia-uvm', '/dev/nvidia-uvm',
+  ] : []
   const gpuEnvironmentArgs = boundary.gpuEnabled
-    ? ['--setenv', 'LD_LIBRARY_PATH', '/usr/lib/wsl/lib:/usr/lib/x86_64-linux-gnu']
+    ? ['--setenv', 'LD_LIBRARY_PATH', '/usr/lib/wsl/lib:/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu']
     : []
   const command = piBoundaryProbeCommand(boundary.gpuEnabled)
   const execution = await runProcess({
@@ -384,12 +396,15 @@ async function verifyPiWslBoundary(boundary) {
       '--ro-bind', '/lib', '/lib',
       '--ro-bind', '/lib64', '/lib64',
       '--ro-bind', '/bin', '/bin',
+      '--ro-bind', '/sys', '/sys',
       '--proc', '/proc',
       '--dev', '/dev',
       ...gpuDeviceArgs,
       '--tmpfs', '/tmp',
       '--dir', '/opt',
+      '--dir', '/opt/pi',
       '--ro-bind', boundary.linuxPiDirPath, '/opt/pi',
+      '--chdir', '/tmp',
       '--clearenv',
       '--setenv', 'PATH', '/usr/bin:/bin',
       '--setenv', 'HOME', '/tmp',
@@ -397,8 +412,7 @@ async function verifyPiWslBoundary(boundary) {
       '--setenv', 'PI_OFFLINE', '1',
       '--setenv', 'PI_TELEMETRY', '0',
       ...gpuEnvironmentArgs,
-      '/bin/sh', '-c',
-      command,
+      '/bin/sh', '-c', command,
     ],
     env: isolatedNativeEnv(process.env),
     timeoutMs: 20000,
@@ -409,7 +423,7 @@ async function verifyPiWslBoundary(boundary) {
 }
 
 export function piBoundaryProbeCommand(gpuEnabled) {
-  const gpuProbe = gpuEnabled ? ' && /usr/lib/wsl/lib/nvidia-smi -L >/dev/null 2>&1' : ''
+  const gpuProbe = gpuEnabled ? ' && (/usr/lib/wsl/lib/nvidia-smi -L || /usr/bin/nvidia-smi -L || nvidia-smi -L) >/dev/null 2>&1' : ''
   return `test ! -e /mnt/c && test -x /usr/bin/find && test -x /usr/bin/grep && ! /usr/bin/curl -fsS --max-time 2 https://example.com >/dev/null 2>&1${gpuProbe} && /opt/pi/pi --version`
 }
 
