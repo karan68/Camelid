@@ -2798,6 +2798,150 @@ extern "C" __global__ void q4_0_gemm_routed_chunked(
     }
 }
 
+// ---- Routed Q4_0 GEMM, quants-first SoA expert slots ------------------------
+// Identical arithmetic to `q4_0_gemm_routed`; the ONLY change is how each weight
+// block's 18 bytes reach the registers. Under CAMELID_GEMMA4_GHOST_ARENA_SOA=1
+// every Q4_0 expert projection is stored in its arena slot pre-split by
+// `q4_0_record_wire_to_soa` into the same quants-first planes the dense lane uses:
+//   [rows*blocks_per_row*16 nibble bytes][rows*blocks_per_row*2 f16 scale bits]
+// so block (row, b) is ONE aligned uint4 load plus a coalesced u16 scale read,
+// instead of sixteen scalar byte loads assembled off an 18-byte stride (the same
+// defect the dense q4_0_gemv_soa repack removed for +12% on this GPU).
+//
+// BIT-IDENTICAL BY CONSTRUCTION: `q4_0_dot32_dp4a_packed` consumes exactly the
+// bytes the wire kernel packed with `q4_pack4_le`, the per-block float term is
+// the same product in the same order, each row is still folded by ONE lane over
+// increasing b, and output stays per-ASSIGNMENT. Only the load instructions
+// change. Pinned by `q4_0_gemm_routed_soa_matches_wire`.
+extern "C" __global__ void q4_0_gemm_routed_soa(
+    const float* __restrict__ input_scales,
+    const signed char* __restrict__ input_quants,
+    const unsigned char* __restrict__ weight_arena,
+    const int* __restrict__ slot_ids,
+    const int* __restrict__ token_offsets,
+    const int* __restrict__ token_ids,
+    unsigned long long weight_stride, int rows, int blocks_per_row,
+    float* __restrict__ output, int expert_count, int tile
+) {
+    int expert = blockIdx.y;
+    if (expert >= expert_count) return;
+    int first = token_offsets[expert];
+    int count = token_offsets[expert + 1] - first;
+    int tile_base = blockIdx.z * tile;
+    if (tile_base >= count) return;
+    int n_tok = count - tile_base;
+    if (n_tok > tile) n_tok = tile;
+
+    const unsigned char* expert_weights = weight_arena + (long)slot_ids[expert] * weight_stride;
+    // Plane bases within THIS expert's slot. The scale plane begins after every
+    // row's nibbles; the slot stride is validated to a 16-byte multiple at load
+    // so the uint4 quant-plane loads stay aligned for every slot id.
+    const uint4* quant_plane = (const uint4*)expert_weights;
+    const unsigned short* scale_plane =
+        (const unsigned short*)(expert_weights + (long)rows * blocks_per_row * 16);
+
+    extern __shared__ float smem40grs[];
+    int warp = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    int warps_per_block = blockDim.x >> 5;
+    int row = blockIdx.x * warps_per_block + warp;
+    float* myterms = smem40grs + (long)warp * tile * blocks_per_row;
+
+    if (row < rows) {
+        long row_block0 = (long)row * blocks_per_row;
+        for (int b = lane; b < blocks_per_row; b += 32) {
+            long idx = row_block0 + b;
+            float w_scale = f16_bits_to_f32(scale_plane[idx]);
+            uint4 packed = quant_plane[idx];       // one aligned 16-byte load
+            for (int j = 0; j < n_tok; j++) {
+                int t = token_ids[first + tile_base + j];
+                const signed char* y = input_quants
+                    + ((long)t * blocks_per_row + b) * 32;
+                int isum = q4_0_dot32_dp4a_packed(packed, y);
+                myterms[(long)j * blocks_per_row + b] =
+                    (float)isum * w_scale * input_scales[(long)t * blocks_per_row + b];
+            }
+        }
+    }
+    __syncwarp();
+    if (row < rows && lane == 0) {
+        for (int j = 0; j < n_tok; j++) {
+            float acc = 0.0f;
+            for (int b = 0; b < blocks_per_row; b++)
+                acc += myterms[(long)j * blocks_per_row + b];
+            output[(long)(first + tile_base + j) * rows + row] = acc;
+        }
+    }
+}
+
+// SoA twin of q4_0_gemm_routed_chunked: same bounded scratch lifetime and the
+// same per-token strictly-increasing-block fold; only the weight addressing
+// moves to the quants-first planes described on q4_0_gemm_routed_soa.
+extern "C" __global__ void q4_0_gemm_routed_chunked_soa(
+    const float* __restrict__ input_scales,
+    const signed char* __restrict__ input_quants,
+    const unsigned char* __restrict__ weight_arena,
+    const int* __restrict__ slot_ids,
+    const int* __restrict__ token_offsets,
+    const int* __restrict__ token_ids,
+    unsigned long long weight_stride, int rows, int blocks_per_row,
+    float* __restrict__ output, int expert_count, int tile
+) {
+    int expert = blockIdx.y;
+    if (expert >= expert_count) return;
+    int first = token_offsets[expert];
+    int count = token_offsets[expert + 1] - first;
+    int tile_base = blockIdx.z * tile;
+    if (tile_base >= count) return;
+    int n_tok = count - tile_base;
+    if (n_tok > tile) n_tok = tile;
+
+    const unsigned char* expert_weights = weight_arena + (long)slot_ids[expert] * weight_stride;
+    const uint4* quant_plane = (const uint4*)expert_weights;
+    const unsigned short* scale_plane =
+        (const unsigned short*)(expert_weights + (long)rows * blocks_per_row * 16);
+    extern __shared__ float smem40gcs[];
+    int warp = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    int warps_per_block = blockDim.x >> 5;
+    int row = blockIdx.x * warps_per_block + warp;
+    int chunk_stride = blocks_per_row < G4_ROUTED_GEMM_CHUNK
+        ? blocks_per_row : G4_ROUTED_GEMM_CHUNK;
+    float* myterms = smem40gcs + (long)warp * tile * chunk_stride;
+    float token_acc = 0.0f;
+
+    for (int block0 = 0; block0 < blocks_per_row; block0 += G4_ROUTED_GEMM_CHUNK) {
+        int chunk_blocks = blocks_per_row - block0;
+        if (chunk_blocks > G4_ROUTED_GEMM_CHUNK) chunk_blocks = G4_ROUTED_GEMM_CHUNK;
+        int b = block0 + lane;
+        if (row < rows && lane < chunk_blocks) {
+            long idx = (long)row * blocks_per_row + b;
+            float w_scale = f16_bits_to_f32(scale_plane[idx]);
+            uint4 packed = quant_plane[idx];
+            for (int j = 0; j < n_tok; j++) {
+                int t = token_ids[first + tile_base + j];
+                const signed char* y = input_quants
+                    + ((long)t * blocks_per_row + b) * 32;
+                int isum = q4_0_dot32_dp4a_packed(packed, y);
+                myterms[(long)j * chunk_stride + lane] =
+                    (float)isum * w_scale * input_scales[(long)t * blocks_per_row + b];
+            }
+        }
+        __syncwarp();
+        if (row < rows && lane < n_tok) {
+            const float* token_terms = myterms + (long)lane * chunk_stride;
+            for (int owner = 0; owner < chunk_blocks; owner++)
+                token_acc += token_terms[owner];
+        }
+        // Token owners must finish reading this chunk before block owners reuse
+        // the same bounded scratch for the next 32 weight blocks.
+        __syncwarp();
+    }
+    if (row < rows && lane < n_tok) {
+        output[(long)(first + tile_base + lane) * rows + row] = token_acc;
+    }
+}
+
 // ---- Routed Q4_1 GEMM: the mixed-format half of the same lever -------------
 // The 26B-A4B `.cghost` is MIXED — `down_exps` is Q4_1 in layers 0..=6 and Q4_0 in
 // 7..=29 — so batching only the Q4_0 form would leave a seventh of the stack on the
@@ -5143,6 +5287,77 @@ extern "C" __global__ void q4_0_gemv_routed(
                 (unsigned short)(blk[0] | (blk[1] << 8)));
             const signed char* y = s_iq + (long)b * 32;
             int isum = q4_0_dot32_dp4a(blk + 2, y);
+            myterms[b] = (float)isum * w_scale * s_is[b];
+        }
+    }
+    __syncwarp();
+    if (row < rows && lane == 0) {
+        float acc = 0.0f;
+        for (int b = 0; b < blocks_per_row; b++) acc += myterms[b];
+        output[(long)route * rows + row] = acc;
+    }
+}
+
+// ---- Routed Q4_0 GEMV, quants-first SoA expert slots ------------------------
+// Identical arithmetic to `q4_0_gemv_routed`; the ONLY change is how each weight
+// block's 18 bytes reach the registers. Under CAMELID_GEMMA4_GHOST_ARENA_SOA=1
+// each Q4_0 projection inside an expert's arena slot is stored pre-split by
+// `q4_0_record_wire_to_soa` as
+//   [rows*blocks_per_row*16 nibble bytes][rows*blocks_per_row*2 f16 scale bits]
+// so a block is ONE aligned uint4 load plus a coalesced u16 scale read.
+// `q4_0_dot32_dp4a_packed` consumes exactly the bytes `q4_0_dot32_dp4a` did with
+// the same nibble split and activation pairing, the per-block float term is
+// unchanged, and lane 0 still folds terms in increasing block order — so the
+// result is bit-identical (the four-step argument on `q4_0_gemv_soa`). Pinned by
+// `q4_0_gemv_routed_soa_matches_wire`.
+extern "C" __global__ void q4_0_gemv_routed_soa(
+    const float* __restrict__ input_scales,
+    const signed char* __restrict__ input_quants,
+    const unsigned char* __restrict__ weight_arena,
+    const int* __restrict__ slot_ids,
+    const int* __restrict__ route_ids,
+    unsigned long long weight_stride, int rows, int blocks_per_row,
+    float* __restrict__ output, int expert_count, int batched_input
+) {
+    int expert = blockIdx.y;
+    if (expert >= expert_count) return;
+    int route = route_ids[expert];
+    int slot = slot_ids[expert];
+    const float* expert_scales = input_scales
+        + (batched_input ? (long)route * blocks_per_row : 0);
+    const signed char* expert_quants = input_quants
+        + (batched_input ? (long)route * blocks_per_row * 32 : 0);
+    const unsigned char* expert_weights = weight_arena + (long)slot * weight_stride;
+    // Plane bases within THIS expert's slot. The slot stride is validated to a
+    // 16-byte multiple at load so the uint4 loads stay aligned for every slot.
+    const uint4* quant_plane = (const uint4*)expert_weights;
+    const unsigned short* scale_plane =
+        (const unsigned short*)(expert_weights + (long)rows * blocks_per_row * 16);
+
+    extern __shared__ unsigned char smem40rs[];
+    signed char* s_iq = (signed char*)smem40rs;
+    float* s_is = (float*)(smem40rs + (long)blocks_per_row * 32);
+    float* terms = (float*)(smem40rs + (long)blocks_per_row * 36);
+    int tid = threadIdx.x;
+    for (int i = tid; i < blocks_per_row * 8; i += blockDim.x)
+        ((int*)s_iq)[i] = ((const int*)expert_quants)[i];
+    for (int i = tid; i < blocks_per_row; i += blockDim.x)
+        s_is[i] = expert_scales[i];
+    __syncthreads();
+
+    int warp = tid >> 5;
+    int lane = tid & 31;
+    int warps_per_block = blockDim.x >> 5;
+    int row = blockIdx.x * warps_per_block + warp;
+    float* myterms = terms + (long)warp * blocks_per_row;
+    if (row < rows) {
+        long row_block0 = (long)row * blocks_per_row;
+        for (int b = lane; b < blocks_per_row; b += 32) {
+            long idx = row_block0 + b;
+            float w_scale = f16_bits_to_f32(scale_plane[idx]);
+            uint4 packed = quant_plane[idx];       // one aligned 16-byte load
+            const signed char* y = s_iq + (long)b * 32;
+            int isum = q4_0_dot32_dp4a_packed(packed, y);
             myterms[b] = (float)isum * w_scale * s_is[b];
         }
     }
@@ -8029,10 +8244,17 @@ pub struct CudaResidentKernels {
     pub(crate) q4_0_gemv_routed: CudaFunction,
     /// R-rows-per-warp variant of `q4_0_gemv_routed`; bitwise-identical, opt-in.
     pub(crate) q4_0_gemv_routed_rows: CudaFunction,
+    /// Quants-first SoA twin of `q4_0_gemv_routed` for repacked expert arenas
+    /// (`CAMELID_GEMMA4_GHOST_ARENA_SOA=1`); bitwise-identical.
+    pub(crate) q4_0_gemv_routed_soa: CudaFunction,
     /// Prefill counterpart of `q4_0_gemv_routed`: one expert against its CSR token list.
     pub(crate) q4_0_gemm_routed: CudaFunction,
     /// 32-block low-shared A/B twin; never selected unless the strict opt-in is `1`.
     pub(crate) q4_0_gemm_routed_chunked: CudaFunction,
+    /// Quants-first SoA twin of `q4_0_gemm_routed`; bitwise-identical.
+    pub(crate) q4_0_gemm_routed_soa: CudaFunction,
+    /// Quants-first SoA twin of `q4_0_gemm_routed_chunked`; bitwise-identical.
+    pub(crate) q4_0_gemm_routed_chunked_soa: CudaFunction,
     pub(crate) q4_1_gemm_routed: CudaFunction,
     pub(crate) q4_1_gemm_routed_chunked: CudaFunction,
     pub(crate) q4_1_gemv_routed: CudaFunction,
@@ -8317,8 +8539,11 @@ impl CudaResidentKernels {
             scaled_axpy: f("scaled_axpy")?,
             q4_0_gemv_routed: f("q4_0_gemv_routed")?,
             q4_0_gemv_routed_rows: f("q4_0_gemv_routed_rows")?,
+            q4_0_gemv_routed_soa: f("q4_0_gemv_routed_soa")?,
             q4_0_gemm_routed: f("q4_0_gemm_routed")?,
             q4_0_gemm_routed_chunked: f("q4_0_gemm_routed_chunked")?,
+            q4_0_gemm_routed_soa: f("q4_0_gemm_routed_soa")?,
+            q4_0_gemm_routed_chunked_soa: f("q4_0_gemm_routed_chunked_soa")?,
             q4_1_gemm_routed: f("q4_1_gemm_routed")?,
             q4_1_gemm_routed_chunked: f("q4_1_gemm_routed_chunked")?,
             q4_1_gemv_routed: f("q4_1_gemv_routed")?,
@@ -8391,11 +8616,14 @@ impl CudaResidentKernels {
         })
     }
 
-    pub(crate) fn gemma4_mtp_q4_0_gemm_routed_kernel(&self) -> (&CudaFunction, bool) {
-        if self.gemma4_mtp_routed_q4_chunked {
-            (&self.q4_0_gemm_routed_chunked, true)
-        } else {
-            (&self.q4_0_gemm_routed, false)
+    /// `soa` selects the quants-first-arena twin of whichever routed Q4_0 GEMM
+    /// the chunked policy picked; every pairing is pinned bitwise-identical.
+    pub(crate) fn gemma4_mtp_q4_0_gemm_routed_kernel(&self, soa: bool) -> (&CudaFunction, bool) {
+        match (self.gemma4_mtp_routed_q4_chunked, soa) {
+            (true, true) => (&self.q4_0_gemm_routed_chunked_soa, true),
+            (true, false) => (&self.q4_0_gemm_routed_chunked, true),
+            (false, true) => (&self.q4_0_gemm_routed_soa, false),
+            (false, false) => (&self.q4_0_gemm_routed, false),
         }
     }
 
@@ -8475,16 +8703,63 @@ pub(crate) fn widen_q8(bytes: &[u8]) -> Vec<u8> {
 /// `q4_0_gemv_soa_matches_wire` for the test that pins it. Mirrors the same
 /// contract as `repack_q8_soa`, `swz_q4k_blocks` and `repack_q1_t128`.
 pub(crate) fn q4_0_wire_to_soa(bytes: &[u8]) -> Vec<u8> {
+    let mut out = vec![0u8; bytes.len()];
+    q4_0_wire_to_soa_into(bytes, &mut out);
+    out
+}
+
+/// Non-allocating core of [`q4_0_wire_to_soa`]: split one contiguous Q4_0 wire
+/// region into the quants-first SoA planes, writing into `out` (same length,
+/// disjoint from `wire`). Same pure byte permutation, same bit-exactness
+/// argument; this form exists so per-record staging paths (page-locked tier
+/// slots, the pinned transfer ring) can repack without a per-record `Vec`.
+pub(crate) fn q4_0_wire_to_soa_into(wire: &[u8], out: &mut [u8]) {
     const WIRE: usize = 18;
-    let n = bytes.len() / WIRE;
-    let mut out = vec![0u8; n * WIRE];
+    let n = wire.len() / WIRE;
+    debug_assert_eq!(
+        wire.len(),
+        n * WIRE,
+        "Q4_0 wire region must be whole blocks"
+    );
+    debug_assert_eq!(out.len(), wire.len(), "SoA repack must not change size");
     let (quants, scales) = out.split_at_mut(n * 16);
     for b in 0..n {
-        let blk = &bytes[b * WIRE..b * WIRE + WIRE];
+        let blk = &wire[b * WIRE..b * WIRE + WIRE];
         scales[b * 2..b * 2 + 2].copy_from_slice(&blk[0..2]);
         quants[b * 16..b * 16 + 16].copy_from_slice(&blk[2..WIRE]);
     }
-    out
+}
+
+/// Repack every Q4_0 projection region of one routed expert record IN PLACE
+/// into the quants-first SoA layout of [`q4_0_wire_to_soa`], region by region
+/// (`gate_up` first, then `down`, using the record layout's role-aware byte
+/// ranges). A region whose dtype is not Q4_0 (the Q4_1 down variant of some
+/// layers) is left byte-for-byte untouched, so its wire kernels keep reading
+/// exactly what they always read.
+///
+/// Pure byte permutation of each repacked region — every byte lands exactly
+/// once, nothing is synthesized — so the SoA consumers are bit-identical by the
+/// same four-step argument as the dense lane. `scratch` is caller-owned reusable
+/// space (grown to the largest region, ~2.2 MiB on the tracked geometry) so the
+/// staging threads do not allocate per record. Pinned by
+/// `q4_0_record_wire_to_soa_is_a_pure_permutation`.
+pub(crate) fn q4_0_record_wire_to_soa(
+    record: &mut [u8],
+    gate_up: std::ops::Range<usize>,
+    gate_up_is_q4_0: bool,
+    down: std::ops::Range<usize>,
+    down_is_q4_0: bool,
+    scratch: &mut Vec<u8>,
+) {
+    for (range, is_q4_0) in [(gate_up, gate_up_is_q4_0), (down, down_is_q4_0)] {
+        if !is_q4_0 {
+            continue;
+        }
+        let region = &mut record[range];
+        scratch.clear();
+        scratch.extend_from_slice(region);
+        q4_0_wire_to_soa_into(scratch, region);
+    }
 }
 
 pub(crate) fn repack_q8_soa(bytes: &[u8]) -> Vec<u8> {

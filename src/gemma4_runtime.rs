@@ -426,6 +426,23 @@ mod gemma4_mtp_io_pipeline_tests {
 }
 
 #[cfg(test)]
+mod gemma4_ghost_arena_soa_tests {
+    use super::gemma4_ghost_arena_soa_policy;
+
+    #[test]
+    fn arena_soa_gate_is_default_off_and_strictly_zero_or_one() {
+        assert_eq!(gemma4_ghost_arena_soa_policy(None), Ok(false));
+        assert_eq!(gemma4_ghost_arena_soa_policy(Some("0")), Ok(false));
+        assert_eq!(gemma4_ghost_arena_soa_policy(Some(" 1 ")), Ok(true));
+        for invalid in ["", "true", "on", "2", "01", "disabled"] {
+            let error = gemma4_ghost_arena_soa_policy(Some(invalid))
+                .expect_err("non-0/1 arena-SoA values must fail closed");
+            assert!(error.contains("must be exactly 0 or 1"), "{error}");
+        }
+    }
+}
+
+#[cfg(test)]
 mod gemma4_mtp_prefill_seed_tests {
     use super::{gemma4_mtp_prefill_seed_policy, ChunkLogits};
 
@@ -8126,6 +8143,11 @@ struct SserHostTier {
     hits: u64,
     misses: u64,
     bytes_read: u64,
+    /// `CAMELID_GEMMA4_GHOST_ARENA_SOA=1`: every record is repacked to the
+    /// quants-first SoA layout AT INSERT (storage read -> tier slot), so the
+    /// HtoD path DMAs the already-repacked bytes unchanged and the arenas hold
+    /// exactly what the SoA kernels read. Every tier fill site must honor this.
+    soa_repack: bool,
 }
 
 #[cfg(feature = "cuda")]
@@ -8552,6 +8574,50 @@ fn gemma4_mtp_resident_split_policy(value: Option<&str>) -> std::result::Result<
             "{GEMMA4_MTP_RESIDENT_SPLIT_ENV} must be exactly 0 or 1; got {other:?}"
         )),
     }
+}
+
+#[cfg(any(feature = "cuda", test))]
+const GEMMA4_GHOST_ARENA_SOA_ENV: &str = "CAMELID_GEMMA4_GHOST_ARENA_SOA";
+
+/// Strict parser for the routed-arena SoA repack gate, mirroring
+/// [`gemma4_mtp_io_pipeline_policy`]: a typo fails model load instead of
+/// silently selecting a lane the receipt did not request.
+#[cfg(any(feature = "cuda", test))]
+fn gemma4_ghost_arena_soa_policy(value: Option<&str>) -> std::result::Result<bool, String> {
+    match value.map(str::trim) {
+        None | Some("0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(other) => Err(format!(
+            "{GEMMA4_GHOST_ARENA_SOA_ENV} must be exactly 0 or 1; got {other:?}"
+        )),
+    }
+}
+
+/// Repack the Q4_0 projection regions of one staged expert record in place,
+/// wherever record bytes are STAGED for the arenas (page-locked tier slot or
+/// pinned transfer-ring slot), off the GPU critical path. Non-Q4_0 regions
+/// (the Q4_1 down variant) stay byte-identical wire. The scratch is
+/// thread-local because `ensure_resident_many` runs its reads on a rayon pool.
+#[cfg(feature = "cuda")]
+fn gemma4_arena_soa_repack_record(
+    record: &mut [u8],
+    layout: &crate::ghost::GhostMoeExpertRecordLayout,
+) {
+    thread_local! {
+        static SOA_SCRATCH: std::cell::RefCell<Vec<u8>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+    SOA_SCRATCH.with(|scratch| {
+        let mut scratch = scratch.borrow_mut();
+        crate::cuda_resident::q4_0_record_wire_to_soa(
+            record,
+            layout.gate_up.clone(),
+            layout.gate_up_dtype == GgufTensorType::Q4_0,
+            layout.down.clone(),
+            layout.down_dtype == GgufTensorType::Q4_0,
+            &mut scratch,
+        );
+    });
 }
 
 /// Plan ordered read groups and the host-tier prefix made ready by each group.
@@ -9119,6 +9185,7 @@ impl SserHostTier {
         ghost: &GhostFile,
         budget_bytes: usize,
         eviction_policy: SserHostTierEvictionPolicy,
+        soa_repack: bool,
     ) -> Result<Option<Self>> {
         if budget_bytes == 0 {
             return Ok(None);
@@ -9158,6 +9225,7 @@ impl SserHostTier {
                 hits: 0,
                 misses: 0,
                 bytes_read: 0,
+                soa_repack,
             }));
         }
         // Otherwise take what the host will give, in chunks, and keep it. Stopping
@@ -9211,6 +9279,7 @@ impl SserHostTier {
             hits: 0,
             misses: 0,
             bytes_read: 0,
+            soa_repack,
         }))
     }
 
@@ -9275,7 +9344,8 @@ impl SserHostTier {
         // Reads land in the page-locked tier slot without a caller-owned Vec. Windows'
         // NO_BUFFERING reader still copies once from its sector-aligned private scratch.
         let (chunk_idx, chunk_off) = self.slot_location(slot);
-        let expert_len = ghost.moe_expert_record_layout(layer, expert)?.byte_len;
+        let layout = ghost.moe_expert_record_layout(layer, expert)?;
+        let expert_len = layout.byte_len;
         let t_read = sser_profile_enabled().then(std::time::Instant::now);
         let read_result = ghost.read_moe_expert_into(
             layer,
@@ -9293,6 +9363,12 @@ impl SserHostTier {
         if let Err(error) = read_result {
             self.free_slots.push(slot);
             return Err(error);
+        }
+        if self.soa_repack {
+            gemma4_arena_soa_repack_record(
+                &mut self.chunks[chunk_idx].slice_mut(chunk_off, stride)[..expert_len],
+                &layout,
+            );
         }
         self.misses += 1;
         self.bytes_read = self.bytes_read.saturating_add(expert_len as u64);
@@ -9432,12 +9508,21 @@ impl SserHostTier {
             return Ok(resolved);
         }
 
+        let soa_repack = self.soa_repack;
         let read_one = |read: &PendingRead| {
             // SAFETY: see the reservation invariant above. `destination..destination+len`
             // is unique for this job and lies inside one live page-locked tier slot.
             let destination =
                 unsafe { std::slice::from_raw_parts_mut(read.destination as *mut u8, read.len) };
-            ghost.read_moe_expert_into(layer, read.expert, destination)
+            ghost.read_moe_expert_into(layer, read.expert, &mut destination[..])?;
+            if soa_repack {
+                // Repack on the read worker, before the record becomes visible
+                // to the DMA callback: each job owns its slot exclusively, and
+                // the repack scratch is thread-local.
+                let layout = ghost.moe_expert_record_layout(layer, read.expert)?;
+                gemma4_arena_soa_repack_record(destination, &layout);
+            }
+            Ok(())
         };
         let pending_ordinals = pending.iter().map(|read| read.ordinal).collect::<Vec<_>>();
         let batches = if on_ready.is_some() {
@@ -9565,8 +9650,8 @@ impl SserHostTier {
                 };
                 let stride = self.stride;
                 let (chunk_idx, chunk_off) = self.slot_location(slot);
-                let expert_len = match ghost.moe_expert_byte_len(layer, expert) {
-                    Ok(len) => len,
+                let layout = match ghost.moe_expert_record_layout(layer, expert) {
+                    Ok(layout) => layout,
                     Err(e) => {
                         self.free_slots.push(slot);
                         eprintln!(
@@ -9575,12 +9660,20 @@ impl SserHostTier {
                         break 'fill;
                     }
                 };
+                let expert_len = layout.byte_len;
                 match ghost.read_moe_expert_into(
                     layer,
                     expert,
                     &mut self.chunks[chunk_idx].slice_mut(chunk_off, stride)[..expert_len],
                 ) {
                     Ok(()) => {
+                        if self.soa_repack {
+                            gemma4_arena_soa_repack_record(
+                                &mut self.chunks[chunk_idx].slice_mut(chunk_off, stride)
+                                    [..expert_len],
+                                &layout,
+                            );
+                        }
                         self.entries.insert(
                             (layer as u16, expert as u16),
                             SserHostEntry { slot, last_used: 0 },
@@ -10640,6 +10733,12 @@ pub struct Gemma4CudaResident {
     /// Opt-in QD4 read/HtoD pipeline for K-wide expert unions. Parsed strictly
     /// once at load so a typo cannot vary behavior between verifier layers.
     mtp_io_pipeline: bool,
+    /// Opt-in quants-first SoA layout for the routed Q4_0 expert arenas
+    /// (`CAMELID_GEMMA4_GHOST_ARENA_SOA`). Records are repacked where they are
+    /// STAGED (host-tier insert / transfer-ring fill), the HtoD path is
+    /// unchanged, and both routed consumers (scalar GEMV, K-wide GEMM) switch
+    /// to the bitwise-identical SoA kernels. Parsed strictly once at load.
+    ghost_arena_soa: bool,
     /// Opt-in resident-first split of the K-wide routed GEMMs: enqueue the
     /// already-resident expert range's compute before the CPU blocks on the
     /// missing experts' storage reads, then run the missing range after its
@@ -10772,6 +10871,15 @@ impl Gemma4CudaResident {
         if mtp_device_draft_chain {
             eprintln!(
                 "[gemma4-mtp-cuda] device draft chain ON: assistant argmax feeds the next embedding via a Q6_K head-row gather"
+            );
+        }
+        let ghost_arena_soa = gemma4_ghost_arena_soa_policy(
+            std::env::var(GEMMA4_GHOST_ARENA_SOA_ENV).ok().as_deref(),
+        )
+        .map_err(BackendError::InvalidModelMetadata)?;
+        if ghost_arena_soa {
+            eprintln!(
+                "[gemma4-mtp-cuda] routed expert arena SoA ON: Q4_0 expert records repacked quants-first at staging; routed consumers use the SoA kernels"
             );
         }
         let ghost_moe = cpu.ghost_moe_cache.is_some();
@@ -11226,6 +11334,58 @@ impl Gemma4CudaResident {
                 )
             })
             .unwrap_or(true);
+        // Fail-closed eligibility for the routed-arena SoA repack. The invariant
+        // the gate promises is "every Q4_0 expert region in every arena is SoA,
+        // and every consumer of a Q4_0 region uses an SoA kernel"; any
+        // configuration with a consumer or fill path outside that invariant is a
+        // typed LOAD error, never a silent wire/SoA mix.
+        if ghost_arena_soa {
+            if !routed_batch_enabled {
+                return Err(BackendError::InvalidModelMetadata(format!(
+                    "{GEMMA4_GHOST_ARENA_SOA_ENV}=1 requires the batched routed expert path; the serial diagnostic lane (CAMELID_GEMMA4_CUDA_BATCHED_EXPERTS=0) reads the arenas as raw wire"
+                )));
+            }
+            if gemma4_cuda_routed_rows_per_warp() > 1 {
+                return Err(BackendError::InvalidModelMetadata(format!(
+                    "{GEMMA4_GHOST_ARENA_SOA_ENV}=1 has no SoA twin of q4_0_gemv_routed_rows; unset CAMELID_GEMMA4_CUDA_ROUTED_ROWS"
+                )));
+            }
+            let mut q4_0_regions = 0usize;
+            for (l, layer) in cpu.layers.iter().enumerate() {
+                let Some(moe) = layer.moe.as_ref() else {
+                    continue;
+                };
+                let gu_fmt = moe.gate_up_exps.format;
+                let down_fmt = moe.down_exps.format;
+                if gu_fmt != WireFormat::Q4_0
+                    || !matches!(down_fmt, WireFormat::Q4_0 | WireFormat::Q4_1)
+                {
+                    return Err(BackendError::InvalidModelMetadata(format!(
+                        "{GEMMA4_GHOST_ARENA_SOA_ENV}=1 supports Q4_0 gate/up with a Q4_0 or Q4_1 down projection; layer {l} has gate_up={gu_fmt:?} down={down_fmt:?}"
+                    )));
+                }
+                // The SoA kernels read the quant plane as aligned uint4, so every
+                // Q4_0 region's byte length (== its slot stride) must be a
+                // 16-byte multiple for every slot id.
+                let gu_bytes = 2 * moe.n_ff_exp * (hidden / 32 * 18);
+                let down_bytes = if down_fmt == WireFormat::Q4_0 {
+                    hidden * (moe.n_ff_exp / 32 * 18)
+                } else {
+                    hidden * (moe.n_ff_exp / 32 * 20)
+                };
+                if !gu_bytes.is_multiple_of(16) || !down_bytes.is_multiple_of(16) {
+                    return Err(BackendError::InvalidModelMetadata(format!(
+                        "{GEMMA4_GHOST_ARENA_SOA_ENV}=1 requires 16-byte-aligned expert slot strides; layer {l} has gate_up={gu_bytes} down={down_bytes} bytes"
+                    )));
+                }
+                q4_0_regions += 1 + usize::from(down_fmt == WireFormat::Q4_0);
+            }
+            if q4_0_regions == 0 {
+                return Err(BackendError::InvalidModelMetadata(format!(
+                    "{GEMMA4_GHOST_ARENA_SOA_ENV}=1 requires routed Q4_0 MoE expert records; this model has none"
+                )));
+            }
+        }
         let host_tier_eviction_policy =
             match std::env::var_os("CAMELID_GEMMA4_GHOST_HOST_TIER_EVICTION") {
                 None => parse_sser_host_tier_eviction_policy(None)?,
@@ -11250,6 +11410,7 @@ impl Gemma4CudaResident {
                     &ghost_cache.file,
                     host_tier_budget_bytes,
                     host_tier_eviction_policy,
+                    ghost_arena_soa,
                 ) {
                     Ok(tier) => tier,
                     Err(e) => {
@@ -11362,6 +11523,7 @@ impl Gemma4CudaResident {
             verify_scratch: None,
             mtp_kwide_last_completed: std::cell::Cell::new(false),
             mtp_io_pipeline,
+            ghost_arena_soa,
             mtp_resident_split,
             mtp_device_draft_chain,
             mtp_cuda_assistant: None,
@@ -12494,7 +12656,8 @@ impl Gemma4CudaResident {
         let hidden = self.hidden;
         {
             let cache = self.sser.as_ref().unwrap().borrow();
-            let (routed_kernel, chunked) = kernels.gemma4_mtp_q4_0_gemm_routed_kernel();
+            let (routed_kernel, chunked) =
+                kernels.gemma4_mtp_q4_0_gemm_routed_kernel(self.ghost_arena_soa);
             crate::cuda_resident::launch_q4_0_gemm_routed_range(
                 s,
                 routed_kernel,
@@ -12531,7 +12694,8 @@ impl Gemma4CudaResident {
             let cache = self.sser.as_ref().unwrap().borrow();
             match moe.down_exps.format {
                 WireFormat::Q4_0 => {
-                    let (routed_kernel, chunked) = kernels.gemma4_mtp_q4_0_gemm_routed_kernel();
+                    let (routed_kernel, chunked) =
+                        kernels.gemma4_mtp_q4_0_gemm_routed_kernel(self.ghost_arena_soa);
                     crate::cuda_resident::launch_q4_0_gemm_routed_range(
                         s,
                         routed_kernel,
@@ -13755,6 +13919,16 @@ impl Gemma4CudaResident {
                             );
                         }
                         read_result?;
+                        if self.ghost_arena_soa {
+                            // Same staging contract as the host tier: the ring
+                            // slot holds the repacked record BEFORE its ranges
+                            // become DMA sources, so the arenas always receive
+                            // the layout the SoA kernels read.
+                            gemma4_arena_soa_repack_record(
+                                transfer.record.slice_mut(0, layout.byte_len),
+                                &layout,
+                            );
+                        }
                         let record = transfer.record.slice(0, layout.byte_len);
                         pending[pending_index] = SserPinnedBatchCopy {
                             key: (l as u16, expert as u16),
@@ -13976,8 +14150,19 @@ impl Gemma4CudaResident {
                             })?;
                         let record = transfer.record.slice_mut(0, record_len);
                         let (gu_buf, down_buf) = record.split_at_mut(expected_gu);
-                        gu_buf.copy_from_slice(gu_host);
-                        down_buf.copy_from_slice(down_host);
+                        // Under the arena-SoA gate the ring stages the repacked
+                        // form directly (source and destination are disjoint, so
+                        // no scratch); non-Q4_0 regions stay byte-identical wire.
+                        if self.ghost_arena_soa && gu_fmt == WireFormat::Q4_0 {
+                            crate::cuda_resident::q4_0_wire_to_soa_into(gu_host, gu_buf);
+                        } else {
+                            gu_buf.copy_from_slice(gu_host);
+                        }
+                        if self.ghost_arena_soa && down_fmt == WireFormat::Q4_0 {
+                            crate::cuda_resident::q4_0_wire_to_soa_into(down_host, down_buf);
+                        } else {
+                            down_buf.copy_from_slice(down_host);
+                        }
                         self.expert_copy_stream
                             .memcpy_htod(
                                 gu_buf,
@@ -13991,9 +14176,28 @@ impl Gemma4CudaResident {
                             )
                             .map_err(cu)?;
                     } else {
+                        // Pageable direct path: every arena fill must produce the
+                        // gate's layout, so repack Q4_0 regions into a temporary
+                        // before the copy (this opt-out lane already pays a
+                        // pageable staging copy inside the driver).
+                        let gu_soa;
+                        let gu_src: &[u8] = if self.ghost_arena_soa && gu_fmt == WireFormat::Q4_0 {
+                            gu_soa = crate::cuda_resident::q4_0_wire_to_soa(gu_host);
+                            &gu_soa
+                        } else {
+                            gu_host
+                        };
+                        let down_soa;
+                        let down_src: &[u8] =
+                            if self.ghost_arena_soa && down_fmt == WireFormat::Q4_0 {
+                                down_soa = crate::cuda_resident::q4_0_wire_to_soa(down_host);
+                                &down_soa
+                            } else {
+                                down_host
+                            };
                         self.expert_copy_stream
                             .memcpy_htod(
-                                gu_host,
+                                gu_src,
                                 &mut cache
                                     .gate_up_arena
                                     .slice_mut(gu_start..gu_start + expected_gu),
@@ -14001,7 +14205,7 @@ impl Gemma4CudaResident {
                             .map_err(cu)?;
                         self.expert_copy_stream
                             .memcpy_htod(
-                                down_host,
+                                down_src,
                                 &mut cache
                                     .down_arena
                                     .slice_mut(down_start..down_start + expected_down),
@@ -14087,7 +14291,11 @@ impl Gemma4CudaResident {
                 let rows_i = rows as i32;
                 let blocks_i = blocks as i32;
                 let rows_per_warp_i = rows_per_warp as i32;
-                let mut builder = s.launch_builder(if rows_per_warp > 1 {
+                // The arena-SoA gate refused CAMELID_GEMMA4_CUDA_ROUTED_ROWS>1 at
+                // load, so the SoA arm here is always the scalar one-row shape.
+                let mut builder = s.launch_builder(if self.ghost_arena_soa {
+                    &k.q4_0_gemv_routed_soa
+                } else if rows_per_warp > 1 {
                     &k.q4_0_gemv_routed_rows
                 } else {
                     &k.q4_0_gemv_routed
