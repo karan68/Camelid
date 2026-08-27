@@ -6375,6 +6375,90 @@ fn q4_0_gemm_routed_matches_gemv() {
     }
 }
 
+/// The draft-chain gather must decode exactly the padded-Q6_K element map that
+/// `q6k_gemv` reads, from a device-resident token id. Pinned BITWISE against a
+/// CPU mirror of the kernel's own expression (`d * (sc*a) * scale`) over
+/// synthesized blocks that exercise every quadrant, both halves, and all scale
+/// groups, at the real head geometry (2816 = 11 super-blocks per row).
+#[test]
+#[ignore = "requires a CUDA device"]
+fn q6k_row_gather_scale_matches_cpu_decode() {
+    let Some(k) = kernels() else {
+        return;
+    };
+    let hidden = 2816usize;
+    let rows = 5usize;
+    let n_sb = hidden / 256;
+    let mut rng = Lcg(0x6e_77);
+    // Q6_K wire super-block: ql[128] qh[64] scales[16] d(f16) = 210 bytes.
+    let mut wire = vec![0u8; rows * n_sb * 210];
+    for chunk in wire.chunks_mut(210) {
+        for byte in chunk[..208].iter_mut() {
+            *byte = rng.next_u8();
+        }
+        // A modest positive normal f16 keeps every product finite and nonzero.
+        let d_bits = 0x2C00u16 | (u16::from(rng.next_u8()) & 0x03FF);
+        chunk[208] = (d_bits & 0xFF) as u8;
+        chunk[209] = (d_bits >> 8) as u8;
+    }
+    let padded = super::pad_q6k_blocks(&wire);
+    let d_head = k.stream.clone_htod(&padded).unwrap();
+    let scale = (hidden as f32).sqrt();
+    for token in [0u32, 2, 4] {
+        let d_token = k.stream.clone_htod(&[token]).unwrap();
+        let mut d_out = k.stream.alloc_zeros::<f32>(hidden).unwrap();
+        super::launch_q6k_row_gather_scale(
+            &k.stream,
+            &k.q6k_row_gather_scale,
+            &d_head,
+            &d_token,
+            0,
+            &mut d_out,
+            hidden,
+            scale,
+        )
+        .unwrap();
+        let mut got = vec![0f32; hidden];
+        k.stream.memcpy_dtoh(&d_out, &mut got).unwrap();
+        k.ctx.synchronize().unwrap();
+
+        let mut nonzero = 0usize;
+        for (i, &got_bits) in got.iter().enumerate() {
+            let sb = i >> 8;
+            let r = i & 255;
+            let block = &padded[(token as usize * n_sb + sb) * 224..][..224];
+            let h = r >> 7;
+            let rem = r & 127;
+            let q = rem >> 5;
+            let s = (rem >> 4) & 1;
+            let l = rem & 15;
+            let albyte = i32::from(block[h * 64 + if q & 1 == 1 { 32 } else { 0 } + s * 16 + l]);
+            let hbyte = i32::from(block[128 + h * 32 + s * 16 + l]);
+            let a = match q {
+                0 => ((albyte & 0xF) | ((hbyte & 3) << 4)) - 32,
+                1 => ((albyte & 0xF) | (((hbyte >> 2) & 3) << 4)) - 32,
+                2 => ((albyte >> 4) | (((hbyte >> 4) & 3) << 4)) - 32,
+                _ => ((albyte >> 4) | (((hbyte >> 6) & 3) << 4)) - 32,
+            };
+            let sc = i32::from(block[192 + 8 * h + s + 2 * q] as i8);
+            let d = crate::inference::f16_bits_to_f32(u16::from_le_bytes([block[208], block[209]]));
+            let expect = d * ((sc * a) as f32) * scale;
+            assert_eq!(
+                got_bits.to_bits(),
+                expect.to_bits(),
+                "element {i} of row {token}: got {got_bits} expected {expect}"
+            );
+            if expect != 0.0 {
+                nonzero += 1;
+            }
+        }
+        assert!(
+            nonzero > hidden / 2,
+            "degenerate fixture: row {token} decoded mostly to zeros"
+        );
+    }
+}
+
 /// `q4_0_gemv_routed_rows` must be BITWISE identical to `q4_0_gemv_routed`.
 ///
 /// Step 08 moves the tail fold from one lane to R lanes, but each row is still

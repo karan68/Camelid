@@ -234,8 +234,9 @@ mod gemma4_mtp_kwide_planner_tests {
 #[cfg(test)]
 mod gemma4_mtp_resident_split_tests {
     use super::{
-        gemma4_mtp_resident_split_policy, gemma4_plan_route_union,
-        gemma4_reorder_union_residents_first, Gemma4RouteUnionPlan, GEMMA4_MTP_ROUTE_COUNT,
+        gemma4_mtp_device_draft_chain_policy, gemma4_mtp_resident_split_policy,
+        gemma4_plan_route_union, gemma4_reorder_union_residents_first, Gemma4RouteUnionPlan,
+        GEMMA4_MTP_ROUTE_COUNT,
     };
 
     #[test]
@@ -246,6 +247,18 @@ mod gemma4_mtp_resident_split_tests {
         for invalid in ["", "true", "on", "2", "01", "disabled"] {
             let error = gemma4_mtp_resident_split_policy(Some(invalid))
                 .expect_err("non-0/1 split values must fail closed");
+            assert!(error.contains("must be exactly 0 or 1"), "{error}");
+        }
+    }
+
+    #[test]
+    fn device_draft_chain_gate_is_default_off_and_strictly_zero_or_one() {
+        assert_eq!(gemma4_mtp_device_draft_chain_policy(None), Ok(false));
+        assert_eq!(gemma4_mtp_device_draft_chain_policy(Some("0")), Ok(false));
+        assert_eq!(gemma4_mtp_device_draft_chain_policy(Some(" 1 ")), Ok(true));
+        for invalid in ["", "true", "on", "2", "01", "disabled"] {
+            let error = gemma4_mtp_device_draft_chain_policy(Some(invalid))
+                .expect_err("non-0/1 draft-chain values must fail closed");
             assert!(error.contains("must be exactly 0 or 1"), "{error}");
         }
     }
@@ -8237,8 +8250,16 @@ struct Gemma4MtpCudaScratchDev {
     logits: cudarc::driver::CudaSlice<f32>,
     cos: cudarc::driver::CudaSlice<f32>,
     sin: cudarc::driver::CudaSlice<f32>,
+    /// Full-attention rope tables get their own buffers so BOTH variants can be
+    /// uploaded once per draft round (position is fixed across a round) instead
+    /// of re-uploaded per layer per proposal; `cos`/`sin` hold the sliding pair.
+    cos_full: cudarc::driver::CudaSlice<f32>,
+    sin_full: cudarc::driver::CudaSlice<f32>,
     position: cudarc::driver::CudaSlice<i32>,
     argmax: cudarc::driver::CudaSlice<u32>,
+    /// One argmax per proposal, drained in a single round-end DtoH by the
+    /// device draft chain.
+    draft_ring: cudarc::driver::CudaSlice<u32>,
     scores: cudarc::driver::CudaSlice<f32>,
 }
 
@@ -8501,6 +8522,23 @@ const GEMMA4_MTP_RESIDENT_SPLIT_ENV: &str = "CAMELID_GEMMA4_MTP_RESIDENT_SPLIT";
 /// slots (`-1` = not resident) and the missing entries as `(union_index, expert)`.
 #[cfg(feature = "cuda")]
 type Gemma4KwideTouchedUnion = (Vec<i32>, Vec<(usize, usize)>);
+
+#[cfg(any(feature = "cuda", test))]
+const GEMMA4_MTP_DEVICE_DRAFT_CHAIN_ENV: &str = "CAMELID_GEMMA4_MTP_DEVICE_DRAFT_CHAIN";
+
+/// Strict parser for the on-device draft chain (argmax feeds the next proposal's
+/// embedding through a device gather, drafts drain in one round-end DtoH).
+/// Mirrors the other K-wide gates: a typo fails model load.
+#[cfg(any(feature = "cuda", test))]
+fn gemma4_mtp_device_draft_chain_policy(value: Option<&str>) -> std::result::Result<bool, String> {
+    match value.map(str::trim) {
+        None | Some("0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(other) => Err(format!(
+            "{GEMMA4_MTP_DEVICE_DRAFT_CHAIN_ENV} must be exactly 0 or 1; got {other:?}"
+        )),
+    }
+}
 
 /// Strict parser for the resident-first verifier split, mirroring
 /// [`gemma4_mtp_io_pipeline_policy`]: a typo fails model load instead of
@@ -10608,6 +10646,12 @@ pub struct Gemma4CudaResident {
     /// copies land. Bit-identical by construction (each expert's fold happens
     /// whole in exactly one launch; the weighted sum consumes router order).
     mtp_resident_split: bool,
+    /// Opt-in on-device assistant draft chain: the argmax feeds the next
+    /// proposal's embedding through a Q6_K head-row gather on the GPU, and the
+    /// drafts drain in ONE round-end DtoH+sync instead of one per proposal.
+    /// Drafter-only numerics (moves acceptance, never emitted tokens); engages
+    /// only when the tied head is device-resident in the padded Q6_K lane.
+    mtp_device_draft_chain: bool,
     /// Default-off 236 MiB full-Q4 assistant plus its persistent activation
     /// scratch. Loaded only after the exact tracked geometry is admitted.
     mtp_cuda_assistant: Option<Gemma4MtpCudaResident>,
@@ -10717,6 +10761,17 @@ impl Gemma4CudaResident {
         if mtp_resident_split {
             eprintln!(
                 "[gemma4-mtp-cuda] K-wide resident-first split ON: resident expert GEMMs overlap missing-union storage reads"
+            );
+        }
+        let mtp_device_draft_chain = gemma4_mtp_device_draft_chain_policy(
+            std::env::var(GEMMA4_MTP_DEVICE_DRAFT_CHAIN_ENV)
+                .ok()
+                .as_deref(),
+        )
+        .map_err(BackendError::InvalidModelMetadata)?;
+        if mtp_device_draft_chain {
+            eprintln!(
+                "[gemma4-mtp-cuda] device draft chain ON: assistant argmax feeds the next embedding via a Q6_K head-row gather"
             );
         }
         let ghost_moe = cpu.ghost_moe_cache.is_some();
@@ -11308,6 +11363,7 @@ impl Gemma4CudaResident {
             mtp_kwide_last_completed: std::cell::Cell::new(false),
             mtp_io_pipeline,
             mtp_resident_split,
+            mtp_device_draft_chain,
             mtp_cuda_assistant: None,
             norms,
             lweights,
@@ -11667,8 +11723,11 @@ impl Gemma4CudaResident {
             logits: alloc_f(self.vocab)?,
             cos: alloc_f(mtp::FULL_HEAD_DIM / 2)?,
             sin: alloc_f(mtp::FULL_HEAD_DIM / 2)?,
+            cos_full: alloc_f(mtp::FULL_HEAD_DIM / 2)?,
+            sin_full: alloc_f(mtp::FULL_HEAD_DIM / 2)?,
             position: stream.alloc_zeros::<i32>(1).map_err(cu)?,
             argmax: stream.alloc_zeros::<u32>(1).map_err(cu)?,
+            draft_ring: stream.alloc_zeros::<u32>(MAX_MTP_VERIFY_ROWS).map_err(cu)?,
             scores: alloc_f(mtp::NUM_ATTENTION_HEADS * self.max_positions)?,
         };
         let bytes = weights.accounting().total_bytes;
@@ -16556,16 +16615,59 @@ impl Gemma4CudaResident {
             mtp::FULL_ROPE_THETA,
             Some(mtp::FULL_PARTIAL_ROTARY_FACTOR),
         );
+        // Position is fixed for the whole round (the assistant is KV-shared and
+        // appends nothing), so both rope variants upload exactly once per round.
+        stream
+            .memcpy_htod(
+                &sliding_rope.0,
+                &mut scratch.cos.slice_mut(0..mtp::SLIDING_HEAD_DIM / 2),
+            )
+            .map_err(cu)?;
+        stream
+            .memcpy_htod(
+                &sliding_rope.1,
+                &mut scratch.sin.slice_mut(0..mtp::SLIDING_HEAD_DIM / 2),
+            )
+            .map_err(cu)?;
+        stream
+            .memcpy_htod(
+                &full_rope.0,
+                &mut scratch.cos_full.slice_mut(0..mtp::FULL_HEAD_DIM / 2),
+            )
+            .map_err(cu)?;
+        stream
+            .memcpy_htod(
+                &full_rope.1,
+                &mut scratch.sin_full.slice_mut(0..mtp::FULL_HEAD_DIM / 2),
+            )
+            .map_err(cu)?;
+
+        // The device draft chain needs the target's tied head resident in the
+        // padded Q6_K lane the gather kernel decodes; any other lane falls back
+        // to the per-proposal host round-trip.
+        let device_head = if self.mtp_device_draft_chain {
+            self.gpu_head
+                .as_ref()
+                .filter(|head| matches!(head.lane, HeadLane::Q6K))
+        } else {
+            None
+        };
+        let embed_scale = (self.hidden as f32).sqrt();
 
         let mut drafts = Vec::with_capacity(k);
         for proposal in 0..k {
             if proposal != 0 {
-                stream
-                    .memcpy_htod(
-                        &embedding,
-                        &mut scratch.joined.slice_mut(0..mtp::BACKBONE_HIDDEN),
-                    )
-                    .map_err(cu)?;
+                // Under the device chain the gather at the end of the previous
+                // iteration already wrote joined[0..hidden] on-stream; only the
+                // recurrent half moves here.
+                if device_head.is_none() {
+                    stream
+                        .memcpy_htod(
+                            &embedding,
+                            &mut scratch.joined.slice_mut(0..mtp::BACKBONE_HIDDEN),
+                        )
+                        .map_err(cu)?;
+                }
                 let recurrent = scratch.recurrent.slice(0..mtp::BACKBONE_HIDDEN);
                 let mut hidden_slot = scratch
                     .joined
@@ -16598,18 +16700,10 @@ impl Gemma4CudaResident {
                     post_feedforward_norm,
                 ) = gemma4_mtp_cuda_layer_ids(layer);
                 let sliding = layer < mtp::SLIDING_LAYERS;
-                let (head_dim, host_layer, rope) = if sliding {
-                    (
-                        mtp::SLIDING_HEAD_DIM,
-                        mtp::SHARED_KV_SLIDING_HOST_LAYER,
-                        &sliding_rope,
-                    )
+                let (head_dim, host_layer) = if sliding {
+                    (mtp::SLIDING_HEAD_DIM, mtp::SHARED_KV_SLIDING_HOST_LAYER)
                 } else {
-                    (
-                        mtp::FULL_HEAD_DIM,
-                        mtp::SHARED_KV_FULL_HOST_LAYER,
-                        &full_rope,
-                    )
+                    (mtp::FULL_HEAD_DIM, mtp::SHARED_KV_FULL_HOST_LAYER)
                 };
                 gemma4_mtp_cuda_launch_rmsnorm(
                     &stream,
@@ -16639,18 +16733,20 @@ impl Gemma4CudaResident {
                     mtp::RMS_NORM_EPS,
                 )
                 .map_err(cu)?;
-                stream
-                    .memcpy_htod(&rope.0, &mut scratch.cos.slice_mut(0..head_dim / 2))
-                    .map_err(cu)?;
-                stream
-                    .memcpy_htod(&rope.1, &mut scratch.sin.slice_mut(0..head_dim / 2))
-                    .map_err(cu)?;
                 crate::cuda_resident::launch_rope(
                     &stream,
                     &kernels.rope,
                     &mut scratch.q,
-                    &scratch.cos,
-                    &scratch.sin,
+                    if sliding {
+                        &scratch.cos
+                    } else {
+                        &scratch.cos_full
+                    },
+                    if sliding {
+                        &scratch.sin
+                    } else {
+                        &scratch.sin_full
+                    },
                     mtp::NUM_ATTENTION_HEADS,
                     head_dim,
                     head_dim,
@@ -16823,19 +16919,60 @@ impl Gemma4CudaResident {
                 &mut scratch.argmax,
             )
             .map_err(cu)?;
-            let mut token = [0u32; 1];
+            if let Some(head) = device_head {
+                let argmax_src = scratch.argmax.slice(0..1);
+                let mut ring_slot = scratch.draft_ring.slice_mut(proposal..proposal + 1);
+                stream
+                    .memcpy_dtod(&argmax_src, &mut ring_slot)
+                    .map_err(cu)?;
+                if proposal + 1 < k {
+                    // Write the next proposal's scaled embedding into
+                    // joined[0..hidden] entirely on-device: no DtoH, no host
+                    // synchronization, no CPU dequantize on the chain.
+                    crate::cuda_resident::launch_q6k_row_gather_scale(
+                        &stream,
+                        &kernels.q6k_row_gather_scale,
+                        &head.weight,
+                        &scratch.argmax,
+                        0,
+                        &mut scratch.joined,
+                        self.hidden,
+                        embed_scale,
+                    )
+                    .map_err(cu)?;
+                }
+            } else {
+                let mut token = [0u32; 1];
+                stream
+                    .memcpy_dtoh(&scratch.argmax, &mut token)
+                    .map_err(cu)?;
+                stream.synchronize().map_err(cu)?;
+                if token[0] as usize >= self.vocab {
+                    return Err(BackendError::RuntimeShapeMismatch(format!(
+                        "CUDA assistant argmax {} exceeds target vocab {}",
+                        token[0], self.vocab
+                    )));
+                }
+                drafts.push(token[0]);
+                embedding = self.mtp_scaled_embedding(token[0])?;
+            }
+        }
+        if device_head.is_some() {
+            // One round-end drain replaces the k per-proposal syncs.
+            let mut tokens = vec![0u32; MAX_MTP_VERIFY_ROWS];
             stream
-                .memcpy_dtoh(&scratch.argmax, &mut token)
+                .memcpy_dtoh(&scratch.draft_ring, &mut tokens)
                 .map_err(cu)?;
             stream.synchronize().map_err(cu)?;
-            if token[0] as usize >= self.vocab {
-                return Err(BackendError::RuntimeShapeMismatch(format!(
-                    "CUDA assistant argmax {} exceeds target vocab {}",
-                    token[0], self.vocab
-                )));
+            for &token in &tokens[..k] {
+                if token as usize >= self.vocab {
+                    return Err(BackendError::RuntimeShapeMismatch(format!(
+                        "CUDA assistant argmax {} exceeds target vocab {}",
+                        token, self.vocab
+                    )));
+                }
+                drafts.push(token);
             }
-            drafts.push(token[0]);
-            embedding = self.mtp_scaled_embedding(token[0])?;
         }
         Ok(drafts)
     }

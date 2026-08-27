@@ -3485,6 +3485,43 @@ extern "C" __global__ void q5k_gemv(
 // where a[256] are the rebuilt signed-6-bit weights (recombination order from
 // q6_k_wire_block_dequant). Lane l (0..8) owns its own aux32 lane; lane 0 then
 // replays sums[l] += (d_w * d_act) * aux32[l] per superblock, in order.
+// Draft-chain helper: dequantize ONE row of the 224-byte PADDED Q6_K tied head
+// (the exact layout q6k_gemv reads below — its unit (h, s, l) element map is
+// mirrored here per element) for the token id sitting in a device buffer, and
+// write it scaled by `scale` (the embedding's sqrt(hidden)). This keeps the
+// assistant's argmax -> next-embedding dependency on-device, so a draft round
+// pays one host synchronization instead of one per proposal. Drafter-only
+// numerics: accuracy moves acceptance, never emitted tokens.
+extern "C" __global__ void q6k_row_gather_scale(
+    const unsigned char* __restrict__ head_bytes, // 224-byte PADDED Q6_K blocks
+    const unsigned int* __restrict__ token,       // device token id buffer
+    int slot,                                     // index into `token`
+    float* __restrict__ out, int hidden, float scale
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= hidden) return;
+    long row = (long)token[slot];
+    int n_sb = hidden >> 8;
+    int sb = i >> 8;
+    int r = i & 255;
+    const unsigned char* block = head_bytes + (row * n_sb + sb) * 224L;
+    int h = r >> 7;         // 128-element half
+    int rem = r & 127;
+    int q = rem >> 5;       // quadrant: weight offset {+0,+32,+64,+96}
+    int s = (rem >> 4) & 1; // 16-element scale sub-group
+    int l = rem & 15;
+    unsigned char albyte = block[h * 64 + ((q & 1) ? 32 : 0) + s * 16 + l];
+    unsigned char hbyte = block[128 + h * 32 + s * 16 + l];
+    int a;
+    if (q == 0)      a = ((albyte & 0xF) | ((hbyte & 3) << 4)) - 32;
+    else if (q == 1) a = ((albyte & 0xF) | (((hbyte >> 2) & 3) << 4)) - 32;
+    else if (q == 2) a = ((albyte >> 4) | (((hbyte >> 4) & 3) << 4)) - 32;
+    else             a = ((albyte >> 4) | (((hbyte >> 6) & 3) << 4)) - 32;
+    int sc = (int)((signed char)block[192 + 8 * h + s + 2 * q]);
+    float d = f16_bits_to_f32((unsigned short)(block[208] | (block[209] << 8)));
+    out[i] = d * (float)(sc * a) * scale;
+}
+
 extern "C" __global__ void q6k_gemv(
     const float* __restrict__ input_scales,         // n_sb f32 (Q8_K d per superblock)
     const signed char* __restrict__ input_quants,   // n_sb*256 i8 (Q8_K quants)
@@ -7966,6 +8003,7 @@ pub struct CudaResidentKernels {
     pub(crate) q4k_gemv: CudaFunction,
     pub(crate) q5k_gemv: CudaFunction,
     pub(crate) q6k_gemv: CudaFunction,
+    pub(crate) q6k_row_gather_scale: CudaFunction,
     pub(crate) q2k_gemv: CudaFunction,
     pub(crate) q3k_gemv: CudaFunction,
     pub(crate) iq4xs_gemv: CudaFunction,
@@ -8254,6 +8292,7 @@ impl CudaResidentKernels {
             q4k_gemv: f("q4k_gemv")?,
             q5k_gemv: f("q5k_gemv")?,
             q6k_gemv: f("q6k_gemv")?,
+            q6k_row_gather_scale: f("q6k_row_gather_scale")?,
             q2k_gemv: f("q2k_gemv")?,
             iq4xs_gemv: f("iq4xs_gemv")?,
             q3k_gemv: f("q3k_gemv")?,
@@ -10912,6 +10951,39 @@ pub(crate) fn launch_q4_0_gemm_routed_range(
         chunked,
         out,
     )
+}
+
+/// Launch the draft-chain embedding gather: dequantize one PADDED-Q6_K head row
+/// (selected by the device-resident token id at `token[slot]`) into
+/// `out[0..hidden]`, scaled by the embedding's sqrt(hidden). The row id never
+/// crosses PCIe, which is the point: the assistant's argmax feeds its next
+/// proposal without a host round-trip.
+#[allow(dead_code, clippy::too_many_arguments)]
+pub(crate) fn launch_q6k_row_gather_scale(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    head_bytes: &CudaSlice<u8>,
+    token: &CudaSlice<u32>,
+    slot: usize,
+    out: &mut CudaSlice<f32>,
+    hidden: usize,
+    scale: f32,
+) -> Result<(), cudarc::driver::DriverError> {
+    use cudarc::driver::{LaunchConfig, PushKernelArg};
+    let cfg = LaunchConfig {
+        grid_dim: ((hidden as u32).div_ceil(256), 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let (slot_i, hidden_i) = (slot as i32, hidden as i32);
+    let mut b = s.launch_builder(f);
+    b.arg(head_bytes)
+        .arg(token)
+        .arg(&slot_i)
+        .arg(out)
+        .arg(&hidden_i)
+        .arg(&scale);
+    unsafe { b.launch(cfg) }.map(|_| ())
 }
 
 /// Q4_1 twin of [`launch_q4_0_gemm_routed_range`].
