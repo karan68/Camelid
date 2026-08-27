@@ -2348,7 +2348,11 @@ enum Command {
         /// Maximum draft tokens proposed per verify round. The default-off
         /// `CAMELID_GEMMA4_MTP_WIDTH_SCHEDULE` instead names verifier widths
         /// (current target row plus drafts), each bounded by this value plus one.
-        #[arg(long, default_value_t = 8)]
+        /// Default 7: on the frozen H40 fixture K=7 accepted every draft
+        /// (alpha 7.00) and beat both K=6 and K=8 paired
+        /// (BASELINE-2026-08-24 §16); K=8's extra row hit the known
+        /// content-boundary miss and paid union bytes for nothing.
+        #[arg(long, default_value_t = 7)]
         mtp_draft_k: usize,
         /// OpenAI-shaped chat request to run instead of `--prompt`, templated through the
         /// SAME renderer `/v1/chat/completions` uses. This is how an offline throughput
@@ -4595,6 +4599,30 @@ async fn main() -> anyhow::Result<()> {
                 .as_deref()
                 .map(gemma4_harness_expected)
                 .transpose()?;
+            // The MTP lane's receipted profile becomes the default the moment the
+            // lane is selected — BEFORE the model load, where every gate resolves.
+            // An explicitly set variable always wins, so receipted arms reproduce
+            // byte-for-byte, and the plain lane (no --mtp-assistant) is untouched.
+            if mtp_assistant.is_some() {
+                let applied =
+                    camelid::gemma4_runtime::gemma4_mtp_profile_defaults_to_apply(|key| {
+                        std::env::var_os(key).is_some()
+                    });
+                if !applied.is_empty() {
+                    for (key, value) in &applied {
+                        std::env::set_var(key, value);
+                    }
+                    eprintln!(
+                        "[gemma4-mtp] promoted profile: {} default(s) applied ({})",
+                        applied.len(),
+                        applied
+                            .iter()
+                            .map(|(key, value)| format!("{key}={value}"))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    );
+                }
+            }
             eprintln!("[gemma4-cuda] loading resident {}...", path.display());
             let t0 = std::time::Instant::now();
             let mut runtime = match cghost.as_deref() {
