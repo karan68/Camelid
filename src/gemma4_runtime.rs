@@ -252,6 +252,49 @@ mod gemma4_mtp_resident_split_tests {
     }
 
     #[test]
+    fn promoted_profile_respects_user_overrides_and_excludes_refuted_gates() {
+        use super::{gemma4_mtp_profile_defaults_to_apply, GEMMA4_MTP_PROMOTED_PROFILE};
+        // Nothing set: the whole profile applies.
+        let all = gemma4_mtp_profile_defaults_to_apply(|_| false);
+        assert_eq!(all.len(), GEMMA4_MTP_PROMOTED_PROFILE.len());
+        // A user-set variable is never overridden.
+        let filtered =
+            gemma4_mtp_profile_defaults_to_apply(|key| key == "CAMELID_GEMMA4_MTP_KWIDE");
+        assert!(filtered
+            .iter()
+            .all(|(key, _)| *key != "CAMELID_GEMMA4_MTP_KWIDE"));
+        assert_eq!(filtered.len(), GEMMA4_MTP_PROMOTED_PROFILE.len() - 1);
+        // Fixture caps and measured-null/regression gates must never ride in.
+        for refuted in [
+            "CAMELID_GEMMA4_GHOST_CUDA_CONTEXT",
+            "CAMELID_GEMMA4_MTP_DEVICE_DRAFT_CHAIN",
+            "CAMELID_GEMMA4_GHOST_ARENA_SOA",
+        ] {
+            assert!(
+                GEMMA4_MTP_PROMOTED_PROFILE
+                    .iter()
+                    .all(|(key, _)| *key != refuted),
+                "{refuted} must not be in the promoted profile"
+            );
+        }
+        // Every strict-parsed member must parse under its own gate.
+        let value_of = |key: &str| {
+            GEMMA4_MTP_PROMOTED_PROFILE
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| *v)
+        };
+        assert_eq!(
+            super::gemma4_mtp_io_pipeline_policy(value_of("CAMELID_GEMMA4_MTP_IO_PIPELINE")),
+            Ok(true)
+        );
+        assert_eq!(
+            super::gemma4_mtp_resident_split_policy(value_of("CAMELID_GEMMA4_MTP_RESIDENT_SPLIT")),
+            Ok(true)
+        );
+    }
+
+    #[test]
     fn device_draft_chain_gate_is_default_off_and_strictly_zero_or_one() {
         assert_eq!(gemma4_mtp_device_draft_chain_policy(None), Ok(false));
         assert_eq!(gemma4_mtp_device_draft_chain_policy(Some("0")), Ok(false));
@@ -8544,6 +8587,52 @@ const GEMMA4_MTP_RESIDENT_SPLIT_ENV: &str = "CAMELID_GEMMA4_MTP_RESIDENT_SPLIT";
 /// slots (`-1` = not resident) and the missing entries as `(union_index, expert)`.
 #[cfg(feature = "cuda")]
 type Gemma4KwideTouchedUnion = (Vec<i32>, Vec<(usize, usize)>);
+
+/// The receipted Windows MTP profile: the environment the composed K-wide arm
+/// measured 25.7–26.3 whole-decode tok/s with on the 16 GiB reference box
+/// (BASELINE-2026-08-24 §16–17, arm `…-io-lfu-q6-anchor-rsplit`). The CLI
+/// applies these as DEFAULTS when `--mtp-assistant` selects the MTP lane, for
+/// every variable the user has not set — an explicit value always wins, so any
+/// receipted arm reproduces byte-for-byte. The plain lane never sees this:
+/// several members (QD4 batch reads, the read pools) measured NEGATIVE or null
+/// for scalar decode, which is exactly why these are a lane profile and not
+/// global default flips.
+///
+/// Deliberately absent: `CAMELID_GEMMA4_GHOST_CUDA_CONTEXT` (a benchmark
+/// fixture cap, not a serving default), `CAMELID_GEMMA4_MTP_DEVICE_DRAFT_CHAIN`
+/// (measured null), and `CAMELID_GEMMA4_GHOST_ARENA_SOA` (measured regression).
+#[cfg(any(feature = "cuda", test))]
+pub const GEMMA4_MTP_PROMOTED_PROFILE: &[(&str, &str)] = &[
+    ("CAMELID_GEMMA4_CUDA_BATCH_EXPERT_COPIES", "1"),
+    ("CAMELID_GEMMA4_PREFILL_CHUNK_TOKENS", "512"),
+    ("CAMELID_GEMMA4_Q4_0_SOA", "1"),
+    ("CAMELID_GEMMA4_SPECULATIVE", "0"),
+    ("CAMELID_GEMMA4_GHOST_BATCH_READS", "1"),
+    ("CAMELID_GEMMA4_GHOST_READ_THREADS", "4"),
+    ("CAMELID_GEMMA4_GHOST_UNCACHED_READERS", "4"),
+    ("CAMELID_GEMMA4_MTP_KWIDE", "1"),
+    ("CAMELID_GEMMA4_MTP_PREFILL_SEED_BOOTSTRAP", "1"),
+    ("CAMELID_GEMMA4_MTP_CUDA_ASSISTANT", "1"),
+    ("CAMELID_GEMMA4_GHOST_HOST_TIER_EVICTION", "mru"),
+    ("CAMELID_GEMMA4_MTP_IO_PIPELINE", "1"),
+    ("CAMELID_GEMMA4_GHOST_CUDA_EVICTION", "lfu"),
+    ("CAMELID_GEMMA4_MTP_DENSE_Q6_ANCHOR_DP4A", "1"),
+    ("CAMELID_GEMMA4_MTP_RESIDENT_SPLIT", "1"),
+];
+
+/// The subset of [`GEMMA4_MTP_PROMOTED_PROFILE`] to actually apply, given which
+/// variables are already set. Pure so the override contract is unit-testable
+/// without touching the process environment.
+#[cfg(any(feature = "cuda", test))]
+pub fn gemma4_mtp_profile_defaults_to_apply(
+    is_set: impl Fn(&str) -> bool,
+) -> Vec<(&'static str, &'static str)> {
+    GEMMA4_MTP_PROMOTED_PROFILE
+        .iter()
+        .copied()
+        .filter(|(key, _)| !is_set(key))
+        .collect()
+}
 
 #[cfg(any(feature = "cuda", test))]
 const GEMMA4_MTP_DEVICE_DRAFT_CHAIN_ENV: &str = "CAMELID_GEMMA4_MTP_DEVICE_DRAFT_CHAIN";

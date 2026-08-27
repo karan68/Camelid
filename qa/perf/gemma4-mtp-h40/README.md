@@ -70,6 +70,7 @@ its control; pair bounded-context arms against the matching plain/MTP control.
 | `mtp-k7-kv192-kwide-qd4-seeded-cuda-assistant-host-mru-io-lfu-q6-anchor-rsplit` | **Current best on the 16 GiB Windows host (25.7–26.3 decode tok/s at ~8 GiB available)**: the composed K=7 arm plus the resident-first verifier split (§16). |
 | `mtp-k7-…-rsplit-dchain` | Plus the on-device assistant draft chain. Exact; measured NULL paired ×3 (§17) — the removed per-proposal syncs were waiting on kernels that had to finish anyway. |
 | `mtp-k7-…-rsplit-soa` | Plus the routed-arena SoA repack. Exact; measured REGRESSION paired ×3 (§17) — the CPU staging repack costs more than the kernel term it improves. Standing control for a device-side repack variant. |
+| `mtp-k7-kv192-profile` | The promotion gate: `--mtp-assistant` with no stack env at all. The CLI's promoted profile (§18) must match the full-env rsplit arm within noise — and does, paired ×3, ids exact. |
 
 ## What a run produces
 
