@@ -158,9 +158,10 @@ phase gate.
   (single gate-checked send path); per-message telemetry footer (client-measured,
   labeled); conversation export (Markdown/JSON, path-free by whitelist);
   persisted **Web Auto / Off** control that reads explicit links or searches
-  current-information prompts before generation, injects bounded untrusted
-  evidence without requiring model tool calls, and retains a hardened source
-  list on the reply;
+  current-information prompts before generation (including linked-source plus
+  supplemental-search requests), injects query-ranked/path-labelled bounded
+  untrusted evidence without requiring model tool calls, and retains only the
+  sources that reached the model on the reply;
   Generation-controls drawer (system prompt + presets; sampling parameters stay
   guarded until `/api/capabilities` advertises the exact row).
 - **Models** — Evidence Chips on every local GGUF card (unmatched models show a

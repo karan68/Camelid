@@ -14,6 +14,8 @@ import { executionRuntimeFields } from '../lib/executionPlan'
 import { createPacerState, paceDrain, paceStep } from '../lib/streamPacing'
 import {
   classifyWebResearchNeed,
+  deriveWebResearchPromptBudget,
+  effectiveGenerationTokenLimit,
   fitWebResearchContext,
   persistWebResearchEnabled,
   readWebResearchEnabled,
@@ -24,7 +26,6 @@ import {
   applyBitNetFreshChatTokenCap,
   applyGemma4ChatTokenFloor,
   applyGemma4GhostChatTokenCap,
-  GEMMA4_GHOST_WEBUI_CONTEXT_TOKENS,
   getConfiguredMaxTokens as getModelMaxTokens,
   hasExplicitMaxTokensSetting,
   isBitNetB158ChatModel,
@@ -138,10 +139,23 @@ function estimateTokenCount(value) {
   return Math.max(1, Math.round(Math.max(wordPieces.length, text.length / 4)))
 }
 
+function estimateMessageContentTokens(content) {
+  if (typeof content === 'string') return estimateTokenCount(content)
+  if (!Array.isArray(content)) return estimateTokenCount(JSON.stringify(content ?? ''))
+  return content.reduce((total, part) => {
+    if (part?.type === 'text') return total + estimateTokenCount(part.text)
+    if (part?.type === 'image_url') return total + estimateTokenCount(part.image_url?.url) + 4
+    return total + estimateTokenCount(JSON.stringify(part ?? ''))
+  }, 0)
+}
+
 function estimateChatTokenCount(messages) {
-  return (messages || []).reduce((total, message) => (
-    total + estimateTokenCount(message?.role) + estimateTokenCount(message?.content) + 3
+  const renderedMessages = (messages || []).reduce((total, message) => (
+    total + estimateTokenCount(message?.role) + estimateMessageContentTokens(message?.content) + 3
   ), 0)
+  // Reserve the assistant-generation marker/BOS-EOT envelope used by Camelid's
+  // chat renderers. Exact active-context limits still come from the backend.
+  return renderedMessages + ((messages || []).length ? 3 : 0)
 }
 
 const CODE_FIRST_SYSTEM_PROMPT = 'begin immediately with complete runnable code. No intro. Output one self-contained file unless the user asks otherwise. For Python, start exactly with ```python, include imports, and close the fence after the complete script. For Python games, prefer tkinter from the standard library over pygame, keep it compact, and include a complete runnable event loop. For HTML output ONE self-contained file. Never use external files or script src. Include inline <style> and inline <script> with working click/game logic before </body>. Start exactly with ```html then <!doctype html> and close the fence after </html>.'
@@ -156,11 +170,19 @@ function getConfiguredMaxTokens() {
 
 export function looksLikeCodePrompt(value) {
   const text = String(value || '').toLowerCase()
+  const explicitRunnableRequest = (
+    /\b(code|source code|runnable|single file|self-contained file)\b/.test(text)
+      && /\b(build|create|generate|implement|make|output|provide|write)\b/.test(text)
+  ) || (
+    /\b(html|css|javascript|python)\b/.test(text)
+      && /\b(generate|output|write)\b/.test(text)
+  )
+  if (explicitRunnableRequest) return true
   // Planning prompts often say "build an app" while asking for a roadmap,
   // checklist, or methodology—not source code. The Web-research acceptance
   // prompt is one of these; do not let the code-first policy override its
   // requested multi-step Xcode task list.
-  if (/\b(task list|task-list|checklist|implementation plan|roadmap|methodology|multi-step plan)\b/.test(text)) return false
+  if (/\b(task list|task-list|checklist|implementation plan|roadmap|methodology|multi-step plan|requirements?|architecture|phases?)\b/.test(text)) return false
   return /\b(code|build|create|implement|write|make)\b/.test(text)
     && /\b(html|html5|css|javascript|js|python|py|pygame|game|pacman|pacmac|tetris|app|component|page|website)\b/.test(text)
 }
@@ -567,6 +589,9 @@ function makeDashboard({ health, models, currentModel, capabilities, conversatio
       loaded_now: Boolean(health?.loaded_now ?? health?.active_model_id),
       active_model_id: health?.active_model_id || null,
       generation_ready: Boolean(health?.generation_ready),
+      active_context_length: Number(health?.active_context_length) || null,
+      max_prompt_tokens: Number(health?.max_prompt_tokens) || null,
+      max_generation_tokens: Number(health?.max_generation_tokens) || null,
       model_family: optionalString(health?.model_family),
       vision_ready: Boolean(health?.vision_ready),
       q8_runtime: health?.q8_runtime || null,
@@ -1068,6 +1093,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
     let activeConversationId = null
     let assistantId = null
     let chatLifecycleId = null
+    let webResearchMs = null
     /* Hoisted so the finally below can always halt the display-pacing loop,
        including on abort and error paths. */
     let stopPacing = () => {}
@@ -1142,6 +1168,33 @@ export function useDashboardData({ showNotice, clearNotice }) {
       // Web UI research is a deterministic preflight: resolve linked/current
       // sources first, then give the ordinary chat request a leading, untrusted
       // evidence message. No tools/tool_choice payload is sent to the model.
+      const sendGate = getChatGateState(dashboard?.capabilities, selectedModel, runtime)
+      const requestModelId = getRuntimeRequestModelId(selectedModel, runtime, selectedModelId)
+      const bitNetB158Chat = isBitNetB158ChatModel(selectedModel, runtime, requestModelId)
+      const responseLimitModelIds = [...new Set([
+        requestModelId,
+        selectedModel?.id,
+        selectedModelId,
+      ].filter(Boolean))]
+      const explicitResponseLimitModelId = responseLimitModelIds.find(hasExplicitMaxTokensSetting) || ''
+      const responseLimitModelId = explicitResponseLimitModelId || requestModelId
+      const requestedMaxTokens = applyGemma4GhostChatTokenCap(
+        applyGemma4ChatTokenFloor(
+          applyBitNetFreshChatTokenCap(
+            localChatMaxTokens(history, responseLimitModelId),
+            {
+              bitNetB158: bitNetB158Chat,
+              hasExplicitSetting: Boolean(explicitResponseLimitModelId),
+            },
+          ),
+          sendGate.hint?.target?.family,
+        ),
+        runtime?.gemma4_serve_lane,
+      )
+      const requestMaxTokens = effectiveGenerationTokenLimit(
+        requestedMaxTokens,
+        runtime?.max_generation_tokens,
+      ) || requestedMaxTokens
       const requestController = new AbortController()
       activeChatRequestRef.current = requestController
       const researchPlan = classifyWebResearchNeed(messageContent)
@@ -1149,23 +1202,26 @@ export function useDashboardData({ showNotice, clearNotice }) {
       let researchFailure = ''
       if (webResearchEnabled) {
         setWebResearchStatus({ phase: 'researching', sourceCount: 0 })
+        const researchStartedAt = performance.now()
         try {
           researchResult = await requestWebResearch(normalizedApiBase, messageContent, {
             signal: requestController.signal,
           })
-          const configuredContext = runtime?.gemma4_serve_lane === 'ghost_moe'
-            ? GEMMA4_GHOST_WEBUI_CONTEXT_TOKENS
-            : modelContextLength(selectedModel)
-          const replyReserve = applyGemma4GhostChatTokenCap(
-            getModelMaxTokens(selectedModelId),
-            runtime?.gemma4_serve_lane,
-          )
-          const fittedResearch = fitWebResearchContext(requestMessages, researchResult, {
-            maxExcerptChars: 8_000,
-            maxPromptTokens: configuredContext
-              ? Math.max(0, configuredContext - replyReserve - 192)
-              : null,
+          const researchElapsedMs = performance.now() - researchStartedAt
+          webResearchMs = researchResult?.triggered ? researchElapsedMs : null
+          const configuredContext = runtime?.active_context_length || modelContextLength(selectedModel)
+          const researchBudget = deriveWebResearchPromptBudget({
+            contextLength: configuredContext,
+            serverMaxPromptTokens: runtime?.max_prompt_tokens,
+            serverMaxGenerationTokens: runtime?.max_generation_tokens,
+            requestedMaxTokens: requestMaxTokens,
+            messages: requestMessages,
             estimateTokenCount: estimateChatTokenCount,
+          })
+          const fittedResearch = fitWebResearchContext(requestMessages, researchResult, {
+            maxPromptTokens: researchBudget.maxPromptTokens,
+            estimateTokenCount: estimateChatTokenCount,
+            queryText: messageContent,
           })
           researchResult = fittedResearch.research
           requestMessages = fittedResearch.messages
@@ -1174,8 +1230,10 @@ export function useDashboardData({ showNotice, clearNotice }) {
             sourceCount: Array.isArray(researchResult?.sources) ? researchResult.sources.length : 0,
           })
         } catch (error) {
+          const researchElapsedMs = performance.now() - researchStartedAt
           if (error?.name === 'AbortError') throw error
           if (researchPlan.needed) {
+            webResearchMs = researchElapsedMs
             researchFailure = error?.message || 'Web research was unavailable.'
             researchResult = {
               triggered: true,
@@ -1196,9 +1254,11 @@ export function useDashboardData({ showNotice, clearNotice }) {
       // Fresh per-token decode trace for this generation (auditable backing for
       // the live tok/s readout; read out after the stream completes).
       if (typeof window !== 'undefined') window.__tpsTrace = []
-      const lifecycleId = beginRequest({ kind: 'chat', endpoint: '/v1/chat/completions', modelId: getRuntimeRequestModelId(selectedModel, runtime, selectedModelId) })
+      const lifecycleId = beginRequest({ kind: 'chat', endpoint: '/v1/chat/completions', modelId: requestModelId })
       chatLifecycleId = lifecycleId
       let firstContentEmitted = false
+      let firstTokenAt = null
+      let decodeStartTokens = 0
       let lastProgressAt = 0
       const pacer = createPacerState()
       /* The pacer is driven by its own animation frame loop rather than by token
@@ -1226,7 +1286,6 @@ export function useDashboardData({ showNotice, clearNotice }) {
       /* Snapshot of the support claim that was active when this send left the
          composer: row id + status only (never paths) so the message footer can
          cite the exact contract row that gated this generation. */
-      const sendGate = getChatGateState(dashboard?.capabilities, selectedModel, runtime)
       const supportRowAtSend = sendGate.hint?.target
         ? { id: sendGate.hint.target.id, status: sendGate.hint.target.status, supported: sendGate.contractSupported }
         : null
@@ -1261,6 +1320,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
         first_byte_ms: null,
         first_event_ms: null,
         first_content_ms: null,
+        web_research_ms: webResearchMs,
         ...(researchAtSend ? { web_research: researchAtSend } : {}),
       }
       persistConversations((current) => current.map((item) => (
@@ -1270,28 +1330,6 @@ export function useDashboardData({ showNotice, clearNotice }) {
       )))
       setPendingChat(null)
 
-      const requestModelId = getRuntimeRequestModelId(selectedModel, runtime, selectedModelId)
-      const bitNetB158Chat = isBitNetB158ChatModel(selectedModel, runtime, requestModelId)
-      const responseLimitModelIds = [...new Set([
-        requestModelId,
-        selectedModel?.id,
-        selectedModelId,
-      ].filter(Boolean))]
-      const explicitResponseLimitModelId = responseLimitModelIds.find(hasExplicitMaxTokensSetting) || ''
-      const responseLimitModelId = explicitResponseLimitModelId || requestModelId
-      const requestMaxTokens = applyGemma4GhostChatTokenCap(
-        applyGemma4ChatTokenFloor(
-          applyBitNetFreshChatTokenCap(
-            localChatMaxTokens(history, responseLimitModelId),
-            {
-              bitNetB158: bitNetB158Chat,
-              hasExplicitSetting: Boolean(explicitResponseLimitModelId),
-            },
-          ),
-          sendGate.hint?.target?.family,
-        ),
-        runtime?.gemma4_serve_lane,
-      )
       // The generic BitNet runnable is a greedy lane. Its experimental status
       // must not cause the browser to advertise Prism's sampling controls that
       // this model does not use.
@@ -1337,6 +1375,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
           ...(receiptMode ? { camelid_receipt: true } : {}),
         }),
       })
+      const responseIsStreaming = response.ok && !response.headers.get('content-type')?.includes('application/json')
       const applyAssistantStreamPatch = (patch) => {
         updateConversationsState((current) => current.map((item) => (
           item.id === conversation.id
@@ -1372,25 +1411,26 @@ export function useDashboardData({ showNotice, clearNotice }) {
           pendingAssistantFrame = window.requestAnimationFrame(flushAssistantStreamPatch)
         }
       }
-      if (response.ok && !response.headers.get('content-type')?.includes('application/json')) {
+      if (responseIsStreaming) {
         markAssistantStreamState({ streaming_phase: 'generating' }, { immediate: true })
       }
       const streamed = await readStreamingChatCompletion(response, (_delta, fullContent, metrics) => {
-        const liveElapsedMs = performance.now() - requestStartedAt
-        /* Live end-to-end output rate uses the REAL token count (one SSE
-           content delta = one generated token in Camelid) over wall time from
-           request start, not a word-piece estimate. The on-screen tok/s is
-           auditable and backed token-for-token by window.__tpsTrace below. */
+        const now = performance.now()
+        const liveElapsedMs = now - requestStartedAt
+        /* Decode rate uses the REAL token count (one SSE content delta = one
+           generated token in Camelid) only after first content. Web research
+           and model TTFT are recorded separately and never dilute tok/s. */
         const realTokens = Number(metrics?.completionTokens) || 0
-        const outputElapsedMs = liveElapsedMs
-        const liveTps = tokensPerSecond(realTokens, outputElapsedMs)
-        if (typeof window !== 'undefined' && realTokens > 0) {
-          if (!Array.isArray(window.__tpsTrace)) window.__tpsTrace = []
-          window.__tpsTrace.push({ i: realTokens, t_ms: Math.round(outputElapsedMs * 10) / 10, tps: liveTps != null ? Math.round(liveTps * 100) / 100 : null, delta: _delta })
-        }
         if (!firstContentEmitted && fullContent) {
           firstContentEmitted = true
           emitFirstContent(lifecycleId, liveElapsedMs)
+        }
+        const decodedTokens = firstTokenAt === null ? 0 : Math.max(0, realTokens - decodeStartTokens)
+        const decodeElapsedMs = firstTokenAt === null ? 0 : now - firstTokenAt
+        const liveTps = responseIsStreaming ? tokensPerSecond(decodedTokens, decodeElapsedMs) : null
+        if (typeof window !== 'undefined' && realTokens > 0) {
+          if (!Array.isArray(window.__tpsTrace)) window.__tpsTrace = []
+          window.__tpsTrace.push({ i: realTokens, t_ms: Math.round(decodeElapsedMs * 10) / 10, tps: liveTps != null ? Math.round(liveTps * 100) / 100 : null, delta: _delta })
         }
         if (performance.now() - lastProgressAt > 100) {
           lastProgressAt = performance.now()
@@ -1414,6 +1454,10 @@ export function useDashboardData({ showNotice, clearNotice }) {
       }, {
         estimateTokenCount,
         onStreamEvent(event) {
+          if ((event.type === 'reasoning' || event.type === 'content') && firstTokenAt === null) {
+            firstTokenAt = performance.now()
+            decodeStartTokens = Number(event.completionTokens) || 0
+          }
           if (event.type === 'bytes' || event.type === 'role' || event.type === 'json_fallback') {
             markAssistantStreamState({
               streaming_phase: 'generating',
@@ -1432,11 +1476,15 @@ export function useDashboardData({ showNotice, clearNotice }) {
       stopPacing()
       flushAssistantStreamPatch()
       const elapsedMs = performance.now() - requestStartedAt
+      const modelTtftMs = firstTokenAt === null ? null : firstTokenAt - requestStartedAt
+      const decodeElapsedMs = firstTokenAt === null ? null : Math.max(0, performance.now() - firstTokenAt)
+      const completionTokenCount = streamed.completionTokens || estimateTokenCount(streamed.content)
+      const decodedTokenCount = Math.max(0, completionTokenCount - decodeStartTokens)
       const assistantMessage = {
         ...assistantMessageBase,
         content: paceDrain(pacer, streamed.content || ''),
-        tokens_in_per_sec: tokensPerSecond(promptTokenEstimate, streamed.firstContentMs),
-        tokens_out_per_sec: tokensPerSecond(streamed.completionTokens || estimateTokenCount(streamed.content), elapsedMs),
+        tokens_in_per_sec: tokensPerSecond(promptTokenEstimate, modelTtftMs),
+        tokens_out_per_sec: responseIsStreaming ? tokensPerSecond(decodedTokenCount, decodeElapsedMs) : null,
         finish_reason: streamed.finishReason,
         elapsed_ms: elapsedMs,
         usage: streamed.usage || {
@@ -1452,7 +1500,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
         streaming_phase: null,
         first_byte_ms: streamed.firstByteMs ?? null,
         first_event_ms: streamed.firstEventMs ?? null,
-        first_content_ms: streamed.firstContentMs ?? null,
+        first_content_ms: modelTtftMs,
       }
       persistConversations((current) => current.map((item) => (
         item.id === conversation.id
@@ -1470,7 +1518,8 @@ export function useDashboardData({ showNotice, clearNotice }) {
         lifecycleId,
         modelId: requestModelId,
         durationMs: elapsedMs,
-        ttftMs: streamed.firstContentMs ?? null,
+        ttftMs: modelTtftMs,
+        webResearchMs,
         promptTokens: assistantMessage.usage?.prompt_tokens,
         completionTokens: assistantMessage.usage?.completion_tokens,
         tokensPerSec: assistantMessage.tokens_out_per_sec,
@@ -1486,6 +1535,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
           modelId: getRuntimeRequestModelId(selectedModel, runtime, selectedModelId),
           durationMs: null,
           ttftMs: null,
+          webResearchMs,
           outcome: requestWasAborted ? 'interrupted' : 'error',
           promptText: messageContent,
         })
