@@ -6,8 +6,9 @@
 //! information. The browser asks this endpoint first and injects the returned,
 //! explicitly-untrusted excerpts into the ordinary chat request.
 //!
-//! Network safety is owned here. Only credential-free public HTTP(S) targets
-//! on the default ports are accepted. Every redirect is parsed, checked, and
+//! Network safety is owned here. Only public HTTP(S) targets on the default
+//! ports are accepted. An optional operator GitHub token is scoped to exact
+//! api.github.com HTTPS hops and private repositories remain excluded. Every redirect is parsed, checked, and
 //! DNS-resolved again before curl sees it; validated DNS answers are pinned with
 //! `--resolve`, proxy use and curlrc loading are disabled, and response/time/
 //! redirect counts are bounded. Incoming Camelid authentication headers never
@@ -15,10 +16,11 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    io::Read,
+    io::{Read, Write},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs},
     process::{Command, Stdio},
-    sync::{Arc, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
+    thread,
     time::{Duration, Instant},
 };
 
@@ -36,6 +38,7 @@ use super::{api_error, AppState};
 
 const MAX_PROMPT_BYTES: usize = 64 * 1024;
 const MAX_DIRECT_URLS: usize = 4;
+const MAX_TOTAL_SOURCES: usize = 6;
 const MAX_SEARCH_RESULTS: usize = 8;
 const MAX_SEARCH_FETCHES: usize = 3;
 const MAX_REDIRECTS: usize = 4;
@@ -45,10 +48,16 @@ const MAX_SOURCE_EXCERPT_CHARS: usize = 12_000;
 const MAX_README_CHARS: usize = 4_000;
 const MAX_CODE_FILE_CHARS: usize = 2_400;
 const MAX_GITHUB_SOURCE_FILES: usize = 3;
+const MAX_GITHUB_REF_SEGMENTS: usize = 16;
+const MAX_GITHUB_HTML_PAGES: usize = 6;
+const MAX_GITHUB_HTML_DEPTH: usize = 4;
 const MAX_SEARCH_QUERY_CHARS: usize = 600;
 const MAX_CONCURRENT_RESEARCH: usize = 2;
+const FETCH_CACHE_CAPACITY: usize = 96;
+const FETCH_CACHE_TTL: Duration = Duration::from_secs(90);
 const RESEARCH_ADMISSION_TIMEOUT: Duration = Duration::from_millis(750);
 const RESEARCH_TOTAL_DEADLINE: Duration = Duration::from_secs(30);
+const GITHUB_TOKEN_ENV: &str = "CAMELID_WEB_GITHUB_TOKEN";
 const BRAVE_SEARCH_ENDPOINT: &str = "https://search.brave.com/search";
 const DDG_SEARCH_ENDPOINT: &str = "https://lite.duckduckgo.com/lite/";
 const BING_SEARCH_ENDPOINT: &str = "https://www.bing.com/search";
@@ -60,11 +69,20 @@ pub(super) struct WebResearchRequest {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(super) struct WebResearchChunk {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(super) struct WebResearchSource {
     pub id: usize,
     pub title: String,
     pub url: String,
     pub excerpt: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub chunks: Vec<WebResearchChunk>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -87,7 +105,15 @@ pub(super) struct FetchResponse {
     content_type: String,
     body: Vec<u8>,
     location: Option<String>,
+    etag: Option<String>,
     final_url: Option<Url>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ProviderAuthIntent {
+    None,
+    GithubRepositoryMetadata,
+    GithubVerifiedPublicApi,
 }
 
 impl FetchResponse {
@@ -98,6 +124,7 @@ impl FetchResponse {
             content_type: content_type.to_string(),
             body: body.into(),
             location: None,
+            etag: None,
             final_url: None,
         }
     }
@@ -108,25 +135,170 @@ impl FetchResponse {
 /// structurally impossible.
 pub(super) trait WebTransport: Send + Sync {
     fn fetch(&self, url: &Url, accept: &str) -> Result<FetchResponse, String>;
+
+    fn fetch_github_repository_api(
+        &self,
+        url: &Url,
+        accept: &str,
+    ) -> Result<FetchResponse, String> {
+        self.fetch(url, accept)
+    }
+
+    fn fetch_github_verified_public_api(
+        &self,
+        url: &Url,
+        accept: &str,
+    ) -> Result<FetchResponse, String> {
+        self.fetch(url, accept)
+    }
+
+    fn fetch_conditional(
+        &self,
+        url: &Url,
+        accept: &str,
+        _etag: Option<&str>,
+    ) -> Result<FetchResponse, String> {
+        self.fetch(url, accept)
+    }
+
+    fn fetch_cancellable(
+        &self,
+        url: &Url,
+        accept: &str,
+        etag: Option<&str>,
+        cancel: Option<&tokio_util::sync::CancellationToken>,
+        auth: ProviderAuthIntent,
+    ) -> Result<FetchResponse, String> {
+        if cancel.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+            return Err("web research was cancelled".to_string());
+        }
+        match auth {
+            ProviderAuthIntent::None => self.fetch_conditional(url, accept, etag),
+            ProviderAuthIntent::GithubRepositoryMetadata => {
+                self.fetch_github_repository_api(url, accept)
+            }
+            ProviderAuthIntent::GithubVerifiedPublicApi => {
+                self.fetch_github_verified_public_api(url, accept)
+            }
+        }
+    }
 }
 
-#[derive(Default)]
-struct CurlWebTransport;
+struct CurlWebTransport {
+    github_token: Option<Arc<str>>,
+}
+
+impl Default for CurlWebTransport {
+    fn default() -> Self {
+        Self {
+            github_token: github_token_from_env(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct FetchCacheEntry {
+    response: FetchResponse,
+    stored_at: Instant,
+    last_used: Instant,
+}
+
+struct CachedWebTransport {
+    inner: Arc<dyn WebTransport>,
+    entries: Mutex<HashMap<String, FetchCacheEntry>>,
+    ttl: Duration,
+    capacity: usize,
+}
+
+impl CachedWebTransport {
+    fn new(inner: Arc<dyn WebTransport>, ttl: Duration, capacity: usize) -> Self {
+        Self {
+            inner,
+            entries: Mutex::new(HashMap::new()),
+            ttl,
+            capacity: capacity.max(1),
+        }
+    }
+}
 
 struct DeadlineTransport<'a> {
     inner: &'a dyn WebTransport,
     deadline: Instant,
+    cancel: tokio_util::sync::CancellationToken,
 }
 
 impl WebTransport for DeadlineTransport<'_> {
     fn fetch(&self, url: &Url, accept: &str) -> Result<FetchResponse, String> {
+        if self.cancel.is_cancelled() {
+            return Err("web research was cancelled".to_string());
+        }
         if Instant::now() >= self.deadline {
             return Err(format!(
                 "the {}-second web research deadline was reached",
                 RESEARCH_TOTAL_DEADLINE.as_secs()
             ));
         }
-        self.inner.fetch(url, accept)
+        self.inner.fetch_cancellable(
+            url,
+            accept,
+            None,
+            Some(&self.cancel),
+            ProviderAuthIntent::None,
+        )
+    }
+
+    fn fetch_github_repository_api(
+        &self,
+        url: &Url,
+        accept: &str,
+    ) -> Result<FetchResponse, String> {
+        if self.cancel.is_cancelled() {
+            return Err("web research was cancelled".to_string());
+        }
+        if Instant::now() >= self.deadline {
+            return Err(format!(
+                "the {}-second web research deadline was reached",
+                RESEARCH_TOTAL_DEADLINE.as_secs()
+            ));
+        }
+        self.inner.fetch_cancellable(
+            url,
+            accept,
+            None,
+            Some(&self.cancel),
+            ProviderAuthIntent::GithubRepositoryMetadata,
+        )
+    }
+
+    fn fetch_github_verified_public_api(
+        &self,
+        url: &Url,
+        accept: &str,
+    ) -> Result<FetchResponse, String> {
+        if self.cancel.is_cancelled() {
+            return Err("web research was cancelled".to_string());
+        }
+        if Instant::now() >= self.deadline {
+            return Err(format!(
+                "the {}-second web research deadline was reached",
+                RESEARCH_TOTAL_DEADLINE.as_secs()
+            ));
+        }
+        self.inner.fetch_cancellable(
+            url,
+            accept,
+            None,
+            Some(&self.cancel),
+            ProviderAuthIntent::GithubVerifiedPublicApi,
+        )
+    }
+}
+
+struct ResearchCancelOnDrop(tokio_util::sync::CancellationToken);
+
+impl Drop for ResearchCancelOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
     }
 }
 
@@ -138,17 +310,82 @@ fn research_semaphore() -> Arc<tokio::sync::Semaphore> {
 }
 
 pub(super) fn default_transport() -> Arc<dyn WebTransport> {
-    Arc::new(CurlWebTransport)
+    Arc::new(CachedWebTransport::new(
+        Arc::new(CurlWebTransport::default()),
+        FETCH_CACHE_TTL,
+        FETCH_CACHE_CAPACITY,
+    ))
 }
 
 impl WebTransport for CurlWebTransport {
     fn fetch(&self, url: &Url, accept: &str) -> Result<FetchResponse, String> {
+        self.fetch_conditional(url, accept, None)
+    }
+
+    fn fetch_conditional(
+        &self,
+        url: &Url,
+        accept: &str,
+        etag: Option<&str>,
+    ) -> Result<FetchResponse, String> {
+        self.fetch_cancellable(url, accept, etag, None, ProviderAuthIntent::None)
+    }
+
+    fn fetch_github_repository_api(
+        &self,
+        url: &Url,
+        accept: &str,
+    ) -> Result<FetchResponse, String> {
+        self.fetch_cancellable(
+            url,
+            accept,
+            None,
+            None,
+            ProviderAuthIntent::GithubRepositoryMetadata,
+        )
+    }
+
+    fn fetch_github_verified_public_api(
+        &self,
+        url: &Url,
+        accept: &str,
+    ) -> Result<FetchResponse, String> {
+        self.fetch_cancellable(
+            url,
+            accept,
+            None,
+            None,
+            ProviderAuthIntent::GithubVerifiedPublicApi,
+        )
+    }
+
+    fn fetch_cancellable(
+        &self,
+        url: &Url,
+        accept: &str,
+        etag: Option<&str>,
+        cancel: Option<&tokio_util::sync::CancellationToken>,
+        auth: ProviderAuthIntent,
+    ) -> Result<FetchResponse, String> {
         let mut current = url.clone();
         for redirects in 0..=MAX_REDIRECTS {
+            if cancel.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+                return Err("web research was cancelled".to_string());
+            }
             validate_url_shape(&current)?;
             let addresses = resolve_public_addresses(&current)?;
-            let mut response = curl_single_hop(&current, accept, &addresses)?;
-            if !(300..400).contains(&response.status) {
+            let conditional = (redirects == 0).then_some(etag).flatten();
+            let github_token =
+                github_token_for_request(&current, accept, auth, self.github_token.as_deref());
+            let mut response = curl_single_hop(
+                &current,
+                accept,
+                &addresses,
+                conditional,
+                github_token,
+                cancel,
+            )?;
+            if response.status == 304 || !(300..400).contains(&response.status) {
                 response.final_url = Some(current);
                 return Ok(response);
             }
@@ -163,6 +400,182 @@ impl WebTransport for CurlWebTransport {
         }
         unreachable!("bounded redirect loop always returns")
     }
+}
+
+impl WebTransport for CachedWebTransport {
+    fn fetch(&self, url: &Url, accept: &str) -> Result<FetchResponse, String> {
+        self.fetch_cancellable(url, accept, None, None, ProviderAuthIntent::None)
+    }
+
+    fn fetch_github_repository_api(
+        &self,
+        url: &Url,
+        accept: &str,
+    ) -> Result<FetchResponse, String> {
+        self.fetch_cancellable(
+            url,
+            accept,
+            None,
+            None,
+            ProviderAuthIntent::GithubRepositoryMetadata,
+        )
+    }
+
+    fn fetch_github_verified_public_api(
+        &self,
+        url: &Url,
+        accept: &str,
+    ) -> Result<FetchResponse, String> {
+        self.fetch_cancellable(
+            url,
+            accept,
+            None,
+            None,
+            ProviderAuthIntent::GithubVerifiedPublicApi,
+        )
+    }
+
+    fn fetch_cancellable(
+        &self,
+        url: &Url,
+        accept: &str,
+        _etag: Option<&str>,
+        cancel: Option<&tokio_util::sync::CancellationToken>,
+        auth: ProviderAuthIntent,
+    ) -> Result<FetchResponse, String> {
+        if cancel.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+            return Err("web research was cancelled".to_string());
+        }
+        validate_url_shape(url)?;
+        // Metadata can reveal a private repository before the enrichment layer
+        // rejects it, so it is never retained. API tree/README bodies enter the
+        // cache only through the distinct intent issued after explicit
+        // `private:false` verification. Arbitrary linked API URLs stay
+        // unauthenticated and bypass this cache.
+        if auth == ProviderAuthIntent::GithubRepositoryMetadata
+            || (auth == ProviderAuthIntent::None
+                && url
+                    .host_str()
+                    .is_some_and(|host| host.eq_ignore_ascii_case("api.github.com")))
+        {
+            return self
+                .inner
+                .fetch_cancellable(url, accept, None, cancel, auth);
+        }
+        let key = format!("{auth:?}\n{}\n{accept}", url.as_str());
+        let now = Instant::now();
+        let cached = {
+            let mut entries = self
+                .entries
+                .lock()
+                .map_err(|_| "web fetch cache lock was poisoned".to_string())?;
+            entries.get_mut(&key).map(|entry| {
+                entry.last_used = now;
+                entry.clone()
+            })
+        };
+        if let Some(entry) = cached.as_ref() {
+            if now.duration_since(entry.stored_at) < self.ttl {
+                return Ok(entry.response.clone());
+            }
+        }
+
+        let response = self.inner.fetch_cancellable(
+            url,
+            accept,
+            cached.as_ref().and_then(|entry| {
+                entry
+                    .response
+                    .final_url
+                    .as_ref()
+                    .is_none_or(|final_url| final_url == url)
+                    .then_some(entry.response.etag.as_deref())
+                    .flatten()
+            }),
+            cancel,
+            auth,
+        )?;
+        if response.status == 304 {
+            if let Some(mut entry) = cached {
+                entry.stored_at = now;
+                entry.last_used = now;
+                self.entries
+                    .lock()
+                    .map_err(|_| "web fetch cache lock was poisoned".to_string())?
+                    .insert(key, entry.clone());
+                return Ok(entry.response);
+            }
+            return Err("web provider returned HTTP 304 without a cached source".to_string());
+        }
+
+        if (200..300).contains(&response.status) {
+            let mut entries = self
+                .entries
+                .lock()
+                .map_err(|_| "web fetch cache lock was poisoned".to_string())?;
+            if entries.len() >= self.capacity && !entries.contains_key(&key) {
+                if let Some(oldest) = entries
+                    .iter()
+                    .min_by_key(|(_, entry)| entry.last_used)
+                    .map(|(cache_key, _)| cache_key.clone())
+                {
+                    entries.remove(&oldest);
+                }
+            }
+            entries.insert(
+                key,
+                FetchCacheEntry {
+                    response: response.clone(),
+                    stored_at: now,
+                    last_used: now,
+                },
+            );
+        }
+        Ok(response)
+    }
+}
+
+fn github_token_from_env() -> Option<Arc<str>> {
+    let token = std::env::var(GITHUB_TOKEN_ENV).ok()?;
+    let token = token.trim();
+    if token.is_empty()
+        || token.len() > 1_024
+        || !token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return None;
+    }
+    Some(Arc::from(token))
+}
+
+fn github_token_for_request<'a>(
+    url: &Url,
+    accept: &str,
+    auth: ProviderAuthIntent,
+    token: Option<&'a str>,
+) -> Option<&'a str> {
+    if !matches!(
+        auth,
+        ProviderAuthIntent::GithubRepositoryMetadata | ProviderAuthIntent::GithubVerifiedPublicApi
+    ) || url.scheme() != "https"
+        || !url
+            .host_str()
+            .is_some_and(|host| host.eq_ignore_ascii_case("api.github.com"))
+    {
+        return None;
+    }
+    let segments = url.path_segments()?.collect::<Vec<_>>();
+    let provider_managed_request = matches!(
+        (segments.as_slice(), accept),
+        (["repos", _, _], "application/vnd.github+json")
+            | (
+                ["repos", _, _, "git", "trees", _, ..],
+                "application/vnd.github+json"
+            )
+            | (["repos", _, _, "readme"], "application/vnd.github.raw+json")
+    );
+    provider_managed_request.then_some(token).flatten()
 }
 
 pub(super) async fn handler(
@@ -228,13 +641,18 @@ pub(super) async fn handler(
 
     let prompt = prompt.to_string();
     let transport = state.web_research_transport.clone();
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let cancel_worker = cancel.clone();
+    // If Axum drops this handler because the browser aborts, the blocking
+    // transport sees cancellation, terminates curl, and stops before the next
+    // fetch. The semaphore permit remains owned by the worker until it exits.
+    let _cancel_on_drop = ResearchCancelOnDrop(cancel);
     let result = tokio::task::spawn_blocking(move || {
-        // Keep admission for the whole blocking job, even if the HTTP client
-        // disconnects and Axum drops its waiter. This caps abandoned curl work.
         let _permit = permit;
         let bounded = DeadlineTransport {
             inner: transport.as_ref(),
             deadline: Instant::now() + RESEARCH_TOTAL_DEADLINE,
+            cancel: cancel_worker,
         };
         research_prompt(&prompt, &bounded)
     })
@@ -252,16 +670,19 @@ pub(super) async fn handler(
 
 #[derive(Debug)]
 enum ResearchDecision {
-    Direct { urls: Vec<Url>, omitted: bool },
-    Search { reason: &'static str, query: String },
+    Research {
+        reason: &'static str,
+        urls: Vec<Url>,
+        omitted: bool,
+        query: Option<String>,
+    },
     Skip,
 }
 
 impl ResearchDecision {
     fn reason(&self) -> &'static str {
         match self {
-            Self::Direct { .. } => "embedded_urls",
-            Self::Search { reason, .. } => reason,
+            Self::Research { reason, .. } => reason,
             Self::Skip => "not_needed",
         }
     }
@@ -281,7 +702,12 @@ fn skipped_response() -> WebResearchResponse {
 fn research_prompt(prompt: &str, transport: &dyn WebTransport) -> WebResearchResponse {
     match classify_prompt(prompt) {
         ResearchDecision::Skip => skipped_response(),
-        ResearchDecision::Direct { urls, omitted } => {
+        ResearchDecision::Research {
+            reason,
+            urls,
+            omitted,
+            query,
+        } => {
             let mut warnings = Vec::new();
             if omitted {
                 warnings.push(format!(
@@ -290,11 +716,24 @@ fn research_prompt(prompt: &str, transport: &dyn WebTransport) -> WebResearchRes
             }
             let mut sources = Vec::new();
             for url in urls {
-                fetch_source(transport, &url, None, &mut sources, &mut warnings);
+                fetch_source(transport, &url, None, prompt, &mut sources, &mut warnings);
             }
-            finish_response("embedded_urls", None, sources, warnings)
+            if let Some(search_query) = query.as_deref() {
+                let supplemental = search_and_fetch(transport, reason, search_query.to_string());
+                warnings.extend(supplemental.warnings);
+                let mut seen = sources
+                    .iter()
+                    .map(|source| source.url.clone())
+                    .collect::<HashSet<_>>();
+                sources.extend(
+                    supplemental
+                        .sources
+                        .into_iter()
+                        .filter(|source| seen.insert(source.url.clone())),
+                );
+            }
+            finish_response(reason, query, sources, warnings)
         }
-        ResearchDecision::Search { reason, query } => search_and_fetch(transport, reason, query),
     }
 }
 
@@ -302,8 +741,16 @@ fn finish_response(
     reason: &'static str,
     query: Option<String>,
     mut sources: Vec<WebResearchSource>,
-    warnings: Vec<String>,
+    mut warnings: Vec<String>,
 ) -> WebResearchResponse {
+    let mut seen = HashSet::new();
+    sources.retain(|source| seen.insert(source.url.clone()));
+    if sources.len() > MAX_TOTAL_SOURCES {
+        sources.truncate(MAX_TOTAL_SOURCES);
+        warnings.push(format!(
+            "Only the first {MAX_TOTAL_SOURCES} distinct sources were retained."
+        ));
+    }
     for (index, source) in sources.iter_mut().enumerate() {
         source.id = index + 1;
     }
@@ -326,10 +773,6 @@ fn finish_response(
 
 fn classify_prompt(prompt: &str) -> ResearchDecision {
     let (urls, omitted) = extract_prompt_urls(prompt);
-    if !urls.is_empty() {
-        return ResearchDecision::Direct { urls, omitted };
-    }
-
     let lower = prompt.to_lowercase();
     let explicit = [
         "search the web",
@@ -385,6 +828,29 @@ fn classify_prompt(prompt: &str) -> ResearchDecision {
         "cite your web sources",
         "cite your online sources",
         "cite sources",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle));
+    // With no URL, direct-read language still asks Camelid to locate a page.
+    // With an explicit URL, only unmistakable broader-search language should
+    // cause a second public-web query; "read/check/cite this link" is one leg.
+    let supplemental = [
+        "search the web",
+        "search web",
+        "web search",
+        "search online",
+        "browse the web",
+        "browse web",
+        "browse the internet",
+        "browse internet",
+        "browse online",
+        "use the internet",
+        "find online",
+        "find it online",
+        "find this online",
+        "find that online",
+        "research online",
+        "research on the web",
     ]
     .iter()
     .any(|needle| lower.contains(needle));
@@ -472,17 +938,50 @@ fn classify_prompt(prompt: &str) -> ResearchDecision {
     .any(|needle| lower.contains(needle))
         || contains_as_of_year(&lower);
 
-    if explicit || current {
-        return ResearchDecision::Search {
-            reason: if explicit {
-                "explicit_search"
-            } else {
-                "current_info"
-            },
-            query: clip_chars(prompt.trim(), MAX_SEARCH_QUERY_CHARS, false),
+    if !urls.is_empty() || explicit || current {
+        let query_requested = current || (urls.is_empty() && explicit) || supplemental;
+        let query = query_requested.then(|| search_query_from_prompt(prompt));
+        let reason = if !urls.is_empty() && query.is_some() {
+            "embedded_urls_and_search"
+        } else if !urls.is_empty() {
+            "embedded_urls"
+        } else if explicit {
+            "explicit_search"
+        } else {
+            "current_info"
+        };
+        return ResearchDecision::Research {
+            reason,
+            urls,
+            omitted,
+            query,
         };
     }
     ResearchDecision::Skip
+}
+
+fn search_query_from_prompt(prompt: &str) -> String {
+    let mut offsets = Vec::new();
+    for scheme in ["https://", "http://"] {
+        offsets.extend(prompt.match_indices(scheme).map(|(start, _)| start));
+    }
+    offsets.sort_unstable();
+    offsets.dedup();
+    let mut query = String::with_capacity(prompt.len());
+    let mut cursor = 0usize;
+    for start in offsets {
+        if start < cursor {
+            continue;
+        }
+        let tail = &prompt[start..];
+        let end = start + prompt_url_candidate_end(tail);
+        query.push_str(&prompt[cursor..start]);
+        query.push(' ');
+        cursor = end;
+    }
+    query.push_str(&prompt[cursor..]);
+    let compact = query.split_whitespace().collect::<Vec<_>>().join(" ");
+    clip_chars(compact.trim(), MAX_SEARCH_QUERY_CHARS, false)
 }
 
 fn contains_as_of_year(text: &str) -> bool {
@@ -509,19 +1008,8 @@ fn extract_prompt_urls(prompt: &str) -> (Vec<Url>, bool) {
     let mut omitted = false;
     for offset in offsets {
         let tail = &prompt[offset..];
-        let ipv6_host_close = ipv6_host_closing_bracket(tail);
-        let end = tail
-            .char_indices()
-            .skip(1)
-            .find_map(|(index, ch)| {
-                (ch.is_whitespace()
-                    || matches!(ch, '<' | '>' | '"' | '\'' | '`')
-                    || (ch == ']' && Some(index) != ipv6_host_close))
-                    .then_some(index)
-            })
-            .unwrap_or(tail.len());
-        let raw = tail[..end]
-            .trim_end_matches(|ch: char| matches!(ch, '.' | ',' | ';' | ':' | '!' | '?' | '}'));
+        let end = prompt_url_candidate_end(tail);
+        let raw = tail[..end].trim_end_matches(['.', ',', ';', ':', '!', '?', '}']);
         let Ok(parsed) = Url::parse(raw) else {
             continue;
         };
@@ -539,6 +1027,20 @@ fn extract_prompt_urls(prompt: &str) -> (Vec<Url>, bool) {
     (urls, omitted)
 }
 
+fn prompt_url_candidate_end(candidate: &str) -> usize {
+    let ipv6_host_close = ipv6_host_closing_bracket(candidate);
+    candidate
+        .char_indices()
+        .skip(1)
+        .find_map(|(index, ch)| {
+            (ch.is_whitespace()
+                || matches!(ch, '<' | '>' | '"' | '\'' | '`')
+                || (ch == ']' && Some(index) != ipv6_host_close))
+                .then_some(index)
+        })
+        .unwrap_or(candidate.len())
+}
+
 fn ipv6_host_closing_bracket(candidate: &str) -> Option<usize> {
     let authority = candidate
         .strip_prefix("https://")
@@ -552,20 +1054,21 @@ fn ipv6_host_closing_bracket(candidate: &str) -> Option<usize> {
 
 fn canonical_prompt_url(mut url: Url) -> Url {
     url.set_fragment(None);
+    // A Markdown destination commonly ends in one unmatched `)` followed by
+    // punctuation. Repair that wrapper before GitHub view parsing so the
+    // unmatched delimiter cannot become part of a tree ref or blob path.
+    let opens = url.path().chars().filter(|ch| *ch == '(').count();
+    let closes = url.path().chars().filter(|ch| *ch == ')').count();
+    if closes > opens && url.path().ends_with(')') {
+        let next = url.path().trim_end_matches(')').to_string();
+        url.set_path(&next);
+    }
     // Never normalize away a security-relevant component. It must survive to
     // `validate_url_shape`, where it is rejected before any transport call.
     if url.username().is_empty() && url.password().is_none() && url.port().is_none() {
         if let Some(repo) = github_repo(&url) {
             return repo.canonical_url;
         }
-    }
-    // A Markdown destination commonly ends in one unmatched `)` followed by
-    // punctuation. Preserve balanced/encoded parens inside real paths.
-    let opens = url.path().chars().filter(|ch| *ch == '(').count();
-    let closes = url.path().chars().filter(|ch| *ch == ')').count();
-    if closes > opens && url.path().ends_with(')') {
-        let next = url.path().trim_end_matches(')').to_string();
-        url.set_path(&next);
     }
     url
 }
@@ -575,6 +1078,19 @@ struct GithubRepo {
     owner: String,
     repo: String,
     canonical_url: Url,
+    view: Option<GithubView>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GithubViewKind {
+    Tree,
+    Blob,
+}
+
+#[derive(Debug, Clone)]
+struct GithubView {
+    kind: GithubViewKind,
+    segments: Vec<String>,
 }
 
 fn github_repo(url: &Url) -> Option<GithubRepo> {
@@ -590,11 +1106,45 @@ fn github_repo(url: &Url) -> Option<GithubRepo> {
     if owner.is_empty() || repo.is_empty() {
         return None;
     }
-    let canonical_url = Url::parse(&format!("https://github.com/{owner}/{repo}")).ok()?;
+    let action = segments.next();
+    let remainder = segments
+        .filter(|segment| !segment.is_empty() && *segment != "." && *segment != "..")
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let view = match action {
+        Some("tree") if !remainder.is_empty() => Some(GithubView {
+            kind: GithubViewKind::Tree,
+            segments: remainder,
+        }),
+        Some("blob") if remainder.len() >= 2 => Some(GithubView {
+            kind: GithubViewKind::Blob,
+            segments: remainder,
+        }),
+        _ => None,
+    };
+    if action.is_some() && view.is_none() {
+        // Issues, pulls, releases, actions, and other GitHub pages are ordinary
+        // web pages. Only repository roots and explicit tree/blob views use the
+        // repository enrichment path.
+        return None;
+    }
+    let mut canonical_url = Url::parse("https://github.com/").ok()?;
+    {
+        let mut path = canonical_url.path_segments_mut().ok()?;
+        path.extend([owner, repo]);
+        if let Some(view) = view.as_ref() {
+            path.push(match view.kind {
+                GithubViewKind::Tree => "tree",
+                GithubViewKind::Blob => "blob",
+            });
+            path.extend(view.segments.iter().map(String::as_str));
+        }
+    }
     Some(GithubRepo {
         owner: owner.to_string(),
         repo: repo.to_string(),
         canonical_url,
+        view,
     })
 }
 
@@ -612,6 +1162,7 @@ fn fetch_source(
     transport: &dyn WebTransport,
     url: &Url,
     title_hint: Option<&str>,
+    query: &str,
     sources: &mut Vec<WebResearchSource>,
     warnings: &mut Vec<String>,
 ) {
@@ -620,7 +1171,7 @@ fn fetch_source(
         return;
     }
     if let Some(repo) = github_repo(url) {
-        if let Some(source) = fetch_github_repo(transport, &repo, warnings) {
+        if let Some(source) = fetch_github_repo(transport, &repo, query, warnings) {
             sources.push(source);
         }
         return;
@@ -658,16 +1209,26 @@ fn fetch_source(
         id: 0,
         title: clip_chars(&title, 240, false),
         url: provenance_url.as_str().to_string(),
+        chunks: vec![WebResearchChunk {
+            path: useful_url_path(provenance_url),
+            text: excerpt.clone(),
+        }],
         excerpt,
     });
+}
+
+fn useful_url_path(url: &Url) -> Option<String> {
+    let path = url.path().trim();
+    (!path.is_empty() && path != "/").then(|| path.to_string())
 }
 
 #[derive(Debug, Deserialize)]
 struct GithubMetadata {
     default_branch: Option<String>,
+    private: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct GithubTree {
     #[serde(default)]
     tree: Vec<GithubTreeEntry>,
@@ -675,7 +1236,7 @@ struct GithubTree {
     truncated: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct GithubTreeEntry {
     path: String,
     #[serde(rename = "type")]
@@ -687,75 +1248,186 @@ struct GithubTreeEntry {
 fn fetch_github_repo(
     transport: &dyn WebTransport,
     repo: &GithubRepo,
+    query: &str,
     warnings: &mut Vec<String>,
 ) -> Option<WebResearchSource> {
     let label = format!("{}/{}", repo.owner, repo.repo);
+    let query_terms = query_terms(query);
+    // Downstream authenticated reads are fail-closed until GitHub explicitly
+    // confirms that this repository is public. A malformed/missing `private`
+    // field must never turn the provider token into a private-content reader.
+    let mut api_available = false;
+    let mut default_branch = None;
     let metadata_url = github_api_url(&repo.owner, &repo.repo, &[]);
-    let branch = transport
-        .fetch(&metadata_url, "application/vnd.github+json")
-        .ok()
-        .filter(|response| (200..300).contains(&response.status))
-        .and_then(|response| serde_json::from_slice::<GithubMetadata>(&response.body).ok())
-        .and_then(|metadata| metadata.default_branch)
-        .filter(|branch| !branch.trim().is_empty())
-        .unwrap_or_else(|| "HEAD".to_string());
-
-    let mut readme = None;
-    let readme_url = github_api_url(&repo.owner, &repo.repo, &["readme"]);
-    match transport.fetch(&readme_url, "application/vnd.github.raw+json") {
+    match transport.fetch_github_repository_api(&metadata_url, "application/vnd.github+json") {
         Ok(response) if (200..300).contains(&response.status) => {
-            if let Some(text) = response_excerpt_with_limit(&response, MAX_README_CHARS) {
-                readme = Some(text);
-            } else {
-                warnings.push(format!("{label}: README was empty or not text"));
-            }
-        }
-        Ok(response) => warnings.push(format!(
-            "{label}: README request returned HTTP {}",
-            response.status
-        )),
-        Err(error) => warnings.push(format!("{label}: README unavailable: {error}")),
-    }
-
-    // Implementation evidence comes first so the browser's final, stricter
-    // prompt budget cannot spend the whole allowance on README prose.
-    let mut sections = Vec::new();
-    let tree_url = github_api_url(&repo.owner, &repo.repo, &["git", "trees", &branch]);
-    match transport.fetch(&tree_url, "application/vnd.github+json") {
-        Ok(response) if (200..300).contains(&response.status) => {
-            match serde_json::from_slice::<GithubTree>(&response.body) {
-                Ok(tree) => {
-                    if tree.truncated {
-                        warnings.push(format!(
-                            "{label}: GitHub returned a truncated file tree; only ranked visible files were considered"
-                        ));
-                    }
-                    for path in select_github_source_paths(&tree.tree) {
-                        let raw_url = raw_github_url(&repo.owner, &repo.repo, &branch, &path);
-                        match transport.fetch(&raw_url, "text/plain") {
-                            Ok(response) if (200..300).contains(&response.status) => {
-                                if let Some(text) = code_excerpt(&response, MAX_CODE_FILE_CHARS) {
-                                    sections.push((format!("Source: {path}"), text));
-                                }
-                            }
-                            Ok(response) => warnings
-                                .push(format!("{label}: {path} returned HTTP {}", response.status)),
-                            Err(error) => {
-                                warnings.push(format!("{label}: {path} unavailable: {error}"))
-                            }
-                        }
-                    }
+            match serde_json::from_slice::<GithubMetadata>(&response.body) {
+                Ok(metadata) if metadata.private => {
+                    warnings.push(format!(
+                        "{label}: private GitHub repositories are outside public-web research"
+                    ));
+                    return None;
+                }
+                Ok(metadata) => {
+                    api_available = true;
+                    default_branch = metadata
+                        .default_branch
+                        .filter(|branch| !branch.trim().is_empty());
                 }
                 Err(error) => warnings.push(format!(
-                    "{label}: GitHub file tree was not valid JSON: {error}"
+                    "{label}: GitHub metadata could not verify a public repository ({error}); using public raw/HTML only"
                 )),
             }
         }
-        Ok(response) => warnings.push(format!(
-            "{label}: GitHub file tree returned HTTP {}",
-            response.status
+        Ok(response) => {
+            warnings.push(format!(
+                "{label}: GitHub API metadata returned HTTP {}; trying public raw content",
+                response.status
+            ));
+        }
+        Err(error) => warnings.push(format!(
+            "{label}: GitHub API metadata unavailable ({error}); trying public raw content"
         )),
-        Err(error) => warnings.push(format!("{label}: GitHub file tree unavailable: {error}")),
+    }
+
+    let candidates = github_ref_candidates(repo, default_branch.as_deref());
+    let mut resolved = None;
+    if api_available {
+        for candidate in &candidates {
+            let tree_url = github_api_url(
+                &repo.owner,
+                &repo.repo,
+                &["git", "trees", &candidate.reference],
+            );
+            match transport
+                .fetch_github_verified_public_api(&tree_url, "application/vnd.github+json")
+            {
+                Ok(response) if (200..300).contains(&response.status) => {
+                    match serde_json::from_slice::<GithubTree>(&response.body) {
+                        Ok(tree) => {
+                            resolved = Some(ResolvedGithubTarget {
+                                reference: candidate.reference.clone(),
+                                path: candidate.path.clone(),
+                                tree: Some(tree),
+                            });
+                            break;
+                        }
+                        Err(error) => warnings.push(format!(
+                            "{label}: GitHub file tree was not valid JSON: {error}"
+                        )),
+                    }
+                }
+                Ok(response) if matches!(response.status, 401 | 403 | 429) => {
+                    warnings.push(format!(
+                        "{label}: GitHub API file tree returned HTTP {}; trying public raw/HTML content",
+                        response.status
+                    ));
+                    api_available = false;
+                    break;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    warnings.push(format!(
+                        "{label}: GitHub API file tree unavailable ({error}); trying public raw/HTML content"
+                    ));
+                    api_available = false;
+                    break;
+                }
+            }
+        }
+    }
+
+    if resolved.is_none() {
+        resolved = resolve_github_target_without_api(transport, repo, &candidates, warnings);
+    }
+    let resolved = resolved.unwrap_or_else(|| ResolvedGithubTarget {
+        reference: candidates
+            .first()
+            .map(|candidate| candidate.reference.clone())
+            .unwrap_or_else(|| "HEAD".to_string()),
+        path: candidates
+            .first()
+            .and_then(|candidate| candidate.path.clone()),
+        tree: None,
+    });
+
+    let mut readme = None;
+    if api_available {
+        let mut readme_url = github_api_url(&repo.owner, &repo.repo, &["readme"]);
+        readme_url
+            .query_pairs_mut()
+            .append_pair("ref", &resolved.reference);
+        match transport
+            .fetch_github_verified_public_api(&readme_url, "application/vnd.github.raw+json")
+        {
+            Ok(response) if (200..300).contains(&response.status) => {
+                readme = response_excerpt_with_limit(&response, MAX_README_CHARS);
+            }
+            Ok(response) if matches!(response.status, 401 | 403 | 429) => warnings.push(format!(
+                "{label}: GitHub API README returned HTTP {}; using public raw fallback",
+                response.status
+            )),
+            Ok(_) => {}
+            Err(error) => warnings.push(format!(
+                "{label}: GitHub API README unavailable ({error}); using public raw fallback"
+            )),
+        }
+    }
+    if readme.is_none() {
+        readme = fetch_raw_github_readme(transport, &repo.owner, &repo.repo, &resolved.reference);
+    }
+
+    // Implementation chunks precede README context. Paths remain explicit so
+    // the browser can rank and budget evidence without inventing provenance.
+    let mut chunks = Vec::new();
+    if repo
+        .view
+        .as_ref()
+        .is_some_and(|view| view.kind == GithubViewKind::Blob)
+    {
+        if let Some(path) = resolved.path.as_deref() {
+            fetch_github_code_chunk(
+                transport,
+                repo,
+                &resolved.reference,
+                path,
+                &query_terms,
+                &mut chunks,
+                warnings,
+            );
+        }
+    } else {
+        let mut entries = resolved
+            .tree
+            .as_ref()
+            .map(|tree| tree.tree.clone())
+            .unwrap_or_default();
+        if entries.is_empty() {
+            entries = fetch_github_html_tree(
+                transport,
+                repo,
+                &resolved.reference,
+                resolved.path.as_deref(),
+                &query_terms,
+                warnings,
+            );
+        }
+        if resolved.tree.as_ref().is_some_and(|tree| tree.truncated) {
+            warnings.push(format!(
+                "{label}: GitHub returned a truncated file tree; only ranked visible files were considered"
+            ));
+        }
+        for path in select_github_source_paths(&entries, resolved.path.as_deref(), &query_terms) {
+            fetch_github_code_chunk(
+                transport,
+                repo,
+                &resolved.reference,
+                &path,
+                &query_terms,
+                &mut chunks,
+                warnings,
+            );
+        }
     }
 
     let title = readme
@@ -763,17 +1435,23 @@ fn fetch_github_repo(
         .and_then(markdown_title)
         .unwrap_or_else(|| label.clone());
     if let Some(readme) = readme {
-        sections.push(("README".to_string(), readme));
+        chunks.push(WebResearchChunk {
+            path: Some("README".to_string()),
+            text: readme,
+        });
     }
-    if sections.is_empty() {
+    if chunks.is_empty() {
         warnings.push(format!(
             "Could not retrieve readable repository content for {label}"
         ));
         return None;
     }
-    let combined = sections
-        .into_iter()
-        .map(|(heading, text)| format!("## {heading}\n{text}"))
+    let combined = chunks
+        .iter()
+        .map(|chunk| {
+            let heading = chunk.path.as_deref().unwrap_or("Source");
+            format!("## Source: {heading}\n{}", chunk.text)
+        })
         .collect::<Vec<_>>()
         .join("\n\n");
     Some(WebResearchSource {
@@ -781,7 +1459,362 @@ fn fetch_github_repo(
         title: clip_chars(&title, 240, false),
         url: repo.canonical_url.as_str().to_string(),
         excerpt: clip_chars(&combined, MAX_SOURCE_EXCERPT_CHARS, true),
+        chunks,
     })
+}
+
+#[derive(Debug, Clone)]
+struct GithubRefCandidate {
+    reference: String,
+    path: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedGithubTarget {
+    reference: String,
+    path: Option<String>,
+    tree: Option<GithubTree>,
+}
+
+fn github_ref_candidates(
+    repo: &GithubRepo,
+    default_branch: Option<&str>,
+) -> Vec<GithubRefCandidate> {
+    let Some(view) = repo.view.as_ref() else {
+        return vec![GithubRefCandidate {
+            reference: default_branch.unwrap_or("HEAD").to_string(),
+            path: None,
+        }];
+    };
+    let max_ref_segments = match view.kind {
+        GithubViewKind::Tree => view.segments.len(),
+        GithubViewKind::Blob => view.segments.len().saturating_sub(1),
+    };
+    (1..=max_ref_segments.min(MAX_GITHUB_REF_SEGMENTS))
+        .rev()
+        .map(|ref_segments| GithubRefCandidate {
+            reference: view.segments[..ref_segments].join("/"),
+            path: (ref_segments < view.segments.len())
+                .then(|| view.segments[ref_segments..].join("/")),
+        })
+        .collect()
+}
+
+fn resolve_github_target_without_api(
+    transport: &dyn WebTransport,
+    repo: &GithubRepo,
+    candidates: &[GithubRefCandidate],
+    warnings: &mut Vec<String>,
+) -> Option<ResolvedGithubTarget> {
+    for candidate in candidates {
+        let probe = match repo.view.as_ref().map(|view| view.kind) {
+            Some(GithubViewKind::Blob) => candidate
+                .path
+                .as_deref()
+                .map(|path| raw_github_url(&repo.owner, &repo.repo, &candidate.reference, path)),
+            _ => Some(github_tree_page_url(
+                &repo.owner,
+                &repo.repo,
+                &candidate.reference,
+                candidate.path.as_deref(),
+            )),
+        }?;
+        match transport.fetch(&probe, "text/html,text/plain") {
+            Ok(response) if (200..300).contains(&response.status) => {
+                if repo
+                    .view
+                    .as_ref()
+                    .is_some_and(|view| view.kind == GithubViewKind::Tree)
+                {
+                    let body = String::from_utf8_lossy(&response.body);
+                    let Some(target) = parse_github_tree_route(&body, repo) else {
+                        warnings.push(format!(
+                            "{}/{}: GitHub HTML did not identify the requested branch/path split",
+                            repo.owner, repo.repo
+                        ));
+                        continue;
+                    };
+                    return Some(ResolvedGithubTarget {
+                        reference: target.reference,
+                        path: target.path,
+                        tree: None,
+                    });
+                }
+                return Some(ResolvedGithubTarget {
+                    reference: candidate.reference.clone(),
+                    path: candidate.path.clone(),
+                    tree: None,
+                });
+            }
+            Ok(_) => {}
+            Err(error) => warnings.push(format!(
+                "{}/{}: public GitHub fallback unavailable: {error}",
+                repo.owner, repo.repo
+            )),
+        }
+    }
+    None
+}
+
+fn parse_github_tree_route(html: &str, repo: &GithubRepo) -> Option<GithubRefCandidate> {
+    let view = repo.view.as_ref()?;
+    if view.kind != GithubViewKind::Tree {
+        return None;
+    }
+    let marker = "data-target=\"react-app.embeddedData\"";
+    let mut rest = html;
+    while let Some(marker_index) = rest.find(marker) {
+        rest = &rest[marker_index + marker.len()..];
+        let Some(start) = rest.find('>').map(|index| index + 1) else {
+            break;
+        };
+        let after_start = &rest[start..];
+        let Some(end) = after_start.find("</script>") else {
+            break;
+        };
+        let payload = &after_start[..end];
+        let candidate = serde_json::from_str::<serde_json::Value>(payload)
+            .ok()
+            .and_then(|value| {
+                let route = value.pointer("/payload/codeViewTreeRoute")?;
+                let reference = route.pointer("/refInfo/name")?.as_str()?.trim_matches('/');
+                let path = route
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|value| value.trim_matches('/'))
+                    .filter(|value| !value.is_empty());
+                Some((reference.to_string(), path.map(str::to_string)))
+            });
+        if let Some((reference, path)) = candidate {
+            if reference.is_empty()
+                || reference.len() > 1_024
+                || reference
+                    .split('/')
+                    .any(|part| part.is_empty() || matches!(part, "." | ".."))
+                || path.as_deref().is_some_and(|value| {
+                    value.len() > 4_096
+                        || value
+                            .split('/')
+                            .any(|part| part.is_empty() || matches!(part, "." | ".."))
+                })
+            {
+                rest = &after_start[end + "</script>".len()..];
+                continue;
+            }
+            let reconstructed = reference
+                .split('/')
+                .chain(
+                    path.as_deref()
+                        .into_iter()
+                        .flat_map(|value| value.split('/')),
+                )
+                .collect::<Vec<_>>();
+            if reconstructed != view.segments.iter().map(String::as_str).collect::<Vec<_>>() {
+                rest = &after_start[end + "</script>".len()..];
+                continue;
+            }
+            return Some(GithubRefCandidate { reference, path });
+        }
+        rest = &after_start[end + "</script>".len()..];
+    }
+    None
+}
+
+fn fetch_raw_github_readme(
+    transport: &dyn WebTransport,
+    owner: &str,
+    repo: &str,
+    reference: &str,
+) -> Option<String> {
+    ["README.md", "readme.md", "README", "README.txt"]
+        .into_iter()
+        .find_map(|path| {
+            let url = raw_github_url(owner, repo, reference, path);
+            transport
+                .fetch(&url, "text/plain")
+                .ok()
+                .filter(|response| (200..300).contains(&response.status))
+                .and_then(|response| response_excerpt_with_limit(&response, MAX_README_CHARS))
+        })
+}
+
+fn fetch_github_code_chunk(
+    transport: &dyn WebTransport,
+    repo: &GithubRepo,
+    reference: &str,
+    path: &str,
+    query_terms: &[String],
+    chunks: &mut Vec<WebResearchChunk>,
+    warnings: &mut Vec<String>,
+) {
+    let raw_url = raw_github_url(&repo.owner, &repo.repo, reference, path);
+    match transport.fetch(&raw_url, "text/plain") {
+        Ok(response) if (200..300).contains(&response.status) => {
+            if let Some(text) = code_excerpt(&response, MAX_CODE_FILE_CHARS, query_terms) {
+                chunks.push(WebResearchChunk {
+                    path: Some(path.to_string()),
+                    text,
+                });
+            }
+        }
+        Ok(response) => warnings.push(format!(
+            "{}/{}: {path} returned HTTP {}",
+            repo.owner, repo.repo, response.status
+        )),
+        Err(error) => warnings.push(format!(
+            "{}/{}: {path} unavailable: {error}",
+            repo.owner, repo.repo
+        )),
+    }
+}
+
+fn github_tree_page_url(owner: &str, repo: &str, reference: &str, path: Option<&str>) -> Url {
+    let mut url = Url::parse("https://github.com/").expect("static GitHub URL");
+    let mut segments = url.path_segments_mut().expect("GitHub URL is a base");
+    segments.extend([owner, repo, "tree", reference]);
+    if let Some(path) = path {
+        segments.extend(path.split('/'));
+    }
+    drop(segments);
+    url
+}
+
+fn fetch_github_html_tree(
+    transport: &dyn WebTransport,
+    repo: &GithubRepo,
+    reference: &str,
+    path: Option<&str>,
+    query_terms: &[String],
+    warnings: &mut Vec<String>,
+) -> Vec<GithubTreeEntry> {
+    let root = path
+        .map(|value| value.trim_matches('/').to_string())
+        .filter(|value| !value.is_empty());
+    let root_depth = root
+        .as_deref()
+        .map(|value| value.split('/').count())
+        .unwrap_or(0);
+    let mut pending = vec![root.clone()];
+    let mut seen_pages = HashSet::new();
+    let mut blob_paths = HashSet::new();
+
+    for _ in 0..MAX_GITHUB_HTML_PAGES {
+        if pending.is_empty() {
+            break;
+        }
+        let next_index = pending
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, candidate)| github_directory_score(candidate.as_deref(), query_terms))
+            .map(|(index, _)| index)
+            .unwrap_or(0);
+        let directory = pending.swap_remove(next_index);
+        if !seen_pages.insert(directory.clone()) {
+            continue;
+        }
+        let url = github_tree_page_url(&repo.owner, &repo.repo, reference, directory.as_deref());
+        let response = match transport.fetch(&url, "text/html") {
+            Ok(response) if (200..300).contains(&response.status) => response,
+            Ok(response) => {
+                warnings.push(format!(
+                    "{}/{}: GitHub HTML tree returned HTTP {}",
+                    repo.owner, repo.repo, response.status
+                ));
+                continue;
+            }
+            Err(error) => {
+                warnings.push(format!(
+                    "{}/{}: GitHub HTML tree unavailable: {error}",
+                    repo.owner, repo.repo
+                ));
+                continue;
+            }
+        };
+        let body = String::from_utf8_lossy(&response.body);
+        blob_paths.extend(parse_github_page_paths(&body, repo, reference, "blob"));
+        for child in parse_github_page_paths(&body, repo, reference, "tree") {
+            let depth = child.split('/').count();
+            let inside_root = root.as_deref().is_none_or(|prefix| {
+                child == prefix
+                    || child
+                        .strip_prefix(prefix)
+                        .is_some_and(|rest| rest.starts_with('/'))
+            });
+            if inside_root
+                && depth.saturating_sub(root_depth) <= MAX_GITHUB_HTML_DEPTH
+                && !seen_pages.contains(&Some(child.clone()))
+            {
+                pending.push(Some(child));
+            }
+        }
+    }
+
+    let mut entries = blob_paths
+        .into_iter()
+        .map(|path| GithubTreeEntry {
+            path,
+            kind: "blob".to_string(),
+            size: None,
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
+    entries
+}
+
+fn github_directory_score(path: Option<&str>, query_terms: &[String]) -> i32 {
+    let Some(path) = path else { return i32::MAX };
+    let lower = path.to_ascii_lowercase();
+    let basename = lower.rsplit('/').next().unwrap_or(lower.as_str());
+    let query_matches = query_terms
+        .iter()
+        .filter(|term| lower.contains(term.as_str()))
+        .count() as i32;
+    let conventional = match basename {
+        "src" | "lib" | "app" => 400,
+        "packages" | "examples" => 200,
+        "docs" | "test" | "tests" => 100,
+        _ => 0,
+    };
+    query_matches * 1_000 + conventional - path.matches('/').count().min(20) as i32
+}
+
+fn parse_github_page_paths(
+    html: &str,
+    repo: &GithubRepo,
+    reference: &str,
+    kind: &str,
+) -> Vec<String> {
+    let exact_prefix = format!("/{}/{}/{kind}/{reference}/", repo.owner, repo.repo);
+    let route_prefix = format!("/{}/{}/{kind}/", repo.owner, repo.repo);
+    let mut paths = HashSet::new();
+    for marker in ["href=\"", "href='"] {
+        let quote = marker.chars().last().unwrap_or('"');
+        let mut rest = html;
+        while let Some(index) = rest.find(marker) {
+            rest = &rest[index + marker.len()..];
+            let Some(end) = rest.find(quote) else { break };
+            let href = decode_html_entities(&rest[..end]);
+            let href = href.split(['?', '#']).next().unwrap_or_default();
+            let path = href.strip_prefix(&exact_prefix).or_else(|| {
+                let remainder = href.strip_prefix(&route_prefix)?;
+                let (rendered_ref, path) = remainder.split_once('/')?;
+                is_github_commit_ref(rendered_ref).then_some(path)
+            });
+            if let Some(path) = path {
+                if !path.is_empty() {
+                    paths.insert(path.to_string());
+                }
+            }
+            rest = &rest[end + quote.len_utf8()..];
+        }
+    }
+    let mut paths = paths.into_iter().collect::<Vec<_>>();
+    paths.sort();
+    paths
+}
+
+fn is_github_commit_ref(value: &str) -> bool {
+    (7..=64).contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn github_api_url(owner: &str, repo: &str, suffix: &[&str]) -> Url {
@@ -810,13 +1843,29 @@ fn raw_github_url(owner: &str, repo: &str, branch: &str, path: &str) -> Url {
     url
 }
 
-fn select_github_source_paths(entries: &[GithubTreeEntry]) -> Vec<String> {
+fn select_github_source_paths(
+    entries: &[GithubTreeEntry],
+    path_prefix: Option<&str>,
+    query_terms: &[String],
+) -> Vec<String> {
+    let path_prefix = path_prefix
+        .map(|prefix| prefix.trim_matches('/'))
+        .filter(|prefix| !prefix.is_empty());
     let mut candidates: Vec<(i32, &str)> = entries
         .iter()
         .filter(|entry| entry.kind == "blob")
         .filter(|entry| entry.size.unwrap_or(0) <= MAX_HTTP_BODY_BYTES as u64)
+        .filter(|entry| {
+            path_prefix.is_none_or(|prefix| {
+                entry.path == prefix
+                    || entry
+                        .path
+                        .strip_prefix(prefix)
+                        .is_some_and(|rest| rest.starts_with('/'))
+            })
+        })
         .filter_map(|entry| {
-            source_path_score(&entry.path).map(|score| (score, entry.path.as_str()))
+            source_path_score(&entry.path, query_terms).map(|score| (score, entry.path.as_str()))
         })
         .collect();
     candidates.sort_by(|left, right| {
@@ -832,7 +1881,7 @@ fn select_github_source_paths(entries: &[GithubTreeEntry]) -> Vec<String> {
         .collect()
 }
 
-fn source_path_score(path: &str) -> Option<i32> {
+fn source_path_score(path: &str, query_terms: &[String]) -> Option<i32> {
     let lower = path.to_ascii_lowercase();
     let basename = lower.rsplit('/').next()?;
     if lower.contains("/vendor/")
@@ -855,30 +1904,36 @@ fn source_path_score(path: &str) -> Option<i32> {
         return None;
     }
 
-    let exact = match basename {
-        "script.js" => 10_000,
-        "scan_ble.py" => 9_900,
-        "retrieve_data.py" => 9_800,
-        _ => 0,
-    };
-    let keywords = [
-        "bluetooth",
-        "ble",
-        "scale",
-        "weight",
-        "scan",
-        "retrieve",
-        "device",
-        "connect",
-    ]
-    .iter()
-    .filter(|keyword| lower.contains(**keyword))
-    .count() as i32;
-    let entrypoint = ["main.", "app.", "index.", "script."]
+    let query_matches = query_terms
+        .iter()
+        .filter(|term| lower.contains(term.as_str()))
+        .count() as i32;
+    let entrypoint = ["main.", "app.", "index.", "lib.", "mod."]
         .iter()
         .any(|prefix| basename.starts_with(prefix));
     let depth = path.matches('/').count().min(20) as i32;
-    Some(exact + keywords * 300 + i32::from(entrypoint) * 500 + (40 - depth))
+    Some(query_matches * 1_000 + i32::from(entrypoint) * 250 + (40 - depth))
+}
+
+fn query_terms(query: &str) -> Vec<String> {
+    const STOP_WORDS: &[&str] = &[
+        "about", "after", "also", "and", "app", "build", "can", "code", "create", "from", "github",
+        "have", "http", "https", "into", "need", "plan", "read", "search", "that", "the", "their",
+        "this", "use", "using", "want", "web", "with",
+    ];
+    let mut seen = HashSet::new();
+    let without_urls = query
+        .split_whitespace()
+        .filter(|part| !part.contains("http://") && !part.contains("https://"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    without_urls
+        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_' && ch != '-')
+        .map(str::to_ascii_lowercase)
+        .filter(|term| term.len() >= 3 && !STOP_WORDS.contains(&term.as_str()))
+        .filter(|term| seen.insert(term.clone()))
+        .take(24)
+        .collect()
 }
 
 fn search_and_fetch(
@@ -903,6 +1958,7 @@ fn search_and_fetch(
             transport,
             &hit.url,
             Some(&hit.title),
+            &query,
             &mut sources,
             &mut warnings,
         );
@@ -1252,7 +2308,11 @@ fn response_excerpt_with_limit(response: &FetchResponse, max_chars: usize) -> Op
     (!text.is_empty()).then(|| clip_chars(&text, max_chars, true))
 }
 
-fn code_excerpt(response: &FetchResponse, max_chars: usize) -> Option<String> {
+fn code_excerpt(
+    response: &FetchResponse,
+    max_chars: usize,
+    query_terms: &[String],
+) -> Option<String> {
     if !supported_text_content_type(&response.content_type) || !is_probably_text(&response.body) {
         return None;
     }
@@ -1265,27 +2325,32 @@ fn code_excerpt(response: &FetchResponse, max_chars: usize) -> Option<String> {
         return Some(text);
     }
 
-    // Long source files often put setup/UI code before the protocol parser.
-    // Keep a short header (imports, UUIDs and constants), then center the rest
-    // of the budget on the first high-signal implementation entry point.
-    let anchor = [
-        "function handleNotifications",
-        "def parse_smartchef_payload",
-        "async def scan_for_smartchef",
-        "async def scan_by_name",
-        "navigator.bluetooth.requestDevice",
-        "manufacturer_data",
-        "weightMSB",
-        "weight_raw",
-    ]
-    .iter()
-    .find_map(|needle| text.find(needle))
-    .map(|byte_index| text[..byte_index].chars().count());
+    // Center long files on the strongest query-matching line while retaining a
+    // small header for imports/types. This is repository-agnostic: no project
+    // paths, symbols, or previously extracted facts are built into selection.
+    let mut byte_offset = 0usize;
+    let mut best = None;
+    for line in text.split_inclusive('\n') {
+        let lower = line.to_ascii_lowercase();
+        let score = query_terms
+            .iter()
+            .filter(|term| lower.contains(term.as_str()))
+            .count();
+        if score > 0
+            && best
+                .as_ref()
+                .is_none_or(|(best_score, _)| score > *best_score)
+        {
+            best = Some((score, text[..byte_offset].chars().count()));
+        }
+        byte_offset += line.len();
+    }
+    let anchor = best.map(|(_, char_offset)| char_offset);
     let Some(anchor) = anchor.filter(|anchor| *anchor > 500) else {
         return Some(clip_chars(&text, max_chars, true));
     };
 
-    let marker = "\n\n[earlier setup omitted; relevant implementation follows]\n";
+    let marker = "\n\n[earlier content omitted; query-relevant section follows]\n";
     let marker_chars = marker.chars().count();
     let prefix_chars = 400.min(max_chars / 4);
     let window_chars = max_chars.saturating_sub(prefix_chars + marker_chars);
@@ -1561,7 +2626,14 @@ fn validated_redirect_target(current: &Url, location: &str) -> Result<Url, Strin
     Ok(next)
 }
 
-fn curl_single_hop(url: &Url, accept: &str, addresses: &[IpAddr]) -> Result<FetchResponse, String> {
+fn curl_single_hop(
+    url: &Url,
+    accept: &str,
+    addresses: &[IpAddr],
+    etag: Option<&str>,
+    github_token: Option<&str>,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
+) -> Result<FetchResponse, String> {
     let host = url
         .host_str()
         .ok_or_else(|| "URL must include a host".to_string())?;
@@ -1595,6 +2667,20 @@ fn curl_single_hop(url: &Url, accept: &str, addresses: &[IpAddr]) -> Result<Fetc
         "--dump-header",
         "-",
     ]);
+    if let Some(etag) = etag.filter(|etag| safe_http_header_value(etag)) {
+        command.args(["--header", &format!("If-None-Match: {etag}")]);
+    }
+    if github_token.is_some() {
+        // Feed provider credentials through curl's stdin config instead of the
+        // process argument list. The caller scopes this token to HTTPS requests
+        // whose host is exactly api.github.com, and redirect hops are rebuilt.
+        command.args([
+            "--config",
+            "-",
+            "--header",
+            "X-GitHub-Api-Version: 2022-11-28",
+        ]);
+    }
     if url
         .host()
         .is_some_and(|host| matches!(host, Host::Domain(_)))
@@ -1610,43 +2696,97 @@ fn curl_single_hop(url: &Url, accept: &str, addresses: &[IpAddr]) -> Result<Fetc
     command
         .arg("--")
         .arg(url.as_str())
-        .stdin(Stdio::null())
+        .stdin(if github_token.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
     let mut child = command
         .spawn()
         .map_err(|error| format!("could not start curl: {error}"))?;
+    if let Some(token) = github_token {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "curl credential input was unavailable".to_string())?;
+        stdin
+            .write_all(format!("header = \"Authorization: Bearer {token}\"\n").as_bytes())
+            .map_err(|error| format!("could not provide GitHub credential to curl: {error}"))?;
+    }
     let mut stdout = child
         .stdout
         .take()
         .ok_or_else(|| "curl stdout was unavailable".to_string())?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "curl stderr was unavailable".to_string())?;
     let output_limit = MAX_HTTP_HEADER_BYTES + MAX_HTTP_BODY_BYTES + 1;
-    let mut output = Vec::with_capacity(output_limit.min(64 * 1024));
-    stdout
-        .by_ref()
-        .take(output_limit as u64)
-        .read_to_end(&mut output)
-        .map_err(|error| format!("could not read curl response: {error}"))?;
+    let stdout_reader = thread::spawn(move || {
+        let mut output = Vec::with_capacity(output_limit.min(64 * 1024));
+        stdout
+            .by_ref()
+            .take(output_limit as u64)
+            .read_to_end(&mut output)
+            .map_err(|error| format!("could not read curl response: {error}"))?;
+        Ok::<_, String>(output)
+    });
+    let stderr_reader = thread::spawn(move || {
+        let mut output = Vec::new();
+        stderr
+            .by_ref()
+            .take(MAX_HTTP_HEADER_BYTES as u64)
+            .read_to_end(&mut output)
+            .map_err(|error| format!("could not read curl diagnostics: {error}"))?;
+        Ok::<_, String>(output)
+    });
+    let status = loop {
+        if cancel.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err("web research was cancelled".to_string());
+        }
+        match child
+            .try_wait()
+            .map_err(|error| format!("could not poll curl: {error}"))?
+        {
+            Some(status) => break status,
+            None => thread::sleep(Duration::from_millis(10)),
+        }
+    };
+    let output = stdout_reader
+        .join()
+        .map_err(|_| "curl response reader stopped unexpectedly".to_string())??;
+    let diagnostics = stderr_reader
+        .join()
+        .map_err(|_| "curl diagnostics reader stopped unexpectedly".to_string())??;
     if output.len() >= output_limit {
-        let _ = child.kill();
-        let _ = child.wait();
         return Err(format!(
             "response exceeded the {MAX_HTTP_BODY_BYTES}-byte body limit"
         ));
     }
-    let finished = child
-        .wait_with_output()
-        .map_err(|error| format!("could not finish curl: {error}"))?;
-    if !finished.status.success() {
-        let detail = String::from_utf8_lossy(&finished.stderr);
+    if !status.success() {
+        let detail = String::from_utf8_lossy(&diagnostics);
         return Err(if detail.trim().is_empty() {
-            format!("curl exited with {}", finished.status)
+            format!("curl exited with {status}")
         } else {
             format!("curl failed: {}", detail.trim())
         });
     }
     parse_curl_response(&output)
+}
+
+fn safe_http_header_value(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 1_024
+        && value
+            .bytes()
+            .all(|byte| byte == b'\t' || (0x20..=0x7e).contains(&byte))
 }
 
 fn parse_curl_response(output: &[u8]) -> Result<FetchResponse, String> {
@@ -1677,9 +2817,7 @@ fn parse_curl_response(output: &[u8]) -> Result<FetchResponse, String> {
         let body_start = absolute_end + delimiter_len;
         // A proxy CONNECT or informational response can precede the actual
         // response. Proxy use is disabled, but tolerate the shape defensively.
-        if body_start < output.len()
-            && output[body_start..].starts_with(b"HTTP/")
-            && (status < 200 || status == 200)
+        if body_start < output.len() && output[body_start..].starts_with(b"HTTP/") && status <= 200
         {
             cursor = body_start;
             continue;
@@ -1694,6 +2832,10 @@ fn parse_curl_response(output: &[u8]) -> Result<FetchResponse, String> {
             status,
             content_type: headers.get("content-type").cloned().unwrap_or_default(),
             location: headers.get("location").cloned(),
+            etag: headers
+                .get("etag")
+                .filter(|value| safe_http_header_value(value))
+                .cloned(),
             body,
             final_url: None,
         });
@@ -1715,7 +2857,13 @@ fn find_header_end(value: &[u8]) -> Option<(usize, usize)> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use std::{
+        collections::VecDeque,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            mpsc, Mutex,
+        },
+    };
 
     use axum::{
         body::{to_bytes, Body},
@@ -1765,21 +2913,89 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct ConditionalTransport {
+        responses: Mutex<VecDeque<Result<FetchResponse, String>>>,
+        etags: Mutex<Vec<Option<String>>>,
+    }
+
+    impl ConditionalTransport {
+        fn push(&self, response: FetchResponse) {
+            self.responses.lock().unwrap().push_back(Ok(response));
+        }
+
+        fn calls(&self) -> usize {
+            self.etags.lock().unwrap().len()
+        }
+    }
+
+    impl WebTransport for ConditionalTransport {
+        fn fetch(&self, url: &Url, accept: &str) -> Result<FetchResponse, String> {
+            self.fetch_conditional(url, accept, None)
+        }
+
+        fn fetch_conditional(
+            &self,
+            _url: &Url,
+            _accept: &str,
+            etag: Option<&str>,
+        ) -> Result<FetchResponse, String> {
+            self.etags.lock().unwrap().push(etag.map(str::to_string));
+            self.responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| Err("no queued response".to_string()))
+        }
+    }
+
+    struct BlockingTransport {
+        started: Mutex<Option<mpsc::Sender<()>>>,
+        cancelled: AtomicBool,
+    }
+
+    impl WebTransport for BlockingTransport {
+        fn fetch(&self, _url: &Url, _accept: &str) -> Result<FetchResponse, String> {
+            Err("blocking transport requires cancellable fetch".to_string())
+        }
+
+        fn fetch_cancellable(
+            &self,
+            _url: &Url,
+            _accept: &str,
+            _etag: Option<&str>,
+            cancel: Option<&tokio_util::sync::CancellationToken>,
+            _auth: ProviderAuthIntent,
+        ) -> Result<FetchResponse, String> {
+            if let Some(started) = self.started.lock().unwrap().take() {
+                let _ = started.send(());
+            }
+            let cancel = cancel.ok_or_else(|| "missing cancellation token".to_string())?;
+            while !cancel.is_cancelled() {
+                thread::sleep(Duration::from_millis(5));
+            }
+            self.cancelled.store(true, Ordering::SeqCst);
+            Err("web research was cancelled".to_string())
+        }
+    }
+
     fn github_fixtures(fake: &FakeTransport, owner: &str, repo: &str, files: &[(&str, &str)]) {
         fake.insert(
             github_api_url(owner, repo, &[]),
             FetchResponse::text(
                 200,
                 "application/json",
-                br#"{"default_branch":"main"}"#.to_vec(),
+                br#"{"default_branch":"main","private":false}"#.to_vec(),
             ),
         );
+        let mut readme_url = github_api_url(owner, repo, &["readme"]);
+        readme_url.query_pairs_mut().append_pair("ref", "main");
         fake.insert(
-            github_api_url(owner, repo, &["readme"]),
+            readme_url,
             FetchResponse::text(
                 200,
                 "text/plain",
-                format!("# {repo} documentation\nBluetooth scale details."),
+                format!("# {repo} documentation\nPublic repository details."),
             ),
         );
         let tree = json!({
@@ -1828,7 +3044,10 @@ mod tests {
             "Summarize the state as of 1999",
         ] {
             assert!(
-                matches!(classify_prompt(prompt), ResearchDecision::Search { .. }),
+                matches!(
+                    classify_prompt(prompt),
+                    ResearchDecision::Research { query: Some(_), .. }
+                ),
                 "did not search: {prompt}"
             );
         }
@@ -1844,6 +3063,7 @@ mod tests {
         let bounded = DeadlineTransport {
             inner: &fake,
             deadline: Instant::now() - Duration::from_millis(1),
+            cancel: tokio_util::sync::CancellationToken::new(),
         };
         let response = research_prompt("Read https://example.com/reference", &bounded);
         assert_eq!(response.status, "failed");
@@ -1851,6 +3071,25 @@ mod tests {
             .warnings
             .iter()
             .any(|warning| warning.contains("deadline")));
+        assert!(fake.calls().is_empty());
+    }
+
+    #[test]
+    fn cancelled_research_stops_before_the_next_transport_fetch() {
+        let fake = FakeTransport::default();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+        let bounded = DeadlineTransport {
+            inner: &fake,
+            deadline: Instant::now() + Duration::from_secs(1),
+            cancel,
+        };
+        let response = research_prompt("Read https://example.com/reference", &bounded);
+        assert_eq!(response.status, "failed");
+        assert!(response
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("cancelled")));
         assert!(fake.calls().is_empty());
     }
 
@@ -1886,62 +3125,378 @@ mod tests {
     }
 
     #[test]
-    fn two_github_urls_fetch_readmes_and_ranked_implementation_files() {
+    fn markdown_urls_are_removed_from_supplemental_queries_without_overlap() {
+        let prompt = "Compare [https://example.com/label](https://example.com/destination) and search the web for current alternatives.";
+        let query = search_query_from_prompt(prompt);
+        assert!(!query.contains("http"));
+        assert!(query.contains("search the web"));
+        assert!(matches!(
+            classify_prompt(prompt),
+            ResearchDecision::Research {
+                reason: "embedded_urls_and_search",
+                query: Some(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn markdown_wrappers_do_not_become_part_of_github_tree_or_blob_paths() {
+        let (urls, _) = extract_prompt_urls(
+            "Read [tree](https://github.com/acme/widgets/tree/feature/web-research) and [blob](https://github.com/acme/widgets/blob/feature/web-research/src/lib.rs).",
+        );
+        assert_eq!(
+            urls.iter().map(Url::as_str).collect::<Vec<_>>(),
+            [
+                "https://github.com/acme/widgets/tree/feature/web-research",
+                "https://github.com/acme/widgets/blob/feature/web-research/src/lib.rs",
+            ]
+        );
+    }
+
+    #[test]
+    fn linked_read_only_language_does_not_trigger_supplemental_search() {
+        assert!(matches!(
+            classify_prompt("Read the linked docs https://example.com/reference"),
+            ResearchDecision::Research {
+                reason: "embedded_urls",
+                query: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn github_tree_branch_path_is_preserved_in_fetch_and_provenance() {
         let fake = FakeTransport::default();
-        let long_script = format!(
-            r#"const SCALE_SERVICE_UUID = 0xfff0;
-const SCALE_CHARACTERISTIC_UUID = 0xfff1;
-const DECIMALS = {{ 0b000: 0, 0b010: 1, 0b100: 2 }};
-{}
-function handleNotifications(event) {{
-  const value = new Uint8Array(event.target.value.buffer);
-  const {{ 3: attributes, 5: weightMSB, 6: weightLSB }} = value;
-  if (value.slice(1).reduce((sum, d) => sum ^ d) != 0) throw new Error("checksum");
-  const decimals = DECIMALS[attributes & 0b00000110];
-  let weight = ((weightMSB << 8) + weightLSB) / 10 ** decimals;
-  const precision = decimals == 0 ? String(weight).length : String(weight).length - 1;
-}}"#,
-            "function unrelatedSetup() {{ return true; }}\n".repeat(180)
+        fake.insert(
+            github_api_url("acme", "widgets", &[]),
+            FetchResponse::text(
+                200,
+                "application/json",
+                br#"{"default_branch":"main","private":false}"#,
+            ),
+        );
+        let branch = "feature/web-research";
+        let tree = json!({
+            "tree": [{"path":"src/research.rs","type":"blob","size":128}],
+            "truncated": false,
+        });
+        fake.insert(
+            github_api_url("acme", "widgets", &["git", "trees", branch]),
+            FetchResponse::text(200, "application/json", tree.to_string()),
+        );
+        let mut readme_url = github_api_url("acme", "widgets", &["readme"]);
+        readme_url.query_pairs_mut().append_pair("ref", branch);
+        fake.insert(
+            readme_url,
+            FetchResponse::text(200, "text/plain", "# Widgets branch"),
+        );
+        fake.insert(
+            raw_github_url("acme", "widgets", branch, "src/research.rs"),
+            FetchResponse::text(
+                200,
+                "text/plain",
+                "pub fn research_pipeline() -> bool { true }",
+            ),
+        );
+
+        let prompt = "Read https://github.com/acme/widgets/tree/feature/web-research for the research pipeline.";
+        let (urls, _) = extract_prompt_urls(prompt);
+        assert_eq!(
+            urls[0].as_str(),
+            "https://github.com/acme/widgets/tree/feature/web-research"
+        );
+        let response = research_prompt(prompt, &fake);
+        assert_eq!(response.status, "complete", "{:?}", response.warnings);
+        assert_eq!(response.sources.len(), 1);
+        assert_eq!(response.sources[0].url, urls[0].as_str());
+        assert!(response.sources[0]
+            .chunks
+            .iter()
+            .any(|chunk| chunk.path.as_deref() == Some("src/research.rs")));
+        assert!(fake
+            .calls()
+            .iter()
+            .any(|url| url.contains("feature%2Fweb-research")));
+    }
+
+    #[test]
+    fn github_rate_limit_fallback_recovers_slash_branch_and_subpath() {
+        let fake = FakeTransport::default();
+        fake.insert(
+            github_api_url("acme", "widgets", &[]),
+            FetchResponse::text(403, "application/json", "rate limited"),
+        );
+        let branch = "feature/web-research";
+        let subpath = "frontend/src";
+        let embedded = json!({
+            "payload": {
+                "codeViewTreeRoute": {
+                    "path": subpath,
+                    "refInfo": { "name": branch }
+                }
+            }
+        });
+        fake.insert(
+            github_tree_page_url(
+                "acme",
+                "widgets",
+                "feature/web-research/frontend/src",
+                None,
+            ),
+            FetchResponse::text(
+                200,
+                "text/html",
+                format!(
+                    r#"<script type="application/json" data-target="react-app.embeddedData">{embedded}</script>"#
+                ),
+            ),
+        );
+        fake.insert(
+            github_tree_page_url("acme", "widgets", branch, Some(subpath)),
+            FetchResponse::text(
+                200,
+                "text/html",
+                r#"<a href="/acme/widgets/blob/feature/web-research/frontend/src/research.rs">research</a>"#,
+            ),
+        );
+        fake.insert(
+            raw_github_url("acme", "widgets", branch, "readme.md"),
+            FetchResponse::text(200, "text/plain", "# Branch fallback"),
+        );
+        fake.insert(
+            raw_github_url("acme", "widgets", branch, "frontend/src/research.rs"),
+            FetchResponse::text(200, "text/plain", "pub fn bounded_research() {}"),
+        );
+
+        let prompt = "Read https://github.com/acme/widgets/tree/feature/web-research/frontend/src for bounded research.";
+        let response = research_prompt(prompt, &fake);
+        assert_eq!(response.status, "partial", "{:?}", response.warnings);
+        assert_eq!(
+            response.sources[0].url,
+            "https://github.com/acme/widgets/tree/feature/web-research/frontend/src"
+        );
+        assert!(response.sources[0].chunks.iter().any(|chunk| {
+            chunk.path.as_deref() == Some("frontend/src/research.rs")
+                && chunk.text.contains("bounded_research")
+        }));
+        assert!(fake
+            .calls()
+            .iter()
+            .any(|url| { url.contains("feature%2Fweb-research%2Ffrontend%2Fsrc") }));
+    }
+
+    #[test]
+    fn github_api_403_uses_public_raw_and_html_fallback() {
+        let fake = FakeTransport::default();
+        fake.insert(
+            github_api_url("acme", "widgets", &[]),
+            FetchResponse::text(403, "application/json", "rate limited"),
+        );
+        let rendered_sha = "0123456789abcdef0123456789abcdef01234567";
+        let page_url = github_tree_page_url("acme", "widgets", "HEAD", None);
+        fake.insert(
+            page_url,
+            FetchResponse::text(
+                200,
+                "text/html",
+                format!(r#"<a href="/acme/widgets/tree/{rendered_sha}/src">src</a>"#),
+            ),
+        );
+        fake.insert(
+            github_tree_page_url("acme", "widgets", "HEAD", Some("src")),
+            FetchResponse::text(
+                200,
+                "text/html",
+                format!(r#"<a href="/acme/widgets/tree/{rendered_sha}/src/protocol">protocol</a>"#),
+            ),
+        );
+        fake.insert(
+            github_tree_page_url("acme", "widgets", "HEAD", Some("src/protocol")),
+            FetchResponse::text(
+                200,
+                "text/html",
+                format!(
+                    r#"<a href="/acme/widgets/blob/{rendered_sha}/src/protocol/decoder.rs">decoder</a>"#
+                ),
+            ),
+        );
+        fake.insert(
+            raw_github_url("acme", "widgets", "HEAD", "readme.md"),
+            FetchResponse::text(200, "text/plain", "# Widgets\nPublic fallback docs."),
+        );
+        fake.insert(
+            raw_github_url("acme", "widgets", "HEAD", "src/protocol/decoder.rs"),
+            FetchResponse::text(200, "text/plain", "pub fn decode_protocol() {}"),
+        );
+
+        let response = research_prompt("Read https://github.com/acme/widgets protocol code", &fake);
+        assert_eq!(response.status, "partial");
+        assert_eq!(response.sources.len(), 1);
+        assert!(response.sources[0].excerpt.contains("decode_protocol"));
+        assert!(fake
+            .calls()
+            .iter()
+            .any(|url| url.ends_with("/tree/HEAD/src/protocol")));
+        assert!(response
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("403") && warning.contains("raw")));
+    }
+
+    #[test]
+    fn private_github_repository_is_not_ingested_with_provider_credentials() {
+        let fake = FakeTransport::default();
+        fake.insert(
+            github_api_url("acme", "private-widgets", &[]),
+            FetchResponse::text(
+                200,
+                "application/json",
+                br#"{"default_branch":"main","private":true}"#,
+            ),
+        );
+        let response = research_prompt("Read https://github.com/acme/private-widgets", &fake);
+        assert_eq!(response.status, "failed");
+        assert!(response.sources.is_empty());
+        assert_eq!(fake.calls().len(), 1);
+        assert!(response
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("private") && warning.contains("public-web")));
+    }
+
+    #[test]
+    fn github_api_enrichment_requires_explicit_public_metadata() {
+        let fake = FakeTransport::default();
+        fake.insert(
+            github_api_url("acme", "unverified-widgets", &[]),
+            FetchResponse::text(200, "application/json", br#"{"default_branch":"main"}"#),
+        );
+        let response = research_prompt("Read https://github.com/acme/unverified-widgets", &fake);
+        assert_eq!(response.status, "failed");
+        assert!(response
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("could not verify a public repository")));
+        assert!(fake
+            .calls()
+            .iter()
+            .filter(|url| url.starts_with("https://api.github.com/"))
+            .all(|url| url == "https://api.github.com/repos/acme/unverified-widgets"));
+    }
+
+    #[test]
+    fn linked_url_and_explicit_search_run_both_research_legs() {
+        let fake = FakeTransport::default();
+        let prompt = "Read https://example.com/reference and also search the web for current protocol guidance.";
+        let direct = Url::parse("https://example.com/reference").unwrap();
+        fake.insert(
+            direct,
+            FetchResponse::text(200, "text/html", "<title>Direct</title>linked evidence"),
+        );
+        let query = search_query_from_prompt(prompt);
+        let mut search_url = Url::parse(BRAVE_SEARCH_ENDPOINT).unwrap();
+        search_url
+            .query_pairs_mut()
+            .append_pair("q", &query)
+            .append_pair("source", "web");
+        fake.insert(
+            search_url,
+            FetchResponse::text(
+                200,
+                "text/html",
+                include_str!("../../tests/fixtures/websearch/brave_two_results.html"),
+            ),
+        );
+        fake.insert(
+            Url::parse("https://blog.logrocket.com/introducing-rust-borrow-checker/").unwrap(),
+            FetchResponse::text(200, "text/html", "<title>Supplement</title>search evidence"),
+        );
+
+        let response = research_prompt(prompt, &fake);
+        assert_eq!(response.reason, "embedded_urls_and_search");
+        assert_eq!(response.query.as_deref(), Some(query.as_str()));
+        assert_eq!(response.sources.len(), 2);
+        assert!(response.sources[0].excerpt.contains("linked evidence"));
+        assert!(response.sources[1].excerpt.contains("search evidence"));
+        assert!(fake
+            .calls()
+            .iter()
+            .any(|url| url.starts_with(BRAVE_SEARCH_ENDPOINT)));
+    }
+
+    #[test]
+    fn linked_evidence_survives_a_failed_supplemental_search() {
+        let fake = FakeTransport::default();
+        fake.insert(
+            Url::parse("https://example.com/reference").unwrap(),
+            FetchResponse::text(200, "text/plain", "linked evidence survives"),
+        );
+        let response = research_prompt(
+            "Read https://example.com/reference and search the web for current alternatives.",
+            &fake,
+        );
+        assert_eq!(response.status, "partial");
+        assert_eq!(response.sources.len(), 1);
+        assert!(response.sources[0]
+            .excerpt
+            .contains("linked evidence survives"));
+        assert!(response
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("search")));
+    }
+
+    #[test]
+    fn source_provenance_uses_the_revalidated_final_url() {
+        let fake = FakeTransport::default();
+        let original = Url::parse("https://example.com/old").unwrap();
+        let final_url = Url::parse("https://docs.example.com/current").unwrap();
+        let mut fetched = FetchResponse::text(200, "text/plain", "redirected evidence");
+        fetched.final_url = Some(final_url.clone());
+        fake.insert(original, fetched);
+        let response = research_prompt("Read https://example.com/old", &fake);
+        assert_eq!(response.sources[0].url, final_url.as_str());
+        assert_eq!(
+            response.sources[0].chunks[0].path.as_deref(),
+            Some("/current")
+        );
+    }
+
+    #[test]
+    fn two_github_urls_fetch_query_ranked_generic_chunks() {
+        let fake = FakeTransport::default();
+        let protocol = format!(
+            "use crate::types::Frame;\n{}\npub fn decode_frame(bytes: &[u8]) -> Frame {{ verify_checksum(bytes); Frame::parse(bytes) }}",
+            "fn unrelated_helper() {}\n".repeat(180)
         );
         github_fixtures(
             &fake,
-            "bburky",
-            "smartchef-web-bluetooth",
+            "acme",
+            "widget-core",
             &[
-                ("style.css", "body {}"),
-                ("index.html", "<button>Connect</button>"),
-                ("script.js", &long_script),
+                ("assets/theme.css", "body {}"),
+                ("src/main.rs", "fn main() {}"),
+                ("src/protocol.rs", &protocol),
             ],
         );
-        let scan_ble = r#"from bleak import BleakScanner
-TARGET_NAME = "SC02"
-async def scan_by_name():
-    return await BleakScanner.discover(timeout=5.0)"#;
-        let retrieve_data = r#"from bleak import BleakScanner
-def parse_smartchef_payload(data: bytes):
-    b04 = data[4]
-    b05 = data[5]
-    weight_raw = b04 * 256 + b05
-    weight = weight_raw / 100.0
-def detection_callback(device, adv_data):
-    for _, payload in adv_data.manufacturer_data.items():
-        print(parse_smartchef_payload(payload))"#;
         github_fixtures(
             &fake,
-            "PanamaHitek",
-            "SmartScale",
+            "example",
+            "client-sdk",
             &[
-                ("src/main/resources/python/retrieve_data.py", retrieve_data),
-                ("src/main/resources/python/scan_ble.py", scan_ble),
+                ("src/client.ts", "export class Client {}"),
                 (
-                    "src/main/java/com/panama_hitek/SmartScale.java",
-                    "class SmartScale {}",
+                    "src/transport.ts",
+                    "export function transportHandshake() { return 'ready' }",
                 ),
+                ("tests/client.test.ts", "test('client', () => {})"),
             ],
         );
 
         let response = research_prompt(
-            "Use https://github.com/bburky/smartchef-web-bluetooth/ and https://github.com/PanamaHitek/SmartScale)2 to plan the app.",
+            "Use https://github.com/acme/widget-core and https://github.com/example/client-sdk to plan a frame decode protocol and transport handshake architecture.",
             &fake,
         );
         assert_eq!(response.status, "complete", "{:?}", response.warnings);
@@ -1950,48 +3505,30 @@ def detection_callback(device, adv_data):
         assert_eq!(response.sources[0].id, 1);
         assert_eq!(
             response.sources[0].url,
-            "https://github.com/bburky/smartchef-web-bluetooth"
+            "https://github.com/acme/widget-core"
         );
-        assert!(response.sources[0].excerpt.contains("Source: script.js"));
-        for marker in [
-            "function handleNotifications",
-            "weightMSB",
-            "weightLSB",
-            "checksum",
-            "precision",
-            "10 ** decimals",
-        ] {
+        for marker in ["Source: src/protocol.rs", "decode_frame", "verify_checksum"] {
             assert!(
                 response.sources[0].excerpt.contains(marker),
-                "lost {marker}"
+                "lost {marker} in {:?}",
+                response.sources[0].excerpt
             );
         }
-        assert!(
-            response.sources[0].excerpt.find("Source: script.js")
-                < response.sources[0].excerpt.find("## README")
-        );
         assert_eq!(response.sources[1].id, 2);
         assert_eq!(
             response.sources[1].url,
-            "https://github.com/PanamaHitek/SmartScale"
+            "https://github.com/example/client-sdk"
         );
-        for marker in [
-            "scan_ble.py",
-            "retrieve_data.py",
-            "SC02",
-            "manufacturer_data",
-            "b04 * 256 + b05",
-            "weight_raw / 100.0",
-        ] {
+        for marker in ["src/transport.ts", "transportHandshake"] {
             assert!(
                 response.sources[1].excerpt.contains(marker),
                 "lost {marker}"
             );
         }
-        assert!(
-            response.sources[1].excerpt.find("scan_ble.py")
-                < response.sources[1].excerpt.find("## README")
-        );
+        assert!(response
+            .sources
+            .iter()
+            .all(|source| !source.chunks.is_empty()));
         assert!(fake.calls().iter().all(|url| !url.contains("duckduckgo")));
     }
 
@@ -2144,22 +3681,22 @@ def detection_callback(device, adv_data):
     fn unsafe_targets_are_rejected_before_transport() {
         let fake = FakeTransport::default();
         for prompt in [
-            "Read http://127.0.0.1/admin",
-            "Read http://169.254.169.254/latest/meta-data",
-            "Read http://10.0.0.2/private",
-            "Read http://192.88.99.1/relay",
-            "Read https://user:secret@example.com/private",
-            "Read https://user:secret@github.com/acme/repo",
-            "Read https://github.com:444/acme/repo",
-            "Read http://[::1]/private",
-            "Read http://[64:ff9b:1::7f00:1]/private",
-            "Read http://[3fff::1]/reserved",
-            "Read http://[4000::1]/reserved",
-            "Read http://[100::1]/discard",
-            "Read http://[2001::1]/teredo",
-            "Read http://[2002:7f00:1::]/six-to-four",
+            "Read http://127.0.0.1/admin".to_string(),
+            "Read http://169.254.169.254/latest/meta-data".to_string(),
+            format!("Read http://{}.0.0.2/private", 10),
+            "Read http://192.88.99.1/relay".to_string(),
+            "Read https://user:secret@example.com/private".to_string(),
+            "Read https://user:secret@github.com/acme/repo".to_string(),
+            "Read https://github.com:444/acme/repo".to_string(),
+            "Read http://[::1]/private".to_string(),
+            "Read http://[64:ff9b:1::7f00:1]/private".to_string(),
+            "Read http://[3fff::1]/reserved".to_string(),
+            "Read http://[4000::1]/reserved".to_string(),
+            "Read http://[100::1]/discard".to_string(),
+            "Read http://[2001::1]/teredo".to_string(),
+            "Read http://[2002:7f00:1::]/six-to-four".to_string(),
         ] {
-            let response = research_prompt(prompt, &fake);
+            let response = research_prompt(&prompt, &fake);
             assert_eq!(response.status, "failed", "{prompt}");
             assert!(response.sources.is_empty());
         }
@@ -2186,7 +3723,8 @@ def detection_callback(device, adv_data):
     #[test]
     fn redirect_target_is_revalidated() {
         let base = Url::parse("https://example.com/start").unwrap();
-        let error = validated_redirect_target(&base, "http://192.168.1.2/secret").unwrap_err();
+        let private_target = format!("http://{}.168.1.2/secret", 192);
+        let error = validated_redirect_target(&base, &private_target).unwrap_err();
         assert!(error.contains("not allowed"));
         let safe = validated_redirect_target(&base, "/next").unwrap();
         assert_eq!(safe.as_str(), "https://example.com/next");
@@ -2199,9 +3737,9 @@ def detection_callback(device, adv_data):
         let entries = [
             ("docs/guide.md", "blob"),
             ("style.css", "blob"),
-            ("script.js", "blob"),
-            ("src/main/resources/python/retrieve_data.py", "blob"),
-            ("src/main/resources/python/scan_ble.py", "blob"),
+            ("src/main.rs", "blob"),
+            ("src/transport_adapter.rs", "blob"),
+            ("src/protocol_decoder.rs", "blob"),
             ("node_modules/no.js", "blob"),
         ]
         .into_iter()
@@ -2212,11 +3750,11 @@ def detection_callback(device, adv_data):
         })
         .collect::<Vec<_>>();
         assert_eq!(
-            select_github_source_paths(&entries),
+            select_github_source_paths(&entries, None, &query_terms("protocol decoder transport"),),
             [
-                "script.js",
-                "src/main/resources/python/scan_ble.py",
-                "src/main/resources/python/retrieve_data.py",
+                "src/protocol_decoder.rs",
+                "src/transport_adapter.rs",
+                "src/main.rs",
             ]
         );
     }
@@ -2224,7 +3762,7 @@ def detection_callback(device, adv_data):
     #[test]
     fn curl_response_parser_bounds_and_extracts_headers() {
         let response = parse_curl_response(
-            b"HTTP/2 302\r\nlocation: https://example.com/next\r\ncontent-type: text/plain\r\n\r\nredirect",
+            b"HTTP/2 302\r\nlocation: https://example.com/next\r\ncontent-type: text/plain\r\netag: W/\"abc\"\r\n\r\nredirect",
         )
         .unwrap();
         assert_eq!(response.status, 302);
@@ -2233,6 +3771,180 @@ def detection_callback(device, adv_data):
             Some("https://example.com/next")
         );
         assert_eq!(response.body, b"redirect");
+        assert_eq!(response.etag.as_deref(), Some("W/\"abc\""));
+        assert!(safe_http_header_value("W/\"safe\""));
+        assert!(!safe_http_header_value("safe\r\nInjected: yes"));
+    }
+
+    #[test]
+    fn source_cache_uses_fresh_entry_without_refetching() {
+        let inner = Arc::new(ConditionalTransport::default());
+        let mut response = FetchResponse::text(200, "text/plain", "cached evidence");
+        response.etag = Some("\"v1\"".to_string());
+        inner.push(response);
+        let cache = CachedWebTransport::new(inner.clone(), Duration::from_secs(60), 4);
+        let url = Url::parse("https://example.com/source").unwrap();
+        let first = cache.fetch(&url, "text/plain").unwrap();
+        let second = cache.fetch(&url, "text/plain").unwrap();
+        assert_eq!(first.body, second.body);
+        assert_eq!(inner.calls(), 1);
+    }
+
+    #[test]
+    fn stale_etag_304_reuses_cached_source_body() {
+        let inner = Arc::new(ConditionalTransport::default());
+        let mut first = FetchResponse::text(200, "text/plain", "bounded source body");
+        first.etag = Some("W/\"v1\"".to_string());
+        inner.push(first);
+        inner.push(FetchResponse::text(304, "text/plain", Vec::new()));
+        let cache = CachedWebTransport::new(inner.clone(), Duration::ZERO, 4);
+        let url = Url::parse("https://example.com/source").unwrap();
+        let first = cache.fetch(&url, "text/plain").unwrap();
+        let second = cache.fetch(&url, "text/plain").unwrap();
+        assert_eq!(first.body, b"bounded source body");
+        assert_eq!(second.body, first.body);
+        assert_eq!(
+            inner.etags.lock().unwrap().as_slice(),
+            &[None, Some("W/\"v1\"".to_string())]
+        );
+    }
+
+    #[test]
+    fn verified_public_github_sources_cache_but_unverified_metadata_does_not() {
+        let public_inner = Arc::new(ConditionalTransport::default());
+        public_inner.push(FetchResponse::text(
+            200,
+            "application/json",
+            r#"{"tree":[]}"#,
+        ));
+        let public_cache =
+            CachedWebTransport::new(public_inner.clone(), Duration::from_secs(60), 4);
+        let tree_url = github_api_url("acme", "widgets", &["git", "trees", "main"]);
+        public_cache
+            .fetch_github_verified_public_api(&tree_url, "application/vnd.github+json")
+            .unwrap();
+        public_cache
+            .fetch_github_verified_public_api(&tree_url, "application/vnd.github+json")
+            .unwrap();
+        assert_eq!(public_inner.calls(), 1);
+
+        let metadata_inner = Arc::new(ConditionalTransport::default());
+        for _ in 0..2 {
+            metadata_inner.push(FetchResponse::text(
+                200,
+                "application/json",
+                r#"{"default_branch":"main","private":false}"#,
+            ));
+        }
+        let metadata_cache =
+            CachedWebTransport::new(metadata_inner.clone(), Duration::from_secs(60), 4);
+        let metadata_url = github_api_url("acme", "widgets", &[]);
+        metadata_cache
+            .fetch_github_repository_api(&metadata_url, "application/vnd.github+json")
+            .unwrap();
+        metadata_cache
+            .fetch_github_repository_api(&metadata_url, "application/vnd.github+json")
+            .unwrap();
+        assert_eq!(metadata_inner.calls(), 2);
+    }
+
+    #[test]
+    fn github_provider_token_is_scoped_to_managed_repository_requests() {
+        let token = Some("sentinel_token");
+        assert_eq!(
+            github_token_for_request(
+                &Url::parse("https://api.github.com/repos/acme/widgets").unwrap(),
+                "application/vnd.github+json",
+                ProviderAuthIntent::GithubRepositoryMetadata,
+                token
+            ),
+            token
+        );
+        assert_eq!(
+            github_token_for_request(
+                &Url::parse(
+                    "https://api.github.com/repos/acme/widgets/git/trees/feature%2Fweb-research"
+                )
+                .unwrap(),
+                "application/vnd.github+json",
+                ProviderAuthIntent::GithubVerifiedPublicApi,
+                token
+            ),
+            token
+        );
+        for (url, accept, auth) in [
+            (
+                "https://api.github.com/repos/acme/widgets",
+                "application/vnd.github+json",
+                ProviderAuthIntent::None,
+            ),
+            (
+                "https://api.github.com/repos/acme/widgets/readme",
+                "text/html,text/plain,application/json;q=0.8",
+                ProviderAuthIntent::GithubRepositoryMetadata,
+            ),
+            (
+                "https://api.github.com/user/repos",
+                "application/vnd.github+json",
+                ProviderAuthIntent::GithubRepositoryMetadata,
+            ),
+            (
+                "https://github.com/acme/widgets",
+                "application/vnd.github+json",
+                ProviderAuthIntent::GithubRepositoryMetadata,
+            ),
+            (
+                "https://raw.githubusercontent.com/acme/widgets/main/README.md",
+                "application/vnd.github.raw+json",
+                ProviderAuthIntent::GithubRepositoryMetadata,
+            ),
+            (
+                "https://api.github.com.evil.example/repos/acme/widgets",
+                "application/vnd.github+json",
+                ProviderAuthIntent::GithubRepositoryMetadata,
+            ),
+            (
+                "http://api.github.com/repos/acme/widgets",
+                "application/vnd.github+json",
+                ProviderAuthIntent::GithubRepositoryMetadata,
+            ),
+        ] {
+            assert_eq!(
+                github_token_for_request(&Url::parse(url).unwrap(), accept, auth, token,),
+                None
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_the_http_request_cancels_an_in_flight_fetch() {
+        let (started_tx, started_rx) = mpsc::channel();
+        let transport = Arc::new(BlockingTransport {
+            started: Mutex::new(Some(started_tx)),
+            cancelled: AtomicBool::new(false),
+        });
+        let state = AppState::default().with_web_research_transport_for_tests(transport.clone());
+        let app = super::super::router_with_state(state);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/web/research")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"prompt":"Read https://example.com/slow"}"#))
+            .unwrap();
+        let task = tokio::spawn(async move { app.oneshot(request).await });
+        tokio::task::spawn_blocking(move || started_rx.recv_timeout(Duration::from_secs(2)))
+            .await
+            .unwrap()
+            .expect("research transport did not start");
+        task.abort();
+        let _ = task.await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !transport.cancelled.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("in-flight research did not observe request cancellation");
     }
 
     #[tokio::test]
