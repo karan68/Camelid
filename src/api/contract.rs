@@ -194,6 +194,24 @@ pub(super) const API_CONFORMANCE_CASES: &[ApiConformanceCase] = &[
         unsupported_modes: &["writes", "shell", "network", "subagents"],
     },
     ApiConformanceCase {
+        id: "web_ui_research",
+        status: SupportStatus::Supported,
+        notes: "POST /api/web/research is a bounded pre-generation research helper for the server-policy-protected embedded Chat UI. A deterministic prompt classifier directly fetches embedded public HTTP(S) URLs or searches Brave HTML with DuckDuckGo Lite and Bing HTML fallbacks for explicit web/current-information requests, then returns explicitly untrusted source excerpts and warning strings for the browser to inject into an ordinary chat request. GitHub repository roots are enriched from ranked source-code excerpts followed by README context. Targets with credentials, non-default ports, loopback/private/link-local/reserved addresses, unsafe redirects or HTTPS downgrades, binary/oversized responses, and excessive URLs/redirects fail closed. Shared admission caps concurrent and abandoned jobs; a between-fetch research deadline prevents additional network work after the window, while each curl hop has its own timeout. Provider and partial-fetch failures return a structured HTTP-200 response so local generation can continue. Configured Camelid API credentials are never forwarded, and this path does not advertise tools to or require tool support from the model.",
+        routes: &[post("/api/web/research")],
+        supported_modes: &[
+            "deterministic_auto_classification",
+            "direct_public_url_fetch",
+            "brave_html_search_with_ddg_lite_and_bing_fallbacks",
+            "github_readme_and_source_enrichment",
+            "typed_nonblocking_failure",
+        ],
+        unsupported_modes: &[
+            "private_network_targets",
+            "credential_forwarding",
+            "model_tool_calling",
+        ],
+    },
+    ApiConformanceCase {
         id: "stream_options.include_usage",
         status: SupportStatus::SupportedCurrentGate,
         notes: "Chat-completions streaming only: stream_options.include_usage:true appends one terminal chunk with choices:[] and a usage object {prompt_tokens, completion_tokens, total_tokens} identical to the non-streaming endpoint's counts, then [DONE]. Omitting it is byte-identical to the prior baseline. Malformed/other stream_options shapes and subfields are tolerated and ignored (no error), matching the llama-server acd79d6 oracle; no other stream_options subfield is supported. Evidence: qa/evidence-bundles/stream-options-include-usage-20260623/.",

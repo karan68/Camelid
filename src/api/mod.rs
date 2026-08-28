@@ -35,6 +35,7 @@ mod metrics;
 mod responses;
 mod responses_store;
 mod server;
+mod web_research;
 mod workspace;
 
 /// Re-exported so anything else in the crate that fronts this server bounds
@@ -218,6 +219,11 @@ pub struct AppState {
     api_surface: ApiSurface,
     /// Lock-free process metrics shared by middleware and decode jobs.
     metrics: metrics::ServerMetrics,
+    /// Bounded public-web transport used only by `/api/web/research` before an
+    /// ordinary chat generation. It never receives request headers or model
+    /// state, so API credentials cannot be forwarded and model tool support is
+    /// irrelevant. The trait seam keeps route tests fully offline.
+    web_research_transport: Arc<dyn web_research::WebTransport>,
 }
 
 impl Default for AppState {
@@ -257,6 +263,7 @@ impl Default for AppState {
             server_limits: server::ServerPolicy::loopback_default().limits,
             api_surface: ApiSurface::Full,
             metrics: metrics::ServerMetrics::default(),
+            web_research_transport: web_research::default_transport(),
         }
     }
 }
@@ -317,6 +324,15 @@ impl AppState {
     fn with_server_policy(mut self, policy: &server::ServerPolicy) -> Self {
         self.server_limits = policy.limits;
         self.api_surface = policy.api_surface();
+        self
+    }
+
+    #[cfg(test)]
+    fn with_web_research_transport_for_tests(
+        mut self,
+        transport: Arc<dyn web_research::WebTransport>,
+    ) -> Self {
+        self.web_research_transport = transport;
         self
     }
 
@@ -2555,6 +2571,7 @@ fn router_with_state_and_policy(state: AppState, policy: server::ServerPolicy) -
             get(generation_sessions).post(create_generation_session),
         )
         .route("/api/generation/preflight", post(preflight_generation))
+        .route("/api/web/research", post(web_research::handler))
         .route(
             "/api/agent/workspace/models",
             get(workspace::compatible_models),

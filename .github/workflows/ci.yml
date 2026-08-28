@@ -427,6 +427,13 @@ jobs:
         if: ${{ !cancelled() }}
         run: npm run smoke:byte-units
 
+      # Pure contract check for Web Auto: exact linked-URL repair/deduplication,
+      # no-browse prompts, current-info detection, bounded untrusted evidence
+      # injection, and hardened source metadata.
+      - name: Frontend web-research smoke
+        if: ${{ !cancelled() }}
+        run: npm run smoke:web-research
+
       # Covers frontend/src/lib/firstRunActivation.js and lib/modelActivation.js:
       # which model a fresh install is offered (supported_* rows only, fit-filtered,
       # smallest first) and the inspect -> load -> readiness protocol behind the one

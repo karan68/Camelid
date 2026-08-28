@@ -1,7 +1,7 @@
 import { memo, useEffect, useRef, useState } from 'react'
 import { Avatar } from '../ui/Avatar'
 import { EvidenceChip } from '../ui/EvidenceChip'
-import { IconCopy, IconCheck, IconRefresh, IconEdit } from '../ui/icons'
+import { IconCopy, IconCheck, IconRefresh, IconEdit, IconSearch, IconExternal } from '../ui/icons'
 import { AssistantMarkdown, copyText, hasOpenCodeFence } from '../../lib/markdown'
 import { capabilityStatusLabel } from '../../lib/capabilities'
 import { formatModelLabel } from '../../lib/formatters'
@@ -38,6 +38,64 @@ const formatFullTimestamp = (value) => {
   const date = new Date(value)
   if (Number.isNaN(date.getTime())) return null
   return date.toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })
+}
+
+const safeWebSourceUrl = (value) => {
+  try {
+    const parsed = new URL(String(value || ''))
+    return ['http:', 'https:'].includes(parsed.protocol) ? parsed.toString() : null
+  } catch {
+    return null
+  }
+}
+
+function WebResearchSources({ research }) {
+  if (!research) return null
+  const sources = (Array.isArray(research.sources) ? research.sources : [])
+    .map((source) => ({ ...source, safeUrl: safeWebSourceUrl(source?.url) }))
+    .filter((source) => source.safeUrl)
+  const warnings = (Array.isArray(research.warnings) ? research.warnings : [])
+    .map(String)
+    .filter(Boolean)
+  if (!sources.length && !warnings.length) return null
+
+  if (!sources.length) {
+    return (
+      <div className="cxturn__web-warning" role="status">
+        <IconSearch size={15} />
+        <span>
+          Web research was unavailable for this reply. Camelid answered without web sources.
+          {warnings[0] && <small>{warnings[0]}</small>}
+        </span>
+      </div>
+    )
+  }
+
+  return (
+    <details className="cxturn__web-sources">
+      <summary>
+        <IconSearch size={15} />
+        <span>Web sources</span>
+        <span className="cxturn__web-count">{sources.length}</span>
+        {warnings.length > 0 && <span className="cxturn__web-partial">Partial</span>}
+      </summary>
+      <ol>
+        {sources.map((source, index) => (
+          <li key={`${source.safeUrl}:${index}`}>
+            <a href={source.safeUrl} target="_blank" rel="noopener noreferrer">
+              <span>{source.title || source.safeUrl}</span>
+              <IconExternal size={13} />
+            </a>
+          </li>
+        ))}
+      </ol>
+      {warnings.length > 0 && (
+        <p className="cxturn__web-source-warning">
+          {warnings.length === 1 ? warnings[0] : `${warnings.length} web-research warnings.`}
+        </p>
+      )}
+    </details>
+  )
 }
 
 /* Per-message metadata footer. Token counts are labeled by source (backend
@@ -244,6 +302,7 @@ export const MessageTurn = memo(function MessageTurn({ message, generationElapse
       <div className="cxturn__body">
         {showStreamingStatus && <StreamingLoader elapsedSeconds={generationElapsedSeconds} label={liveStatusLabel} compact />}
         {(messageContent || !assistantStreaming) && <AssistantMarkdown content={messageContent} streaming={assistantStreaming} />}
+        <WebResearchSources research={message.web_research} />
         {showLiveGenerationBadge && <LiveGenerationBadge elapsedSeconds={generationElapsedSeconds} label={liveStatusLabel} tokensPerSec={message.tokens_out_per_sec} />}
 
         {noVisibleResponse && (

@@ -13,12 +13,22 @@ import { contractSamplingOverrides } from '../lib/samplingContract'
 import { executionRuntimeFields } from '../lib/executionPlan'
 import { createPacerState, paceDrain, paceStep } from '../lib/streamPacing'
 import {
+  classifyWebResearchNeed,
+  fitWebResearchContext,
+  persistWebResearchEnabled,
+  readWebResearchEnabled,
+  requestWebResearch,
+  webResearchMetadata,
+} from '../lib/webResearch.js'
+import {
   applyBitNetFreshChatTokenCap,
   applyGemma4ChatTokenFloor,
   applyGemma4GhostChatTokenCap,
+  GEMMA4_GHOST_WEBUI_CONTEXT_TOKENS,
   getConfiguredMaxTokens as getModelMaxTokens,
   hasExplicitMaxTokensSetting,
   isBitNetB158ChatModel,
+  modelContextLength,
 } from '../lib/responseLimits'
 import { beginRequest, emitFirstContent, emitProgress, getTelemetrySnapshot, recordChatGeneration, recordHealthPoll } from '../lib/telemetryLog'
 
@@ -144,8 +154,13 @@ function getConfiguredMaxTokens() {
   return Number.isFinite(value) && value >= 256 ? value : DEFAULT_CHAT_MAX_TOKENS
 }
 
-function looksLikeCodePrompt(value) {
+export function looksLikeCodePrompt(value) {
   const text = String(value || '').toLowerCase()
+  // Planning prompts often say "build an app" while asking for a roadmap,
+  // checklist, or methodology—not source code. The Web-research acceptance
+  // prompt is one of these; do not let the code-first policy override its
+  // requested multi-step Xcode task list.
+  if (/\b(task list|task-list|checklist|implementation plan|roadmap|methodology|multi-step plan)\b/.test(text)) return false
   return /\b(code|build|create|implement|write|make)\b/.test(text)
     && /\b(html|html5|css|javascript|js|python|py|pygame|game|pacman|pacmac|tetris|app|component|page|website)\b/.test(text)
 }
@@ -592,6 +607,8 @@ export function useDashboardData({ showNotice, clearNotice }) {
   const [composer, setComposer] = useState('')
   const [newChatTitle, setNewChatTitle] = useState('')
   const [sending, setSending] = useState(false)
+  const [webResearchEnabled, setWebResearchEnabledState] = useState(readWebResearchEnabled)
+  const [webResearchStatus, setWebResearchStatus] = useState({ phase: 'idle', sourceCount: 0 })
   // Opt-in parity receipts: sends the next message non-streaming with
   // camelid_receipt:true so the response carries a verifiable receipt.
   const [receiptMode, setReceiptMode] = useState(false)
@@ -637,6 +654,13 @@ export function useDashboardData({ showNotice, clearNotice }) {
       : valueOrUpdater
     selectedConversationIdRef.current = next
     setSelectedConversationIdState(next)
+    return next
+  }
+
+  const setWebResearchEnabled = (enabled) => {
+    const next = Boolean(enabled)
+    setWebResearchEnabledState(next)
+    persistWebResearchEnabled(next)
     return next
   }
 
@@ -1101,8 +1125,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
             ]
           : content,
       }))
-      const requestMessages = applyLocalChatPolicy(requestHistory)
-      const promptTokenEstimate = estimateChatTokenCount(requestMessages)
+      let requestMessages = applyLocalChatPolicy(requestHistory)
 
       persistConversations((current) => current.map((item) => (
         item.id === conversation.id
@@ -1114,6 +1137,60 @@ export function useDashboardData({ showNotice, clearNotice }) {
             }
           : item
       )))
+
+      // Gemma 4 26B is not advertised as function-tool-capable by Camelid, so
+      // Web UI research is a deterministic preflight: resolve linked/current
+      // sources first, then give the ordinary chat request a leading, untrusted
+      // evidence message. No tools/tool_choice payload is sent to the model.
+      const requestController = new AbortController()
+      activeChatRequestRef.current = requestController
+      const researchPlan = classifyWebResearchNeed(messageContent)
+      let researchResult = null
+      let researchFailure = ''
+      if (webResearchEnabled) {
+        setWebResearchStatus({ phase: 'researching', sourceCount: 0 })
+        try {
+          researchResult = await requestWebResearch(normalizedApiBase, messageContent, {
+            signal: requestController.signal,
+          })
+          const configuredContext = runtime?.gemma4_serve_lane === 'ghost_moe'
+            ? GEMMA4_GHOST_WEBUI_CONTEXT_TOKENS
+            : modelContextLength(selectedModel)
+          const replyReserve = applyGemma4GhostChatTokenCap(
+            getModelMaxTokens(selectedModelId),
+            runtime?.gemma4_serve_lane,
+          )
+          const fittedResearch = fitWebResearchContext(requestMessages, researchResult, {
+            maxExcerptChars: 8_000,
+            maxPromptTokens: configuredContext
+              ? Math.max(0, configuredContext - replyReserve - 192)
+              : null,
+            estimateTokenCount: estimateChatTokenCount,
+          })
+          researchResult = fittedResearch.research
+          requestMessages = fittedResearch.messages
+          setWebResearchStatus({
+            phase: researchResult?.status === 'failed' ? 'failed' : 'complete',
+            sourceCount: Array.isArray(researchResult?.sources) ? researchResult.sources.length : 0,
+          })
+        } catch (error) {
+          if (error?.name === 'AbortError') throw error
+          if (researchPlan.needed) {
+            researchFailure = error?.message || 'Web research was unavailable.'
+            researchResult = {
+              triggered: true,
+              reason: researchPlan.reason,
+              query: researchPlan.query,
+              sources: [],
+              warnings: [],
+            }
+            showNotice('Web research was unavailable. Camelid will answer without web sources.', 'info')
+          }
+          setWebResearchStatus({ phase: 'failed', sourceCount: 0 })
+        }
+      }
+      const researchAtSend = webResearchMetadata(researchResult, researchFailure)
+      const promptTokenEstimate = estimateChatTokenCount(requestMessages)
 
       const requestStartedAt = performance.now()
       // Fresh per-token decode trace for this generation (auditable backing for
@@ -1184,6 +1261,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
         first_byte_ms: null,
         first_event_ms: null,
         first_content_ms: null,
+        ...(researchAtSend ? { web_research: researchAtSend } : {}),
       }
       persistConversations((current) => current.map((item) => (
         item.id === conversation.id
@@ -1218,8 +1296,6 @@ export function useDashboardData({ showNotice, clearNotice }) {
       // must not cause the browser to advertise Prism's sampling controls that
       // this model does not use.
       const useExperimentalSampling = sendGate.chatMode === 'experimental' && !bitNetB158Chat
-      const requestController = new AbortController()
-      activeChatRequestRef.current = requestController
       const response = await fetch(`${normalizedApiBase}/v1/chat/completions`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1404,14 +1480,16 @@ export function useDashboardData({ showNotice, clearNotice }) {
       })
     } catch (error) {
       const requestWasAborted = error?.name === 'AbortError'
-      recordChatGeneration({
-        lifecycleId: chatLifecycleId,
-        modelId: getRuntimeRequestModelId(selectedModel, runtime, selectedModelId),
-        durationMs: null,
-        ttftMs: null,
-        outcome: requestWasAborted ? 'interrupted' : 'error',
-        promptText: messageContent,
-      })
+      if (chatLifecycleId) {
+        recordChatGeneration({
+          lifecycleId: chatLifecycleId,
+          modelId: getRuntimeRequestModelId(selectedModel, runtime, selectedModelId),
+          durationMs: null,
+          ttftMs: null,
+          outcome: requestWasAborted ? 'interrupted' : 'error',
+          promptText: messageContent,
+        })
+      }
       const pendingPatchAtFailure = pendingAssistantPatch
       if (pendingAssistantFrame !== null && typeof window !== 'undefined') {
         window.cancelAnimationFrame(pendingAssistantFrame)
@@ -1452,6 +1530,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
     } finally {
       stopPacing()
       activeChatRequestRef.current = null
+      setWebResearchStatus({ phase: 'idle', sourceCount: 0 })
       setStoppingGeneration(false)
       setSending(false)
       await loadDashboard({ silent: true })
@@ -1864,6 +1943,9 @@ export function useDashboardData({ showNotice, clearNotice }) {
     newChatTitle,
     setNewChatTitle,
     sending,
+    webResearchEnabled,
+    setWebResearchEnabled,
+    webResearchStatus,
     receiptMode,
     setReceiptMode,
     thinkingMode,
