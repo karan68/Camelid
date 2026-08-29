@@ -4473,7 +4473,16 @@ mod tests {
         )
         .unwrap()
         .execute(&sb);
-        assert!(out.text().contains("truncated"), "{}", out.text());
+        assert!(
+            out.text().contains("bytes omitted"),
+            "oversized capture must disclose omitted output: {}",
+            out.text()
+        );
+        assert!(
+            out.text().len() <= MAX_OUTPUT_BYTES,
+            "tool output must remain bounded: {} bytes",
+            out.text().len()
+        );
     }
 
     #[cfg(windows)]
@@ -4552,7 +4561,16 @@ mod tests {
             "should complete, not time out: {}",
             out.text()
         );
-        assert!(out.text().contains("truncated"), "{}", out.text());
+        assert!(
+            out.text().contains("bytes omitted"),
+            "oversized capture must disclose omitted output: {}",
+            out.text()
+        );
+        assert!(
+            out.text().len() <= MAX_OUTPUT_BYTES,
+            "tool output must remain bounded: {} bytes",
+            out.text().len()
+        );
     }
 
     #[cfg(windows)]
