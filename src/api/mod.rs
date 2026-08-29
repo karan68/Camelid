@@ -35,6 +35,7 @@ mod metrics;
 mod responses;
 mod responses_store;
 mod server;
+mod web_research;
 mod workspace;
 
 /// Re-exported so anything else in the crate that fronts this server bounds
@@ -218,6 +219,13 @@ pub struct AppState {
     api_surface: ApiSurface,
     /// Lock-free process metrics shared by middleware and decode jobs.
     metrics: metrics::ServerMetrics,
+    /// Bounded public-web transport used only by `/api/web/research` before an
+    /// ordinary chat generation. It never receives request headers or model
+    /// state, so Camelid API credentials cannot be forwarded and model tool
+    /// support is irrelevant. Its optional GitHub provider credential comes
+    /// only from the operator environment and is host-scoped inside the
+    /// transport. The trait seam keeps route tests fully offline.
+    web_research_transport: Arc<dyn web_research::WebTransport>,
 }
 
 impl Default for AppState {
@@ -257,6 +265,7 @@ impl Default for AppState {
             server_limits: server::ServerPolicy::loopback_default().limits,
             api_surface: ApiSurface::Full,
             metrics: metrics::ServerMetrics::default(),
+            web_research_transport: web_research::default_transport(),
         }
     }
 }
@@ -317,6 +326,15 @@ impl AppState {
     fn with_server_policy(mut self, policy: &server::ServerPolicy) -> Self {
         self.server_limits = policy.limits;
         self.api_surface = policy.api_surface();
+        self
+    }
+
+    #[cfg(test)]
+    fn with_web_research_transport_for_tests(
+        mut self,
+        transport: Arc<dyn web_research::WebTransport>,
+    ) -> Self {
+        self.web_research_transport = transport;
         self
     }
 
@@ -585,6 +603,12 @@ pub struct HealthResponse {
     pub build: String,
     pub loaded_now: bool,
     pub generation_ready: bool,
+    /// Effective context window of the active loaded runtime, not a catalog or
+    /// training-context guess. WebUI prompt budgeting uses this value.
+    pub active_context_length: Option<u32>,
+    /// Operator ceilings applied by this server process.
+    pub max_prompt_tokens: usize,
+    pub max_generation_tokens: u32,
     /// True when the active runnable model has a resident Prism/Qwen3-VL
     /// projector and can accept OpenAI `image_url` chat content parts.
     pub vision_ready: bool,
@@ -2555,6 +2579,7 @@ fn router_with_state_and_policy(state: AppState, policy: server::ServerPolicy) -
             get(generation_sessions).post(create_generation_session),
         )
         .route("/api/generation/preflight", post(preflight_generation))
+        .route("/api/web/research", post(web_research::handler))
         .route(
             "/api/agent/workspace/models",
             get(workspace::compatible_models),
@@ -3282,6 +3307,9 @@ async fn health_registry_snapshot(state: &AppState) -> HealthResponse {
         || runnable_serve_ready
         || dg_serve_ready
         || model.is_some_and(loaded_model_generation_ready);
+    let active_context_length = model
+        .and_then(|model| model.llama_config.as_ref())
+        .map(|config| config.context_length);
     let execution_plans = state.execution_plans.read().await;
     let execution_plan = active_id_lock
         .as_ref()
@@ -3334,6 +3362,9 @@ async fn health_registry_snapshot(state: &AppState) -> HealthResponse {
         build: crate::receipt::camelid_version(),
         loaded_now,
         generation_ready,
+        active_context_length,
+        max_prompt_tokens: state.server_limits.max_prompt_tokens,
+        max_generation_tokens: state.server_limits.max_generation_tokens,
         vision_ready,
         active_model_id: active_id_lock.clone(),
         q8_runtime: q8_runtime_health(),
@@ -3452,6 +3483,9 @@ fn busy_health_response(state: &AppState) -> HealthResponse {
         build: crate::receipt::camelid_version(),
         loaded_now: false,
         generation_ready: false,
+        active_context_length: None,
+        max_prompt_tokens: state.server_limits.max_prompt_tokens,
+        max_generation_tokens: state.server_limits.max_generation_tokens,
         vision_ready: false,
         active_model_id: None,
         q8_runtime: q8_runtime_health(),
