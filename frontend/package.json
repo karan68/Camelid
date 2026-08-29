@@ -37,6 +37,7 @@
     "capture:views": "node scripts/capture-views.mjs",
     "smoke:markdown": "node scripts/markdown-smoke.mjs",
     "smoke:web-research": "node scripts/web-research-smoke.mjs",
+    "smoke:web-research-browser": "node scripts/web-research-browser-smoke.mjs",
     "smoke:byte-units": "node scripts/byte-units-smoke.mjs",
     "smoke:flow": "node scripts/flow-visual-smoke.mjs"
   },

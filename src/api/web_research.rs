@@ -49,10 +49,14 @@ const MAX_README_CHARS: usize = 4_000;
 const MAX_CODE_FILE_CHARS: usize = 2_400;
 const MAX_GITHUB_SOURCE_FILES: usize = 3;
 const MAX_GITHUB_REF_SEGMENTS: usize = 16;
+const MAX_GITHUB_API_TREE_PAGES: usize = 12;
+const MAX_GITHUB_API_TREE_DEPTH: usize = 6;
+const MAX_GITHUB_API_TREE_ENTRIES: usize = 1_024;
 const MAX_GITHUB_HTML_PAGES: usize = 6;
 const MAX_GITHUB_HTML_DEPTH: usize = 4;
 const MAX_SEARCH_QUERY_CHARS: usize = 600;
 const MAX_CONCURRENT_RESEARCH: usize = 2;
+const MAX_CONCURRENT_DNS_LOOKUPS: usize = 4;
 const FETCH_CACHE_CAPACITY: usize = 96;
 const FETCH_CACHE_TTL: Duration = Duration::from_secs(90);
 const RESEARCH_ADMISSION_TIMEOUT: Duration = Duration::from_millis(750);
@@ -72,6 +76,8 @@ pub(super) struct WebResearchRequest {
 pub(super) struct WebResearchChunk {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
     pub text: String,
 }
 
@@ -114,6 +120,12 @@ pub(super) enum ProviderAuthIntent {
     None,
     GithubRepositoryMetadata,
     GithubVerifiedPublicApi,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GithubAuthScope {
+    owner: String,
+    repo: String,
 }
 
 impl FetchResponse {
@@ -167,10 +179,14 @@ pub(super) trait WebTransport: Send + Sync {
         accept: &str,
         etag: Option<&str>,
         cancel: Option<&tokio_util::sync::CancellationToken>,
+        deadline: Option<Instant>,
         auth: ProviderAuthIntent,
     ) -> Result<FetchResponse, String> {
         if cancel.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
             return Err("web research was cancelled".to_string());
+        }
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(research_deadline_error());
         }
         match auth {
             ProviderAuthIntent::None => self.fetch_conditional(url, accept, etag),
@@ -243,6 +259,7 @@ impl WebTransport for DeadlineTransport<'_> {
             accept,
             None,
             Some(&self.cancel),
+            Some(self.deadline),
             ProviderAuthIntent::None,
         )
     }
@@ -266,6 +283,7 @@ impl WebTransport for DeadlineTransport<'_> {
             accept,
             None,
             Some(&self.cancel),
+            Some(self.deadline),
             ProviderAuthIntent::GithubRepositoryMetadata,
         )
     }
@@ -289,6 +307,7 @@ impl WebTransport for DeadlineTransport<'_> {
             accept,
             None,
             Some(&self.cancel),
+            Some(self.deadline),
             ProviderAuthIntent::GithubVerifiedPublicApi,
         )
     }
@@ -300,6 +319,48 @@ impl Drop for ResearchCancelOnDrop {
     fn drop(&mut self) {
         self.0.cancel();
     }
+}
+
+struct DnsLookupGate {
+    active: std::sync::atomic::AtomicUsize,
+    capacity: usize,
+}
+
+impl DnsLookupGate {
+    const fn new(capacity: usize) -> Self {
+        Self {
+            active: std::sync::atomic::AtomicUsize::new(0),
+            capacity,
+        }
+    }
+
+    fn try_acquire(&self) -> Option<DnsLookupPermit<'_>> {
+        self.active
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |active| (active < self.capacity).then_some(active + 1),
+            )
+            .ok()
+            .map(|_| DnsLookupPermit { gate: self })
+    }
+}
+
+struct DnsLookupPermit<'a> {
+    gate: &'a DnsLookupGate,
+}
+
+impl Drop for DnsLookupPermit<'_> {
+    fn drop(&mut self) {
+        self.gate
+            .active
+            .fetch_sub(1, std::sync::atomic::Ordering::Release);
+    }
+}
+
+fn dns_lookup_gate() -> &'static DnsLookupGate {
+    static GATE: DnsLookupGate = DnsLookupGate::new(MAX_CONCURRENT_DNS_LOOKUPS);
+    &GATE
 }
 
 fn research_semaphore() -> Arc<tokio::sync::Semaphore> {
@@ -328,7 +389,7 @@ impl WebTransport for CurlWebTransport {
         accept: &str,
         etag: Option<&str>,
     ) -> Result<FetchResponse, String> {
-        self.fetch_cancellable(url, accept, etag, None, ProviderAuthIntent::None)
+        self.fetch_cancellable(url, accept, etag, None, None, ProviderAuthIntent::None)
     }
 
     fn fetch_github_repository_api(
@@ -339,6 +400,7 @@ impl WebTransport for CurlWebTransport {
         self.fetch_cancellable(
             url,
             accept,
+            None,
             None,
             None,
             ProviderAuthIntent::GithubRepositoryMetadata,
@@ -355,6 +417,7 @@ impl WebTransport for CurlWebTransport {
             accept,
             None,
             None,
+            None,
             ProviderAuthIntent::GithubVerifiedPublicApi,
         )
     }
@@ -365,18 +428,35 @@ impl WebTransport for CurlWebTransport {
         accept: &str,
         etag: Option<&str>,
         cancel: Option<&tokio_util::sync::CancellationToken>,
+        deadline: Option<Instant>,
         auth: ProviderAuthIntent,
     ) -> Result<FetchResponse, String> {
+        let deadline = deadline.unwrap_or_else(|| Instant::now() + RESEARCH_TOTAL_DEADLINE);
+        let github_scope = github_auth_scope_for_request(url, accept, auth);
+        if auth != ProviderAuthIntent::None && github_scope.is_none() {
+            return Err(
+                "GitHub provider-auth request was outside its managed repository scope".to_string(),
+            );
+        }
         let mut current = url.clone();
         for redirects in 0..=MAX_REDIRECTS {
             if cancel.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
                 return Err("web research was cancelled".to_string());
             }
+            if Instant::now() >= deadline {
+                return Err(research_deadline_error());
+            }
             validate_url_shape(&current)?;
-            let addresses = resolve_public_addresses(&current)?;
+            validate_github_redirect_scope(&current, github_scope.as_ref())?;
+            let addresses = resolve_public_addresses(&current, cancel, Some(deadline))?;
             let conditional = (redirects == 0).then_some(etag).flatten();
-            let github_token =
-                github_token_for_request(&current, accept, auth, self.github_token.as_deref());
+            let github_token = github_token_for_request(
+                &current,
+                accept,
+                auth,
+                github_scope.as_ref(),
+                self.github_token.as_deref(),
+            );
             let mut response = curl_single_hop(
                 &current,
                 accept,
@@ -384,6 +464,7 @@ impl WebTransport for CurlWebTransport {
                 conditional,
                 github_token,
                 cancel,
+                Some(deadline),
             )?;
             if response.status == 304 || !(300..400).contains(&response.status) {
                 response.final_url = Some(current);
@@ -404,7 +485,7 @@ impl WebTransport for CurlWebTransport {
 
 impl WebTransport for CachedWebTransport {
     fn fetch(&self, url: &Url, accept: &str) -> Result<FetchResponse, String> {
-        self.fetch_cancellable(url, accept, None, None, ProviderAuthIntent::None)
+        self.fetch_cancellable(url, accept, None, None, None, ProviderAuthIntent::None)
     }
 
     fn fetch_github_repository_api(
@@ -415,6 +496,7 @@ impl WebTransport for CachedWebTransport {
         self.fetch_cancellable(
             url,
             accept,
+            None,
             None,
             None,
             ProviderAuthIntent::GithubRepositoryMetadata,
@@ -431,6 +513,7 @@ impl WebTransport for CachedWebTransport {
             accept,
             None,
             None,
+            None,
             ProviderAuthIntent::GithubVerifiedPublicApi,
         )
     }
@@ -441,6 +524,7 @@ impl WebTransport for CachedWebTransport {
         accept: &str,
         _etag: Option<&str>,
         cancel: Option<&tokio_util::sync::CancellationToken>,
+        deadline: Option<Instant>,
         auth: ProviderAuthIntent,
     ) -> Result<FetchResponse, String> {
         if cancel.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
@@ -460,7 +544,7 @@ impl WebTransport for CachedWebTransport {
         {
             return self
                 .inner
-                .fetch_cancellable(url, accept, None, cancel, auth);
+                .fetch_cancellable(url, accept, None, cancel, deadline, auth);
         }
         let key = format!("{auth:?}\n{}\n{accept}", url.as_str());
         let now = Instant::now();
@@ -493,6 +577,7 @@ impl WebTransport for CachedWebTransport {
                     .flatten()
             }),
             cancel,
+            deadline,
             auth,
         )?;
         if response.status == 304 {
@@ -553,12 +638,21 @@ fn github_token_for_request<'a>(
     url: &Url,
     accept: &str,
     auth: ProviderAuthIntent,
+    scope: Option<&GithubAuthScope>,
     token: Option<&'a str>,
 ) -> Option<&'a str> {
-    if !matches!(
-        auth,
-        ProviderAuthIntent::GithubRepositoryMetadata | ProviderAuthIntent::GithubVerifiedPublicApi
-    ) || url.scheme() != "https"
+    let scope = scope?;
+    (github_auth_scope_for_request(url, accept, auth).as_ref() == Some(scope))
+        .then_some(token)
+        .flatten()
+}
+
+fn github_auth_scope_for_request(
+    url: &Url,
+    accept: &str,
+    auth: ProviderAuthIntent,
+) -> Option<GithubAuthScope> {
+    if url.scheme() != "https"
         || !url
             .host_str()
             .is_some_and(|host| host.eq_ignore_ascii_case("api.github.com"))
@@ -566,16 +660,66 @@ fn github_token_for_request<'a>(
         return None;
     }
     let segments = url.path_segments()?.collect::<Vec<_>>();
-    let provider_managed_request = matches!(
-        (segments.as_slice(), accept),
-        (["repos", _, _], "application/vnd.github+json")
-            | (
+    let managed = match auth {
+        ProviderAuthIntent::None => false,
+        ProviderAuthIntent::GithubRepositoryMetadata => matches!(
+            (segments.as_slice(), accept),
+            (["repos", _, _], "application/vnd.github+json")
+        ),
+        ProviderAuthIntent::GithubVerifiedPublicApi => matches!(
+            (segments.as_slice(), accept),
+            (
                 ["repos", _, _, "git", "trees", _, ..],
                 "application/vnd.github+json"
+            ) | (["repos", _, _, "readme"], "application/vnd.github.raw+json")
+        ),
+    };
+    if !managed {
+        return None;
+    }
+    let owner = *segments.get(1)?;
+    let repo = *segments.get(2)?;
+    (valid_github_owner(owner) && valid_github_repo(repo)).then(|| GithubAuthScope {
+        owner: owner.to_ascii_lowercase(),
+        repo: repo.to_ascii_lowercase(),
+    })
+}
+
+fn validate_github_redirect_scope(
+    url: &Url,
+    scope: Option<&GithubAuthScope>,
+) -> Result<(), String> {
+    let Some(scope) = scope else { return Ok(()) };
+    if !url
+        .host_str()
+        .is_some_and(|host| host.eq_ignore_ascii_case("api.github.com"))
+    {
+        return Ok(());
+    }
+    let segments = url
+        .path_segments()
+        .map(|segments| segments.collect::<Vec<_>>())
+        .unwrap_or_default();
+    let redirected = match segments.as_slice() {
+        ["repos", owner, repo, ..] if valid_github_owner(owner) && valid_github_repo(repo) => {
+            GithubAuthScope {
+                owner: owner.to_ascii_lowercase(),
+                repo: repo.to_ascii_lowercase(),
+            }
+        }
+        _ => {
+            return Err(
+                "GitHub API redirect left the original managed repository scope".to_string(),
             )
-            | (["repos", _, _, "readme"], "application/vnd.github.raw+json")
-    );
-    provider_managed_request.then_some(token).flatten()
+        }
+    };
+    if redirected != *scope {
+        return Err(format!(
+            "GitHub API redirect changed repository scope from {}/{} to {}/{}",
+            scope.owner, scope.repo, redirected.owner, redirected.repo
+        ));
+    }
+    Ok(())
 }
 
 pub(super) async fn handler(
@@ -772,8 +916,21 @@ fn finish_response(
 }
 
 fn classify_prompt(prompt: &str) -> ResearchDecision {
-    let (urls, omitted) = extract_prompt_urls(prompt);
-    let lower = prompt.to_lowercase();
+    let (mut urls, mut omitted) = extract_prompt_urls(prompt);
+    let lower = prompt
+        .to_lowercase()
+        .replace('’', "'")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if has_global_web_veto(&lower) {
+        return ResearchDecision::Skip;
+    }
+    let links_vetoed = has_link_read_veto(&lower);
+    if links_vetoed {
+        urls.clear();
+        omitted = false;
+    }
     let explicit = [
         "search the web",
         "search web",
@@ -782,7 +939,6 @@ fn classify_prompt(prompt: &str) -> ResearchDecision {
         "look this up",
         "look it up",
         "look up",
-        "lookup",
         "look up online",
         "browse the web",
         "browse web",
@@ -853,39 +1009,61 @@ fn classify_prompt(prompt: &str) -> ResearchDecision {
         "research on the web",
     ]
     .iter()
-    .any(|needle| lower.contains(needle));
+    .any(|needle| lower.contains(needle))
+        || has_linked_broader_research_cue(&lower);
     let current = [
         "latest version",
+        "latest versions",
         "latest release",
+        "latest releases",
         "latest news",
         "latest price",
+        "latest prices",
         "latest schedule",
+        "latest schedules",
         "latest score",
+        "latest scores",
         "latest documentation",
         "latest docs",
         "latest specification",
+        "latest specifications",
         "latest status",
+        "latest statuses",
         "newest version",
+        "newest versions",
         "newest release",
+        "newest releases",
         "newest news",
         "newest price",
+        "newest prices",
         "newest schedule",
+        "newest schedules",
         "newest score",
+        "newest scores",
         "newest documentation",
         "newest docs",
         "newest specification",
+        "newest specifications",
         "newest status",
+        "newest statuses",
         "most recent",
         "current version",
+        "current versions",
         "current release",
+        "current releases",
         "current status",
+        "current statuses",
         "current price",
+        "current prices",
         "current weather",
         "current schedule",
+        "current schedules",
         "current score",
+        "current scores",
         "current documentation",
         "current docs",
         "current ceo",
+        "current ceos",
         "currently available",
         "up-to-date",
         "up to date",
@@ -923,6 +1101,7 @@ fn classify_prompt(prompt: &str) -> ResearchDecision {
         "schedule now",
         "score now",
         "current officeholder",
+        "current officeholders",
         "who is the current",
         "who is current",
         "what's new in",
@@ -939,7 +1118,8 @@ fn classify_prompt(prompt: &str) -> ResearchDecision {
         || contains_as_of_year(&lower);
 
     if !urls.is_empty() || explicit || current {
-        let query_requested = current || (urls.is_empty() && explicit) || supplemental;
+        let query_requested =
+            current || supplemental || (!links_vetoed && urls.is_empty() && explicit);
         let query = query_requested.then(|| search_query_from_prompt(prompt));
         let reason = if !urls.is_empty() && query.is_some() {
             "embedded_urls_and_search"
@@ -958,6 +1138,346 @@ fn classify_prompt(prompt: &str) -> ResearchDecision {
         };
     }
     ResearchDecision::Skip
+}
+
+fn has_global_web_veto(lower: &str) -> bool {
+    let no_source_phrases = [
+        "no web search",
+        "no web research",
+        "no web access",
+        "no web browsing",
+        "no internet search",
+        "no internet research",
+        "no internet access",
+        "no internet browsing",
+        "no online sources",
+        "no outside sources",
+        "no external sources",
+        "no network access",
+    ];
+    if no_source_phrases
+        .iter()
+        .any(|phrase| contains_no_source_directive(lower, phrase))
+        || ["stay offline", "remain offline"]
+            .iter()
+            .any(|phrase| directive_clause_starts_with(lower, phrase))
+        || [
+            "without online sources",
+            "without outside sources",
+            "without external sources",
+            "without network access",
+        ]
+        .iter()
+        .any(|phrase| directive_clause_starts_with(lower, phrase))
+    {
+        return true;
+    }
+
+    // Keep these newer forms clause-directed. A product prompt can quote UI
+    // copy such as "do not connect to the internet" or "answer without
+    // external sources" while separately asking Camelid to research examples;
+    // matching only an imperative clause avoids turning that descriptive copy
+    // into a privacy instruction for the whole turn.
+    if directive_action_targets(
+        lower,
+        &[
+            "do not connect to ",
+            "don't connect to ",
+            "dont connect to ",
+            "never connect to ",
+            "without connecting to ",
+        ],
+        &[
+            "web",
+            "the web",
+            "internet",
+            "the internet",
+            "network",
+            "the network",
+        ],
+    ) || directive_action_targets(
+        lower,
+        &[
+            "do not search ",
+            "don't search ",
+            "dont search ",
+            "never search ",
+            "do not browse ",
+            "don't browse ",
+            "dont browse ",
+            "never browse ",
+            "do not research ",
+            "don't research ",
+            "dont research ",
+            "never research ",
+            "without searching ",
+            "without browsing ",
+            "without researching ",
+        ],
+        &["online"],
+    ) || directive_action_targets(
+        lower,
+        &["answer without ", "respond without "],
+        &[
+            "online sources",
+            "outside sources",
+            "external sources",
+            "web sources",
+            "online material",
+            "outside material",
+            "external material",
+            "web material",
+            "online content",
+            "outside content",
+            "external content",
+            "web content",
+        ],
+    ) {
+        return true;
+    }
+
+    let direct_prefixes = ["do not ", "don't ", "dont ", "never "];
+    let direct_actions = ["use", "access", "browse", "search", "research", "consult"];
+    let progressive_actions = [
+        "using",
+        "accessing",
+        "browsing",
+        "searching",
+        "researching",
+        "consulting",
+    ];
+    let targets = [
+        "web",
+        "the web",
+        "internet",
+        "the internet",
+        "online sources",
+        "outside sources",
+        "external sources",
+        "online sites",
+        "outside sites",
+        "external sites",
+        "online websites",
+        "outside websites",
+        "external websites",
+        "network",
+        "the network",
+    ];
+    if direct_prefixes
+        .iter()
+        .any(|prefix| veto_action_phrase(lower, prefix, &direct_actions, &targets))
+    {
+        return true;
+    }
+    veto_action_phrase(lower, "without ", &progressive_actions, &targets)
+}
+
+fn directive_action_targets(lower: &str, prefixes: &[&str], targets: &[&str]) -> bool {
+    lower.split([';', '.', '!', '?', '\n']).any(|clause| {
+        let clause = clause
+            .trim()
+            .strip_prefix("please ")
+            .unwrap_or_else(|| clause.trim());
+        prefixes.iter().any(|prefix| {
+            clause.strip_prefix(prefix).is_some_and(|after| {
+                targets.iter().any(|target| {
+                    after.strip_prefix(target).is_some_and(|tail| {
+                        tail.chars()
+                            .next()
+                            .is_none_or(|ch| !ch.is_ascii_alphanumeric() && ch != '_')
+                    })
+                })
+            })
+        })
+    })
+}
+
+fn has_linked_broader_research_cue(lower: &str) -> bool {
+    const ACTIONS: &[&str] = &["look up", "research"];
+
+    // Match an explicitly coordinated second research leg. Keeping the
+    // coordinator attached to the action avoids treating a link-only request
+    // such as "Look up https://example.com and summarize it" as a web search.
+    for lead in ["also ", "additionally ", "in addition ", "in addition, "] {
+        if ACTIONS
+            .iter()
+            .any(|action| contains_word_bounded(lower, &format!("{lead}{action}")))
+        {
+            return true;
+        }
+    }
+    for coordinator in ["and ", "then "] {
+        for courtesy in ["", "please "] {
+            for additive in ["", "also "] {
+                if ACTIONS.iter().any(|action| {
+                    contains_word_bounded(
+                        lower,
+                        &format!("{coordinator}{courtesy}{additive}{action}"),
+                    )
+                }) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    // Also accept a bounded trailing coordination marker, mirroring the Web
+    // UI's 180-character, single-clause window.
+    ACTIONS.iter().any(|action| {
+        lower.match_indices(action).any(|(index, _)| {
+            if !word_bounds_at(lower, index, action.len()) {
+                return false;
+            }
+            let tail = &lower[index + action.len()..];
+            let bounded = tail
+                .chars()
+                .take(180)
+                .take_while(|ch| !matches!(ch, '.' | '!' | '?'))
+                .collect::<String>();
+            ["too", "also", "as well"]
+                .iter()
+                .any(|marker| contains_word_bounded(&bounded, marker))
+        })
+    })
+}
+
+fn contains_word_bounded(value: &str, phrase: &str) -> bool {
+    value
+        .match_indices(phrase)
+        .any(|(index, _)| word_bounds_at(value, index, phrase.len()))
+}
+
+fn word_bounds_at(value: &str, index: usize, length: usize) -> bool {
+    let is_word = |ch: char| ch.is_ascii_alphanumeric() || ch == '_';
+    value[..index]
+        .chars()
+        .next_back()
+        .is_none_or(|ch| !is_word(ch))
+        && value[index + length..]
+            .chars()
+            .next()
+            .is_none_or(|ch| !is_word(ch))
+}
+
+fn has_link_read_veto(lower: &str) -> bool {
+    const ACTIONS: &[&str] = &["open", "fetch", "follow", "visit", "read", "access", "use"];
+    const TARGETS: &[&str] = &[
+        "link",
+        "links",
+        "url",
+        "urls",
+        "this link",
+        "this url",
+        "that link",
+        "that url",
+        "the link",
+        "the links",
+        "the url",
+        "the urls",
+        "these links",
+        "these urls",
+        "those links",
+        "those urls",
+        "any link",
+        "any links",
+        "any url",
+        "any urls",
+        "web page",
+        "the web page",
+        "website",
+        "the website",
+        "linked page",
+        "the linked page",
+        "linked docs",
+        "the linked docs",
+    ];
+    ["do not ", "don't ", "dont ", "never "]
+        .iter()
+        .any(|prefix| {
+            veto_action_phrase(lower, prefix, ACTIONS, TARGETS)
+                || veto_action_phrase(lower, prefix, ACTIONS, &["http://", "https://"])
+        })
+}
+
+fn veto_action_phrase(lower: &str, prefix: &str, actions: &[&str], targets: &[&str]) -> bool {
+    actions.iter().any(|first| {
+        targets
+            .iter()
+            .any(|target| contains_veto_target(lower, &format!("{prefix}{first} {target}"), target))
+            || ["or", "and"].iter().any(|conjunction| {
+                actions.iter().any(|second| {
+                    targets.iter().any(|target| {
+                        contains_veto_target(
+                            lower,
+                            &format!("{prefix}{first} {conjunction} {second} {target}"),
+                            target,
+                        )
+                    })
+                })
+            })
+    })
+}
+
+fn contains_veto_target(lower: &str, phrase: &str, target: &str) -> bool {
+    lower.match_indices(phrase).any(|(index, _)| {
+        let after = &lower[index + phrase.len()..];
+        if target.ends_with("://") {
+            return true;
+        }
+        let boundary = after
+            .chars()
+            .next()
+            .is_none_or(|ch| !ch.is_ascii_alphanumeric() && ch != '_');
+        if !boundary {
+            return false;
+        }
+        let link_specific_web_target = matches!(target, "web" | "the web")
+            && [" page", " pages", " site", " sites"]
+                .iter()
+                .any(|suffix| after.starts_with(suffix));
+        !link_specific_web_target
+    })
+}
+
+fn contains_no_source_directive(lower: &str, phrase: &str) -> bool {
+    lower.match_indices(phrase).any(|(index, _)| {
+        let before = lower[..index].trim_end();
+        if before.is_empty() {
+            return true;
+        }
+        let clause = before
+            .rsplit([';', '.', '!', '?', '\n'])
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .trim_end_matches(',')
+            .trim();
+        matches!(
+            clause,
+            "use"
+                | "using"
+                | "with"
+                | "please"
+                | "please use"
+                | "answer with"
+                | "respond with"
+                | "work with"
+                | "continue with"
+        )
+    })
+}
+
+fn directive_clause_starts_with(lower: &str, phrase: &str) -> bool {
+    lower.split([';', '.', '!', '?', '\n']).any(|clause| {
+        let clause = clause
+            .trim()
+            .strip_prefix("please ")
+            .unwrap_or_else(|| clause.trim());
+        clause == phrase
+            || clause
+                .strip_prefix(phrase)
+                .is_some_and(|after| after.starts_with([',', ':']))
+    })
 }
 
 fn search_query_from_prompt(prompt: &str) -> String {
@@ -1009,8 +1529,19 @@ fn extract_prompt_urls(prompt: &str) -> (Vec<Url>, bool) {
     for offset in offsets {
         let tail = &prompt[offset..];
         let end = prompt_url_candidate_end(tail);
-        let raw = tail[..end].trim_end_matches(['.', ',', ';', ':', '!', '?', '}']);
-        let Ok(parsed) = Url::parse(raw) else {
+        let mut raw = tail[..end].trim_end_matches(['.', ',', ';', ':', '!', '?', '}']);
+        // A closing parenthesis is syntax only when this URL began immediately
+        // after an opening Markdown/prose wrapper. Legal GitHub refs and file
+        // names may themselves end in `)` and must otherwise remain untouched.
+        if prompt[..offset].ends_with('(') {
+            raw = raw.strip_suffix(')').unwrap_or(raw);
+        }
+        // Markdown escapes `)` inside a link destination as `\)`. Decode only
+        // the known malformed numbered-list paste shape at a GitHub repo root;
+        // a general backslash rewrite could change legitimate URL paths.
+        let repaired_raw = repair_markdown_escaped_github_repo_candidate(raw);
+        let parse_raw = repaired_raw.as_deref().unwrap_or(raw);
+        let Ok(parsed) = Url::parse(parse_raw) else {
             continue;
         };
         let normalized = canonical_prompt_url(parsed);
@@ -1025,6 +1556,36 @@ fn extract_prompt_urls(prompt: &str) -> (Vec<Url>, bool) {
         urls.push(normalized);
     }
     (urls, omitted)
+}
+
+fn repair_markdown_escaped_github_repo_candidate(raw: &str) -> Option<String> {
+    let (scheme, authority_and_path) = raw
+        .strip_prefix("https://")
+        .map(|tail| ("https", tail))
+        .or_else(|| raw.strip_prefix("http://").map(|tail| ("http", tail)))?;
+    let (authority, path) = authority_and_path.split_once('/')?;
+    if !authority.eq_ignore_ascii_case("github.com") {
+        return None;
+    }
+
+    let mut segments = path.split('/');
+    let owner = segments.next()?;
+    let pasted_repo = segments.next()?;
+    if segments.next().is_some() {
+        return None;
+    }
+    let close = pasted_repo.rfind("\\)")?;
+    let repo = &pasted_repo[..close];
+    let suffix = &pasted_repo[close + 2..];
+    if suffix.is_empty()
+        || !suffix.bytes().all(|byte| byte.is_ascii_digit())
+        || !valid_github_owner(owner)
+        || !valid_github_repo(repo)
+    {
+        return None;
+    }
+
+    Some(format!("{scheme}://github.com/{owner}/{repo}){suffix}"))
 }
 
 fn prompt_url_candidate_end(candidate: &str) -> usize {
@@ -1054,15 +1615,7 @@ fn ipv6_host_closing_bracket(candidate: &str) -> Option<usize> {
 
 fn canonical_prompt_url(mut url: Url) -> Url {
     url.set_fragment(None);
-    // A Markdown destination commonly ends in one unmatched `)` followed by
-    // punctuation. Repair that wrapper before GitHub view parsing so the
-    // unmatched delimiter cannot become part of a tree ref or blob path.
-    let opens = url.path().chars().filter(|ch| *ch == '(').count();
-    let closes = url.path().chars().filter(|ch| *ch == ')').count();
-    if closes > opens && url.path().ends_with(')') {
-        let next = url.path().trim_end_matches(')').to_string();
-        url.set_path(&next);
-    }
+    repair_numbered_github_repo_paste(&mut url);
     // Never normalize away a security-relevant component. It must survive to
     // `validate_url_shape`, where it is rejected before any transport call.
     if url.username().is_empty() && url.password().is_none() && url.port().is_none() {
@@ -1071,6 +1624,41 @@ fn canonical_prompt_url(mut url: Url) -> Url {
         }
     }
     url
+}
+
+fn repair_numbered_github_repo_paste(url: &mut Url) {
+    if !url
+        .host_str()
+        .is_some_and(|host| host.eq_ignore_ascii_case("github.com"))
+    {
+        return;
+    }
+    let segments = match url.path_segments() {
+        Some(segments) => segments
+            .filter(|segment| !segment.is_empty())
+            .collect::<Vec<_>>(),
+        None => return,
+    };
+    let [owner, pasted_repo] = segments.as_slice() else {
+        return;
+    };
+    let Some(close) = pasted_repo.rfind(')') else {
+        return;
+    };
+    let suffix = &pasted_repo[close + 1..];
+    let repo = &pasted_repo[..close];
+    if suffix.is_empty()
+        || !suffix.bytes().all(|byte| byte.is_ascii_digit())
+        || !valid_github_owner(owner)
+        || !valid_github_repo(repo)
+    {
+        return;
+    }
+    let owner = owner.to_string();
+    let repo = repo.to_string();
+    if let Ok(mut path) = url.path_segments_mut() {
+        path.clear().extend([owner.as_str(), repo.as_str()]);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1101,9 +1689,10 @@ fn github_repo(url: &Url) -> Option<GithubRepo> {
         return None;
     }
     let mut segments = url.path_segments()?.filter(|part| !part.is_empty());
-    let owner = github_slug_prefix(segments.next()?);
-    let repo = github_slug_prefix(segments.next()?).trim_end_matches(".git");
-    if owner.is_empty() || repo.is_empty() {
+    let owner = segments.next()?;
+    let raw_repo = segments.next()?;
+    let repo = raw_repo.strip_suffix(".git").unwrap_or(raw_repo);
+    if !valid_github_owner(owner) || !valid_github_repo(repo) {
         return None;
     }
     let action = segments.next();
@@ -1148,14 +1737,28 @@ fn github_repo(url: &Url) -> Option<GithubRepo> {
     })
 }
 
-fn github_slug_prefix(value: &str) -> &str {
-    let end = value
-        .char_indices()
-        .find_map(|(index, ch)| {
-            (!ch.is_ascii_alphanumeric() && !matches!(ch, '-' | '_' | '.')).then_some(index)
-        })
-        .unwrap_or(value.len());
-    &value[..end]
+fn valid_github_owner(value: &str) -> bool {
+    (1..=39).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        && value
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphanumeric)
+        && value
+            .as_bytes()
+            .last()
+            .is_some_and(u8::is_ascii_alphanumeric)
+        && !value.contains("--")
+}
+
+fn valid_github_repo(value: &str) -> bool {
+    (1..=100).contains(&value.len())
+        && !matches!(value, "." | "..")
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
 fn fetch_source(
@@ -1211,6 +1814,7 @@ fn fetch_source(
         url: provenance_url.as_str().to_string(),
         chunks: vec![WebResearchChunk {
             path: useful_url_path(provenance_url),
+            url: Some(provenance_url.as_str().to_string()),
             text: excerpt.clone(),
         }],
         excerpt,
@@ -1243,6 +1847,276 @@ struct GithubTreeEntry {
     kind: String,
     #[serde(default)]
     size: Option<u64>,
+    #[serde(default)]
+    sha: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct GithubReadme {
+    path: String,
+    url: Url,
+    text: String,
+}
+
+enum GithubTreeCandidateResult {
+    Found(GithubTree),
+    ProviderUnavailable,
+    NotFound,
+}
+
+struct GithubTreeFrontier {
+    treeish: String,
+    prefix: Option<String>,
+    depth: usize,
+}
+
+fn fetch_github_tree_candidate(
+    transport: &dyn WebTransport,
+    repo: &GithubRepo,
+    candidate: &GithubRefCandidate,
+    query_terms: &[String],
+    pages_remaining: &mut usize,
+    warnings: &mut Vec<String>,
+) -> GithubTreeCandidateResult {
+    if *pages_remaining == 0 {
+        return GithubTreeCandidateResult::NotFound;
+    }
+    *pages_remaining -= 1;
+    let label = format!("{}/{}", repo.owner, repo.repo);
+    let tree_url = github_api_url(
+        &repo.owner,
+        &repo.repo,
+        &["git", "trees", &candidate.reference],
+    );
+    let mut truncated_tree = None;
+    match transport.fetch_github_verified_public_api(&tree_url, "application/vnd.github+json") {
+        Ok(response) if (200..300).contains(&response.status) => {
+            match serde_json::from_slice::<GithubTree>(&response.body) {
+                Ok(tree) if !tree.truncated => return GithubTreeCandidateResult::Found(tree),
+                Ok(tree) => {
+                    warnings.push(format!(
+                        "{label}: GitHub returned a truncated recursive tree; using bounded tree traversal"
+                    ));
+                    truncated_tree = Some(tree);
+                }
+                Err(error) => warnings.push(format!(
+                    "{label}: GitHub recursive file tree was not valid JSON ({error}); using bounded tree traversal"
+                )),
+            }
+        }
+        Ok(response) if matches!(response.status, 401 | 403 | 429) => {
+            warnings.push(format!(
+                "{label}: GitHub API file tree returned HTTP {}; trying public raw/HTML content",
+                response.status
+            ));
+            return GithubTreeCandidateResult::ProviderUnavailable;
+        }
+        Ok(response) if matches!(response.status, 404 | 422) => {
+            return GithubTreeCandidateResult::NotFound;
+        }
+        Ok(response) => warnings.push(format!(
+            "{label}: GitHub recursive file tree returned HTTP {}; trying bounded tree traversal",
+            response.status
+        )),
+        Err(error) => warnings.push(format!(
+            "{label}: GitHub recursive file tree unavailable ({error}); trying bounded tree traversal"
+        )),
+    }
+
+    match fetch_bounded_github_tree(
+        transport,
+        repo,
+        &candidate.reference,
+        candidate.path.as_deref(),
+        query_terms,
+        pages_remaining,
+        warnings,
+    ) {
+        GithubTreeCandidateResult::NotFound => truncated_tree
+            .map(GithubTreeCandidateResult::Found)
+            .unwrap_or(GithubTreeCandidateResult::NotFound),
+        result => result,
+    }
+}
+
+fn fetch_bounded_github_tree(
+    transport: &dyn WebTransport,
+    repo: &GithubRepo,
+    reference: &str,
+    path_prefix: Option<&str>,
+    query_terms: &[String],
+    pages_remaining: &mut usize,
+    warnings: &mut Vec<String>,
+) -> GithubTreeCandidateResult {
+    let label = format!("{}/{}", repo.owner, repo.repo);
+    let target = path_prefix
+        .map(|path| path.trim_matches('/'))
+        .filter(|path| !path.is_empty());
+    let mut pending = vec![GithubTreeFrontier {
+        treeish: reference.to_string(),
+        prefix: None,
+        depth: 0,
+    }];
+    let mut seen_trees = HashSet::new();
+    let mut entries = Vec::new();
+    let mut successful_pages = 0usize;
+    let mut inspected_entries = 0usize;
+    let mut incomplete = false;
+    let mut entry_limit_exceeded = false;
+
+    while *pages_remaining > 0 && !pending.is_empty() {
+        let next_index = pending
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, item)| {
+                github_api_directory_score(item.prefix.as_deref(), target, query_terms)
+            })
+            .map(|(index, _)| index)
+            .unwrap_or(0);
+        let item = pending.swap_remove(next_index);
+        if !seen_trees.insert((item.treeish.clone(), item.prefix.clone())) {
+            continue;
+        }
+        *pages_remaining -= 1;
+        let tree_url = github_nonrecursive_tree_api_url(&repo.owner, &repo.repo, &item.treeish);
+        let response = match transport
+            .fetch_github_verified_public_api(&tree_url, "application/vnd.github+json")
+        {
+            Ok(response) if (200..300).contains(&response.status) => response,
+            Ok(response) if matches!(response.status, 401 | 403 | 429) => {
+                warnings.push(format!(
+                    "{label}: bounded GitHub tree traversal returned HTTP {}",
+                    response.status
+                ));
+                if entries.is_empty() {
+                    return GithubTreeCandidateResult::ProviderUnavailable;
+                }
+                incomplete = true;
+                break;
+            }
+            Ok(response) => {
+                incomplete = true;
+                warnings.push(format!(
+                    "{label}: bounded GitHub tree page returned HTTP {}",
+                    response.status
+                ));
+                continue;
+            }
+            Err(error) => {
+                incomplete = true;
+                warnings.push(format!(
+                    "{label}: bounded GitHub tree page was unavailable ({error})"
+                ));
+                continue;
+            }
+        };
+        let page = match serde_json::from_slice::<GithubTree>(&response.body) {
+            Ok(page) => page,
+            Err(error) => {
+                incomplete = true;
+                warnings.push(format!(
+                    "{label}: bounded GitHub tree page was not valid JSON ({error})"
+                ));
+                continue;
+            }
+        };
+        successful_pages += 1;
+        incomplete |= page.truncated;
+
+        for entry in page.tree {
+            if inspected_entries >= MAX_GITHUB_API_TREE_ENTRIES {
+                incomplete = true;
+                entry_limit_exceeded = true;
+                break;
+            }
+            inspected_entries += 1;
+            if !valid_github_tree_path(&entry.path) {
+                continue;
+            }
+            let full_path = item
+                .prefix
+                .as_deref()
+                .map(|prefix| format!("{prefix}/{}", entry.path))
+                .unwrap_or_else(|| entry.path.clone());
+            if !valid_github_tree_path(&full_path) {
+                continue;
+            }
+            match entry.kind.as_str() {
+                "blob" => entries.push(GithubTreeEntry {
+                    path: full_path,
+                    kind: entry.kind,
+                    size: entry.size,
+                    sha: entry.sha,
+                }),
+                "tree" if item.depth < MAX_GITHUB_API_TREE_DEPTH => {
+                    if let Some(sha) = entry.sha.filter(|sha| is_github_commit_ref(sha)) {
+                        pending.push(GithubTreeFrontier {
+                            treeish: sha,
+                            prefix: Some(full_path),
+                            depth: item.depth + 1,
+                        });
+                    }
+                }
+                "tree" => incomplete = true,
+                _ => {}
+            }
+        }
+        if entry_limit_exceeded {
+            break;
+        }
+    }
+
+    if successful_pages == 0 {
+        return GithubTreeCandidateResult::NotFound;
+    }
+    if !pending.is_empty() {
+        incomplete = true;
+    }
+    if incomplete {
+        warnings.push(format!(
+            "{label}: bounded GitHub tree traversal stopped at its page, depth, or entry limit"
+        ));
+    }
+    GithubTreeCandidateResult::Found(GithubTree {
+        tree: entries,
+        truncated: incomplete,
+    })
+}
+
+fn github_api_directory_score(
+    path: Option<&str>,
+    target: Option<&str>,
+    query_terms: &[String],
+) -> i64 {
+    let Some(path) = path else { return i64::MAX };
+    let path_score = github_directory_score(Some(path), query_terms) as i64;
+    let target_score = target.map_or(0, |target| {
+        if path == target
+            || target
+                .strip_prefix(path)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+        {
+            1_000_000
+        } else if path
+            .strip_prefix(target)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+        {
+            500_000
+        } else {
+            -100_000
+        }
+    });
+    target_score + path_score
+}
+
+fn valid_github_tree_path(path: &str) -> bool {
+    !path.is_empty()
+        && path.len() <= 4_096
+        && !path.starts_with('/')
+        && !path.chars().any(char::is_control)
+        && path
+            .split('/')
+            .all(|segment| !segment.is_empty() && !matches!(segment, "." | ".."))
 }
 
 fn fetch_github_repo(
@@ -1251,8 +2125,10 @@ fn fetch_github_repo(
     query: &str,
     warnings: &mut Vec<String>,
 ) -> Option<WebResearchSource> {
+    let warning_start = warnings.len();
     let label = format!("{}/{}", repo.owner, repo.repo);
     let query_terms = query_terms(query);
+    let overview_only = repo.view.is_none() && is_github_repository_overview_request(query, repo);
     // Downstream authenticated reads are fail-closed until GitHub explicitly
     // confirms that this repository is public. A malformed/missing `private`
     // field must never turn the provider token into a private-content reader.
@@ -1291,48 +2167,47 @@ fn fetch_github_repo(
     }
 
     let candidates = github_ref_candidates(repo, default_branch.as_deref());
-    let mut resolved = None;
-    if api_available {
+    // A repository-root overview is already answered best by the repository
+    // metadata and README. Avoid spending GitHub API quota (and latency) on a
+    // recursive tree that will not add useful evidence to that answer.
+    let mut resolved = overview_only.then(|| ResolvedGithubTarget {
+        reference: candidates
+            .first()
+            .map(|candidate| candidate.reference.clone())
+            .unwrap_or_else(|| "HEAD".to_string()),
+        path: None,
+        tree: None,
+    });
+    let mut api_tree_pages_remaining = MAX_GITHUB_API_TREE_PAGES;
+    if api_available && resolved.is_none() {
         for candidate in &candidates {
-            let tree_url = github_api_url(
-                &repo.owner,
-                &repo.repo,
-                &["git", "trees", &candidate.reference],
-            );
-            match transport
-                .fetch_github_verified_public_api(&tree_url, "application/vnd.github+json")
-            {
-                Ok(response) if (200..300).contains(&response.status) => {
-                    match serde_json::from_slice::<GithubTree>(&response.body) {
-                        Ok(tree) => {
-                            resolved = Some(ResolvedGithubTarget {
-                                reference: candidate.reference.clone(),
-                                path: candidate.path.clone(),
-                                tree: Some(tree),
-                            });
-                            break;
-                        }
-                        Err(error) => warnings.push(format!(
-                            "{label}: GitHub file tree was not valid JSON: {error}"
-                        )),
-                    }
+            match fetch_github_tree_candidate(
+                transport,
+                repo,
+                candidate,
+                &query_terms,
+                &mut api_tree_pages_remaining,
+                warnings,
+            ) {
+                GithubTreeCandidateResult::Found(tree) => {
+                    resolved = Some(ResolvedGithubTarget {
+                        reference: candidate.reference.clone(),
+                        path: candidate.path.clone(),
+                        tree: Some(tree),
+                    });
+                    break;
                 }
-                Ok(response) if matches!(response.status, 401 | 403 | 429) => {
-                    warnings.push(format!(
-                        "{label}: GitHub API file tree returned HTTP {}; trying public raw/HTML content",
-                        response.status
-                    ));
+                GithubTreeCandidateResult::ProviderUnavailable => {
                     api_available = false;
                     break;
                 }
-                Ok(_) => {}
-                Err(error) => {
-                    warnings.push(format!(
-                        "{label}: GitHub API file tree unavailable ({error}); trying public raw/HTML content"
-                    ));
-                    api_available = false;
-                    break;
-                }
+                GithubTreeCandidateResult::NotFound => {}
+            }
+            if api_tree_pages_remaining == 0 {
+                warnings.push(format!(
+                    "{label}: GitHub tree lookup reached its {MAX_GITHUB_API_TREE_PAGES}-page limit"
+                ));
+                break;
             }
         }
     }
@@ -1361,7 +2236,13 @@ fn fetch_github_repo(
             .fetch_github_verified_public_api(&readme_url, "application/vnd.github.raw+json")
         {
             Ok(response) if (200..300).contains(&response.status) => {
-                readme = response_excerpt_with_limit(&response, MAX_README_CHARS);
+                readme = response_excerpt_with_limit(&response, MAX_README_CHARS).map(|text| {
+                    GithubReadme {
+                        path: "README".to_string(),
+                        url: github_readme_page_url(&repo.owner, &repo.repo, &resolved.reference),
+                        text,
+                    }
+                });
             }
             Ok(response) if matches!(response.status, 401 | 403 | 429) => warnings.push(format!(
                 "{label}: GitHub API README returned HTTP {}; using public raw fallback",
@@ -1377,67 +2258,75 @@ fn fetch_github_repo(
         readme = fetch_raw_github_readme(transport, &repo.owner, &repo.repo, &resolved.reference);
     }
 
-    // Implementation chunks precede README context. Paths remain explicit so
-    // the browser can rank and budget evidence without inventing provenance.
+    let readme_only = overview_only && readme.is_some();
+    // Specific implementation questions keep code ahead of the README.
+    // Generic repository overviews use only the README so the model receives
+    // focused evidence without a broad and quota-expensive file-tree scan.
     let mut chunks = Vec::new();
-    if repo
-        .view
-        .as_ref()
-        .is_some_and(|view| view.kind == GithubViewKind::Blob)
-    {
-        if let Some(path) = resolved.path.as_deref() {
-            fetch_github_code_chunk(
-                transport,
-                repo,
-                &resolved.reference,
-                path,
-                &query_terms,
-                &mut chunks,
-                warnings,
-            );
-        }
-    } else {
-        let mut entries = resolved
-            .tree
+    if !readme_only {
+        if repo
+            .view
             .as_ref()
-            .map(|tree| tree.tree.clone())
-            .unwrap_or_default();
-        if entries.is_empty() {
-            entries = fetch_github_html_tree(
-                transport,
-                repo,
-                &resolved.reference,
-                resolved.path.as_deref(),
-                &query_terms,
-                warnings,
-            );
-        }
-        if resolved.tree.as_ref().is_some_and(|tree| tree.truncated) {
-            warnings.push(format!(
-                "{label}: GitHub returned a truncated file tree; only ranked visible files were considered"
-            ));
-        }
-        for path in select_github_source_paths(&entries, resolved.path.as_deref(), &query_terms) {
-            fetch_github_code_chunk(
-                transport,
-                repo,
-                &resolved.reference,
-                &path,
-                &query_terms,
-                &mut chunks,
-                warnings,
-            );
+            .is_some_and(|view| view.kind == GithubViewKind::Blob)
+        {
+            if let Some(path) = resolved.path.as_deref() {
+                fetch_github_code_chunk(
+                    transport,
+                    repo,
+                    &resolved.reference,
+                    path,
+                    &query_terms,
+                    &mut chunks,
+                    warnings,
+                );
+            }
+        } else {
+            let mut entries = resolved
+                .tree
+                .as_ref()
+                .map(|tree| tree.tree.clone())
+                .unwrap_or_default();
+            if entries.is_empty() {
+                entries = fetch_github_html_tree(
+                    transport,
+                    repo,
+                    &resolved.reference,
+                    resolved.path.as_deref(),
+                    &query_terms,
+                    warnings,
+                );
+            }
+            for path in select_github_source_paths(&entries, resolved.path.as_deref(), &query_terms)
+            {
+                fetch_github_code_chunk(
+                    transport,
+                    repo,
+                    &resolved.reference,
+                    &path,
+                    &query_terms,
+                    &mut chunks,
+                    warnings,
+                );
+            }
         }
     }
 
+    normalize_github_tree_warnings(
+        warnings,
+        warning_start,
+        &label,
+        resolved.tree.as_ref().map(|tree| tree.truncated),
+    );
+
     let title = readme
-        .as_deref()
-        .and_then(markdown_title)
+        .as_ref()
+        .and_then(|readme| markdown_title(&readme.text))
         .unwrap_or_else(|| label.clone());
     if let Some(readme) = readme {
         chunks.push(WebResearchChunk {
-            path: Some("README".to_string()),
-            text: readme,
+            path: Some(readme.path),
+            url: Some(readme.url.to_string()),
+            text: readme.text,
         });
     }
     if chunks.is_empty() {
@@ -1461,6 +2350,47 @@ fn fetch_github_repo(
         excerpt: clip_chars(&combined, MAX_SOURCE_EXCERPT_CHARS, true),
         chunks,
     })
+}
+
+fn normalize_github_tree_warnings(
+    warnings: &mut Vec<String>,
+    warning_start: usize,
+    label: &str,
+    incomplete: Option<bool>,
+) {
+    let Some(incomplete) = incomplete else {
+        return;
+    };
+    let tail = warnings.split_off(warning_start.min(warnings.len()));
+    let mut saw_tree_warning = false;
+    for warning in tail {
+        let detail = warning
+            .strip_prefix(label)
+            .map(str::trim_start)
+            .and_then(|detail| detail.strip_prefix(':'))
+            .map(str::trim_start);
+        let is_tree_warning = detail.is_some_and(|detail| {
+            let lower = detail.to_ascii_lowercase();
+            detail.starts_with("GitHub returned a truncated recursive tree")
+                || detail.starts_with("bounded GitHub tree traversal stopped")
+                || detail.starts_with("GitHub returned a truncated file tree")
+                || detail.starts_with("GitHub tree lookup reached")
+                || (detail.starts_with("GitHub recursive file tree unavailable")
+                    && (lower.contains("maximum allowed file size")
+                        || lower.contains("maximum file size exceeded")
+                        || lower.contains("body limit")))
+        });
+        if is_tree_warning {
+            saw_tree_warning = true;
+        } else {
+            warnings.push(warning);
+        }
+    }
+    if incomplete && saw_tree_warning {
+        warnings.push(format!(
+            "{label}: repository file coverage was incomplete after bounded GitHub traversal; only ranked visible files were considered"
+        ));
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1625,7 +2555,7 @@ fn fetch_raw_github_readme(
     owner: &str,
     repo: &str,
     reference: &str,
-) -> Option<String> {
+) -> Option<GithubReadme> {
     ["README.md", "readme.md", "README", "README.txt"]
         .into_iter()
         .find_map(|path| {
@@ -1634,7 +2564,20 @@ fn fetch_raw_github_readme(
                 .fetch(&url, "text/plain")
                 .ok()
                 .filter(|response| (200..300).contains(&response.status))
-                .and_then(|response| response_excerpt_with_limit(&response, MAX_README_CHARS))
+                .and_then(|response| {
+                    let text = response_excerpt_with_limit(&response, MAX_README_CHARS)?;
+                    let provenance = response
+                        .final_url
+                        .as_ref()
+                        .filter(|final_url| *final_url != &url)
+                        .cloned()
+                        .unwrap_or_else(|| github_blob_page_url(owner, repo, reference, path));
+                    Some(GithubReadme {
+                        path: path.to_string(),
+                        url: provenance,
+                        text,
+                    })
+                })
         })
 }
 
@@ -1650,9 +2593,16 @@ fn fetch_github_code_chunk(
     let raw_url = raw_github_url(&repo.owner, &repo.repo, reference, path);
     match transport.fetch(&raw_url, "text/plain") {
         Ok(response) if (200..300).contains(&response.status) => {
+            let provenance = response
+                .final_url
+                .as_ref()
+                .filter(|final_url| *final_url != &raw_url)
+                .cloned()
+                .unwrap_or_else(|| github_blob_page_url(&repo.owner, &repo.repo, reference, path));
             if let Some(text) = code_excerpt(&response, MAX_CODE_FILE_CHARS, query_terms) {
                 chunks.push(WebResearchChunk {
                     path: Some(path.to_string()),
+                    url: Some(provenance.to_string()),
                     text,
                 });
             }
@@ -1676,6 +2626,26 @@ fn github_tree_page_url(owner: &str, repo: &str, reference: &str, path: Option<&
         segments.extend(path.split('/'));
     }
     drop(segments);
+    url
+}
+
+fn github_blob_page_url(owner: &str, repo: &str, reference: &str, path: &str) -> Url {
+    let mut url = Url::parse("https://github.com/").expect("static GitHub URL");
+    let mut segments = url.path_segments_mut().expect("GitHub URL is a base");
+    segments.extend([owner, repo, "blob"]);
+    segments.extend(reference.split('/'));
+    segments.extend(path.split('/'));
+    drop(segments);
+    url
+}
+
+fn github_readme_page_url(owner: &str, repo: &str, reference: &str) -> Url {
+    let mut url = Url::parse("https://github.com/").expect("static GitHub URL");
+    let mut segments = url.path_segments_mut().expect("GitHub URL is a base");
+    segments.extend([owner, repo, "tree"]);
+    segments.extend(reference.split('/'));
+    drop(segments);
+    url.set_fragment(Some("readme"));
     url
 }
 
@@ -1755,6 +2725,7 @@ fn fetch_github_html_tree(
             path,
             kind: "blob".to_string(),
             size: None,
+            sha: None,
         })
         .collect::<Vec<_>>();
     entries.sort_by(|left, right| left.path.cmp(&right.path));
@@ -1827,6 +2798,12 @@ fn github_api_url(owner: &str, repo: &str, suffix: &[&str]) -> Url {
     if suffix.first() == Some(&"trees") || suffix.get(1) == Some(&"trees") {
         url.query_pairs_mut().append_pair("recursive", "1");
     }
+    url
+}
+
+fn github_nonrecursive_tree_api_url(owner: &str, repo: &str, treeish: &str) -> Url {
+    let mut url = github_api_url(owner, repo, &["git", "trees", treeish]);
+    url.set_query(None);
     url
 }
 
@@ -1915,11 +2892,139 @@ fn source_path_score(path: &str, query_terms: &[String]) -> Option<i32> {
     Some(query_matches * 1_000 + i32::from(entrypoint) * 250 + (40 - depth))
 }
 
+fn is_github_repository_overview_request(query: &str, repo: &GithubRepo) -> bool {
+    const IMPLEMENTATION_CUES: &[&str] = &[
+        "architecture",
+        "backend",
+        "bug",
+        "build",
+        "class",
+        "code",
+        "dependency",
+        "dependencies",
+        "endpoint",
+        "feature",
+        "file",
+        "fix",
+        "frontend",
+        "function",
+        "implement",
+        "implementation",
+        "modify",
+        "module",
+        "performance",
+        "protocol",
+        "security",
+        "source",
+        "test",
+        "update",
+        "vulnerability",
+        "vulnerabilities",
+    ];
+    const GENERIC_OVERVIEW_WORDS: &[&str] = &[
+        "a",
+        "about",
+        "an",
+        "and",
+        "can",
+        "check",
+        "could",
+        "describe",
+        "do",
+        "does",
+        "explain",
+        "for",
+        "give",
+        "github",
+        "inspect",
+        "is",
+        "it",
+        "its",
+        "me",
+        "of",
+        "overview",
+        "please",
+        "read",
+        "repo",
+        "repository",
+        "review",
+        "summarize",
+        "summary",
+        "tell",
+        "the",
+        "this",
+        "us",
+        "what",
+        "would",
+        "you",
+    ];
+
+    let without_urls = search_query_from_prompt(query).to_ascii_lowercase();
+    let words = without_urls
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>();
+    if words.iter().any(|word| IMPLEMENTATION_CUES.contains(word)) {
+        return false;
+    }
+    if words.is_empty() {
+        return true;
+    }
+    let repository_subject_words = [&repo.owner, &repo.repo]
+        .into_iter()
+        .flat_map(|value| {
+            value
+                .split(|ch: char| !ch.is_ascii_alphanumeric())
+                .filter(|word| !word.is_empty())
+                .map(str::to_ascii_lowercase)
+        })
+        .collect::<HashSet<_>>();
+    words.iter().all(|word| {
+        GENERIC_OVERVIEW_WORDS.contains(word) || repository_subject_words.contains(*word)
+    })
+}
+
 fn query_terms(query: &str) -> Vec<String> {
     const STOP_WORDS: &[&str] = &[
-        "about", "after", "also", "and", "app", "build", "can", "code", "create", "from", "github",
-        "have", "http", "https", "into", "need", "plan", "read", "search", "that", "the", "their",
-        "this", "use", "using", "want", "web", "with",
+        "about",
+        "after",
+        "also",
+        "and",
+        "app",
+        "build",
+        "can",
+        "code",
+        "could",
+        "create",
+        "describe",
+        "from",
+        "github",
+        "have",
+        "http",
+        "https",
+        "into",
+        "need",
+        "overview",
+        "please",
+        "plan",
+        "read",
+        "repo",
+        "repository",
+        "search",
+        "that",
+        "the",
+        "their",
+        "this",
+        "tell",
+        "use",
+        "using",
+        "want",
+        "web",
+        "what",
+        "with",
+        "would",
+        "you",
+        "your",
     ];
     let mut seen = HashSet::new();
     let without_urls = query
@@ -2531,8 +3636,42 @@ fn validate_url_shape(url: &Url) -> Result<(), String> {
     Ok(())
 }
 
-fn resolve_public_addresses(url: &Url) -> Result<Vec<IpAddr>, String> {
+fn research_deadline_error() -> String {
+    format!(
+        "the {}-second web research deadline was reached",
+        RESEARCH_TOTAL_DEADLINE.as_secs()
+    )
+}
+
+fn resolve_public_addresses(
+    url: &Url,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
+    deadline: Option<Instant>,
+) -> Result<Vec<IpAddr>, String> {
+    resolve_public_addresses_with(url, cancel, deadline, |host, port| {
+        (host.as_str(), port)
+            .to_socket_addrs()
+            .map_err(|error| format!("could not resolve public host {host}: {error}"))
+            .map(|addresses| addresses.map(|address| address.ip()).collect())
+    })
+}
+
+fn resolve_public_addresses_with<F>(
+    url: &Url,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
+    deadline: Option<Instant>,
+    resolver: F,
+) -> Result<Vec<IpAddr>, String>
+where
+    F: FnOnce(String, u16) -> Result<Vec<IpAddr>, String> + Send + 'static,
+{
     validate_url_shape(url)?;
+    if cancel.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+        return Err("web research was cancelled".to_string());
+    }
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Err(research_deadline_error());
+    }
     if let Some(ip) = match url.host() {
         Some(Host::Ipv4(address)) => Some(IpAddr::V4(address)),
         Some(Host::Ipv6(address)) => Some(IpAddr::V6(address)),
@@ -2546,19 +3685,56 @@ fn resolve_public_addresses(url: &Url) -> Result<Vec<IpAddr>, String> {
     let port = url
         .port_or_known_default()
         .ok_or_else(|| "URL has no HTTP(S) port".to_string())?;
-    let mut addresses: Vec<IpAddr> = (host, port)
-        .to_socket_addrs()
-        .map_err(|error| format!("could not resolve public host {host}: {error}"))?
-        .map(|address| address.ip())
-        .collect();
+    let host = host.to_string();
+    let display_host = host.clone();
+    // The research worker may abandon a stuck system resolver at its deadline,
+    // but the resolver thread itself can only be reclaimed by the OS call
+    // returning. Keep a separate, process-wide cap owned by those threads so
+    // repeated abandoned lookups cannot accumulate without bound.
+    let dns_permit = dns_lookup_gate().try_acquire().ok_or_else(|| {
+        "DNS lookup capacity is busy; web research can continue without this source".to_string()
+    })?;
+    let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+    thread::Builder::new()
+        .name("camelid-web-dns".to_string())
+        .spawn(move || {
+            let _dns_permit = dns_permit;
+            let _ = result_tx.send(resolver(host, port));
+        })
+        .map_err(|error| format!("could not start DNS lookup for {display_host}: {error}"))?;
+
+    let mut addresses = loop {
+        if cancel.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+            return Err("web research was cancelled".to_string());
+        }
+        let wait = match deadline {
+            Some(deadline) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(research_deadline_error());
+                }
+                remaining.min(Duration::from_millis(10))
+            }
+            None => Duration::from_millis(10),
+        };
+        match result_rx.recv_timeout(wait) {
+            Ok(result) => break result?,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(format!(
+                    "DNS lookup worker for {display_host} stopped unexpectedly"
+                ))
+            }
+        }
+    };
     addresses.sort_unstable();
     addresses.dedup();
     if addresses.is_empty() {
-        return Err(format!("public host {host} did not resolve"));
+        return Err(format!("public host {display_host} did not resolve"));
     }
     if addresses.iter().any(|address| !is_public_ip(*address)) {
         return Err(format!(
-            "host {host} resolved to a loopback, private, link-local, or reserved address"
+            "host {display_host} resolved to a loopback, private, link-local, or reserved address"
         ));
     }
     Ok(addresses)
@@ -2611,6 +3787,9 @@ fn is_public_ipv6(address: Ipv6Addr) -> bool {
         || (segments[0] == 0x0100 && segments[1] == 0 && segments[2] == 0 && segments[3] == 0)
         || segments[0] == 0x2002
         || (segments[0] == 0x2001 && segments[1] == 0)
+        || (segments[0] == 0x2001 && segments[1] == 0x0002 && segments[2] == 0)
+        || (segments[0] == 0x2001 && (segments[1] & 0xfff0) == 0x0010)
+        || (segments[0] == 0x2001 && (segments[1] & 0xfff0) == 0x0020)
         || (segments[0] == 0x2001 && segments[1] == 0x0db8)
         || (segments[0] == 0x3fff && (segments[1] & 0xf000) == 0))
 }
@@ -2633,7 +3812,22 @@ fn curl_single_hop(
     etag: Option<&str>,
     github_token: Option<&str>,
     cancel: Option<&tokio_util::sync::CancellationToken>,
+    deadline: Option<Instant>,
 ) -> Result<FetchResponse, String> {
+    if cancel.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+        return Err("web research was cancelled".to_string());
+    }
+    let remaining = deadline
+        .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+        .unwrap_or(Duration::from_secs(15));
+    if remaining.is_zero() {
+        return Err(research_deadline_error());
+    }
+    let hop_timeout = remaining.min(Duration::from_secs(15));
+    let connect_timeout = hop_timeout.min(Duration::from_secs(5));
+    let hop_timeout_arg = curl_timeout_arg(hop_timeout).ok_or_else(research_deadline_error)?;
+    let connect_timeout_arg =
+        curl_timeout_arg(connect_timeout).ok_or_else(research_deadline_error)?;
     let host = url
         .host_str()
         .ok_or_else(|| "URL must include a host".to_string())?;
@@ -2655,9 +3849,9 @@ fn curl_single_hop(
         "--max-redirs",
         "0",
         "--connect-timeout",
-        "5",
+        &connect_timeout_arg,
         "--max-time",
-        "15",
+        &hop_timeout_arg,
         "--max-filesize",
         &MAX_HTTP_BODY_BYTES.to_string(),
         "--user-agent",
@@ -2751,6 +3945,13 @@ fn curl_single_hop(
             let _ = stderr_reader.join();
             return Err("web research was cancelled".to_string());
         }
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err(research_deadline_error());
+        }
         match child
             .try_wait()
             .map_err(|error| format!("could not poll curl: {error}"))?
@@ -2779,6 +3980,14 @@ fn curl_single_hop(
         });
     }
     parse_curl_response(&output)
+}
+
+fn curl_timeout_arg(duration: Duration) -> Option<String> {
+    // Round down so curl can never be configured beyond the caller's
+    // remaining total deadline. A sub-microsecond budget is treated as
+    // already expired rather than rounded upward.
+    let micros = duration.as_micros();
+    (micros > 0).then(|| format!("{}.{:06}", micros / 1_000_000, micros % 1_000_000))
 }
 
 fn safe_http_header_value(value: &str) -> bool {
@@ -2888,6 +4097,13 @@ mod tests {
                 .insert(url.to_string(), Ok(response));
         }
 
+        fn insert_error(&self, url: Url, error: impl Into<String>) {
+            self.responses
+                .lock()
+                .unwrap()
+                .insert(url.to_string(), Err(error.into()));
+        }
+
         fn calls(&self) -> Vec<String> {
             self.calls
                 .lock()
@@ -2896,6 +4112,14 @@ mod tests {
                 .map(|(url, _)| url.clone())
                 .collect()
         }
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct ClassifierFixtureCase {
+        prompt: String,
+        needed: bool,
+        has_query: bool,
+        url_count: usize,
     }
 
     impl WebTransport for FakeTransport {
@@ -2965,6 +4189,7 @@ mod tests {
             _accept: &str,
             _etag: Option<&str>,
             cancel: Option<&tokio_util::sync::CancellationToken>,
+            _deadline: Option<Instant>,
             _auth: ProviderAuthIntent,
         ) -> Result<FetchResponse, String> {
             if let Some(started) = self.started.lock().unwrap().take() {
@@ -3030,10 +4255,31 @@ mod tests {
     }
 
     #[test]
+    fn shared_classifier_fixture_matches_frontend_planning() {
+        let cases: Vec<ClassifierFixtureCase> = serde_json::from_str(include_str!(
+            "../../tests/fixtures/websearch/classifier_cases.json"
+        ))
+        .expect("shared web-search classifier fixture");
+        for case in cases {
+            match classify_prompt(&case.prompt) {
+                ResearchDecision::Research { urls, query, .. } => {
+                    assert!(case.needed, "unexpected research: {}", case.prompt);
+                    assert_eq!(query.is_some(), case.has_query, "query: {}", case.prompt);
+                    assert_eq!(urls.len(), case.url_count, "URLs: {}", case.prompt);
+                }
+                ResearchDecision::Skip => {
+                    assert!(!case.needed, "unexpected skip: {}", case.prompt);
+                    assert!(!case.has_query, "skipped query: {}", case.prompt);
+                    assert_eq!(case.url_count, 0, "skipped URLs: {}", case.prompt);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn current_and_explicit_frontend_cues_classify_as_search() {
         for prompt in [
             "Look up the Xcode documentation",
-            "Lookup the Xcode documentation",
             "Read the linked docs for this package",
             "Check the website for recent changes",
             "What is today's weather?",
@@ -3055,6 +4301,38 @@ mod tests {
             classify_prompt("Explain what happened as of 20 minutes ago"),
             ResearchDecision::Skip
         ));
+        assert!(matches!(
+            classify_prompt("Build a lookup table from this text."),
+            ResearchDecision::Skip
+        ));
+    }
+
+    #[test]
+    fn directive_privacy_forms_skip_without_capturing_descriptive_copy() {
+        for prompt in [
+            "Do not connect to the internet; what is the latest Xcode release?",
+            "Answer without external sources; compare the latest releases in my notes.",
+        ] {
+            assert!(
+                matches!(classify_prompt(prompt), ResearchDecision::Skip),
+                "privacy directive unexpectedly researched: {prompt}"
+            );
+        }
+
+        for prompt in [
+            "Describe the state shown when there is no network access; search the web for current recovery guidance.",
+            "Review the copy no external sources; search the web for current alternatives.",
+            "Write UI copy that says do not connect to the internet; search the web for current examples.",
+            "Explain the phrase answer without external sources; search the web for current guidance.",
+        ] {
+            assert!(
+                matches!(
+                    classify_prompt(prompt),
+                    ResearchDecision::Research { query: Some(_), .. }
+                ),
+                "descriptive copy unexpectedly vetoed research: {prompt}"
+            );
+        }
     }
 
     #[test]
@@ -3094,6 +4372,74 @@ mod tests {
     }
 
     #[test]
+    fn dns_lookup_releases_the_caller_at_the_total_deadline() {
+        let url = Url::parse("https://example.com/slow").unwrap();
+        let (release_tx, release_rx) = mpsc::channel();
+        let result = resolve_public_addresses_with(
+            &url,
+            None,
+            Some(Instant::now() + Duration::from_millis(30)),
+            move |_host, _port| {
+                let _ = release_rx.recv_timeout(Duration::from_secs(1));
+                Ok(vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))])
+            },
+        );
+        assert!(result.unwrap_err().contains("deadline"));
+        release_tx.send(()).unwrap();
+    }
+
+    #[test]
+    fn dns_lookup_releases_the_caller_when_cancelled() {
+        let url = Url::parse("https://example.com/slow").unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let cancel_worker = cancel.clone();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let canceller = thread::spawn(move || {
+            started_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("controlled resolver did not start");
+            cancel_worker.cancel();
+        });
+        let result = resolve_public_addresses_with(
+            &url,
+            Some(&cancel),
+            Some(Instant::now() + Duration::from_secs(1)),
+            move |_host, _port| {
+                started_tx.send(()).unwrap();
+                let _ = release_rx.recv_timeout(Duration::from_secs(1));
+                Ok(vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))])
+            },
+        );
+        canceller.join().unwrap();
+        assert!(result.unwrap_err().contains("cancelled"));
+        release_tx.send(()).unwrap();
+    }
+
+    #[test]
+    fn dns_lookup_rejects_the_entire_answer_set_if_any_address_is_private() {
+        let url = Url::parse("https://example.com/mixed-dns").unwrap();
+        let result = resolve_public_addresses_with(&url, None, None, |_host, _port| {
+            Ok(vec![
+                IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
+                IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+            ])
+        });
+        assert!(result.unwrap_err().contains("reserved address"));
+    }
+
+    #[test]
+    fn dns_lookup_gate_fails_fast_at_capacity_and_recovers_on_drop() {
+        let gate = DnsLookupGate::new(2);
+        let first = gate.try_acquire().expect("first DNS slot");
+        let second = gate.try_acquire().expect("second DNS slot");
+        assert!(gate.try_acquire().is_none());
+        drop(first);
+        assert!(gate.try_acquire().is_some());
+        drop(second);
+    }
+
+    #[test]
     fn malformed_prompt_github_url_is_canonicalized_without_losing_valid_digits() {
         let (urls, omitted) = extract_prompt_urls(
             "Read https://github.com/PanamaHitek/SmartScale)2 and https://github.com/acme/repo2.",
@@ -3106,6 +4452,60 @@ mod tests {
                 "https://github.com/acme/repo2",
             ]
         );
+    }
+
+    #[test]
+    fn markdown_escaped_numbered_github_repo_paste_is_recovered() {
+        let (urls, omitted) = extract_prompt_urls(
+            r#"Read [SmartScale](https://github.com/PanamaHitek/SmartScale\)2)."#,
+        );
+        assert!(!omitted);
+        assert_eq!(
+            urls.iter().map(Url::as_str).collect::<Vec<_>>(),
+            ["https://github.com/PanamaHitek/SmartScale"]
+        );
+    }
+
+    #[test]
+    fn legal_github_tree_and_blob_parentheses_are_not_treated_as_paste_wrappers() {
+        let (urls, omitted) = extract_prompt_urls(
+            "Compare https://github.com/acme/widgets/tree/release)2 and https://github.com/acme/widgets/blob/main/spec)",
+        );
+        assert!(!omitted);
+        assert_eq!(
+            urls.iter().map(Url::as_str).collect::<Vec<_>>(),
+            [
+                "https://github.com/acme/widgets/tree/release)2",
+                "https://github.com/acme/widgets/blob/main/spec)",
+            ]
+        );
+    }
+
+    #[test]
+    fn markdown_closing_parenthesis_is_removed_from_the_destination_only() {
+        let (urls, _) = extract_prompt_urls(
+            "Read [the spec](https://github.com/acme/widgets/blob/main/spec.md).",
+        );
+        assert_eq!(
+            urls[0].as_str(),
+            "https://github.com/acme/widgets/blob/main/spec.md"
+        );
+    }
+
+    #[test]
+    fn malformed_github_slugs_are_not_silently_truncated_into_other_repositories() {
+        for raw in [
+            "https://github.com/acme!shadow/widgets",
+            "https://github.com/acme/widgets!shadow",
+            "https://github.com/-acme/widgets",
+        ] {
+            let parsed = Url::parse(raw).unwrap();
+            assert!(
+                github_repo(&parsed).is_none(),
+                "accepted malformed slug: {raw}"
+            );
+            assert_eq!(canonical_prompt_url(parsed).as_str(), raw);
+        }
     }
 
     #[test]
@@ -3156,14 +4556,172 @@ mod tests {
 
     #[test]
     fn linked_read_only_language_does_not_trigger_supplemental_search() {
+        for prompt in [
+            "Read the linked docs https://example.com/reference",
+            "Check https://example.com/reference and summarize it",
+            "Cite https://example.com/reference in the answer",
+        ] {
+            assert!(
+                matches!(
+                    classify_prompt(prompt),
+                    ResearchDecision::Research {
+                        reason: "embedded_urls",
+                        query: None,
+                        ..
+                    }
+                ),
+                "link-only prompt unexpectedly added search: {prompt}"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_coordinated_research_adds_a_bounded_supplemental_query() {
+        for (prompt, query_fragment) in [
+            (
+                "Read https://example.com/spec and look up competing libraries too.",
+                "look up competing libraries",
+            ),
+            (
+                "Read https://example.com/spec and research alternatives too.",
+                "research alternatives",
+            ),
+            (
+                "Read https://example.com/spec; additionally research similar libraries.",
+                "research similar libraries",
+            ),
+            (
+                "Read https://example.com/spec, then please also look up alternatives.",
+                "look up alternatives",
+            ),
+        ] {
+            match classify_prompt(prompt) {
+                ResearchDecision::Research {
+                    reason,
+                    urls,
+                    query: Some(query),
+                    ..
+                } => {
+                    assert_eq!(reason, "embedded_urls_and_search");
+                    assert_eq!(urls.len(), 1);
+                    assert_eq!(urls[0].as_str(), "https://example.com/spec");
+                    assert!(!query.contains("http"));
+                    assert!(query.contains(query_fragment));
+                }
+                decision => panic!("unexpected research decision for {prompt}: {decision:?}"),
+            }
+        }
+
         assert!(matches!(
-            classify_prompt("Read the linked docs https://example.com/reference"),
+            classify_prompt("Look up https://example.com/spec and summarize it."),
             ResearchDecision::Research {
                 reason: "embedded_urls",
                 query: None,
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn github_repository_overview_uses_readme_without_fetching_a_file_tree() {
+        let fake = FakeTransport::default();
+        fake.insert(
+            github_api_url("acme", "widgets", &[]),
+            FetchResponse::text(
+                200,
+                "application/json",
+                br#"{"default_branch":"main","private":false}"#,
+            ),
+        );
+        let mut readme_url = github_api_url("acme", "widgets", &["readme"]);
+        readme_url.query_pairs_mut().append_pair("ref", "main");
+        fake.insert(
+            readme_url,
+            FetchResponse::text(
+                200,
+                "text/plain",
+                "# Widgets\nA concise repository overview.",
+            ),
+        );
+
+        let response = research_prompt(
+            "Can you tell me about this GitHub repo? https://github.com/acme/widgets",
+            &fake,
+        );
+
+        assert_eq!(response.status, "complete", "{:?}", response.warnings);
+        assert_eq!(response.sources.len(), 1);
+        assert_eq!(response.sources[0].chunks.len(), 1);
+        assert_eq!(
+            response.sources[0].chunks[0].path.as_deref(),
+            Some("README")
+        );
+        assert!(response.sources[0].excerpt.contains("repository overview"));
+        let calls = fake.calls();
+        assert_eq!(calls.len(), 2, "unexpected overview fetches: {calls:?}");
+        assert!(!calls.iter().any(|url| url.contains("/git/trees/")));
+    }
+
+    #[test]
+    fn github_overview_intent_is_distinct_from_implementation_requests() {
+        let repo = github_repo(&Url::parse("https://github.com/acme/widgets").unwrap()).unwrap();
+        for prompt in [
+            "Can you tell me about this GitHub repo? https://github.com/acme/widgets",
+            "Summarize this repository: https://github.com/acme/widgets",
+            "Give me an overview of Widgets https://github.com/acme/widgets",
+            "https://github.com/acme/widgets",
+        ] {
+            assert!(
+                is_github_repository_overview_request(prompt, &repo),
+                "missed overview intent: {prompt}"
+            );
+        }
+        for prompt in [
+            "Build this app from https://github.com/acme/widgets",
+            "Read the code in this repo https://github.com/acme/widgets",
+            "Explain the architecture in https://github.com/acme/widgets",
+            "Find the protocol implementation in https://github.com/acme/widgets",
+            "Summarize this repository and trace its request cancellation logic https://github.com/acme/widgets",
+            "Describe this repo and explain how authentication works https://github.com/acme/widgets",
+        ] {
+            assert!(
+                !is_github_repository_overview_request(prompt, &repo),
+                "implementation request was reduced to an overview: {prompt}"
+            );
+        }
+    }
+
+    #[test]
+    fn github_overview_tries_raw_readme_before_html_when_api_is_unavailable() {
+        let fake = FakeTransport::default();
+        fake.insert(
+            github_api_url("acme", "widgets", &[]),
+            FetchResponse::text(403, "application/json", "rate limited"),
+        );
+        fake.insert(
+            raw_github_url("acme", "widgets", "HEAD", "README.md"),
+            FetchResponse::text(200, "text/plain", "# Widgets\nRaw overview evidence."),
+        );
+
+        let response = research_prompt(
+            "Tell me about this repo https://github.com/acme/widgets",
+            &fake,
+        );
+
+        assert_eq!(response.status, "partial");
+        assert_eq!(response.sources.len(), 1);
+        assert!(response.sources[0]
+            .excerpt
+            .contains("Raw overview evidence"));
+        let calls = fake.calls();
+        assert_eq!(
+            calls.len(),
+            2,
+            "unexpected overview fallback calls: {calls:?}"
+        );
+        assert!(!calls
+            .iter()
+            .any(|url| url.starts_with("https://github.com/acme/widgets/tree/")));
     }
 
     #[test]
@@ -3215,10 +4773,516 @@ mod tests {
             .chunks
             .iter()
             .any(|chunk| chunk.path.as_deref() == Some("src/research.rs")));
+        assert!(response.sources[0].chunks.iter().any(|chunk| {
+            chunk.path.as_deref() == Some("src/research.rs")
+                && chunk.url.as_deref()
+                    == Some(
+                        "https://github.com/acme/widgets/blob/feature/web-research/src/research.rs",
+                    )
+        }));
+        assert!(response.sources[0].chunks.iter().any(|chunk| {
+            chunk.path.as_deref() == Some("README")
+                && chunk.url.as_deref()
+                    == Some("https://github.com/acme/widgets/tree/feature/web-research#readme")
+        }));
         assert!(fake
             .calls()
             .iter()
             .any(|url| url.contains("feature%2Fweb-research")));
+    }
+
+    #[test]
+    fn recursive_tree_body_limit_uses_bounded_sha_walk_for_slash_branch_and_path() {
+        let fake = FakeTransport::default();
+        fake.insert(
+            github_api_url("acme", "widgets", &[]),
+            FetchResponse::text(
+                200,
+                "application/json",
+                br#"{"default_branch":"main","private":false}"#,
+            ),
+        );
+        let branch = "feature/web-research";
+        for invalid_ref in [
+            "feature/web-research/frontend/src",
+            "feature/web-research/frontend",
+        ] {
+            fake.insert(
+                github_api_url("acme", "widgets", &["git", "trees", invalid_ref]),
+                FetchResponse::text(404, "application/json", "not found"),
+            );
+        }
+        fake.insert_error(
+            github_api_url("acme", "widgets", &["git", "trees", branch]),
+            "response exceeded the 524288-byte body limit",
+        );
+
+        let frontend_sha = "a".repeat(40);
+        let src_sha = "b".repeat(40);
+        let mut root_entries = vec![json!({
+            "path": "frontend",
+            "type": "tree",
+            "sha": frontend_sha,
+        })];
+        root_entries.extend((0..20).map(|index| {
+            json!({
+                "path": format!("unrelated-{index}"),
+                "type": "tree",
+                "sha": format!("{index:040x}"),
+            })
+        }));
+        fake.insert(
+            github_nonrecursive_tree_api_url("acme", "widgets", branch),
+            FetchResponse::text(
+                200,
+                "application/json",
+                json!({ "tree": root_entries, "truncated": false }).to_string(),
+            ),
+        );
+        fake.insert(
+            github_nonrecursive_tree_api_url("acme", "widgets", &frontend_sha),
+            FetchResponse::text(
+                200,
+                "application/json",
+                json!({
+                    "tree": [{ "path": "src", "type": "tree", "sha": src_sha }],
+                    "truncated": false,
+                })
+                .to_string(),
+            ),
+        );
+        fake.insert(
+            github_nonrecursive_tree_api_url("acme", "widgets", &src_sha),
+            FetchResponse::text(
+                200,
+                "application/json",
+                json!({
+                    "tree": [{
+                        "path": "research.rs",
+                        "type": "blob",
+                        "size": 128,
+                        "sha": "c".repeat(40),
+                    }],
+                    "truncated": false,
+                })
+                .to_string(),
+            ),
+        );
+        let mut readme_url = github_api_url("acme", "widgets", &["readme"]);
+        readme_url.query_pairs_mut().append_pair("ref", branch);
+        fake.insert(
+            readme_url,
+            FetchResponse::text(200, "text/plain", "# Bounded tree"),
+        );
+        fake.insert(
+            raw_github_url("acme", "widgets", branch, "frontend/src/research.rs"),
+            FetchResponse::text(200, "text/plain", "pub fn bounded_research_endpoint() {}"),
+        );
+
+        let response = research_prompt(
+            "Read https://github.com/acme/widgets/tree/feature/web-research/frontend/src for the research endpoint.",
+            &fake,
+        );
+        assert_eq!(response.sources.len(), 1, "{:?}", response.warnings);
+        assert_eq!(
+            response.sources[0].url,
+            "https://github.com/acme/widgets/tree/feature/web-research/frontend/src"
+        );
+        assert!(response.sources[0].chunks.iter().any(|chunk| {
+            chunk.path.as_deref() == Some("frontend/src/research.rs")
+                && chunk.url.as_deref()
+                    == Some(
+                        "https://github.com/acme/widgets/blob/feature/web-research/frontend/src/research.rs",
+                    )
+                && chunk.text.contains("bounded_research_endpoint")
+        }));
+        let calls = fake.calls();
+        let tree_api_calls = calls
+            .iter()
+            .filter(|url| url.starts_with("https://api.github.com/repos/acme/widgets/git/trees/"))
+            .count();
+        assert!(tree_api_calls <= MAX_GITHUB_API_TREE_PAGES);
+        assert!(calls
+            .contains(&github_nonrecursive_tree_api_url("acme", "widgets", branch).to_string()));
+        assert!(calls.contains(
+            &github_nonrecursive_tree_api_url("acme", "widgets", &frontend_sha).to_string()
+        ));
+        assert!(calls
+            .contains(&github_nonrecursive_tree_api_url("acme", "widgets", &src_sha).to_string()));
+        let coverage_warnings = response
+            .warnings
+            .iter()
+            .filter(|warning| warning.contains("repository file coverage"))
+            .collect::<Vec<_>>();
+        assert_eq!(coverage_warnings.len(), 1, "{:?}", response.warnings);
+        assert!(coverage_warnings[0].contains("ranked visible files"));
+    }
+
+    #[test]
+    fn truncated_recursive_tree_is_replaced_by_bounded_nonrecursive_evidence() {
+        let fake = FakeTransport::default();
+        fake.insert(
+            github_api_url("acme", "widgets", &[]),
+            FetchResponse::text(
+                200,
+                "application/json",
+                br#"{"default_branch":"main","private":false}"#,
+            ),
+        );
+        fake.insert(
+            github_api_url("acme", "widgets", &["git", "trees", "main"]),
+            FetchResponse::text(
+                200,
+                "application/json",
+                json!({
+                    "tree": [{ "path": "src/unrelated.rs", "type": "blob", "size": 64 }],
+                    "truncated": true,
+                })
+                .to_string(),
+            ),
+        );
+        fake.insert(
+            github_nonrecursive_tree_api_url("acme", "widgets", "main"),
+            FetchResponse::text(
+                200,
+                "application/json",
+                json!({
+                    "tree": [{ "path": "src/protocol.rs", "type": "blob", "size": 64 }],
+                    "truncated": false,
+                })
+                .to_string(),
+            ),
+        );
+        let mut readme_url = github_api_url("acme", "widgets", &["readme"]);
+        readme_url.query_pairs_mut().append_pair("ref", "main");
+        fake.insert(
+            readme_url,
+            FetchResponse::text(200, "text/plain", "# Widgets"),
+        );
+        fake.insert(
+            raw_github_url("acme", "widgets", "main", "src/protocol.rs"),
+            FetchResponse::text(200, "text/plain", "pub fn protocol_decoder() {}"),
+        );
+
+        let response = research_prompt(
+            "Read https://github.com/acme/widgets for the protocol decoder.",
+            &fake,
+        );
+        assert_eq!(response.sources.len(), 1, "{:?}", response.warnings);
+        assert!(response.sources[0]
+            .chunks
+            .iter()
+            .any(|chunk| chunk.path.as_deref() == Some("src/protocol.rs")));
+        assert!(response.warnings.is_empty(), "{:?}", response.warnings);
+        assert!(fake
+            .calls()
+            .contains(&github_nonrecursive_tree_api_url("acme", "widgets", "main").to_string()));
+    }
+
+    #[test]
+    fn bounded_sha_walk_keeps_identical_trees_mounted_at_distinct_paths() {
+        let fake = FakeTransport::default();
+        let repo = github_repo(&Url::parse("https://github.com/acme/widgets").unwrap()).unwrap();
+        let shared_sha = "d".repeat(40);
+        fake.insert(
+            github_nonrecursive_tree_api_url("acme", "widgets", "main"),
+            FetchResponse::text(
+                200,
+                "application/json",
+                json!({
+                    "tree": [
+                        { "path": "first", "type": "tree", "sha": shared_sha },
+                        { "path": "second", "type": "tree", "sha": shared_sha },
+                    ],
+                    "truncated": false,
+                })
+                .to_string(),
+            ),
+        );
+        fake.insert(
+            github_nonrecursive_tree_api_url("acme", "widgets", &shared_sha),
+            FetchResponse::text(
+                200,
+                "application/json",
+                json!({
+                    "tree": [{ "path": "shared.rs", "type": "blob", "size": 64 }],
+                    "truncated": false,
+                })
+                .to_string(),
+            ),
+        );
+        let mut pages = MAX_GITHUB_API_TREE_PAGES;
+        let mut warnings = Vec::new();
+        let GithubTreeCandidateResult::Found(tree) =
+            fetch_bounded_github_tree(&fake, &repo, "main", None, &[], &mut pages, &mut warnings)
+        else {
+            panic!("bounded tree walk failed: {warnings:?}");
+        };
+        let paths = tree
+            .tree
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            paths,
+            HashSet::from(["first/shared.rs", "second/shared.rs"])
+        );
+        assert_eq!(
+            fake.calls()
+                .iter()
+                .filter(|url| {
+                    *url == &github_nonrecursive_tree_api_url("acme", "widgets", &shared_sha)
+                        .to_string()
+                })
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn bounded_sha_walk_rejects_an_oversized_combined_path() {
+        let fake = FakeTransport::default();
+        let repo = github_repo(&Url::parse("https://github.com/acme/widgets").unwrap()).unwrap();
+        let directory_sha = "e".repeat(40);
+        let long_prefix = "a".repeat(3_000);
+        let long_leaf = format!("{}.rs", "b".repeat(1_500));
+        fake.insert(
+            github_nonrecursive_tree_api_url("acme", "widgets", "main"),
+            FetchResponse::text(
+                200,
+                "application/json",
+                json!({
+                    "tree": [{ "path": long_prefix, "type": "tree", "sha": directory_sha }],
+                    "truncated": false,
+                })
+                .to_string(),
+            ),
+        );
+        fake.insert(
+            github_nonrecursive_tree_api_url("acme", "widgets", &directory_sha),
+            FetchResponse::text(
+                200,
+                "application/json",
+                json!({
+                    "tree": [{ "path": long_leaf, "type": "blob", "size": 64 }],
+                    "truncated": false,
+                })
+                .to_string(),
+            ),
+        );
+        let mut pages = MAX_GITHUB_API_TREE_PAGES;
+        let mut warnings = Vec::new();
+        let GithubTreeCandidateResult::Found(tree) =
+            fetch_bounded_github_tree(&fake, &repo, "main", None, &[], &mut pages, &mut warnings)
+        else {
+            panic!("bounded tree walk failed: {warnings:?}");
+        };
+        assert!(tree.tree.is_empty());
+    }
+
+    #[test]
+    fn bounded_sha_walk_marks_a_skipped_child_page_as_incomplete() {
+        let fake = FakeTransport::default();
+        let repo = github_repo(&Url::parse("https://github.com/acme/widgets").unwrap()).unwrap();
+        let good_sha = "1".repeat(40);
+        let missing_sha = "2".repeat(40);
+        fake.insert(
+            github_nonrecursive_tree_api_url("acme", "widgets", "main"),
+            FetchResponse::text(
+                200,
+                "application/json",
+                json!({
+                    "tree": [
+                        { "path": "good", "type": "tree", "sha": good_sha },
+                        { "path": "missing", "type": "tree", "sha": missing_sha },
+                    ],
+                    "truncated": false,
+                })
+                .to_string(),
+            ),
+        );
+        fake.insert(
+            github_nonrecursive_tree_api_url("acme", "widgets", &good_sha),
+            FetchResponse::text(
+                200,
+                "application/json",
+                json!({
+                    "tree": [{ "path": "lib.rs", "type": "blob", "size": 64 }],
+                    "truncated": false,
+                })
+                .to_string(),
+            ),
+        );
+        fake.insert_error(
+            github_nonrecursive_tree_api_url("acme", "widgets", &missing_sha),
+            "deadline expired",
+        );
+
+        let mut pages = MAX_GITHUB_API_TREE_PAGES;
+        let mut warnings = Vec::new();
+        let GithubTreeCandidateResult::Found(tree) =
+            fetch_bounded_github_tree(&fake, &repo, "main", None, &[], &mut pages, &mut warnings)
+        else {
+            panic!("bounded tree walk failed: {warnings:?}");
+        };
+        assert!(tree.truncated);
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.contains("deadline expired")));
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.contains("page, depth, or entry limit")));
+    }
+
+    #[test]
+    fn github_warning_normalization_keeps_operational_failures() {
+        let mut warnings = vec![
+            "acme/widgets: bounded GitHub tree page was unavailable (deadline expired)"
+                .to_string(),
+            "acme/widgets: bounded GitHub tree traversal stopped at its page, depth, or entry limit"
+                .to_string(),
+        ];
+        normalize_github_tree_warnings(&mut warnings, 0, "acme/widgets", Some(true));
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.contains("deadline expired")));
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.contains("repository file coverage")));
+
+        for size_error in [
+            "response exceeded the 524288-byte body limit",
+            "curl: (63) Maximum file size exceeded",
+            "curl: Exceeded the maximum allowed file size (524288)",
+        ] {
+            let mut recovered = vec![format!(
+                "acme/widgets: GitHub recursive file tree unavailable ({size_error}); trying bounded tree traversal"
+            )];
+            normalize_github_tree_warnings(&mut recovered, 0, "acme/widgets", Some(false));
+            assert!(
+                recovered.is_empty(),
+                "successful bounded recovery retained obsolete size warning: {recovered:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_sha_walk_stops_at_the_directory_depth_limit() {
+        let fake = FakeTransport::default();
+        let repo = github_repo(&Url::parse("https://github.com/acme/widgets").unwrap()).unwrap();
+        let shas = (0..=MAX_GITHUB_API_TREE_DEPTH)
+            .map(|index| format!("{index:040x}"))
+            .collect::<Vec<_>>();
+        fake.insert(
+            github_nonrecursive_tree_api_url("acme", "widgets", "main"),
+            FetchResponse::text(
+                200,
+                "application/json",
+                json!({
+                    "tree": [{ "path": "level-0", "type": "tree", "sha": shas[0] }],
+                    "truncated": false,
+                })
+                .to_string(),
+            ),
+        );
+        for index in 0..MAX_GITHUB_API_TREE_DEPTH {
+            fake.insert(
+                github_nonrecursive_tree_api_url("acme", "widgets", &shas[index]),
+                FetchResponse::text(
+                    200,
+                    "application/json",
+                    json!({
+                        "tree": [{
+                            "path": format!("level-{}", index + 1),
+                            "type": "tree",
+                            "sha": shas[index + 1],
+                        }],
+                        "truncated": false,
+                    })
+                    .to_string(),
+                ),
+            );
+        }
+        let mut pages = MAX_GITHUB_API_TREE_PAGES;
+        let mut warnings = Vec::new();
+        let GithubTreeCandidateResult::Found(tree) =
+            fetch_bounded_github_tree(&fake, &repo, "main", None, &[], &mut pages, &mut warnings)
+        else {
+            panic!("bounded tree walk failed: {warnings:?}");
+        };
+        assert!(tree.truncated);
+        assert!(!fake.calls().contains(
+            &github_nonrecursive_tree_api_url("acme", "widgets", &shas[MAX_GITHUB_API_TREE_DEPTH])
+                .to_string()
+        ));
+    }
+
+    #[test]
+    fn bounded_tree_truncation_and_entry_limits_have_exact_boundaries() {
+        let run = |blob_count: usize, provider_truncated: bool, pending_tree: bool| {
+            let fake = FakeTransport::default();
+            let repo =
+                github_repo(&Url::parse("https://github.com/acme/widgets").unwrap()).unwrap();
+            let mut entries = (0..blob_count)
+                .map(|index| {
+                    json!({
+                        "path": format!("src/file-{index}.rs"),
+                        "type": "blob",
+                        "size": 64,
+                    })
+                })
+                .collect::<Vec<_>>();
+            if pending_tree {
+                entries.push(json!({
+                    "path": "pending",
+                    "type": "tree",
+                    "sha": "f".repeat(40),
+                }));
+            }
+            fake.insert(
+                github_nonrecursive_tree_api_url("acme", "widgets", "main"),
+                FetchResponse::text(
+                    200,
+                    "application/json",
+                    json!({
+                        "tree": entries,
+                        "truncated": provider_truncated,
+                    })
+                    .to_string(),
+                ),
+            );
+            let mut pages = 1;
+            let mut warnings = Vec::new();
+            let GithubTreeCandidateResult::Found(tree) = fetch_bounded_github_tree(
+                &fake,
+                &repo,
+                "main",
+                None,
+                &[],
+                &mut pages,
+                &mut warnings,
+            ) else {
+                panic!("bounded tree walk failed: {warnings:?}");
+            };
+            (tree, warnings)
+        };
+
+        let (exact, exact_warnings) = run(MAX_GITHUB_API_TREE_ENTRIES, false, false);
+        assert!(!exact.truncated);
+        assert!(exact_warnings.is_empty());
+
+        let (overflow, overflow_warnings) = run(MAX_GITHUB_API_TREE_ENTRIES + 1, false, false);
+        assert!(overflow.truncated);
+        assert!(!overflow_warnings.is_empty());
+
+        let (pending, pending_warnings) = run(MAX_GITHUB_API_TREE_ENTRIES - 1, false, true);
+        assert!(pending.truncated);
+        assert!(!pending_warnings.is_empty());
+
+        let (provider_truncated, provider_warnings) = run(1, true, false);
+        assert!(provider_truncated.truncated);
+        assert!(!provider_warnings.is_empty());
     }
 
     #[test]
@@ -3279,6 +5343,10 @@ mod tests {
         );
         assert!(response.sources[0].chunks.iter().any(|chunk| {
             chunk.path.as_deref() == Some("frontend/src/research.rs")
+                && chunk.url.as_deref()
+                    == Some(
+                        "https://github.com/acme/widgets/blob/feature/web-research/frontend/src/research.rs",
+                    )
                 && chunk.text.contains("bounded_research")
         }));
         assert!(fake
@@ -3335,6 +5403,11 @@ mod tests {
         assert_eq!(response.status, "partial");
         assert_eq!(response.sources.len(), 1);
         assert!(response.sources[0].excerpt.contains("decode_protocol"));
+        assert!(response.sources[0].chunks.iter().any(|chunk| {
+            chunk.path.as_deref() == Some("readme.md")
+                && chunk.url.as_deref()
+                    == Some("https://github.com/acme/widgets/blob/HEAD/readme.md")
+        }));
         assert!(fake
             .calls()
             .iter()
@@ -3462,6 +5535,43 @@ mod tests {
             response.sources[0].chunks[0].path.as_deref(),
             Some("/current")
         );
+        assert_eq!(
+            response.sources[0].chunks[0].url.as_deref(),
+            Some(final_url.as_str())
+        );
+    }
+
+    #[test]
+    fn redirected_github_raw_chunks_use_the_revalidated_final_url() {
+        let fake = FakeTransport::default();
+        let repo = github_repo(&Url::parse("https://github.com/acme/widgets").unwrap()).unwrap();
+        let code_raw = raw_github_url("acme", "widgets", "main", "src/lib.rs");
+        let code_final = Url::parse("https://cdn.example.com/widgets/src/lib.rs").unwrap();
+        let mut code_response = FetchResponse::text(200, "text/plain", "pub fn redirected() {}");
+        code_response.final_url = Some(code_final.clone());
+        fake.insert(code_raw, code_response);
+        let mut chunks = Vec::new();
+        let mut warnings = Vec::new();
+        fetch_github_code_chunk(
+            &fake,
+            &repo,
+            "main",
+            "src/lib.rs",
+            &[],
+            &mut chunks,
+            &mut warnings,
+        );
+        assert!(warnings.is_empty());
+        assert_eq!(chunks[0].url.as_deref(), Some(code_final.as_str()));
+
+        let readme_raw = raw_github_url("acme", "widgets", "main", "README.md");
+        let readme_final = Url::parse("https://docs.example.com/widgets/readme").unwrap();
+        let mut readme_response = FetchResponse::text(200, "text/plain", "# Redirected README");
+        readme_response.final_url = Some(readme_final.clone());
+        fake.insert(readme_raw, readme_response);
+        let readme = fetch_raw_github_readme(&fake, "acme", "widgets", "main").unwrap();
+        assert_eq!(readme.path, "README.md");
+        assert_eq!(readme.url, readme_final);
     }
 
     #[test]
@@ -3529,6 +5639,11 @@ mod tests {
             .sources
             .iter()
             .all(|source| !source.chunks.is_empty()));
+        assert!(response
+            .sources
+            .iter()
+            .flat_map(|source| &source.chunks)
+            .all(|chunk| chunk.url.is_some()));
         assert!(fake.calls().iter().all(|url| !url.contains("duckduckgo")));
     }
 
@@ -3694,6 +5809,11 @@ mod tests {
             "Read http://[4000::1]/reserved".to_string(),
             "Read http://[100::1]/discard".to_string(),
             "Read http://[2001::1]/teredo".to_string(),
+            "Read http://[2001:2::1]/benchmarking".to_string(),
+            "Read http://[2001:2:0:ffff::1]/benchmarking".to_string(),
+            "Read http://[2001:10::1]/deprecated-orchid".to_string(),
+            "Read http://[2001:20::1]/orchid".to_string(),
+            "Read http://[2001:2f:ffff::1]/orchid".to_string(),
             "Read http://[2002:7f00:1::]/six-to-four".to_string(),
         ] {
             let response = research_prompt(&prompt, &fake);
@@ -3701,6 +5821,27 @@ mod tests {
             assert!(response.sources.is_empty());
         }
         assert!(fake.calls().is_empty());
+    }
+
+    #[test]
+    fn ipv6_special_use_masks_do_not_overreach_adjacent_global_addresses() {
+        for address in [
+            "2001:2::1",
+            "2001:2:0:ffff::1",
+            "2001:10::1",
+            "2001:1f:ffff::1",
+            "2001:20::1",
+            "2001:2f:ffff::1",
+        ] {
+            assert!(!is_public_ipv6(address.parse().unwrap()), "{address}");
+        }
+        for address in [
+            "2001:2:1::1",
+            "2001:4860:4860::8888",
+            "2606:4700:4700::1111",
+        ] {
+            assert!(is_public_ipv6(address.parse().unwrap()), "{address}");
+        }
     }
 
     #[test]
@@ -3747,6 +5888,7 @@ mod tests {
             path: path.to_string(),
             kind: kind.to_string(),
             size: Some(100),
+            sha: None,
         })
         .collect::<Vec<_>>();
         assert_eq!(
@@ -3774,6 +5916,24 @@ mod tests {
         assert_eq!(response.etag.as_deref(), Some("W/\"abc\""));
         assert!(safe_http_header_value("W/\"safe\""));
         assert!(!safe_http_header_value("safe\r\nInjected: yes"));
+    }
+
+    #[test]
+    fn curl_timeout_argument_never_rounds_past_the_remaining_budget() {
+        assert_eq!(curl_timeout_arg(Duration::ZERO), None);
+        assert_eq!(
+            curl_timeout_arg(Duration::from_nanos(999)),
+            None,
+            "sub-microsecond budget must be treated as expired"
+        );
+        assert_eq!(
+            curl_timeout_arg(Duration::from_nanos(1_999_999_999)).as_deref(),
+            Some("1.999999")
+        );
+        assert_eq!(
+            curl_timeout_arg(Duration::from_secs(15)).as_deref(),
+            Some("15.000000")
+        );
     }
 
     #[test]
@@ -3851,23 +6011,39 @@ mod tests {
     #[test]
     fn github_provider_token_is_scoped_to_managed_repository_requests() {
         let token = Some("sentinel_token");
+        let metadata_url = Url::parse("https://api.github.com/repos/acme/widgets").unwrap();
+        let metadata_scope = github_auth_scope_for_request(
+            &metadata_url,
+            "application/vnd.github+json",
+            ProviderAuthIntent::GithubRepositoryMetadata,
+        )
+        .unwrap();
         assert_eq!(
             github_token_for_request(
-                &Url::parse("https://api.github.com/repos/acme/widgets").unwrap(),
+                &metadata_url,
                 "application/vnd.github+json",
                 ProviderAuthIntent::GithubRepositoryMetadata,
+                Some(&metadata_scope),
                 token
             ),
             token
         );
+        let tree_url = Url::parse(
+            "https://api.github.com/repos/acme/widgets/git/trees/feature%2Fweb-research",
+        )
+        .unwrap();
+        let tree_scope = github_auth_scope_for_request(
+            &tree_url,
+            "application/vnd.github+json",
+            ProviderAuthIntent::GithubVerifiedPublicApi,
+        )
+        .unwrap();
         assert_eq!(
             github_token_for_request(
-                &Url::parse(
-                    "https://api.github.com/repos/acme/widgets/git/trees/feature%2Fweb-research"
-                )
-                .unwrap(),
+                &tree_url,
                 "application/vnd.github+json",
                 ProviderAuthIntent::GithubVerifiedPublicApi,
+                Some(&tree_scope),
                 token
             ),
             token
@@ -3909,11 +6085,53 @@ mod tests {
                 ProviderAuthIntent::GithubRepositoryMetadata,
             ),
         ] {
+            let url = Url::parse(url).unwrap();
+            let scope = github_auth_scope_for_request(&url, accept, auth);
             assert_eq!(
-                github_token_for_request(&Url::parse(url).unwrap(), accept, auth, token,),
+                github_token_for_request(&url, accept, auth, scope.as_ref(), token,),
                 None
             );
         }
+    }
+
+    #[test]
+    fn github_provider_scope_rejects_cross_repository_api_redirects() {
+        let original = Url::parse("https://api.github.com/repos/acme/widgets").unwrap();
+        let scope = github_auth_scope_for_request(
+            &original,
+            "application/vnd.github+json",
+            ProviderAuthIntent::GithubRepositoryMetadata,
+        )
+        .unwrap();
+        let cross_repo = Url::parse("https://api.github.com/repos/other/private-widgets").unwrap();
+        assert!(validate_github_redirect_scope(&cross_repo, Some(&scope))
+            .unwrap_err()
+            .contains("changed repository scope"));
+        assert_eq!(
+            github_token_for_request(
+                &cross_repo,
+                "application/vnd.github+json",
+                ProviderAuthIntent::GithubRepositoryMetadata,
+                Some(&scope),
+                Some("sentinel_token"),
+            ),
+            None
+        );
+
+        let cross_host =
+            Url::parse("https://raw.githubusercontent.com/other/private-widgets/main/README.md")
+                .unwrap();
+        assert!(validate_github_redirect_scope(&cross_host, Some(&scope)).is_ok());
+        assert_eq!(
+            github_token_for_request(
+                &cross_host,
+                "application/vnd.github+json",
+                ProviderAuthIntent::GithubRepositoryMetadata,
+                Some(&scope),
+                Some("sentinel_token"),
+            ),
+            None
+        );
     }
 
     #[tokio::test]

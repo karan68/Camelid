@@ -206,6 +206,8 @@ assert.match(diagnosticsSource, /Decode Rate/, 'developer diagnostics must use t
 assert.match(messageTurnSource, /tokens est\.[\s\S]*in \{usage\.prompt_tokens\}[\s\S]*out \{usage\.completion_tokens/, 'the streaming footer should label live input and output token counts explicitly')
 assert.match(dashboardHookSource, /usage:\s*\{\s*prompt_tokens: promptTokenEstimate,\s*completion_tokens: 0,[\s\S]*usage_source: 'client_estimate'/, 'a new assistant row should expose input tokens and zero output tokens before the first streamed token')
 assert.match(dashboardHookSource, /completion_tokens: realTokens,[\s\S]*total_tokens: promptTokenEstimate \+ realTokens/, 'live assistant patches should advance output token usage during generation')
+assert.match(dashboardHookSource, /sendGate\.chatMode !== 'experimental' && sendGate\.hint\?\.target/, 'an experimental artifact must not persist a verified reference-row chip')
+assert.match(messageTurnSource, /message\.support_row && !message\.experimental_lane/, 'legacy experimental replies must hide contradictory verified reference-row chips')
 assert.doesNotMatch(messageTurnSource, /cxturn__meta--reserve/, 'the invisible footer placeholder is gone; the live footer itself holds the layout slot')
 assert.doesNotMatch(read('../src/styles/chat.css'), /cxturn__meta--reserve/, 'the reserved-footer spacer css must not outlive the placeholder it styled')
 assert.match(messageTurnSource, /streaming=\{assistantStreaming\}/, 'assistant markdown should know when an assistant row is still streaming')
@@ -577,7 +579,15 @@ assert.doesNotMatch(rlcSource, /navigator\.deviceMemory|performance\.memory/, 'n
 assert.match(chatWorkspaceSource, /validateSendBudget/, 'the composer must validate prompt+max_tokens against the real context rule at send time')
 
 /* ---- Display pacing honesty bounds (Phase 8B) ---- */
-const { createPacerState, paceStep, paceDrain, MAX_LAG_MS } = await import('../src/lib/streamPacing.js')
+const {
+  createPacerState,
+  paceStep,
+  paceDrain,
+  paceFirstVisiblePrefix,
+  paceHasPendingText,
+  FIRST_VISIBLE_PREFIX_CHARS,
+  MAX_LAG_MS,
+} = await import('../src/lib/streamPacing.js')
 {
   const state = createPacerState()
   let received = ''
@@ -599,8 +609,23 @@ const { createPacerState, paceStep, paceDrain, MAX_LAG_MS } = await import('../s
   const drained = paceDrain(state, received)
   assert.equal(drained, received, 'drain must be instant and byte-identical to the received stream')
 }
+{
+  const state = createPacerState()
+  const received = 'stream '.repeat(80)
+  const first = paceFirstVisiblePrefix(state, received, 0)
+  assert.ok(first.length > 0, 'the first streamed text must become visible immediately')
+  assert.ok(
+    [...first].length <= FIRST_VISIBLE_PREFIX_CHARS,
+    'an arbitrarily large first SSE chunk must reveal only the bounded prefix synchronously',
+  )
+  assert.equal(paceHasPendingText(first, received), true, 'the unrevealed first-chunk tail must remain queued for pacing')
+  const complete = paceDrain(state, received)
+  assert.equal(paceHasPendingText(complete, received), false, 'a caught-up display must stop requesting pacing frames')
+}
 assert.match(dashboardHookSource, /paceStep\(pacer, fullContent/, 'streaming display must go through the bounded pacer')
 assert.match(dashboardHookSource, /paceDrain\(pacer, streamed\.content/, 'final content must drain byte-identical from the real stream')
+assert.match(dashboardHookSource, /if \(paced !== lastPacedContent\)/, 'pacing ticks must not re-commit unchanged content')
+assert.match(dashboardHookSource, /if \(paceHasPendingText\(paced, fullContent\)\) startPacing\(\)/, 'the pacing loop must stop once displayed text catches the received stream')
 
 /* ---- Streaming feel: paced by elapsed time, and scroll is never stolen ---- */
 // The pacer must advance on its own animation frame loop, not only when a

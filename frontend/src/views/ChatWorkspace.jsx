@@ -186,9 +186,17 @@ export default function ChatWorkspace({
     () => (selectedConversation?.messages || []).filter((message) => !isBootstrapMessage(message)),
     [selectedConversation?.messages],
   )
+  const visibleWebResearchStatus = !webResearchStatus?.conversationId
+    || webResearchStatus.conversationId === selectedConversation?.id
+    ? webResearchStatus
+    : { phase: 'idle', sourceCount: 0, conversationId: null }
   const hasStreamingAssistant = rawVisibleMessages.some((m) => m.role === 'assistant' && m.streaming)
   const hasStreamingAssistantContent = rawVisibleMessages.some((m) => m.role === 'assistant' && m.streaming && String(m.content || '').trim())
-  const generationActive = Boolean(sending || hasStreamingAssistant)
+  const requestActive = Boolean(sending)
+  // Sending is process-global (only one local-model request may run), while
+  // loaders, stop controls, and auto-follow belong only to the conversation
+  // that owns the pending/streaming turn.
+  const generationActive = Boolean(pendingConversation || hasStreamingAssistant)
   const visibleMessages = useMemo(() => {
     if (!generationActive) return rawVisibleMessages
     return rawVisibleMessages.filter((message, index, messages) => {
@@ -196,14 +204,14 @@ export default function ChatWorkspace({
       return !isTrailingInterruptedPlaceholder
     })
   }, [generationActive, rawVisibleMessages])
-  const pendingPrompt = (pendingConversation?.content || (sending ? composer.trim() : '')).trim()
+  const pendingPrompt = String(pendingConversation?.content || '').trim()
   const pendingPromptAlreadyVisible = Boolean(
     pendingPrompt && [...visibleMessages].reverse().some((m) => m.role === 'user' && m.content === pendingPrompt),
   )
   const pendingUserPrompt = pendingPromptAlreadyVisible ? '' : pendingPrompt
   const lastVisibleMessage = visibleMessages.at(-1)
   const lastVisibleMessageIsUser = lastVisibleMessage?.role === 'user'
-  const awaitingAssistant = Boolean(generationActive && !hasStreamingAssistantContent && !hasStreamingAssistant && (pendingPrompt || lastVisibleMessageIsUser || sending))
+  const awaitingAssistant = Boolean(generationActive && !hasStreamingAssistantContent && !hasStreamingAssistant && (pendingPrompt || lastVisibleMessageIsUser))
   const streamingScrollSignature = useMemo(() => (
     visibleMessages.map((m) => `${m.id}:${m.streaming ? 'streaming' : 'done'}:${String(m.content || '').length}`).join('|')
     + `|awaiting:${awaitingAssistant ? '1' : '0'}|active:${generationActive ? '1' : '0'}`
@@ -253,7 +261,7 @@ export default function ChatWorkspace({
      (send gate, reply cap, local-inference note) folds into the tooltip below. */
   const webResearchPlan = useMemo(() => classifyWebResearchNeed(composer), [composer])
   const webResearchWillUsePublicWeb = webResearchEnabled && webResearchPlan.needed && canChat
-  const statusLine = webResearchStatus?.phase === 'researching'
+  const statusLine = visibleWebResearchStatus?.phase === 'researching'
     ? 'Reading relevant web sources before Camelid answers…'
     : webResearchWillUsePublicWeb
       ? 'Web Auto will send linked URLs or a search query to the public web.'
@@ -323,17 +331,17 @@ export default function ChatWorkspace({
             : 'Pick a local GGUF model first. Camelid will show the readiness path here.'
 
   const readinessState = canChat ? 'ready' : apiUnavailable ? 'offline' : selectedEmbeddingOnly ? 'blocked' : selectedRuntimeLoadedButNotReady || supportBlocked ? 'blocked' : selectedModel ? 'waiting' : 'idle'
-  const statusTone = webResearchStatus?.phase === 'researching'
+  const statusTone = visibleWebResearchStatus?.phase === 'researching'
     ? 'ready'
     : webResearchWillUsePublicWeb
       ? 'warn'
     : supportedChatReady || verifiedChatReady ? 'ready' : varianceChatReady || unverifiedChatReady ? 'warn' : apiUnavailable ? 'offline' : selectedEmbeddingReady ? 'ready' : selectedEmbeddingOnly ? 'neutral' : supportBlocked ? 'warn' : runtime?.loaded_now ? 'warn' : 'neutral'
 
-  const canSubmit = Boolean(composer.trim()) && canChat && !generationActive
-  const sendDisabledReason = canChat
-    ? ''
-    : generationActive
-      ? 'Wait for the current reply to finish or stop it before sending again.'
+  const canSubmit = Boolean(composer.trim()) && canChat && !requestActive
+  const sendDisabledReason = requestActive
+    ? 'Wait for the current reply to finish before sending again.'
+    : canChat
+      ? ''
       : apiUnavailable
         ? 'Sending unlocks once the connection is back.'
         : selectedEmbeddingOnly
@@ -363,13 +371,20 @@ export default function ChatWorkspace({
           : isFreshThread
             ? 'Load a model first'
             : 'Choose a ready model first'
-  const composerStopLabel = stoppingGeneration ? 'Stopping…' : 'Stop'
-  const awaitingAssistantLabel = webResearchStatus?.phase === 'researching'
+  const composerStopLabel = stoppingGeneration
+    ? 'Stopping…'
+    : visibleWebResearchStatus?.phase === 'researching'
+      ? 'Stop research'
+      : 'Stop'
+  const composerStopAriaLabel = visibleWebResearchStatus?.phase === 'researching'
+    ? 'Stop web research'
+    : 'Stop Camelid generation'
+  const awaitingAssistantLabel = visibleWebResearchStatus?.phase === 'researching'
     ? 'Reading relevant web sources…'
     : PREPARING_STREAMING_LABEL
   const secondaryActionLabel = canChat ? 'Save to memory' : (apiUnavailable ? 'Open API' : 'Open Models')
   const secondaryAction = canChat ? saveToMemory : () => setTab(apiUnavailable ? 'api' : 'library')
-  const secondaryActionDisabled = canChat ? generationActive : false
+  const secondaryActionDisabled = canChat ? requestActive : false
 
   // ----- Effects -----
   useEffect(() => {
@@ -553,7 +568,7 @@ export default function ChatWorkspace({
   const sendBudget = validateSendBudget({
     promptTokens: estimatedPromptTokens,
     maxTokens: effectiveMaxTokens,
-    contextLength: modelContextLength(selectedModel),
+    contextLength: runtime?.active_context_length || modelContextLength(selectedModel),
   })
 
   /* Folded fine print: everything that used to stack under the composer now
@@ -625,7 +640,7 @@ export default function ChatWorkspace({
                     if (activateModel) activateModel(id)
                     else setSelectedModelId(id)
                   }}
-                  disabled={generationActive || Boolean(loadingModelId)}
+                  disabled={requestActive || Boolean(loadingModelId)}
                 >
                   {!selectedPickerModelId && <option value="">Choose chat model</option>}
                   {runnableModels.length > 0 && (
@@ -664,7 +679,7 @@ export default function ChatWorkspace({
                   type="button"
                   className={`cxcomposer__tool cxcomposer__tool--collapsible ${composerImage ? 'is-on' : ''}`}
                   onClick={() => imageInputRef.current?.click()}
-                  disabled={generationActive}
+                  disabled={requestActive}
                   aria-label="Attach image"
                   title="Attach one PNG or JPEG for the loaded Prism vision model"
                 >
@@ -682,11 +697,11 @@ export default function ChatWorkspace({
                 aria-label={webResearchEnabled ? 'Turn off automatic web research' : 'Turn on automatic web research'}
                 aria-pressed={webResearchEnabled}
                 onClick={() => setWebResearchEnabled(!webResearchEnabled)}
-                disabled={generationActive}
+                disabled={requestActive}
               >
                 <IconSearch size={16} />
                 <span className="cxcomposer__tool-label">
-                  {webResearchStatus?.phase === 'researching' ? 'Reading web…' : webResearchEnabled ? 'Web auto' : 'Web off'}
+                  {visibleWebResearchStatus?.phase === 'researching' ? 'Reading web…' : webResearchEnabled ? 'Web auto' : 'Web off'}
                 </span>
               </button>
             )}
@@ -741,7 +756,7 @@ export default function ChatWorkspace({
           </div>
           <div className="cxcomposer__actions">
             {generationActive && (
-              <button type="button" className="cxcomposer__stop" aria-label="Stop Camelid generation" onClick={stopGeneration} disabled={stoppingGeneration}>
+              <button type="button" className="cxcomposer__stop" aria-label={composerStopAriaLabel} onClick={stopGeneration} disabled={stoppingGeneration}>
                 <IconStop size={16} /> {composerStopLabel}
               </button>
             )}
@@ -857,7 +872,7 @@ export default function ChatWorkspace({
                   ? [...visibleMessages.slice(0, index)].reverse().find((item) => item.role === 'user')
                   : null
                 const priorUserPrompt = priorUserMessage?.content || null
-                const canResend = Boolean(resendFromMessage) && !generationActive && canChat
+                const canResend = Boolean(resendFromMessage) && !requestActive && canChat
                 const priorMessage = index > 0 ? visibleMessages[index - 1] : null
                 const dayKey = dayKeyOf(message.created_at)
                 const priorDayKey = priorMessage ? dayKeyOf(priorMessage.created_at) : null

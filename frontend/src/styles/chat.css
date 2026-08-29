@@ -172,7 +172,7 @@
 .cxturn__web-sources li { padding-left: var(--space-1); }
 .cxturn__web-sources a { display: inline-flex; align-items: center; gap: var(--space-1); color: var(--color-accent-text); overflow-wrap: anywhere; }
 .cxturn__web-sources a:hover { text-decoration: underline; text-underline-offset: 2px; }
-.cxturn__web-source-warning { padding: 0 var(--space-3) var(--space-3); color: var(--color-warning); }
+.cxturn__web-source-warning { display: flex; flex-direction: column; gap: var(--space-1); padding: 0 var(--space-3) var(--space-3); color: var(--color-warning); }
 .cxturn__actions { display: flex; align-items: center; gap: var(--space-2); margin-top: var(--space-3); }
 .cxturn__action-time {
   font-family: var(--font-mono);

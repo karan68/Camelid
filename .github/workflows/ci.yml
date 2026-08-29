@@ -434,6 +434,13 @@ jobs:
         if: ${{ !cancelled() }}
         run: npm run smoke:web-research
 
+      # Real compiled-UI coverage for Web Auto. A single loopback fixture serves
+      # both assets and deterministic API/SSE responses, so this neither starts
+      # a model process nor reaches the public web.
+      - name: Frontend web-research browser smoke
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: npm run smoke:web-research-browser
+
       # Keeps the stream event boundary used to separate research latency,
       # model TTFT, and post-first-content decode rate gated in CI. The Web Auto
       # smoke above covers cancellation; this lane covers SSE usage/fallbacks.

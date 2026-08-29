@@ -65,7 +65,7 @@ function WebResearchSources({ research }) {
         <IconSearch size={15} />
         <span>
           Web research was unavailable for this reply. Camelid answered without web sources.
-          {warnings[0] && <small>{warnings[0]}</small>}
+          {warnings.map((warning, index) => <small key={`${warning}:${index}`}>{warning}</small>)}
         </span>
       </div>
     )
@@ -90,9 +90,9 @@ function WebResearchSources({ research }) {
         ))}
       </ol>
       {warnings.length > 0 && (
-        <p className="cxturn__web-source-warning">
-          {warnings.length === 1 ? warnings[0] : `${warnings.length} web-research warnings.`}
-        </p>
+        <div className="cxturn__web-source-warning" role="status">
+          {warnings.map((warning, index) => <div key={`${warning}:${index}`}>{warning}</div>)}
+        </div>
       )}
     </details>
   )
@@ -117,7 +117,7 @@ function MessageMetaFooter({ message }) {
           {formatModelLabel(message.model_id)}
         </span>
       )}
-      {message.support_row && (
+      {message.support_row && !message.experimental_lane && (
         <EvidenceChip
           status={message.support_row.status}
           state={message.support_row.supported ? 'supported' : null}
@@ -332,7 +332,7 @@ export const MessageTurn = memo(function MessageTurn({ message, generationElapse
               </button>
             )}
             {showMessageActions && onRegenerate && (
-              <button type="button" className="cxturn__action" onClick={() => onRegenerate()} title="Resend the prompt that produced this reply, with the same parameters">
+              <button type="button" className="cxturn__action" onClick={() => onRegenerate()} title="Resend the prompt that produced this reply with the current Chat and Web Auto settings">
                 <IconRefresh size={16} /> <span>Regenerate</span>
               </button>
             )}
