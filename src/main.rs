@@ -964,6 +964,11 @@ enum AgentAction {
         allow_fs: bool,
         #[arg(long, default_value_t = false)]
         allow_mcp: bool,
+        /// Trust and immediately execute this named server from the workspace's
+        /// camelid.mcp.json. Repeat for each reviewed server. Has no effect
+        /// unless --allow-mcp is also present.
+        #[arg(long = "trust-mcp-server", action = clap::ArgAction::Append)]
+        trust_mcp_server: Vec<String>,
         #[arg(long, default_value = "sandboxed")]
         shell_sandbox: String,
         #[arg(long, default_value_t = 30)]
@@ -2043,6 +2048,11 @@ enum Command {
         /// CAMELID_PRODUCTION. Off by default.
         #[arg(long, default_value_t = false)]
         allow_mcp: bool,
+        /// Agent: trust and immediately execute this named server command from
+        /// the workspace's camelid.mcp.json during startup. Repeat for each
+        /// reviewed server. Requires --allow-mcp.
+        #[arg(long = "trust-mcp-server", action = clap::ArgAction::Append)]
+        trust_mcp_server: Vec<String>,
         /// Agent: shell-command timeout in seconds.
         #[arg(long, default_value_t = 30)]
         shell_timeout: u64,
@@ -3668,6 +3678,7 @@ async fn main() -> anyhow::Result<()> {
             allow_net,
             allow_fs,
             allow_mcp,
+            trust_mcp_server,
             shell_timeout,
             enable_thinking,
             audit_webhook,
@@ -3694,6 +3705,7 @@ async fn main() -> anyhow::Result<()> {
                 allow_net,
                 allow_fs,
                 allow_mcp,
+                trust_mcp_servers: trust_mcp_server,
                 shell_timeout,
                 enable_thinking,
                 audit_webhook,
@@ -5313,6 +5325,7 @@ async fn main() -> anyhow::Result<()> {
                 allow_net,
                 allow_fs,
                 allow_mcp,
+                trust_mcp_server,
                 shell_sandbox,
                 shell_timeout,
                 models_dir,
@@ -5351,6 +5364,7 @@ async fn main() -> anyhow::Result<()> {
                     allow_net,
                     allow_fs,
                     allow_mcp,
+                    trust_mcp_servers: trust_mcp_server,
                     shell_timeout,
                     enable_thinking: false,
                     audit_webhook: None,
