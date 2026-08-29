@@ -115,6 +115,39 @@ pub(super) struct FetchResponse {
     final_url: Option<Url>,
 }
 
+/// A credential-free response for other crate-local callers that need the same
+/// public-network boundary as Web Auto.  Deliberately exposes no redirect or
+/// cache internals and never enables provider authentication.
+#[derive(Debug)]
+pub(crate) struct PublicHttpResponse {
+    pub status: u16,
+    pub content_type: String,
+    pub body: Vec<u8>,
+    pub final_url: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PublicHttpMethod {
+    Get,
+    Head,
+}
+
+impl PublicHttpMethod {
+    fn parse(method: &str) -> Result<Self, String> {
+        match method.trim().to_ascii_uppercase().as_str() {
+            "GET" => Ok(Self::Get),
+            "HEAD" => Ok(Self::Head),
+            other => Err(format!(
+                "unsupported HTTP method `{other}` (only GET and HEAD are allowed)"
+            )),
+        }
+    }
+
+    fn head_only(self) -> bool {
+        self == Self::Head
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ProviderAuthIntent {
     None,
@@ -378,6 +411,135 @@ pub(super) fn default_transport() -> Arc<dyn WebTransport> {
     ))
 }
 
+/// Fetch one public HTTP(S) resource through the hardened Web Auto transport.
+///
+/// This entry point is intentionally small: callers cannot provide headers,
+/// credentials, proxies, ports, redirect policy, or an unbounded timeout/body
+/// size.  GET and HEAD are the only accepted methods.  Each redirect is
+/// revalidated and re-resolved, and the validated DNS answers remain pinned for
+/// the corresponding curl hop.
+pub(crate) fn fetch_public_http(method: &str, raw_url: &str) -> Result<PublicHttpResponse, String> {
+    let method = PublicHttpMethod::parse(method)?;
+    let url = Url::parse(raw_url.trim()).map_err(|error| format!("invalid URL: {error}"))?;
+    validate_url_shape(&url)?;
+    let deadline = Instant::now() + RESEARCH_TOTAL_DEADLINE;
+    let admission_deadline = Instant::now() + RESEARCH_ADMISSION_TIMEOUT;
+    let _permit = loop {
+        match research_semaphore().try_acquire_owned() {
+            Ok(permit) => break permit,
+            Err(_) if Instant::now() < admission_deadline && Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(_) => {
+                return Err("public web fetch capacity is busy; retry shortly".to_string());
+            }
+        }
+    };
+    // Do not use the provider-token-bearing default transport here.  Keeping the
+    // token absent in the transport object makes forwarding Camelid/GitHub
+    // credentials structurally impossible for native agent fetches.
+    let transport = CurlWebTransport { github_token: None };
+    let response = transport.fetch_public_method(
+        &url,
+        "text/html,application/xhtml+xml,text/plain,application/json;q=0.9,*/*;q=0.1",
+        method,
+        None,
+        Some(deadline),
+    )?;
+    Ok(PublicHttpResponse {
+        status: response.status,
+        content_type: response.content_type,
+        body: response.body,
+        final_url: response.final_url.unwrap_or(url).as_str().to_string(),
+    })
+}
+
+impl CurlWebTransport {
+    fn fetch_public_method(
+        &self,
+        url: &Url,
+        accept: &str,
+        method: PublicHttpMethod,
+        cancel: Option<&tokio_util::sync::CancellationToken>,
+        deadline: Option<Instant>,
+    ) -> Result<FetchResponse, String> {
+        self.fetch_method_cancellable(
+            url,
+            accept,
+            None,
+            cancel,
+            deadline,
+            ProviderAuthIntent::None,
+            method,
+        )
+    }
+
+    // Keep the security-relevant request attributes explicit at this boundary:
+    // provider auth, cancellation, deadline, and method must not be inferred.
+    #[expect(clippy::too_many_arguments)]
+    fn fetch_method_cancellable(
+        &self,
+        url: &Url,
+        accept: &str,
+        etag: Option<&str>,
+        cancel: Option<&tokio_util::sync::CancellationToken>,
+        deadline: Option<Instant>,
+        auth: ProviderAuthIntent,
+        method: PublicHttpMethod,
+    ) -> Result<FetchResponse, String> {
+        let deadline = deadline.unwrap_or_else(|| Instant::now() + RESEARCH_TOTAL_DEADLINE);
+        let github_scope = github_auth_scope_for_request(url, accept, auth);
+        if auth != ProviderAuthIntent::None && github_scope.is_none() {
+            return Err(
+                "GitHub provider-auth request was outside its managed repository scope".to_string(),
+            );
+        }
+        let mut current = url.clone();
+        for redirects in 0..=MAX_REDIRECTS {
+            if cancel.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+                return Err("web research was cancelled".to_string());
+            }
+            if Instant::now() >= deadline {
+                return Err(research_deadline_error());
+            }
+            validate_url_shape(&current)?;
+            validate_github_redirect_scope(&current, github_scope.as_ref())?;
+            let addresses = resolve_public_addresses(&current, cancel, Some(deadline))?;
+            let conditional = (redirects == 0).then_some(etag).flatten();
+            let github_token = github_token_for_request(
+                &current,
+                accept,
+                auth,
+                github_scope.as_ref(),
+                self.github_token.as_deref(),
+            );
+            let mut response = curl_single_hop(
+                &current,
+                accept,
+                &addresses,
+                conditional,
+                github_token,
+                cancel,
+                Some(deadline),
+                method.head_only(),
+            )?;
+            if response.status == 304 || !(300..400).contains(&response.status) {
+                response.final_url = Some(current);
+                return Ok(response);
+            }
+            if redirects == MAX_REDIRECTS {
+                return Err(format!("redirect limit ({MAX_REDIRECTS}) exceeded"));
+            }
+            let location = response
+                .location
+                .as_deref()
+                .ok_or_else(|| format!("HTTP {} redirect omitted Location", response.status))?;
+            current = validated_redirect_target(&current, location)?;
+        }
+        unreachable!("bounded redirect loop always returns")
+    }
+}
+
 impl WebTransport for CurlWebTransport {
     fn fetch(&self, url: &Url, accept: &str) -> Result<FetchResponse, String> {
         self.fetch_conditional(url, accept, None)
@@ -431,55 +593,15 @@ impl WebTransport for CurlWebTransport {
         deadline: Option<Instant>,
         auth: ProviderAuthIntent,
     ) -> Result<FetchResponse, String> {
-        let deadline = deadline.unwrap_or_else(|| Instant::now() + RESEARCH_TOTAL_DEADLINE);
-        let github_scope = github_auth_scope_for_request(url, accept, auth);
-        if auth != ProviderAuthIntent::None && github_scope.is_none() {
-            return Err(
-                "GitHub provider-auth request was outside its managed repository scope".to_string(),
-            );
-        }
-        let mut current = url.clone();
-        for redirects in 0..=MAX_REDIRECTS {
-            if cancel.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
-                return Err("web research was cancelled".to_string());
-            }
-            if Instant::now() >= deadline {
-                return Err(research_deadline_error());
-            }
-            validate_url_shape(&current)?;
-            validate_github_redirect_scope(&current, github_scope.as_ref())?;
-            let addresses = resolve_public_addresses(&current, cancel, Some(deadline))?;
-            let conditional = (redirects == 0).then_some(etag).flatten();
-            let github_token = github_token_for_request(
-                &current,
-                accept,
-                auth,
-                github_scope.as_ref(),
-                self.github_token.as_deref(),
-            );
-            let mut response = curl_single_hop(
-                &current,
-                accept,
-                &addresses,
-                conditional,
-                github_token,
-                cancel,
-                Some(deadline),
-            )?;
-            if response.status == 304 || !(300..400).contains(&response.status) {
-                response.final_url = Some(current);
-                return Ok(response);
-            }
-            if redirects == MAX_REDIRECTS {
-                return Err(format!("redirect limit ({MAX_REDIRECTS}) exceeded"));
-            }
-            let location = response
-                .location
-                .as_deref()
-                .ok_or_else(|| format!("HTTP {} redirect omitted Location", response.status))?;
-            current = validated_redirect_target(&current, location)?;
-        }
-        unreachable!("bounded redirect loop always returns")
+        self.fetch_method_cancellable(
+            url,
+            accept,
+            etag,
+            cancel,
+            deadline,
+            auth,
+            PublicHttpMethod::Get,
+        )
     }
 }
 
@@ -3805,6 +3927,10 @@ fn validated_redirect_target(current: &Url, location: &str) -> Result<Url, Strin
     Ok(next)
 }
 
+// This is the final SSRF/auth boundary before spawning curl. Keeping every
+// validated input explicit makes accidental credential or redirect widening
+// visible at each call site.
+#[expect(clippy::too_many_arguments)]
 fn curl_single_hop(
     url: &Url,
     accept: &str,
@@ -3813,6 +3939,7 @@ fn curl_single_hop(
     github_token: Option<&str>,
     cancel: Option<&tokio_util::sync::CancellationToken>,
     deadline: Option<Instant>,
+    head_only: bool,
 ) -> Result<FetchResponse, String> {
     if cancel.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
         return Err("web research was cancelled".to_string());
@@ -3874,6 +4001,9 @@ fn curl_single_hop(
             "--header",
             "X-GitHub-Api-Version: 2022-11-28",
         ]);
+    }
+    if head_only {
+        command.arg("--head");
     }
     if url
         .host()
@@ -4082,6 +4212,29 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
+
+    #[test]
+    fn public_http_entry_point_has_a_strict_method_allowlist() {
+        assert_eq!(
+            PublicHttpMethod::parse("GET").unwrap(),
+            PublicHttpMethod::Get
+        );
+        assert_eq!(
+            PublicHttpMethod::parse("head").unwrap(),
+            PublicHttpMethod::Head
+        );
+        let error = fetch_public_http("POST", "https://example.com/").unwrap_err();
+        assert!(error.contains("only GET and HEAD"), "{error}");
+    }
+
+    #[test]
+    fn public_http_entry_point_rejects_non_http_and_private_targets_before_curl() {
+        let scheme_error = fetch_public_http("GET", "file:///etc/passwd").unwrap_err();
+        assert!(scheme_error.contains("public http://"), "{scheme_error}");
+
+        let private_error = fetch_public_http("GET", "http://127.0.0.1/").unwrap_err();
+        assert!(private_error.contains("reserved IPs"), "{private_error}");
+    }
 
     #[derive(Default)]
     struct FakeTransport {
