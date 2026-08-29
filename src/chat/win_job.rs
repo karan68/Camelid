@@ -151,12 +151,10 @@ fn resume_initial_thread(process_id: u32) -> std::io::Result<()> {
     // SAFETY: snapshot is live and entry points to a correctly sized struct.
     let mut available = unsafe { Thread32First(snapshot.0, &mut entry) } != 0;
     while available {
-        if entry.th32OwnerProcessID == process_id {
-            if found.replace(entry.th32ThreadID).is_some() {
-                return Err(std::io::Error::other(
-                    "suspended child had more than one initial thread",
-                ));
-            }
+        if entry.th32OwnerProcessID == process_id && found.replace(entry.th32ThreadID).is_some() {
+            return Err(std::io::Error::other(
+                "suspended child had more than one initial thread",
+            ));
         }
         // SAFETY: same live snapshot and output struct as Thread32First.
         available = unsafe { Thread32Next(snapshot.0, &mut entry) } != 0;

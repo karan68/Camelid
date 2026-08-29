@@ -69,12 +69,15 @@ fn store(sandbox: &Sandbox) -> Result<PathBuf, String> {
             }
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let mut builder = std::fs::DirBuilder::new();
+                let builder = std::fs::DirBuilder::new();
                 #[cfg(unix)]
-                {
+                let builder = {
                     use std::os::unix::fs::DirBuilderExt;
+
+                    let mut builder = builder;
                     builder.mode(0o700);
-                }
+                    builder
+                };
                 builder
                     .create(&dir)
                     .map_err(|e| format!("could not create {}: {e}", dir.display()))?;
