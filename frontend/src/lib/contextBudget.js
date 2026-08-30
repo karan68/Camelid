@@ -32,6 +32,11 @@ const SEGMENT_LABELS = {
   free: 'still free',
 }
 
+/* When the reservation has been clamped it is no longer a chosen size, it is
+   simply whatever the conversation has not taken, so calling it "held" implies a
+   commitment the user never made. */
+const CLAMPED_RESERVE_LABEL = 'left for the reply'
+
 function nonNegativeInteger(value) {
   const n = Number(value)
   if (!Number.isFinite(n) || n <= 0) return 0
@@ -95,7 +100,7 @@ export function composeContextBudget({
   const segments = CONTEXT_SEGMENT_KEYS
     .map((key) => ({
       key,
-      label: SEGMENT_LABELS[key],
+      label: key === 'reserved' && reserveClamped ? CLAMPED_RESERVE_LABEL : SEGMENT_LABELS[key],
       tokens: tokensByKey[key],
       percent: percentOf(tokensByKey[key], total),
     }))
@@ -112,8 +117,17 @@ export function composeContextBudget({
   else if (reserveClamped) level = 'notice'
 
   /* The share unavailable to the next message, which is what both the chip and
-     the automatic-compaction threshold read. */
-  const filledPercent = percentOf(used + reserved, total)
+     the automatic-compaction threshold read.
+
+     A clamped reservation is deliberately NOT counted. Once clamped it equals
+     the remaining room by definition, so `used + reserved` is exactly the whole
+     window no matter how short the conversation is: every model whose context is
+     smaller than the configured reply limit would sit at 100% from its first
+     empty message, and the automatic trim would fire on every send. Rule 2 is
+     the honest measure of pressure here -- what threatens the conversation is
+     the prompt filling the window, not a reply that simply gets shorter. */
+  const committed = reserveClamped ? used : used + reserved
+  const filledPercent = percentOf(committed, total)
   const warnAt = Number(warnAtPercent)
   const nearLimit = Number.isFinite(warnAt) && filledPercent >= warnAt
 
@@ -124,6 +138,7 @@ export function composeContextBudget({
     requestedReserveTokens: requestedReserve,
     freeTokens: free,
     reserveClamped,
+    committedTokens: committed,
     usedPercent: percentOf(used, total),
     reservedPercent: percentOf(reserved, total),
     freePercent: percentOf(free, total),

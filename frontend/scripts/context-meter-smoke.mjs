@@ -134,6 +134,44 @@ check('passing the tested envelope is reported without becoming an error', () =>
   assert.equal(b.level, 'ok', 'untested is not unsupported')
 })
 
+/* Found by feeding a real `active_context_length` through the running WebUI.
+   A server that loads a model at 4096 while the configured reply limit is the
+   8192 default clamps the reservation to the remaining room -- so `used +
+   reserved` is the entire window by definition, and an EMPTY chat reported
+   "100% used, 4.1K / 4.1K". That number also drives the automatic trim, so it
+   would have fired on every send in any window smaller than the reply limit. */
+check('a clamped reservation does not pin a small window at 100%', () => {
+  const empty = composeContextBudget({ contextLength: 4096, promptTokens: 12, reservedTokens: 8192, warnAtPercent: 80 })
+  assert.equal(empty.reserveClamped, true)
+  assert.equal(empty.freeTokens, 0, 'the reply really does take the rest of the room')
+  assert.ok(empty.filledPercent < 1, `an empty chat cannot be full, got ${empty.filledPercent}%`)
+  assert.equal(empty.committedTokens, 12, 'only the conversation is spoken for')
+  assert.equal(empty.nearLimit, false, 'the automatic trim must not fire on an empty chat')
+})
+
+check('a clamped window still fills up as the conversation grows', () => {
+  const growing = composeContextBudget({ contextLength: 4096, promptTokens: 3400, reservedTokens: 8192, warnAtPercent: 80 })
+  assert.equal(growing.reserveClamped, true)
+  assert.ok(growing.filledPercent > 80, 'pressure must still be reported once the prompt is large')
+  assert.equal(growing.nearLimit, true, 'the automatic trim must still fire when it should')
+})
+
+check('an unclamped reservation is still counted as spoken for', () => {
+  // Unchanged behaviour: a genuine 8192 reservation in a 131072 window.
+  const b = composeContextBudget({ contextLength: 131072, promptTokens: 100, reservedTokens: 8192, warnAtPercent: 80 })
+  assert.equal(b.reserveClamped, false)
+  assert.equal(b.committedTokens, 8292, 'a reservation the user chose is a real claim')
+  assert.equal(b.nearLimit, false)
+})
+
+check('a clamped reservation is not described as "held"', () => {
+  const b = composeContextBudget({ contextLength: 4096, promptTokens: 12, reservedTokens: 8192 })
+  const reserved = b.segments.find((segment) => segment.key === 'reserved')
+  assert.equal(reserved.label, 'left for the reply')
+  const unclamped = composeContextBudget({ contextLength: 131072, promptTokens: 100, reservedTokens: 8192 })
+  assert.equal(unclamped.segments.find((s) => s.key === 'reserved').label, 'held for the reply')
+})
+
 console.log('formatting')
 
 check('token counts stay short enough for a chip', () => {

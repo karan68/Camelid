@@ -69,7 +69,9 @@ export function ContextMeter({
      guessed one — an invented denominator is worse than no denominator. */
   if (!budget) return null
 
-  const summary = `${formatTokenCount(budget.usedTokens + budget.reservedTokens)} / ${formatTokenCount(budget.contextLength)} tokens`
+  /* Same total the percentage is computed from, so the chip cannot read "0%"
+     next to a token count that has already reached the window size. */
+  const summary = `${formatTokenCount(budget.committedTokens)} / ${formatTokenCount(budget.contextLength)} tokens`
   const tone = budget.level === 'ok' && budget.nearLimit ? 'near' : budget.level
 
   return (
