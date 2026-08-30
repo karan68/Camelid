@@ -1,10 +1,11 @@
 import { useEffect, useRef, useState } from 'react'
-import { IconMemory, IconCheckCircle } from '../ui/icons.jsx'
+import { IconMemory, IconCheckCircle, IconRefresh } from '../ui/icons.jsx'
 import {
   composeContextBudget,
   formatTokenCount,
   formatPercent,
 } from '../../lib/contextBudget.js'
+import { AUTO_COMPACT_THRESHOLD_PERCENT } from '../../lib/conversationCompaction.js'
 
 /* How full the model's context window is, and what is filling it.
  *
@@ -28,6 +29,11 @@ export function ContextMeter({
   reservedTokens,
   verifiedBound = null,
   executionLane = '',
+  autoCompact = false,
+  onToggleAutoCompact = null,
+  onCompactNow = null,
+  compaction = null,
+  onSendEverything = null,
 }) {
   const [open, setOpen] = useState(false)
   const rootRef = useRef(null)
@@ -55,6 +61,7 @@ export function ContextMeter({
     imageTokens,
     reservedTokens,
     verifiedBound,
+    warnAtPercent: AUTO_COMPACT_THRESHOLD_PERCENT,
   })
 
   /* A model whose window we cannot read gets no meter at all rather than a
@@ -62,12 +69,13 @@ export function ContextMeter({
   if (!budget) return null
 
   const summary = `${formatTokenCount(budget.usedTokens + budget.reservedTokens)} / ${formatTokenCount(budget.contextLength)} tokens`
+  const tone = budget.level === 'ok' && budget.nearLimit ? 'near' : budget.level
 
   return (
     <div className="ctxmeter" ref={rootRef}>
       <button
         type="button"
-        className={`ctxmeter__chip is-${budget.level}`}
+        className={`ctxmeter__chip is-${tone}`}
         aria-expanded={open}
         aria-label={`Context window ${formatPercent(budget.filledPercent)} used. ${summary}. Show breakdown.`}
         onClick={() => setOpen((value) => !value)}
@@ -133,6 +141,46 @@ export function ContextMeter({
               </li>
             ))}
           </ul>
+
+          {(onCompactNow || onToggleAutoCompact) && (
+            <div className="ctxmeter__compact">
+              {onCompactNow && (
+                <button
+                  type="button"
+                  className="ctxmeter__compact-action"
+                  onClick={onCompactNow}
+                >
+                  <IconRefresh size={12} /> Compact for sending
+                </button>
+              )}
+              {onToggleAutoCompact && (
+                <label className="ctxmeter__compact-auto">
+                  <input
+                    type="checkbox"
+                    checked={autoCompact}
+                    onChange={(event) => onToggleAutoCompact(event.target.checked)}
+                  />
+                  <span>Automatically at {AUTO_COMPACT_THRESHOLD_PERCENT}%</span>
+                </label>
+              )}
+            </div>
+          )}
+
+          {compaction?.active && (
+            <p className="ctxmeter__compacted">
+              <span>
+                {compaction.elidedCount.toLocaleString()} earlier{' '}
+                {compaction.elidedCount === 1 ? 'reply is' : 'replies are'} not being sent.
+                {compaction.freedTokens > 0 && <> Freed ~{compaction.freedTokens.toLocaleString()} tokens.</>}
+                {' '}Your transcript is unchanged.
+              </span>
+              {onSendEverything && (
+                <button type="button" className="ctxmeter__compact-undo" onClick={onSendEverything}>
+                  Send everything
+                </button>
+              )}
+            </p>
+          )}
 
           <p className="ctxmeter__foot">
             {executionLane

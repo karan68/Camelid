@@ -61,6 +61,7 @@ function percentOf(tokens, total) {
  * @param {number} input.imageTokens Estimated share of `promptTokens` spent on image content.
  * @param {number} input.reservedTokens Configured response limit, before clamping.
  * @param {number|null} input.verifiedBound Largest context size with committed evidence, or null.
+ * @param {number|null} input.warnAtPercent Fill level at which the window counts as nearly full.
  * @returns {object|null} Composition, or null when the window size is unknown.
  */
 export function composeContextBudget({
@@ -70,6 +71,7 @@ export function composeContextBudget({
   imageTokens = 0,
   reservedTokens = 0,
   verifiedBound = null,
+  warnAtPercent = null,
 } = {}) {
   const total = positiveIntegerOrNull(contextLength)
   if (total === null) return null
@@ -109,6 +111,12 @@ export function composeContextBudget({
   if (used >= total) level = 'error'
   else if (reserveClamped) level = 'notice'
 
+  /* The share unavailable to the next message, which is what both the chip and
+     the automatic-compaction threshold read. */
+  const filledPercent = percentOf(used + reserved, total)
+  const warnAt = Number(warnAtPercent)
+  const nearLimit = Number.isFinite(warnAt) && filledPercent >= warnAt
+
   return {
     contextLength: total,
     usedTokens: used,
@@ -119,9 +127,8 @@ export function composeContextBudget({
     usedPercent: percentOf(used, total),
     reservedPercent: percentOf(reserved, total),
     freePercent: percentOf(free, total),
-    /* What the collapsed chip shows: committed context, reservation included,
-       because that is the share unavailable to the next message. */
-    filledPercent: percentOf(used + reserved, total),
+    filledPercent,
+    nearLimit,
     verifiedBound: bound,
     showVerifiedMarker,
     verifiedPercent: showVerifiedMarker ? percentOf(bound, total) : null,

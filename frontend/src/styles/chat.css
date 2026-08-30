@@ -1034,3 +1034,74 @@
   .ctxmeter__fill,
   .ctxmeter__bar-fill { transition: width 160ms ease, left 160ms ease; }
 }
+/* Compaction controls inside the meter panel. `is-near` is the 80% state that
+   automatic compaction keys off, so the chip warns with the same threshold the
+   trim uses rather than a second hand-tuned number. */
+
+.ctxmeter__chip.is-near { border-color: var(--color-warning); color: var(--color-text); }
+
+.ctxmeter__compact {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+  margin-top: var(--space-3);
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--color-border-soft);
+}
+
+.ctxmeter__compact-action {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 3px var(--space-3);
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+  color: var(--color-text);
+  font-size: var(--text-2xs);
+  cursor: pointer;
+}
+
+.ctxmeter__compact-action:hover { background: var(--color-surface-hover); }
+.ctxmeter__compact-action:focus-visible { outline: none; box-shadow: var(--shadow-focus); }
+
+.ctxmeter__compact-auto {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--text-2xs);
+  color: var(--color-text-muted);
+  cursor: pointer;
+}
+
+.ctxmeter__compact-auto input { margin: 0; cursor: pointer; }
+
+.ctxmeter__compacted {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-3);
+  margin: var(--space-3) 0 0;
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-md);
+  background: var(--color-accent-soft);
+  font-size: var(--text-2xs);
+  line-height: 1.5;
+  color: var(--color-text-muted);
+}
+
+.ctxmeter__compact-undo {
+  flex: 0 0 auto;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--color-accent-text);
+  font-size: var(--text-2xs);
+  text-decoration: underline;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.ctxmeter__compact-undo:focus-visible { outline: none; box-shadow: var(--shadow-focus); }

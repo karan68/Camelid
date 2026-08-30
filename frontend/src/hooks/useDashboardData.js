@@ -8,6 +8,12 @@ import { readStreamingChatCompletion } from '../lib/chatCompletionStream'
 import { NEW_CHAT_SENTINEL, resolveSelectedConversation, shouldCreateConversationForSend } from '../lib/chatState'
 import { normalizeStoredConversations } from '../lib/conversationStorage.js'
 import { appStorage } from '../lib/appStorage.js'
+import { composeContextBudget } from '../lib/contextBudget.js'
+import {
+  AUTO_COMPACT_THRESHOLD_PERCENT,
+  applySendCompaction,
+  resolveCompactionIntent,
+} from '../lib/conversationCompaction.js'
 import { getRuntimeRequestModelId, isExternalModel, modelRuntimeIdMatches } from '../lib/modelState'
 import { contractSamplingOverrides } from '../lib/samplingContract'
 import { executionRuntimeFields } from '../lib/executionPlan'
@@ -1209,6 +1215,36 @@ export function useDashboardData({ showNotice, clearNotice }) {
           : content,
       }))
       let requestMessages = applyLocalChatPolicy(requestHistory)
+
+      /* Send-time compaction. Trims only this payload -- the stored transcript
+         is untouched -- so a wrong call costs the user nothing. Reads the same
+         preference store and runs the same pure trim the composer's meter
+         previews with, so the panel cannot advertise a trim that does not
+         happen here. */
+      const compactionReserve = applyGemma4GhostChatTokenCap(
+        getModelMaxTokens(selectedModelId),
+        runtime?.gemma4_serve_lane,
+      )
+      const compactionBudget = composeContextBudget({
+        contextLength: runtime?.active_context_length || modelContextLength(selectedModel),
+        promptTokens: requestMessages.reduce(
+          (sum, message) => sum + estimateTokenCount(
+            typeof message?.content === 'string'
+              ? message.content
+              : JSON.stringify(message?.content ?? ''),
+          ),
+          0,
+        ),
+        reservedTokens: compactionReserve,
+        warnAtPercent: AUTO_COMPACT_THRESHOLD_PERCENT,
+      })
+      const compactionIntent = resolveCompactionIntent(selectedConversationIdRef.current)
+      const sendCompaction = applySendCompaction(requestMessages, {
+        enabled: compactionIntent.enabled,
+        forced: compactionIntent.forced,
+        filledPercent: compactionBudget?.filledPercent ?? 0,
+      })
+      requestMessages = sendCompaction.messages
 
       const estimateResearchPromptTokens = (candidateMessages) => estimateWebResearchChatTokens(
         candidateMessages,
