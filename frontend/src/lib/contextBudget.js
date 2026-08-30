@@ -25,11 +25,11 @@
 export const CONTEXT_SEGMENT_KEYS = ['system', 'messages', 'images', 'reserved', 'free']
 
 const SEGMENT_LABELS = {
-  system: 'System prompt',
-  messages: 'Messages',
-  images: 'Images',
-  reserved: 'Reserved for reply',
-  free: 'Free',
+  system: 'system prompt',
+  messages: 'this conversation',
+  images: 'images',
+  reserved: 'held for the reply',
+  free: 'still free',
 }
 
 function nonNegativeInteger(value) {

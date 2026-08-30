@@ -931,9 +931,11 @@
 .ctxmeter__panel {
   position: absolute;
   bottom: calc(100% + var(--space-2));
-  left: 0;
+  /* Anchored to the chip's right edge so the panel grows inward. Anchoring left
+     put its edge exactly on the viewport boundary at 1024px. */
+  right: 0;
   z-index: 30;
-  width: min(320px, calc(100vw - var(--space-6)));
+  width: min(400px, calc(100vw - var(--space-6)));
   padding: var(--space-4);
   border: 1px solid var(--color-border-strong);
   border-radius: var(--radius-lg);
@@ -1028,7 +1030,6 @@
 }
 
 .ctxmeter__foot code { font-family: var(--font-mono); font-size: var(--text-micro); }
-.ctxmeter__foot--estimate { margin-top: 2px; font-style: italic; }
 
 @media (prefers-reduced-motion: no-preference) {
   .ctxmeter__fill,
@@ -1040,16 +1041,21 @@
 
 .ctxmeter__chip.is-near { border-color: var(--color-warning); color: var(--color-text); }
 
+/* Stacked, not side by side: the action and the automatic toggle each need a
+   full line at this width, and letting them share one wrapped the label into a
+   three-line column beside a pinned checkbox. Each child claims the full row so
+   no inherited justification can reintroduce that gap. */
 .ctxmeter__compact {
   display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--space-3);
-  flex-wrap: wrap;
+  flex-direction: column;
+  align-items: stretch;
+  gap: var(--space-2);
   margin-top: var(--space-3);
   padding-top: var(--space-3);
   border-top: 1px solid var(--color-border-soft);
 }
+
+.ctxmeter__compact > * { align-self: flex-start; }
 
 .ctxmeter__compact-action {
   display: inline-flex;
@@ -1068,15 +1074,28 @@
 .ctxmeter__compact-action:focus-visible { outline: none; box-shadow: var(--shadow-focus); }
 
 .ctxmeter__compact-auto {
-  display: inline-flex;
+  display: flex;
   align-items: center;
+  justify-content: flex-start;
   gap: var(--space-2);
   font-size: var(--text-2xs);
   color: var(--color-text-muted);
   cursor: pointer;
+  /* 25 characters at this size cannot overflow a 400px panel, and forbidding
+     the wrap is what stops a stale or competing rule stacking it again. */
+  white-space: nowrap;
 }
 
-.ctxmeter__compact-auto input { margin: 0; cursor: pointer; }
+/* A global reset makes inputs `display: block`, and a blockified checkbox fills
+   its flex line -- which pushed the label 146px to the right. Size it
+   explicitly rather than relying on the intrinsic width it no longer has. */
+.ctxmeter__compact-auto input {
+  flex: none;
+  width: 13px;
+  height: 13px;
+  margin: 0;
+  cursor: pointer;
+}
 
 .ctxmeter__compacted {
   display: flex;
@@ -1105,3 +1124,64 @@
 }
 
 .ctxmeter__compact-undo:focus-visible { outline: none; box-shadow: var(--shadow-focus); }
+/* Receipt-style breakdown: numbers stack in one right-aligned column and sum to
+   a ruled total. A conversation's context spend reads the way this project asks
+   people to read everything else it produces. */
+
+.ctxmeter__headline {
+  margin: 0 0 var(--space-3);
+  font-size: var(--text-sm);
+  line-height: 1.5;
+  color: var(--color-text-muted);
+}
+
+.ctxmeter__headline strong {
+  font-size: var(--text-lg);
+  font-weight: 600;
+  color: var(--color-text);
+  font-variant-numeric: tabular-nums;
+}
+
+.ctxmeter__receipt { list-style: none; margin: var(--space-3) 0 0; padding: 0; }
+
+.ctxmeter__receipt-row {
+  display: grid;
+  grid-template-columns: 10px minmax(64px, auto) 1fr;
+  align-items: center;
+  gap: var(--space-3);
+  padding: 3px 0;
+  font-size: var(--text-2xs);
+  color: var(--color-text-muted);
+}
+
+.ctxmeter__receipt-num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  color: var(--color-text);
+}
+
+.ctxmeter__receipt-label { color: var(--color-text-muted); }
+
+.ctxmeter__receipt-row--total {
+  margin-top: 3px;
+  padding-top: var(--space-2);
+  border-top: 1px solid var(--color-border-soft);
+}
+
+.ctxmeter__receipt-row--total .ctxmeter__receipt-num { font-weight: 600; }
+.ctxmeter__swatch--blank { background: none; }
+
+.ctxmeter__compact-action[disabled] {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.ctxmeter__compact-hint {
+  margin: var(--space-2) 0 0;
+  font-size: var(--text-micro);
+  line-height: 1.5;
+  color: var(--color-text-faint);
+}
+
+/* The bar carries the whole story at a glance, so give it room to be read. */
+.ctxmeter__bar { height: 10px; }

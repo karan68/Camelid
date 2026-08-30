@@ -32,6 +32,7 @@ export function ContextMeter({
   autoCompact = false,
   onToggleAutoCompact = null,
   onCompactNow = null,
+  canCompact = false,
   compaction = null,
   onSendEverything = null,
 }) {
@@ -93,14 +94,8 @@ export function ContextMeter({
 
       {open && (
         <div className="ctxmeter__panel" role="group" aria-label="Context window breakdown">
-          <div className="ctxmeter__panel-head">
-            <span className="ctxmeter__panel-title">Context window</span>
-            <span className="ctxmeter__panel-total">{formatPercent(budget.filledPercent)}</span>
-          </div>
-          <p className="ctxmeter__panel-count">
-            {budget.usedTokens.toLocaleString()} + {budget.reservedTokens.toLocaleString()} reserved
-            {' / '}
-            {budget.contextLength.toLocaleString()} tokens
+          <p className="ctxmeter__headline">
+            <strong>{formatPercent(budget.filledPercent)}</strong> of this model&rsquo;s context is spoken for
           </p>
 
           <div className="ctxmeter__bar">
@@ -118,29 +113,33 @@ export function ContextMeter({
             )}
           </div>
 
+          {/* Reads as a receipt rather than a formula: the numbers stack and
+              sum, which is the shape this project already asks people to trust. */}
+          <ul className="ctxmeter__receipt">
+            {budget.segments.map((segment) => (
+              <li key={segment.key} className={`ctxmeter__receipt-row is-${segment.key}`}>
+                <span className="ctxmeter__swatch" aria-hidden="true" />
+                <span className="ctxmeter__receipt-num">{segment.tokens.toLocaleString()}</span>
+                <span className="ctxmeter__receipt-label">{segment.label}</span>
+              </li>
+            ))}
+            <li className="ctxmeter__receipt-row ctxmeter__receipt-row--total">
+              <span className="ctxmeter__swatch ctxmeter__swatch--blank" aria-hidden="true" />
+              <span className="ctxmeter__receipt-num">{budget.contextLength.toLocaleString()}</span>
+              <span className="ctxmeter__receipt-label">tokens in total</span>
+            </li>
+          </ul>
+
           {budget.showVerifiedMarker && (
             <p className="ctxmeter__verified">
               <IconCheckCircle size={12} />
               <span>
-                Verified to {budget.verifiedBound.toLocaleString()} tokens.
-                {' '}
                 {budget.beyondVerified
-                  ? 'You are past the tested envelope — still supported, just untested.'
-                  : 'Context beyond the marker works; it simply has no committed evidence yet.'}
+                  ? <>Past the {budget.verifiedBound.toLocaleString()}-token tested mark — still fine, just no receipt.</>
+                  : <>Tested to {budget.verifiedBound.toLocaleString()} tokens — it works beyond that, just without a receipt.</>}
               </span>
             </p>
           )}
-
-          <ul className="ctxmeter__legend">
-            {budget.segments.map((segment) => (
-              <li key={segment.key} className={`ctxmeter__legend-row is-${segment.key}`}>
-                <span className="ctxmeter__swatch" aria-hidden="true" />
-                <span className="ctxmeter__legend-label">{segment.label}</span>
-                <span className="ctxmeter__legend-tokens">{segment.tokens.toLocaleString()}</span>
-                <span className="ctxmeter__legend-percent">{formatPercent(segment.percent)}</span>
-              </li>
-            ))}
-          </ul>
 
           {(onCompactNow || onToggleAutoCompact) && (
             <div className="ctxmeter__compact">
@@ -149,8 +148,12 @@ export function ContextMeter({
                   type="button"
                   className="ctxmeter__compact-action"
                   onClick={onCompactNow}
+                  disabled={!canCompact}
+                  /* A button that silently does nothing is worse than one that
+                     refuses and says why. */
+                  title={canCompact ? undefined : 'Everything here is either yours or recent, so there is nothing to leave out.'}
                 >
-                  <IconRefresh size={12} /> Compact for sending
+                  <IconRefresh size={12} /> Trim what gets sent
                 </button>
               )}
               {onToggleAutoCompact && (
@@ -160,35 +163,38 @@ export function ContextMeter({
                     checked={autoCompact}
                     onChange={(event) => onToggleAutoCompact(event.target.checked)}
                   />
-                  <span>Automatically at {AUTO_COMPACT_THRESHOLD_PERCENT}%</span>
+                  <span>Trim automatically at {AUTO_COMPACT_THRESHOLD_PERCENT}%</span>
                 </label>
               )}
             </div>
           )}
 
+          {onCompactNow && !canCompact && (
+            <p className="ctxmeter__compact-hint">
+              Nothing to trim yet — everything here is recent or yours.
+            </p>
+          )}
+
           {compaction?.active && (
             <p className="ctxmeter__compacted">
               <span>
-                {compaction.elidedCount.toLocaleString()} earlier{' '}
-                {compaction.elidedCount === 1 ? 'reply is' : 'replies are'} not being sent.
-                {compaction.freedTokens > 0 && <> Freed ~{compaction.freedTokens.toLocaleString()} tokens.</>}
-                {' '}Your transcript is unchanged.
+                {compaction.elidedCount.toLocaleString()} older{' '}
+                {compaction.elidedCount === 1 ? 'reply is' : 'replies are'} being left out of what gets sent
+                {compaction.freedTokens > 0 && <>, freeing about {compaction.freedTokens.toLocaleString()} tokens</>}.
+                {' '}Nothing was deleted — your transcript is untouched.
               </span>
               {onSendEverything && (
                 <button type="button" className="ctxmeter__compact-undo" onClick={onSendEverything}>
-                  Send everything
+                  Send it all
                 </button>
               )}
             </p>
           )}
 
           <p className="ctxmeter__foot">
-            {executionLane
-              ? <>Runs on <code>{executionLane}</code> — your hardware, no per-token cost.</>
-              : <>Runs on your hardware — no per-token cost.</>}
-          </p>
-          <p className="ctxmeter__foot ctxmeter__foot--estimate">
-            Prompt size is an estimate until the message is sent.
+            Your hardware
+            {executionLane && <> &middot; <code>{executionLane}</code></>}
+            {' '}&middot; sizes estimated until sent
           </p>
         </div>
       )}

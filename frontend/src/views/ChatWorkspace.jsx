@@ -17,6 +17,7 @@ import { composeContextBudget } from '../lib/contextBudget.js'
 import {
   AUTO_COMPACT_THRESHOLD_PERCENT,
   applySendCompaction,
+  compactForSend,
   getAutoCompactEnabled,
   setAutoCompactEnabled,
   getCompactionOverride,
@@ -610,8 +611,7 @@ export default function ChatWorkspace({
     forced: compactionOverride === 'force',
     filledPercent: contextBudget?.filledPercent ?? 0,
   })
-  const elidedTokenEstimate = compactionPreview.compacted
-    ? visibleMessages
+  const elidedTokenEstimate = compactionPreview.compacted    ? visibleMessages
       .filter((message) => !compactionPreview.messages.includes(message))
       .reduce((sum, message) => {
         const text = String(message?.content || '')
@@ -869,6 +869,7 @@ export default function ChatWorkspace({
           autoCompact={autoCompact}
           onToggleAutoCompact={handleToggleAutoCompact}
           onCompactNow={compactionPreview.compacted ? null : handleCompactNow}
+          canCompact={compactForSend(visibleMessages) !== null}
           compaction={compactionPreview.compacted
             ? {
               active: true,
