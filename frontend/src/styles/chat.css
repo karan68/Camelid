@@ -870,3 +870,167 @@
   .cxfirstrun__primary,
   .cxfirstrun__secondary { text-align: center; }
 }
+
+/* --- Context meter -------------------------------------------------------
+   Sits in the composer status line. The reservation is drawn as its own
+   hatched band rather than folded into "used": it is room held for the reply,
+   not tokens already spent. The verified-bound marker sits ON the track with
+   the space past it still styled as usable, because the tested envelope is
+   evidence, not a ceiling. */
+
+.ctxmeter { position: relative; display: inline-flex; }
+
+.ctxmeter__chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 2px var(--space-2);
+  border: 1px solid var(--color-border-soft);
+  border-radius: var(--radius-pill);
+  background: var(--color-surface-subtle);
+  color: var(--color-text-muted);
+  font-size: var(--text-2xs);
+  line-height: 1.6;
+  cursor: pointer;
+}
+
+.ctxmeter__chip:hover { background: var(--color-surface-hover); color: var(--color-text); }
+.ctxmeter__chip:focus-visible { outline: none; box-shadow: var(--shadow-focus); }
+.ctxmeter__chip.is-notice { border-color: var(--color-warning); }
+.ctxmeter__chip.is-error { border-color: var(--color-danger, var(--color-warning)); color: var(--color-text); }
+
+.ctxmeter__track {
+  position: relative;
+  width: 44px;
+  height: 4px;
+  border-radius: var(--radius-pill);
+  background: var(--color-border-soft);
+  overflow: hidden;
+}
+
+.ctxmeter__fill {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  background: var(--color-accent);
+  border-radius: var(--radius-pill);
+}
+
+.ctxmeter__fill--reserved {
+  background: repeating-linear-gradient(
+    135deg,
+    var(--color-accent-soft) 0 3px,
+    transparent 3px 6px
+  );
+  box-shadow: inset 0 0 0 1px var(--color-accent-soft);
+}
+
+.ctxmeter__chip-value { font-variant-numeric: tabular-nums; }
+
+.ctxmeter__panel {
+  position: absolute;
+  bottom: calc(100% + var(--space-2));
+  left: 0;
+  z-index: 30;
+  width: min(320px, calc(100vw - var(--space-6)));
+  padding: var(--space-4);
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-lg);
+  background: var(--color-bg-elevated);
+  box-shadow: var(--shadow-3);
+}
+
+.ctxmeter__panel-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.ctxmeter__panel-title { font-size: var(--text-sm); font-weight: 600; color: var(--color-text); }
+.ctxmeter__panel-total { font-size: var(--text-sm); color: var(--color-text-muted); font-variant-numeric: tabular-nums; }
+
+.ctxmeter__panel-count {
+  margin: 2px 0 var(--space-3);
+  font-size: var(--text-2xs);
+  color: var(--color-text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.ctxmeter__bar {
+  position: relative;
+  height: 8px;
+  border-radius: var(--radius-pill);
+  background: var(--color-border-soft);
+  overflow: hidden;
+}
+
+.ctxmeter__bar-fill { position: absolute; top: 0; bottom: 0; left: 0; background: var(--color-accent); }
+
+.ctxmeter__bar-fill--reserved {
+  background: repeating-linear-gradient(
+    135deg,
+    var(--color-accent-soft) 0 4px,
+    transparent 4px 8px
+  );
+  box-shadow: inset 0 0 0 1px var(--color-accent-soft);
+}
+
+/* Marker, not a wall: 2px rule with a gap either side so the usable context
+   past the tested envelope still reads as available. */
+.ctxmeter__marker {
+  position: absolute;
+  top: -2px;
+  bottom: -2px;
+  width: 2px;
+  background: var(--color-text);
+  opacity: 0.55;
+}
+
+.ctxmeter__verified {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  margin: var(--space-3) 0 0;
+  font-size: var(--text-2xs);
+  line-height: 1.5;
+  color: var(--color-text-muted);
+}
+
+.ctxmeter__legend { list-style: none; margin: var(--space-3) 0 0; padding: 0; }
+
+.ctxmeter__legend-row {
+  display: grid;
+  grid-template-columns: 10px 1fr auto auto;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 2px 0;
+  font-size: var(--text-2xs);
+  color: var(--color-text-muted);
+}
+
+.ctxmeter__swatch { width: 8px; height: 8px; border-radius: 2px; background: var(--color-accent); }
+.ctxmeter__legend-row.is-messages .ctxmeter__swatch { opacity: 0.75; }
+.ctxmeter__legend-row.is-images .ctxmeter__swatch { opacity: 0.5; }
+.ctxmeter__legend-row.is-reserved .ctxmeter__swatch { background: var(--color-accent-soft); box-shadow: inset 0 0 0 1px var(--color-accent); }
+.ctxmeter__legend-row.is-free .ctxmeter__swatch { background: var(--color-border-soft); }
+.ctxmeter__legend-label { color: var(--color-text); }
+.ctxmeter__legend-tokens,
+.ctxmeter__legend-percent { font-variant-numeric: tabular-nums; }
+.ctxmeter__legend-percent { min-width: 34px; text-align: right; }
+
+.ctxmeter__foot {
+  margin: var(--space-3) 0 0;
+  font-size: var(--text-micro);
+  line-height: 1.5;
+  color: var(--color-text-faint);
+}
+
+.ctxmeter__foot code { font-family: var(--font-mono); font-size: var(--text-micro); }
+.ctxmeter__foot--estimate { margin-top: 2px; font-style: italic; }
+
+@media (prefers-reduced-motion: no-preference) {
+  .ctxmeter__fill,
+  .ctxmeter__bar-fill { transition: width 160ms ease, left 160ms ease; }
+}

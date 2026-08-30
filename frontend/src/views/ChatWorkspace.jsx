@@ -3,7 +3,7 @@ import { getChatGateState } from '../lib/chatGate'
 import { displayQuantLabel, exactArtifactFilenameForRow } from '../lib/capabilities'
 import { formatModelLabel } from '../lib/formatters'
 import { isEmbeddingOnlyModel, isGenerationCapableModel } from '../lib/modelCapabilities.js'
-import { applyGemma4GhostChatTokenCap, getConfiguredMaxTokens, isBitNetB158ChatModel, modelContextLength, validateSendBudget } from '../lib/responseLimits'
+import { applyGemma4GhostChatTokenCap, getConfiguredMaxTokens, isBitNetB158ChatModel, modelContextLength, validateSendBudget, verifiedContextBound } from '../lib/responseLimits'
 import { CamelidMark } from '../components/ui/CamelidMark'
 import { Avatar } from '../components/ui/Avatar'
 import { StatusDot } from '../components/ui/StatusDot'
@@ -12,6 +12,7 @@ import { IconSend, IconStop, IconMemory, IconReceipt, IconThinking, IconBolt, Ic
 import { Tooltip } from '../components/ui/Tooltip'
 import { MessageTurn } from '../components/chat/MessageTurn'
 import { ChatControls } from '../components/chat/ChatControls'
+import { ContextMeter } from '../components/chat/ContextMeter'
 import { PREPARING_STREAMING_LABEL, StreamingLoader } from '../components/chat/render/StreamingIndicator'
 import { classifyWebResearchNeed } from '../lib/webResearch.js'
 
@@ -565,11 +566,18 @@ export default function ChatWorkspace({
     runtime?.gemma4_serve_lane,
   )
   const ghostBudgetCapped = effectiveMaxTokens < configuredMaxTokens
+  const activeContextLength = runtime?.active_context_length || modelContextLength(selectedModel)
   const sendBudget = validateSendBudget({
     promptTokens: estimatedPromptTokens,
     maxTokens: effectiveMaxTokens,
-    contextLength: runtime?.active_context_length || modelContextLength(selectedModel),
+    contextLength: activeContextLength,
   })
+  /* The meter reads the same three numbers the budget check does, so the chip
+     and the notice under the composer can never disagree. The verified bound is
+     drawn as a marker rather than a limit: past it the row is still served, it
+     simply has no committed evidence pack. */
+  const verifiedBound = verifiedContextBound(capabilities, selectedModel)
+  const executionLane = runtime?.execution_plan?.selected_backend || ''
 
   /* Folded fine print: everything that used to stack under the composer now
      lives in the status line's tooltip. Error and budget notices still render
@@ -794,6 +802,13 @@ export default function ChatWorkspace({
           <StatusDot tone={statusTone} pulse={supportedChatReady || verifiedChatReady || varianceChatReady} />
           <span className="cxcomposer__status-text">{statusLine}</span>
         </span>
+        <ContextMeter
+          contextLength={activeContextLength}
+          promptTokens={estimatedPromptTokens}
+          reservedTokens={effectiveMaxTokens}
+          verifiedBound={verifiedBound}
+          executionLane={executionLane}
+        />
         {statusDetail && (
           <Tooltip content={statusDetail} placement="top">
             <button type="button" className="cxcomposer__status-info" aria-label="Chat status details">
