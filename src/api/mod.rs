@@ -35,6 +35,7 @@ mod metrics;
 mod responses;
 mod responses_store;
 mod server;
+mod tool_envelope;
 mod web_research;
 pub(crate) mod workspace;
 
@@ -15672,7 +15673,7 @@ async fn completions(
     if stream {
         // Text-completion streaming does not implement stream_options yet
         // (scope: chat-completions only), so usage is never emitted here.
-        return stream_completion(&state, prepared, false, false, false);
+        return stream_completion(&state, prepared, false, false, None);
     }
 
     // The decode runs on the engine worker; CancelOnDrop stops it within one
@@ -15907,6 +15908,11 @@ async fn chat_completions(
     };
     let tools_active = req.tools.as_ref().is_some_and(|tools| !tools.is_empty())
         && tool_choice_allows_calls(req.tool_choice.as_ref());
+    // Captured before `req` is consumed downstream. This is the only thing that
+    // authorises undoing a schema envelope the model echoed around its arguments.
+    let declared_tool_parameters = tool_envelope::ToolParameterNames::from_request_tools(
+        req.tools.as_deref().unwrap_or_default(),
+    );
     let tools_unsupported_on_lane = |lane: &str| {
         api_error(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -16158,7 +16164,11 @@ async fn chat_completions(
             prepared,
             true,
             include_usage,
-            tools_active && !constraint_active,
+            if tools_active && !constraint_active {
+                Some(declared_tool_parameters)
+            } else {
+                None
+            },
         );
     }
 
@@ -16205,7 +16215,7 @@ async fn chat_completions(
             // request supplied tools and tool_choice permits it. On a tool call,
             // content is emptied and finish_reason flips to "tool_calls".
             let tool_calls = if should_parse_tool_calls(tools_active, constraint_active) {
-                parse_tool_calls(&content)
+                parse_tool_calls(&content, &declared_tool_parameters)
             } else {
                 None
             };
@@ -20299,7 +20309,14 @@ fn should_parse_tool_calls(tools_active: bool, constraint_active: bool) -> bool 
 /// The parser tolerates trailing junk after a complete JSON value but remains
 /// strict about function names and JSON arguments, so ordinary prose is never
 /// reclassified as a call.
-fn parse_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
+///
+/// `declared` carries the parameter names the request advertised, which is what
+/// authorises undoing a schema envelope the model echoed around its arguments;
+/// see [`tool_envelope`].
+fn parse_tool_calls(
+    text: &str,
+    declared: &tool_envelope::ToolParameterNames,
+) -> Option<Vec<ToolCall>> {
     let trimmed = text.trim();
     let trimmed = trimmed
         .strip_prefix("<|python_tag|>")
@@ -20335,7 +20352,7 @@ fn parse_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
         .collect::<Vec<_>>();
     let calls = values
         .iter()
-        .filter_map(tool_call_from_value)
+        .filter_map(|value| tool_call_from_value(value, declared))
         .collect::<Vec<_>>();
     (!calls.is_empty()).then_some(calls)
 }
@@ -20347,7 +20364,10 @@ fn first_json_value(text: &str) -> Option<serde_json::Value> {
         .ok()
 }
 
-fn tool_call_from_value(value: &serde_json::Value) -> Option<ToolCall> {
+fn tool_call_from_value(
+    value: &serde_json::Value,
+    declared: &tool_envelope::ToolParameterNames,
+) -> Option<ToolCall> {
     let obj = value.as_object()?;
     let function = obj.get("function").and_then(serde_json::Value::as_object);
     let name = function
@@ -20370,6 +20390,7 @@ fn tool_call_from_value(value: &serde_json::Value) -> Option<ToolCall> {
         }
         args => args,
     };
+    let args = tool_envelope::unwrap_schema_envelope(name, args, declared);
     let arguments = serde_json::to_string(&args).ok()?;
     Some(ToolCall {
         id: format!("call_{}", uuid::Uuid::new_v4().simple()),
@@ -21433,7 +21454,7 @@ fn stream_completion(
     mut prepared: PreparedGeneration,
     chat: bool,
     include_usage: bool,
-    parse_stream_tool_calls: bool,
+    stream_tool_calls: Option<tool_envelope::ToolParameterNames>,
 ) -> Response {
     // Speculation only runs in the non-streaming loop; streaming requests on
     // a spec-enabled server keep the unchanged vanilla path (including the
@@ -21526,7 +21547,7 @@ fn stream_completion(
                             Some(stream_started.elapsed().as_millis());
                     }
                     if chat {
-                        if parse_stream_tool_calls {
+                        if stream_tool_calls.is_some() {
                             tool_candidate.push_str(&delta);
                             continue;
                         }
@@ -21589,8 +21610,8 @@ fn stream_completion(
                     });
                     if chat {
                         let mut resolved_finish_reason = finish_reason;
-                        if parse_stream_tool_calls {
-                            if let Some(tool_calls) = parse_tool_calls(&tool_candidate) {
+                        if let Some(declared) = stream_tool_calls.as_ref() {
+                            if let Some(tool_calls) = parse_tool_calls(&tool_candidate, declared) {
                                 resolved_finish_reason = "tool_calls";
                                 let tool_calls = tool_calls
                                     .into_iter()
@@ -24610,7 +24631,7 @@ mod tests {
             orphan_test_prepared("model-a.gguf"),
             true,
             false,
-            false,
+            None,
         );
 
         // Drive the SSE body the way a client does. The reader task polls the
@@ -25072,6 +25093,12 @@ mod tests {
         assert!(validate_choice_and_logprob_fields(&oob).is_err());
     }
 
+    /// No tools declared, so the schema-envelope repair can never fire: these
+    /// cases must behave exactly as they did before it existed.
+    fn no_declared_tools() -> tool_envelope::ToolParameterNames {
+        tool_envelope::ToolParameterNames::from_request_tools(&[])
+    }
+
     #[test]
     fn constrained_output_is_never_reclassified_as_tool_call() {
         // M3 regression: a schema that legitimately declares a `name` property
@@ -25081,7 +25108,7 @@ mod tests {
         // "tool_calls"). OpenAI allows tools + response_format together.
         let constrained_content = r#"{"name":"x","parameters":{}}"#;
         assert!(
-            parse_tool_calls(constrained_content).is_some(),
+            parse_tool_calls(constrained_content, &no_declared_tools()).is_some(),
             "the gate, not the parser, is what protects constrained output"
         );
         assert!(!should_parse_tool_calls(true, true));
@@ -25093,8 +25120,11 @@ mod tests {
     #[test]
     fn parse_tool_calls_extracts_llama_format() {
         // Llama 3.x: {"name", "parameters"}; arguments becomes a JSON string.
-        let tc = parse_tool_calls(r#"{"name": "get_weather", "parameters": {"city": "Paris"}}"#)
-            .unwrap();
+        let tc = parse_tool_calls(
+            r#"{"name": "get_weather", "parameters": {"city": "Paris"}}"#,
+            &no_declared_tools(),
+        )
+        .unwrap();
         assert_eq!(tc.len(), 1);
         assert_eq!(tc[0].function.name, "get_weather");
         assert_eq!(tc[0].kind, "function");
@@ -25104,16 +25134,51 @@ mod tests {
     }
 
     #[test]
+    fn a_schema_envelope_echoed_by_the_model_is_unwrapped_for_the_client() {
+        // Observed on Llama-3.2-1B-Instruct-Q8_0: the model replied with the
+        // schema shape it was shown, leaving `arguments.city` unreachable to an
+        // ordinary OpenAI client.
+        let echoed = r#"{"name": "get_weather", "parameters": {"properties": {"city": "Paris"}}}"#;
+        let declared =
+            tool_envelope::ToolParameterNames::from_request_tools(&[serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                        "required": ["city"]
+                    }
+                }
+            })]);
+
+        let repaired = parse_tool_calls(echoed, &declared).unwrap();
+        let args: serde_json::Value =
+            serde_json::from_str(&repaired[0].function.arguments).unwrap();
+        assert_eq!(args, serde_json::json!({"city": "Paris"}));
+
+        // The declared schema is the only thing that authorises the rewrite: with
+        // no tools declared the model's output is relayed exactly as produced.
+        let untouched = parse_tool_calls(echoed, &no_declared_tools()).unwrap();
+        let args: serde_json::Value =
+            serde_json::from_str(&untouched[0].function.arguments).unwrap();
+        assert_eq!(args, serde_json::json!({"properties": {"city": "Paris"}}));
+    }
+
+    #[test]
     fn parse_tool_calls_tolerates_python_tag_and_junk() {
         // python_tag prefix + trailing junk small models emit; "arguments" variant.
-        let tc = parse_tool_calls(r#"<|python_tag|>{"name": "f", "arguments": {"x": 1}} trailing"#)
-            .unwrap();
+        let tc = parse_tool_calls(
+            r#"<|python_tag|>{"name": "f", "arguments": {"x": 1}} trailing"#,
+            &no_declared_tools(),
+        )
+        .unwrap();
         assert_eq!(tc[0].function.name, "f");
         let args: serde_json::Value = serde_json::from_str(&tc[0].function.arguments).unwrap();
         assert_eq!(args["x"], 1);
         // prose is not a tool call; a JSON object without "name" is not either.
-        assert!(parse_tool_calls("The weather in Paris is sunny.").is_none());
-        assert!(parse_tool_calls(r#"{"parameters": {"x": 1}}"#).is_none());
+        assert!(parse_tool_calls("The weather in Paris is sunny.", &no_declared_tools()).is_none());
+        assert!(parse_tool_calls(r#"{"parameters": {"x": 1}}"#, &no_declared_tools()).is_none());
     }
 
     #[test]
@@ -25121,6 +25186,7 @@ mod tests {
         let qwen = parse_tool_calls(
             r#"<tool_call>{"name":"read_file","arguments":{"path":"a.txt"}}</tool_call>
 <tool_call>{"name":"list_dir","arguments":{"path":"."}}</tool_call>"#,
+            &no_declared_tools(),
         )
         .unwrap();
         assert_eq!(qwen.len(), 2);
@@ -25130,6 +25196,7 @@ mod tests {
 
         let mistral = parse_tool_calls(
             r#"[TOOL_CALLS] [{"name":"read_file","arguments":"{\"path\":\"b.txt\"}"}]"#,
+            &no_declared_tools(),
         )
         .unwrap();
         assert_eq!(mistral.len(), 1);
@@ -25170,9 +25237,12 @@ mod tests {
 
     #[test]
     fn chat_tool_call_delta_uses_openai_stream_shape() {
-        let call = parse_tool_calls(r#"{"name":"weather","parameters":{"city":"Paris"}}"#)
-            .unwrap()
-            .remove(0);
+        let call = parse_tool_calls(
+            r#"{"name":"weather","parameters":{"city":"Paris"}}"#,
+            &no_declared_tools(),
+        )
+        .unwrap()
+        .remove(0);
         let delta = ChatCompletionDelta {
             role: None,
             content: None,
