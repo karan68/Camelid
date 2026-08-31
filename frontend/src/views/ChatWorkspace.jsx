@@ -3,7 +3,7 @@ import { getChatGateState } from '../lib/chatGate'
 import { displayQuantLabel, exactArtifactFilenameForRow } from '../lib/capabilities'
 import { formatModelLabel } from '../lib/formatters'
 import { isEmbeddingOnlyModel, isGenerationCapableModel } from '../lib/modelCapabilities.js'
-import { applyGemma4GhostChatTokenCap, getConfiguredMaxTokens, isBitNetB158ChatModel, modelContextLength, validateSendBudget } from '../lib/responseLimits'
+import { applyGemma4GhostChatTokenCap, getConfiguredMaxTokens, isBitNetB158ChatModel, modelContextLength, validateSendBudget, verifiedContextBound } from '../lib/responseLimits'
 import { CamelidMark } from '../components/ui/CamelidMark'
 import { Avatar } from '../components/ui/Avatar'
 import { StatusDot } from '../components/ui/StatusDot'
@@ -12,6 +12,17 @@ import { IconSend, IconStop, IconMemory, IconReceipt, IconThinking, IconBolt, Ic
 import { Tooltip } from '../components/ui/Tooltip'
 import { MessageTurn } from '../components/chat/MessageTurn'
 import { ChatControls } from '../components/chat/ChatControls'
+import { ContextMeter } from '../components/chat/ContextMeter'
+import { composeContextBudget } from '../lib/contextBudget.js'
+import {
+  AUTO_COMPACT_THRESHOLD_PERCENT,
+  applySendCompaction,
+  compactForSend,
+  getAutoCompactEnabled,
+  setAutoCompactEnabled,
+  getCompactionOverride,
+  setCompactionOverride,
+} from '../lib/conversationCompaction.js'
 import { PREPARING_STREAMING_LABEL, StreamingLoader } from '../components/chat/render/StreamingIndicator'
 import { classifyWebResearchNeed } from '../lib/webResearch.js'
 
@@ -565,11 +576,66 @@ export default function ChatWorkspace({
     runtime?.gemma4_serve_lane,
   )
   const ghostBudgetCapped = effectiveMaxTokens < configuredMaxTokens
+  const activeContextLength = runtime?.active_context_length || modelContextLength(selectedModel)
   const sendBudget = validateSendBudget({
     promptTokens: estimatedPromptTokens,
     maxTokens: effectiveMaxTokens,
-    contextLength: runtime?.active_context_length || modelContextLength(selectedModel),
+    contextLength: activeContextLength,
   })
+  /* The meter reads the same three numbers the budget check does, so the chip
+     and the notice under the composer can never disagree. The verified bound is
+     drawn as a marker rather than a limit: past it the row is still served, it
+     simply has no committed evidence pack. */
+  const verifiedBound = verifiedContextBound(capabilities, selectedModel)
+  const executionLane = runtime?.execution_plan?.selected_backend || ''
+
+  /* Compaction preview. The panel must describe what the NEXT send will do, so
+     it runs the same pure trim the send path runs, over the same preference
+     store -- there is no second copy of the rule to drift. */
+  const conversationId = selectedConversation?.id || ''
+  const [autoCompact, setAutoCompactState] = useState(() => getAutoCompactEnabled())
+  const [compactionOverride, setCompactionOverrideState] = useState(null)
+  useEffect(() => {
+    setCompactionOverrideState(getCompactionOverride(conversationId))
+  }, [conversationId])
+
+  const contextBudget = composeContextBudget({
+    contextLength: activeContextLength,
+    promptTokens: estimatedPromptTokens,
+    reservedTokens: effectiveMaxTokens,
+    verifiedBound,
+    warnAtPercent: AUTO_COMPACT_THRESHOLD_PERCENT,
+  })
+  const compactionPreview = applySendCompaction(visibleMessages, {
+    enabled: compactionOverride === 'off' ? false : autoCompact,
+    forced: compactionOverride === 'force',
+    filledPercent: contextBudget?.filledPercent ?? 0,
+  })
+  const elidedTokenEstimate = compactionPreview.compacted    ? visibleMessages
+      .filter((message) => !compactionPreview.messages.includes(message))
+      .reduce((sum, message) => {
+        const text = String(message?.content || '')
+        const pieces = text.match(/[\p{L}\p{N}_]+|[^\s\p{L}\p{N}_]/gu) || []
+        return sum + Math.round(Math.max(pieces.length, text.length / 4))
+      }, 0)
+    : 0
+
+  const handleToggleAutoCompact = (next) => {
+    setAutoCompactEnabled(next)
+    setAutoCompactState(next)
+    /* Changing the preference clears a per-chat override, otherwise the
+       checkbox would appear to do nothing in this conversation. */
+    setCompactionOverride(conversationId, null)
+    setCompactionOverrideState(null)
+  }
+  const handleCompactNow = () => {
+    setCompactionOverride(conversationId, 'force')
+    setCompactionOverrideState('force')
+  }
+  const handleSendEverything = () => {
+    setCompactionOverride(conversationId, 'off')
+    setCompactionOverrideState('off')
+  }
 
   /* Folded fine print: everything that used to stack under the composer now
      lives in the status line's tooltip. Error and budget notices still render
@@ -794,6 +860,25 @@ export default function ChatWorkspace({
           <StatusDot tone={statusTone} pulse={supportedChatReady || verifiedChatReady || varianceChatReady} />
           <span className="cxcomposer__status-text">{statusLine}</span>
         </span>
+        <ContextMeter
+          contextLength={activeContextLength}
+          promptTokens={estimatedPromptTokens}
+          reservedTokens={effectiveMaxTokens}
+          verifiedBound={verifiedBound}
+          executionLane={executionLane}
+          autoCompact={autoCompact}
+          onToggleAutoCompact={handleToggleAutoCompact}
+          onCompactNow={compactionPreview.compacted ? null : handleCompactNow}
+          canCompact={compactForSend(visibleMessages) !== null}
+          compaction={compactionPreview.compacted
+            ? {
+              active: true,
+              elidedCount: compactionPreview.elidedCount,
+              freedTokens: elidedTokenEstimate,
+            }
+            : null}
+          onSendEverything={compactionPreview.compacted ? handleSendEverything : null}
+        />
         {statusDetail && (
           <Tooltip content={statusDetail} placement="top">
             <button type="button" className="cxcomposer__status-info" aria-label="Chat status details">
