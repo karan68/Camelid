@@ -201,11 +201,11 @@ function UserTurn({ message, messageContent, onEditResend }) {
                 rows={Math.min(8, Math.max(2, draft.split('\n').length))}
                 onChange={(event) => setDraft(event.target.value)}
                 onKeyDown={(event) => {
-                  if (event.key === "Enter" && !event.shiftKey) {
+                  if (event.key === 'Enter' && !event.shiftKey) {
                     event.preventDefault()
                     submitEdit()
                   }
-                  if (event.key === "Escape") {
+                  if (event.key === 'Escape') {
                     event.stopPropagation()
                     setEditing(false)
                     setDraft(messageContent)
@@ -230,10 +230,10 @@ function UserTurn({ message, messageContent, onEditResend }) {
             )}
             <button
               type="button"
-              className={`cxturn__action cxturn__action--icon ${copied ? "is-copied" : ""}`}
+              className={`cxturn__action cxturn__action--icon ${copied ? 'is-copied' : ''}`}
               onClick={handleCopy}
-              title={copied ? "Copied" : "Copy"}
-              aria-label={copied ? "Copied" : "Copy message"}
+              title={copied ? 'Copied' : 'Copy'}
+              aria-label={copied ? 'Copied' : 'Copy message'}
             >
               {copied ? <IconCheck size={16} /> : <IconCopy size={16} />}
             </button>
@@ -342,10 +342,10 @@ export const MessageTurn = memo(function MessageTurn({ message, generationElapse
             {showMessageActions && (
               <button
                 type="button"
-                className={`cxturn__action cxturn__action--icon ${copied ? "is-copied" : ""}`}
+                className={`cxturn__action cxturn__action--icon ${copied ? 'is-copied' : ''}`}
                 onClick={handleCopyMessage}
-                title={copied ? "Copied" : "Copy response"}
-                aria-label={copied ? "Copied" : "Copy response"}
+                title={copied ? 'Copied' : 'Copy response'}
+                aria-label={copied ? 'Copied' : 'Copy response'}
               >
                 {copied ? <IconCheck size={16} /> : <IconCopy size={16} />}
               </button>

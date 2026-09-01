@@ -44,54 +44,22 @@ pub async fn handler(uri: Uri) -> Response {
 }
 
 fn serve_asset(path: &str) -> Option<Response> {
-    let disk_file = std::path::Path::new("frontend/dist").join(path);
-    let (mime, data): (String, axum::body::Bytes) = if disk_file.is_file() {
-        if let Ok(bytes) = std::fs::read(&disk_file) {
-            let m = if path.ends_with(".html") {
-                "text/html"
-            } else if path.ends_with(".js") {
-                "application/javascript"
-            } else if path.ends_with(".css") {
-                "text/css"
-            } else if path.ends_with(".woff2") {
-                "font/woff2"
-            } else if path.ends_with(".woff") {
-                "font/woff"
-            } else if path.ends_with(".svg") {
-                "image/svg+xml"
-            } else if path.ends_with(".json") {
-                "application/json"
-            } else {
-                "application/octet-stream"
-            };
-            (m.to_string(), bytes.into())
-        } else {
-            let asset = WebAssets::get(path)?;
-            (
-                asset.metadata.mimetype().to_string(),
-                axum::body::Bytes::copy_from_slice(&asset.data),
-            )
-        }
-    } else {
-        let asset = WebAssets::get(path)?;
-        (
-            asset.metadata.mimetype().to_string(),
-            axum::body::Bytes::copy_from_slice(&asset.data),
-        )
-    };
-
+    let asset = WebAssets::get(path)?;
+    let mime = asset.metadata.mimetype();
+    // Vite emits content-hashed filenames under assets/, so they can be cached
+    // forever; the HTML shell must always be revalidated to pick up new builds.
     let cache_control = if path.starts_with("assets/") {
         "public, max-age=31536000, immutable"
     } else {
-        "no-store, no-cache, must-revalidate, max-age=0"
+        "no-cache"
     };
     Some(
         (
             [
-                (header::CONTENT_TYPE, mime),
+                (header::CONTENT_TYPE, mime.to_string()),
                 (header::CACHE_CONTROL, cache_control.to_string()),
             ],
-            data,
+            asset.data,
         )
             .into_response(),
     )

@@ -697,7 +697,6 @@ extern "C" __global__ void bitnet_f16_head_matvec(
             // intrinsic (compute_61, Pascal+). The PTX is forward-compatible, so
             // the driver JITs it for whatever newer GPU is present (e.g. sm_86).
             arch: Some("compute_61"),
-            options: vec!["--std=c++17".to_string()],
             ..Default::default()
         }
     }
@@ -881,13 +880,6 @@ extern "C" __global__ void bitnet_f16_head_matvec(
     }
 
     pub fn detect_cuda_device() -> CudaDeviceInfo {
-        if let Some(cap) = probe_capability() {
-            return CudaDeviceInfo {
-                available: true,
-                device_name: Some(cap.device_name),
-                reason: None,
-            };
-        }
         match backend() {
             Some(b) => {
                 let guard = b.lock().expect("cuda backend mutex poisoned");

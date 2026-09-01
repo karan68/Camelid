@@ -8383,16 +8383,13 @@ impl CudaResidentKernels {
             .filter_map(std::env::var_os)
             .map(std::path::PathBuf::from)
             .map(|root| root.join("include"))
-            .chain([
-                std::path::PathBuf::from("/usr/local/cuda/include"),
-                std::path::PathBuf::from("/usr/include"),
-            ])
+            .chain([std::path::PathBuf::from("/usr/local/cuda/include")])
             .find(|include| include.join("mma.h").is_file());
         let tensor_core_q1 =
             (cc_major > 7 || (cc_major == 7 && cc_minor >= 5)) && cuda_include.is_some();
         let binary_tensor_core_q1 = cc_major >= 8;
         let mut include_paths = Vec::new();
-        let mut options = vec!["--std=c++17".to_string()];
+        let mut options = Vec::new();
         if let Some(include) = cuda_include {
             include_paths.push(include.to_string_lossy().into_owned());
             options.push("-DCAMELID_HAS_WMMA=1".to_string());

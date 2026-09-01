@@ -8,6 +8,12 @@ import { readStreamingChatCompletion } from '../lib/chatCompletionStream'
 import { NEW_CHAT_SENTINEL, resolveSelectedConversation, shouldCreateConversationForSend } from '../lib/chatState'
 import { normalizeStoredConversations } from '../lib/conversationStorage.js'
 import { appStorage } from '../lib/appStorage.js'
+import { composeContextBudget } from '../lib/contextBudget.js'
+import {
+  AUTO_COMPACT_THRESHOLD_PERCENT,
+  applySendCompaction,
+  resolveCompactionIntent,
+} from '../lib/conversationCompaction.js'
 import { getRuntimeRequestModelId, isExternalModel, modelRuntimeIdMatches } from '../lib/modelState'
 import { contractSamplingOverrides } from '../lib/samplingContract'
 import { executionRuntimeFields } from '../lib/executionPlan'
@@ -1210,6 +1216,36 @@ export function useDashboardData({ showNotice, clearNotice }) {
       }))
       let requestMessages = applyLocalChatPolicy(requestHistory)
 
+      /* Send-time compaction. Trims only this payload -- the stored transcript
+         is untouched -- so a wrong call costs the user nothing. Reads the same
+         preference store and runs the same pure trim the composer's meter
+         previews with, so the panel cannot advertise a trim that does not
+         happen here. */
+      const compactionReserve = applyGemma4GhostChatTokenCap(
+        getModelMaxTokens(selectedModelId),
+        runtime?.gemma4_serve_lane,
+      )
+      const compactionBudget = composeContextBudget({
+        contextLength: runtime?.active_context_length || modelContextLength(selectedModel),
+        promptTokens: requestMessages.reduce(
+          (sum, message) => sum + estimateTokenCount(
+            typeof message?.content === 'string'
+              ? message.content
+              : JSON.stringify(message?.content ?? ''),
+          ),
+          0,
+        ),
+        reservedTokens: compactionReserve,
+        warnAtPercent: AUTO_COMPACT_THRESHOLD_PERCENT,
+      })
+      const compactionIntent = resolveCompactionIntent(selectedConversationIdRef.current)
+      const sendCompaction = applySendCompaction(requestMessages, {
+        enabled: compactionIntent.enabled,
+        forced: compactionIntent.forced,
+        filledPercent: compactionBudget?.filledPercent ?? 0,
+      })
+      requestMessages = sendCompaction.messages
+
       const estimateResearchPromptTokens = (candidateMessages) => estimateWebResearchChatTokens(
         candidateMessages,
         { visionTokenAllowance: runtime?.vision_token_allowance },
@@ -1459,11 +1495,11 @@ export function useDashboardData({ showNotice, clearNotice }) {
           // locked. Experimental rows have no parity contract and small models loop
           // badly under greedy decoding, so they sample for usable output. BitNet's
           // runnable lane is explicitly greedy even while its row is experimental.
-          // When web research is active, apply a mild temperature and repeat penalty
-          // to prevent small models from degenerating into repetitive n-gram loops on long outputs.
           temperature: useExperimentalSampling ? 0.7 : 0,
+          // Prism's checked 27B demo sampler: keep the experimental lane aligned
+          // with the model authors instead of letting low-bit greedy decode fall
+          // into exact repetition loops.
           ...(useExperimentalSampling ? { top_p: 0.95, top_k: 20, min_p: 0 } : {}),
-          ...(researchAtSend ? { repeat_penalty: 1.15, presence_penalty: 0.1 } : {}),
           // Gemma 4 may spend its first four tokens on a hidden channel
           // envelope before the first visible token. Keep at least that visible
           // floor, then apply the Ghost-only WebUI ceiling so the global 8,192
