@@ -246,6 +246,9 @@ pub struct Sandbox {
     root: PathBuf,
     allow_net: bool,
     shell_timeout: Duration,
+    /// User-facing undo snapshots. Disposable benchmark workspaces disable
+    /// these so adapter-owned state cannot contaminate repository scoring.
+    checkpoints_enabled: bool,
     /// OS-level confinement mode for `run_shell` (Task 1). Defaults to
     /// [`ShellSandbox::Sandboxed`]; production sets it from `--shell-sandbox`.
     shell_mode: ShellSandbox,
@@ -286,9 +289,20 @@ impl Sandbox {
             root,
             allow_net,
             shell_timeout,
+            checkpoints_enabled: true,
             shell_mode: ShellSandbox::default(),
             fs_unrestricted: false,
         })
+    }
+
+    /// Enable or disable user-facing undo snapshots for this sandbox.
+    pub fn with_checkpoints(mut self, enabled: bool) -> Self {
+        self.checkpoints_enabled = enabled;
+        self
+    }
+
+    pub fn checkpoints_enabled(&self) -> bool {
+        self.checkpoints_enabled
     }
 
     /// Set the `run_shell` confinement mode (defaults to sandboxed).
@@ -410,23 +424,35 @@ impl Sandbox {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolProfile {
     Full,
+    BenchmarkShared,
     WorkspaceReadOnly,
 }
 
 impl ToolProfile {
     pub fn allows(self, tool: &str) -> bool {
-        self == ToolProfile::Full
-            || (self == ToolProfile::WorkspaceReadOnly
-                && matches!(tool, "read_file" | "list_dir" | "search"))
+        match self {
+            ToolProfile::Full => true,
+            ToolProfile::BenchmarkShared => matches!(
+                tool,
+                "read_file" | "list_dir" | "search" | "write_file" | "edit_file" | "run_shell"
+            ),
+            ToolProfile::WorkspaceReadOnly => {
+                matches!(tool, "read_file" | "list_dir" | "search")
+            }
+        }
     }
 
     pub fn is_workspace(self) -> bool {
         self == Self::WorkspaceReadOnly
     }
 
+    pub fn is_benchmark_shared(self) -> bool {
+        self == Self::BenchmarkShared
+    }
+
     pub fn observation_limit(self) -> Option<usize> {
         match self {
-            Self::Full => None,
+            Self::Full | Self::BenchmarkShared => None,
             Self::WorkspaceReadOnly => Some(2 * 1024),
         }
     }
@@ -508,6 +534,10 @@ pub fn specs_for(profile: ToolProfile, allow_net: bool, shell_mode: ShellSandbox
             risk: Risk::Exec,
             params: json!({"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}),
         });
+    }
+    if profile == ToolProfile::BenchmarkShared {
+        tools.retain(|tool| profile.allows(&tool.name));
+        return tools;
     }
     if allow_net {
         tools.push(ToolSpec {
@@ -3523,6 +3553,27 @@ mod tests {
         .collect::<Vec<_>>();
         assert_eq!(read_only, vec!["read_file", "list_dir", "search"]);
         assert!(!ToolProfile::WorkspaceReadOnly.allows("write_file"));
+    }
+
+    #[test]
+    fn benchmark_profile_is_exactly_the_shared_task_tool_set() {
+        let shared = specs_for(ToolProfile::BenchmarkShared, true, ShellSandbox::Sandboxed)
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            shared,
+            vec![
+                "read_file",
+                "list_dir",
+                "search",
+                "write_file",
+                "edit_file",
+                "run_shell"
+            ]
+        );
+        assert!(!ToolProfile::BenchmarkShared.allows("update_plan"));
+        assert!(!ToolProfile::BenchmarkShared.allows("spawn_subagent"));
     }
 
     #[test]

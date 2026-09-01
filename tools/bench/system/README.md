@@ -11,8 +11,21 @@ overlays, and outside canary remain controller-owned. Package, fixture, scorer,
 and canary identities are checked before execution; task, fixture, and scorer
 identities are checked again after scoring.
 
+Phase 3 starts the native Camelid adapter around the shipped `camelid agent
+exec` CLI. The adapter verifies candidate/model bytes before materialization,
+reserves an ephemeral loopback address, constructs bounded shared-task flags,
+strips credentials and Camelid environment overrides, preserves exit `0/1/3`,
+kills the owned process tree on timeout, and invokes the independent scorer only
+after cleanup. Unattended execution requires an explicit disposable-boundary
+implementation; the production CLI exposes only WSL bubblewrap, with network
+unshared, Windows mounts absent, system/runtime/model read-only, and only the
+task attempt writable. Synthetic mode exists only inside canned tests.
+
 It does not set a regression threshold, run model-backed work in CI, compare
-external runtimes, execute either agent adapter, or create public evidence.
+external runtimes, execute a real model in hosted CI, or create public evidence.
+O9 is implemented through `agent exec --benchmark-events`: a create-new,
+secret-safe typed trace carries terminal state, per-step token/timing data, and
+hashed tool audit events. Human stderr is never parsed into evidence.
 
 ## Safety and validity
 
@@ -82,13 +95,43 @@ node tools/bench/system/cli.mjs task-materialize --task <task-dir> --workspace <
 node tools/bench/system/cli.mjs task-score --task <task-dir> --workspace <workspace> --out <score.json>
 ```
 
+Run one real native attempt only through the WSL bubblewrap boundary, score it,
+seal the local evidence bundle, verify checksums, and remove the disposable
+workspace after success:
+
+```sh
+node tools/bench/system/cli.mjs native-run \
+  --task <task-dir> --workspace <new-workspace> \
+  --binary <windows-visible-linux-binary> --linux-binary <linux-path> \
+  --model <windows-model> --linux-model <linux-path> \
+  --source-sha <sha> --campaign-id <id> --timeout-ms <ms> --out <bundle-dir> \
+  --wsl-gpu true --max-tokens-per-step 256
+```
+
+CPU remains the default. `--wsl-gpu true` adds only the WSL GPU device and
+driver-library search path to the otherwise unchanged network-unshared
+bubblewrap boundary, requires a successful in-boundary GPU preflight, and is
+recorded in `adapter.json` and `manifest.json`.
+
+`--max-tokens-per-step` may tighten but never exceed the task package's declared
+per-step ceiling. The effective value is recorded in the same evidence files.
+
+Trace-emitting disposable benchmark runs disable Camelid's user-facing undo
+checkpoints. Ordinary agent sessions retain checkpoints; benchmark bundles
+record `checkpoints_enabled: false` so strict repository scoring sees only task
+mutations rather than adapter-owned `.camelid/` state.
+
+The same path uses the recorded `benchmark_shared` tool profile: exactly
+`read_file`, `list_dir`, `search`, `write_file`, `edit_file`, and `run_shell`.
+Native-only planning, GUI, MCP, network, system-inspection, and subagent tools
+are neither advertised nor accepted for shared-task evidence.
+
 The workspace path must not already exist. This prevents materialization from
 overwriting an unrelated directory or a pre-existing canary.
 
-The initial task packages name Windows and Linux. Windows is verified locally;
-Linux requires the hosted validation-script run on the exact published head
-before publication claims it as proven. macOS remains unclaimed until the same
-model-free suite runs there. Phase 2 paths use forward slashes, are
+The initial task packages name Windows and Linux; exact-head hosted validation
+proves both. macOS remains unclaimed until the same model-free suite runs there.
+Phase 2 paths use forward slashes, are
 case-sensitive, and allow either an exact
 relative path or a trailing recursive `/**`. Parent traversal, absolute paths,
 backslashes, other wildcard forms, symlinks, special files, and case-folding
@@ -111,8 +154,10 @@ node tools/bench/system/test-cli.mjs
 node tools/bench/system/test-safety.mjs
 node tools/bench/test-v0.1-benchmark-harness.mjs
 node scripts/test-benchmark-system-phase2.mjs
+node scripts/test-benchmark-system-phase3.mjs
 ```
 
 The existing `validation-scripts` CI job runs the same set through
 `scripts/test-benchmark-system-phase1.mjs` and
-`scripts/test-benchmark-system-phase2.mjs`.
+`scripts/test-benchmark-system-phase2.mjs`. The model-free Phase 3 adapter test
+is discovered through `scripts/test-benchmark-system-phase3.mjs`.

@@ -9,15 +9,16 @@
 //! the redraw loop) is a documented follow-up. See `DECISIONS.md` D9.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs::OpenOptions;
 use std::io::Write;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use super::audit::{self, AuditEvent, AuditSink};
+use super::audit::{self, AuditEvent, AuditKind, AuditSink, InMemorySink};
 use super::banner;
 use super::client::{Client, StreamEnd};
 use super::session::{Session, CANCEL};
@@ -354,6 +355,7 @@ pub fn run_loop(
         BTreeSet::new()
     };
     let mut observed_workspace = false;
+    let mut observed_file_content = false;
     let mut workspace_observations: Vec<(String, String)> = Vec::new();
     let mut successful_workspace_reads = BTreeSet::new();
     let mut calibration: Option<f32> = None;
@@ -442,6 +444,16 @@ pub fn run_loop(
         }
         match step {
             ModelStep::Text(text) => {
+                if cfg.tool_profile.is_benchmark_shared() && !observed_file_content {
+                    reporter.notice("Shared benchmark requires file evidence before answering");
+                    history.push(AgentMsg::System(
+                        "Inspect the actual workspace before answering. Use list_dir to discover \
+                         paths, then read_file or search to observe relevant file content. Do not \
+                         invent paths or describe a fix without applying and verifying it."
+                            .into(),
+                    ));
+                    continue;
+                }
                 let missing_reads = required_workspace_reads
                     .difference(&successful_workspace_reads)
                     .cloned()
@@ -531,6 +543,23 @@ pub fn run_loop(
                     }
                     let signature = format!("{}::{}", call.name, call.args);
                     *ran.entry(call.name.clone()).or_insert(0) += 1;
+                    if cfg.tool_profile.is_benchmark_shared()
+                        && !observed_file_content
+                        && !matches!(call.name.as_str(), "read_file" | "list_dir" | "search")
+                    {
+                        reporter.tool_call(&format!("{}(?)", call.name));
+                        let outcome = ToolOutcome::Err(
+                            "shared benchmark requires a successful read_file or search before \
+                             mutation or command execution; discover paths with list_dir first"
+                                .into(),
+                        );
+                        reporter.tool_result(&call.name, &outcome);
+                        history.push(AgentMsg::ToolResult {
+                            name: call.name,
+                            outcome,
+                        });
+                        continue;
+                    }
                     // Validate against schema + sandbox. A bad/unknown/escape call
                     // becomes a tool-error result the model can recover from.
                     let action = match tools::validate_for(cfg.tool_profile, &call, sandbox) {
@@ -613,6 +642,23 @@ pub fn run_loop(
                         Some(max_bytes) => outcome.clipped(max_bytes),
                         None => outcome,
                     };
+                    let list_dir_file = match &action {
+                        Action::ListDir { path, .. } if path.is_file() => Some(path),
+                        _ => None,
+                    };
+                    let outcome = if cfg.tool_profile.is_benchmark_shared() && outcome.is_err() {
+                        if let Some(path) = list_dir_file {
+                            let relative = normalize_workspace_path(&sandbox.rel(path));
+                            ToolOutcome::Err(format!(
+                                "{relative} is a file, not a directory; call read_file with path \
+                                 `{relative}` to inspect its content"
+                            ))
+                        } else {
+                            outcome
+                        }
+                    } else {
+                        outcome
+                    };
                     if cfg.tool_profile.is_workspace() && !outcome.is_err() {
                         observed_workspace = true;
                         if let Action::ReadFile { path, .. } = &action {
@@ -621,6 +667,12 @@ pub fn run_loop(
                         }
                         workspace_observations
                             .push((action.tool_name().to_string(), outcome.text().to_string()));
+                    }
+                    if cfg.tool_profile.is_benchmark_shared() && !outcome.is_err() {
+                        observed_workspace = true;
+                        if matches!(action, Action::ReadFile { .. } | Action::Search { .. }) {
+                            observed_file_content = true;
+                        }
                     }
                     let name = action.tool_name();
                     reporter.tool_result(name, &outcome);
@@ -2448,8 +2500,9 @@ impl Approver for InlineApprover {
 pub fn run_exec(
     session: &mut Session,
     addr: SocketAddr,
-    cfg: AgentConfig,
+    mut cfg: AgentConfig,
     goal: &str,
+    benchmark_events: Option<&Path>,
 ) -> anyhow::Result<i32> {
     if !session.active_tool_capable() {
         eprintln!(
@@ -2476,7 +2529,13 @@ pub fn run_exec(
     };
     let sandbox = Sandbox::new(&cfg.workdir, cfg.allow_net, cfg.shell_timeout)?
         .with_shell_mode(cfg.shell_sandbox)
-        .with_fs_unrestricted(cfg.allow_fs);
+        .with_fs_unrestricted(cfg.allow_fs)
+        .with_checkpoints(benchmark_events.is_none());
+
+    let trace_audit = benchmark_events.map(|_| InMemorySink::default());
+    if let Some(sink) = &trace_audit {
+        cfg.audit = Box::new(sink.clone());
+    }
 
     let _subagent_session =
         super::subagent::configure_scoped(super::subagent::SubagentConfig::for_session(
@@ -2511,7 +2570,8 @@ pub fn run_exec(
     driver.set_delta_sink(Some(Box::new(|_| {})));
     // Progress narrates on stderr so stdout carries only the answer and can be
     // piped into something else.
-    let mut reporter = StderrReporter;
+    let started = Instant::now();
+    let mut reporter = ExecTraceReporter::default();
     let mut approver = super::subagent::NonInteractiveApprover;
 
     CANCEL.store(false, Ordering::SeqCst);
@@ -2530,6 +2590,21 @@ pub fn run_exec(
         Some(AgentMsg::Assistant(a)) => a.clone(),
         _ => String::new(),
     };
+    let outcome = RunOutcome::classify(&end);
+    if let Some(path) = benchmark_events {
+        let audit_events = trace_audit
+            .as_ref()
+            .map(InMemorySink::events)
+            .unwrap_or_default();
+        write_exec_trace(
+            path,
+            &end,
+            outcome,
+            started.elapsed(),
+            &reporter,
+            &audit_events,
+        )?;
+    }
     // stdout is reserved for the answer so a headless run can be piped; every
     // other outcome narrates on stderr. The exit code itself is not decided
     // here -- it comes from the shared `RunOutcome` classifier the subagent
@@ -2541,7 +2616,7 @@ pub fn run_exec(
         LoopEnd::Repeated => eprintln!("stopped — the model was repeating a failing call"),
         LoopEnd::Aborted => eprintln!("aborted"),
     }
-    Ok(RunOutcome::classify(&end).exit_code())
+    Ok(outcome.exit_code())
 }
 
 /// Clear the plan without importing the module at every call site.
@@ -2549,9 +2624,18 @@ fn plan_reset() {
     super::plan::clear();
 }
 
-/// Reporter for headless runs: everything to stderr, so stdout stays the answer.
-struct StderrReporter;
-impl Reporter for StderrReporter {
+/// Reporter for headless runs. Human progress stays on stderr; the optional
+/// benchmark trace retains only typed metrics and counters.
+#[derive(Default)]
+struct ExecTraceReporter {
+    pending_context: Option<Value>,
+    steps: Vec<Value>,
+    compactions: u64,
+    model_ms: u64,
+    output_tokens: Option<u64>,
+}
+
+impl Reporter for ExecTraceReporter {
     fn model_text(&mut self, _text: &str) {}
     fn tool_call(&mut self, line: &str) {
         eprintln!("  ▸ {line}");
@@ -2561,7 +2645,110 @@ impl Reporter for StderrReporter {
         eprintln!("  └ {name}: {tag}");
     }
     fn notice(&mut self, text: &str) {
+        if text.starts_with("compacted context:") {
+            self.compactions = self.compactions.saturating_add(1);
+        }
         eprintln!("· {text}");
+    }
+    fn context_budget(&mut self, usage: ContextBudgetUsage) {
+        self.pending_context = Some(context_budget_json(usage));
+    }
+    fn model_timing(&mut self, metrics: ModelStepMetrics) {
+        let index = self.steps.len();
+        self.model_ms = self.model_ms.saturating_add(metrics.total_ms);
+        self.output_tokens = match (index, self.output_tokens, metrics.output_tokens) {
+            (0, _, Some(tokens)) => Some(u64::from(tokens)),
+            (_, Some(total), Some(tokens)) => Some(total.saturating_add(u64::from(tokens))),
+            _ => None,
+        };
+        self.steps.push(json!({
+            "index": index,
+            "model_ms": metrics.total_ms,
+            "ttft_ms": metrics.ttft_ms,
+            "output_tokens": metrics.output_tokens,
+            "context": self.pending_context.take(),
+        }));
+    }
+}
+
+fn context_budget_json(usage: ContextBudgetUsage) -> Value {
+    json!({
+        "prompt_tokens": usage.prompt_tokens,
+        "generation_tokens": usage.generation_tokens,
+        "budget_tokens": usage.budget_tokens,
+        "system_tokens_estimate": usage.system_tokens_estimate,
+        "tool_definition_tokens_estimate": usage.tool_definition_tokens_estimate,
+        "message_tokens_estimate": usage.message_tokens_estimate,
+        "recent_memory_tokens_estimate": usage.recent_memory_tokens_estimate,
+        "retrieved_memory_tokens_estimate": usage.retrieved_memory_tokens_estimate,
+        "evidence_memory_tokens_estimate": usage.evidence_memory_tokens_estimate,
+        "tool_result_tokens_estimate": usage.tool_result_tokens_estimate,
+    })
+}
+
+fn write_exec_trace(
+    path: &Path,
+    end: &LoopEnd,
+    outcome: RunOutcome,
+    wall: Duration,
+    reporter: &ExecTraceReporter,
+    audit_events: &[AuditEvent],
+) -> anyhow::Result<()> {
+    let events = audit_events
+        .iter()
+        .map(|event| {
+            let mut value = event.to_json();
+            if let Some(object) = value.as_object_mut() {
+                object.remove("timestamp_unix_ms");
+            }
+            value
+        })
+        .collect::<Vec<_>>();
+    let tool_calls = audit_events
+        .iter()
+        .filter(|event| event.kind == AuditKind::ToolCall)
+        .count();
+    let tool_errors = events
+        .iter()
+        .filter(|event| {
+            event.get("event").and_then(Value::as_str) == Some("agent.tool_result")
+                && event.get("outcome").and_then(Value::as_str) == Some("error")
+        })
+        .count();
+    let (status, exit_code) = outcome.terminal_contract();
+    let trace = json!({
+        "schema": "camelid.agent-exec-trace/v1",
+        "terminal": {
+            "reason": loop_end_label(end),
+            "outcome": status,
+            "exit_code": exit_code,
+            "wall_ms": u64::try_from(wall.as_millis()).unwrap_or(u64::MAX),
+        },
+        "summary": {
+            "model_steps": reporter.steps.len(),
+            "tool_calls": tool_calls,
+            "tool_errors": tool_errors,
+            "compactions": reporter.compactions,
+            "model_ms": reporter.model_ms,
+            "output_tokens": reporter.output_tokens,
+        },
+        "steps": reporter.steps,
+        "audit_events": events,
+    });
+    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    serde_json::to_writer_pretty(&mut file, &trace)?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn loop_end_label(end: &LoopEnd) -> &'static str {
+    match end {
+        LoopEnd::Answered => "answered",
+        LoopEnd::Aborted => "aborted",
+        LoopEnd::StepCapped => "step_capped",
+        LoopEnd::Repeated => "repeated",
+        LoopEnd::DriverError => "driver_error",
     }
 }
 
@@ -3801,6 +3988,63 @@ mod tests {
         assert_eq!(reporter.text.len(), 1);
         assert!(reporter.text[0].contains("Found 1 Markdown file"));
         assert!(reporter.text[0].contains("- `README.md`"));
+    }
+
+    #[test]
+    fn benchmark_requires_file_evidence_before_mutation_or_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("src/pricing.cjs"),
+            "if (subtotalCents > 10000) return subtotalCents\n",
+        )
+        .unwrap();
+        let sandbox = Sandbox::new(dir.path(), false, Duration::from_secs(5)).unwrap();
+        let mut driver = MockDriver {
+            steps: vec![
+                ModelStep::Text("done without looking".into()),
+                ModelStep::Calls(vec![tc(
+                    "edit_file",
+                    json!({"path":"src/pricing.cjs","old":"> 10000","new":">= 10000"}),
+                )]),
+                ModelStep::Calls(vec![tc("list_dir", json!({"path":"."}))]),
+                ModelStep::Calls(vec![tc("list_dir", json!({"path":"src/pricing.cjs"}))]),
+                ModelStep::Calls(vec![tc("read_file", json!({"path":"src/pricing.cjs"}))]),
+                ModelStep::Calls(vec![tc(
+                    "edit_file",
+                    json!({"path":"src/pricing.cjs","old":"> 10000","new":">= 10000"}),
+                )]),
+                ModelStep::Text("fixed and verified".into()),
+            ],
+            idx: 0,
+        };
+        let mut approver = ScriptApprover(vec![Decision::Once], 0);
+        let mut reporter = RecordReporter::default();
+        let mut history = vec![AgentMsg::User("fix the discount boundary".into())];
+        let mut config = cfg(dir.path(), false);
+        config.tool_profile = tools::ToolProfile::BenchmarkShared;
+
+        let end = run_loop(
+            &mut driver,
+            &mut approver,
+            &mut reporter,
+            &sandbox,
+            &config,
+            &AtomicBool::new(false),
+            &mut Policy::default(),
+            &mut history,
+        );
+
+        assert_eq!(end, LoopEnd::Answered);
+        assert!(reporter.results[0].contains("requires a successful read_file"));
+        assert!(reporter
+            .results
+            .iter()
+            .any(|result| result.contains("call read_file with path `src/pricing.cjs`")));
+        assert_eq!(reporter.text, vec!["fixed and verified"]);
+        assert!(std::fs::read_to_string(dir.path().join("src/pricing.cjs"))
+            .unwrap()
+            .contains(">= 10000"));
     }
 
     #[test]
@@ -5296,6 +5540,70 @@ mod tests {
             assert_eq!(outcome.subagent_status(), status);
             assert_eq!(outcome.exit_code(), code);
         }
+    }
+
+    #[test]
+    fn exec_trace_is_typed_secret_safe_and_create_new() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trace.json");
+        let mut reporter = ExecTraceReporter::default();
+        reporter.context_budget(ContextBudgetUsage {
+            prompt_tokens: 100,
+            generation_tokens: 32,
+            budget_tokens: 4096,
+            system_tokens_estimate: 10,
+            tool_definition_tokens_estimate: 20,
+            message_tokens_estimate: 30,
+            recent_memory_tokens_estimate: 0,
+            retrieved_memory_tokens_estimate: 0,
+            evidence_memory_tokens_estimate: 0,
+            tool_result_tokens_estimate: 40,
+        });
+        reporter.model_timing(ModelStepMetrics {
+            total_ms: 20,
+            ttft_ms: Some(3),
+            output_tokens: Some(7),
+        });
+        reporter.notice("compacted context: 10 messages -> 5 (4 folded into a summary)");
+        let digest = audit::digest_args(&json!({"token":"secret-value"}));
+        let events = vec![
+            AuditEvent::call("read_file", "auto", digest.clone()),
+            AuditEvent::result(
+                "read_file",
+                "auto",
+                digest,
+                &ToolOutcome::Ok("secret tool output".into()),
+                Duration::from_millis(2),
+            ),
+        ];
+        write_exec_trace(
+            &path,
+            &LoopEnd::Answered,
+            RunOutcome::Completed,
+            Duration::from_millis(25),
+            &reporter,
+            &events,
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let trace: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(trace["terminal"]["reason"], "answered");
+        assert_eq!(trace["summary"]["model_steps"], 1);
+        assert_eq!(trace["summary"]["tool_calls"], 1);
+        assert_eq!(trace["summary"]["compactions"], 1);
+        assert_eq!(trace["summary"]["output_tokens"], 7);
+        assert!(!text.contains("secret-value"));
+        assert!(!text.contains("secret tool output"));
+        assert!(!text.contains("timestamp_unix_ms"));
+        assert!(write_exec_trace(
+            &path,
+            &LoopEnd::Answered,
+            RunOutcome::Completed,
+            Duration::from_millis(25),
+            &reporter,
+            &events,
+        )
+        .is_err());
     }
 
     /// `--yolo` is the one flag that hands an unattended process exec-tier
