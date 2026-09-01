@@ -67,11 +67,17 @@ fn serve_asset(path: &str) -> Option<Response> {
             (m.to_string(), bytes.into())
         } else {
             let asset = WebAssets::get(path)?;
-            (asset.metadata.mimetype().to_string(), axum::body::Bytes::copy_from_slice(&asset.data))
+            (
+                asset.metadata.mimetype().to_string(),
+                axum::body::Bytes::copy_from_slice(&asset.data),
+            )
         }
     } else {
         let asset = WebAssets::get(path)?;
-        (asset.metadata.mimetype().to_string(), axum::body::Bytes::copy_from_slice(&asset.data))
+        (
+            asset.metadata.mimetype().to_string(),
+            axum::body::Bytes::copy_from_slice(&asset.data),
+        )
     };
 
     let cache_control = if path.starts_with("assets/") {

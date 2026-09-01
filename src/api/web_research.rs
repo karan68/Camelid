@@ -1684,7 +1684,10 @@ fn clean_conversational_query(text: &str) -> String {
     if cleaned.starts_with('[') {
         if let Some(close_idx) = cleaned.find(']') {
             let after_bracket = cleaned[close_idx + 1..].trim();
-            let after_colon = after_bracket.strip_prefix(':').unwrap_or(after_bracket).trim();
+            let after_colon = after_bracket
+                .strip_prefix(':')
+                .unwrap_or(after_bracket)
+                .trim();
             if !after_colon.is_empty() {
                 cleaned = after_colon;
             }
@@ -1812,8 +1815,14 @@ fn clean_conversational_query(text: &str) -> String {
         }
     }
 
-    let mut trimmed = result.trim().trim_end_matches(&['?', '.', ',', '(', ')'][..]).trim().to_string();
-    if trimmed.eq_ignore_ascii_case("september 1, 2026") || trimmed.eq_ignore_ascii_case("september 1 2026") {
+    let mut trimmed = result
+        .trim()
+        .trim_end_matches(&['?', '.', ',', '(', ')'][..])
+        .trim()
+        .to_string();
+    if trimmed.eq_ignore_ascii_case("september 1, 2026")
+        || trimmed.eq_ignore_ascii_case("september 1 2026")
+    {
         trimmed = "September 1 2026 events".to_string();
     }
     if trimmed.is_empty() {
@@ -1900,7 +1909,11 @@ fn is_meta_instruction_line(line: &str) -> bool {
 
 fn search_queries_from_prompt(prompt: &str) -> Vec<String> {
     let mut queries = Vec::new();
-    let lines: Vec<&str> = prompt.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    let lines: Vec<&str> = prompt
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
 
     // If multi-line prompt, check for individual query lines
     if lines.len() > 1 {
@@ -1926,15 +1939,32 @@ fn search_queries_from_prompt(prompt: &str) -> Vec<String> {
 
 fn contains_temporal_metric(text: &str) -> bool {
     let temporal_words = [
-        "today", "tonight", "right now", "this week", "this month", "currently", "recently",
+        "today",
+        "tonight",
+        "right now",
+        "this week",
+        "this month",
+        "currently",
+        "recently",
         "yesterday",
     ];
     let metric_words = [
-        "news", "price", "prices", "stock", "stocks", "schedule", "schedules", "score", "scores",
-        "result", "results", "weather", "forecast", "temperature",
+        "news",
+        "price",
+        "prices",
+        "stock",
+        "stocks",
+        "schedule",
+        "schedules",
+        "score",
+        "scores",
+        "result",
+        "results",
+        "weather",
+        "forecast",
+        "temperature",
     ];
-    temporal_words.iter().any(|t| text.contains(t))
-        && metric_words.iter().any(|m| text.contains(m))
+    temporal_words.iter().any(|t| text.contains(t)) && metric_words.iter().any(|m| text.contains(m))
 }
 
 fn contains_version_query(text: &str) -> bool {
@@ -3511,7 +3541,13 @@ fn extract_weather_location(query: &str) -> Option<String> {
         return None;
     }
     let mut cleaned = lower;
-    for prefix in ["search the web", "search online", "web search", "look up", ":"] {
+    for prefix in [
+        "search the web",
+        "search online",
+        "web search",
+        "look up",
+        ":",
+    ] {
         cleaned = cleaned.replace(prefix, " ");
     }
     let words = cleaned
@@ -3520,12 +3556,58 @@ fn extract_weather_location(query: &str) -> Option<String> {
         .filter(|w| !w.is_empty())
         .collect::<Vec<_>>();
     let stop_words = [
-        "what", "whats", "what's", "is", "the", "weather", "like", "in", "for", "at", "today",
-        "now", "forecast", "current", "temperature", "temp", "please", "tell", "me", "about", "how",
-        "show", "give", "get", "check", "right", "conditions", "condition", "it", "outside", "this",
-        "afternoon", "morning", "evening", "night", "weekend", "tomorrow", "raining", "snowing",
-        "rain", "snow", "humidity", "wind",
-        "and", "of", "live", "physical", "observation", "sky", "degrees", "celsius", "fahrenheit",
+        "what",
+        "whats",
+        "what's",
+        "is",
+        "the",
+        "weather",
+        "like",
+        "in",
+        "for",
+        "at",
+        "today",
+        "now",
+        "forecast",
+        "current",
+        "temperature",
+        "temp",
+        "please",
+        "tell",
+        "me",
+        "about",
+        "how",
+        "show",
+        "give",
+        "get",
+        "check",
+        "right",
+        "conditions",
+        "condition",
+        "it",
+        "outside",
+        "this",
+        "afternoon",
+        "morning",
+        "evening",
+        "night",
+        "weekend",
+        "tomorrow",
+        "raining",
+        "snowing",
+        "rain",
+        "snow",
+        "humidity",
+        "wind",
+        "and",
+        "of",
+        "live",
+        "physical",
+        "observation",
+        "sky",
+        "degrees",
+        "celsius",
+        "fahrenheit",
     ];
     let loc_words = words
         .into_iter()
@@ -3607,7 +3689,9 @@ fn fetch_live_weather(transport: &dyn WebTransport, location: &str) -> Option<We
 }
 
 fn is_undesirable_search_domain(url: &Url) -> bool {
-    let Some(host) = url.host_str() else { return false; };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
     let lower = host.to_ascii_lowercase();
     let undesirable = [
         "youtube.com",
@@ -3621,7 +3705,9 @@ fn is_undesirable_search_domain(url: &Url) -> bool {
         "zhihu.com",
         "quora.com",
     ];
-    undesirable.iter().any(|domain| lower == *domain || lower.ends_with(&format!(".{domain}")))
+    undesirable
+        .iter()
+        .any(|domain| lower == *domain || lower.ends_with(&format!(".{domain}")))
 }
 
 fn is_date_or_time_query(query: &str) -> bool {
@@ -3657,7 +3743,14 @@ fn is_date_or_time_query(query: &str) -> bool {
 fn format_tm(tm: &libc::tm, fmt_str: &str) -> String {
     let mut buf = [0u8; 64];
     let fmt = std::ffi::CString::new(fmt_str).unwrap();
-    let len = unsafe { libc::strftime(buf.as_mut_ptr() as *mut libc::c_char, buf.len(), fmt.as_ptr(), tm) };
+    let len = unsafe {
+        libc::strftime(
+            buf.as_mut_ptr() as *mut libc::c_char,
+            buf.len(),
+            fmt.as_ptr(),
+            tm,
+        )
+    };
     std::str::from_utf8(&buf[..len]).unwrap_or("").to_string()
 }
 
@@ -4304,7 +4397,9 @@ fn clean_plain_text(value: &str) -> String {
 
 fn strip_html(value: &str) -> String {
     let mut cleaned = remove_html_element(value, "script");
-    for tag in ["style", "nav", "footer", "header", "aside", "svg", "form", "noscript"] {
+    for tag in [
+        "style", "nav", "footer", "header", "aside", "svg", "form", "noscript",
+    ] {
         cleaned = remove_html_element(&cleaned, tag);
     }
     let mut text = String::with_capacity(cleaned.len());
@@ -4358,7 +4453,9 @@ fn extract_meta_description(html: &str) -> Option<String> {
         "property=\"og:description\"",
         "property='og:description'",
     ] {
-        let Some(pos) = lower.find(marker) else { continue };
+        let Some(pos) = lower.find(marker) else {
+            continue;
+        };
         let tag_start = lower[..pos].rfind("<meta")?;
         let tag_end = tag_start + lower[tag_start..].find('>')?;
         let tag = &html[tag_start..=tag_end];
@@ -4837,8 +4934,7 @@ fn curl_single_hop(
     if reached_output_limit {
         output.truncate(MAX_HTTP_HEADER_BYTES + MAX_HTTP_BODY_BYTES);
     }
-    if !status.success()
-        && !(reached_output_limit && matches!(status.code(), Some(23) | Some(141)))
+    if !status.success() && !(reached_output_limit && matches!(status.code(), Some(23) | Some(141)))
     {
         let detail = String::from_utf8_lossy(&diagnostics);
         return Err(if detail.trim().is_empty() {
@@ -7154,16 +7250,17 @@ mod tests {
         "#;
         let response = FetchResponse::text(200, "text/html", html);
         let excerpt = response_excerpt(&response).unwrap();
-        assert!(excerpt.starts_with("Overview: A comprehensive guide to concurrency in modern Rust."));
+        assert!(
+            excerpt.starts_with("Overview: A comprehensive guide to concurrency in modern Rust.")
+        );
         assert!(excerpt.contains("Rust makes writing multi-threaded code"));
     }
 
     #[test]
     fn large_body_is_truncated_gracefully_without_erroring() {
         let large_content = "X".repeat(MAX_HTTP_BODY_BYTES + 500_000);
-        let response_bytes = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n{large_content}"
-        );
+        let response_bytes =
+            format!("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n{large_content}");
         let parsed = parse_curl_response(response_bytes.as_bytes()).unwrap();
         assert_eq!(parsed.status, 200);
         assert_eq!(parsed.body.len(), MAX_HTTP_BODY_BYTES);

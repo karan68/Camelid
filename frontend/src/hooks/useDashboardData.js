@@ -1470,7 +1470,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
           // runnable lane is explicitly greedy even while its row is experimental.
           // When web research is active, apply a mild temperature and repeat penalty
           // to prevent small models from degenerating into repetitive n-gram loops on long outputs.
-          temperature: useExperimentalSampling ? 0.7 : (researchAtSend ? 0.2 : 0),
+          temperature: useExperimentalSampling ? 0.7 : 0,
           ...(useExperimentalSampling ? { top_p: 0.95, top_k: 20, min_p: 0 } : {}),
           ...(researchAtSend ? { repeat_penalty: 1.15, presence_penalty: 0.1 } : {}),
           // Gemma 4 may spend its first four tokens on a hidden channel
