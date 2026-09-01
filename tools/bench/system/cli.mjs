@@ -6,9 +6,11 @@ import { fileURLToPath } from 'node:url'
 import {
   writeBenchmarkBundle,
   writeNativeAgentBundle,
+  writePiAgentBundle,
   verifyBundleChecksums,
 } from './bundle.mjs'
 import { runNativeAgentAttempt } from './adapters/native-camelid.mjs'
+import { PI_SANDBOX_BASE_URL, runPiAgentAttempt } from './adapters/pi-agent.mjs'
 import { controllerManifest } from './lib/controller-manifest.mjs'
 import { canonicalJson } from './lib/digest.mjs'
 import { acquireCampaignLock, assertMinimumFreeDisk } from './lib/safety.mjs'
@@ -154,6 +156,43 @@ try {
     console.log(`outcome=${result.attempt.score.outcome}`)
     console.log(`terminal=${result.attempt.terminal.class}`)
     if (!result.attempt.score.outcome.startsWith('PASS_')) process.exitCode = 1
+  } else if (command === 'pi-run') {
+    const workspaceRoot = resolve(requiredValue(args, 'workspace'))
+    const outputDir = resolve(requiredValue(args, 'out'))
+    if (workspaceRoot === outputDir) throw new Error('--workspace and --out must be different paths')
+    const result = await runPiAgentAttempt({
+      taskRoot: resolve(requiredValue(args, 'task')),
+      workspaceRoot,
+      piArchivePath: resolve(requiredValue(args, 'pi-archive')),
+      piExecutablePath: resolve(requiredValue(args, 'pi')),
+      binaryPath: resolve(requiredValue(args, 'binary')),
+      modelPath: resolve(requiredValue(args, 'model')),
+      modelId: requiredValue(args, 'model-id'),
+      baseUrl: PI_SANDBOX_BASE_URL,
+      contextWindow: integerValue(args, 'context-window', null, false),
+      campaignId: requiredValue(args, 'campaign-id'),
+      sourceSha: requiredValue(args, 'source-sha'),
+      attempt: integerValue(args, 'attempt', 0, true),
+      timeoutMs: integerValue(args, 'timeout-ms', null, false),
+      maxOutputTokensPerStep: optionalIntegerValue(args, 'max-tokens-per-step'),
+      boundary: {
+        kind: 'wsl-bwrap',
+        distribution: args.values.get('wsl-distribution') ?? 'Ubuntu',
+        linuxPiDirPath: requiredValue(args, 'linux-pi-dir'),
+        linuxPiArchivePath: requiredValue(args, 'linux-pi-archive'),
+        linuxBinaryPath: requiredValue(args, 'linux-binary'),
+        linuxModelPath: requiredValue(args, 'linux-model'),
+        gpuEnabled: booleanValue(args, 'wsl-gpu', false),
+      },
+    })
+    const bundle = await writePiAgentBundle({ outputDir, result })
+    const verification = await verifyBundleChecksums(outputDir)
+    if (!verification.ok) throw new Error(`Pi bundle checksum verification failed: ${verification.failures.join('; ')}`)
+    await rm(workspaceRoot, { recursive: true, force: true })
+    console.log(`bundle_dir=${bundle.outputDir}`)
+    console.log(`outcome=${result.attempt.score.outcome}`)
+    console.log(`terminal=${result.attempt.terminal.class}`)
+    if (!result.attempt.score.outcome.startsWith('PASS_')) process.exitCode = 1
   } else {
     process.stdout.write(usage())
     process.exitCode = command ? 2 : 0
@@ -282,5 +321,6 @@ function usage() {
     `  node tools/bench/system/cli.mjs task-verify --task <task-dir>\n` +
     `  node tools/bench/system/cli.mjs task-materialize --task <task-dir> --workspace <new-workspace>\n` +
     `  node tools/bench/system/cli.mjs task-score --task <task-dir> --workspace <workspace> [--out <score.json>]\n` +
-    `  node tools/bench/system/cli.mjs native-run --task <task-dir> --workspace <new-workspace> --binary <windows-visible-linux-binary> --linux-binary <linux-path> --model <windows-model> --linux-model <linux-path> --source-sha <sha> --campaign-id <id> --timeout-ms <ms> --out <bundle-dir> [--wsl-gpu <true|false>] [--max-tokens-per-step <n>]\n`
+    `  node tools/bench/system/cli.mjs native-run --task <task-dir> --workspace <new-workspace> --binary <windows-visible-linux-binary> --linux-binary <linux-path> --model <windows-model> --linux-model <linux-path> --source-sha <sha> --campaign-id <id> --timeout-ms <ms> --out <bundle-dir> [--wsl-gpu <true|false>] [--max-tokens-per-step <n>]\n` +
+    `  node tools/bench/system/cli.mjs pi-run --task <task-dir> --workspace <new-workspace> --pi-archive <windows-archive> --pi <windows-visible-linux-pi> --linux-pi-archive <linux-path> --linux-pi-dir <linux-dir> --binary <windows-visible-linux-binary> --linux-binary <linux-path> --model <windows-model> --linux-model <linux-path> --model-id <exact-id> --context-window <tokens> --source-sha <sha> --campaign-id <id> --timeout-ms <ms> --out <bundle-dir> [--wsl-gpu <true|false>] [--max-tokens-per-step <n>]\n`
 }

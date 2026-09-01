@@ -27,6 +27,22 @@ O9 is implemented through `agent exec --benchmark-events`: a create-new,
 secret-safe typed trace carries terminal state, per-step token/timing data, and
 hashed tool audit events. Human stderr is never parsed into evidence.
 
+Phase 4 pins Pi `0.84.3` by release archive hash and source commit. The Pi
+adapter verifies the archive, extracted Pi executable, Camelid binary, and
+model through both Windows-visible and WSL paths before task materialization.
+Pi and Camelid then run as siblings inside one network-unshared bubblewrap
+namespace. Pi receives an isolated ephemeral config/home, no session, no
+project trust, no context/resource discovery, offline startup, and an exact
+shared-tool allowlist. Pi JSON stream v3 is parsed from full stdout after both
+processes are terminal; repository scoring remains independent of final prose.
+The checked compatibility fixture records the real pinned release sending
+`max_tokens`, SSE usage frames, non-strict function tools, and a nameless tool
+result continuation. `developer`, `max_completion_tokens`, `reasoning_effort`,
+`store`, strict tools, and grammar tools remain explicitly unqualified.
+The only explicit extension is controller-owned and provider-scoped: it maps
+Camelid's typed prompt-limit error to Pi's documented
+`context_length_exceeded` marker. Extension discovery remains disabled.
+
 ## Safety and validity
 
 - Source SHAs, `Cargo.lock`, model bytes, prompt bytes, and built binaries are
@@ -108,6 +124,36 @@ node tools/bench/system/cli.mjs native-run \
   --wsl-gpu true --max-tokens-per-step 256
 ```
 
+Run one pinned Pi attempt through the same task/scorer and WSL boundary. The
+release archive, extracted executable, Camelid binary, model, exact served
+model ID, and context window are all explicit inputs:
+
+```sh
+node tools/bench/system/cli.mjs pi-run \
+  --task <task-dir> --workspace <new-workspace> --out <bundle-dir> \
+  --pi-archive <windows-archive> --pi <windows-visible-linux-pi> \
+  --linux-pi-archive <linux-archive> --linux-pi-dir <linux-pi-dir> \
+  --binary <windows-visible-linux-camelid> --linux-binary <linux-camelid> \
+  --model <windows-model> --linux-model <linux-model> \
+  --model-id <exact-served-id> --context-window <tokens> \
+  --source-sha <sha> --campaign-id <id> --timeout-ms <ms> \
+  --wsl-gpu true --max-tokens-per-step 256
+```
+
+`pi-run` writes and independently verifies a sealed local bundle before it
+removes the disposable workspace. A failed scorer or model outcome is retained
+as evidence and returns nonzero; it is never retried until it passes.
+
+Pi's named `find` and `grep` tools are not advertised because the pinned release
+implements them through `fd` and `rg`, which are absent and cannot be downloaded
+inside the offline boundary. The allowed `bash` tool retains search capability
+through preflight-verified `/usr/bin/find` and `/usr/bin/grep`.
+
+The controller appends task-independent benchmark workflow rules to Pi's stock
+system prompt: inspect and read before editing, never invent workspace facts,
+recover from tool errors, verify changes, and continue until done or genuinely
+blocked. The appended text contains no task path, source text, or expected answer.
+
 CPU remains the default. `--wsl-gpu true` adds only the WSL GPU device and
 driver-library search path to the otherwise unchanged network-unshared
 bubblewrap boundary, requires a successful in-boundary GPU preflight, and is
@@ -151,13 +197,22 @@ node tools/bench/system/test-process-runner.mjs
 node tools/bench/system/test-runtime-adapter.mjs
 node tools/bench/system/test-bundle.mjs
 node tools/bench/system/test-cli.mjs
+node tools/bench/system/test-pi-contract.mjs
+node tools/bench/system/test-pi-openai-contract.mjs
+node tools/bench/system/test-pi-provider-extension.mjs
+node tools/bench/system/test-pi-adapter.mjs
+node tools/bench/system/test-pi-bundle.mjs
+node tools/bench/system/test-pi-cli.mjs
 node tools/bench/system/test-safety.mjs
 node tools/bench/test-v0.1-benchmark-harness.mjs
 node scripts/test-benchmark-system-phase2.mjs
 node scripts/test-benchmark-system-phase3.mjs
+node scripts/test-benchmark-system-phase4.mjs
 ```
 
 The existing `validation-scripts` CI job runs the same set through
 `scripts/test-benchmark-system-phase1.mjs` and
 `scripts/test-benchmark-system-phase2.mjs`. The model-free Phase 3 adapter test
-is discovered through `scripts/test-benchmark-system-phase3.mjs`.
+is discovered through `scripts/test-benchmark-system-phase3.mjs`; the Phase 4
+Pi contract, provider extension, adapter, bundle, and CLI tests are grouped by
+`scripts/test-benchmark-system-phase4.mjs`.
