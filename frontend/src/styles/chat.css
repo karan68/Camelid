@@ -94,8 +94,14 @@
 /* ---- Turns ---- */
 .cxturn { display: flex; gap: var(--space-3); animation: camelidFadeInUp var(--dur-base) var(--ease-standard); }
 .cxturn--user { justify-content: flex-end; }
-.cxturn__user-chip {
+.cxturn__user-wrapper {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
   max-width: 80%;
+}
+.cxturn__user-chip {
+  max-width: 100%;
   padding: var(--space-3) var(--space-4);
   border-radius: var(--radius-lg) var(--radius-lg) var(--radius-sm) var(--radius-lg);
   background: var(--color-user-chip);
@@ -178,6 +184,7 @@
   font-family: var(--font-mono);
   font-size: var(--text-2xs);
   color: var(--color-text-faint);
+  margin-right: 2px;
 }
 .cxturn__action {
   display: inline-flex;
@@ -188,8 +195,37 @@
   color: var(--color-text-muted);
   font-size: var(--text-xs);
   font-weight: 500;
+  border: none;
+  background: transparent;
+  cursor: pointer;
 }
 .cxturn__action:hover { background: var(--color-surface-hover); color: var(--color-text); }
+.cxturn__action--icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border-radius: var(--radius-md);
+  color: var(--color-text-muted);
+  cursor: pointer;
+  border: none;
+  background: transparent;
+  transition: background var(--dur-fast) var(--ease-standard),
+              color var(--dur-fast) var(--ease-standard),
+              transform var(--dur-fast) var(--ease-standard);
+}
+.cxturn__action--icon:hover {
+  background: var(--color-surface-hover);
+  color: var(--color-text);
+}
+.cxturn__action--icon:active {
+  transform: scale(0.92);
+}
+.cxturn__action--icon.is-copied {
+  color: var(--color-accent-text);
+}
 
 /* ---- Assistant markdown content ---- */
 .cxturn__body .message-markdown { color: var(--color-text); font-size: var(--text-md); line-height: var(--leading-relaxed); }
@@ -492,7 +528,7 @@
 
 @media (max-width: 860px) {
   .cxchat__suggestions { grid-template-columns: 1fr; }
-  .cxturn__user-chip { max-width: 90%; }
+  .cxturn__user-wrapper { max-width: 90%; }
 }
 
 /* Narrow composer: the labeled toolbar buttons collapse to icon-only (their
@@ -594,9 +630,20 @@
 
 /* ---- User-row edit & resend (Phase 2) ---- */
 .cxturn--user { position: relative; }
-.cxturn__actions--user { justify-content: flex-end; opacity: 0; transition: opacity var(--dur-fast) var(--ease-standard); }
+.cxturn__actions--user {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  margin-top: 4px;
+  justify-content: flex-end;
+  opacity: 0;
+  transition: opacity var(--dur-fast) var(--ease-standard);
+}
 .cxturn--user:hover .cxturn__actions--user,
 .cxturn--user:focus-within .cxturn__actions--user { opacity: 1; }
+@media (hover: none) {
+  .cxturn__actions--user { opacity: 0.85; }
+}
 .cxturn__edit { display: flex; flex-direction: column; gap: var(--space-2); min-width: min(480px, 70vw); }
 .cxturn__edit-input {
   width: 100%;
