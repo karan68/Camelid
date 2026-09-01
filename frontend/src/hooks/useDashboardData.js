@@ -254,15 +254,6 @@ function getConfiguredSystemPrompt() {
 function applyLocalChatPolicy(messages) {
   const lastUser = [...(messages || [])].reverse().find((message) => message.role === 'user')
   const systemMessages = []
-
-  // Always anchor local chat with the real-world current date and time
-  if (typeof window !== 'undefined') {
-    const now = new Date()
-    const dateStr = now.toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })
-    const timeStr = now.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })
-    systemMessages.push({ role: 'system', content: `Current date: ${dateStr}. Current local time: ${timeStr}.` })
-  }
-
   // User-configured system prompt (Generation controls drawer) leads; the
   // code-first policy prompt appends behind it when the prompt looks code-y.
   const configuredPrompt = getConfiguredSystemPrompt()
