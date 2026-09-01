@@ -13598,7 +13598,7 @@ fn build_resident_cuda_engine(
             return None;
         }
     }
-    let mut engine = crate::cuda_resident::CudaResidentDecode::new_with_kv_quant(
+    let mut engine = match crate::cuda_resident::CudaResidentDecode::new_with_kv_quant(
         n_layers,
         n_heads,
         n_kv,
@@ -13611,8 +13611,13 @@ fn build_resident_cuda_engine(
         rms_eps,
         split_half_pairing,
         kv_quant,
-    )
-    .ok()?;
+    ) {
+        Ok(engine) => engine,
+        Err(err) => {
+            eprintln!("[resident-cuda] new_with_kv_quant failed: {err}");
+            return None;
+        }
+    };
     for (idx, l) in weights.layers[range.clone()].iter().enumerate() {
         let (q, k, v, o, gate, up, down) = match (
             raw(&l.attention_q),
@@ -13626,7 +13631,10 @@ fn build_resident_cuda_engine(
             (Some(q), Some(k), Some(v), Some(o), Some(g), Some(u), Some(d)) => {
                 (q, k, v, o, g, u, d)
             }
-            _ => return None,
+            _ => {
+                eprintln!("[resident-cuda] layer {idx} raw weight extraction failed");
+                return None;
+            }
         };
         // Per-projection quant lanes (q,k,v,o,gate,up,down) ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â drives the per-tensor
         // repack + GEMV kernel + activation quantizer. Q4_K_M is mixed: most

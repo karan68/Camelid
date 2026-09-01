@@ -8383,13 +8383,16 @@ impl CudaResidentKernels {
             .filter_map(std::env::var_os)
             .map(std::path::PathBuf::from)
             .map(|root| root.join("include"))
-            .chain([std::path::PathBuf::from("/usr/local/cuda/include")])
+            .chain([
+                std::path::PathBuf::from("/usr/local/cuda/include"),
+                std::path::PathBuf::from("/usr/include"),
+            ])
             .find(|include| include.join("mma.h").is_file());
         let tensor_core_q1 =
             (cc_major > 7 || (cc_major == 7 && cc_minor >= 5)) && cuda_include.is_some();
         let binary_tensor_core_q1 = cc_major >= 8;
         let mut include_paths = Vec::new();
-        let mut options = Vec::new();
+        let mut options = vec!["--std=c++17".to_string()];
         if let Some(include) = cuda_include {
             include_paths.push(include.to_string_lossy().into_owned());
             options.push("-DCAMELID_HAS_WMMA=1".to_string());
@@ -14932,12 +14935,6 @@ impl CudaResidentDecode {
     /// a device shows a sustained gain over the mature serial GEMVs.
     pub fn prefers_batched_prefill(&self) -> bool {
         self.supports_batched_prefill()
-            && self.layers.iter().all(|layer| {
-                layer
-                    .quants
-                    .iter()
-                    .all(|q| matches!(q, ProjQuant::Q8_0 | ProjQuant::Q1_0))
-            })
     }
 
     /// Whether linear speculative verification can use the batched stack,
