@@ -1,0 +1,52 @@
+{
+    "label":  "no-forced-tier",
+    "coldCache":  false,
+    "maxTokens":  8,
+    "expertCacheMib":  64,
+    "rows":  [
+                 {
+                     "Case":  "tiny",
+                     "Rep":  1,
+                     "PreTempC":  51,
+                     "PromptTokens":  32,
+                     "PrefillSec":  4.94,
+                     "PrefillTokPerSec":  6.48,
+                     "Misses":  2281,
+                     "MissesPerToken":  71.3,
+                     "Log":  ".\\qa\\perf\\receipts\\prefill-no-forced-tier-tiny-1.log"
+                 },
+                 {
+                     "Case":  "small",
+                     "Rep":  1,
+                     "PreTempC":  52,
+                     "PromptTokens":  92,
+                     "PrefillSec":  6.77,
+                     "PrefillTokPerSec":  13.59,
+                     "Misses":  2785,
+                     "MissesPerToken":  30.3,
+                     "Log":  ".\\qa\\perf\\receipts\\prefill-no-forced-tier-small-1.log"
+                 },
+                 {
+                     "Case":  "medium",
+                     "Rep":  1,
+                     "PreTempC":  52,
+                     "PromptTokens":  362,
+                     "PrefillSec":  14.86,
+                     "PrefillTokPerSec":  24.35,
+                     "Misses":  3353,
+                     "MissesPerToken":  9.3,
+                     "Log":  ".\\qa\\perf\\receipts\\prefill-no-forced-tier-medium-1.log"
+                 },
+                 {
+                     "Case":  "large",
+                     "Rep":  1,
+                     "PreTempC":  52,
+                     "PromptTokens":  1442,
+                     "PrefillSec":  66.2,
+                     "PrefillTokPerSec":  21.78,
+                     "Misses":  8412,
+                     "MissesPerToken":  5.8,
+                     "Log":  ".\\qa\\perf\\receipts\\prefill-no-forced-tier-large-1.log"
+                 }
+             ]
+}

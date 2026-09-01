@@ -1025,6 +1025,45 @@ pub fn gemma4_cuda_lane_selectable() -> bool {
     cuda_resident_decode_will_run()
 }
 
+/// Whether the qwen35 serve lane should run on the CUDA-resident engine.
+///
+/// **Default ON** where a CUDA device is actually driving this process; opt out
+/// with `CAMELID_QWEN35_CUDA=0` (0/off/false/no/disabled). It used to be opt-IN
+/// for every row except Prism low-bit on Windows, which is the gemma4 Phase 0
+/// finding wearing different clothes: the certified Ornith K-quant rows decoded
+/// on the CPU out of the box on a CUDA host — `select_kquant_plan` advertised
+/// `cuda_resident_kquant_runtime` off `platform.cuda_resident_active` while
+/// `generate_qwen35_streaming` read `CAMELID_QWEN35_CUDA` itself and fell to the
+/// CPU runnable lane, because the two consulted different things.
+///
+/// This is the POLICY half only. It says nothing about whether a given file
+/// FITS: capacity is enforced per request by `qwen35_generation_budget` against
+/// `CAMELID_QWEN35_CUDA_MAXPOS`, and every CUDA error raised before a token is
+/// emitted falls back to the CPU oracle (`qwen35_cuda_with_cpu_fallback`).
+///
+/// `--gpu off` and the UI's live toggle stay authoritative: they clear
+/// `gpu_accel_enabled`, which `cuda_resident_decode_will_run` requires. An
+/// explicit `CAMELID_QWEN35_CUDA=1` is an opt-IN to this lane, never an override
+/// of that master switch.
+///
+/// The default flips only on Windows, which is where the qwen35 CUDA lane
+/// carries receipts (the Ornith Q4_K_M parity + agent-eval PASS receipts, and
+/// the Prism Windows CUDA branch this predicate replaces). Other CUDA hosts keep
+/// the historical opt-in until the same evidence exists for them, so this change
+/// cannot alter a platform it has not been measured on.
+pub fn qwen35_cuda_lane_selectable() -> bool {
+    if matches!(requested_profile().0, ExecutionProfile::Safe) {
+        return false;
+    }
+    if env_flag_disabled("CAMELID_QWEN35_CUDA") {
+        return false;
+    }
+    if !cfg!(windows) && !env_flag_enabled("CAMELID_QWEN35_CUDA") {
+        return false;
+    }
+    cuda_resident_decode_will_run()
+}
+
 /// Everything the gemma4 CUDA-resident lane puts in VRAM BESIDES the per-layer
 /// projections: the small per-layer norms, the f16 KV cache at the load site's
 /// 4096-position window, the GPU tied head, the GPU PLE context projection, and
@@ -1180,23 +1219,37 @@ pub fn gemma4_cuda_lane_admitted(gguf: &GgufFile) -> Result<(), String> {
 ///   parity test, but no gemma4 ROW has an end-to-end receipt on this lane. Kernel
 ///   parity is not row parity — that gap is exactly what the Q4_0 mis-decode was
 ///   (`q4_0_gemv` had a passing kernel parity test the whole time it shipped garbage).
-/// - **K-quant projections (Q4_K/Q5_K/Q6_K).** The CPU wire lane serves them and
+/// - **K-quant projections (Q4_K/Q5_K).** The CPU wire lane serves them and
 ///   `nvfp4_cuda_lane_check` refuses them at load. Declining HERE too is what makes
 ///   the disclosure honest: an E4B Q4_K_M row has a Q8_0 `token_embd`, so the old
 ///   any-Q8_0-tensor test admitted it, the plan printed `gemma4_cuda_resident_runtime`,
 ///   and the load site then refused and served on the CPU — the D20 defect this
 ///   predicate exists to prevent.
+/// - **Q2_K.** Declined on a NEGATIVE receipt, not merely a missing one:
+///   `gemma-4-26B-mixq2k-it` requantised the routed experts to Q2_K and decoded
+///   degenerate output on all three A/B prompts, at 14.89 tok/s (`qa/perf/HANDOFF.md`
+///   §5). Note `gemma4_projection_tensors` includes `ffn_gate_up_exps`/`ffn_down_exps`,
+///   so admitting Q2_K here would admit exactly the tensors that were measured bad.
+///
+/// **Q6_K is the one K-quant admitted**, because the 26B-A4B ghost row forces the
+/// question rather than because the format is trusted in general.
+/// `google_gemma-4-26B-A4B-it-Q4_0.gguf` is a MIXED export: 14 of its 30
+/// `attn_q.weight` tensors are Q6_K and the other 16 are Q4_0, `ffn_down` is 27×Q4_0
+/// plus 3×Q4_1, and `ffn_down_exps` is 23×Q4_0 plus 7×Q4_1. Declining Q6_K declines
+/// the row this lane exists to serve. The admission is scoped to that evidence: it
+/// says Q6_K appears in a receipted row, NOT that a Q6_K-throughout row is receipted.
 fn gemma4_projection_quant_admitted(gguf: &GgufFile) -> Result<(), String> {
-    const RECEIPTED_PROJECTION_FORMATS: [GgufTensorType; 3] = [
+    const RECEIPTED_PROJECTION_FORMATS: [GgufTensorType; 4] = [
         GgufTensorType::Q8_0,
         GgufTensorType::Q4_0,
         GgufTensorType::Q4_1,
+        GgufTensorType::Q6K,
     ];
     match gemma4_projection_tensors(gguf)
         .find(|t| !RECEIPTED_PROJECTION_FORMATS.contains(&t.tensor_type))
     {
         Some(t) => Err(format!(
-            "gemma4 CUDA-resident decode has a greedy-parity receipt for Q8_0/Q4_0/Q4_1 layer \
+            "gemma4 CUDA-resident decode has a greedy-parity receipt for Q8_0/Q4_0/Q4_1/Q6_K layer \
              projections; this row is {} and carries {} as {:?}, which has no parity receipt on \
              this lane (the CPU gemma4 runtime serves it correctly)",
             quant_type(gguf),
@@ -2562,6 +2615,57 @@ mod tests {
         env::remove_var("CAMELID_LFM2_METAL");
     }
 
+    /// The qwen35 CUDA lane must ROUTE where the plan DISCLOSES it.
+    /// `select_kquant_plan` advertises `cuda_resident_kquant_runtime` off
+    /// `platform.cuda_resident_active` alone, but routing additionally required the
+    /// output tensor to be a Prism low-bit quant — so a certified Ornith Q4_K_M row
+    /// (qwen35) reported the CUDA lane in `/v1/health` and decoded on the CPU.
+    /// Measured on an RTX 3060 Laptop: 0.42 tok/s served, 6.14 tok/s once the lane
+    /// was reachable, same row, same host.
+    ///
+    /// Pins the two halves to one predicate: with no operator opt-out, Windows
+    /// routing tracks `cuda_resident_decode_will_run` exactly — the same signal the
+    /// plan reads — for every qwen35 row, Prism or K-quant.
+    #[test]
+    fn qwen35_cuda_routing_tracks_the_disclosed_resident_lane() {
+        let _guard = crate::test_support::env_lock();
+        env::remove_var("CAMELID_QWEN35_CUDA");
+        env::remove_var("CAMELID_PROFILE");
+        env::remove_var("CAMELID_DETERMINISTIC");
+
+        if cfg!(windows) {
+            assert_eq!(
+                qwen35_cuda_lane_selectable(),
+                cuda_resident_decode_will_run(),
+                "with no opt-out, routing must follow the same signal the plan discloses \
+                 — not a per-row quant test the plan never applied"
+            );
+        }
+
+        env::set_var("CAMELID_QWEN35_CUDA", "0");
+        assert!(
+            !qwen35_cuda_lane_selectable(),
+            "an explicit opt-out must still pin the CPU oracle"
+        );
+
+        env::set_var("CAMELID_QWEN35_CUDA", "1");
+        env::set_var("CAMELID_PROFILE", "safe");
+        assert!(
+            !qwen35_cuda_lane_selectable(),
+            "safe profile must beat an explicit opt-in"
+        );
+        env::remove_var("CAMELID_PROFILE");
+
+        env::set_var("CAMELID_DETERMINISTIC", "1");
+        assert!(
+            !qwen35_cuda_lane_selectable(),
+            "deterministic mode must pin the CPU oracle even with an explicit opt-in"
+        );
+
+        env::remove_var("CAMELID_DETERMINISTIC");
+        env::remove_var("CAMELID_QWEN35_CUDA");
+    }
+
     use super::*;
     use crate::{
         gguf::{GgufFile, GgufMetadataValue, GgufTensorDescriptor},
@@ -2934,6 +3038,65 @@ mod tests {
             GgufTensorType::Q6K,
         ))
         .expect_err("NVFP4 has kernel parity but no gemma4 end-to-end receipt");
+    }
+
+    #[test]
+    fn gemma4_quant_admission_declines_q2_k_and_admits_the_mixed_26b_row() {
+        // Q2_K carries a NEGATIVE receipt, not merely a missing one: `mixq2k` requantised
+        // the routed experts to Q2_K and decoded degenerate output on all three A/B
+        // prompts. `gemma4_projection_tensors` covers `ffn_*_exps`, so admitting Q2_K
+        // here would admit precisely the tensors that were measured bad.
+        let err = gemma4_projection_quant_admitted(&gemma4_row(
+            "26b-q2_k",
+            GgufTensorType::Q2K,
+            GgufTensorType::Q8_0,
+        ))
+        .expect_err("Q2_K projections decoded degenerate output; they are not receipted");
+        assert!(
+            err.contains("Q2K"),
+            "the decline must name the format: {err}"
+        );
+
+        // The real 26B-A4B ghost row is MIXED and must stay admitted: 14/30 attn_q are
+        // Q6_K and 16/30 are Q4_0, ffn_down is 27xQ4_0 + 3xQ4_1, ffn_down_exps is
+        // 23xQ4_0 + 7xQ4_1. Pinning the mix is the point — a single-format fixture
+        // cannot catch a regression that declines only the Q6_K half of the row.
+        let mut mixed = gemma4_row("26b-a4b-q4_0", GgufTensorType::Q4_0, GgufTensorType::Q8_0);
+        for (layer, suffix, ty) in [
+            (1_usize, "attn_q.weight", GgufTensorType::Q6K),
+            (2, "ffn_down.weight", GgufTensorType::Q4_1),
+            (3, "ffn_gate_up_exps.weight", GgufTensorType::Q4_0),
+            (4, "ffn_down_exps.weight", GgufTensorType::Q4_1),
+        ] {
+            mixed.tensors.push(GgufTensorDescriptor {
+                name: format!("blk.{layer}.{suffix}"),
+                dimensions: vec![32, 32],
+                tensor_type: ty,
+                relative_offset: 0,
+                absolute_offset: 0,
+                n_bytes: 34,
+            });
+        }
+        mixed.tensor_count = mixed.tensors.len() as i64;
+        gemma4_projection_quant_admitted(&mixed)
+            .expect("the mixed Q4_0/Q4_1/Q6_K 26B-A4B row is the row this lane exists to serve");
+
+        // And a single Q2_K expert tensor anywhere in that row must still sink it.
+        mixed.tensors.push(GgufTensorDescriptor {
+            name: "blk.5.ffn_down_exps.weight".into(),
+            dimensions: vec![32, 32],
+            tensor_type: GgufTensorType::Q2K,
+            relative_offset: 0,
+            absolute_offset: 0,
+            n_bytes: 34,
+        });
+        mixed.tensor_count = mixed.tensors.len() as i64;
+        let err = gemma4_projection_quant_admitted(&mixed)
+            .expect_err("one Q2_K expert tensor is still unreceipted");
+        assert!(
+            err.contains("ffn_down_exps") && err.contains("Q2K"),
+            "the decline must name the offending expert tensor: {err}"
+        );
     }
 
     #[test]

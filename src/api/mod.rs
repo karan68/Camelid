@@ -35,7 +35,11 @@ mod metrics;
 mod responses;
 mod responses_store;
 mod server;
-mod workspace;
+mod tool_envelope;
+mod web_research;
+pub(crate) mod workspace;
+
+pub(crate) use web_research::fetch_public_http;
 
 /// Re-exported so anything else in the crate that fronts this server bounds
 /// request bodies at the same size the server itself does.
@@ -218,6 +222,13 @@ pub struct AppState {
     api_surface: ApiSurface,
     /// Lock-free process metrics shared by middleware and decode jobs.
     metrics: metrics::ServerMetrics,
+    /// Bounded public-web transport used only by `/api/web/research` before an
+    /// ordinary chat generation. It never receives request headers or model
+    /// state, so Camelid API credentials cannot be forwarded and model tool
+    /// support is irrelevant. Its optional GitHub provider credential comes
+    /// only from the operator environment and is host-scoped inside the
+    /// transport. The trait seam keeps route tests fully offline.
+    web_research_transport: Arc<dyn web_research::WebTransport>,
 }
 
 impl Default for AppState {
@@ -257,6 +268,7 @@ impl Default for AppState {
             server_limits: server::ServerPolicy::loopback_default().limits,
             api_surface: ApiSurface::Full,
             metrics: metrics::ServerMetrics::default(),
+            web_research_transport: web_research::default_transport(),
         }
     }
 }
@@ -317,6 +329,15 @@ impl AppState {
     fn with_server_policy(mut self, policy: &server::ServerPolicy) -> Self {
         self.server_limits = policy.limits;
         self.api_surface = policy.api_surface();
+        self
+    }
+
+    #[cfg(test)]
+    fn with_web_research_transport_for_tests(
+        mut self,
+        transport: Arc<dyn web_research::WebTransport>,
+    ) -> Self {
+        self.web_research_transport = transport;
         self
     }
 
@@ -585,6 +606,12 @@ pub struct HealthResponse {
     pub build: String,
     pub loaded_now: bool,
     pub generation_ready: bool,
+    /// Effective context window of the active loaded runtime, not a catalog or
+    /// training-context guess. WebUI prompt budgeting uses this value.
+    pub active_context_length: Option<u32>,
+    /// Operator ceilings applied by this server process.
+    pub max_prompt_tokens: usize,
+    pub max_generation_tokens: u32,
     /// True when the active runnable model has a resident Prism/Qwen3-VL
     /// projector and can accept OpenAI `image_url` chat content parts.
     pub vision_ready: bool,
@@ -798,6 +825,10 @@ pub struct ModelListItem {
     pub object: &'static str,
     pub created: u64,
     pub owned_by: &'static str,
+    /// Camelid extension: identity of the exact loaded GGUF. Agent clients use
+    /// this to avoid transferring tool capability to a same-named replacement.
+    pub filename: Option<String>,
+    pub gguf_sha256: String,
     pub meta: Option<ModelListMeta>,
 }
 
@@ -820,6 +851,11 @@ pub struct ModelListMeta {
 #[derive(Debug, Deserialize)]
 pub struct ChatCompletionRequest {
     pub model: Option<String>,
+    /// Camelid-private optimistic binding for agent requests. When present, the
+    /// request is accepted only while `model` resolves to these exact GGUF
+    /// bytes. Ordinary OpenAI-compatible callers omit it and retain the
+    /// existing model-selection behavior.
+    pub camelid_expected_gguf_sha256: Option<String>,
     pub messages: Option<Vec<ChatMessage>>,
     pub stream: Option<bool>,
     pub max_tokens: Option<u32>,
@@ -952,6 +988,113 @@ pub struct CompletionRequest {
     pub camelid_receipt: Option<bool>,
     #[serde(flatten)]
     pub unsupported_fields: HashMap<String, serde_json::Value>,
+}
+
+fn valid_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn artifact_binding_error(
+    status: StatusCode,
+    code: &'static str,
+    message: impl Into<String>,
+) -> Response {
+    api_error(
+        status,
+        code,
+        message.into(),
+        Some("camelid_expected_gguf_sha256"),
+    )
+}
+
+// Axum handlers return `Response` directly, so preserving the typed HTTP error
+// here avoids lossy remapping at every artifact-bound generation entry point.
+#[expect(clippy::result_large_err)]
+fn verify_loaded_artifact_binding(
+    model: &LoadedModel,
+    expected_sha256: Option<&str>,
+) -> std::result::Result<(), Response> {
+    let Some(expected_sha256) = expected_sha256 else {
+        return Ok(());
+    };
+    if !valid_sha256_hex(expected_sha256) {
+        return Err(artifact_binding_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_expected_model_artifact",
+            "camelid_expected_gguf_sha256 must be a 64-character hexadecimal SHA-256 digest",
+        ));
+    }
+    let actual_sha256 = model.lane.gguf_sha256.trim();
+    if !valid_sha256_hex(actual_sha256) {
+        return Err(artifact_binding_error(
+            StatusCode::CONFLICT,
+            "model_artifact_identity_unavailable",
+            "the selected model does not expose a usable GGUF SHA-256 identity; reload it before continuing the agent session",
+        ));
+    }
+    if !actual_sha256.eq_ignore_ascii_case(expected_sha256) {
+        return Err(artifact_binding_error(
+            StatusCode::CONFLICT,
+            "model_artifact_mismatch",
+            "the selected model id now refers to different GGUF bytes; restart or explicitly resume the agent with the newly loaded artifact",
+        ));
+    }
+    Ok(())
+}
+
+/// Resolve and bind an opt-in exact-artifact request while holding the same
+/// transition lock used by load/unload. Callers keep the returned guard only
+/// until they have cloned a dedicated serve runtime. Dense generation drops it
+/// before prompt preparation: [`prepare_generation`] resolves one `LoadedModel`
+/// clone and re-verifies the digest on that clone, so a concurrent transition
+/// either supplies the expected runtime or fails closed without nesting this
+/// lock when a cold speculative draft model is loaded.
+async fn bind_expected_loaded_artifact(
+    state: &AppState,
+    requested_model: Option<&str>,
+    expected_sha256: Option<&str>,
+) -> std::result::Result<Option<tokio::sync::OwnedMutexGuard<()>>, Response> {
+    let Some(expected_sha256) = expected_sha256 else {
+        return Ok(None);
+    };
+    if !valid_sha256_hex(expected_sha256) {
+        return Err(artifact_binding_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_expected_model_artifact",
+            "camelid_expected_gguf_sha256 must be a 64-character hexadecimal SHA-256 digest",
+        ));
+    }
+
+    let transition = Arc::clone(&state.model_transition).lock_owned().await;
+    let active_id = state.active_model_id.read().await.clone();
+    let loaded = state.loaded_models.read().await;
+    let target = if let Some(requested) = requested_model {
+        loaded.get(requested).or_else(|| {
+            loaded.values().find(|model| {
+                model.id == requested
+                    || model
+                        .path
+                        .file_name()
+                        .is_some_and(|name| name.to_string_lossy() == requested)
+            })
+        })
+    } else if let Some(active) = active_id.as_deref() {
+        loaded.get(active)
+    } else if loaded.len() == 1 {
+        loaded.values().next()
+    } else {
+        None
+    };
+    let model = target.ok_or_else(|| {
+        artifact_binding_error(
+            StatusCode::CONFLICT,
+            "model_artifact_identity_unavailable",
+            "the requested model artifact is not currently loaded; reload it before continuing the agent session",
+        )
+    })?;
+    verify_loaded_artifact_binding(model, Some(expected_sha256))?;
+    drop(loaded);
+    Ok(Some(transition))
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1512,6 +1655,10 @@ pub struct LlamaServerSlotCamelid {
 #[derive(Clone, Debug, Deserialize)]
 pub struct GenerationSessionRequest {
     pub model: Option<String>,
+    /// See [`ChatCompletionRequest::camelid_expected_gguf_sha256`]. Agent
+    /// preflights carry the same exact-artifact binding as the generation they
+    /// size, so a same-id replacement cannot silently cross a model step.
+    pub camelid_expected_gguf_sha256: Option<String>,
     pub prompt: Option<String>,
     pub messages: Option<Vec<ChatMessage>>,
     pub max_tokens: Option<u32>,
@@ -2198,6 +2345,11 @@ struct RawLogitDiagnostic {
 #[derive(Debug, Serialize)]
 pub struct ErrorEnvelope {
     pub error: ErrorBody,
+    /// Exact rendered prompt size for the typed prompt-limit error. This lets a
+    /// count-only preflight trim optional context without weakening the normal
+    /// generation ceiling. Other errors omit the field and remain fatal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_token_count: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2555,6 +2707,7 @@ fn router_with_state_and_policy(state: AppState, policy: server::ServerPolicy) -
             get(generation_sessions).post(create_generation_session),
         )
         .route("/api/generation/preflight", post(preflight_generation))
+        .route("/api/web/research", post(web_research::handler))
         .route(
             "/api/agent/workspace/models",
             get(workspace::compatible_models),
@@ -3282,6 +3435,9 @@ async fn health_registry_snapshot(state: &AppState) -> HealthResponse {
         || runnable_serve_ready
         || dg_serve_ready
         || model.is_some_and(loaded_model_generation_ready);
+    let active_context_length = model
+        .and_then(|model| model.llama_config.as_ref())
+        .map(|config| config.context_length);
     let execution_plans = state.execution_plans.read().await;
     let execution_plan = active_id_lock
         .as_ref()
@@ -3334,6 +3490,9 @@ async fn health_registry_snapshot(state: &AppState) -> HealthResponse {
         build: crate::receipt::camelid_version(),
         loaded_now,
         generation_ready,
+        active_context_length,
+        max_prompt_tokens: state.server_limits.max_prompt_tokens,
+        max_generation_tokens: state.server_limits.max_generation_tokens,
         vision_ready,
         active_model_id: active_id_lock.clone(),
         q8_runtime: q8_runtime_health(),
@@ -3452,6 +3611,9 @@ fn busy_health_response(state: &AppState) -> HealthResponse {
         build: crate::receipt::camelid_version(),
         loaded_now: false,
         generation_ready: false,
+        active_context_length: None,
+        max_prompt_tokens: state.server_limits.max_prompt_tokens,
+        max_generation_tokens: state.server_limits.max_generation_tokens,
         vision_ready: false,
         active_model_id: None,
         q8_runtime: q8_runtime_health(),
@@ -4483,6 +4645,7 @@ async fn llama_server_completion(
     };
     let req = GenerationSessionRequest {
         model: req.model,
+        camelid_expected_gguf_sha256: None,
         prompt,
         messages: None,
         max_tokens,
@@ -8076,7 +8239,11 @@ fn enforce_distributed_model_sha256(state: &AppState, path: &std::path::Path) ->
     let Some(expected) = &state.distributed_model_sha256 else {
         return Ok(());
     };
-    let actual = crate::receipt::sha256_file_hex_cached(path).map_err(|err| {
+    // A distributed identity is an authorization boundary. The persistent
+    // digest cache is deliberately only a performance hint and is writable by
+    // the local user, so it must never decide whether coordinator and worker
+    // bytes match.
+    let actual = crate::receipt::sha256_file_hex(path).map_err(|err| {
         BackendError::InvalidModelMetadata(format!(
             "could not verify the distributed model {}: {err}",
             path.display()
@@ -8185,6 +8352,14 @@ async fn load_model(State(state): State<AppState>, Json(req): Json<LoadModelRequ
         let ids = reclaim.ids.clone();
         {
             let _transition = state.model_transition.lock().await;
+            if state.workspace_sessions.blocks_model_transition().await {
+                return api_error(
+                    StatusCode::CONFLICT,
+                    "model_operation_in_progress",
+                    BackendError::ModelOperationInProgress.to_string(),
+                    None,
+                );
+            }
             let _exclusive = state.model_file_lifecycle.write().await;
             for id in &ids {
                 if let Err(resp) = release_model(&state, Some(id.clone())).await {
@@ -8277,9 +8452,7 @@ mod distributed_model_pin_tests {
         std::fs::write(&other, b"other model").unwrap();
         let state = AppState {
             models_dir: temp.path().to_path_buf(),
-            distributed_model_sha256: Some(
-                crate::receipt::sha256_file_hex_cached(&startup).unwrap(),
-            ),
+            distributed_model_sha256: Some(crate::receipt::sha256_file_hex(&startup).unwrap()),
             ..AppState::default()
         };
 
@@ -8753,20 +8926,20 @@ fn gemma4_cuda_enabled() -> bool {
     crate::execution_plan::gemma4_cuda_lane_selectable()
 }
 
-/// Ghost-MoE CUDA remains an explicit experimental opt-in until the exact 26B
-/// row has a committed Windows parity receipt. The ordinary host-wide CUDA
-/// policy still has to admit the device after this narrow gate is enabled.
+/// Route Gemma 4 Ghost-MoE through the CUDA-resident decode engine.
+/// Enabled by default whenever CUDA decode is available; opt out with
+/// `CAMELID_GEMMA4_GHOST_CUDA=0`.
 #[cfg(feature = "cuda")]
 fn gemma4_ghost_cuda_enabled(catalog_managed: bool) -> bool {
-    let enabled = std::env::var("CAMELID_GEMMA4_GHOST_CUDA")
+    let disabled = std::env::var("CAMELID_GEMMA4_GHOST_CUDA")
         .ok()
         .is_some_and(|value| {
             matches!(
                 value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "on" | "yes" | "enabled"
+                "0" | "false" | "off" | "no" | "disabled"
             )
         });
-    (enabled || catalog_managed) && gemma4_cuda_enabled()
+    (catalog_managed || !disabled) && gemma4_cuda_enabled()
 }
 
 /// Per-file VRAM fit check for the gemma4 CUDA-resident lane.
@@ -9932,9 +10105,15 @@ mod gemma4_template_tests {
     }
 }
 
-/// Test-only re-export of the gemma4 marker renderer (the template-shapes
-/// integration test asserts byte parity against the committed reference pack).
-pub fn gemma4_chat_prompt_for_tests(messages: &[ChatMessage], thinking: bool) -> String {
+/// The gemma4 marker renderer, exposed as the ONE way anything outside the serve lane
+/// may template a gemma4 chat prompt.
+///
+/// The template-shapes integration test asserts byte parity against the committed
+/// reference pack through here, and the offline MTP harness
+/// (`gemma4-cuda-generate --request-json`) renders through here too — an offline
+/// throughput number is only comparable to a served one if both walked the same
+/// renderer, and a second copy of this logic would silently drift.
+pub fn render_gemma4_chat_prompt(messages: &[ChatMessage], thinking: bool) -> String {
     gemma4_chat_prompt(messages, thinking)
 }
 
@@ -10970,9 +11149,9 @@ fn prism_vision_companion_for_model(
 }
 
 /// Exact identity gate for a capability-bearing artifact. Size is checked
-/// before hashing so truncated files fail cheaply; the existing GGUF hash
-/// cache keeps subsequent Models scans and model loads from re-reading a valid
-/// 600 MiB projector.
+/// before hashing so truncated files fail cheaply. The digest is intentionally
+/// uncached: a user-writable performance cache cannot authorize a vision
+/// projector or any other capability-bearing artifact.
 fn file_matches_expected_identity(
     path: &std::path::Path,
     expected_size: u64,
@@ -10981,7 +11160,7 @@ fn file_matches_expected_identity(
     let has_expected_size = std::fs::metadata(path)
         .is_ok_and(|metadata| metadata.is_file() && metadata.len() == expected_size);
     has_expected_size
-        && receipt::sha256_file_hex_cached(path)
+        && receipt::sha256_file_hex(path)
             .is_ok_and(|actual| actual.eq_ignore_ascii_case(expected_sha256))
 }
 
@@ -11892,7 +12071,9 @@ fn runnable_completions_rejection(model_id: &str) -> Response {
 /// covers EVERY raw-completions surface (`/completion`,
 /// `/api/generation/preflight`, `/api/generation/sessions`, multi-choice
 /// fan-out, receipt replay) lives at the dense chokepoint in
-/// [`prepare_generation`].
+/// [`prepare_generation`]. The chat-shaped, count-only form of
+/// `/api/generation/preflight` is the deliberate exception: it resolves this
+/// same runtime and tokenizes the exact chat prompt without decoding.
 async fn reject_completions_for_runnable_arch(
     state: &AppState,
     model: &Option<String>,
@@ -12047,10 +12228,11 @@ fn decode_prism_image_data_url(url: &str) -> std::result::Result<Vec<u8>, Respon
 #[allow(clippy::result_large_err)]
 fn prepare_runnable_prompt(
     runtime: &RunnableServeRuntime,
-    req: &ChatCompletionRequest,
     messages: &[ChatMessage],
     prompt_text: &str,
     tools_present: bool,
+    image_min_tokens: Option<u32>,
+    image_max_tokens: Option<u32>,
 ) -> std::result::Result<RunnablePreparedPrompt, Response> {
     let image_urls: Vec<&str> = messages
         .iter()
@@ -12146,9 +12328,8 @@ fn prepare_runnable_prompt(
                 None,
             )
         })?;
-    let min_image_tokens = req.camelid_image_min_tokens.unwrap_or(8).clamp(1, 1024) as usize;
-    let max_image_tokens = req
-        .camelid_image_max_tokens
+    let min_image_tokens = image_min_tokens.unwrap_or(8).clamp(1, 1024) as usize;
+    let max_image_tokens = image_max_tokens
         .unwrap_or(128)
         .clamp(min_image_tokens as u32, 1024) as usize;
     Ok(RunnablePreparedPrompt::Vision {
@@ -12293,6 +12474,77 @@ fn runnable_vision_receipt_rejection() -> Response {
     )
 }
 
+/// Render one runnable-lane chat request through the same architecture-specific
+/// template gate used by both generation transports and count-only preflight.
+/// Keeping this decision in one place is important for agent budgeting: a
+/// preflight count is authoritative only when it includes the exact tool schema
+/// and marker dialect the following generation will consume.
+#[allow(clippy::result_large_err)]
+fn render_runnable_chat_prompt_for_request(
+    runtime: &RunnableServeRuntime,
+    id: &str,
+    messages: &[ChatMessage],
+    tools: &[serde_json::Value],
+    enable_thinking: bool,
+) -> std::result::Result<String, Response> {
+    if runtime.architecture == "gemma2" {
+        if !tools.is_empty() {
+            return Err(gemma_runnable_lane_tools_rejection());
+        }
+        return prepare_gemma2_runnable_chat_prompt(runtime, id, messages)
+            .map_err(|rejection| *rejection);
+    }
+    if runtime.architecture == "gemma3" {
+        if !tools.is_empty() {
+            return Err(gemma_runnable_lane_tools_rejection());
+        }
+        return Ok(render_gemma3_prompt(messages));
+    }
+    if runtime.architecture == "bitnet-b1.58" {
+        if let Some(rejection) = bitnet_b158_request_rejection(tools, enable_thinking) {
+            return Err(rejection);
+        }
+        return prepare_bitnet_b158_chat_prompt(runtime, id, messages);
+    }
+    if runtime.architecture == "lfm2" {
+        if !tools.is_empty() {
+            return Err(lfm2_runnable_lane_tools_rejection());
+        }
+        if let Some(rejection) = reject_lfm2_with_unrecognized_template(runtime, id) {
+            return Err(rejection);
+        }
+        return Ok(render_lfm2_chatml_prompt_for_template(
+            messages,
+            runtime
+                .tokenizer
+                .chat_template
+                .as_deref()
+                .unwrap_or_default(),
+        ));
+    }
+    if runtime.architecture == "command-r" {
+        if !tools.is_empty() {
+            return Err(aya_runnable_lane_tools_rejection());
+        }
+        if enable_thinking {
+            return Err(aya_runnable_lane_thinking_rejection());
+        }
+        return prepare_aya_runnable_chat_prompt(runtime, id, messages);
+    }
+    Ok(if tools.is_empty() {
+        render_ornith_chatml_prompt(messages, enable_thinking)
+    } else {
+        render_ornith_chatml_prompt_with_tools(messages, tools, enable_thinking)
+    })
+}
+
+/// One reply allowance for runnable generation and its count-only preflight.
+/// Keeping the default/cap shared prevents a successful fit from reserving a
+/// different number of tokens than the generation that immediately follows.
+fn runnable_effective_max_tokens(requested: Option<u32>) -> u32 {
+    requested.unwrap_or(256).min(4096)
+}
+
 /// Non-streaming chat for a runnable-served model (qwen35/Ornith): render the Ornith
 /// ChatML prompt (with tools when present), greedy-generate to EOG, split the
 /// `<think>` reasoning, and lift `<function=â€¦>` tool calls into structured `tool_calls`
@@ -12310,69 +12562,27 @@ async fn runnable_chat_nonstreaming(
     let messages = req.messages.clone().unwrap_or_default();
     let enable_thinking = req.camelid_enable_thinking.unwrap_or(false);
     let tools = runnable_request_tools(req);
-    let prompt_text = if runtime.architecture == "gemma2" {
-        if !tools.is_empty() {
-            return gemma_runnable_lane_tools_rejection();
-        }
-        match prepare_gemma2_runnable_chat_prompt(&runtime, &id, &messages) {
-            Ok(prompt) => prompt,
-            Err(rejection) => return *rejection,
-        }
-    } else if runtime.architecture == "gemma3" {
-        if !tools.is_empty() {
-            return gemma_runnable_lane_tools_rejection();
-        }
-        render_gemma3_prompt(&messages)
-    } else if runtime.architecture == "bitnet-b1.58" {
-        if let Some(rejection) = bitnet_b158_request_rejection(&tools, enable_thinking) {
-            return rejection;
-        }
-        match prepare_bitnet_b158_chat_prompt(&runtime, &id, &messages) {
-            Ok(prompt) => prompt,
-            Err(rejection) => return rejection,
-        }
-    } else if runtime.architecture == "lfm2" {
-        // LFM2 has its own template AND its own tool-call envelope; borrowing
-        // the qwen35 tools renderer would emit a format these weights were
-        // never trained on. Fail closed until an LFM2 tool lane is proven.
-        if !tools.is_empty() {
-            return lfm2_runnable_lane_tools_rejection();
-        }
-        // Keyed on the FILE's template, not the arch string alone. LFM2.5 ships
-        // both an open-think dialect and a plain assistant-generation dialect;
-        // select only after the exact marker contract is recognized.
-        if let Some(rejection) = reject_lfm2_with_unrecognized_template(&runtime, &id) {
-            return rejection;
-        }
-        render_lfm2_chatml_prompt_for_template(
-            &messages,
-            runtime
-                .tokenizer
-                .chat_template
-                .as_deref()
-                .unwrap_or_default(),
-        )
-    } else if runtime.architecture == "command-r" {
-        if !tools.is_empty() {
-            return aya_runnable_lane_tools_rejection();
-        }
-        if enable_thinking {
-            return aya_runnable_lane_thinking_rejection();
-        }
-        match prepare_aya_runnable_chat_prompt(&runtime, &id, &messages) {
-            Ok(prompt) => prompt,
-            Err(rejection) => return rejection,
-        }
-    } else if tools.is_empty() {
-        render_ornith_chatml_prompt(&messages, enable_thinking)
-    } else {
-        render_ornith_chatml_prompt_with_tools(&messages, &tools, enable_thinking)
+    let prompt_text = match render_runnable_chat_prompt_for_request(
+        &runtime,
+        &id,
+        &messages,
+        &tools,
+        enable_thinking,
+    ) {
+        Ok(prompt) => prompt,
+        Err(rejection) => return rejection,
     };
-    let prepared =
-        match prepare_runnable_prompt(&runtime, req, &messages, &prompt_text, !tools.is_empty()) {
-            Ok(prepared) => prepared,
-            Err(response) => return response,
-        };
+    let prepared = match prepare_runnable_prompt(
+        &runtime,
+        &messages,
+        &prompt_text,
+        !tools.is_empty(),
+        req.camelid_image_min_tokens,
+        req.camelid_image_max_tokens,
+    ) {
+        Ok(prepared) => prepared,
+        Err(response) => return response,
+    };
     if receipt_stamp.is_some() && matches!(&prepared, RunnablePreparedPrompt::Vision { .. }) {
         return runnable_vision_receipt_rejection();
     }
@@ -12380,7 +12590,7 @@ async fn runnable_chat_nonstreaming(
         Ok(config) => config,
         Err(response) => return response,
     };
-    let max_tokens = req.max_tokens.unwrap_or(256).min(4096) as usize;
+    let max_tokens = runnable_effective_max_tokens(req.max_tokens) as usize;
     let rt = runtime.clone();
     let result = tokio::task::spawn_blocking(move || match prepared {
         RunnablePreparedPrompt::Text(prompt_ids) => {
@@ -12547,74 +12757,32 @@ async fn runnable_chat_streaming(
     let messages = req.messages.clone().unwrap_or_default();
     let enable_thinking = req.camelid_enable_thinking.unwrap_or(false);
     let tools = runnable_request_tools(req);
-    let prompt_text = if runtime.architecture == "gemma2" {
-        if !tools.is_empty() {
-            return gemma_runnable_lane_tools_rejection();
-        }
-        match prepare_gemma2_runnable_chat_prompt(&runtime, &id, &messages) {
-            Ok(prompt) => prompt,
-            Err(rejection) => return *rejection,
-        }
-    } else if runtime.architecture == "gemma3" {
-        if !tools.is_empty() {
-            return gemma_runnable_lane_tools_rejection();
-        }
-        render_gemma3_prompt(&messages)
-    } else if runtime.architecture == "bitnet-b1.58" {
-        if let Some(rejection) = bitnet_b158_request_rejection(&tools, enable_thinking) {
-            return rejection;
-        }
-        match prepare_bitnet_b158_chat_prompt(&runtime, &id, &messages) {
-            Ok(prompt) => prompt,
-            Err(rejection) => return rejection,
-        }
-    } else if runtime.architecture == "lfm2" {
-        // LFM2 has its own template AND its own tool-call envelope; borrowing
-        // the qwen35 tools renderer would emit a format these weights were
-        // never trained on. Fail closed until an LFM2 tool lane is proven.
-        if !tools.is_empty() {
-            return lfm2_runnable_lane_tools_rejection();
-        }
-        // Keyed on the FILE's template, not the arch string alone. LFM2.5 ships
-        // both an open-think dialect and a plain assistant-generation dialect;
-        // select only after the exact marker contract is recognized.
-        if let Some(rejection) = reject_lfm2_with_unrecognized_template(&runtime, &id) {
-            return rejection;
-        }
-        render_lfm2_chatml_prompt_for_template(
-            &messages,
-            runtime
-                .tokenizer
-                .chat_template
-                .as_deref()
-                .unwrap_or_default(),
-        )
-    } else if runtime.architecture == "command-r" {
-        if !tools.is_empty() {
-            return aya_runnable_lane_tools_rejection();
-        }
-        if enable_thinking {
-            return aya_runnable_lane_thinking_rejection();
-        }
-        match prepare_aya_runnable_chat_prompt(&runtime, &id, &messages) {
-            Ok(prompt) => prompt,
-            Err(rejection) => return rejection,
-        }
-    } else if tools.is_empty() {
-        render_ornith_chatml_prompt(&messages, enable_thinking)
-    } else {
-        render_ornith_chatml_prompt_with_tools(&messages, &tools, enable_thinking)
+    let prompt_text = match render_runnable_chat_prompt_for_request(
+        &runtime,
+        &id,
+        &messages,
+        &tools,
+        enable_thinking,
+    ) {
+        Ok(prompt) => prompt,
+        Err(rejection) => return rejection,
     };
-    let prepared =
-        match prepare_runnable_prompt(&runtime, req, &messages, &prompt_text, !tools.is_empty()) {
-            Ok(prepared) => prepared,
-            Err(response) => return response,
-        };
+    let prepared = match prepare_runnable_prompt(
+        &runtime,
+        &messages,
+        &prompt_text,
+        !tools.is_empty(),
+        req.camelid_image_min_tokens,
+        req.camelid_image_max_tokens,
+    ) {
+        Ok(prepared) => prepared,
+        Err(response) => return response,
+    };
     let sampling = match runnable_sampling_config(req) {
         Ok(config) => config,
         Err(response) => return response,
     };
-    let max_tokens = req.max_tokens.unwrap_or(256).min(4096) as usize;
+    let max_tokens = runnable_effective_max_tokens(req.max_tokens) as usize;
     let include_usage = stream_options_include_usage(req.stream_options.as_ref());
     let parse_stream_tool_calls = !tools.is_empty();
     // Post-hoc envelope lifting is gated on tool_choice, not tool presence:
@@ -13478,6 +13646,9 @@ async fn load_model_from_path_with_activation(
         return Err(BackendError::ModelOperationInProgress);
     }
     let _transition = state.model_transition.lock().await;
+    if state.workspace_sessions.blocks_model_transition().await {
+        return Err(BackendError::ModelOperationInProgress);
+    }
     let _reader = state.model_file_lifecycle.read().await;
     // Every load funnels through here, so resolve relative paths against the
     // configured models dir at this one chokepoint (absolute paths and
@@ -13698,16 +13869,13 @@ fn build_loaded_model(
     let tokenizer_result = Tokenizer::from_gguf(&gguf);
     let tokenizer = tokenizer_state_from_result(tokenizer_result.as_ref());
     let tokenizer_runtime = tokenizer_result.ok().map(Arc::new);
-    // Hash the exact GGUF bytes once at load time so receipts can name the
-    // lane without re-hashing per request.
-    //
-    // Memoized across process starts on (path, len, mtime, dev, ino): this
-    // read is the dominant cost of loading a large row — ~85 s for a 2.5 GB
-    // artifact on an external SSD — and it is paid before the first request
-    // can be served. The digest is unchanged, and no verification path reads
-    // the cache, so a stale entry can only cost a false alarm at verify time,
-    // never a false pass. See `receipt::gguf_hash_cache`.
-    let gguf_sha256 = receipt::sha256_file_hex_cached(&path).map_err(|err| match err {
+    // Hash the exact GGUF bytes once at load time so receipts and capability
+    // gates can name the lane without re-hashing per request. This must bypass
+    // the persistent performance cache: loaded-model identity authorizes exact
+    // tool-capable rows, and a writable cache entry is not cryptographic proof
+    // of the bytes that were loaded. Repeat loads in this process still take
+    // the idempotent fast path above and reuse this already-proven identity.
+    let gguf_sha256 = receipt::sha256_file_hex(&path).map_err(|err| match err {
         receipt::ReceiptError::Io { path, source } => BackendError::Io { path, source },
         other => BackendError::InvalidModelMetadata(other.to_string()),
     })?;
@@ -13951,6 +14119,14 @@ async fn unload_model(
         );
     }
     let _transition = state.model_transition.lock().await;
+    if state.workspace_sessions.blocks_model_transition().await {
+        return api_error(
+            StatusCode::CONFLICT,
+            "model_operation_in_progress",
+            BackendError::ModelOperationInProgress.to_string(),
+            None,
+        );
+    }
     let _exclusive = state.model_file_lifecycle.write().await;
     let model_id = if let Some(Json(req)) = payload {
         req.id
@@ -14913,6 +15089,12 @@ fn model_list_item(model: &LoadedModel) -> ModelListItem {
         object: "model",
         created: 0,
         owned_by: "camelid",
+        filename: model
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_string),
+        gguf_sha256: model.lane.gguf_sha256.clone(),
         meta: model_list_meta(model),
     }
 }
@@ -14957,6 +15139,20 @@ async fn create_generation_session(
         Ok(payload) => payload,
         Err(err) => return malformed_json_error(err),
     };
+    let artifact_binding = match bind_expected_loaded_artifact(
+        &state,
+        req.model.as_deref(),
+        req.camelid_expected_gguf_sha256.as_deref(),
+    )
+    .await
+    {
+        Ok(binding) => binding,
+        Err(response) => return response,
+    };
+    // Validation prepares a concrete model clone and verifies the digest again.
+    // Do not carry the transition guard into that path: a cold speculative
+    // draft load legitimately needs the same transition lock.
+    drop(artifact_binding);
     match validate_generation_request(&state, req).await {
         Ok(summary) => {
             state
@@ -14978,10 +15174,209 @@ async fn preflight_generation(
         Ok(payload) => payload,
         Err(err) => return malformed_json_error(err),
     };
+    let artifact_binding = match bind_expected_loaded_artifact(
+        &state,
+        req.model.as_deref(),
+        req.camelid_expected_gguf_sha256.as_deref(),
+    )
+    .await
+    {
+        Ok(binding) => binding,
+        Err(response) => return response,
+    };
+
+    // Agent prompt fitting sends chat messages plus tool definitions through
+    // this count-only endpoint. Runnable-only rows (notably certified
+    // Ornith/qwen35 agent rows) cannot enter `prepare_generation`: that is a
+    // dense/raw-completions path and deliberately rejects their architecture.
+    // Resolve the same dedicated runtime as real chat while the transition
+    // guard is still held for artifact-bound agent requests, then count with
+    // its exact renderer/tokenizer.
+    if req.prompt.is_none() && req.messages.is_some() {
+        match resolve_runnable_runtime(&state, &req.model).await {
+            Ok(Some((id, runtime))) => {
+                drop(artifact_binding);
+                return match validate_runnable_generation_preflight(
+                    &state,
+                    &id,
+                    runtime.as_ref(),
+                    &req,
+                ) {
+                    Ok(summary) => Json(summary).into_response(),
+                    Err(response) => response,
+                };
+            }
+            Ok(None) => {}
+            Err(response) => return response,
+        }
+    }
+    drop(artifact_binding);
     match validate_generation_request(&state, req).await {
         Ok(summary) => Json(summary).into_response(),
         Err(response) => response,
     }
+}
+
+/// Count one runnable-lane chat prompt without decoding. This mirrors the
+/// runnable chat renderer, tool-schema normalization, tokenizer special-token
+/// policy, and effective reply cap. It intentionally refuses vision prompts:
+/// their projected image-token count is data-dependent and is known only after
+/// projector execution, while the coding-agent lane is text-only.
+#[allow(clippy::result_large_err)]
+fn validate_runnable_generation_preflight(
+    state: &AppState,
+    id: &str,
+    runtime: &RunnableServeRuntime,
+    req: &GenerationSessionRequest,
+) -> std::result::Result<GenerationSessionSummary, Response> {
+    validate_unsupported_generation_fields(req).map_err(|response| *response)?;
+    validate_choice_and_logprob_fields(req).map_err(|response| *response)?;
+    sampling_config_from_request(req).map_err(|response| *response)?;
+    stop_sequences_from_request(req.stop.as_ref()).map_err(|response| *response)?;
+    if req.max_tokens == Some(0) {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_max_tokens",
+            "max_tokens must be greater than zero".to_string(),
+            Some("max_tokens"),
+        ));
+    }
+
+    let messages = req
+        .messages
+        .as_deref()
+        .filter(|messages| !messages.is_empty())
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                "missing_generation_input",
+                "generation requires a non-empty messages array".to_string(),
+                Some("messages"),
+            )
+        })?;
+    if let Some(response) = reject_unsupported_multimodal_content(messages) {
+        return Err(response);
+    }
+    if messages
+        .iter()
+        .any(|message| !message.image_urls.is_empty())
+    {
+        return Err(api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "vision_preflight_unavailable",
+            "count-only generation preflight is unavailable for projected image prompts"
+                .to_string(),
+            Some("messages"),
+        ));
+    }
+    let tools = normalize_runnable_tools(req.tools.as_deref(), true);
+    let prompt_text = render_runnable_chat_prompt_for_request(
+        runtime,
+        id,
+        messages,
+        &tools,
+        req.camelid_enable_thinking.unwrap_or(false),
+    )?;
+    let prepared = prepare_runnable_prompt(
+        runtime,
+        messages,
+        &prompt_text,
+        !tools.is_empty(),
+        None,
+        None,
+    )?;
+    let prompt_token_count = match prepared {
+        RunnablePreparedPrompt::Text(token_ids) => token_ids.len(),
+        // Kept as a defensive backstop if prompt preparation ever learns a
+        // second route to projected inputs.
+        RunnablePreparedPrompt::Vision { .. } => {
+            return Err(api_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "vision_preflight_unavailable",
+                "count-only generation preflight is unavailable for projected image prompts"
+                    .to_string(),
+                Some("messages"),
+            ))
+        }
+    };
+    let max_tokens = validate_runnable_preflight_budget(
+        prompt_token_count,
+        req.max_tokens,
+        req.camelid_context_budget_tokens,
+        state.server_limits,
+    )?;
+
+    Ok(GenerationSessionSummary {
+        id: format!("preflight-{id}"),
+        object: "generation.preflight",
+        model: id.to_string(),
+        prompt_token_count,
+        max_tokens,
+        state: "validated",
+        dense_session_ready: false,
+        next_step: "the runnable chat prompt is template-rendered and token-counted; no model decode or session allocation occurred",
+    })
+}
+
+/// Apply the same reply cap used by runnable chat and reserve it against the
+/// caller's runtime context budget. Kept separate from tokenization so the
+/// exact-boundary behavior can be regression-tested without loading multi-GB
+/// model weights merely to construct a runnable runtime.
+#[allow(clippy::result_large_err)]
+fn validate_runnable_preflight_budget(
+    prompt_token_count: usize,
+    requested_max_tokens: Option<u32>,
+    context_budget_tokens: Option<u32>,
+    server_limits: server::ServerLimits,
+) -> std::result::Result<u32, Response> {
+    if prompt_token_count > server_limits.max_prompt_tokens {
+        return Err(api_error_with_prompt_token_count(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "prompt_token_limit_exceeded",
+            format!(
+                "prompt encoded to {prompt_token_count} tokens, above the server ceiling of {}",
+                server_limits.max_prompt_tokens
+            ),
+            Some("prompt"),
+            Some(prompt_token_count),
+        ));
+    }
+
+    // These are the exact runnable chat defaults/caps used by both generation
+    // transports below. Agent callers normally provide an explicit value already
+    // intersected with the live server ceiling.
+    let max_tokens = runnable_effective_max_tokens(requested_max_tokens);
+    if max_tokens > server_limits.max_generation_tokens {
+        return Err(api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "generation_token_limit_exceeded",
+            format!(
+                "effective max_tokens exceeds the server ceiling of {}",
+                server_limits.max_generation_tokens
+            ),
+            Some("max_tokens"),
+        ));
+    }
+    if let Some(budget_tokens) = context_budget_tokens {
+        if budget_tokens == 0 {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_context_budget",
+                "camelid_context_budget_tokens must be greater than zero".to_string(),
+                Some("camelid_context_budget_tokens"),
+            ));
+        }
+        if let Err(message) = enforce_context_budget(prompt_token_count, max_tokens, budget_tokens)
+        {
+            return Err(api_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "context_budget_exceeded",
+                message,
+                Some("camelid_context_budget_tokens"),
+            ));
+        }
+    }
+    Ok(max_tokens)
 }
 
 /// Every choice of an n>1 request, prepared upfront (KV caches allocate
@@ -15229,6 +15624,7 @@ async fn completions(
     }
     let req = GenerationSessionRequest {
         model: req.model,
+        camelid_expected_gguf_sha256: None,
         prompt: req.prompt,
         messages: None,
         max_tokens: req.max_tokens,
@@ -15277,7 +15673,7 @@ async fn completions(
     if stream {
         // Text-completion streaming does not implement stream_options yet
         // (scope: chat-completions only), so usage is never emitted here.
-        return stream_completion(&state, prepared, false, false, false);
+        return stream_completion(&state, prepared, false, false, None);
     }
 
     // The decode runs on the engine worker; CancelOnDrop stops it within one
@@ -15457,6 +15853,16 @@ async fn chat_completions(
         Ok(payload) => payload,
         Err(err) => return malformed_json_error(err),
     };
+    let artifact_binding = match bind_expected_loaded_artifact(
+        &state,
+        req.model.as_deref(),
+        req.camelid_expected_gguf_sha256.as_deref(),
+    )
+    .await
+    {
+        Ok(binding) => binding,
+        Err(response) => return response,
+    };
     // Fail closed on unsupported multimodal types before routing. Prism
     // `image_url` parts are collected separately and handled by the qwen35
     // runnable lane; audio, video, and malformed parts never degrade into a
@@ -15502,6 +15908,11 @@ async fn chat_completions(
     };
     let tools_active = req.tools.as_ref().is_some_and(|tools| !tools.is_empty())
         && tool_choice_allows_calls(req.tool_choice.as_ref());
+    // Captured before `req` is consumed downstream. This is the only thing that
+    // authorises undoing a schema envelope the model echoed around its arguments.
+    let declared_tool_parameters = tool_envelope::ToolParameterNames::from_request_tools(
+        req.tools.as_deref().unwrap_or_default(),
+    );
     let tools_unsupported_on_lane = |lane: &str| {
         api_error(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -15526,6 +15937,9 @@ async fn chat_completions(
             if tools_active {
                 return tools_unsupported_on_lane("gemma4");
             }
+            // The runtime Arc was cloned while model transitions were locked;
+            // it is now self-contained for this response.
+            drop(artifact_binding);
             return if req.stream.unwrap_or(false) {
                 gemma4_chat_streaming(&state, id, runtime, &req).await
             } else {
@@ -15543,6 +15957,7 @@ async fn chat_completions(
             if constraint.is_some() {
                 return constraint_unsupported_on_lane();
             }
+            drop(artifact_binding);
             if req.stream.unwrap_or(false) {
                 return runnable_chat_streaming(id, runtime, &req).await;
             }
@@ -15565,6 +15980,7 @@ async fn chat_completions(
             if tools_active {
                 return tools_unsupported_on_lane("diffusion-gemma");
             }
+            drop(artifact_binding);
             if req.stream.unwrap_or(false) {
                 return dg_chat_streaming(id, runtime, &req).await;
             }
@@ -15573,6 +15989,10 @@ async fn chat_completions(
         Ok(None) => {}
         Err(resp) => return resp,
     }
+    // The dense path re-resolves and verifies a concrete LoadedModel clone in
+    // prepare_generation. Releasing here avoids a recursive transition-lock
+    // acquisition when speculative decoding has to load its draft model.
+    drop(artifact_binding);
     if has_image_input {
         return vision_unsupported_on_lane("dense");
     }
@@ -15680,6 +16100,7 @@ async fn chat_completions(
     let include_usage = stream_options_include_usage(req.stream_options.as_ref());
     let req = GenerationSessionRequest {
         model: req.model,
+        camelid_expected_gguf_sha256: req.camelid_expected_gguf_sha256,
         prompt: None,
         messages: req.messages,
         max_tokens: req.max_tokens,
@@ -15743,7 +16164,11 @@ async fn chat_completions(
             prepared,
             true,
             include_usage,
-            tools_active && !constraint_active,
+            if tools_active && !constraint_active {
+                Some(declared_tool_parameters)
+            } else {
+                None
+            },
         );
     }
 
@@ -15790,7 +16215,7 @@ async fn chat_completions(
             // request supplied tools and tool_choice permits it. On a tool call,
             // content is emptied and finish_reason flips to "tool_calls".
             let tool_calls = if should_parse_tool_calls(tools_active, constraint_active) {
-                parse_tool_calls(&content)
+                parse_tool_calls(&content, &declared_tool_parameters)
             } else {
                 None
             };
@@ -16194,6 +16619,7 @@ async fn replay_loaded_receipt_request(
     };
     let session_request = GenerationSessionRequest {
         model: Some(loaded.id.clone()),
+        camelid_expected_gguf_sha256: Some(loaded.lane.gguf_sha256.clone()),
         prompt,
         messages,
         max_tokens: Some(request.max_tokens),
@@ -17170,6 +17596,7 @@ async fn prepare_generation(
 ) -> std::result::Result<PreparedGeneration, Response> {
     let requested_max_tokens = req.max_tokens;
     let context_budget_tokens = req.camelid_context_budget_tokens;
+    let expected_gguf_sha256 = req.camelid_expected_gguf_sha256.clone();
     let request_tools = req.tools.clone();
     validate_unsupported_generation_fields(&req).map_err(|response| *response)?;
     validate_choice_and_logprob_fields(&req).map_err(|response| *response)?;
@@ -17219,15 +17646,17 @@ async fn prepare_generation(
         Ok(m) => m,
         Err(res) => return Err(res),
     };
+    verify_loaded_artifact_binding(&model, expected_gguf_sha256.as_deref())?;
     // Fail closed for runnable-served archs at the dense chokepoint. Every
     // raw completions-style surface funnels through here (`/completion`,
-    // `/v1/completions` and its n>1 fan-out, `/api/generation/preflight`,
-    // `/api/generation/sessions`, receipt replay), and no engine this function
-    // can reach runs those archs correctly — falling through would produce
+    // `/v1/completions` and its n>1 fan-out, the raw-prompt form of
+    // `/api/generation/preflight`, `/api/generation/sessions`, receipt replay),
+    // and no engine this function can reach runs those archs correctly — falling through would produce
     // fluent-looking garbage (qwen35/gemma2) or a windowed-arch H4 error
     // (gemma3 on a fallback host), not a useful completion. Chat requests for
     // runnable-served archs never reach this: the runnable short-circuit in
-    // `chat_completions` serves them or returns a typed 503 first. gemma3 on a
+    // `chat_completions` (and its count-only preflight counterpart) serves them
+    // or returns a typed 503 first. gemma3 on a
     // resident-capable host is NOT runnable-served (capability-aware Phase 3b
     // predicate): its chat AND raw completions flow through here onto the
     // dense/resident lane deliberately.
@@ -17273,6 +17702,11 @@ async fn prepare_generation(
             Some("model"),
         )
     })?;
+    // A cold speculative-draft load temporarily releases the request's outer
+    // transition binding. Re-verify the post-transition clone, not just its id
+    // and path: a same-id replacement at the same pathname must not cross an
+    // exact-artifact agent boundary.
+    verify_loaded_artifact_binding(&model, expected_gguf_sha256.as_deref())?;
 
     let mut timings = GenerationTimings::default();
     let tokenization_started = Instant::now();
@@ -17408,7 +17842,7 @@ async fn prepare_generation(
         ));
     }
     if token_ids.len() > state.server_limits.max_prompt_tokens {
-        return Err(api_error(
+        return Err(api_error_with_prompt_token_count(
             StatusCode::PAYLOAD_TOO_LARGE,
             "prompt_token_limit_exceeded",
             format!(
@@ -17417,6 +17851,7 @@ async fn prepare_generation(
                 state.server_limits.max_prompt_tokens
             ),
             Some("prompt"),
+            Some(token_ids.len()),
         ));
     }
 
@@ -19831,16 +20266,26 @@ fn tool_choice_allows_calls(tool_choice: Option<&serde_json::Value>) -> bool {
 /// opted out of. The lanes' post-hoc `<function=...>` lifting is gated
 /// separately on `tool_choice_allows_calls` (not on this list being empty,
 /// because the agent loop lifts envelopes with no tools in the request).
-fn runnable_request_tools(req: &ChatCompletionRequest) -> Vec<serde_json::Value> {
-    if !tool_choice_allows_calls(req.tool_choice.as_ref()) {
+fn normalize_runnable_tools(
+    tools: Option<&[serde_json::Value]>,
+    calls_allowed: bool,
+) -> Vec<serde_json::Value> {
+    if !calls_allowed {
         return Vec::new();
     }
-    req.tools
-        .clone()
+    tools
         .unwrap_or_default()
-        .into_iter()
-        .map(|t| t.get("function").cloned().unwrap_or(t))
+        .iter()
+        .cloned()
+        .map(|tool| tool.get("function").cloned().unwrap_or(tool))
         .collect()
+}
+
+fn runnable_request_tools(req: &ChatCompletionRequest) -> Vec<serde_json::Value> {
+    normalize_runnable_tools(
+        req.tools.as_deref(),
+        tool_choice_allows_calls(req.tool_choice.as_ref()),
+    )
 }
 
 /// Whether the model's raw content should be probed for a tool call.
@@ -19864,7 +20309,14 @@ fn should_parse_tool_calls(tools_active: bool, constraint_active: bool) -> bool 
 /// The parser tolerates trailing junk after a complete JSON value but remains
 /// strict about function names and JSON arguments, so ordinary prose is never
 /// reclassified as a call.
-fn parse_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
+///
+/// `declared` carries the parameter names the request advertised, which is what
+/// authorises undoing a schema envelope the model echoed around its arguments;
+/// see [`tool_envelope`].
+fn parse_tool_calls(
+    text: &str,
+    declared: &tool_envelope::ToolParameterNames,
+) -> Option<Vec<ToolCall>> {
     let trimmed = text.trim();
     let trimmed = trimmed
         .strip_prefix("<|python_tag|>")
@@ -19900,7 +20352,7 @@ fn parse_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
         .collect::<Vec<_>>();
     let calls = values
         .iter()
-        .filter_map(tool_call_from_value)
+        .filter_map(|value| tool_call_from_value(value, declared))
         .collect::<Vec<_>>();
     (!calls.is_empty()).then_some(calls)
 }
@@ -19912,7 +20364,10 @@ fn first_json_value(text: &str) -> Option<serde_json::Value> {
         .ok()
 }
 
-fn tool_call_from_value(value: &serde_json::Value) -> Option<ToolCall> {
+fn tool_call_from_value(
+    value: &serde_json::Value,
+    declared: &tool_envelope::ToolParameterNames,
+) -> Option<ToolCall> {
     let obj = value.as_object()?;
     let function = obj.get("function").and_then(serde_json::Value::as_object);
     let name = function
@@ -19935,6 +20390,7 @@ fn tool_call_from_value(value: &serde_json::Value) -> Option<ToolCall> {
         }
         args => args,
     };
+    let args = tool_envelope::unwrap_schema_envelope(name, args, declared);
     let arguments = serde_json::to_string(&args).ok()?;
     Some(ToolCall {
         id: format!("call_{}", uuid::Uuid::new_v4().simple()),
@@ -20998,7 +21454,7 @@ fn stream_completion(
     mut prepared: PreparedGeneration,
     chat: bool,
     include_usage: bool,
-    parse_stream_tool_calls: bool,
+    stream_tool_calls: Option<tool_envelope::ToolParameterNames>,
 ) -> Response {
     // Speculation only runs in the non-streaming loop; streaming requests on
     // a spec-enabled server keep the unchanged vanilla path (including the
@@ -21091,7 +21547,7 @@ fn stream_completion(
                             Some(stream_started.elapsed().as_millis());
                     }
                     if chat {
-                        if parse_stream_tool_calls {
+                        if stream_tool_calls.is_some() {
                             tool_candidate.push_str(&delta);
                             continue;
                         }
@@ -21154,8 +21610,8 @@ fn stream_completion(
                     });
                     if chat {
                         let mut resolved_finish_reason = finish_reason;
-                        if parse_stream_tool_calls {
-                            if let Some(tool_calls) = parse_tool_calls(&tool_candidate) {
+                        if let Some(declared) = stream_tool_calls.as_ref() {
+                            if let Some(tool_calls) = parse_tool_calls(&tool_candidate, declared) {
                                 resolved_finish_reason = "tool_calls";
                                 let tool_calls = tool_calls
                                     .into_iter()
@@ -23541,6 +23997,16 @@ fn api_error(
     message: String,
     param: Option<&'static str>,
 ) -> Response {
+    api_error_with_prompt_token_count(status, code, message, param, None)
+}
+
+fn api_error_with_prompt_token_count(
+    status: StatusCode,
+    code: &'static str,
+    message: String,
+    param: Option<&'static str>,
+    prompt_token_count: Option<usize>,
+) -> Response {
     // Surface failures that happen while a generation is live on the
     // telemetry stream. Errors raised outside an active generation
     // (request validation, model management) are not inference errors and
@@ -23571,6 +24037,7 @@ fn api_error(
                 code,
                 param,
             },
+            prompt_token_count,
         }),
     )
         .into_response();
@@ -23707,6 +24174,83 @@ mod tests {
                 "KV cache budget exceeded; shorten this conversation".to_string(),
             )
         );
+    }
+
+    #[tokio::test]
+    async fn prompt_limit_error_carries_count_without_weakening_its_typed_failure() {
+        let response = api_error_with_prompt_token_count(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "prompt_token_limit_exceeded",
+            "prompt encoded to 110 tokens, above the server ceiling of 100".to_string(),
+            Some("prompt"),
+            Some(110),
+        );
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            stream_error_parts(&response).0,
+            "prompt_token_limit_exceeded"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["code"], "prompt_token_limit_exceeded");
+        assert_eq!(body["prompt_token_count"], 110);
+    }
+
+    fn runnable_preflight_test_limits() -> server::ServerLimits {
+        server::ServerLimits {
+            max_request_body_bytes: 1_024,
+            max_prompt_tokens: 100,
+            max_generation_tokens: 8_192,
+            max_download_bytes: 1_024,
+        }
+    }
+
+    #[test]
+    fn runnable_preflight_budget_reserves_the_exact_effective_reply_allowance() {
+        let limits = runnable_preflight_test_limits();
+
+        assert_eq!(
+            validate_runnable_preflight_budget(73, Some(27), Some(100), limits).unwrap(),
+            27,
+            "an exact prompt-plus-reply boundary must fit"
+        );
+        let response =
+            validate_runnable_preflight_budget(73, Some(27), Some(99), limits).unwrap_err();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let details = response.extensions().get::<ApiErrorDetails>().unwrap();
+        assert_eq!(details.code, "context_budget_exceeded");
+        assert!(details.message.contains("73 tokens"));
+        assert!(details.message.contains("27 tokens"));
+        assert!(details.message.contains("99 tokens"));
+
+        assert_eq!(
+            validate_runnable_preflight_budget(10, Some(9_000), None, limits).unwrap(),
+            4_096,
+            "preflight must reserve the same hard reply cap as runnable generation"
+        );
+    }
+
+    #[tokio::test]
+    async fn runnable_preflight_prompt_ceiling_returns_the_count_that_was_measured() {
+        let response = validate_runnable_preflight_budget(
+            101,
+            Some(1),
+            None,
+            runnable_preflight_test_limits(),
+        )
+        .unwrap_err();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            response.extensions().get::<ApiErrorDetails>().unwrap().code,
+            "prompt_token_limit_exceeded"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["prompt_token_count"], 101);
     }
 
     #[test]
@@ -24087,7 +24631,7 @@ mod tests {
             orphan_test_prepared("model-a.gguf"),
             true,
             false,
-            false,
+            None,
         );
 
         // Drive the SSE body the way a client does. The reader task polls the
@@ -24549,6 +25093,12 @@ mod tests {
         assert!(validate_choice_and_logprob_fields(&oob).is_err());
     }
 
+    /// No tools declared, so the schema-envelope repair can never fire: these
+    /// cases must behave exactly as they did before it existed.
+    fn no_declared_tools() -> tool_envelope::ToolParameterNames {
+        tool_envelope::ToolParameterNames::from_request_tools(&[])
+    }
+
     #[test]
     fn constrained_output_is_never_reclassified_as_tool_call() {
         // M3 regression: a schema that legitimately declares a `name` property
@@ -24558,7 +25108,7 @@ mod tests {
         // "tool_calls"). OpenAI allows tools + response_format together.
         let constrained_content = r#"{"name":"x","parameters":{}}"#;
         assert!(
-            parse_tool_calls(constrained_content).is_some(),
+            parse_tool_calls(constrained_content, &no_declared_tools()).is_some(),
             "the gate, not the parser, is what protects constrained output"
         );
         assert!(!should_parse_tool_calls(true, true));
@@ -24570,8 +25120,11 @@ mod tests {
     #[test]
     fn parse_tool_calls_extracts_llama_format() {
         // Llama 3.x: {"name", "parameters"}; arguments becomes a JSON string.
-        let tc = parse_tool_calls(r#"{"name": "get_weather", "parameters": {"city": "Paris"}}"#)
-            .unwrap();
+        let tc = parse_tool_calls(
+            r#"{"name": "get_weather", "parameters": {"city": "Paris"}}"#,
+            &no_declared_tools(),
+        )
+        .unwrap();
         assert_eq!(tc.len(), 1);
         assert_eq!(tc[0].function.name, "get_weather");
         assert_eq!(tc[0].kind, "function");
@@ -24581,16 +25134,51 @@ mod tests {
     }
 
     #[test]
+    fn a_schema_envelope_echoed_by_the_model_is_unwrapped_for_the_client() {
+        // Observed on Llama-3.2-1B-Instruct-Q8_0: the model replied with the
+        // schema shape it was shown, leaving `arguments.city` unreachable to an
+        // ordinary OpenAI client.
+        let echoed = r#"{"name": "get_weather", "parameters": {"properties": {"city": "Paris"}}}"#;
+        let declared =
+            tool_envelope::ToolParameterNames::from_request_tools(&[serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                        "required": ["city"]
+                    }
+                }
+            })]);
+
+        let repaired = parse_tool_calls(echoed, &declared).unwrap();
+        let args: serde_json::Value =
+            serde_json::from_str(&repaired[0].function.arguments).unwrap();
+        assert_eq!(args, serde_json::json!({"city": "Paris"}));
+
+        // The declared schema is the only thing that authorises the rewrite: with
+        // no tools declared the model's output is relayed exactly as produced.
+        let untouched = parse_tool_calls(echoed, &no_declared_tools()).unwrap();
+        let args: serde_json::Value =
+            serde_json::from_str(&untouched[0].function.arguments).unwrap();
+        assert_eq!(args, serde_json::json!({"properties": {"city": "Paris"}}));
+    }
+
+    #[test]
     fn parse_tool_calls_tolerates_python_tag_and_junk() {
         // python_tag prefix + trailing junk small models emit; "arguments" variant.
-        let tc = parse_tool_calls(r#"<|python_tag|>{"name": "f", "arguments": {"x": 1}} trailing"#)
-            .unwrap();
+        let tc = parse_tool_calls(
+            r#"<|python_tag|>{"name": "f", "arguments": {"x": 1}} trailing"#,
+            &no_declared_tools(),
+        )
+        .unwrap();
         assert_eq!(tc[0].function.name, "f");
         let args: serde_json::Value = serde_json::from_str(&tc[0].function.arguments).unwrap();
         assert_eq!(args["x"], 1);
         // prose is not a tool call; a JSON object without "name" is not either.
-        assert!(parse_tool_calls("The weather in Paris is sunny.").is_none());
-        assert!(parse_tool_calls(r#"{"parameters": {"x": 1}}"#).is_none());
+        assert!(parse_tool_calls("The weather in Paris is sunny.", &no_declared_tools()).is_none());
+        assert!(parse_tool_calls(r#"{"parameters": {"x": 1}}"#, &no_declared_tools()).is_none());
     }
 
     #[test]
@@ -24598,6 +25186,7 @@ mod tests {
         let qwen = parse_tool_calls(
             r#"<tool_call>{"name":"read_file","arguments":{"path":"a.txt"}}</tool_call>
 <tool_call>{"name":"list_dir","arguments":{"path":"."}}</tool_call>"#,
+            &no_declared_tools(),
         )
         .unwrap();
         assert_eq!(qwen.len(), 2);
@@ -24607,6 +25196,7 @@ mod tests {
 
         let mistral = parse_tool_calls(
             r#"[TOOL_CALLS] [{"name":"read_file","arguments":"{\"path\":\"b.txt\"}"}]"#,
+            &no_declared_tools(),
         )
         .unwrap();
         assert_eq!(mistral.len(), 1);
@@ -24647,9 +25237,12 @@ mod tests {
 
     #[test]
     fn chat_tool_call_delta_uses_openai_stream_shape() {
-        let call = parse_tool_calls(r#"{"name":"weather","parameters":{"city":"Paris"}}"#)
-            .unwrap()
-            .remove(0);
+        let call = parse_tool_calls(
+            r#"{"name":"weather","parameters":{"city":"Paris"}}"#,
+            &no_declared_tools(),
+        )
+        .unwrap()
+        .remove(0);
         let delta = ChatCompletionDelta {
             role: None,
             content: None,
@@ -24699,6 +25292,56 @@ mod tests {
         let tools = runnable_request_tools(&with_choice(None));
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["name"], "weather");
+    }
+
+    #[test]
+    fn runnable_preflight_and_chat_normalize_the_same_tool_schema_into_the_prompt() {
+        let wrapped_tool = serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read a workspace file",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"]
+                }
+            }
+        });
+        let chat: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "ornith",
+            "messages": [{"role": "user", "content": "read notes.txt"}],
+            "tools": [wrapped_tool.clone()]
+        }))
+        .unwrap();
+        let preflight: GenerationSessionRequest = serde_json::from_value(serde_json::json!({
+            "model": "ornith",
+            "messages": [{"role": "user", "content": "read notes.txt"}],
+            "tools": [wrapped_tool]
+        }))
+        .unwrap();
+
+        let chat_tools = runnable_request_tools(&chat);
+        let preflight_tools = normalize_runnable_tools(preflight.tools.as_deref(), true);
+        assert_eq!(preflight_tools, chat_tools);
+        assert_eq!(preflight_tools[0]["name"], "read_file");
+        assert!(preflight_tools[0].get("function").is_none());
+
+        let messages = preflight.messages.as_deref().unwrap();
+        let chat_prompt = render_ornith_chatml_prompt_with_tools(messages, &chat_tools, false);
+        let preflight_prompt =
+            render_ornith_chatml_prompt_with_tools(messages, &preflight_tools, false);
+        assert_eq!(preflight_prompt, chat_prompt);
+        let rendered_tool = preflight_prompt
+            .split_once("<tools>\n")
+            .and_then(|(_, rest)| rest.split_once("\n</tools>"))
+            .map(|(tool, _)| tool)
+            .expect("the runnable tool renderer emits one JSON object in the tools block");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(rendered_tool).unwrap(),
+            preflight_tools[0]
+        );
+        assert!(preflight_prompt.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"));
     }
 
     #[test]
@@ -33939,6 +34582,89 @@ mod runnable_completions_gate_api_tests {
         let (status, body) =
             post_json(app, "/api/generation/preflight", json!({ "prompt": "hi" })).await;
         assert_gate_rejection(status, &body);
+    }
+
+    #[tokio::test]
+    async fn runnable_preflight_chat_shape_uses_the_chat_lane_not_dense_preparation() {
+        let app = router_with_state(state_with_loaded_arch("qwen35").await);
+        let (status, body) = post_json(
+            app,
+            "/api/generation/preflight",
+            json!({
+                "model": "gate-test",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "parameters": {"type": "object", "properties": {}}
+                    }
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body["error"]["code"], "model_not_ready");
+        assert_ne!(body["error"]["code"], "unsupported_completions_lane");
+    }
+
+    #[tokio::test]
+    async fn agent_request_binding_detects_same_id_artifact_swap_between_steps() {
+        let state = state_with_loaded_arch("qwen35").await;
+        let original = "ab".repeat(32);
+        let binding =
+            match bind_expected_loaded_artifact(&state, Some("gate-test"), Some(&original)).await {
+                Ok(Some(binding)) => binding,
+                Ok(None) => panic!("an expected digest must acquire a transition binding"),
+                Err(response) => panic!("matching artifact was rejected: {}", response.status()),
+            };
+        drop(binding);
+
+        state
+            .loaded_models
+            .write()
+            .await
+            .get_mut("gate-test")
+            .expect("synthetic model")
+            .lane
+            .gguf_sha256 = "cd".repeat(32);
+
+        let rejection =
+            match bind_expected_loaded_artifact(&state, Some("gate-test"), Some(&original)).await {
+                Err(response) => response,
+                Ok(_) => panic!("same-id replacement must not inherit an agent request"),
+            };
+        assert_eq!(rejection.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn generation_preflight_rejects_an_expected_artifact_mismatch_first() {
+        let app = router_with_state(state_with_loaded_arch("qwen35").await);
+        let (status, body) = post_json(
+            app,
+            "/api/generation/preflight",
+            json!({
+                "model": "gate-test",
+                "camelid_expected_gguf_sha256": "cd".repeat(32),
+                "prompt": "hi"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["error"]["code"], "model_artifact_mismatch");
+    }
+
+    #[tokio::test]
+    async fn chat_without_artifact_binding_preserves_existing_routing() {
+        let app = router_with_state(state_with_loaded_arch("qwen35").await);
+        let (status, body) = post_json(
+            app,
+            "/v1/chat/completions",
+            json!({"model":"gate-test", "messages":[{"role":"user", "content":"hi"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body["error"]["code"], "model_not_ready");
     }
 
     #[tokio::test]

@@ -1,0 +1,12 @@
+{
+  "description": "Plain decode with the load-time host-tier stripe FORCED ON (CAMELID_GEMMA4_GHOST_TIER_PREFILL=1). It is off by default -- auto requires the tier to cover 40% of all expert records and it covers 25% -- and this arm exists to keep the reason on file. The stripe fills experts 0..31 of every layer, an index-ordered set unrelated to routing, and prefill's 2,176 first-touch inserts displace it before decode asks anything: measured paired x3, the decode-phase tier hit rate is IDENTICAL with and without it (484 hits / 1,094 storage reads), while load costs 4.1 s more (12.1-13.1 s against 8.5-8.8 s). Pure cost.",
+  "mtp": false,
+  "draft_k": 0,
+  "env": {
+    "CAMELID_GEMMA4_CUDA_BATCH_EXPERT_COPIES": "1",
+    "CAMELID_GEMMA4_GHOST_TIER_PREFILL": "1",
+    "CAMELID_GEMMA4_PREFILL_CHUNK_TOKENS": "512",
+    "CAMELID_GEMMA4_Q4_0_SOA": "1",
+    "CAMELID_GEMMA4_SPECULATIVE": "0"
+  }
+}

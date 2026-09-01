@@ -1,0 +1,123 @@
+# Gemma 4 26B-A4B MTP assistant — architecture findings (2026-08-24)
+
+Work toward MTP on the Windows/CUDA ghost lane. The assistant forward is being brought up
+against the committed BF16 oracle **before** any kernel work, because it is self-contained
+and target-free: the oracle needs no 26B weights at all.
+
+**Status: ARCHITECTURE CONFIRMED CORRECT. Bit-exactness is NOT required and was the wrong bar.**
+
+Two results settle this:
+
+1. **The reference runs locally.** transformers 5.12.1 + torch 2.12.0+cpu were ALREADY
+   installed and `Gemma4AssistantForCausalLM` imports. Running it on the oracle's inputs
+   reproduces the oracle at **cosine 0.997** (not bit-exact only because the oracle pinned
+   5.16.0.dev0). No install was needed — check before planning one.
+2. **Stage-by-stage diff proves the structure is right.** Against reference intermediates,
+   every stage through `q_norm` matches at **0.99999+** at layer 0. The whole residual enters
+   at `o_proj` — i.e. inside the attention arithmetic — and then AMPLIFIES ~30x per layer
+   (L0 0.9991 -> L1 0.9705 -> L2 0.7800 -> L3 0.3659). With `scaling = 1.0` the softmax is so
+   peaked that tiny score perturbations move the distribution hard. Rounding to BF16 improves
+   L0 `o_proj` 0.999136 -> 0.999500, confirming the cause is BF16 arithmetic fidelity, but
+   numpy cannot reproduce torch's BF16 matmul accumulation exactly.
+
+**Why bit-exactness does not matter here:** MTP is lossless because the TARGET verifies every
+drafted token — `accepted_draft_prefix` commits only the longest prefix equal to the target's
+own argmax. Drafter numeric drift therefore changes the ACCEPTANCE RATE (speed), never the
+emitted tokens. A drafter that is architecturally correct and numerically close is sufficient;
+one that is bit-exact buys nothing but a slightly higher alpha. Chasing parity here was my
+error and it blocked progress for several rounds.
+
+**The gate for the CUDA port is therefore the torch reference (runnable locally), not the
+frozen oracle**, and the acceptance-rate telemetry is the real quality signal.
+
+## Provenance — everything below is hash-verified, not inferred
+
+| artifact | sha256 (prefix) | source |
+|---|---|---|
+| `model.safetensors` | `c082cc58…` | `google/gemma-4-26B-A4B-it-qat-q4_0-unquantized-assistant` @ `9537141506fe…` |
+| `config.json` | `23d2bc4a…` | same repo/revision |
+| `modeling_gemma4_assistant.py` | `a77e6767…` | `huggingface/transformers` @ `0c92811846…` |
+| `modeling_gemma4.py` | `51d9c119…` | same revision |
+| `modeling_rope_utils.py` | (fetched) | same revision |
+
+The first four match `qa/evidence-bundles/gemma4-26b-mtp-assistant-oracle/manifest.json`
+exactly. **Fetch the reference source instead of reverse-engineering from config** — doing
+the latter cost several wrong guesses before the sources settled every question in minutes.
+
+## The seven corrections (each one was measurably wrong)
+
+1. **★ RMSNorm is `normed * weight`, NOT Gemma 2/3's `normed * (1 + weight)`.** Gemma 4
+   changed the convention (`Gemma4RMSNorm.forward`). This was the single biggest error —
+   it corrupts every norm in the model. Fixing it moved cosine 0.20 → 0.48 and brought the
+   magnitude from 295 to within 2% of the oracle.
+2. **★ `self.scaling = 1.0`** — attention does NOT scale by `head_dim**-0.5`. Gemma 4 relies
+   on `q_norm` instead. Note the diagnostic harness has a `scaling is None` fallback to
+   `head_dim**-0.5` that is never taken; do not copy it.
+3. **`layer_scalar` multiplies the ENTIRE layer output**, residual included, as the last
+   statement of the decoder layer (`hidden_states *= self.layer_scalar`). Not a branch scale.
+   Values here: 0.297 / 0.516 / 0.535 / 0.426.
+4. **Proportional RoPE (full-attention layer only)**: `rope_angles = int(0.25 * 512 // 2) = 64`
+   frequencies `1/(1e6^(2i/512))`, then **192 zeros** padding to `head_dim/2`. So 3/4 of the
+   dims are NOT rotated, but cos/sin remain full `head_dim` length and `rotate_half` still
+   spans all 512. Sliding layers use plain default RoPE, θ=1e4, fully rotated.
+5. **Sliding window is the LAST 1024 of 1031** (`[7, 1031)`), despite the double flip in
+   `create_attention_masks`. Measured decisively: 0.547 windowed vs 0.161 unwindowed. With
+   `scaling = 1.0` the softmax is extremely peaked, so 7 positions out of 1031 swing the
+   result enormously — window boundaries are not a rounding detail here.
+
+6. **RoPE cos/sin must be rounded to BF16** before use. The reference computes them in the
+   model dtype; keeping them f32 costs real accuracy here (0.547 -> 0.641 with everything
+   else held fixed).
+7. **BF16 rounding after every op matters** (0.641 -> 0.695) — the reference is BF16
+   end-to-end with `type_as` after each stage. NOTE: this arm currently overshoots the
+   magnitude (237.40 vs 220.88) while the f32 arm sits at 219.87, so the cast PLACEMENT here
+   is still not the reference's. Getting the cast points exactly right is likely the rest of
+   the gap.
+
+## Architecture, confirmed
+
+- 4 layers: 3 × `sliding_attention` (16 q-heads × 256, 8 KV heads), 1 × `full_attention`
+  (16 q-heads × 512, 2 KV heads). GQA maps q-head `h` to kv-head `h // n_rep`.
+- **No `k_proj`/`v_proj` anywhere.** All 4 layers are `is_kv_shared_layer`; K/V arrive from
+  the host and are consumed RAW — no RoPE, no norm applied to them.
+- Shared-KV contract: sliding ← host layer 28, full ← host layer 29, `position_id` = the
+  shared-KV logical length (1031), i.e. the still-unforwarded bonus token's position.
+- `pre_projection` [1024, 5632] consumes `concat(target_scaled_embedding,
+  target_final_normalized_hidden)` — **embedding first**.
+- `post_projection` [2816, 1024] produces `last_hidden_state`, the recurrence input.
+- `logits = lm_head(h_1024)` — a plain tied matmul, because `use_ordered_embeddings: False`.
+  The `Gemma4AssistantMaskedEmbedder` centroid path (`num_centroids` 2048,
+  `centroid_intermediate_top_k` 32) exists but is **inactive for this checkpoint**.
+- Layer order: `input_layernorm → attn → post_attention_layernorm → +residual →
+  pre_feedforward_layernorm → mlp → post_feedforward_layernorm → +residual → *layer_scalar`.
+- `hidden_activation: gelu_pytorch_tanh`, `rms_norm_eps: 1e-6`.
+
+## What is still wrong
+
+Cosine 0.695 with the magnitude essentially correct in the f32 arm. A correct-magnitude / wrong-direction
+error is the signature of a rotation or an indexing/ordering fault, not a scale bug. Prime
+suspects, in order:
+1. **Exact BF16 cast placement.** Rounding after every op helps (0.641 -> 0.695) but
+   overshoots magnitude, so my cast points are close but not the reference's. This is the
+   leading suspect and it is inherently a per-stage question.
+2. The bidirectional mask may contribute more than the plain window crop modelled here.
+3. RoPE frequency indexing on the sliding layers.
+
+**The efficient way to finish this is per-stage comparison, not more end-to-end guessing.**
+`generate_stage_diagnostics.py` in the oracle bundle emits every intermediate
+(`layer.N.input_norm`, `.q_proj`, `.q_norm`, `.q_rope`, `.attention_scores`,
+`.attention_probs`, `.attention_context`, `.o_proj`, …). Its output is NOT committed — only
+the generator is. Running it needs torch 2.13 + transformers 5.16.0.dev0 on arm64, which
+this box is not. Either run it on the Mac and commit the JSON, or relax the generator's
+pinned-version `require()` calls and run it here.
+
+## Files
+
+- `mtp_inputs.py` — port of the oracle's deterministic BF16 bit-pattern generator.
+  **All 6 inputs reproduce the oracle's recorded sha256 bit-exact**, so the harness is
+  verified on its input side.
+- `mtp_forward.py` — numpy reference forward (safetensors reader + 4-layer forward).
+  Superseded in places by the corrections above; treat FINDINGS.md as authoritative.
+
+Related: `qa/evidence-bundles/gemma4-26b-mtp-assistant-oracle/`,
+`qa/gemma4/oracle/google_gemma-4-26B-A4B-it-Q4_0.PARITY-STATUS.md`.
