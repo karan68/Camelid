@@ -273,17 +273,6 @@ impl Mat {
 }
 
 impl RawMat {
-    #[cfg(not(target_os = "macos"))]
-    fn is_prism_low_bit(&self) -> bool {
-        matches!(
-            self.tt,
-            GgufTensorType::Q1_0
-                | GgufTensorType::Q2_0G64
-                | GgufTensorType::Q2_0G128
-                | GgufTensorType::Pq2_0
-        )
-    }
-
     fn row_bytes(&self) -> usize {
         self.bytes.len() / self.out_features
     }
@@ -1226,9 +1215,9 @@ impl RunnableModel {
                     resident_cuda_artifact_from_sha256, ResidentCudaArtifact,
                 };
 
-                // Hash only the plausible exact Q1 row. API loads normally hit the
-                // receipt hash cache; direct CLI loads still prove identity before
-                // admitting kernels/layouts validated against one concrete artifact.
+                // Hash only the plausible exact Q1 row. This exact digest admits
+                // kernels/layouts validated against one concrete artifact, so a
+                // user-writable persistent cache cannot be its authority.
                 let ffn_dim = q35_layers
                     .first()
                     .map(|layer| layer.ffn_gate.out_features)
@@ -1245,7 +1234,7 @@ impl RunnableModel {
                     && has_q1_projection;
 
                 if candidate {
-                    match crate::receipt::sha256_file_hex_cached(std::path::Path::new(path)) {
+                    match crate::receipt::sha256_file_hex(std::path::Path::new(path)) {
                         Ok(sha256) => resident_cuda_artifact_from_sha256(&sha256),
                         Err(err) => {
                             eprintln!(
@@ -2973,26 +2962,16 @@ impl RunnableModel {
         }
         #[cfg(feature = "cuda")]
         {
-            let cuda_requested = match std::env::var("CAMELID_QWEN35_CUDA") {
-                Ok(value) => matches!(
-                    value.to_ascii_lowercase().as_str(),
-                    "1" | "true" | "on" | "yes"
-                ),
-                // Prism's Windows port is the packed resident CUDA graph. Keep
-                // Ornith's established opt-in policy, while selecting CUDA by
-                // default for Prism rows on Windows; CAMELID_QWEN35_CUDA=0 is
-                // still an explicit CPU fallback/debug override.
-                Err(_) => cfg!(windows) && self.output.is_prism_low_bit(),
-            };
-            // `--gpu off` (and the UI's live toggle) is the AUTHORITATIVE master switch:
-            // it is documented as "Force the CPU reference path; never use the GPU even
-            // if one is present". Nothing in this lane consulted it, so on Windows --
-            // where the default above is ON for every Prism row -- `--gpu off` could not
-            // select the CPU lane at all for the qwen35 Bonsai rows; they kept building
-            // the resident CUDA graph. `CAMELID_QWEN35_CUDA=1` is an opt-IN to this lane,
-            // not an override of the master switch. `gpu_accel_enabled()` lazily seeds
-            // from platform capability, so the default (auto) path is unchanged.
-            let cuda_enabled = cuda_requested && crate::cuda::gpu_accel_enabled();
+            // SINGLE SOURCE OF TRUTH with the disclosed execution plan. This lane used
+            // to read `CAMELID_QWEN35_CUDA` itself and default ON only for Prism low-bit
+            // rows on Windows, so a certified Ornith K-quant row (qwen35 Q4_K_M) served
+            // out of the box reported `cuda_resident_kquant_runtime` from
+            // `select_kquant_plan` while decoding here on the CPU — measured 0.42 tok/s
+            // against 6.1 tok/s on the very same row and host. That is the gemma4 Phase 0
+            // defect: the plan and the lane consulted different things. `--gpu off` and
+            // the UI toggle stay authoritative because the policy requires
+            // `gpu_accel_enabled()`; `CAMELID_QWEN35_CUDA=0` still forces the CPU oracle.
+            let cuda_enabled = crate::execution_plan::qwen35_cuda_lane_selectable();
             if cuda_enabled {
                 return qwen35_cuda_with_cpu_fallback(
                     on_token,

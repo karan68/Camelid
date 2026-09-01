@@ -53,7 +53,7 @@ fn renderer_matches_reference_strings_for_all_shapes() {
                 unsupported_content_parts: Vec::new(),
             })
             .collect();
-        let rendered = camelid::api::gemma4_chat_prompt_for_tests(&messages, shape.thinking);
+        let rendered = camelid::api::render_gemma4_chat_prompt(&messages, shape.thinking);
         assert_eq!(
             rendered, shape.rendered_prompt,
             "shape {} diverges from the reference rendering",

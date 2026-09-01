@@ -1,0 +1,5 @@
+# Exploratory receipts stay local, matching the Mac harness's policy: only a
+# promoted receipt is published, and only once it has been produced on a settled
+# host. Raw runs also carry absolute local paths, which the public scrub rejects.
+*
+!.gitignore

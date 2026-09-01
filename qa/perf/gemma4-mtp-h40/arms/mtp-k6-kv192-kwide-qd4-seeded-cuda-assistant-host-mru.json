@@ -1,0 +1,19 @@
+{
+  "description": "Windows width-7 verifier probe (6 drafts) with the resident Q4 CUDA assistant, exact K-wide CUDA verification, QD4 fills, prefill seeding, and complementary MRU host-tier eviction.",
+  "mtp": true,
+  "draft_k": 6,
+  "env": {
+    "CAMELID_GEMMA4_CUDA_BATCH_EXPERT_COPIES": "1",
+    "CAMELID_GEMMA4_PREFILL_CHUNK_TOKENS": "512",
+    "CAMELID_GEMMA4_Q4_0_SOA": "1",
+    "CAMELID_GEMMA4_SPECULATIVE": "0",
+    "CAMELID_GEMMA4_GHOST_CUDA_CONTEXT": "192",
+    "CAMELID_GEMMA4_GHOST_BATCH_READS": "1",
+    "CAMELID_GEMMA4_GHOST_READ_THREADS": "4",
+    "CAMELID_GEMMA4_GHOST_UNCACHED_READERS": "4",
+    "CAMELID_GEMMA4_MTP_KWIDE": "1",
+    "CAMELID_GEMMA4_MTP_PREFILL_SEED_BOOTSTRAP": "1",
+    "CAMELID_GEMMA4_MTP_CUDA_ASSISTANT": "1",
+    "CAMELID_GEMMA4_GHOST_HOST_TIER_EVICTION": "mru"
+  }
+}

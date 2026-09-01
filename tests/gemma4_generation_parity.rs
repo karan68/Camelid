@@ -98,7 +98,7 @@ fn gemma4_greedy_generation_matches_llama_cpp_oracle() {
         eprintln!("SKIP gemma4 generation parity: set CAMELID_GEMMA4_GGUF");
         return;
     };
-    let row = row_id(&model);
+    let row = std::env::var("CAMELID_GEMMA4_ROW").unwrap_or_else(|_| row_id(&model));
     // Pack selection: CAMELID_GEMMA4_PACK names the pack file stem under
     // qa/gemma4/prompt_packs/ (default basic_v1). The oracle is keyed by BOTH
     // the row and the pack stem, so mismatched artifacts can never pair up.
@@ -141,10 +141,15 @@ fn gemma4_greedy_generation_matches_llama_cpp_oracle() {
         }
     );
 
+    let cghost = std::env::var_os("CAMELID_GEMMA4_GHOST_CGHOST").map(PathBuf::from);
     let cpu_runtime = if use_gpu || use_cuda {
         None
     } else {
-        Some(Gemma4Runtime::load(&model).expect("load gemma4 runtime"))
+        Some(match cghost.as_ref() {
+            Some(cg) => Gemma4Runtime::load_ghost_moe(&model, cg, 1024, false)
+                .expect("load gemma4 ghost runtime"),
+            None => Gemma4Runtime::load(&model).expect("load gemma4 runtime"),
+        })
     };
     #[cfg(target_os = "macos")]
     let gpu_runtime = if use_gpu {
@@ -181,10 +186,18 @@ fn gemma4_greedy_generation_matches_llama_cpp_oracle() {
                 .max()
                 .unwrap_or(192)
         }) + 64;
-        Some(
-            camelid::gemma4_runtime::Gemma4CudaResident::load(&model, max_positions)
+        Some(match cghost.as_ref() {
+            Some(cg) => camelid::gemma4_runtime::Gemma4CudaResident::load_ghost_moe(
+                &model,
+                cg,
+                1024,
+                false,
+                max_positions,
+            )
+            .expect("load gemma4 cuda ghost runtime"),
+            None => camelid::gemma4_runtime::Gemma4CudaResident::load(&model, max_positions)
                 .expect("load gemma4 cuda runtime"),
-        )
+        })
     } else {
         None
     };
@@ -195,6 +208,10 @@ fn gemma4_greedy_generation_matches_llama_cpp_oracle() {
 
     let mut failures = Vec::new();
     for prompt in &pack.prompts {
+        #[cfg(feature = "cuda")]
+        if let Some(cuda_rt) = cuda_runtime.as_mut() {
+            cuda_rt.clear_cache();
+        }
         let expected = oracle
             .results
             .iter()
