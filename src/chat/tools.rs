@@ -360,7 +360,16 @@ impl Sandbox {
             }
         };
         let canon = if must_exist {
-            std::fs::canonicalize(&candidate).map_err(|e| format!("cannot access {raw}: {e}"))?
+            match std::fs::canonicalize(&candidate) {
+                Ok(c) => c,
+                Err(e) => {
+                    let err_msg = format!("cannot access {raw}: {e}");
+                    if let Some(suggestion) = suggest_path_in_sandbox(&self.root, raw) {
+                        return Err(format!("{err_msg}. Did you mean '{suggestion}'?"));
+                    }
+                    return Err(err_msg);
+                }
+            }
         } else {
             let parent = candidate
                 .parent()
@@ -413,6 +422,109 @@ impl Sandbox {
                 }
             })
             .unwrap_or_else(|_| path.display().to_string())
+    }
+}
+
+/// Compute Levenshtein edit distance between two strings.
+pub(crate) fn levenshtein_distance(a: &str, b: &str) -> usize {
+    let a_chars: Vec<char> = a.chars().collect();
+    let b_chars: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b_chars.len()).collect();
+    let mut curr: Vec<usize> = vec![0; b_chars.len() + 1];
+
+    for (i, &ac) in a_chars.iter().enumerate() {
+        curr[0] = i + 1;
+        for (j, &bc) in b_chars.iter().enumerate() {
+            let cost = if ac == bc { 0 } else { 1 };
+            curr[j + 1] = (prev[j + 1] + 1).min(curr[j] + 1).min(prev[j] + cost);
+        }
+        prev.copy_from_slice(&curr);
+    }
+    prev[b_chars.len()]
+}
+
+/// Find closest matching file in sandbox root if a requested path does not exist.
+pub(crate) fn suggest_path_in_sandbox(root: &Path, raw: &str) -> Option<String> {
+    let raw_norm = raw.replace('\\', "/");
+    let raw_path = Path::new(&raw_norm);
+    let raw_name = raw_path.file_name()?.to_str()?;
+    if raw_name.is_empty() || raw_name.starts_with('.') {
+        return None;
+    }
+    let raw_stem = raw_path.file_stem()?.to_str()?;
+
+    let mut stack = vec![root.to_path_buf()];
+    let mut best_suggestion = None;
+    let mut best_score = 0usize;
+    let mut visited_dirs = 0usize;
+    let mut inspected_files = 0usize;
+
+    while let Some(dir) = stack.pop() {
+        visited_dirs += 1;
+        if visited_dirs > 64 {
+            break;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+
+        for entry in entries.flatten() {
+            let Ok(ft) = entry.file_type() else {
+                continue;
+            };
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.starts_with('.') || name_str == "target" || name_str == "node_modules" {
+                continue;
+            }
+
+            if ft.is_dir() {
+                stack.push(entry.path());
+            } else if ft.is_file() {
+                inspected_files += 1;
+                if inspected_files > 500 {
+                    break;
+                }
+
+                let entry_path = entry.path();
+                let Ok(rel) = entry_path.strip_prefix(root) else {
+                    continue;
+                };
+                let rel_str = rel.to_string_lossy().replace('\\', "/");
+                let entry_stem = Path::new(&*name_str).file_stem().and_then(|s| s.to_str()).unwrap_or("");
+
+                let score = if name_str == raw_name {
+                    100
+                } else if name_str.to_ascii_lowercase() == raw_name.to_ascii_lowercase() {
+                    90
+                } else if entry_stem == raw_stem {
+                    80
+                } else if raw_name.len() >= 3 && name_str.len() >= 3 {
+                    let dist = levenshtein_distance(&name_str, raw_name);
+                    if dist <= 2 {
+                        70 - dist * 10
+                    } else {
+                        0
+                    }
+                } else {
+                    0
+                };
+
+                if score > best_score {
+                    best_score = score;
+                    best_suggestion = Some(rel_str);
+                    if score == 100 {
+                        return best_suggestion;
+                    }
+                }
+            }
+        }
+    }
+
+    if best_score >= 50 {
+        best_suggestion
+    } else {
+        None
     }
 }
 
@@ -491,9 +603,9 @@ pub fn specs_for(profile: ToolProfile, allow_net: bool, shell_mode: ShellSandbox
         },
         ToolSpec {
             name: "search".into(),
-            description: "Search UTF-8 file contents for a literal substring within the workspace. This does not search filenames and does not accept regex or glob syntax.".into(),
+            description: "Search UTF-8 file contents for a literal substring within the workspace. Optional path_filter filters file paths (e.g. `*.rs` or `src/**`).".into(),
             risk: Risk::Read,
-            params: json!({"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":profile.search_hit_limit()}},"required":["pattern"]}),
+            params: json!({"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"path_filter":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":profile.search_hit_limit()}},"required":["pattern"]}),
         },
         ToolSpec {
             name: "update_plan".into(),
@@ -777,6 +889,7 @@ pub enum Action {
         pattern: String,
         path: PathBuf,
         limit: usize,
+        path_filter: Option<String>,
     },
     WriteFile {
         path: PathBuf,
@@ -959,9 +1072,13 @@ impl Action {
                 pattern,
                 path,
                 limit,
-                ..
+                path_filter,
             } => {
-                format!("search({pattern:?}, {}, limit={limit})", sandbox.rel(path))
+                if let Some(filter) = path_filter {
+                    format!("search({pattern:?}, {}, filter={filter:?}, limit={limit})", sandbox.rel(path))
+                } else {
+                    format!("search({pattern:?}, {}, limit={limit})", sandbox.rel(path))
+                }
             }
             Action::WriteFile { path, content, .. } => {
                 format!("write_file({}, {} bytes)", sandbox.rel(path), content.len())
@@ -1118,7 +1235,8 @@ impl Action {
                 pattern,
                 path,
                 limit,
-            } => search(pattern, path, *limit, sandbox),
+                path_filter,
+            } => search(pattern, path, *limit, path_filter.as_deref(), sandbox),
             // Snapshot before every mutation, at the execution site rather than
             // on the model's say-so, so undo is available whether or not the
             // model thought to ask for it. The snapshot only becomes a
@@ -1272,6 +1390,7 @@ pub fn validate_for(
         "search" => {
             let pattern = str_arg("pattern")?;
             let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
+            let path_filter = args.get("path_filter").and_then(Value::as_str).map(str::to_string);
             let max_limit = profile.search_hit_limit();
             let limit = args
                 .get("limit")
@@ -1286,6 +1405,7 @@ pub fn validate_for(
                 pattern,
                 path: sandbox.resolve(path, true)?,
                 limit: limit as usize,
+                path_filter,
             })
         }
         "write_file" => {
@@ -1930,7 +2050,37 @@ fn list_dir(path: &Path, offset: usize, limit: Option<usize>) -> ToolOutcome {
     })
 }
 
-fn search(pattern: &str, root: &Path, limit: usize, sandbox: &Sandbox) -> ToolOutcome {
+fn matches_path_filter(rel_path: &str, filter: &str) -> bool {
+    let filter = filter.trim();
+    if filter.is_empty() || filter == "*" {
+        return true;
+    }
+    if let Some(ext) = filter.strip_prefix("*.") {
+        return rel_path.ends_with(&format!(".{ext}"));
+    }
+    if let Some(ext) = filter.strip_prefix('.') {
+        return rel_path.ends_with(&format!(".{ext}"));
+    }
+    if let Some(dir) = filter.strip_suffix("/**") {
+        return rel_path.starts_with(dir) || rel_path.starts_with(&format!("{dir}/"));
+    }
+    if let Some(dir) = filter.strip_suffix("/*") {
+        return rel_path.starts_with(dir) || rel_path.starts_with(&format!("{dir}/"));
+    }
+    if let Some(dir) = filter.strip_suffix('/') {
+        return rel_path.starts_with(dir) || rel_path.starts_with(&format!("{dir}/"));
+    }
+    let file_name = Path::new(rel_path).file_name().and_then(|f| f.to_str()).unwrap_or("");
+    file_name == filter || rel_path.contains(filter)
+}
+
+fn search(
+    pattern: &str,
+    root: &Path,
+    limit: usize,
+    path_filter: Option<&str>,
+    sandbox: &Sandbox,
+) -> ToolOutcome {
     let needle = pattern.to_lowercase();
     let root = match std::fs::canonicalize(root) {
         Ok(root) if sandbox.permits(&root) => root,
@@ -1941,6 +2091,12 @@ fn search(pattern: &str, root: &Path, limit: usize, sandbox: &Sandbox) -> ToolOu
         Err(error) => return ToolOutcome::Err(format!("search path is unavailable: {error}")),
     };
     if root_metadata.file_type().is_file() {
+        if let Some(filter) = path_filter {
+            let rel = sandbox.rel(&root);
+            if !matches_path_filter(&rel, filter) {
+                return ToolOutcome::Ok(format!("no matches for {pattern:?}"));
+            }
+        }
         return search_file(&needle, &root, limit, sandbox);
     }
     if !root_metadata.file_type().is_dir() {
@@ -1992,6 +2148,14 @@ fn search(pattern: &str, root: &Path, limit: usize, sandbox: &Sandbox) -> ToolOu
                 stack.push(path);
                 continue;
             }
+
+            if let Some(filter) = path_filter {
+                let rel = sandbox.rel(&path);
+                if !matches_path_filter(&rel, filter) {
+                    continue;
+                }
+            }
+
             files_scanned += 1;
             let Ok((bytes, grew_past_limit)) = read_regular_file_bounded(
                 &path,
@@ -2272,7 +2436,254 @@ fn write_file(path: &Path, content: &str) -> ToolOutcome {
     }
 }
 
+fn byte_offset_to_line(content: &str, byte_offset: usize) -> usize {
+    content[..byte_offset.min(content.len())]
+        .chars()
+        .filter(|&c| c == '\n')
+        .count()
+        + 1
+}
+
+fn map_lf_range_to_orig(content: &str, start_lf: usize, end_lf: usize) -> (usize, usize) {
+    let mut orig_bytes = 0usize;
+    let mut lf_bytes = 0usize;
+    let mut orig_start = None;
+    let mut orig_end = None;
+
+    let mut chars = content.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if lf_bytes == start_lf && orig_start.is_none() {
+            orig_start = Some(orig_bytes);
+        }
+        if lf_bytes == end_lf && orig_end.is_none() {
+            orig_end = Some(orig_bytes);
+            break;
+        }
+
+        if ch == '\r' && chars.peek() == Some(&'\n') {
+            chars.next();
+            orig_bytes += 2;
+            lf_bytes += 1;
+        } else {
+            orig_bytes += ch.len_utf8();
+            lf_bytes += ch.len_utf8();
+        }
+    }
+
+    let start = orig_start.unwrap_or(0);
+    let end = orig_end.unwrap_or(content.len());
+    (start, end)
+}
+
+fn adjust_indentation(new_text: &str, indent_delta: isize, crlf: bool) -> String {
+    let sep = if crlf { "\r\n" } else { "\n" };
+    let lines: Vec<&str> = new_text.lines().collect();
+    let mut result = Vec::with_capacity(lines.len());
+
+    for line in lines {
+        if line.trim().is_empty() {
+            result.push(String::new());
+        } else if indent_delta > 0 {
+            let padding = " ".repeat(indent_delta as usize);
+            result.push(format!("{padding}{line}"));
+        } else if indent_delta < 0 {
+            let trim_count = (-indent_delta) as usize;
+            let leading_spaces = line.chars().take_while(|c| *c == ' ').count();
+            let to_remove = leading_spaces.min(trim_count);
+            result.push(line[to_remove..].to_string());
+        } else {
+            result.push(line.to_string());
+        }
+    }
+
+    let mut joined = result.join(sep);
+    if new_text.ends_with('\n') {
+        joined.push_str(sep);
+    }
+    joined
+}
+
+struct LineMatchCandidate {
+    start_line: usize,
+    end_line: usize,
+    start_byte: usize,
+    end_byte: usize,
+    indent_delta: isize,
+}
+
+fn find_tolerant_line_matches(content: &str, old: &str) -> Vec<LineMatchCandidate> {
+    let file_lines: Vec<&str> = content.lines().collect();
+    let old_lines: Vec<&str> = old.lines().collect();
+    if old_lines.is_empty() || file_lines.len() < old_lines.len() {
+        return Vec::new();
+    }
+
+    let mut line_start_bytes = Vec::with_capacity(file_lines.len() + 1);
+    let mut cursor = 0usize;
+    for line in &file_lines {
+        line_start_bytes.push(cursor);
+        cursor += line.len();
+        if content[cursor..].starts_with("\r\n") {
+            cursor += 2;
+        } else if content[cursor..].starts_with('\n') {
+            cursor += 1;
+        }
+    }
+    line_start_bytes.push(cursor);
+
+    let m = old_lines.len();
+    let mut candidates = Vec::new();
+
+    for i in 0..=(file_lines.len() - m) {
+        let window = &file_lines[i..i + m];
+        let mut uniform_delta: Option<isize> = None;
+        let mut matches = true;
+
+        for (fl, ol) in window.iter().zip(old_lines.iter()) {
+            let fl_trim = fl.trim();
+            let ol_trim = ol.trim();
+
+            if ol_trim.is_empty() {
+                if !fl_trim.is_empty() {
+                    matches = false;
+                    break;
+                }
+                continue;
+            }
+
+            if fl_trim != ol_trim {
+                matches = false;
+                break;
+            }
+
+            let fl_indent = fl.chars().take_while(|c| *c == ' ').count() as isize;
+            let ol_indent = ol.chars().take_while(|c| *c == ' ').count() as isize;
+            let delta = fl_indent - ol_indent;
+
+            match uniform_delta {
+                None => uniform_delta = Some(delta),
+                Some(existing) if existing == delta => {}
+                Some(_) => {
+                    matches = false;
+                    break;
+                }
+            }
+        }
+
+        if matches {
+            let start_byte = line_start_bytes[i];
+            let end_byte = if i + m < file_lines.len() {
+                line_start_bytes[i + m]
+            } else {
+                content.len()
+            };
+            candidates.push(LineMatchCandidate {
+                start_line: i + 1,
+                end_line: i + m,
+                start_byte,
+                end_byte,
+                indent_delta: uniform_delta.unwrap_or(0),
+            });
+        }
+    }
+
+    candidates
+}
+
+fn generate_near_miss_diagnostics(content: &str, old: &str) -> String {
+    let file_lines: Vec<&str> = content.lines().collect();
+    let old_lines: Vec<&str> = old.lines().collect();
+
+    if file_lines.is_empty() {
+        return "`old` text not found: file is empty".into();
+    }
+    if old_lines.is_empty() {
+        return "`old` text cannot be empty".into();
+    }
+
+    let m = old_lines.len();
+    let mut best_score = 0.0f32;
+    let mut best_window_idx = 0usize;
+
+    for i in 0..file_lines.len() {
+        let window_len = m.min(file_lines.len() - i);
+        let window = &file_lines[i..i + window_len];
+
+        let mut score = 0.0f32;
+        for (k, fl) in window.iter().enumerate() {
+            let ol = old_lines[k];
+            if fl == &ol {
+                score += 1.0;
+            } else if fl.trim() == ol.trim() {
+                score += 0.85;
+            } else if fl.trim_end() == ol.trim_end() {
+                score += 0.9;
+            } else {
+                let dist = levenshtein_distance(fl.trim(), ol.trim());
+                let max_len = fl.trim().len().max(ol.trim().len());
+                if max_len > 0 && dist < max_len {
+                    let sim = 1.0 - (dist as f32 / max_len as f32);
+                    if sim > 0.5 {
+                        score += sim * 0.7;
+                    }
+                }
+            }
+        }
+
+        let normalized_score = score / m as f32;
+        if normalized_score > best_score {
+            best_score = normalized_score;
+            best_window_idx = i;
+        }
+    }
+
+    if best_score >= 0.35 {
+        let start_line = best_window_idx + 1;
+        let end_line = (best_window_idx + m).min(file_lines.len());
+        let window_lines = &file_lines[best_window_idx..end_line];
+
+        let mut snippet = String::new();
+        for (idx, line) in window_lines.iter().enumerate() {
+            snippet.push_str(&format!("  {:4} | {}\n", start_line + idx, line));
+        }
+
+        let hint = if let (Some(fl), Some(ol)) = (window_lines.first(), old_lines.first()) {
+            if fl.trim() == ol.trim() {
+                let fl_indent = fl.chars().take_while(|c| *c == ' ').count();
+                let ol_indent = ol.chars().take_while(|c| *c == ' ').count();
+                format!(
+                    "Hint: Indentation mismatch on line {start_line}. File uses {fl_indent} spaces; `old` had {ol_indent} spaces."
+                )
+            } else {
+                format!(
+                    "Hint: Verify differences near line {start_line}:\n  File has: `{fl}`\n  `old` had: `{ol}`"
+                )
+            }
+        } else {
+            "Hint: Verify line content and indentation with `read_file` before editing.".to_string()
+        };
+
+        format!(
+            "`old` text not found in file (0 exact matches).\n\
+             Closest match found at lines {start_line}-{end_line}:\n\
+             ----------------------------------------\n\
+             {snippet}\
+             ----------------------------------------\n\
+             {hint}"
+        )
+    } else {
+        "`old` text not found in file (0 occurrences). Inspect the target section with `read_file` before editing.".into()
+    }
+}
+
 fn edit_file(path: &Path, old: &str, new: &str) -> ToolOutcome {
+    if old.is_empty() {
+        return ToolOutcome::Err("`old` text cannot be empty".into());
+    }
+    if old == new {
+        return ToolOutcome::Err("`new` text is identical to `old` text; no changes made".into());
+    }
+
     let (bytes, grew_past_limit) = match read_regular_file_bounded(
         path,
         MAX_RANGED_FILE_BYTES,
@@ -2291,20 +2702,87 @@ fn edit_file(path: &Path, old: &str, new: &str) -> ToolOutcome {
         Ok(content) => content,
         Err(error) => return ToolOutcome::Err(format!("edit read failed: {error}")),
     };
-    let count = content.matches(old).count();
-    if count == 0 {
-        return ToolOutcome::Err("`old` text not found in file".into());
-    }
-    if count > 1 {
+
+    // 1. Exact match tier
+    let exact_matches: Vec<usize> = content.match_indices(old).map(|(idx, _)| idx).collect();
+    if exact_matches.len() == 1 {
+        let updated = content.replacen(old, new, 1);
+        return match write_regular_file(path, updated.as_bytes()) {
+            Ok(()) => ToolOutcome::Ok(format!("edited {}", path.display())),
+            Err(e) => ToolOutcome::Err(format!("write failed: {e}")),
+        };
+    } else if exact_matches.len() > 1 {
+        let lines: Vec<usize> = exact_matches
+            .iter()
+            .map(|&idx| byte_offset_to_line(&content, idx))
+            .collect();
         return ToolOutcome::Err(format!(
-            "`old` text is not unique ({count} occurrences); include more context"
+            "`old` text is not unique ({} occurrences at lines {}); include more context",
+            lines.len(),
+            lines.iter().map(|l| l.to_string()).collect::<Vec<_>>().join(", ")
         ));
     }
-    let updated = content.replacen(old, new, 1);
-    match write_regular_file(path, updated.as_bytes()) {
-        Ok(()) => ToolOutcome::Ok(format!("edited {}", path.display())),
-        Err(e) => ToolOutcome::Err(format!("write failed: {e}")),
+
+    // 2. CRLF vs LF line-ending normalization
+    let file_has_crlf = content.contains("\r\n");
+    let content_lf = content.replace("\r\n", "\n");
+    let old_lf = old.replace("\r\n", "\n");
+    if old_lf != old || file_has_crlf {
+        let norm_matches: Vec<usize> = content_lf.match_indices(&old_lf).map(|(idx, _)| idx).collect();
+        if norm_matches.len() == 1 {
+            let (start_orig, end_orig) = map_lf_range_to_orig(&content, norm_matches[0], norm_matches[0] + old_lf.len());
+            let adjusted_new = if file_has_crlf && !new.contains("\r\n") {
+                new.replace('\n', "\r\n")
+            } else {
+                new.to_string()
+            };
+            let updated = format!("{}{adjusted_new}{}", &content[..start_orig], &content[end_orig..]);
+            return match write_regular_file(path, updated.as_bytes()) {
+                Ok(()) => ToolOutcome::Ok(format!("edited {} (matched with normalized line endings)", path.display())),
+                Err(e) => ToolOutcome::Err(format!("write failed: {e}")),
+            };
+        } else if norm_matches.len() > 1 {
+            let lines: Vec<usize> = norm_matches
+                .iter()
+                .map(|&idx| byte_offset_to_line(&content_lf, idx))
+                .collect();
+            return ToolOutcome::Err(format!(
+                "`old` text is not unique ({} occurrences at lines {}); include more context",
+                lines.len(),
+                lines.iter().map(|l| l.to_string()).collect::<Vec<_>>().join(", ")
+            ));
+        }
     }
+
+    // 3. Tolerant whitespace & uniform indentation matching
+    let tolerant_candidates = find_tolerant_line_matches(&content, old);
+    if tolerant_candidates.len() == 1 {
+        let candidate = &tolerant_candidates[0];
+        let mut adjusted_new = adjust_indentation(new, candidate.indent_delta, file_has_crlf);
+        let had_trailing_newline = content[candidate.start_byte..candidate.end_byte].ends_with('\n');
+        if had_trailing_newline && !adjusted_new.ends_with('\n') {
+            adjusted_new.push_str(if file_has_crlf { "\r\n" } else { "\n" });
+        }
+        let updated = format!("{}{adjusted_new}{}", &content[..candidate.start_byte], &content[candidate.end_byte..]);
+        return match write_regular_file(path, updated.as_bytes()) {
+            Ok(()) => ToolOutcome::Ok(format!(
+                "edited {} (matched lines {}-{} after adjusting indentation/whitespace)",
+                path.display(),
+                candidate.start_line,
+                candidate.end_line
+            )),
+            Err(e) => ToolOutcome::Err(format!("write failed: {e}")),
+        };
+    } else if tolerant_candidates.len() > 1 {
+        let lines: Vec<usize> = tolerant_candidates.iter().map(|c| c.start_line).collect();
+        return ToolOutcome::Err(format!(
+            "`old` text matches multiple locations after whitespace normalization (lines {}); include more context",
+            lines.iter().map(|l| l.to_string()).collect::<Vec<_>>().join(", ")
+        ));
+    }
+
+    // 4. Actionable near-miss diagnostics when no match is found
+    ToolOutcome::Err(generate_near_miss_diagnostics(&content, old))
 }
 
 #[derive(Default)]
@@ -5195,5 +5673,134 @@ mod tests {
         let out = run("cmd /c exit 3; cmd /c exit 0");
         assert!(matches!(out, ToolOutcome::Ok(_)), "got {out:?}");
         assert!(out.text().contains("exit: 0"));
+    }
+
+    #[test]
+    fn edit_file_replaces_exact_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("code.txt");
+        std::fs::write(&file_path, "fn calculate() -> i32 {\n    return 42;\n}\n").unwrap();
+
+        let outcome = edit_file(&file_path, "return 42;", "return 100;");
+        assert!(matches!(outcome, ToolOutcome::Ok(_)));
+        let updated = std::fs::read_to_string(&file_path).unwrap();
+        assert_eq!(updated, "fn calculate() -> i32 {\n    return 100;\n}\n");
+    }
+
+    #[test]
+    fn edit_file_tolerates_crlf_vs_lf() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("crlf.txt");
+        std::fs::write(&file_path, "line 1\r\nline 2\r\nline 3\r\n").unwrap();
+
+        // Model sends standard \n in both old and new
+        let outcome = edit_file(&file_path, "line 2\n", "line 2 modified\n");
+        assert!(matches!(outcome, ToolOutcome::Ok(_)));
+        let updated = std::fs::read_to_string(&file_path).unwrap();
+        assert_eq!(updated, "line 1\r\nline 2 modified\r\nline 3\r\n");
+    }
+
+    #[test]
+    fn edit_file_tolerates_uniform_indentation_shift() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("indent.txt");
+        let initial = "function test() {\n        let a = 1;\n        let b = 2;\n        return a + b;\n}\n";
+        std::fs::write(&file_path, initial).unwrap();
+
+        // Model sends 4-space indent instead of 8-space indent in file
+        let old = "    let a = 1;\n    let b = 2;\n    return a + b;";
+        let new = "    let a = 10;\n    let b = 20;\n    return a + b;";
+
+        let outcome = edit_file(&file_path, old, new);
+        assert!(matches!(outcome, ToolOutcome::Ok(_)));
+        let updated = std::fs::read_to_string(&file_path).unwrap();
+        let expected = "function test() {\n        let a = 10;\n        let b = 20;\n        return a + b;\n}\n";
+        assert_eq!(updated, expected);
+    }
+
+    #[test]
+    fn edit_file_reports_ambiguous_line_numbers() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("dup.txt");
+        std::fs::write(&file_path, "header\nitem\nmiddle\nitem\nfooter\n").unwrap();
+
+        let outcome = edit_file(&file_path, "item", "new_item");
+        assert!(outcome.is_err());
+        let err = outcome.text();
+        assert!(err.contains("not unique"));
+        assert!(err.contains("lines 2, 4"));
+    }
+
+    #[test]
+    fn edit_file_provides_actionable_near_miss_diagnostics() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("pricing.cjs");
+        let code = "function calculateDiscount(total, discount) {\n  if (total > 10000) {\n    return total - discount;\n  }\n  return total;\n}\n";
+        std::fs::write(&file_path, code).unwrap();
+
+        // Model sends 4 spaces when file has 2 spaces, and typo in condition
+        let old = "    if (total >= 10000) {\n      return total - discount;\n    }";
+        let outcome = edit_file(&file_path, old, "    return 0;");
+        assert!(outcome.is_err());
+        let err = outcome.text();
+        assert!(err.contains("Closest match found at lines 2-4"));
+        assert!(err.contains("calculateDiscount") || err.contains("if (total > 10000)"));
+    }
+
+    #[test]
+    fn sandbox_resolve_suggests_nearest_file_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("pricing.cjs"), "// code").unwrap();
+
+        let sb = Sandbox::new(dir.path(), false, Duration::from_secs(5)).unwrap();
+
+        // Target in subfolder requested without folder prefix
+        let err = sb.resolve("pricing.cjs", true).unwrap_err();
+        assert!(err.contains("Did you mean 'src/pricing.cjs'?"));
+
+        // Extension typo
+        let err = sb.resolve("src/pricing.js", true).unwrap_err();
+        assert!(err.contains("Did you mean 'src/pricing.cjs'?"));
+    }
+
+    #[test]
+    fn search_respects_path_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        let tests = dir.path().join("tests");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&tests).unwrap();
+
+        std::fs::write(src.join("lib.rs"), "fn target_symbol() {}\n").unwrap();
+        std::fs::write(tests.join("test.rs"), "fn target_symbol() {}\n").unwrap();
+        std::fs::write(src.join("other.js"), "function target_symbol() {}\n").unwrap();
+
+        let sb = Sandbox::new(dir.path(), false, Duration::from_secs(5)).unwrap();
+
+        // 1. Search filtered by extension *.js
+        let action = validate_for(
+            ToolProfile::Full,
+            &call("search", json!({"pattern": "target_symbol", "path_filter": "*.js"})),
+            &sb,
+        ).unwrap();
+        let outcome = action.execute(&sb);
+        let text = outcome.text();
+        assert!(text.contains("other.js"));
+        assert!(!text.contains("lib.rs"));
+        assert!(!text.contains("test.rs"));
+
+        // 2. Search filtered by directory prefix src/**
+        let action = validate_for(
+            ToolProfile::Full,
+            &call("search", json!({"pattern": "target_symbol", "path_filter": "src/**"})),
+            &sb,
+        ).unwrap();
+        let outcome = action.execute(&sb);
+        let text = outcome.text();
+        assert!(text.contains("src/lib.rs") || text.contains("src\\lib.rs"));
+        assert!(text.contains("src/other.js") || text.contains("src\\other.js"));
+        assert!(!text.contains("tests/test.rs") && !text.contains("tests\\test.rs"));
     }
 }

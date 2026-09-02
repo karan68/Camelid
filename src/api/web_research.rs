@@ -1219,6 +1219,12 @@ fn classify_prompt(prompt: &str) -> ResearchDecision {
         "score right now",
         "news now",
         "weather now",
+        "weather in ",
+        "weather for ",
+        "weather report",
+        "weather forecast",
+        "forecast for ",
+        "forecast in ",
         "price now",
         "schedule now",
         "score now",
@@ -4009,7 +4015,14 @@ fn curl_single_hop(
         .host()
         .is_some_and(|host| matches!(host, Host::Domain(_)))
     {
+        let has_v4 = addresses.iter().any(|address| address.is_ipv4());
+        if has_v4 {
+            command.arg("--ipv4");
+        }
         for address in addresses {
+            if has_v4 && address.is_ipv6() {
+                continue;
+            }
             let pinned = match address {
                 IpAddr::V4(address) => format!("{host}:{port}:{address}"),
                 IpAddr::V6(address) => format!("{host}:{port}:[{address}]"),

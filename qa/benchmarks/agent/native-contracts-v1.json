@@ -102,6 +102,37 @@
       "evidence": [
         { "kind": "js_test", "file": "tools/bench/system/test-native-adapter.mjs", "marker": "outside_task_root", "platforms": ["windows", "linux"] }
       ]
+    },
+    {
+      "id": "native_edit_self_healing",
+      "evidence": [
+        { "kind": "rust_test", "file": "src/chat/tools.rs", "test": "edit_file_tolerates_uniform_indentation_shift", "platforms": ["windows", "macos", "linux"] },
+        { "kind": "rust_test", "file": "src/chat/tools.rs", "test": "edit_file_provides_actionable_near_miss_diagnostics", "platforms": ["windows", "macos", "linux"] }
+      ]
+    },
+    {
+      "id": "native_path_suggestion",
+      "evidence": [
+        { "kind": "rust_test", "file": "src/chat/tools.rs", "test": "sandbox_resolve_suggests_nearest_file_path", "platforms": ["windows", "macos", "linux"] }
+      ]
+    },
+    {
+      "id": "native_compaction_working_set",
+      "evidence": [
+        { "kind": "rust_test", "file": "src/chat/agent.rs", "test": "compaction_records_active_working_set_ledger", "platforms": ["windows", "macos", "linux"] }
+      ]
+    },
+    {
+      "id": "native_search_path_filter",
+      "evidence": [
+        { "kind": "rust_test", "file": "src/chat/tools.rs", "test": "search_respects_path_filter", "platforms": ["windows", "macos", "linux"] }
+      ]
+    },
+    {
+      "id": "native_verification_gate",
+      "evidence": [
+        { "kind": "rust_test", "file": "src/chat/agent.rs", "test": "verification_gate_requires_test_run_after_mutating_files", "platforms": ["windows", "macos", "linux"] }
+      ]
     }
   ]
 }

@@ -358,6 +358,8 @@ pub fn run_loop(
     let mut observed_file_content = false;
     let mut workspace_observations: Vec<(String, String)> = Vec::new();
     let mut successful_workspace_reads = BTreeSet::new();
+    let mut mutated_files = BTreeSet::new();
+    let mut verified_after_mutation = true;
     let mut calibration: Option<f32> = None;
 
     for _ in 0..cfg.max_steps {
@@ -452,6 +454,26 @@ pub fn run_loop(
                          invent paths or describe a fix without applying and verifying it."
                             .into(),
                     ));
+                    continue;
+                }
+                let goal_asks_verification = history.iter().any(|m| match m {
+                    AgentMsg::User(text) => {
+                        let lower = text.to_lowercase();
+                        lower.contains("verify") || lower.contains("test")
+                    }
+                    _ => false,
+                });
+                if goal_asks_verification
+                    && !mutated_files.is_empty()
+                    && !verified_after_mutation
+                    && tools.iter().any(|t| t.name == "run_shell")
+                {
+                    reporter.notice("Verification required before final answer");
+                    history.push(AgentMsg::System(format!(
+                        "You have modified files ({}) but have not executed a test or verification command since the modification. \
+                         Execute the test suite using run_shell to verify your fix before concluding.",
+                        mutated_files.iter().cloned().collect::<Vec<_>>().join(", ")
+                    )));
                     continue;
                 }
                 let missing_reads = required_workspace_reads
@@ -672,6 +694,18 @@ pub fn run_loop(
                         observed_workspace = true;
                         if matches!(action, Action::ReadFile { .. } | Action::Search { .. }) {
                             observed_file_content = true;
+                        }
+                    }
+                    if !outcome.is_err() {
+                        match &action {
+                            Action::EditFile { path, .. } | Action::WriteFile { path, .. } => {
+                                mutated_files.insert(normalize_workspace_path(&sandbox.rel(path)));
+                                verified_after_mutation = false;
+                            }
+                            Action::RunShell { .. } => {
+                                verified_after_mutation = true;
+                            }
+                            _ => {}
                         }
                     }
                     let name = action.tool_name();
@@ -1265,6 +1299,40 @@ fn estimate_tokens(history: &[AgentMsg], calibration: Option<f32>) -> u32 {
     (chars as f32 * per_char).ceil() as u32
 }
 
+fn summarize_tool_call(call: &ToolCall) -> String {
+    match call.name.as_str() {
+        "edit_file" | "write_file" | "read_file" => {
+            let path = call.args.get("path").and_then(Value::as_str).unwrap_or("");
+            if path.is_empty() {
+                call.name.clone()
+            } else {
+                format!("{}({})", call.name, path)
+            }
+        }
+        "run_shell" => {
+            let cmd = call.args.get("command").and_then(Value::as_str).unwrap_or("");
+            if cmd.is_empty() {
+                "run_shell".into()
+            } else {
+                format!("run_shell(\"{}\")", first_line(cmd, 60))
+            }
+        }
+        "search" => {
+            let pat = call.args.get("pattern").and_then(Value::as_str).unwrap_or("");
+            if pat.is_empty() {
+                "search".into()
+            } else {
+                format!("search(\"{}\")", first_line(pat, 40))
+            }
+        }
+        "list_dir" => {
+            let path = call.args.get("path").and_then(Value::as_str).unwrap_or(".");
+            format!("list_dir({})", path)
+        }
+        _ => call.name.clone(),
+    }
+}
+
 fn digest(message: &AgentMsg) -> Option<String> {
     match message {
         AgentMsg::System(_) | AgentMsg::Memory(_) | AgentMsg::Summary(_) => None,
@@ -1274,15 +1342,26 @@ fn digest(message: &AgentMsg) -> Option<String> {
             "- called: {}",
             calls
                 .iter()
-                .map(|call| call.name.as_str())
+                .map(summarize_tool_call)
                 .collect::<Vec<_>>()
                 .join(", ")
         )),
-        AgentMsg::ToolResult { name, outcome } => Some(format!(
-            "- {name} returned {} ({} bytes, content not retained)",
-            if outcome.is_err() { "an error" } else { "ok" },
-            outcome.text().len()
-        )),
+        AgentMsg::ToolResult { name, outcome } => {
+            let status = if outcome.is_err() {
+                let err_text = outcome.text();
+                if let Some(exit_line) = err_text.lines().find(|l| l.contains("exit:")) {
+                    format!("an error ({})", exit_line.trim())
+                } else {
+                    "an error".to_string()
+                }
+            } else {
+                "ok".to_string()
+            };
+            Some(format!(
+                "- {name} returned {status} ({} bytes, content not retained)",
+                outcome.text().len()
+            ))
+        }
     }
 }
 
@@ -1357,14 +1436,76 @@ pub fn compact(
         });
     }
 
+    let mut modified_files = std::collections::BTreeSet::new();
+    let mut inspected_files = std::collections::BTreeSet::new();
+    let mut last_shell_cmd: Option<(String, &'static str)> = None;
+
+    for (idx, msg) in middle.iter().enumerate() {
+        if let AgentMsg::ToolCalls(calls) = msg {
+            for call in calls {
+                match call.name.as_str() {
+                    "edit_file" | "write_file" => {
+                        if let Some(path) = call.args.get("path").and_then(Value::as_str) {
+                            let succeeded = middle.get(idx + 1).map_or(false, |next| {
+                                matches!(next, AgentMsg::ToolResult { outcome, .. } if !outcome.is_err())
+                            });
+                            if succeeded {
+                                modified_files.insert(path.to_string());
+                            }
+                        }
+                    }
+                    "read_file" => {
+                        if let Some(path) = call.args.get("path").and_then(Value::as_str) {
+                            inspected_files.insert(path.to_string());
+                        }
+                    }
+                    "run_shell" => {
+                        if let Some(cmd) = call.args.get("command").and_then(Value::as_str) {
+                            let status = middle.get(idx + 1).map_or("executed", |next| {
+                                match next {
+                                    AgentMsg::ToolResult { outcome, .. } if outcome.is_err() => "failed",
+                                    AgentMsg::ToolResult { outcome: _, .. } => "passed",
+                                    _ => "executed",
+                                }
+                            });
+                            last_shell_cmd = Some((first_line(cmd, 60), status));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    let mut ledger = String::new();
+    if !modified_files.is_empty() || !inspected_files.is_empty() || last_shell_cmd.is_some() {
+        ledger.push_str("\nActive working set:\n");
+        if !modified_files.is_empty() {
+            ledger.push_str(&format!(
+                "- Modified files: {}\n",
+                modified_files.into_iter().collect::<Vec<_>>().join(", ")
+            ));
+        }
+        if !inspected_files.is_empty() {
+            ledger.push_str(&format!(
+                "- Inspected files: {}\n",
+                inspected_files.into_iter().collect::<Vec<_>>().join(", ")
+            ));
+        }
+        if let Some((cmd, status)) = last_shell_cmd {
+            ledger.push_str(&format!("- Last command: `{cmd}` ({status})\n"));
+        }
+    }
+
     let lines = middle
         .iter()
         .filter_map(|message| digest(message))
         .collect::<Vec<_>>();
     let summary = format!(
         "[earlier steps in this session, compacted to save context - {} messages. \
-         This records what happened, not tool output; re-read anything you still need.]\n{}",
+         This records what happened, not tool output; re-read anything you still need.]{}\n{}",
         middle.len(),
+        ledger,
         lines.join("\n")
     );
     // Splice the summary in where the elided run began: after the pinned
@@ -4048,6 +4189,52 @@ mod tests {
     }
 
     #[test]
+    fn verification_gate_requires_test_run_after_mutating_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(src.join("pricing.cjs"), "const x = 1;\n").unwrap();
+        let sandbox = Sandbox::new(dir.path(), false, Duration::from_secs(5)).unwrap();
+
+        let mut driver = MockDriver {
+            steps: vec![
+                ModelStep::Calls(vec![tc("read_file", json!({"path":"src/pricing.cjs"}))]),
+                ModelStep::Calls(vec![tc(
+                    "edit_file",
+                    json!({"path":"src/pricing.cjs","old":"1","new":"2"}),
+                )]),
+                // 1. Model prematurely attempts to claim completion without testing
+                ModelStep::Text("I fixed the code!".into()),
+                // 2. Model runs tests
+                ModelStep::Calls(vec![tc("run_shell", json!({"command":"echo ok"}))]),
+                // 3. Model finishes after verification
+                ModelStep::Text("Tests verified and passed!".into()),
+            ],
+            idx: 0,
+        };
+        let mut approver = ScriptApprover(vec![Decision::Once, Decision::Once], 0);
+        let mut reporter = RecordReporter::default();
+        let mut history = vec![AgentMsg::User("Fix the bug and verify that tests pass".into())];
+        let mut config = cfg(dir.path(), false);
+        config.tool_profile = tools::ToolProfile::BenchmarkShared;
+
+        let end = run_loop(
+            &mut driver,
+            &mut approver,
+            &mut reporter,
+            &sandbox,
+            &config,
+            &AtomicBool::new(false),
+            &mut Policy::default(),
+            &mut history,
+        );
+
+        assert_eq!(end, LoopEnd::Answered);
+        assert!(reporter.notices.iter().any(|n| n.contains("Verification required")));
+        assert_eq!(reporter.text, vec!["Tests verified and passed!"]);
+    }
+
+    #[test]
     fn explicit_memory_only_follow_up_may_answer_without_a_tool() {
         let history = vec![AgentMsg::User(
             "Without reading files again, repeat the earlier code.".into(),
@@ -5049,6 +5236,53 @@ mod tests {
         let before = long_history("secret");
         let (after, _) = compact(&before, 1024, None).unwrap();
         assert!(estimate_tokens(&after, None) < estimate_tokens(&before, None));
+    }
+
+    #[test]
+    fn compaction_records_active_working_set_ledger() {
+        let mut history = vec![
+            AgentMsg::System("safety".into()),
+            AgentMsg::User("fix calculation bug".into()),
+            AgentMsg::ToolCalls(vec![tc("read_file", json!({"path": "src/pricing.cjs"}))]),
+            AgentMsg::ToolResult {
+                name: "read_file".into(),
+                outcome: ToolOutcome::Ok("const x = 1;".repeat(50)),
+            },
+            AgentMsg::ToolCalls(vec![tc("edit_file", json!({"path": "src/pricing.cjs", "old": "1", "new": "2"}))]),
+            AgentMsg::ToolResult {
+                name: "edit_file".into(),
+                outcome: ToolOutcome::Ok("edited src/pricing.cjs".into()),
+            },
+            AgentMsg::ToolCalls(vec![tc("run_shell", json!({"command": "node tests/test.cjs"}))]),
+            AgentMsg::ToolResult {
+                name: "run_shell".into(),
+                outcome: ToolOutcome::Err("error: tests failed\nexit: 1".into()),
+            },
+        ];
+        for i in 0..10 {
+            history.push(AgentMsg::ToolCalls(vec![tc("read_file", json!({"path": format!("file-{i}.js")}))]));
+            history.push(AgentMsg::ToolResult {
+                name: "read_file".into(),
+                outcome: ToolOutcome::Ok("data".repeat(50)),
+            });
+        }
+        let (after, report) = compact(&history, 1024, None).unwrap();
+        assert!(report.elided > 0);
+        let summary = after
+            .iter()
+            .find_map(|m| match m {
+                AgentMsg::Summary(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .expect("should contain summary");
+
+        assert!(summary.contains("Active working set:"));
+        assert!(summary.contains("Modified files: src/pricing.cjs"));
+        assert!(summary.contains("Inspected files:"));
+        assert!(summary.contains("src/pricing.cjs"));
+        assert!(summary.contains("Last command: `node tests/test.cjs` (failed)"));
+        assert!(summary.contains("called: edit_file(src/pricing.cjs)"));
+        assert!(summary.contains("called: run_shell(\"node tests/test.cjs\")"));
     }
 
     #[test]
