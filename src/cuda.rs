@@ -757,36 +757,49 @@ extern "C" __global__ void bitnet_f16_head_matvec(
         // driver-only Linux host would abort the process at startup — including
         // under `--gpu off`, because capability detection reaches this path
         // regardless of the GPU switch. Degrade to the CPU path instead.
-        let ptx: Ptx = std::panic::catch_unwind(|| {
-            cudarc::nvrtc::compile_ptx_with_opts(Q8_KERNEL_SRC, compile_options())
-        })
-        .map_err(|_| "CUDA NVRTC library not available".to_string())?
-        .map_err(|e| format!("nvrtc compile failed: {e}"))?;
-        let module = ctx
-            .load_module(ptx)
-            .map_err(|e| format!("load_module failed: {e}"))?;
-        let kernel = module
-            .load_function("q8_0_encoded_linear_rows")
-            .map_err(|e| format!("load_function failed: {e}"))?;
-        let kernel_block = module
-            .load_function("q8_0_block_linear_row")
-            .map_err(|e| format!("load_function (block) failed: {e}"))?;
-        let kernel_bitnet = module
-            .load_function("bitnet_i2_s_linear_rows")
-            .map_err(|e| format!("load_function (BitNet I2_S) failed: {e}"))?;
-        let kernel_bitnet_f16_head = module
-            .load_function("bitnet_f16_head_matvec")
-            .map_err(|e| format!("load_function (BitNet F16 head) failed: {e}"))?;
-        Ok(CudaBackend {
-            ctx,
-            stream,
-            kernel,
-            kernel_block,
-            kernel_bitnet,
-            kernel_bitnet_f16_head,
-            device_name,
-            weight_cache: HashMap::new(),
-            bitnet_f16_head_weight_cache: HashMap::new(),
+        //
+        // Past the announcement above a usable device exists, so failing here
+        // leaves a working GPU idle while inference silently runs on the CPU.
+        // Say so once. Failures BEFORE the announcement mean "no CUDA device on
+        // this host", which is ordinary and stays quiet.
+        (|| -> Result<CudaBackend, String> {
+            let ptx: Ptx = std::panic::catch_unwind(|| {
+                cudarc::nvrtc::compile_ptx_with_opts(Q8_KERNEL_SRC, compile_options())
+            })
+            .map_err(|_| "CUDA NVRTC library not available".to_string())?
+            .map_err(|e| format!("nvrtc compile failed: {e}"))?;
+            let module = ctx
+                .load_module(ptx)
+                .map_err(|e| format!("load_module failed: {e}"))?;
+            let kernel = module
+                .load_function("q8_0_encoded_linear_rows")
+                .map_err(|e| format!("load_function failed: {e}"))?;
+            let kernel_block = module
+                .load_function("q8_0_block_linear_row")
+                .map_err(|e| format!("load_function (block) failed: {e}"))?;
+            let kernel_bitnet = module
+                .load_function("bitnet_i2_s_linear_rows")
+                .map_err(|e| format!("load_function (BitNet I2_S) failed: {e}"))?;
+            let kernel_bitnet_f16_head = module
+                .load_function("bitnet_f16_head_matvec")
+                .map_err(|e| format!("load_function (BitNet F16 head) failed: {e}"))?;
+            Ok(CudaBackend {
+                ctx,
+                stream,
+                kernel,
+                kernel_block,
+                kernel_bitnet,
+                kernel_bitnet_f16_head,
+                device_name,
+                weight_cache: HashMap::new(),
+                bitnet_f16_head_weight_cache: HashMap::new(),
+            })
+        })()
+        .inspect_err(|reason| {
+            eprintln!(
+                "[cuda] device found but the GPU lane could not start ({reason}); \
+                 running on the CPU path instead"
+            );
         })
     }
 
