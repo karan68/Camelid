@@ -462,6 +462,12 @@ extern "C" __global__ void q8_0_encoded_linear_rows(
 // per-block integer dot is exact; the cross-block f32 reduction is reassociated
 // vs the CPU's sequential sum, so this is token-identical (not bit-identical) —
 // the same standard as the Metal GPU path. Verified by the parity audit.
+__device__ __forceinline__ int camelid_dp4a(int a, int b, int c) {
+    int d;
+    asm("dp4a.s32.s32 %0, %1, %2, %3;" : "=r"(d) : "r"(a), "r"(b), "r"(c));
+    return d;
+}
+
 extern "C" __global__ void q8_0_block_linear_row(
     const float* __restrict__ input_scales,   // [blocks_per_row]
     const signed char* __restrict__ input_quants, // [blocks_per_row * 32]
@@ -485,7 +491,7 @@ extern "C" __global__ void q8_0_block_linear_row(
         int int_sum = 0;
         #pragma unroll
         for (int k = 0; k < 8; k++) {
-            int_sum = __dp4a(wq[k], iq[k], int_sum);
+            int_sum = camelid_dp4a(wq[k], iq[k], int_sum);
         }
         partial += (float)int_sum * w_scale * input_scales[b];
     }
