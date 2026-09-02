@@ -512,7 +512,8 @@ __device__ __forceinline__ int i2_s_ternary(
     return code == 0 ? -1 : (code == 2 ? 1 : 0);
 }
 
-extern "C" __global__ void bitnet_i2_s_linear_rows(
+extern "C" {
+__global__ void bitnet_i2_s_linear_rows(
     const signed char* __restrict__ input,
     const unsigned char* __restrict__ weights,
     const int input_rows,
@@ -574,6 +575,7 @@ extern "C" __global__ void bitnet_i2_s_linear_rows(
     const long long packed_len = (long long)weight_rows * input_width / 4;
     const float scale = *reinterpret_cast<const float*>(weights + packed_len);
     output[idx] = (float)sum * activation_scales[input_row] * scale;
+}
 }
 
 // Header-free IEEE-754 binary16 conversion. The tied BitNet head stays in its
@@ -682,7 +684,10 @@ extern "C" __global__ void bitnet_f16_head_matvec(
         BACKEND
             .get_or_init(|| match init_backend() {
                 Ok(b) => Some(Mutex::new(b)),
-                Err(_) => None,
+                Err(err) => {
+                    eprintln!("[cuda] backend initialization failed: {err}");
+                    None
+                }
             })
             .as_ref()
     }
