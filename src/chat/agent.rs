@@ -1310,7 +1310,11 @@ fn summarize_tool_call(call: &ToolCall) -> String {
             }
         }
         "run_shell" => {
-            let cmd = call.args.get("command").and_then(Value::as_str).unwrap_or("");
+            let cmd = call
+                .args
+                .get("command")
+                .and_then(Value::as_str)
+                .unwrap_or("");
             if cmd.is_empty() {
                 "run_shell".into()
             } else {
@@ -1318,7 +1322,11 @@ fn summarize_tool_call(call: &ToolCall) -> String {
             }
         }
         "search" => {
-            let pat = call.args.get("pattern").and_then(Value::as_str).unwrap_or("");
+            let pat = call
+                .args
+                .get("pattern")
+                .and_then(Value::as_str)
+                .unwrap_or("");
             if pat.is_empty() {
                 "search".into()
             } else {
@@ -1461,13 +1469,14 @@ pub fn compact(
                     }
                     "run_shell" => {
                         if let Some(cmd) = call.args.get("command").and_then(Value::as_str) {
-                            let status = middle.get(idx + 1).map_or("executed", |next| {
-                                match next {
-                                    AgentMsg::ToolResult { outcome, .. } if outcome.is_err() => "failed",
+                            let status =
+                                middle.get(idx + 1).map_or("executed", |next| match next {
+                                    AgentMsg::ToolResult { outcome, .. } if outcome.is_err() => {
+                                        "failed"
+                                    }
                                     AgentMsg::ToolResult { outcome: _, .. } => "passed",
                                     _ => "executed",
-                                }
-                            });
+                                });
                             last_shell_cmd = Some((first_line(cmd, 60), status));
                         }
                     }
@@ -4214,7 +4223,9 @@ mod tests {
         };
         let mut approver = ScriptApprover(vec![Decision::Once, Decision::Once], 0);
         let mut reporter = RecordReporter::default();
-        let mut history = vec![AgentMsg::User("Fix the bug and verify that tests pass".into())];
+        let mut history = vec![AgentMsg::User(
+            "Fix the bug and verify that tests pass".into(),
+        )];
         let mut config = cfg(dir.path(), false);
         config.tool_profile = tools::ToolProfile::BenchmarkShared;
 
@@ -4230,7 +4241,10 @@ mod tests {
         );
 
         assert_eq!(end, LoopEnd::Answered);
-        assert!(reporter.notices.iter().any(|n| n.contains("Verification required")));
+        assert!(reporter
+            .notices
+            .iter()
+            .any(|n| n.contains("Verification required")));
         assert_eq!(reporter.text, vec!["Tests verified and passed!"]);
     }
 
@@ -5248,19 +5262,28 @@ mod tests {
                 name: "read_file".into(),
                 outcome: ToolOutcome::Ok("const x = 1;".repeat(50)),
             },
-            AgentMsg::ToolCalls(vec![tc("edit_file", json!({"path": "src/pricing.cjs", "old": "1", "new": "2"}))]),
+            AgentMsg::ToolCalls(vec![tc(
+                "edit_file",
+                json!({"path": "src/pricing.cjs", "old": "1", "new": "2"}),
+            )]),
             AgentMsg::ToolResult {
                 name: "edit_file".into(),
                 outcome: ToolOutcome::Ok("edited src/pricing.cjs".into()),
             },
-            AgentMsg::ToolCalls(vec![tc("run_shell", json!({"command": "node tests/test.cjs"}))]),
+            AgentMsg::ToolCalls(vec![tc(
+                "run_shell",
+                json!({"command": "node tests/test.cjs"}),
+            )]),
             AgentMsg::ToolResult {
                 name: "run_shell".into(),
                 outcome: ToolOutcome::Err("error: tests failed\nexit: 1".into()),
             },
         ];
         for i in 0..10 {
-            history.push(AgentMsg::ToolCalls(vec![tc("read_file", json!({"path": format!("file-{i}.js")}))]));
+            history.push(AgentMsg::ToolCalls(vec![tc(
+                "read_file",
+                json!({"path": format!("file-{i}.js")}),
+            )]));
             history.push(AgentMsg::ToolResult {
                 name: "read_file".into(),
                 outcome: ToolOutcome::Ok("data".repeat(50)),

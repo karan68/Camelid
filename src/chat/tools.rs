@@ -491,7 +491,10 @@ pub(crate) fn suggest_path_in_sandbox(root: &Path, raw: &str) -> Option<String> 
                     continue;
                 };
                 let rel_str = rel.to_string_lossy().replace('\\', "/");
-                let entry_stem = Path::new(&*name_str).file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                let entry_stem = Path::new(&*name_str)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("");
 
                 let score = if name_str == raw_name {
                     100
@@ -1075,7 +1078,10 @@ impl Action {
                 path_filter,
             } => {
                 if let Some(filter) = path_filter {
-                    format!("search({pattern:?}, {}, filter={filter:?}, limit={limit})", sandbox.rel(path))
+                    format!(
+                        "search({pattern:?}, {}, filter={filter:?}, limit={limit})",
+                        sandbox.rel(path)
+                    )
                 } else {
                     format!("search({pattern:?}, {}, limit={limit})", sandbox.rel(path))
                 }
@@ -1390,7 +1396,10 @@ pub fn validate_for(
         "search" => {
             let pattern = str_arg("pattern")?;
             let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
-            let path_filter = args.get("path_filter").and_then(Value::as_str).map(str::to_string);
+            let path_filter = args
+                .get("path_filter")
+                .and_then(Value::as_str)
+                .map(str::to_string);
             let max_limit = profile.search_hit_limit();
             let limit = args
                 .get("limit")
@@ -2070,7 +2079,10 @@ fn matches_path_filter(rel_path: &str, filter: &str) -> bool {
     if let Some(dir) = filter.strip_suffix('/') {
         return rel_path.starts_with(dir) || rel_path.starts_with(&format!("{dir}/"));
     }
-    let file_name = Path::new(rel_path).file_name().and_then(|f| f.to_str()).unwrap_or("");
+    let file_name = Path::new(rel_path)
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or("");
     file_name == filter || rel_path.contains(filter)
 }
 
@@ -2719,7 +2731,11 @@ fn edit_file(path: &Path, old: &str, new: &str) -> ToolOutcome {
         return ToolOutcome::Err(format!(
             "`old` text is not unique ({} occurrences at lines {}); include more context",
             lines.len(),
-            lines.iter().map(|l| l.to_string()).collect::<Vec<_>>().join(", ")
+            lines
+                .iter()
+                .map(|l| l.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
         ));
     }
 
@@ -2728,17 +2744,28 @@ fn edit_file(path: &Path, old: &str, new: &str) -> ToolOutcome {
     let content_lf = content.replace("\r\n", "\n");
     let old_lf = old.replace("\r\n", "\n");
     if old_lf != old || file_has_crlf {
-        let norm_matches: Vec<usize> = content_lf.match_indices(&old_lf).map(|(idx, _)| idx).collect();
+        let norm_matches: Vec<usize> = content_lf
+            .match_indices(&old_lf)
+            .map(|(idx, _)| idx)
+            .collect();
         if norm_matches.len() == 1 {
-            let (start_orig, end_orig) = map_lf_range_to_orig(&content, norm_matches[0], norm_matches[0] + old_lf.len());
+            let (start_orig, end_orig) =
+                map_lf_range_to_orig(&content, norm_matches[0], norm_matches[0] + old_lf.len());
             let adjusted_new = if file_has_crlf && !new.contains("\r\n") {
                 new.replace('\n', "\r\n")
             } else {
                 new.to_string()
             };
-            let updated = format!("{}{adjusted_new}{}", &content[..start_orig], &content[end_orig..]);
+            let updated = format!(
+                "{}{adjusted_new}{}",
+                &content[..start_orig],
+                &content[end_orig..]
+            );
             return match write_regular_file(path, updated.as_bytes()) {
-                Ok(()) => ToolOutcome::Ok(format!("edited {} (matched with normalized line endings)", path.display())),
+                Ok(()) => ToolOutcome::Ok(format!(
+                    "edited {} (matched with normalized line endings)",
+                    path.display()
+                )),
                 Err(e) => ToolOutcome::Err(format!("write failed: {e}")),
             };
         } else if norm_matches.len() > 1 {
@@ -2749,7 +2776,11 @@ fn edit_file(path: &Path, old: &str, new: &str) -> ToolOutcome {
             return ToolOutcome::Err(format!(
                 "`old` text is not unique ({} occurrences at lines {}); include more context",
                 lines.len(),
-                lines.iter().map(|l| l.to_string()).collect::<Vec<_>>().join(", ")
+                lines
+                    .iter()
+                    .map(|l| l.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ));
         }
     }
@@ -2759,11 +2790,16 @@ fn edit_file(path: &Path, old: &str, new: &str) -> ToolOutcome {
     if tolerant_candidates.len() == 1 {
         let candidate = &tolerant_candidates[0];
         let mut adjusted_new = adjust_indentation(new, candidate.indent_delta, file_has_crlf);
-        let had_trailing_newline = content[candidate.start_byte..candidate.end_byte].ends_with('\n');
+        let had_trailing_newline =
+            content[candidate.start_byte..candidate.end_byte].ends_with('\n');
         if had_trailing_newline && !adjusted_new.ends_with('\n') {
             adjusted_new.push_str(if file_has_crlf { "\r\n" } else { "\n" });
         }
-        let updated = format!("{}{adjusted_new}{}", &content[..candidate.start_byte], &content[candidate.end_byte..]);
+        let updated = format!(
+            "{}{adjusted_new}{}",
+            &content[..candidate.start_byte],
+            &content[candidate.end_byte..]
+        );
         return match write_regular_file(path, updated.as_bytes()) {
             Ok(()) => ToolOutcome::Ok(format!(
                 "edited {} (matched lines {}-{} after adjusting indentation/whitespace)",
@@ -5704,7 +5740,8 @@ mod tests {
     fn edit_file_tolerates_uniform_indentation_shift() {
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("indent.txt");
-        let initial = "function test() {\n        let a = 1;\n        let b = 2;\n        return a + b;\n}\n";
+        let initial =
+            "function test() {\n        let a = 1;\n        let b = 2;\n        return a + b;\n}\n";
         std::fs::write(&file_path, initial).unwrap();
 
         // Model sends 4-space indent instead of 8-space indent in file
@@ -5782,9 +5819,13 @@ mod tests {
         // 1. Search filtered by extension *.js
         let action = validate_for(
             ToolProfile::Full,
-            &call("search", json!({"pattern": "target_symbol", "path_filter": "*.js"})),
+            &call(
+                "search",
+                json!({"pattern": "target_symbol", "path_filter": "*.js"}),
+            ),
             &sb,
-        ).unwrap();
+        )
+        .unwrap();
         let outcome = action.execute(&sb);
         let text = outcome.text();
         assert!(text.contains("other.js"));
@@ -5794,9 +5835,13 @@ mod tests {
         // 2. Search filtered by directory prefix src/**
         let action = validate_for(
             ToolProfile::Full,
-            &call("search", json!({"pattern": "target_symbol", "path_filter": "src/**"})),
+            &call(
+                "search",
+                json!({"pattern": "target_symbol", "path_filter": "src/**"}),
+            ),
             &sb,
-        ).unwrap();
+        )
+        .unwrap();
         let outcome = action.execute(&sb);
         let text = outcome.text();
         assert!(text.contains("src/lib.rs") || text.contains("src\\lib.rs"));
