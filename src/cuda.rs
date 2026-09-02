@@ -462,6 +462,10 @@ extern "C" __global__ void q8_0_encoded_linear_rows(
 // per-block integer dot is exact; the cross-block f32 reduction is reassociated
 // vs the CPU's sequential sum, so this is token-identical (not bit-identical) —
 // the same standard as the Metal GPU path. Verified by the parity audit.
+// NVRTC compiles this source without the CUDA headers that declare `__dp4a`,
+// so the intrinsic is spelled out as the single PTX instruction it lowers to.
+// `dp4a.s32.s32` needs PTX ISA 5.0 / sm_61, which `compile_options` already
+// targets.
 __device__ __forceinline__ int camelid_dp4a(int a, int b, int c) {
     int d;
     asm("dp4a.s32.s32 %0, %1, %2, %3;" : "=r"(d) : "r"(a), "r"(b), "r"(c));
@@ -518,8 +522,7 @@ __device__ __forceinline__ int i2_s_ternary(
     return code == 0 ? -1 : (code == 2 ? 1 : 0);
 }
 
-extern "C" {
-__global__ void bitnet_i2_s_linear_rows(
+extern "C" __global__ void bitnet_i2_s_linear_rows(
     const signed char* __restrict__ input,
     const unsigned char* __restrict__ weights,
     const int input_rows,
@@ -581,7 +584,6 @@ __global__ void bitnet_i2_s_linear_rows(
     const long long packed_len = (long long)weight_rows * input_width / 4;
     const float scale = *reinterpret_cast<const float*>(weights + packed_len);
     output[idx] = (float)sum * activation_scales[input_row] * scale;
-}
 }
 
 // Header-free IEEE-754 binary16 conversion. The tied BitNet head stays in its
@@ -690,10 +692,7 @@ extern "C" __global__ void bitnet_f16_head_matvec(
         BACKEND
             .get_or_init(|| match init_backend() {
                 Ok(b) => Some(Mutex::new(b)),
-                Err(err) => {
-                    eprintln!("[cuda] backend initialization failed: {err}");
-                    None
-                }
+                Err(_) => None,
             })
             .as_ref()
     }
@@ -704,8 +703,8 @@ extern "C" __global__ void bitnet_f16_head_matvec(
             // compiler contract `a*b*c + sum` into a fused multiply-add, which
             // would round differently and could flip a near-tie token.
             fmad: Some(false),
-            // Target a virtual arch that supports the `__dp4a` 8-bit dot
-            // intrinsic (compute_61, Pascal+). The PTX is forward-compatible, so
+            // Target a virtual arch that supports the `dp4a` 8-bit dot
+            // instruction (compute_61, Pascal+). The PTX is forward-compatible, so
             // the driver JITs it for whatever newer GPU is present (e.g. sm_86).
             arch: Some("compute_61"),
             ..Default::default()

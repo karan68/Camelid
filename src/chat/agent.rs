@@ -359,7 +359,8 @@ pub fn run_loop(
     let mut workspace_observations: Vec<(String, String)> = Vec::new();
     let mut successful_workspace_reads = BTreeSet::new();
     let mut mutated_files = BTreeSet::new();
-    let mut verified_after_mutation = true;
+    let mut ran_command_since_mutation = true;
+    let mut verification_requested = false;
     let mut calibration: Option<f32> = None;
 
     for _ in 0..cfg.max_steps {
@@ -456,22 +457,28 @@ pub fn run_loop(
                     ));
                     continue;
                 }
-                let goal_asks_verification = history.iter().any(|m| match m {
-                    AgentMsg::User(text) => {
-                        let lower = text.to_lowercase();
-                        lower.contains("verify") || lower.contains("test")
-                    }
-                    _ => false,
-                });
-                if goal_asks_verification
+                // Premature-completion guard. A mutation that was never followed
+                // by a command is very likely unverified, so ask for one — ONCE.
+                // The nag is not repeated: a command that reports a failure is
+                // still a result the model must be free to report, and an
+                // unbounded nag turns a finished task into a step-capped one.
+                //
+                // Scoped to the benchmark profile, like the evidence gate above.
+                // The interactive agent has a human watching, and nagging one to
+                // run the build after a one-line doc edit is noise.
+                if cfg.tool_profile.is_benchmark_shared()
+                    && !verification_requested
                     && !mutated_files.is_empty()
-                    && !verified_after_mutation
+                    && !ran_command_since_mutation
                     && tools.iter().any(|t| t.name == "run_shell")
                 {
+                    verification_requested = true;
                     reporter.notice("Verification required before final answer");
                     history.push(AgentMsg::System(format!(
-                        "You have modified files ({}) but have not executed a test or verification command since the modification. \
-                         Execute the test suite using run_shell to verify your fix before concluding.",
+                        "You changed {} and have not run any command since. If this change can be \
+                         verified, run the project's build or tests with run_shell and report \
+                         exactly what it reported, including a failure. If nothing here is \
+                         verifiable, say so and finish.",
                         mutated_files.iter().cloned().collect::<Vec<_>>().join(", ")
                     )));
                     continue;
@@ -624,6 +631,9 @@ pub fn run_loop(
                         return LoopEnd::Aborted;
                     }
 
+                    // Whether the tool body actually ran, as opposed to being
+                    // refused by the approval policy before it could.
+                    let executed = !matches!(&decision, Decision::No | Decision::Abort);
                     let outcome = match decision {
                         Decision::Abort => {
                             reporter.notice("aborted by user");
@@ -696,17 +706,18 @@ pub fn run_loop(
                             observed_file_content = true;
                         }
                     }
-                    if !outcome.is_err() {
-                        match &action {
-                            Action::EditFile { path, .. } | Action::WriteFile { path, .. } => {
-                                mutated_files.insert(normalize_workspace_path(&sandbox.rel(path)));
-                                verified_after_mutation = false;
-                            }
-                            Action::RunShell { .. } => {
-                                verified_after_mutation = true;
-                            }
-                            _ => {}
+                    match &action {
+                        Action::EditFile { path, .. } | Action::WriteFile { path, .. }
+                            if !outcome.is_err() =>
+                        {
+                            mutated_files.insert(normalize_workspace_path(&sandbox.rel(path)));
+                            ran_command_since_mutation = false;
                         }
+                        // A command that ran at all clears the guard, whatever it
+                        // reported: the point is that the model looked, not that
+                        // the result was green.
+                        Action::RunShell { .. } if executed => ran_command_since_mutation = true,
+                        _ => {}
                     }
                     let name = action.tool_name();
                     reporter.tool_result(name, &outcome);
@@ -1299,6 +1310,23 @@ fn estimate_tokens(history: &[AgentMsg], calibration: Option<f32>) -> u32 {
     (chars as f32 * per_char).ceil() as u32
 }
 
+/// The working-set ledger lives inside the summary that exists to SAVE context,
+/// so a session that touched a hundred files must not paste a hundred paths.
+fn join_capped(paths: std::collections::BTreeSet<String>) -> String {
+    const MAX_LEDGER_ENTRIES: usize = 12;
+    let total = paths.len();
+    let shown = paths
+        .into_iter()
+        .take(MAX_LEDGER_ENTRIES)
+        .collect::<Vec<_>>()
+        .join(", ");
+    if total > MAX_LEDGER_ENTRIES {
+        format!("{shown} (+{} more)", total - MAX_LEDGER_ENTRIES)
+    } else {
+        shown
+    }
+}
+
 fn summarize_tool_call(call: &ToolCall) -> String {
     match call.name.as_str() {
         "edit_file" | "write_file" | "read_file" => {
@@ -1335,7 +1363,7 @@ fn summarize_tool_call(call: &ToolCall) -> String {
         }
         "list_dir" => {
             let path = call.args.get("path").and_then(Value::as_str).unwrap_or(".");
-            format!("list_dir({})", path)
+            format!("list_dir({path})")
         }
         _ => call.name.clone(),
     }
@@ -1450,14 +1478,18 @@ pub fn compact(
 
     for (idx, msg) in middle.iter().enumerate() {
         if let AgentMsg::ToolCalls(calls) = msg {
-            for call in calls {
+            for (nth, call) in calls.iter().enumerate() {
+                // `run_loop` pushes one `ToolResult` per call, in order, directly
+                // after the batch — so the nth call's result is at idx + 1 + nth,
+                // not always at idx + 1.
+                let result = match middle.get(idx + 1 + nth) {
+                    Some(AgentMsg::ToolResult { outcome, .. }) => Some(outcome),
+                    _ => None,
+                };
                 match call.name.as_str() {
                     "edit_file" | "write_file" => {
                         if let Some(path) = call.args.get("path").and_then(Value::as_str) {
-                            let succeeded = middle.get(idx + 1).map_or(false, |next| {
-                                matches!(next, AgentMsg::ToolResult { outcome, .. } if !outcome.is_err())
-                            });
-                            if succeeded {
+                            if result.is_some_and(|outcome| !outcome.is_err()) {
                                 modified_files.insert(path.to_string());
                             }
                         }
@@ -1469,14 +1501,11 @@ pub fn compact(
                     }
                     "run_shell" => {
                         if let Some(cmd) = call.args.get("command").and_then(Value::as_str) {
-                            let status =
-                                middle.get(idx + 1).map_or("executed", |next| match next {
-                                    AgentMsg::ToolResult { outcome, .. } if outcome.is_err() => {
-                                        "failed"
-                                    }
-                                    AgentMsg::ToolResult { outcome: _, .. } => "passed",
-                                    _ => "executed",
-                                });
+                            let status = match result {
+                                Some(outcome) if outcome.is_err() => "failed",
+                                Some(_) => "succeeded",
+                                None => "executed",
+                            };
                             last_shell_cmd = Some((first_line(cmd, 60), status));
                         }
                     }
@@ -1492,13 +1521,13 @@ pub fn compact(
         if !modified_files.is_empty() {
             ledger.push_str(&format!(
                 "- Modified files: {}\n",
-                modified_files.into_iter().collect::<Vec<_>>().join(", ")
+                join_capped(modified_files)
             ));
         }
         if !inspected_files.is_empty() {
             ledger.push_str(&format!(
                 "- Inspected files: {}\n",
-                inspected_files.into_iter().collect::<Vec<_>>().join(", ")
+                join_capped(inspected_files)
             ));
         }
         if let Some((cmd, status)) = last_shell_cmd {
@@ -4164,6 +4193,8 @@ mod tests {
                     "edit_file",
                     json!({"path":"src/pricing.cjs","old":"> 10000","new":">= 10000"}),
                 )]),
+                // The premature-completion guard spends the first of these.
+                ModelStep::Text("fixed and verified".into()),
                 ModelStep::Text("fixed and verified".into()),
             ],
             idx: 0,
@@ -4191,6 +4222,10 @@ mod tests {
             .results
             .iter()
             .any(|result| result.contains("call read_file with path `src/pricing.cjs`")));
+        assert!(reporter
+            .notices
+            .iter()
+            .any(|n| n.contains("Verification required")));
         assert_eq!(reporter.text, vec!["fixed and verified"]);
         assert!(std::fs::read_to_string(dir.path().join("src/pricing.cjs"))
             .unwrap()
@@ -4246,6 +4281,107 @@ mod tests {
             .iter()
             .any(|n| n.contains("Verification required")));
         assert_eq!(reporter.text, vec!["Tests verified and passed!"]);
+    }
+
+    /// The guard asks once. A command that ran and REPORTED A FAILURE is a
+    /// result the model must be free to hand back — without this, a red test
+    /// suite could never be reported and the run would step-cap instead.
+    #[test]
+    fn a_failing_verification_command_can_still_be_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(src.join("pricing.cjs"), "const x = 1;\n").unwrap();
+        let sandbox = Sandbox::new(dir.path(), false, Duration::from_secs(5)).unwrap();
+
+        let failing = if cfg!(windows) { "exit /b 1" } else { "exit 1" };
+        let mut driver = MockDriver {
+            steps: vec![
+                ModelStep::Calls(vec![tc("read_file", json!({"path":"src/pricing.cjs"}))]),
+                ModelStep::Calls(vec![tc(
+                    "edit_file",
+                    json!({"path":"src/pricing.cjs","old":"1","new":"2"}),
+                )]),
+                ModelStep::Text("I fixed the code!".into()),
+                ModelStep::Calls(vec![tc("run_shell", json!({"command": failing}))]),
+                ModelStep::Text("I applied the change; the test suite still fails.".into()),
+                // Reached only if the guard wrongly fires a second time.
+                ModelStep::Text("second attempt".into()),
+            ],
+            idx: 0,
+        };
+        let mut approver = ScriptApprover(vec![Decision::Once, Decision::Once], 0);
+        let mut reporter = RecordReporter::default();
+        let mut history = vec![AgentMsg::User("Fix the bug and run the tests".into())];
+        let mut config = cfg(dir.path(), false);
+        config.tool_profile = tools::ToolProfile::BenchmarkShared;
+
+        let end = run_loop(
+            &mut driver,
+            &mut approver,
+            &mut reporter,
+            &sandbox,
+            &config,
+            &AtomicBool::new(false),
+            &mut Policy::default(),
+            &mut history,
+        );
+
+        assert_eq!(end, LoopEnd::Answered);
+        assert_eq!(
+            reporter.text,
+            vec!["I applied the change; the test suite still fails."]
+        );
+    }
+
+    /// The guard costs at most one step. A model that will not call a tool must
+    /// still be able to finish, or an edit-only task ends in `StepCapped`.
+    #[test]
+    fn the_verification_guard_asks_once_and_then_accepts_the_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(src.join("pricing.cjs"), "const x = 1;\n").unwrap();
+        let sandbox = Sandbox::new(dir.path(), false, Duration::from_secs(5)).unwrap();
+
+        let mut driver = MockDriver {
+            steps: vec![
+                ModelStep::Calls(vec![tc("read_file", json!({"path":"src/pricing.cjs"}))]),
+                ModelStep::Calls(vec![tc(
+                    "edit_file",
+                    json!({"path":"src/pricing.cjs","old":"1","new":"2"}),
+                )]),
+                ModelStep::Text("Done; there is nothing to run here.".into()),
+                ModelStep::Text("Done; there is nothing to run here.".into()),
+            ],
+            idx: 0,
+        };
+        let mut approver = ScriptApprover(vec![Decision::Once, Decision::Once], 0);
+        let mut reporter = RecordReporter::default();
+        let mut history = vec![AgentMsg::User("Rename the constant".into())];
+        let mut config = cfg(dir.path(), false);
+        config.tool_profile = tools::ToolProfile::BenchmarkShared;
+
+        let end = run_loop(
+            &mut driver,
+            &mut approver,
+            &mut reporter,
+            &sandbox,
+            &config,
+            &AtomicBool::new(false),
+            &mut Policy::default(),
+            &mut history,
+        );
+
+        assert_eq!(end, LoopEnd::Answered);
+        assert_eq!(
+            reporter
+                .notices
+                .iter()
+                .filter(|n| n.contains("Verification required"))
+                .count(),
+            1
+        );
     }
 
     #[test]

@@ -426,7 +426,7 @@ impl Sandbox {
 }
 
 /// Compute Levenshtein edit distance between two strings.
-pub(crate) fn levenshtein_distance(a: &str, b: &str) -> usize {
+fn levenshtein_distance(a: &str, b: &str) -> usize {
     let a_chars: Vec<char> = a.chars().collect();
     let b_chars: Vec<char> = b.chars().collect();
     let mut prev: Vec<usize> = (0..=b_chars.len()).collect();
@@ -444,7 +444,7 @@ pub(crate) fn levenshtein_distance(a: &str, b: &str) -> usize {
 }
 
 /// Find closest matching file in sandbox root if a requested path does not exist.
-pub(crate) fn suggest_path_in_sandbox(root: &Path, raw: &str) -> Option<String> {
+fn suggest_path_in_sandbox(root: &Path, raw: &str) -> Option<String> {
     let raw_norm = raw.replace('\\', "/");
     let raw_path = Path::new(&raw_norm);
     let raw_name = raw_path.file_name()?.to_str()?;
@@ -459,7 +459,7 @@ pub(crate) fn suggest_path_in_sandbox(root: &Path, raw: &str) -> Option<String> 
     let mut visited_dirs = 0usize;
     let mut inspected_files = 0usize;
 
-    while let Some(dir) = stack.pop() {
+    'walk: while let Some(dir) = stack.pop() {
         visited_dirs += 1;
         if visited_dirs > 64 {
             break;
@@ -483,7 +483,7 @@ pub(crate) fn suggest_path_in_sandbox(root: &Path, raw: &str) -> Option<String> 
             } else if ft.is_file() {
                 inspected_files += 1;
                 if inspected_files > 500 {
-                    break;
+                    break 'walk;
                 }
 
                 let entry_path = entry.path();
@@ -606,7 +606,7 @@ pub fn specs_for(profile: ToolProfile, allow_net: bool, shell_mode: ShellSandbox
         },
         ToolSpec {
             name: "search".into(),
-            description: "Search UTF-8 file contents for a literal substring within the workspace. Optional path_filter filters file paths (e.g. `*.rs` or `src/**`).".into(),
+            description: "Search UTF-8 file contents for a literal substring within the workspace. This does not search filenames and does not accept regex. Optional path_filter accepts exactly one of `*.ext`, `dir/**`, or a plain file name or path fragment.".into(),
             risk: Risk::Read,
             params: json!({"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"path_filter":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":profile.search_hit_limit()}},"required":["pattern"]}),
         },
@@ -2059,31 +2059,78 @@ fn list_dir(path: &Path, offset: usize, limit: Option<usize>) -> ToolOutcome {
     })
 }
 
-fn matches_path_filter(rel_path: &str, filter: &str) -> bool {
-    let filter = filter.trim();
+/// The exact `path_filter` forms `search` understands. Anything else is
+/// refused rather than silently matching nothing, because an empty result set
+/// reads to the model as "the symbol is not there".
+///
+/// Patterns and paths are both normalized to `/` first: `Sandbox::rel` renders
+/// with the platform separator, so an un-normalized `dir/**` would silently miss
+/// every file on Windows.
+fn parse_path_filter(filter: &str) -> Result<PathFilter, String> {
+    let raw = filter.trim();
+    let normalized = raw.replace('\\', "/");
+    let filter = normalized.as_str();
     if filter.is_empty() || filter == "*" {
-        return true;
+        return Ok(PathFilter::Any);
     }
-    if let Some(ext) = filter.strip_prefix("*.") {
-        return rel_path.ends_with(&format!(".{ext}"));
+    if let Some(ext) = filter
+        .strip_prefix("*.")
+        .or_else(|| filter.strip_prefix('.'))
+    {
+        if ext.is_empty() || ext.contains(['*', '/']) {
+            return Err(unsupported_path_filter(raw));
+        }
+        return Ok(PathFilter::Extension(format!(".{ext}")));
     }
-    if let Some(ext) = filter.strip_prefix('.') {
-        return rel_path.ends_with(&format!(".{ext}"));
+    if let Some(dir) = filter
+        .strip_suffix("/**")
+        .or_else(|| filter.strip_suffix("/*"))
+        .or_else(|| filter.strip_suffix('/'))
+    {
+        if dir.is_empty() || dir.contains('*') {
+            return Err(unsupported_path_filter(raw));
+        }
+        return Ok(PathFilter::Directory(format!("{dir}/")));
     }
-    if let Some(dir) = filter.strip_suffix("/**") {
-        return rel_path.starts_with(dir) || rel_path.starts_with(&format!("{dir}/"));
+    if filter.contains('*') {
+        return Err(unsupported_path_filter(raw));
     }
-    if let Some(dir) = filter.strip_suffix("/*") {
-        return rel_path.starts_with(dir) || rel_path.starts_with(&format!("{dir}/"));
+    Ok(PathFilter::Name(filter.to_string()))
+}
+
+fn unsupported_path_filter(filter: &str) -> String {
+    format!(
+        "unsupported path_filter {filter:?}: use `*.ext` for an extension, `dir/**` for a \
+         subtree, or a plain file name or path fragment"
+    )
+}
+
+enum PathFilter {
+    Any,
+    /// Suffix including the dot, e.g. `.rs`.
+    Extension(String),
+    /// Directory prefix including the trailing slash, so `src/` cannot match
+    /// `src-generated/`.
+    Directory(String),
+    Name(String),
+}
+
+impl PathFilter {
+    fn matches(&self, rel_path: &str) -> bool {
+        let rel_path = rel_path.replace('\\', "/");
+        match self {
+            PathFilter::Any => true,
+            PathFilter::Extension(suffix) => rel_path.ends_with(suffix.as_str()),
+            PathFilter::Directory(prefix) => rel_path.starts_with(prefix.as_str()),
+            PathFilter::Name(name) => {
+                Path::new(&rel_path)
+                    .file_name()
+                    .and_then(|f| f.to_str())
+                    .is_some_and(|file_name| file_name == name)
+                    || rel_path.contains(name.as_str())
+            }
+        }
     }
-    if let Some(dir) = filter.strip_suffix('/') {
-        return rel_path.starts_with(dir) || rel_path.starts_with(&format!("{dir}/"));
-    }
-    let file_name = Path::new(rel_path)
-        .file_name()
-        .and_then(|f| f.to_str())
-        .unwrap_or("");
-    file_name == filter || rel_path.contains(filter)
 }
 
 fn search(
@@ -2094,6 +2141,10 @@ fn search(
     sandbox: &Sandbox,
 ) -> ToolOutcome {
     let needle = pattern.to_lowercase();
+    let filter = match path_filter.map(parse_path_filter).transpose() {
+        Ok(filter) => filter,
+        Err(error) => return ToolOutcome::Err(error),
+    };
     let root = match std::fs::canonicalize(root) {
         Ok(root) if sandbox.permits(&root) => root,
         _ => return ToolOutcome::Err("search path is unavailable or outside the workspace".into()),
@@ -2103,9 +2154,8 @@ fn search(
         Err(error) => return ToolOutcome::Err(format!("search path is unavailable: {error}")),
     };
     if root_metadata.file_type().is_file() {
-        if let Some(filter) = path_filter {
-            let rel = sandbox.rel(&root);
-            if !matches_path_filter(&rel, filter) {
+        if let Some(filter) = &filter {
+            if !filter.matches(&sandbox.rel(&root)) {
                 return ToolOutcome::Ok(format!("no matches for {pattern:?}"));
             }
         }
@@ -2161,9 +2211,8 @@ fn search(
                 continue;
             }
 
-            if let Some(filter) = path_filter {
-                let rel = sandbox.rel(&path);
-                if !matches_path_filter(&rel, filter) {
+            if let Some(filter) = &filter {
+                if !filter.matches(&sandbox.rel(&path)) {
                     continue;
                 }
             }
@@ -2487,6 +2536,11 @@ fn map_lf_range_to_orig(content: &str, start_lf: usize, end_lf: usize) -> (usize
     (start, end)
 }
 
+/// Re-indent `new_text` by `indent_delta` columns.
+///
+/// Indentation is measured in leading SPACES only, so a tab-indented file and a
+/// space-indented `old` resolve to a delta of zero and the replacement is
+/// written exactly as the model sent it.
 fn adjust_indentation(new_text: &str, indent_delta: isize, crlf: bool) -> String {
     let sep = if crlf { "\r\n" } else { "\n" };
     let lines: Vec<&str> = new_text.lines().collect();
@@ -2602,6 +2656,13 @@ fn find_tolerant_line_matches(content: &str, old: &str) -> Vec<LineMatchCandidat
     candidates
 }
 
+/// `generate_near_miss_diagnostics` scores every window of the file against
+/// `old`, and `levenshtein_distance` is O(a*b) per line pair. `edit_file` accepts
+/// files up to `MAX_RANGED_FILE_BYTES`, so both costs are bounded: past these
+/// budgets the generic "not found" message is returned instead of scanning on.
+const MAX_NEAR_MISS_WINDOW_COMPARISONS: usize = 2_000_000;
+const MAX_NEAR_MISS_LEVENSHTEIN_CELLS: usize = 4_000_000;
+
 fn generate_near_miss_diagnostics(content: &str, old: &str) -> String {
     let file_lines: Vec<&str> = content.lines().collect();
     let old_lines: Vec<&str> = old.lines().collect();
@@ -2614,6 +2675,10 @@ fn generate_near_miss_diagnostics(content: &str, old: &str) -> String {
     }
 
     let m = old_lines.len();
+    if file_lines.len().saturating_mul(m) > MAX_NEAR_MISS_WINDOW_COMPARISONS {
+        return NEAR_MISS_GENERIC.into();
+    }
+    let mut levenshtein_budget = MAX_NEAR_MISS_LEVENSHTEIN_CELLS;
     let mut best_score = 0.0f32;
     let mut best_window_idx = 0usize;
 
@@ -2631,8 +2696,14 @@ fn generate_near_miss_diagnostics(content: &str, old: &str) -> String {
             } else if fl.trim_end() == ol.trim_end() {
                 score += 0.9;
             } else {
-                let dist = levenshtein_distance(fl.trim(), ol.trim());
-                let max_len = fl.trim().len().max(ol.trim().len());
+                let (fl, ol) = (fl.trim(), ol.trim());
+                let cells = fl.len().saturating_mul(ol.len());
+                if cells > levenshtein_budget {
+                    continue;
+                }
+                levenshtein_budget -= cells;
+                let dist = levenshtein_distance(fl, ol);
+                let max_len = fl.len().max(ol.len());
                 if max_len > 0 && dist < max_len {
                     let sim = 1.0 - (dist as f32 / max_len as f32);
                     if sim > 0.5 {
@@ -2684,9 +2755,11 @@ fn generate_near_miss_diagnostics(content: &str, old: &str) -> String {
              {hint}"
         )
     } else {
-        "`old` text not found in file (0 occurrences). Inspect the target section with `read_file` before editing.".into()
+        NEAR_MISS_GENERIC.into()
     }
 }
+
+const NEAR_MISS_GENERIC: &str = "`old` text not found in file (0 occurrences). Inspect the target section with `read_file` before editing.";
 
 fn edit_file(path: &Path, old: &str, new: &str) -> ToolOutcome {
     if old.is_empty() {
@@ -5847,5 +5920,31 @@ mod tests {
         assert!(text.contains("src/lib.rs") || text.contains("src\\lib.rs"));
         assert!(text.contains("src/other.js") || text.contains("src\\other.js"));
         assert!(!text.contains("tests/test.rs") && !text.contains("tests\\test.rs"));
+    }
+
+    #[test]
+    fn a_directory_path_filter_does_not_match_a_sibling_with_the_same_prefix() {
+        let filter = parse_path_filter("src/**").unwrap();
+        // `Sandbox::rel` renders with the platform separator; both must behave.
+        assert!(filter.matches("src/lib.rs"));
+        assert!(filter.matches("src\\lib.rs"));
+        assert!(filter.matches("src/deep/lib.rs"));
+        assert!(!filter.matches("src-generated/lib.rs"));
+        assert!(!filter.matches("tests/src.rs"));
+    }
+
+    #[test]
+    fn an_unsupported_path_filter_is_refused_rather_than_matching_nothing() {
+        // Silently returning zero hits reads to the model as "the symbol is not
+        // there", which is a worse answer than an error it can correct.
+        for unsupported in ["src/*.rs", "**/*.rs", "src/**/tools.rs", "*.", "/"] {
+            let error = parse_path_filter(unsupported)
+                .err()
+                .unwrap_or_else(|| panic!("{unsupported} should not be accepted"));
+            assert!(error.contains("unsupported path_filter"), "{error}");
+        }
+        for supported in ["*.rs", ".rs", "src/**", "src/", "tools.rs", "*", ""] {
+            assert!(parse_path_filter(supported).is_ok(), "{supported}");
+        }
     }
 }

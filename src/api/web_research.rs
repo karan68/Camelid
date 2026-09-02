@@ -1222,9 +1222,10 @@ fn classify_prompt(prompt: &str) -> ResearchDecision {
         "weather in ",
         "weather for ",
         "weather report",
+        // Deliberately weather-anchored. A bare "forecast for" also matches
+        // "revenue forecast for next year", and a false positive here sends the
+        // user's prompt to a search engine.
         "weather forecast",
-        "forecast for ",
-        "forecast in ",
         "price now",
         "schedule now",
         "score now",
@@ -3933,6 +3934,22 @@ fn validated_redirect_target(current: &Url, location: &str) -> Result<Url, Strin
     Ok(next)
 }
 
+/// Choose which of the already-validated addresses to pin with `--resolve`.
+///
+/// A dual-stack DNS answer on a single-stack host (a v4-only GCP Compute Engine
+/// VM, say) hands curl AAAA records that can never connect, and the hop dies
+/// with `couldn't connect to server` instead of using the A record beside it.
+/// When both families are present the IPv6 addresses are dropped. A host whose
+/// only answer is IPv6 keeps it — this narrows the address set, it never empties
+/// it, so the SSRF pin still binds every address curl may reach.
+fn addresses_to_pin(addresses: &[IpAddr]) -> Vec<IpAddr> {
+    if addresses.iter().any(IpAddr::is_ipv4) {
+        addresses.iter().copied().filter(IpAddr::is_ipv4).collect()
+    } else {
+        addresses.to_vec()
+    }
+}
+
 // This is the final SSRF/auth boundary before spawning curl. Keeping every
 // validated input explicit makes accidental credential or redirect widening
 // visible at each call site.
@@ -4015,14 +4032,13 @@ fn curl_single_hop(
         .host()
         .is_some_and(|host| matches!(host, Host::Domain(_)))
     {
-        let has_v4 = addresses.iter().any(|address| address.is_ipv4());
-        if has_v4 {
+        let pinned = addresses_to_pin(addresses);
+        if pinned.len() < addresses.len() {
+            // Every address we still pin is IPv4; tell curl so too, so a cache
+            // miss cannot send it back to the resolver and out over IPv6.
             command.arg("--ipv4");
         }
-        for address in addresses {
-            if has_v4 && address.is_ipv6() {
-                continue;
-            }
+        for address in pinned {
             let pinned = match address {
                 IpAddr::V4(address) => format!("{host}:{port}:{address}"),
                 IpAddr::V6(address) => format!("{host}:{port}:[{address}]"),
@@ -4225,6 +4241,21 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
+
+    #[test]
+    fn dual_stack_answers_pin_only_the_reachable_family() {
+        let v4: IpAddr = "93.184.216.34".parse().unwrap();
+        let v4b: IpAddr = "93.184.216.35".parse().unwrap();
+        let v6: IpAddr = "2606:2800:220:1:248:1893:25c8:1946".parse().unwrap();
+
+        // Mixed answer: the IPv6 addresses are dropped so a v4-only host cannot
+        // spend the hop budget dialling an unreachable address.
+        assert_eq!(addresses_to_pin(&[v6, v4, v4b]), vec![v4, v4b]);
+        // IPv6-only answer is kept verbatim; narrowing must never empty the set,
+        // or the SSRF pin would stop binding and curl would resolve for itself.
+        assert_eq!(addresses_to_pin(&[v6]), vec![v6]);
+        assert_eq!(addresses_to_pin(&[v4]), vec![v4]);
+    }
 
     #[test]
     fn public_http_entry_point_has_a_strict_method_allowlist() {
