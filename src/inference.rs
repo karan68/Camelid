@@ -34,9 +34,11 @@ mod kv_f16;
 pub mod kv_pool;
 mod metal_resident;
 mod metal_seam;
+pub mod paged_kv;
 mod q8_block_reader;
 mod q8_runtime;
 mod q8_telemetry;
+pub mod radix_cache;
 mod rope;
 /// Test-only re-export: the gemma3 self-parity/full-forward tests in
 /// `crate::metal::tests` build their RoPE tables with the SAME oracle-form
@@ -52,8 +54,6 @@ mod spec_tree_lossless;
 pub mod speculative;
 pub mod suffix_decoding;
 pub mod token_recycling;
-pub mod paged_kv;
-pub mod radix_cache;
 mod win_pin;
 
 #[cfg(test)]
@@ -77,11 +77,6 @@ pub use kv_pool::{
     KvPoolError, KvPoolSnapshot, KvSequenceCheckpoint, KvSequenceId, KvSequenceState,
     UnifiedKvCachePool,
 };
-pub use paged_kv::{
-    paged_attention, BlockTable, PagedKvBlockPool, PhysicalBlockId, PhysicalKvBlock,
-    KV_BLOCK_TOKENS,
-};
-pub use radix_cache::{RadixCacheStats, RadixNode, RadixPrefixCache};
 pub use q8_block_reader::Q8BlockReader;
 use q8_runtime::{
     q8_0_env_flag_enabled_default_off, q8_0_env_flag_enabled_default_on_fail_closed,

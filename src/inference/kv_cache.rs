@@ -918,7 +918,10 @@ impl LlamaKvCache {
             KvDtype::Fp8E4m3 => {
                 let key_blocks = k_head_dim.div_ceil(KV_QUANT_BLOCK_VALUES);
                 let key_dst = self.quantized_offset(layer_idx, position, kv_head, key_blocks);
-                quantize_row_fp8_e4m3(key_row, &mut self.keys_fp8_e4m3[key_dst..key_dst + key_blocks]);
+                quantize_row_fp8_e4m3(
+                    key_row,
+                    &mut self.keys_fp8_e4m3[key_dst..key_dst + key_blocks],
+                );
                 if v_dim > 0 {
                     let value_blocks = v_dim.div_ceil(KV_QUANT_BLOCK_VALUES);
                     let value_dst =
@@ -932,7 +935,10 @@ impl LlamaKvCache {
             KvDtype::Fp8E5m2 => {
                 let key_blocks = k_head_dim.div_ceil(KV_QUANT_BLOCK_VALUES);
                 let key_dst = self.quantized_offset(layer_idx, position, kv_head, key_blocks);
-                quantize_row_fp8_e5m2(key_row, &mut self.keys_fp8_e5m2[key_dst..key_dst + key_blocks]);
+                quantize_row_fp8_e5m2(
+                    key_row,
+                    &mut self.keys_fp8_e5m2[key_dst..key_dst + key_blocks],
+                );
                 if v_dim > 0 {
                     let value_blocks = v_dim.div_ceil(KV_QUANT_BLOCK_VALUES);
                     let value_dst =
@@ -979,12 +985,18 @@ impl LlamaKvCache {
             KvDtype::Fp8E4m3 => {
                 let block_count = k_head_dim.div_ceil(KV_QUANT_BLOCK_VALUES);
                 let block_src = self.quantized_offset(layer_idx, position, kv_head, block_count);
-                dequantize_row_fp8_e4m3(&self.keys_fp8_e4m3[block_src..block_src + block_count], out);
+                dequantize_row_fp8_e4m3(
+                    &self.keys_fp8_e4m3[block_src..block_src + block_count],
+                    out,
+                );
             }
             KvDtype::Fp8E5m2 => {
                 let block_count = k_head_dim.div_ceil(KV_QUANT_BLOCK_VALUES);
                 let block_src = self.quantized_offset(layer_idx, position, kv_head, block_count);
-                dequantize_row_fp8_e5m2(&self.keys_fp8_e5m2[block_src..block_src + block_count], out);
+                dequantize_row_fp8_e5m2(
+                    &self.keys_fp8_e5m2[block_src..block_src + block_count],
+                    out,
+                );
             }
         }
     }

@@ -84,36 +84,62 @@ impl PhysicalKvBlock {
 
         match dtype {
             KvDtype::F32 => {
-                block.keys_f32.resize(KV_BLOCK_TOKENS * streams * k_dim, 0.0);
-                block.values_f32.resize(KV_BLOCK_TOKENS * streams * v_dim, 0.0);
+                block
+                    .keys_f32
+                    .resize(KV_BLOCK_TOKENS * streams * k_dim, 0.0);
+                block
+                    .values_f32
+                    .resize(KV_BLOCK_TOKENS * streams * v_dim, 0.0);
             }
             KvDtype::F16 => {
                 block.keys_f16.resize(KV_BLOCK_TOKENS * streams * k_dim, 0);
-                block.values_f16.resize(KV_BLOCK_TOKENS * streams * v_dim, 0);
+                block
+                    .values_f16
+                    .resize(KV_BLOCK_TOKENS * streams * v_dim, 0);
             }
             KvDtype::Q8_0 => {
                 let k_blocks = k_dim.div_ceil(KV_QUANT_BLOCK_VALUES);
                 let v_blocks = v_dim.div_ceil(KV_QUANT_BLOCK_VALUES);
-                block.keys_q8_0.resize(KV_BLOCK_TOKENS * streams * k_blocks, BlockQ8_0::default());
-                block.values_q8_0.resize(KV_BLOCK_TOKENS * streams * v_blocks, BlockQ8_0::default());
+                block
+                    .keys_q8_0
+                    .resize(KV_BLOCK_TOKENS * streams * k_blocks, BlockQ8_0::default());
+                block
+                    .values_q8_0
+                    .resize(KV_BLOCK_TOKENS * streams * v_blocks, BlockQ8_0::default());
             }
             KvDtype::Q4_0 => {
                 let k_blocks = k_dim.div_ceil(KV_QUANT_BLOCK_VALUES);
                 let v_blocks = v_dim.div_ceil(KV_QUANT_BLOCK_VALUES);
-                block.keys_q4_0.resize(KV_BLOCK_TOKENS * streams * k_blocks, BlockQ4_0::default());
-                block.values_q4_0.resize(KV_BLOCK_TOKENS * streams * v_blocks, BlockQ4_0::default());
+                block
+                    .keys_q4_0
+                    .resize(KV_BLOCK_TOKENS * streams * k_blocks, BlockQ4_0::default());
+                block
+                    .values_q4_0
+                    .resize(KV_BLOCK_TOKENS * streams * v_blocks, BlockQ4_0::default());
             }
             KvDtype::Fp8E4m3 => {
                 let k_blocks = k_dim.div_ceil(KV_QUANT_BLOCK_VALUES);
                 let v_blocks = v_dim.div_ceil(KV_QUANT_BLOCK_VALUES);
-                block.keys_fp8_e4m3.resize(KV_BLOCK_TOKENS * streams * k_blocks, BlockFp8E4m3::default());
-                block.values_fp8_e4m3.resize(KV_BLOCK_TOKENS * streams * v_blocks, BlockFp8E4m3::default());
+                block.keys_fp8_e4m3.resize(
+                    KV_BLOCK_TOKENS * streams * k_blocks,
+                    BlockFp8E4m3::default(),
+                );
+                block.values_fp8_e4m3.resize(
+                    KV_BLOCK_TOKENS * streams * v_blocks,
+                    BlockFp8E4m3::default(),
+                );
             }
             KvDtype::Fp8E5m2 => {
                 let k_blocks = k_dim.div_ceil(KV_QUANT_BLOCK_VALUES);
                 let v_blocks = v_dim.div_ceil(KV_QUANT_BLOCK_VALUES);
-                block.keys_fp8_e5m2.resize(KV_BLOCK_TOKENS * streams * k_blocks, BlockFp8E5m2::default());
-                block.values_fp8_e5m2.resize(KV_BLOCK_TOKENS * streams * v_blocks, BlockFp8E5m2::default());
+                block.keys_fp8_e5m2.resize(
+                    KV_BLOCK_TOKENS * streams * k_blocks,
+                    BlockFp8E5m2::default(),
+                );
+                block.values_fp8_e5m2.resize(
+                    KV_BLOCK_TOKENS * streams * v_blocks,
+                    BlockFp8E5m2::default(),
+                );
             }
         }
         block
@@ -154,7 +180,10 @@ impl PhysicalKvBlock {
                 }
                 if v_dim > 0 {
                     let v_start = (s_idx * KV_BLOCK_TOKENS + token_offset) * v_dim;
-                    for (dst, &src) in self.values_f16[v_start..v_start + v_dim].iter_mut().zip(value) {
+                    for (dst, &src) in self.values_f16[v_start..v_start + v_dim]
+                        .iter_mut()
+                        .zip(value)
+                    {
                         *dst = crate::tensor::f32_to_f16_bits(src);
                     }
                 }
@@ -186,7 +215,10 @@ impl PhysicalKvBlock {
                 if v_dim > 0 {
                     let v_blocks = v_dim.div_ceil(KV_QUANT_BLOCK_VALUES);
                     let v_start = (s_idx * KV_BLOCK_TOKENS + token_offset) * v_blocks;
-                    quantize_row_fp8_e4m3(value, &mut self.values_fp8_e4m3[v_start..v_start + v_blocks]);
+                    quantize_row_fp8_e4m3(
+                        value,
+                        &mut self.values_fp8_e4m3[v_start..v_start + v_blocks],
+                    );
                 }
             }
             KvDtype::Fp8E5m2 => {
@@ -196,7 +228,10 @@ impl PhysicalKvBlock {
                 if v_dim > 0 {
                     let v_blocks = v_dim.div_ceil(KV_QUANT_BLOCK_VALUES);
                     let v_start = (s_idx * KV_BLOCK_TOKENS + token_offset) * v_blocks;
-                    quantize_row_fp8_e5m2(value, &mut self.values_fp8_e5m2[v_start..v_start + v_blocks]);
+                    quantize_row_fp8_e5m2(
+                        value,
+                        &mut self.values_fp8_e5m2[v_start..v_start + v_blocks],
+                    );
                 }
             }
         }
@@ -294,12 +329,20 @@ impl PhysicalKvBlock {
             KvDtype::Fp8E4m3 => {
                 let v_blocks = v_dim.div_ceil(KV_QUANT_BLOCK_VALUES);
                 let v_start = (s_idx * KV_BLOCK_TOKENS + token_offset) * v_blocks;
-                axpy_row_fp8_e4m3(out, prob, &self.values_fp8_e4m3[v_start..v_start + v_blocks]);
+                axpy_row_fp8_e4m3(
+                    out,
+                    prob,
+                    &self.values_fp8_e4m3[v_start..v_start + v_blocks],
+                );
             }
             KvDtype::Fp8E5m2 => {
                 let v_blocks = v_dim.div_ceil(KV_QUANT_BLOCK_VALUES);
                 let v_start = (s_idx * KV_BLOCK_TOKENS + token_offset) * v_blocks;
-                axpy_row_fp8_e5m2(out, prob, &self.values_fp8_e5m2[v_start..v_start + v_blocks]);
+                axpy_row_fp8_e5m2(
+                    out,
+                    prob,
+                    &self.values_fp8_e5m2[v_start..v_start + v_blocks],
+                );
             }
         }
     }
@@ -333,7 +376,9 @@ impl PagedKvBlockPool {
         if let Some(recycled_id) = self.free_list.pop() {
             let block = self.blocks[recycled_id.as_usize()]
                 .as_mut()
-                .ok_or_else(|| BackendError::RuntimeShapeMismatch("Corrupt free block in pool".to_string()))?;
+                .ok_or_else(|| {
+                    BackendError::RuntimeShapeMismatch("Corrupt free block in pool".to_string())
+                })?;
             block.ref_count = 1;
             block.num_tokens = 0;
             self.allocated_count += 1;
@@ -365,7 +410,17 @@ impl PagedKvBlockPool {
     /// Decrement reference count. If 0, return block to free list.
     pub fn release(&mut self, id: PhysicalBlockId) {
         if let Some(Some(block)) = self.blocks.get_mut(id.as_usize()) {
-            block.ref_count = block.ref_count.saturating_sub(1);
+            // A block already at zero is on the free list. Re-releasing it previously
+            // pushed the id a second time, after which two independent `allocate()`
+            // calls handed back the SAME block and silently aliased their KV. Treat a
+            // release of an already-free block as a no-op instead.
+            // Deliberately a silent no-op rather than a debug assertion: this is the
+            // guard that keeps a caller-side double free from corrupting the pool, so
+            // it has to hold in every build profile, including tests.
+            if block.ref_count == 0 {
+                return;
+            }
+            block.ref_count -= 1;
             if block.ref_count == 0 {
                 self.free_list.push(id);
                 self.allocated_count = self.allocated_count.saturating_sub(1);
@@ -376,18 +431,22 @@ impl PagedKvBlockPool {
     /// Copy-on-Write: If block has `ref_count > 1`, clone its contents into a newly allocated block
     /// and decrement old block's ref_count.
     pub fn ensure_unique(&mut self, id: PhysicalBlockId) -> Result<PhysicalBlockId> {
-        let needs_cow = self.block(id).map_or(false, |b| b.ref_count > 1);
+        let needs_cow = self.block(id).is_some_and(|b| b.ref_count > 1);
         if !needs_cow {
             return Ok(id);
         }
 
-        let cloned_block = self.block(id)
-            .ok_or_else(|| BackendError::RuntimeShapeMismatch("Block not found for CoW".to_string()))?
+        let cloned_block = self
+            .block(id)
+            .ok_or_else(|| {
+                BackendError::RuntimeShapeMismatch("Block not found for CoW".to_string())
+            })?
             .clone();
 
         let new_id = self.allocate()?;
-        let target = self.block_mut(new_id)
-            .ok_or_else(|| BackendError::RuntimeShapeMismatch("Allocated block missing".to_string()))?;
+        let target = self.block_mut(new_id).ok_or_else(|| {
+            BackendError::RuntimeShapeMismatch("Allocated block missing".to_string())
+        })?;
 
         target.token_ids = cloned_block.token_ids;
         target.num_tokens = cloned_block.num_tokens;
@@ -396,13 +455,25 @@ impl PagedKvBlockPool {
         target.keys_f16.copy_from_slice(&cloned_block.keys_f16);
         target.values_f16.copy_from_slice(&cloned_block.values_f16);
         target.keys_q8_0.copy_from_slice(&cloned_block.keys_q8_0);
-        target.values_q8_0.copy_from_slice(&cloned_block.values_q8_0);
+        target
+            .values_q8_0
+            .copy_from_slice(&cloned_block.values_q8_0);
         target.keys_q4_0.copy_from_slice(&cloned_block.keys_q4_0);
-        target.values_q4_0.copy_from_slice(&cloned_block.values_q4_0);
-        target.keys_fp8_e4m3.copy_from_slice(&cloned_block.keys_fp8_e4m3);
-        target.values_fp8_e4m3.copy_from_slice(&cloned_block.values_fp8_e4m3);
-        target.keys_fp8_e5m2.copy_from_slice(&cloned_block.keys_fp8_e5m2);
-        target.values_fp8_e5m2.copy_from_slice(&cloned_block.values_fp8_e5m2);
+        target
+            .values_q4_0
+            .copy_from_slice(&cloned_block.values_q4_0);
+        target
+            .keys_fp8_e4m3
+            .copy_from_slice(&cloned_block.keys_fp8_e4m3);
+        target
+            .values_fp8_e4m3
+            .copy_from_slice(&cloned_block.values_fp8_e4m3);
+        target
+            .keys_fp8_e5m2
+            .copy_from_slice(&cloned_block.keys_fp8_e5m2);
+        target
+            .values_fp8_e5m2
+            .copy_from_slice(&cloned_block.values_fp8_e5m2);
 
         self.release(id);
         Ok(new_id)
@@ -433,18 +504,34 @@ impl PagedKvBlockPool {
         let k_bytes = match self.dtype {
             KvDtype::F32 => k_dim * 4,
             KvDtype::F16 => k_dim * 2,
-            KvDtype::Q8_0 => k_dim.div_ceil(KV_QUANT_BLOCK_VALUES) * std::mem::size_of::<BlockQ8_0>(),
-            KvDtype::Q4_0 => k_dim.div_ceil(KV_QUANT_BLOCK_VALUES) * std::mem::size_of::<BlockQ4_0>(),
-            KvDtype::Fp8E4m3 => k_dim.div_ceil(KV_QUANT_BLOCK_VALUES) * std::mem::size_of::<BlockFp8E4m3>(),
-            KvDtype::Fp8E5m2 => k_dim.div_ceil(KV_QUANT_BLOCK_VALUES) * std::mem::size_of::<BlockFp8E5m2>(),
+            KvDtype::Q8_0 => {
+                k_dim.div_ceil(KV_QUANT_BLOCK_VALUES) * std::mem::size_of::<BlockQ8_0>()
+            }
+            KvDtype::Q4_0 => {
+                k_dim.div_ceil(KV_QUANT_BLOCK_VALUES) * std::mem::size_of::<BlockQ4_0>()
+            }
+            KvDtype::Fp8E4m3 => {
+                k_dim.div_ceil(KV_QUANT_BLOCK_VALUES) * std::mem::size_of::<BlockFp8E4m3>()
+            }
+            KvDtype::Fp8E5m2 => {
+                k_dim.div_ceil(KV_QUANT_BLOCK_VALUES) * std::mem::size_of::<BlockFp8E5m2>()
+            }
         };
         let v_bytes = match self.dtype {
             KvDtype::F32 => v_dim * 4,
             KvDtype::F16 => v_dim * 2,
-            KvDtype::Q8_0 => v_dim.div_ceil(KV_QUANT_BLOCK_VALUES) * std::mem::size_of::<BlockQ8_0>(),
-            KvDtype::Q4_0 => v_dim.div_ceil(KV_QUANT_BLOCK_VALUES) * std::mem::size_of::<BlockQ4_0>(),
-            KvDtype::Fp8E4m3 => v_dim.div_ceil(KV_QUANT_BLOCK_VALUES) * std::mem::size_of::<BlockFp8E4m3>(),
-            KvDtype::Fp8E5m2 => v_dim.div_ceil(KV_QUANT_BLOCK_VALUES) * std::mem::size_of::<BlockFp8E5m2>(),
+            KvDtype::Q8_0 => {
+                v_dim.div_ceil(KV_QUANT_BLOCK_VALUES) * std::mem::size_of::<BlockQ8_0>()
+            }
+            KvDtype::Q4_0 => {
+                v_dim.div_ceil(KV_QUANT_BLOCK_VALUES) * std::mem::size_of::<BlockQ4_0>()
+            }
+            KvDtype::Fp8E4m3 => {
+                v_dim.div_ceil(KV_QUANT_BLOCK_VALUES) * std::mem::size_of::<BlockFp8E4m3>()
+            }
+            KvDtype::Fp8E5m2 => {
+                v_dim.div_ceil(KV_QUANT_BLOCK_VALUES) * std::mem::size_of::<BlockFp8E5m2>()
+            }
         };
         KV_BLOCK_TOKENS * streams * (k_bytes + v_bytes)
     }
@@ -487,7 +574,11 @@ impl BlockTable {
     }
 
     /// Append a token slot, allocating a new physical block if the last block is full.
-    pub fn append_token(&mut self, pool: &mut PagedKvBlockPool, token_id: u32) -> Result<(PhysicalBlockId, usize)> {
+    pub fn append_token(
+        &mut self,
+        pool: &mut PagedKvBlockPool,
+        token_id: u32,
+    ) -> Result<(PhysicalBlockId, usize)> {
         let block_idx = self.num_tokens / KV_BLOCK_TOKENS;
         let token_offset = self.num_tokens % KV_BLOCK_TOKENS;
 
@@ -546,10 +637,12 @@ pub fn paged_attention(
 
     let mut scores = Vec::with_capacity(num_tokens);
     for pos in 0..num_tokens {
-        let (block_id, token_offset) = block_table.logical_to_physical(pos)
-            .ok_or_else(|| BackendError::RuntimeShapeMismatch("Paged attention bounds error".to_string()))?;
-        let block = pool.block(block_id)
-            .ok_or_else(|| BackendError::RuntimeShapeMismatch("Physical block missing".to_string()))?;
+        let (block_id, token_offset) = block_table.logical_to_physical(pos).ok_or_else(|| {
+            BackendError::RuntimeShapeMismatch("Paged attention bounds error".to_string())
+        })?;
+        let block = pool.block(block_id).ok_or_else(|| {
+            BackendError::RuntimeShapeMismatch("Physical block missing".to_string())
+        })?;
         let score = block.dot_key(token_offset, layer_idx, kv_head, query, &pool.plan) * scale;
         scores.push(score);
     }
@@ -632,8 +725,15 @@ mod tests {
 
         // Appending to table2 triggers CoW on the last block
         table2.append_token(&mut pool, 100).unwrap();
-        assert_ne!(table1.blocks[1], table2.blocks[1], "Block 1 should be cloned on write");
-        assert_eq!(pool.block(table1.blocks[0]).unwrap().ref_count, 2, "Block 0 remains shared");
+        assert_ne!(
+            table1.blocks[1], table2.blocks[1],
+            "Block 1 should be cloned on write"
+        );
+        assert_eq!(
+            pool.block(table1.blocks[0]).unwrap().ref_count,
+            2,
+            "Block 0 remains shared"
+        );
     }
 
     #[test]
@@ -658,5 +758,64 @@ mod tests {
         for &val in &out {
             assert!((val - 0.50).abs() < 0.05, "Expected ~0.50, got {val}");
         }
+    }
+
+    /// Regression: `release` decremented with `saturating_sub` and then pushed to the
+    /// free list whenever the count read zero. Releasing an already-free block left the
+    /// count at zero, so the condition fired again and the id landed on the free list a
+    /// second time — after which two independent `allocate()` calls handed back the
+    /// SAME block and silently aliased their KV.
+    #[test]
+    fn releasing_an_already_free_block_cannot_alias_it() {
+        let mut pool = PagedKvBlockPool::new(dummy_plan(), KvDtype::F32, 8);
+        let b = pool.allocate().unwrap();
+
+        pool.release(b);
+        let free_after_first = pool.free_count();
+        pool.release(b);
+        assert_eq!(
+            pool.free_count(),
+            free_after_first,
+            "a redundant release must not enqueue the block twice"
+        );
+
+        let x = pool.allocate().unwrap();
+        let y = pool.allocate().unwrap();
+        assert_ne!(x, y, "two allocations must never return the same block");
+    }
+
+    /// Copy-on-write hands the writer a private block and drops its share of the
+    /// original, leaving the other holder as sole owner.
+    #[test]
+    fn copy_on_write_splits_ownership_exactly_once() {
+        let mut pool = PagedKvBlockPool::new(dummy_plan(), KvDtype::F32, 8);
+        let shared = pool.allocate().unwrap();
+        pool.retain(shared); // two holders
+        assert_eq!(pool.block(shared).unwrap().ref_count, 2);
+
+        let private = pool.ensure_unique(shared).unwrap();
+        assert_ne!(private, shared, "a shared block must be cloned on write");
+        assert_eq!(
+            pool.block(shared).unwrap().ref_count,
+            1,
+            "the writer's share of the original is dropped"
+        );
+        assert_eq!(pool.block(private).unwrap().ref_count, 1);
+
+        // An unshared block is returned as-is rather than needlessly copied.
+        assert_eq!(pool.ensure_unique(private).unwrap(), private);
+    }
+
+    /// The pool is a fixed budget: exhausting it reports an error rather than
+    /// over-allocating, and recycling makes capacity available again.
+    #[test]
+    fn exhausting_the_pool_reports_a_budget_error_and_recovers() {
+        let capacity = 4;
+        let mut pool = PagedKvBlockPool::new(dummy_plan(), KvDtype::F32, capacity);
+        let blocks: Vec<_> = (0..capacity).map(|_| pool.allocate().unwrap()).collect();
+        assert!(pool.allocate().is_err(), "capacity must be a hard bound");
+
+        pool.release(blocks[0]);
+        assert!(pool.allocate().is_ok(), "a freed block is reusable");
     }
 }
