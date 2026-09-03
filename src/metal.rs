@@ -73,7 +73,7 @@ fn attention_matmul_prefill_q8_stage_bytes(
 mod attention_matmul_prefill_shape_tests {
     use super::{
         attention_matmul_prefill_head_dim_supported, attention_matmul_prefill_q8_stage_bytes,
-        attention_matmul_prefill_rows_fit,
+        attention_matmul_prefill_rows_fit, kquant_mm_stage_bytes,
     };
 
     #[test]
@@ -118,6 +118,28 @@ mod attention_matmul_prefill_shape_tests {
             attention_matmul_prefill_q8_stage_bytes(0, 1_000, 64, usize::MAX),
             None
         );
+    }
+
+    /// The K-quant half panel is the one allocation this lane adds, and it is sized to the
+    /// largest projection in the model rather than to the prompt -- an 8B's ffn pair is
+    /// ~117 MB. It must decline the lane rather than allocate past the cap, and it must not
+    /// wrap: `rows * k * 2` overflows usize for a shape a corrupt header could claim.
+    #[test]
+    fn kquant_staging_fails_closed_before_an_oversized_or_overflowed_panel() {
+        // Llama-3.2-3B's ffn pair: 8192 rows contracting over 3072.
+        let needed = 8192 * 3072 * std::mem::size_of::<u16>();
+        assert_eq!(kquant_mm_stage_bytes(8192, 3072, needed), Some(needed));
+        assert_eq!(
+            kquant_mm_stage_bytes(8192, 3072, needed - 1),
+            None,
+            "a panel one byte over the scratch cap must decline the lane, not allocate"
+        );
+        assert_eq!(
+            kquant_mm_stage_bytes(usize::MAX, 2, usize::MAX),
+            None,
+            "checked shape arithmetic must reject overflow"
+        );
+        assert_eq!(kquant_mm_stage_bytes(0, 3072, usize::MAX), None);
     }
 }
 
@@ -14112,6 +14134,27 @@ fn kquant_mm_prefill_enabled() -> bool {
     })
 }
 
+/// Additionally admit the K-quant MM lane to the attention-as-matmul prefill.
+///
+/// Separate from `kquant_mm_prefill_enabled` because the two differ in kind, not just in
+/// degree. Staging the projections is TOKEN-IDENTICAL — verified at 871 and 1205 positions
+/// — and takes prefill 12 339 -> 899 ms. Admitting attention takes it further, to 595 ms,
+/// but attention-as-matmul stages K/Q scores as half, and on a K-quant model's flatter
+/// logits that moves greedy output (divergence at generated token 4 on Llama-3.2-1B-Q4_K_M,
+/// deterministic across processes). It is the same precision trade the Q8_0 lane already
+/// makes by default, but it should not be forced on anyone who armed the lane for the
+/// lossless part.
+///
+/// Requires `CAMELID_METAL_KQUANT_MM=1` as well; on its own it does nothing.
+#[cfg(target_os = "macos")]
+fn kquant_attn_mm_prefill_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("CAMELID_METAL_KQUANT_ATTN_MM")
+            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    })
+}
+
 /// Bytes for the K-quant half staging panel: the largest single projection in the model,
 /// reused by every projection of every layer. `None` when it would exceed the scratch cap,
 /// which declines the lane rather than allocating it.
@@ -24782,6 +24825,29 @@ impl ResidentDecodeState {
             .iter()
             .flatten()
             .all(|w| w.format == ResidentWeightFormat::Q8_0);
+        // Every resident weight is Q4_K or Q6_K -- the shape a Q4_K_M download has, which
+        // mixes the two. Q5_K is excluded: it has no dequant kernel here, and one mixed-in
+        // Q5_K tensor would silently fall back per projection rather than per model.
+        let all_kquant_mm = resident.iter().flatten().all(|w| {
+            matches!(
+                w.format,
+                ResidentWeightFormat::Q4K | ResidentWeightFormat::Q6K
+            )
+        });
+        // The panel is reused by every projection of every layer, so it only has to hold
+        // the largest one. `down` contracts over ffn_dim into hidden rows; `gate`/`up`
+        // expand hidden into ffn_dim rows -- both are hidden * ffn_dim elements, and that
+        // dominates the attention projections whenever ffn_dim >= q_dim.
+        let kq_stage_bytes = (all_kquant_mm && kquant_mm_prefill_enabled())
+            .then(|| {
+                kquant_mm_stage_bytes(
+                    self.ffn_dim.max(q_dim).max(kv_dim),
+                    self.ffn_dim.max(self.hidden),
+                    attn_mm_scratch_cap_bytes(),
+                )
+            })
+            .flatten();
+        let use_kq_mm = kq_stage_bytes.is_some();
         let resident_moe: Vec<Option<ResidentMoeResolved>> = if has_moe {
             let mut cache = metal_linear_cache().lock().ok()?;
             layers
@@ -24851,10 +24917,23 @@ impl ResidentDecodeState {
         // MoE layers ride the f16 stream only when the routed path is the id-GEMM + panel
         // add (those have half variants); the grouped-GEMV fallback reads/writes f32.
         let use_attn_mm = (!has_moe || (moe_prefill_mm_enabled() && moe_prefill_grouped_enabled()))
-            && !self.kv16
+            // An F16 primary IS the half cache this path reads, exactly as it is for the
+            // split-K decode attention: `attn_k16`/`attn_v16` below bind the primary
+            // instead of the (empty) mirrors. Scoped to the K-quant MM lane rather than
+            // opened for every kv16 primary, so the blast radius is the lane being
+            // measured -- a Q8_0 model forced to `CAMELID_METAL_KV_DTYPE=f16` keeps its
+            // current behaviour.
+            && (!self.kv16 || (use_kq_mm && kquant_attn_mm_prefill_enabled()))
             && (!self.kvq8 || stage_q8_kv)
             && (!stage_q8_kv || q8_stage_bytes.is_some())
-            && all_q8
+            // A K-quant model staged onto the MM lane has the same half activation stream
+            // this path needs; the attention matmuls never touch a weight, so `all_q8` was
+            // only ever standing in for "the f16 stream is available". Note the surviving
+            // `!self.kv16` conjunct above still excludes the K-quant DEFAULT, whose primary
+            // is F16 — this admits a K-quant model only when it is running an F32 primary.
+            // Admitting the F16 primary needs the same "the primary IS the half cache"
+            // binding the split-K path uses, at the `cache_k16`/`cache_v16` sites below.
+            && (all_q8 || (use_kq_mm && kquant_attn_mm_prefill_enabled()))
             && mm_prefill_enabled()
             && !has_qk_norm
             && attention_matmul_prefill_rows_fit(n_tokens, self.max_positions)
@@ -24889,7 +24968,17 @@ impl ResidentDecodeState {
         // fused rope+scatter kernel -- which would have been the wrong shape anyway, since
         // Q8 needs a per-32-element-block amax and the fused kernel runs one thread per
         // RoPE pair. The convert is now guarded on `!use_h16` to match.
-        let use_h16 = use_attn_mm && half_rope * 2 == self.head_dim;
+        // Excludes the F16-primary lane. The es=2 stream has exactly two producers for the
+        // half query panel -- the fused rope+scatter, and `rope_rotate_batch_h` on the Q8
+        // lane -- and an F16 primary can use neither: the fused kernel writes K into both
+        // cache_k and cache_k16 (the second of which does not exist here), and
+        // `rope_rotate_batch_h` belongs to the Q8 scatter. With both declined, nothing
+        // would write `q_h` and attention would read an uninitialized panel. Keeping es=4
+        // routes Q through the guarded `!use_fused_rope && !use_h16` f32->half convert
+        // instead, which costs one dispatch per layer; the receipt for the Q8 lane records
+        // es=2 as a fidelity and dispatch-count improvement, not a throughput one, so this
+        // gives up nothing measurable.
+        let use_h16 = use_attn_mm && !self.kv16 && half_rope * 2 == self.head_dim;
         let es = if use_h16 { 2 } else { 4 }; // element size of the activation stream
         let seq = nb(n_tokens * self.hidden * es);
         let seq_out = nb(n_tokens * self.hidden * es);
@@ -25037,29 +25126,6 @@ impl ResidentDecodeState {
         // ~85% of the prefill and the batched-column GEMV is issue-bound); only the
         // attention-as-matmul/f16-stream path is declined so the residual stream stays f32
         // for the routed-expert kernels.
-        // Every resident weight is Q4_K or Q6_K -- the shape a Q4_K_M download has, which
-        // mixes the two. Q5_K is excluded: it has no dequant kernel here, and one mixed-in
-        // Q5_K tensor would silently fall back per projection rather than per model.
-        let all_kquant_mm = resident.iter().flatten().all(|w| {
-            matches!(
-                w.format,
-                ResidentWeightFormat::Q4K | ResidentWeightFormat::Q6K
-            )
-        });
-        // The panel is reused by every projection of every layer, so it only has to hold
-        // the largest one. `down` contracts over ffn_dim into hidden rows; `gate`/`up`
-        // expand hidden into ffn_dim rows -- both are hidden * ffn_dim elements, and that
-        // dominates the attention projections whenever ffn_dim >= q_dim.
-        let kq_stage_bytes = (all_kquant_mm && kquant_mm_prefill_enabled())
-            .then(|| {
-                kquant_mm_stage_bytes(
-                    self.ffn_dim.max(q_dim).max(kv_dim),
-                    self.ffn_dim.max(self.hidden),
-                    attn_mm_scratch_cap_bytes(),
-                )
-            })
-            .flatten();
-        let use_kq_mm = kq_stage_bytes.is_some();
         let use_mm = (all_q8 || use_kq_mm)
             && mm_prefill_enabled()
             && q_dim.is_multiple_of(128)
@@ -25588,7 +25654,13 @@ impl ResidentDecodeState {
             // twin of that kernel. Decoupling it from use_attn_mm keeps this change to the
             // attention path; the unfused RoPE costs three dispatches instead of one per
             // layer, which is small next to the O(n^2) attention win being unblocked.
-            let use_fused_rope = use_attn_mm && !stage_q8_kv && half_rope * 2 == self.head_dim;
+            // Also excludes an F16 primary, for the same reason it excludes the Q8 lane:
+            // this kernel writes rotated K into cache_k AND cache_k16, and under a half
+            // primary the first is already half while the second is an empty Vec. The
+            // unfused RoPE costs three dispatches instead of one per layer, which is small
+            // next to the O(n^2) attention win it unblocks.
+            let use_fused_rope =
+                use_attn_mm && !stage_q8_kv && !self.kv16 && half_rope * 2 == self.head_dim;
             if use_fused_rope {
                 // Fused rope(Q)->half panel + rope(K)->caches + V scatter, one dispatch.
                 e.set_compute_pipeline_state(if use_h16 {
@@ -25910,13 +25982,21 @@ impl ResidentDecodeState {
                         );
                     }
                 }
+                // Three sources of half K/V, in the order their primaries compress:
+                // a Q8 primary stages into a transient panel, an F16 primary IS the half
+                // cache, and an F32 primary keeps persistent mirrors. Same layout and the
+                // same max_positions stride in all three.
                 let attn_k16: &Buffer = if stage_q8_kv {
                     &q8_k_stage
+                } else if self.kv16 {
+                    &self.cache_k[i]
                 } else {
                     &self.cache_k16[i]
                 };
                 let attn_v16: &Buffer = if stage_q8_kv {
                     &q8_v_stage
+                } else if self.kv16 {
+                    &self.cache_v[i]
                 } else {
                     &self.cache_v16[i]
                 };
