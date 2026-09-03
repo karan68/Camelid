@@ -14,6 +14,8 @@ pub enum KvCacheQuantization {
     F16,
     Q8_0,
     Q4_0,
+    Fp8E4m3,
+    Fp8E5m2,
 }
 
 impl fmt::Display for KvCacheQuantization {
@@ -22,6 +24,8 @@ impl fmt::Display for KvCacheQuantization {
             Self::F16 => write!(f, "f16"),
             Self::Q8_0 => write!(f, "q8_0"),
             Self::Q4_0 => write!(f, "q4_0"),
+            Self::Fp8E4m3 => write!(f, "fp8_e4m3"),
+            Self::Fp8E5m2 => write!(f, "fp8_e5m2"),
         }
     }
 }
@@ -34,8 +38,10 @@ impl std::str::FromStr for KvCacheQuantization {
             "f16" | "fp16" | "none" | "off" => Ok(Self::F16),
             "q8_0" | "q80" | "q8" => Ok(Self::Q8_0),
             "q4_0" | "q40" | "q4" => Ok(Self::Q4_0),
+            "fp8_e4m3" | "fp8_e4" | "fp8" | "e4m3" => Ok(Self::Fp8E4m3),
+            "fp8_e5m2" | "fp8_e5" | "e5m2" => Ok(Self::Fp8E5m2),
             _ => Err(format!(
-                "unknown kv cache quantization format '{s}'; supported: f16, q8_0, q4_0"
+                "unknown kv cache quantization format '{s}'; supported: f16, q8_0, q4_0, fp8_e4m3, fp8_e5m2"
             )),
         }
     }
@@ -73,6 +79,42 @@ impl Default for BlockQ4_0 {
         Self {
             scale: 0,
             qs: [0; KV_QUANT_BLOCK_VALUES / 2],
+        }
+    }
+}
+
+/// Block of 32 FP16/FP32 elements quantized to 8-bit FP8 E4M3FN (with f16 block scale).
+/// Storage per 32 elements: 1 f16 scale (2 bytes) + 32 u8 values (32 bytes) = 34 bytes.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockFp8E4m3 {
+    pub scale: u16, // f16 bits
+    pub qs: [u8; KV_QUANT_BLOCK_VALUES],
+}
+
+impl Default for BlockFp8E4m3 {
+    fn default() -> Self {
+        Self {
+            scale: 0,
+            qs: [0; KV_QUANT_BLOCK_VALUES],
+        }
+    }
+}
+
+/// Block of 32 FP16/FP32 elements quantized to 8-bit FP8 E5M2 (with f16 block scale).
+/// Storage per 32 elements: 1 f16 scale (2 bytes) + 32 u8 values (32 bytes) = 34 bytes.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockFp8E5m2 {
+    pub scale: u16, // f16 bits
+    pub qs: [u8; KV_QUANT_BLOCK_VALUES],
+}
+
+impl Default for BlockFp8E5m2 {
+    fn default() -> Self {
+        Self {
+            scale: 0,
+            qs: [0; KV_QUANT_BLOCK_VALUES],
         }
     }
 }
@@ -294,6 +336,325 @@ pub fn axpy_row_q4_0(out: &mut [f32], probability: f32, value_blocks: &[BlockQ4_
                 packed >> 4
             };
             *out_value = (probability * d).mul_add(quant as f32 - 8.0, *out_value);
+        }
+    }
+}
+
+// =========================================================================
+// FP8 E4M3 (E4M3FN) and E5M2 Quantization & Attention Primitives
+// =========================================================================
+
+/// Convert a single f32 value to an 8-bit FP8 E4M3FN byte.
+/// Exponent bias: 7. Range: ~1.95e-3 to 448.0. NaN: 0x7F / 0xFF.
+#[inline]
+pub fn f32_to_fp8_e4m3(val: f32) -> u8 {
+    let bits = val.to_bits();
+    let sign = ((bits >> 31) & 1) as u8;
+    let abs_v = val.abs();
+
+    if abs_v == 0.0 || !abs_v.is_finite() {
+        if val.is_nan() {
+            return (sign << 7) | 0x7F;
+        }
+        if val.is_infinite() {
+            return (sign << 7) | 0x7E; // Clamped to max finite
+        }
+        return sign << 7;
+    }
+
+    // Subnormal threshold: 2^-6 * (1/8) = 2^-9 = 1.0 / 512.0
+    if abs_v < 0.015625 {
+        let m = (abs_v * 512.0).round() as u32;
+        if m == 0 {
+            return sign << 7;
+        }
+        if m >= 8 {
+            return (sign << 7) | (1 << 3);
+        }
+        return (sign << 7) | (m as u8);
+    }
+
+    if abs_v >= 448.0 {
+        return (sign << 7) | 0x7E;
+    }
+
+    let f32_exp = ((bits >> 23) & 0xFF) as i32;
+    let f32_mant = bits & 0x7FFFFF;
+    let mut new_exp = f32_exp - 127 + 7;
+
+    let mut mant_3bit = (f32_mant + 0x80000) >> 20;
+    if mant_3bit >= 8 {
+        new_exp += 1;
+        mant_3bit = 0;
+    }
+
+    if new_exp >= 15 {
+        let m = (((abs_v / 256.0) - 1.0) * 8.0).round().clamp(0.0, 6.0) as u8;
+        return (sign << 7) | (0xF << 3) | m;
+    }
+    if new_exp < 1 {
+        let m = (abs_v * 512.0).round().clamp(0.0, 7.0) as u8;
+        return (sign << 7) | m;
+    }
+
+    (sign << 7) | ((new_exp as u8) << 3) | (mant_3bit as u8)
+}
+
+/// Convert an 8-bit FP8 E4M3FN byte to f32.
+#[inline]
+pub fn fp8_e4m3_to_f32(byte: u8) -> f32 {
+    let sign = if (byte & 0x80) != 0 { -1.0f32 } else { 1.0f32 };
+    let exp = (byte >> 3) & 0x0F;
+    let mant = byte & 0x07;
+
+    if byte == 0x7F || byte == 0xFF {
+        return f32::NAN;
+    }
+    if exp == 0 {
+        if mant == 0 {
+            return if (byte & 0x80) != 0 { -0.0 } else { 0.0 };
+        }
+        return sign * (mant as f32) * (1.0 / 512.0);
+    }
+    let scale = (2.0f32).powi(exp as i32 - 7);
+    let frac = 1.0 + (mant as f32) * 0.125;
+    sign * scale * frac
+}
+
+/// Convert a single f32 value to an 8-bit FP8 E5M2 byte.
+/// Exponent bias: 15. Range: ~1.52e-5 to 57344.0.
+#[inline]
+pub fn f32_to_fp8_e5m2(val: f32) -> u8 {
+    let bits = val.to_bits();
+    let sign = ((bits >> 31) & 1) as u8;
+    let abs_v = val.abs();
+
+    if abs_v == 0.0 || !abs_v.is_finite() {
+        if val.is_nan() {
+            return (sign << 7) | (0x1F << 2) | 0x1;
+        }
+        if val.is_infinite() {
+            return (sign << 7) | (0x1F << 2);
+        }
+        return sign << 7;
+    }
+
+    // Subnormal threshold: 2^-14 * (1/4) = 2^-16 = 1.0 / 65536.0
+    if abs_v < 0.00006103515625 {
+        let m = (abs_v * 65536.0).round() as u32;
+        if m == 0 {
+            return sign << 7;
+        }
+        if m >= 4 {
+            return (sign << 7) | (1 << 2);
+        }
+        return (sign << 7) | (m as u8);
+    }
+
+    if abs_v >= 57344.0 {
+        return (sign << 7) | (0x1E << 2) | 0x3;
+    }
+
+    let f32_exp = ((bits >> 23) & 0xFF) as i32;
+    let f32_mant = bits & 0x7FFFFF;
+    let mut new_exp = f32_exp - 127 + 15;
+
+    let mut mant_2bit = (f32_mant + 0x100000) >> 21;
+    if mant_2bit >= 4 {
+        new_exp += 1;
+        mant_2bit = 0;
+    }
+
+    if new_exp >= 31 {
+        return (sign << 7) | (0x1E << 2) | 0x3;
+    }
+    if new_exp < 1 {
+        let m = (abs_v * 65536.0).round().clamp(0.0, 3.0) as u8;
+        return (sign << 7) | m;
+    }
+
+    (sign << 7) | ((new_exp as u8) << 2) | (mant_2bit as u8)
+}
+
+/// Convert an 8-bit FP8 E5M2 byte to f32.
+#[inline]
+pub fn fp8_e5m2_to_f32(byte: u8) -> f32 {
+    let sign = if (byte & 0x80) != 0 { -1.0f32 } else { 1.0f32 };
+    let exp = (byte >> 2) & 0x1F;
+    let mant = byte & 0x03;
+
+    if exp == 31 {
+        if mant == 0 {
+            return sign * f32::INFINITY;
+        } else {
+            return f32::NAN;
+        }
+    }
+    if exp == 0 {
+        if mant == 0 {
+            return if (byte & 0x80) != 0 { -0.0 } else { 0.0 };
+        }
+        return sign * (mant as f32) * (1.0 / 65536.0);
+    }
+    let scale = (2.0f32).powi(exp as i32 - 15);
+    let frac = 1.0 + (mant as f32) * 0.25;
+    sign * scale * frac
+}
+
+pub fn quantize_block_fp8_e4m3(src: &[f32; KV_QUANT_BLOCK_VALUES]) -> BlockFp8E4m3 {
+    let mut amax = 0.0f32;
+    for &v in src {
+        let abs_v = v.abs();
+        if abs_v > amax {
+            amax = abs_v;
+        }
+    }
+    let d = amax / 448.0;
+    let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+    let mut qs = [0u8; KV_QUANT_BLOCK_VALUES];
+    for i in 0..KV_QUANT_BLOCK_VALUES {
+        qs[i] = f32_to_fp8_e4m3(src[i] * id);
+    }
+    BlockFp8E4m3 {
+        scale: super::f32_to_f16_bits(d),
+        qs,
+    }
+}
+
+pub fn dequantize_block_fp8_e4m3(block: &BlockFp8E4m3, dst: &mut [f32]) {
+    debug_assert!(dst.len() <= KV_QUANT_BLOCK_VALUES);
+    let d = super::f16_bits_to_f32(block.scale);
+    for (i, value) in dst.iter_mut().enumerate() {
+        *value = fp8_e4m3_to_f32(block.qs[i]) * d;
+    }
+}
+
+pub fn vec_dot_fp8_e4m3(query: &[f32], key_block: &BlockFp8E4m3) -> f32 {
+    debug_assert!(query.len() <= KV_QUANT_BLOCK_VALUES);
+    let d = super::f16_bits_to_f32(key_block.scale);
+    let mut sum = 0.0f32;
+    for (i, &query_value) in query.iter().enumerate() {
+        sum += query_value * fp8_e4m3_to_f32(key_block.qs[i]);
+    }
+    sum * d
+}
+
+pub fn quantize_row_fp8_e4m3(src: &[f32], dst: &mut [BlockFp8E4m3]) {
+    debug_assert_eq!(dst.len(), src.len().div_ceil(KV_QUANT_BLOCK_VALUES));
+    for (block, chunk) in dst.iter_mut().zip(src.chunks(KV_QUANT_BLOCK_VALUES)) {
+        let mut values = [0.0f32; KV_QUANT_BLOCK_VALUES];
+        values[..chunk.len()].copy_from_slice(chunk);
+        *block = quantize_block_fp8_e4m3(&values);
+    }
+}
+
+pub fn dequantize_row_fp8_e4m3(src: &[BlockFp8E4m3], dst: &mut [f32]) {
+    debug_assert_eq!(src.len(), dst.len().div_ceil(KV_QUANT_BLOCK_VALUES));
+    for (block, chunk) in src.iter().zip(dst.chunks_mut(KV_QUANT_BLOCK_VALUES)) {
+        dequantize_block_fp8_e4m3(block, chunk);
+    }
+}
+
+pub fn vec_dot_row_fp8_e4m3(query: &[f32], key_blocks: &[BlockFp8E4m3]) -> f32 {
+    debug_assert_eq!(
+        key_blocks.len(),
+        query.len().div_ceil(KV_QUANT_BLOCK_VALUES)
+    );
+    query
+        .chunks(KV_QUANT_BLOCK_VALUES)
+        .zip(key_blocks)
+        .map(|(chunk, block)| vec_dot_fp8_e4m3(chunk, block))
+        .sum()
+}
+
+pub fn axpy_row_fp8_e4m3(out: &mut [f32], probability: f32, value_blocks: &[BlockFp8E4m3]) {
+    debug_assert_eq!(
+        value_blocks.len(),
+        out.len().div_ceil(KV_QUANT_BLOCK_VALUES)
+    );
+    for (out_chunk, block) in out.chunks_mut(KV_QUANT_BLOCK_VALUES).zip(value_blocks) {
+        let d = super::f16_bits_to_f32(block.scale);
+        for (i, out_value) in out_chunk.iter_mut().enumerate() {
+            *out_value = (probability * d).mul_add(fp8_e4m3_to_f32(block.qs[i]), *out_value);
+        }
+    }
+}
+
+pub fn quantize_block_fp8_e5m2(src: &[f32; KV_QUANT_BLOCK_VALUES]) -> BlockFp8E5m2 {
+    let mut amax = 0.0f32;
+    for &v in src {
+        let abs_v = v.abs();
+        if abs_v > amax {
+            amax = abs_v;
+        }
+    }
+    let d = amax / 57344.0;
+    let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+    let mut qs = [0u8; KV_QUANT_BLOCK_VALUES];
+    for i in 0..KV_QUANT_BLOCK_VALUES {
+        qs[i] = f32_to_fp8_e5m2(src[i] * id);
+    }
+    BlockFp8E5m2 {
+        scale: super::f32_to_f16_bits(d),
+        qs,
+    }
+}
+
+pub fn dequantize_block_fp8_e5m2(block: &BlockFp8E5m2, dst: &mut [f32]) {
+    debug_assert!(dst.len() <= KV_QUANT_BLOCK_VALUES);
+    let d = super::f16_bits_to_f32(block.scale);
+    for (i, value) in dst.iter_mut().enumerate() {
+        *value = fp8_e5m2_to_f32(block.qs[i]) * d;
+    }
+}
+
+pub fn vec_dot_fp8_e5m2(query: &[f32], key_block: &BlockFp8E5m2) -> f32 {
+    debug_assert!(query.len() <= KV_QUANT_BLOCK_VALUES);
+    let d = super::f16_bits_to_f32(key_block.scale);
+    let mut sum = 0.0f32;
+    for (i, &query_value) in query.iter().enumerate() {
+        sum += query_value * fp8_e5m2_to_f32(key_block.qs[i]);
+    }
+    sum * d
+}
+
+pub fn quantize_row_fp8_e5m2(src: &[f32], dst: &mut [BlockFp8E5m2]) {
+    debug_assert_eq!(dst.len(), src.len().div_ceil(KV_QUANT_BLOCK_VALUES));
+    for (block, chunk) in dst.iter_mut().zip(src.chunks(KV_QUANT_BLOCK_VALUES)) {
+        let mut values = [0.0f32; KV_QUANT_BLOCK_VALUES];
+        values[..chunk.len()].copy_from_slice(chunk);
+        *block = quantize_block_fp8_e5m2(&values);
+    }
+}
+
+pub fn dequantize_row_fp8_e5m2(src: &[BlockFp8E5m2], dst: &mut [f32]) {
+    debug_assert_eq!(src.len(), dst.len().div_ceil(KV_QUANT_BLOCK_VALUES));
+    for (block, chunk) in src.iter().zip(dst.chunks_mut(KV_QUANT_BLOCK_VALUES)) {
+        dequantize_block_fp8_e5m2(block, chunk);
+    }
+}
+
+pub fn vec_dot_row_fp8_e5m2(query: &[f32], key_blocks: &[BlockFp8E5m2]) -> f32 {
+    debug_assert_eq!(
+        key_blocks.len(),
+        query.len().div_ceil(KV_QUANT_BLOCK_VALUES)
+    );
+    query
+        .chunks(KV_QUANT_BLOCK_VALUES)
+        .zip(key_blocks)
+        .map(|(chunk, block)| vec_dot_fp8_e5m2(chunk, block))
+        .sum()
+}
+
+pub fn axpy_row_fp8_e5m2(out: &mut [f32], probability: f32, value_blocks: &[BlockFp8E5m2]) {
+    debug_assert_eq!(
+        value_blocks.len(),
+        out.len().div_ceil(KV_QUANT_BLOCK_VALUES)
+    );
+    for (out_chunk, block) in out.chunks_mut(KV_QUANT_BLOCK_VALUES).zip(value_blocks) {
+        let d = super::f16_bits_to_f32(block.scale);
+        for (i, out_value) in out_chunk.iter_mut().enumerate() {
+            *out_value = (probability * d).mul_add(fp8_e5m2_to_f32(block.qs[i]), *out_value);
         }
     }
 }
@@ -571,5 +932,73 @@ mod tests {
             super::super::f16_bits_to_f32(super::super::f32_to_f16_bits(value)),
             value
         );
+    }
+
+    #[test]
+    fn fp8_blocks_have_wire_compatible_sizes() {
+        assert_eq!(size_of::<BlockFp8E4m3>(), 34);
+        assert_eq!(size_of::<BlockFp8E5m2>(), 34);
+    }
+
+    #[test]
+    fn fp8_e4m3_roundtrip_and_dot_product() {
+        let mut original = [0.0f32; KV_QUANT_BLOCK_VALUES];
+        for (i, value) in original.iter_mut().enumerate() {
+            *value = (i as f32 - 16.0) * 0.5;
+        }
+        let block = quantize_block_fp8_e4m3(&original);
+        let mut reconstructed = [0.0f32; KV_QUANT_BLOCK_VALUES];
+        dequantize_block_fp8_e4m3(&block, &mut reconstructed);
+
+        for i in 0..KV_QUANT_BLOCK_VALUES {
+            let diff = (original[i] - reconstructed[i]).abs();
+            assert!(
+                diff < 0.65,
+                "FP8_E4M3 roundtrip diff too high at index {i}: {diff}"
+            );
+        }
+        let query: [f32; KV_QUANT_BLOCK_VALUES] = std::array::from_fn(|i| (i as f32 - 7.0) * 0.125);
+        let expected: f32 = query.iter().zip(reconstructed).map(|(q, k)| q * k).sum();
+        assert!((vec_dot_fp8_e4m3(&query, &block) - expected).abs() < 1e-4);
+
+        let mut accumulated: [f32; KV_QUANT_BLOCK_VALUES] =
+            std::array::from_fn(|i| i as f32 * 0.01);
+        let expected_accumulated: [f32; KV_QUANT_BLOCK_VALUES] =
+            std::array::from_fn(|i| 0.375f32.mul_add(reconstructed[i], i as f32 * 0.01));
+        axpy_row_fp8_e4m3(&mut accumulated, 0.375, &[block]);
+        for (actual, expected) in accumulated.iter().zip(expected_accumulated) {
+            assert!((actual - expected).abs() < 1e-4);
+        }
+    }
+
+    #[test]
+    fn fp8_e5m2_roundtrip_and_dot_product() {
+        let mut original = [0.0f32; KV_QUANT_BLOCK_VALUES];
+        for (i, value) in original.iter_mut().enumerate() {
+            *value = (i as f32 - 16.0) * 0.5;
+        }
+        let block = quantize_block_fp8_e5m2(&original);
+        let mut reconstructed = [0.0f32; KV_QUANT_BLOCK_VALUES];
+        dequantize_block_fp8_e5m2(&block, &mut reconstructed);
+
+        for i in 0..KV_QUANT_BLOCK_VALUES {
+            let diff = (original[i] - reconstructed[i]).abs();
+            assert!(
+                diff < 1.10,
+                "FP8_E5M2 roundtrip diff too high at index {i}: {diff}"
+            );
+        }
+        let query: [f32; KV_QUANT_BLOCK_VALUES] = std::array::from_fn(|i| (i as f32 - 7.0) * 0.125);
+        let expected: f32 = query.iter().zip(reconstructed).map(|(q, k)| q * k).sum();
+        assert!((vec_dot_fp8_e5m2(&query, &block) - expected).abs() < 1e-4);
+
+        let mut accumulated: [f32; KV_QUANT_BLOCK_VALUES] =
+            std::array::from_fn(|i| i as f32 * 0.01);
+        let expected_accumulated: [f32; KV_QUANT_BLOCK_VALUES] =
+            std::array::from_fn(|i| 0.375f32.mul_add(reconstructed[i], i as f32 * 0.01));
+        axpy_row_fp8_e5m2(&mut accumulated, 0.375, &[block]);
+        for (actual, expected) in accumulated.iter().zip(expected_accumulated) {
+            assert!((actual - expected).abs() < 1e-4);
+        }
     }
 }
