@@ -17482,6 +17482,49 @@ fn kvq8_enabled() -> bool {
     resident_kv_format() == ResidentKvFormat::Q8
 }
 
+/// Admit an F16-PRIMARY resident KV cache to the split-K decode attention.
+///
+/// The split-K gate historically read `!kv16_enabled()`, which excluded every K-quant
+/// model on Metal: `weights_use_kquant` selects the F16 primary for Q4_K/Q6_K weights, so
+/// the most common quantization fell through to `attention_decode_v2_kv16` — ONE
+/// threadgroup per query head (`width: n_heads`) against split-K's `n_kv_heads x
+/// n_splits`. On a 3B at 2066 positions that is 24 threadgroups against 264.
+///
+/// The exclusion was a dispatch gap, not a kernel gap. `attention_decode_splitk_kv16`
+/// (and its `_direct` head_dim-128 variant) already take `device const half*` at buffers
+/// 1/2 because the F32 lane's split-K reads its f16 mirrors through them; under an F16
+/// primary the primary IS that half cache, so the same kernels bind straight to it.
+///
+/// Measured on an M4 / 16 GiB with Llama-3.2-3B-Instruct-Q4_K_M at 2066 positions: the
+/// zero-config F16 default decodes at 15.25 tok/s against 22.38 for an F32 primary that
+/// does get split-K (1.47x), while the F32-with-split-K-forced-off control sits at 14.77 —
+/// i.e. the F16 default was performing as a no-split-K lane because it was one.
+///
+/// Off by default: one host, and BENCHMARK_TREATY promotes nothing on one host. Arm with
+/// `CAMELID_METAL_ATTN_SPLITK_KV16_PRIMARY=1`.
+#[cfg(target_os = "macos")]
+fn splitk_kv16_primary_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("CAMELID_METAL_ATTN_SPLITK_KV16_PRIMARY")
+            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    })
+}
+
+/// The KV-format half of the split-K admission predicate, extracted so the one way to get
+/// it wrong is covered by a test.
+///
+/// The failure mode this guards is a SUBSTITUTION: replacing the historical
+/// `!kv16_enabled()` conjunct with the new gate rather than OR-ing them. That reads as a
+/// tidy one-line edit and silently takes split-K away from the F32 lane, where it measures
+/// 1.67x on an M4 — a large regression on every dense model, traded for a win on K-quant
+/// ones. It is a disjunction: the F32 lane is admitted unconditionally, and the F16 primary
+/// is admitted when its gate is armed.
+#[cfg(target_os = "macos")]
+fn splitk_kv_format_admits(kv16_primary: bool, kv16_primary_gate: bool) -> bool {
+    !kv16_primary || kv16_primary_gate
+}
+
 /// Opt-in: tiled decode attention with online softmax (4 simdgroups per head, coalesced
 /// K/V reads, no scores buffer). Requires head_dim % 32 == 0 and <= 128.
 #[cfg(target_os = "macos")]
@@ -17962,12 +18005,17 @@ fn encode_attention(
     // covers (kv_heads x splits) threadgroups with the K/V tile staged once per group.
     // Below the threshold the fixed scratch/merge cost outweighs the win.
     let group = n_heads.checked_div(n_kv_heads).unwrap_or(0);
-    // A Q8 primary now has its own split-K kernel (attention_decode_splitk_kvq8), so it
-    // no longer has to forfeit split-K the way a kv16 primary still does. kv16-primary
-    // stays excluded: it keeps no separate mirrors, and its primary IS the half cache the
-    // f32 lane's mirrors provide, so there is nothing here to reuse for it yet.
+    // A Q8 primary has its own split-K kernel (attention_decode_splitk_kvq8). A kv16
+    // primary needs no new kernel at all -- its primary IS the half cache the f32 lane's
+    // mirrors provide, so `attention_decode_splitk_kv16` binds straight to it (see
+    // `splitk_kv16_primary_enabled`, and the dispatch chain below which selects on the
+    // presence of mirrors rather than on the process-global format).
+    //
+    // NOTE the disjunction: this must not become a substitution. Replacing
+    // `!kv16_enabled()` with the new gate would take split-K away from the f32 lane,
+    // where it measures 1.67x on an M4.
     let splitk = v2
-        && !kv16_enabled()
+        && splitk_kv_format_admits(kv16_enabled(), splitk_kv16_primary_enabled())
         && splitk_attention_enabled()
         && (1..=4).contains(&group)
         && position_count >= 128;
@@ -17989,6 +18037,32 @@ fn encode_attention(
             // wanted -- the whole point is that the Q8 cache is 1.88x smaller than the f16
             // mirrors this path reads on the f32 lane.
             e.set_compute_pipeline_state(&k.attention_decode_splitk_kvq8_pipeline);
+            e.set_buffer(0, Some(query), query_off);
+            e.set_buffer(1, Some(keys), 0);
+            e.set_buffer(2, Some(values), 0);
+        } else if kv16_mirrors.is_none() {
+            // F16 PRIMARY. Selected on the ABSENCE OF MIRRORS, deliberately, not on
+            // `kv16_enabled()`: mirrors are allocated only when the primary is f32
+            // (`!kv16 && !kvq8`, see `ResidentDecodeState::new`), so with the Q8 arm
+            // already taken above, `None` here proves `keys`/`values` hold half data.
+            //
+            // Keying this off the process-global instead would reintroduce the exact
+            // hazard `kv_roundtrips_through_cpu_exactly` documents: a model switch
+            // re-decides the global while a session still holds an engine built under the
+            // previous format, so the global is a time-of-check answer to a time-of-use
+            // question. Getting it wrong here does not fail loudly -- it binds half data
+            // to `attention_decode_splitk_f32`, whose signature is `device const float*`,
+            // and returns plausible garbage. The buffer we were handed is the only
+            // trustworthy witness to its own element type.
+            //
+            // This branch also closes that hazard in the other direction: the final
+            // `else` is now reachable only with mirrors present, i.e. a proven f32
+            // primary.
+            if head_dim == 128 {
+                e.set_compute_pipeline_state(&k.attention_decode_splitk_kv16_direct_pipeline);
+            } else {
+                e.set_compute_pipeline_state(&k.attention_decode_splitk_kv16_pipeline);
+            }
             e.set_buffer(0, Some(query), query_off);
             e.set_buffer(1, Some(keys), 0);
             e.set_buffer(2, Some(values), 0);
@@ -29688,6 +29762,31 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Split-K admission is a DISJUNCTION over the KV format, not a substitution.
+    ///
+    /// Admitting the F16 primary (the automatic default for every Q4_K/Q6_K model, via
+    /// `weights_use_kquant`) is worth ~1.47x decode on an M4, because the excluded lane
+    /// falls to `attention_decode_v2_kv16` at one threadgroup per query head. The tidy-
+    /// looking way to write that change — replacing the `!kv16_enabled()` conjunct with
+    /// the new gate instead of OR-ing it — silently drops split-K from the F32 lane,
+    /// where it measures 1.67x. That trade is a large net regression on every dense
+    /// model and would not show up in a K-quant benchmark. Needs no GPU: policy, not
+    /// dispatch.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn splitk_admits_the_f32_lane_whatever_the_kv16_primary_gate_says() {
+        use super::splitk_kv_format_admits;
+
+        // The F32 lane is admitted unconditionally — including when the F16-primary
+        // gate is armed. This is the assertion a substitution breaks.
+        assert!(splitk_kv_format_admits(false, false));
+        assert!(splitk_kv_format_admits(false, true));
+
+        // An F16 primary is admitted only behind its own gate.
+        assert!(!splitk_kv_format_admits(true, false));
+        assert!(splitk_kv_format_admits(true, true));
     }
 
     /// The F16-primary resident KV cache is qualified for the K-quant lane, so
