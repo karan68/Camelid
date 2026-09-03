@@ -2003,7 +2003,11 @@ enum Command {
         #[arg(long = "gpu", value_enum, default_value_t = GpuMode::Auto, env = "CAMELID_GPU")]
         gpu: GpuMode,
         /// KV cache quantization format: "f16" (default, unquantized), "q8_0"
-        /// (50% memory savings), or "q4_0" (75% memory savings).
+        /// (50% memory savings), "q4_0" (75% memory savings), or "fp8_e4m3" /
+        /// "fp8_e5m2" (same 50% savings as q8_0, trading uniform accuracy for
+        /// outlier headroom — see docs/kv-cache-fp8.md). CPU lanes only: the
+        /// resident CUDA decoder honours f16 and q8_0, and runs every other
+        /// format's KV as f16 on the GPU.
         #[arg(long, env = "CAMELID_KV_QUANT", default_value_t = KvCacheQuantization::F16)]
         kv_quant: KvCacheQuantization,
         #[command(flatten)]

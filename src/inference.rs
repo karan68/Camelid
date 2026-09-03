@@ -34,9 +34,11 @@ mod kv_f16;
 pub mod kv_pool;
 mod metal_resident;
 mod metal_seam;
+pub mod paged_kv;
 mod q8_block_reader;
 mod q8_runtime;
 mod q8_telemetry;
+pub mod radix_cache;
 mod rope;
 /// Test-only re-export: the gemma3 self-parity/full-forward tests in
 /// `crate::metal::tests` build their RoPE tables with the SAME oracle-form
@@ -112,7 +114,9 @@ use crate::{
     tensor::{
         dot_product,
         kv_quant::{
-            axpy_row_q4_0, axpy_row_q8_0, vec_dot_row_q4_0, vec_dot_row_q8_0, KV_QUANT_BLOCK_VALUES,
+            axpy_row_fp8_e4m3, axpy_row_fp8_e5m2, axpy_row_q4_0, axpy_row_q8_0,
+            vec_dot_row_fp8_e4m3, vec_dot_row_fp8_e5m2, vec_dot_row_q4_0, vec_dot_row_q8_0,
+            KV_QUANT_BLOCK_VALUES,
         },
         parse_byte_count_env, q8_0_file_read_stats, should_parallelize_linear_output,
         with_q8_file_cache_capacity_override, CpuTensor, Q8_0Block, Q8_0FileBacking,
@@ -2574,6 +2578,10 @@ impl LlamaInferenceSession {
                     values_q8_0: Vec::new(),
                     keys_q4_0: Vec::new(),
                     values_q4_0: Vec::new(),
+                    keys_fp8_e4m3: Vec::new(),
+                    values_fp8_e4m3: Vec::new(),
+                    keys_fp8_e5m2: Vec::new(),
+                    values_fp8_e5m2: Vec::new(),
                     allocated_sequence_length: 0,
                     position: 0,
                     materialized_through: 0,
@@ -27096,6 +27104,16 @@ fn attention_context_for_head_into_with_kernels(
                     [key_block_start..key_block_start + key_blocks_per_row];
                 vec_dot_row_q4_0(params.query_slice, key_blocks) * params.scale
             }
+            KvDtype::Fp8E4m3 => {
+                let key_blocks = &params.kv_cache.keys_fp8_e4m3
+                    [key_block_start..key_block_start + key_blocks_per_row];
+                vec_dot_row_fp8_e4m3(params.query_slice, key_blocks) * params.scale
+            }
+            KvDtype::Fp8E5m2 => {
+                let key_blocks = &params.kv_cache.keys_fp8_e5m2
+                    [key_block_start..key_block_start + key_blocks_per_row];
+                vec_dot_row_fp8_e5m2(params.query_slice, key_blocks) * params.scale
+            }
         };
         scores.push(score);
         if position + 1 < params.position_count {
@@ -27180,6 +27198,26 @@ fn attention_context_for_head_into_with_kernels(
                         [quantized_value_start..quantized_value_start + value_blocks_per_row]
                 };
                 axpy_row_q4_0(out_slice, probability, value_blocks);
+            }
+            KvDtype::Fp8E4m3 => {
+                let value_blocks = if is_mla {
+                    &params.kv_cache.keys_fp8_e4m3[quantized_key_value_start
+                        ..quantized_key_value_start + value_blocks_per_row]
+                } else {
+                    &params.kv_cache.values_fp8_e4m3
+                        [quantized_value_start..quantized_value_start + value_blocks_per_row]
+                };
+                axpy_row_fp8_e4m3(out_slice, probability, value_blocks);
+            }
+            KvDtype::Fp8E5m2 => {
+                let value_blocks = if is_mla {
+                    &params.kv_cache.keys_fp8_e5m2[quantized_key_value_start
+                        ..quantized_key_value_start + value_blocks_per_row]
+                } else {
+                    &params.kv_cache.values_fp8_e5m2
+                        [quantized_value_start..quantized_value_start + value_blocks_per_row]
+                };
+                axpy_row_fp8_e5m2(out_slice, probability, value_blocks);
             }
         }
         if position + 1 < params.position_count {
