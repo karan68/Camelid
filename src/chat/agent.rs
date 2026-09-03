@@ -1334,7 +1334,9 @@ fn summarize_tool_call(call: &ToolCall) -> String {
             if path.is_empty() {
                 call.name.clone()
             } else {
-                format!("{}({})", call.name, path)
+                // Same rendering the mutation ledger uses, so one path does not
+                // appear two ways across the summaries the model reads.
+                format!("{}({})", call.name, normalize_workspace_path(path))
             }
         }
         "run_shell" => {
@@ -1363,7 +1365,7 @@ fn summarize_tool_call(call: &ToolCall) -> String {
         }
         "list_dir" => {
             let path = call.args.get("path").and_then(Value::as_str).unwrap_or(".");
-            format!("list_dir({path})")
+            format!("list_dir({})", normalize_workspace_path(path))
         }
         _ => call.name.clone(),
     }
@@ -4178,7 +4180,9 @@ mod tests {
             "if (subtotalCents > 10000) return subtotalCents\n",
         )
         .unwrap();
-        let sandbox = Sandbox::new(dir.path(), false, Duration::from_secs(5)).unwrap();
+        let sandbox = Sandbox::new(dir.path(), false, Duration::from_secs(5))
+            .unwrap()
+            .with_checkpoints(false);
         let mut driver = MockDriver {
             steps: vec![
                 ModelStep::Text("done without looking".into()),
@@ -4238,7 +4242,9 @@ mod tests {
         let src = dir.path().join("src");
         std::fs::create_dir(&src).unwrap();
         std::fs::write(src.join("pricing.cjs"), "const x = 1;\n").unwrap();
-        let sandbox = Sandbox::new(dir.path(), false, Duration::from_secs(5)).unwrap();
+        let sandbox = Sandbox::new(dir.path(), false, Duration::from_secs(5))
+            .unwrap()
+            .with_checkpoints(false);
 
         let mut driver = MockDriver {
             steps: vec![
@@ -4292,7 +4298,11 @@ mod tests {
         let src = dir.path().join("src");
         std::fs::create_dir(&src).unwrap();
         std::fs::write(src.join("pricing.cjs"), "const x = 1;\n").unwrap();
-        let sandbox = Sandbox::new(dir.path(), false, Duration::from_secs(5)).unwrap();
+        // The benchmark profile runs with checkpoints off in production, and the
+        // log is process-wide, so leave it alone.
+        let sandbox = Sandbox::new(dir.path(), false, Duration::from_secs(5))
+            .unwrap()
+            .with_checkpoints(false);
 
         let failing = if cfg!(windows) { "exit /b 1" } else { "exit 1" };
         let mut driver = MockDriver {
@@ -4342,7 +4352,10 @@ mod tests {
         let src = dir.path().join("src");
         std::fs::create_dir(&src).unwrap();
         std::fs::write(src.join("pricing.cjs"), "const x = 1;\n").unwrap();
-        let sandbox = Sandbox::new(dir.path(), false, Duration::from_secs(5)).unwrap();
+        // As above: benchmark profile, process-wide checkpoint log.
+        let sandbox = Sandbox::new(dir.path(), false, Duration::from_secs(5))
+            .unwrap()
+            .with_checkpoints(false);
 
         let mut driver = MockDriver {
             steps: vec![

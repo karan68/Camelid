@@ -2155,8 +2155,13 @@ fn search(
     };
     if root_metadata.file_type().is_file() {
         if let Some(filter) = &filter {
-            if !filter.matches(&sandbox.rel(&root)) {
-                return ToolOutcome::Ok(format!("no matches for {pattern:?}"));
+            let rel = sandbox.rel(&root);
+            if !filter.matches(&rel) {
+                return ToolOutcome::Err(format!(
+                    "path_filter {:?} excludes the search path {rel}, so this search can never \
+                     match; drop the filter or search a directory that contains it",
+                    path_filter.unwrap_or("")
+                ));
             }
         }
         return search_file(&needle, &root, limit, sandbox);
@@ -2538,9 +2543,10 @@ fn map_lf_range_to_orig(content: &str, start_lf: usize, end_lf: usize) -> (usize
 
 /// Re-indent `new_text` by `indent_delta` columns.
 ///
-/// Indentation is measured in leading SPACES only, so a tab-indented file and a
-/// space-indented `old` resolve to a delta of zero and the replacement is
-/// written exactly as the model sent it.
+/// Indentation is measured in leading SPACES only. `find_tolerant_line_matches`
+/// only produces a delta for runs that are comparable by width, and a negative
+/// delta reaches here only once `indent_shift_applies` has confirmed every line
+/// can absorb it; the clamp below is a floor, not a fallback.
 fn adjust_indentation(new_text: &str, indent_delta: isize, crlf: bool) -> String {
     let sep = if crlf { "\r\n" } else { "\n" };
     let lines: Vec<&str> = new_text.lines().collect();
@@ -2567,6 +2573,23 @@ fn adjust_indentation(new_text: &str, indent_delta: isize, crlf: bool) -> String
         joined.push_str(sep);
     }
     joined
+}
+
+/// Whether every line of `new_text` can absorb a negative `indent_delta`.
+///
+/// A line with less leading space than the shift would be clamped at column 0
+/// while its siblings move by the full delta, silently flattening the relative
+/// indentation inside the replacement. A shift that does not fit is evidence the
+/// uniform-delta assumption is wrong, so the match is abandoned instead.
+fn indent_shift_applies(new_text: &str, indent_delta: isize) -> bool {
+    if indent_delta >= 0 {
+        return true;
+    }
+    let trim_count = indent_delta.unsigned_abs();
+    new_text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .all(|line| line.chars().take_while(|c| *c == ' ').count() >= trim_count)
 }
 
 struct LineMatchCandidate {
@@ -2622,9 +2645,19 @@ fn find_tolerant_line_matches(content: &str, old: &str) -> Vec<LineMatchCandidat
                 break;
             }
 
-            let fl_indent = fl.chars().take_while(|c| *c == ' ').count() as isize;
-            let ol_indent = ol.chars().take_while(|c| *c == ' ').count() as isize;
-            let delta = fl_indent - ol_indent;
+            let fl_ws = &fl[..fl.len() - fl.trim_start().len()];
+            let ol_ws = &ol[..ol.len() - ol.trim_start().len()];
+            // A tab run measures zero columns, so differing tab counts would
+            // read as a zero delta and overwrite the file's own indentation with
+            // the model's. Only space-only runs are comparable by width;
+            // anything else has to match byte for byte.
+            let comparable = fl_ws == ol_ws
+                || (fl_ws.bytes().all(|b| b == b' ') && ol_ws.bytes().all(|b| b == b' '));
+            if !comparable {
+                matches = false;
+                break;
+            }
+            let delta = fl_ws.len() as isize - ol_ws.len() as isize;
 
             match uniform_delta {
                 None => uniform_delta = Some(delta),
@@ -2660,6 +2693,11 @@ fn find_tolerant_line_matches(content: &str, old: &str) -> Vec<LineMatchCandidat
 /// `old`, and `levenshtein_distance` is O(a*b) per line pair. `edit_file` accepts
 /// files up to `MAX_RANGED_FILE_BYTES`, so both costs are bounded: past these
 /// budgets the generic "not found" message is returned instead of scanning on.
+///
+/// The cell budget is a running total spent top-down, so on a large file only
+/// the first windows get fuzzy scoring and "closest match" is biased toward the
+/// top. The free exact/`trim`/`trim_end` tiers still cover the whole file, so
+/// this degrades the ranking, never the correctness of a reported match.
 const MAX_NEAR_MISS_WINDOW_COMPARISONS: usize = 2_000_000;
 const MAX_NEAR_MISS_LEVENSHTEIN_CELLS: usize = 4_000_000;
 
@@ -2860,7 +2898,9 @@ fn edit_file(path: &Path, old: &str, new: &str) -> ToolOutcome {
 
     // 3. Tolerant whitespace & uniform indentation matching
     let tolerant_candidates = find_tolerant_line_matches(&content, old);
-    if tolerant_candidates.len() == 1 {
+    if tolerant_candidates.len() == 1
+        && indent_shift_applies(new, tolerant_candidates[0].indent_delta)
+    {
         let candidate = &tolerant_candidates[0];
         let mut adjusted_new = adjust_indentation(new, candidate.indent_delta, file_has_crlf);
         let had_trailing_newline =
@@ -5826,6 +5866,55 @@ mod tests {
         let updated = std::fs::read_to_string(&file_path).unwrap();
         let expected = "function test() {\n        let a = 10;\n        let b = 20;\n        return a + b;\n}\n";
         assert_eq!(updated, expected);
+    }
+
+    /// A tab run measures zero columns, so a differing tab count used to look
+    /// like a uniform zero delta and write the model's indentation into the
+    /// file. In Python or a Makefile that is a semantic change reported as `Ok`.
+    #[test]
+    fn a_tab_indented_file_is_not_rewritten_by_a_shallower_tab_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("indent.py");
+        let initial = "def f():\n\t\tif x:\n\t\t\treturn 1\n";
+        std::fs::write(&file_path, initial).unwrap();
+
+        // One tab shallower than the file at every line.
+        let outcome = edit_file(&file_path, "\tif x:\n\t\treturn 1", "\tif x:\n\t\treturn 2");
+
+        assert!(outcome.is_err(), "{}", outcome.text());
+        assert_eq!(std::fs::read_to_string(&file_path).unwrap(), initial);
+    }
+
+    /// A negative shift is applied per line with a clamp, so a line that cannot
+    /// absorb it lands at column 0 while its siblings move by the full delta.
+    /// A shift that does not fit is evidence the uniform-delta assumption is
+    /// wrong, so the match is abandoned rather than applied.
+    #[test]
+    fn an_indent_shift_that_would_flatten_the_replacement_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("flatten.py");
+        let initial = "if x:\n  a = 1\n  b = 2\n";
+        std::fs::write(&file_path, initial).unwrap();
+
+        // delta is -6, but `if y:` carries only 4 leading spaces.
+        let outcome = edit_file(
+            &file_path,
+            "        a = 1\n        b = 2",
+            "        a = 1\n    if y:\n        b = 2",
+        );
+
+        assert!(outcome.is_err(), "{}", outcome.text());
+        assert_eq!(std::fs::read_to_string(&file_path).unwrap(), initial);
+
+        // A negative shift every line can absorb still applies.
+        let fits = dir.path().join("fits.py");
+        std::fs::write(&fits, initial).unwrap();
+        let outcome = edit_file(&fits, "    a = 1\n    b = 2", "    a = 10\n    b = 20");
+        assert!(matches!(outcome, ToolOutcome::Ok(_)), "{}", outcome.text());
+        assert_eq!(
+            std::fs::read_to_string(&fits).unwrap(),
+            "if x:\n  a = 10\n  b = 20\n"
+        );
     }
 
     #[test]
