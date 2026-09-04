@@ -266,6 +266,10 @@ pub struct DocumentSearchResult {
     pub chunk_index: usize,
     pub excerpt: String,
     pub score: f32,
+    /// `keyword` for an FTS hit, `attached` when an explicitly attached
+    /// document is supplied as context because the user's wording had no
+    /// lexical overlap with its contents.
+    pub retrieval: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -313,6 +317,14 @@ pub async fn ingest_document(
     let byte_size = text_content.len();
     let chunks = chunk_text(&text_content, DEFAULT_CHUNK_CHARS, DEFAULT_CHUNK_OVERLAP);
     let chunk_count = chunks.len();
+    if chunks.is_empty() {
+        return Err(api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "empty_document",
+            "The document did not contain any readable text.".to_string(),
+            None,
+        ));
+    }
 
     let _lock = db_lock().lock().unwrap();
     let mut conn = open_connection().map_err(|e| {
@@ -443,6 +455,65 @@ fn sanitize_fts5_query(query: &str) -> String {
     tokens.join(" OR ")
 }
 
+/// When the user explicitly attached documents, a zero-hit lexical search must
+/// not silently turn into a plain model request. Return leading chunks in
+/// attachment order, round-robin across files, so every attached document gets
+/// a chance to contribute before later chunks consume the small context limit.
+fn attached_document_context(
+    conn: &Connection,
+    doc_ids: &[String],
+    top_k: usize,
+) -> Result<Vec<DocumentSearchResult>, rusqlite::Error> {
+    let mut statement = conn.prepare(
+        "SELECT c.doc_id, d.filename, c.chunk_index, c.content
+         FROM document_chunks AS c
+         JOIN documents AS d ON d.id = c.doc_id
+         WHERE c.doc_id = ?1
+         ORDER BY c.chunk_index ASC
+         LIMIT ?2",
+    )?;
+    let mut chunks_by_document = Vec::new();
+
+    // At most `top_k` documents can contribute to a `top_k` response. This
+    // also bounds work for a malformed request containing thousands of ids.
+    for doc_id in doc_ids.iter().take(top_k) {
+        let chunks = statement
+            .query_map(params![doc_id, top_k as i64], |row| {
+                Ok(DocumentSearchResult {
+                    doc_id: row.get(0)?,
+                    filename: row.get(1)?,
+                    chunk_index: row.get::<_, i64>(2)? as usize,
+                    excerpt: row.get(3)?,
+                    score: 0.0,
+                    retrieval: "attached",
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        chunks_by_document.push(chunks);
+    }
+
+    let mut results = Vec::new();
+    let mut chunk_index = 0;
+    while results.len() < top_k {
+        let mut added = false;
+        for chunks in &chunks_by_document {
+            if let Some(chunk) = chunks.get(chunk_index) {
+                results.push(chunk.clone());
+                added = true;
+                if results.len() == top_k {
+                    break;
+                }
+            }
+        }
+        if !added {
+            break;
+        }
+        chunk_index += 1;
+    }
+
+    Ok(results)
+}
+
 /// Endpoint: `POST /api/documents/search`
 pub async fn search_documents(
     State(_state): State<AppState>,
@@ -536,7 +607,21 @@ pub async fn search_documents(
             chunk_index,
             excerpt: content,
             score: normalized_score,
+            retrieval: "keyword",
         });
+    }
+
+    if query_results.is_empty() {
+        if let Some(attached_ids) = payload.doc_ids.as_deref() {
+            query_results = attached_document_context(&conn, attached_ids, top_k).map_err(|e| {
+                api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "attached_document_fallback_error",
+                    e.to_string(),
+                    None,
+                )
+            })?;
+        }
     }
 
     Ok(Json(SearchDocumentsResponse {
@@ -676,5 +761,41 @@ mod tests {
             extract_text_from_bytes("NOTES.DOCX", &bytes),
             "One & two three"
         );
+    }
+
+    #[test]
+    fn attached_documents_supply_context_when_keywords_do_not_match() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        for (doc_id, filename, chunks) in [
+            ("doc-a", "alpha.txt", vec!["File1\nFile2", "Alpha tail"]),
+            ("doc-b", "beta.txt", vec!["Beta lead", "Beta tail"]),
+        ] {
+            conn.execute(
+                "INSERT INTO documents (id, filename, file_type, byte_size, chunk_count, created_at)
+                 VALUES (?1, ?2, 'txt', 1, ?3, 1)",
+                params![doc_id, filename, chunks.len() as i64],
+            )
+            .unwrap();
+            for (index, content) in chunks.into_iter().enumerate() {
+                conn.execute(
+                    "INSERT INTO document_chunks (doc_id, chunk_index, content) VALUES (?1, ?2, ?3)",
+                    params![doc_id, index as i64, content],
+                )
+                .unwrap();
+            }
+        }
+
+        let doc_ids = vec!["doc-a".to_string(), "doc-b".to_string()];
+        let results = attached_document_context(&conn, &doc_ids, 3).unwrap();
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| (result.doc_id.as_str(), result.chunk_index))
+                .collect::<Vec<_>>(),
+            vec![("doc-a", 0), ("doc-b", 0), ("doc-a", 1)]
+        );
+        assert_eq!(results[0].excerpt, "File1\nFile2");
+        assert!(results.iter().all(|result| result.retrieval == "attached"));
     }
 }

@@ -25,6 +25,12 @@ import {
 } from '../lib/conversationCompaction.js'
 import { PREPARING_STREAMING_LABEL, StreamingLoader } from '../components/chat/render/StreamingIndicator'
 import { classifyWebResearchNeed } from '../lib/webResearch.js'
+import {
+  ATTACHED_DOCUMENTS_STORAGE_KEY,
+  normalizeAttachedDocuments,
+  readAttachedDocuments,
+  writeAttachedDocuments,
+} from '../lib/documentAttachments.js'
 
 const isBootstrapMessage = (message) =>
   message?.role === 'assistant' &&
@@ -198,8 +204,9 @@ export default function ChatWorkspace({
   const [userScrolledAway, setUserScrolledAway] = useState(false)
   const [composerImage, setComposerImage] = useState(null)
   const [imageError, setImageError] = useState('')
-  const [attachedDocuments, setAttachedDocuments] = useState([])
+  const [attachedDocuments, setAttachedDocumentsState] = useState(readAttachedDocuments)
   const [documentIngesting, setDocumentIngesting] = useState(false)
+  const [documentError, setDocumentError] = useState('')
   const [activeCitation, setActiveCitation] = useState(null)
   const chatBottomRef = useRef(null)
   const composerRef = useRef(null)
@@ -207,6 +214,15 @@ export default function ChatWorkspace({
   const docInputRef = useRef(null)
   const autoFollowGenerationRef = useRef(true)
   const composerReadinessId = 'camelid-chat-readiness-note'
+
+  const setAttachedDocuments = (valueOrUpdater) => {
+    setAttachedDocumentsState((current) => {
+      const value = typeof valueOrUpdater === 'function'
+        ? valueOrUpdater(current)
+        : valueOrUpdater
+      return writeAttachedDocuments(value)
+    })
+  }
 
   const rawVisibleMessages = useMemo(
     () => (selectedConversation?.messages || []).filter((message) => !isBootstrapMessage(message)),
@@ -433,6 +449,40 @@ export default function ChatWorkspace({
     }
   }, [visionReady, selectedModelId])
 
+  // Document ids contain no file contents or local paths. Persist this small
+  // association so an attached RAG source survives a reload, app navigation,
+  // or a second browser tab. Reconcile it against the server when possible so
+  // a cleaned temporary database cannot leave a permanently stale pill.
+  useEffect(() => {
+    let cancelled = false
+    if (attachedDocuments.length) {
+      fetch('/api/documents')
+        .then((response) => (response.ok ? response.json() : null))
+        .then((documents) => {
+          if (cancelled || !Array.isArray(documents)) return
+          const availableIds = new Set(documents.map((document) => document.id))
+          setAttachedDocumentsState((current) => {
+            const next = current.filter((document) => availableIds.has(document.doc_id))
+            return next.length === current.length ? current : writeAttachedDocuments(next)
+          })
+        })
+        .catch(() => {})
+    }
+    const handleStorage = (event) => {
+      if (event.key === ATTACHED_DOCUMENTS_STORAGE_KEY) {
+        setAttachedDocumentsState(readAttachedDocuments())
+      }
+    }
+    window.addEventListener('storage', handleStorage)
+    return () => {
+      cancelled = true
+      window.removeEventListener('storage', handleStorage)
+    }
+    // Reconcile the persisted initial snapshot once; later edits already come
+    // from successful ingest/remove actions in this component.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
   useEffect(() => {
     if (!generationActive) return undefined
     autoFollowGenerationRef.current = true
@@ -517,6 +567,7 @@ export default function ChatWorkspace({
 
   const handleDocumentFiles = async (files) => {
     if (!files || !files.length) return
+    setDocumentError('')
     setDocumentIngesting(true)
     for (const file of Array.from(files)) {
       try {
@@ -539,12 +590,18 @@ export default function ChatWorkspace({
             is_base64,
           }),
         })
-        if (res.ok) {
-          const doc = await res.json()
-          setAttachedDocuments((prev) => [...prev.filter((d) => d.doc_id !== doc.doc_id), doc])
+        if (!res.ok) {
+          const failure = await res.json().catch(() => null)
+          throw new Error(failure?.error?.message || failure?.message || `Could not index ${file.name}.`)
         }
+        const doc = await res.json()
+        setAttachedDocuments((prev) => [
+          ...prev.filter((item) => item.doc_id !== doc.doc_id && item.filename !== doc.filename),
+          doc,
+        ])
       } catch (err) {
         console.error('Failed to ingest document:', file.name, err)
+        setDocumentError(err?.message || `Could not index ${file.name}.`)
       }
     }
     setDocumentIngesting(false)
@@ -769,7 +826,7 @@ export default function ChatWorkspace({
           }
         }}
       >
-        {attachedDocuments.length > 0 && (
+        {(attachedDocuments.length > 0 || documentIngesting) && (
           <div className="cxcomposer__docs">
             {attachedDocuments.map((doc) => (
               <div key={doc.doc_id} className="cxcomposer__doc-pill">
@@ -997,6 +1054,7 @@ export default function ChatWorkspace({
       </div>
 
       {imageError && <p className="cxcomposer__image-error" role="alert">{imageError}</p>}
+      {documentError && <p className="cxcomposer__image-error" role="alert">{documentError}</p>}
 
       {sendBudget.level === 'error' && (
         <p className="cxcomposer__budget-error" role="alert">
@@ -1184,7 +1242,9 @@ export default function ChatWorkspace({
                 <IconFile size={16} />
                 <span>{activeCitation.filename || 'Source Document'}</span>
               </div>
-              {activeCitation.score != null && (
+              {activeCitation.retrieval === 'attached' ? (
+                <span className="citation-modal__score">Attached context</span>
+              ) : activeCitation.score != null && (
                 <span className="citation-modal__score">
                   Relevance: {(activeCitation.score * 100).toFixed(0)}%
                 </span>
