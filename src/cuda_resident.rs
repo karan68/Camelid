@@ -6540,22 +6540,42 @@ extern "C" __global__ void attention_batched_q8_0(
         int max_groups = 1024 / head_dim; if (max_groups < 1) max_groups = 1;
         int G = (position_count + head_dim - 1) / head_dim;
         if (G < 1) G = 1; if (G > max_groups) G = max_groups;
-        float* vpart = shared + head_dim;
-        int gid = tid / head_dim;
-        int did = tid % head_dim;
-        int b = did / 32;
-        int bi = did % 32;
-        int p_lo = (int)((long)gid * position_count / G);
-        int p_hi = (int)((long)(gid + 1) * position_count / G);
-        float acc = 0.0f;
-        for (int p = p_lo; p < p_hi; p++) {
-            const block_q8_0* vp = vbase + ((long)p * blocks_per_head + b);
-            float d = f16_bits_to_f32(vp->scale);
-            acc += (scores[p] * inv) * (d * (float)vp->qs[bi]);
+        float* vpart = shared + head_dim; // [max_groups * head_dim]
+        // Grid-stride over all G*head_dim partials, exactly as the f16
+        // `attention_batched` does.
+        //
+        // The two launcher families use opposite conventions. `launch_attention`
+        // (decode) sets blockDim = groups*head_dim and the kernel recovers
+        // G = blockDim.x/head_dim, so deriving gid from tid is self-consistent there.
+        // `launch_attention_batched` instead pins blockDim at 128 and computes G from
+        // position_count, so the kernel MUST stride. This one was written to the decode
+        // convention and launched with the batched one, which breaks in both directions
+        // whenever blockDim.x != G*head_dim:
+        //   head_dim 128, G>=2 (over-subscribed): gid was always 0, so only 1/G of the
+        //     positions were accumulated and the g>=1 slots of `vpart` were summed back
+        //     uninitialised. Correct at G==1 only.
+        //   head_dim 64 (under-subscribed): threads 64..127 got gid==1 even at G==1,
+        //     scanned positions past the live prefix, and wrote vpart[did+1] on top of
+        //     the gid==0 writer for dim did+1 — a race at every context length.
+        //   head_dim 256: gid was always 0 and did never exceeded 127, so output dims
+        //     128..255 were never written at any context length.
+        // Striding to exactly G*head_dim fixes all three.
+        for (int idx = tid; idx < G * head_dim; idx += blockDim.x) {
+            int gid = idx / head_dim, did = idx % head_dim;
+            int b = did / 32;
+            int bi = did % 32;
+            int p_lo = (int)((long)gid * position_count / G);
+            int p_hi = (int)((long)(gid + 1) * position_count / G);
+            float acc = 0.0f;
+            for (int p = p_lo; p < p_hi; p++) {
+                const block_q8_0* vp = vbase + ((long)p * blocks_per_head + b);
+                float d = f16_bits_to_f32(vp->scale);
+                acc += (scores[p] * inv) * (d * (float)vp->qs[bi]);
+            }
+            vpart[(long)did * G + gid] = acc;
         }
-        vpart[(long)did * G + gid] = acc;
         __syncthreads();
-        if (gid == 0) {
+        for (int did = tid; did < head_dim; did += blockDim.x) {
             float sum = 0.0f;
             for (int g = 0; g < G; g++) sum += vpart[(long)did * G + g];
             out[(long)t * q_per_token + (long)head * head_dim + did] = sum;
