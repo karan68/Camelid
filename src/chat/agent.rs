@@ -358,6 +358,9 @@ pub fn run_loop(
     let mut observed_file_content = false;
     let mut workspace_observations: Vec<(String, String)> = Vec::new();
     let mut successful_workspace_reads = BTreeSet::new();
+    let mut mutated_files = BTreeSet::new();
+    let mut ran_command_since_mutation = true;
+    let mut verification_requested = false;
     let mut calibration: Option<f32> = None;
 
     for _ in 0..cfg.max_steps {
@@ -452,6 +455,32 @@ pub fn run_loop(
                          invent paths or describe a fix without applying and verifying it."
                             .into(),
                     ));
+                    continue;
+                }
+                // Premature-completion guard. A mutation that was never followed
+                // by a command is very likely unverified, so ask for one — ONCE.
+                // The nag is not repeated: a command that reports a failure is
+                // still a result the model must be free to report, and an
+                // unbounded nag turns a finished task into a step-capped one.
+                //
+                // Scoped to the benchmark profile, like the evidence gate above.
+                // The interactive agent has a human watching, and nagging one to
+                // run the build after a one-line doc edit is noise.
+                if cfg.tool_profile.is_benchmark_shared()
+                    && !verification_requested
+                    && !mutated_files.is_empty()
+                    && !ran_command_since_mutation
+                    && tools.iter().any(|t| t.name == "run_shell")
+                {
+                    verification_requested = true;
+                    reporter.notice("Verification required before final answer");
+                    history.push(AgentMsg::System(format!(
+                        "You changed {} and have not run any command since. If this change can be \
+                         verified, run the project's build or tests with run_shell and report \
+                         exactly what it reported, including a failure. If nothing here is \
+                         verifiable, say so and finish.",
+                        mutated_files.iter().cloned().collect::<Vec<_>>().join(", ")
+                    )));
                     continue;
                 }
                 let missing_reads = required_workspace_reads
@@ -602,6 +631,9 @@ pub fn run_loop(
                         return LoopEnd::Aborted;
                     }
 
+                    // Whether the tool body actually ran, as opposed to being
+                    // refused by the approval policy before it could.
+                    let executed = !matches!(&decision, Decision::No | Decision::Abort);
                     let outcome = match decision {
                         Decision::Abort => {
                             reporter.notice("aborted by user");
@@ -673,6 +705,19 @@ pub fn run_loop(
                         if matches!(action, Action::ReadFile { .. } | Action::Search { .. }) {
                             observed_file_content = true;
                         }
+                    }
+                    match &action {
+                        Action::EditFile { path, .. } | Action::WriteFile { path, .. }
+                            if !outcome.is_err() =>
+                        {
+                            mutated_files.insert(normalize_workspace_path(&sandbox.rel(path)));
+                            ran_command_since_mutation = false;
+                        }
+                        // A command that ran at all clears the guard, whatever it
+                        // reported: the point is that the model looked, not that
+                        // the result was green.
+                        Action::RunShell { .. } if executed => ran_command_since_mutation = true,
+                        _ => {}
                     }
                     let name = action.tool_name();
                     reporter.tool_result(name, &outcome);
@@ -1265,6 +1310,67 @@ fn estimate_tokens(history: &[AgentMsg], calibration: Option<f32>) -> u32 {
     (chars as f32 * per_char).ceil() as u32
 }
 
+/// The working-set ledger lives inside the summary that exists to SAVE context,
+/// so a session that touched a hundred files must not paste a hundred paths.
+fn join_capped(paths: std::collections::BTreeSet<String>) -> String {
+    const MAX_LEDGER_ENTRIES: usize = 12;
+    let total = paths.len();
+    let shown = paths
+        .into_iter()
+        .take(MAX_LEDGER_ENTRIES)
+        .collect::<Vec<_>>()
+        .join(", ");
+    if total > MAX_LEDGER_ENTRIES {
+        format!("{shown} (+{} more)", total - MAX_LEDGER_ENTRIES)
+    } else {
+        shown
+    }
+}
+
+fn summarize_tool_call(call: &ToolCall) -> String {
+    match call.name.as_str() {
+        "edit_file" | "write_file" | "read_file" => {
+            let path = call.args.get("path").and_then(Value::as_str).unwrap_or("");
+            if path.is_empty() {
+                call.name.clone()
+            } else {
+                // Same rendering the mutation ledger uses, so one path does not
+                // appear two ways across the summaries the model reads.
+                format!("{}({})", call.name, normalize_workspace_path(path))
+            }
+        }
+        "run_shell" => {
+            let cmd = call
+                .args
+                .get("command")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if cmd.is_empty() {
+                "run_shell".into()
+            } else {
+                format!("run_shell(\"{}\")", first_line(cmd, 60))
+            }
+        }
+        "search" => {
+            let pat = call
+                .args
+                .get("pattern")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if pat.is_empty() {
+                "search".into()
+            } else {
+                format!("search(\"{}\")", first_line(pat, 40))
+            }
+        }
+        "list_dir" => {
+            let path = call.args.get("path").and_then(Value::as_str).unwrap_or(".");
+            format!("list_dir({})", normalize_workspace_path(path))
+        }
+        _ => call.name.clone(),
+    }
+}
+
 fn digest(message: &AgentMsg) -> Option<String> {
     match message {
         AgentMsg::System(_) | AgentMsg::Memory(_) | AgentMsg::Summary(_) => None,
@@ -1274,15 +1380,26 @@ fn digest(message: &AgentMsg) -> Option<String> {
             "- called: {}",
             calls
                 .iter()
-                .map(|call| call.name.as_str())
+                .map(summarize_tool_call)
                 .collect::<Vec<_>>()
                 .join(", ")
         )),
-        AgentMsg::ToolResult { name, outcome } => Some(format!(
-            "- {name} returned {} ({} bytes, content not retained)",
-            if outcome.is_err() { "an error" } else { "ok" },
-            outcome.text().len()
-        )),
+        AgentMsg::ToolResult { name, outcome } => {
+            let status = if outcome.is_err() {
+                let err_text = outcome.text();
+                if let Some(exit_line) = err_text.lines().find(|l| l.contains("exit:")) {
+                    format!("an error ({})", exit_line.trim())
+                } else {
+                    "an error".to_string()
+                }
+            } else {
+                "ok".to_string()
+            };
+            Some(format!(
+                "- {name} returned {status} ({} bytes, content not retained)",
+                outcome.text().len()
+            ))
+        }
     }
 }
 
@@ -1357,14 +1474,78 @@ pub fn compact(
         });
     }
 
+    let mut modified_files = std::collections::BTreeSet::new();
+    let mut inspected_files = std::collections::BTreeSet::new();
+    let mut last_shell_cmd: Option<(String, &'static str)> = None;
+
+    for (idx, msg) in middle.iter().enumerate() {
+        if let AgentMsg::ToolCalls(calls) = msg {
+            for (nth, call) in calls.iter().enumerate() {
+                // `run_loop` pushes one `ToolResult` per call, in order, directly
+                // after the batch — so the nth call's result is at idx + 1 + nth,
+                // not always at idx + 1.
+                let result = match middle.get(idx + 1 + nth) {
+                    Some(AgentMsg::ToolResult { outcome, .. }) => Some(outcome),
+                    _ => None,
+                };
+                match call.name.as_str() {
+                    "edit_file" | "write_file" => {
+                        if let Some(path) = call.args.get("path").and_then(Value::as_str) {
+                            if result.is_some_and(|outcome| !outcome.is_err()) {
+                                modified_files.insert(path.to_string());
+                            }
+                        }
+                    }
+                    "read_file" => {
+                        if let Some(path) = call.args.get("path").and_then(Value::as_str) {
+                            inspected_files.insert(path.to_string());
+                        }
+                    }
+                    "run_shell" => {
+                        if let Some(cmd) = call.args.get("command").and_then(Value::as_str) {
+                            let status = match result {
+                                Some(outcome) if outcome.is_err() => "failed",
+                                Some(_) => "succeeded",
+                                None => "executed",
+                            };
+                            last_shell_cmd = Some((first_line(cmd, 60), status));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    let mut ledger = String::new();
+    if !modified_files.is_empty() || !inspected_files.is_empty() || last_shell_cmd.is_some() {
+        ledger.push_str("\nActive working set:\n");
+        if !modified_files.is_empty() {
+            ledger.push_str(&format!(
+                "- Modified files: {}\n",
+                join_capped(modified_files)
+            ));
+        }
+        if !inspected_files.is_empty() {
+            ledger.push_str(&format!(
+                "- Inspected files: {}\n",
+                join_capped(inspected_files)
+            ));
+        }
+        if let Some((cmd, status)) = last_shell_cmd {
+            ledger.push_str(&format!("- Last command: `{cmd}` ({status})\n"));
+        }
+    }
+
     let lines = middle
         .iter()
         .filter_map(|message| digest(message))
         .collect::<Vec<_>>();
     let summary = format!(
         "[earlier steps in this session, compacted to save context - {} messages. \
-         This records what happened, not tool output; re-read anything you still need.]\n{}",
+         This records what happened, not tool output; re-read anything you still need.]{}\n{}",
         middle.len(),
+        ledger,
         lines.join("\n")
     );
     // Splice the summary in where the elided run began: after the pinned
@@ -3999,7 +4180,9 @@ mod tests {
             "if (subtotalCents > 10000) return subtotalCents\n",
         )
         .unwrap();
-        let sandbox = Sandbox::new(dir.path(), false, Duration::from_secs(5)).unwrap();
+        let sandbox = Sandbox::new(dir.path(), false, Duration::from_secs(5))
+            .unwrap()
+            .with_checkpoints(false);
         let mut driver = MockDriver {
             steps: vec![
                 ModelStep::Text("done without looking".into()),
@@ -4014,6 +4197,8 @@ mod tests {
                     "edit_file",
                     json!({"path":"src/pricing.cjs","old":"> 10000","new":">= 10000"}),
                 )]),
+                // The premature-completion guard spends the first of these.
+                ModelStep::Text("fixed and verified".into()),
                 ModelStep::Text("fixed and verified".into()),
             ],
             idx: 0,
@@ -4041,10 +4226,175 @@ mod tests {
             .results
             .iter()
             .any(|result| result.contains("call read_file with path `src/pricing.cjs`")));
+        assert!(reporter
+            .notices
+            .iter()
+            .any(|n| n.contains("Verification required")));
         assert_eq!(reporter.text, vec!["fixed and verified"]);
         assert!(std::fs::read_to_string(dir.path().join("src/pricing.cjs"))
             .unwrap()
             .contains(">= 10000"));
+    }
+
+    #[test]
+    fn verification_gate_requires_test_run_after_mutating_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(src.join("pricing.cjs"), "const x = 1;\n").unwrap();
+        let sandbox = Sandbox::new(dir.path(), false, Duration::from_secs(5))
+            .unwrap()
+            .with_checkpoints(false);
+
+        let mut driver = MockDriver {
+            steps: vec![
+                ModelStep::Calls(vec![tc("read_file", json!({"path":"src/pricing.cjs"}))]),
+                ModelStep::Calls(vec![tc(
+                    "edit_file",
+                    json!({"path":"src/pricing.cjs","old":"1","new":"2"}),
+                )]),
+                // 1. Model prematurely attempts to claim completion without testing
+                ModelStep::Text("I fixed the code!".into()),
+                // 2. Model runs tests
+                ModelStep::Calls(vec![tc("run_shell", json!({"command":"echo ok"}))]),
+                // 3. Model finishes after verification
+                ModelStep::Text("Tests verified and passed!".into()),
+            ],
+            idx: 0,
+        };
+        let mut approver = ScriptApprover(vec![Decision::Once, Decision::Once], 0);
+        let mut reporter = RecordReporter::default();
+        let mut history = vec![AgentMsg::User(
+            "Fix the bug and verify that tests pass".into(),
+        )];
+        let mut config = cfg(dir.path(), false);
+        config.tool_profile = tools::ToolProfile::BenchmarkShared;
+
+        let end = run_loop(
+            &mut driver,
+            &mut approver,
+            &mut reporter,
+            &sandbox,
+            &config,
+            &AtomicBool::new(false),
+            &mut Policy::default(),
+            &mut history,
+        );
+
+        assert_eq!(end, LoopEnd::Answered);
+        assert!(reporter
+            .notices
+            .iter()
+            .any(|n| n.contains("Verification required")));
+        assert_eq!(reporter.text, vec!["Tests verified and passed!"]);
+    }
+
+    /// The guard asks once. A command that ran and REPORTED A FAILURE is a
+    /// result the model must be free to hand back — without this, a red test
+    /// suite could never be reported and the run would step-cap instead.
+    #[test]
+    fn a_failing_verification_command_can_still_be_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(src.join("pricing.cjs"), "const x = 1;\n").unwrap();
+        // The benchmark profile runs with checkpoints off in production, and the
+        // log is process-wide, so leave it alone.
+        let sandbox = Sandbox::new(dir.path(), false, Duration::from_secs(5))
+            .unwrap()
+            .with_checkpoints(false);
+
+        let failing = if cfg!(windows) { "exit /b 1" } else { "exit 1" };
+        let mut driver = MockDriver {
+            steps: vec![
+                ModelStep::Calls(vec![tc("read_file", json!({"path":"src/pricing.cjs"}))]),
+                ModelStep::Calls(vec![tc(
+                    "edit_file",
+                    json!({"path":"src/pricing.cjs","old":"1","new":"2"}),
+                )]),
+                ModelStep::Text("I fixed the code!".into()),
+                ModelStep::Calls(vec![tc("run_shell", json!({"command": failing}))]),
+                ModelStep::Text("I applied the change; the test suite still fails.".into()),
+                // Reached only if the guard wrongly fires a second time.
+                ModelStep::Text("second attempt".into()),
+            ],
+            idx: 0,
+        };
+        let mut approver = ScriptApprover(vec![Decision::Once, Decision::Once], 0);
+        let mut reporter = RecordReporter::default();
+        let mut history = vec![AgentMsg::User("Fix the bug and run the tests".into())];
+        let mut config = cfg(dir.path(), false);
+        config.tool_profile = tools::ToolProfile::BenchmarkShared;
+
+        let end = run_loop(
+            &mut driver,
+            &mut approver,
+            &mut reporter,
+            &sandbox,
+            &config,
+            &AtomicBool::new(false),
+            &mut Policy::default(),
+            &mut history,
+        );
+
+        assert_eq!(end, LoopEnd::Answered);
+        assert_eq!(
+            reporter.text,
+            vec!["I applied the change; the test suite still fails."]
+        );
+    }
+
+    /// The guard costs at most one step. A model that will not call a tool must
+    /// still be able to finish, or an edit-only task ends in `StepCapped`.
+    #[test]
+    fn the_verification_guard_asks_once_and_then_accepts_the_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(src.join("pricing.cjs"), "const x = 1;\n").unwrap();
+        // As above: benchmark profile, process-wide checkpoint log.
+        let sandbox = Sandbox::new(dir.path(), false, Duration::from_secs(5))
+            .unwrap()
+            .with_checkpoints(false);
+
+        let mut driver = MockDriver {
+            steps: vec![
+                ModelStep::Calls(vec![tc("read_file", json!({"path":"src/pricing.cjs"}))]),
+                ModelStep::Calls(vec![tc(
+                    "edit_file",
+                    json!({"path":"src/pricing.cjs","old":"1","new":"2"}),
+                )]),
+                ModelStep::Text("Done; there is nothing to run here.".into()),
+                ModelStep::Text("Done; there is nothing to run here.".into()),
+            ],
+            idx: 0,
+        };
+        let mut approver = ScriptApprover(vec![Decision::Once, Decision::Once], 0);
+        let mut reporter = RecordReporter::default();
+        let mut history = vec![AgentMsg::User("Rename the constant".into())];
+        let mut config = cfg(dir.path(), false);
+        config.tool_profile = tools::ToolProfile::BenchmarkShared;
+
+        let end = run_loop(
+            &mut driver,
+            &mut approver,
+            &mut reporter,
+            &sandbox,
+            &config,
+            &AtomicBool::new(false),
+            &mut Policy::default(),
+            &mut history,
+        );
+
+        assert_eq!(end, LoopEnd::Answered);
+        assert_eq!(
+            reporter
+                .notices
+                .iter()
+                .filter(|n| n.contains("Verification required"))
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -5049,6 +5399,62 @@ mod tests {
         let before = long_history("secret");
         let (after, _) = compact(&before, 1024, None).unwrap();
         assert!(estimate_tokens(&after, None) < estimate_tokens(&before, None));
+    }
+
+    #[test]
+    fn compaction_records_active_working_set_ledger() {
+        let mut history = vec![
+            AgentMsg::System("safety".into()),
+            AgentMsg::User("fix calculation bug".into()),
+            AgentMsg::ToolCalls(vec![tc("read_file", json!({"path": "src/pricing.cjs"}))]),
+            AgentMsg::ToolResult {
+                name: "read_file".into(),
+                outcome: ToolOutcome::Ok("const x = 1;".repeat(50)),
+            },
+            AgentMsg::ToolCalls(vec![tc(
+                "edit_file",
+                json!({"path": "src/pricing.cjs", "old": "1", "new": "2"}),
+            )]),
+            AgentMsg::ToolResult {
+                name: "edit_file".into(),
+                outcome: ToolOutcome::Ok("edited src/pricing.cjs".into()),
+            },
+            AgentMsg::ToolCalls(vec![tc(
+                "run_shell",
+                json!({"command": "node tests/test.cjs"}),
+            )]),
+            AgentMsg::ToolResult {
+                name: "run_shell".into(),
+                outcome: ToolOutcome::Err("error: tests failed\nexit: 1".into()),
+            },
+        ];
+        for i in 0..10 {
+            history.push(AgentMsg::ToolCalls(vec![tc(
+                "read_file",
+                json!({"path": format!("file-{i}.js")}),
+            )]));
+            history.push(AgentMsg::ToolResult {
+                name: "read_file".into(),
+                outcome: ToolOutcome::Ok("data".repeat(50)),
+            });
+        }
+        let (after, report) = compact(&history, 1024, None).unwrap();
+        assert!(report.elided > 0);
+        let summary = after
+            .iter()
+            .find_map(|m| match m {
+                AgentMsg::Summary(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .expect("should contain summary");
+
+        assert!(summary.contains("Active working set:"));
+        assert!(summary.contains("Modified files: src/pricing.cjs"));
+        assert!(summary.contains("Inspected files:"));
+        assert!(summary.contains("src/pricing.cjs"));
+        assert!(summary.contains("Last command: `node tests/test.cjs` (failed)"));
+        assert!(summary.contains("called: edit_file(src/pricing.cjs)"));
+        assert!(summary.contains("called: run_shell(\"node tests/test.cjs\")"));
     }
 
     #[test]

@@ -24,6 +24,11 @@ const expected = [
   'native_mcp_round_trip',
   'native_subagent_cleanup',
   'native_outside_canary_unchanged',
+  'native_edit_self_healing',
+  'native_path_suggestion',
+  'native_compaction_working_set',
+  'native_search_path_filter',
+  'native_verification_gate',
 ]
 
 assert.equal(manifest.schema, 'camelid.benchmark.native-contracts/v1')
@@ -44,7 +49,7 @@ for (const contract of manifest.contracts) {
   }
 }
 
-console.log('benchmark Phase 3 native contract inventory: PASS (16 contracts)')
+console.log(`benchmark Phase 3 native contract inventory: PASS (${expected.length} contracts)`)
 
 function escapeRegExp(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
