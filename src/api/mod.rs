@@ -22452,6 +22452,22 @@ fn render_chat_prompt_for_tokenization_fallback(
                 parse_special: tokenizer.chat_prompt_parse_special(),
             };
         }
+        // Llama 4's header-marker family (Meta MobileMoE and siblings). Kept
+        // ahead of the Llama 3 branch because the two are one lineage with two
+        // marker spellings; neither recognizer can fire on the other's
+        // template, so the order documents the kinship rather than guarding it.
+        if is_llama4_header_template(template) {
+            return RenderedPrompt {
+                text: render_llama4_header_prompt(messages),
+                // No BOS text in the rendered string; add_bos_token=true puts
+                // <|begin_of_text|> in exactly once at token level.
+                add_special: true,
+                // <|header_start|>/<|header_end|>/<|eot|> are control tokens in
+                // this vocabulary; special parsing is what turns them into their
+                // ids instead of spelling them out as ordinary text.
+                parse_special: tokenizer.chat_prompt_parse_special(),
+            };
+        }
         if is_llama3_instruct_template(template) {
             return RenderedPrompt {
                 text: render_llama3_instruct_prompt(messages),
@@ -23050,6 +23066,22 @@ fn is_llama3_instruct_template(template: &str) -> bool {
         && template.contains("<|eot_id|>")
 }
 
+/// Llama 4's header-marker chat template — the family Meta's MobileMoE ships
+/// (`general.architecture = mobilemoe`): every turn is
+/// `<|header_start|>{role}<|header_end|>\n\n{content}<|eot|>`, closed by a bare
+/// assistant header. Same shape as Llama 3 instruct with different marker
+/// spellings, and the two cannot cross-match: `<|header_start|>` never appears
+/// in a Llama 3 template, and `<|eot|>` is not a substring of `<|eot_id|>`
+/// (after `<|eot` comes `_`, not `|`). Without this branch the template fell
+/// through the whole chain to `render_role_colon_prompt` and served a
+/// `"User: …"` transcript these weights were never trained on, so the model
+/// continued the transcript instead of ending its turn.
+fn is_llama4_header_template(template: &str) -> bool {
+    template.contains("<|header_start|>")
+        && template.contains("<|header_end|>")
+        && template.contains("<|eot|>")
+}
+
 fn is_exact_llama31_instruct_template(template: &str) -> bool {
     template.len() == 4613
         && format!("{:x}", Sha256::digest(template.as_bytes()))
@@ -23391,6 +23423,39 @@ fn render_llama3_instruct_prompt_with_options(
     if append_generation_prompt {
         prompt.push_str("<|start_header_id|>assistant<|end_header_id|>\n\n");
     }
+    prompt
+}
+
+/// Render Llama 4's header-marker template byte-faithfully for the
+/// `add_generation_prompt = true` case.
+///
+/// The source template opens with `{{ bos_token }}`, but the rendered string
+/// carries NO BOS text. The GGUF declares `add_bos_token = true` and this
+/// branch encodes with `add_special = true`, so `<|begin_of_text|>` lands
+/// exactly once at token level — the resolution `render_llama3_instruct_prompt`
+/// and `render_gemma3_prompt` took for the same conflict. Spelling BOS into the
+/// text as well is the Mistral shape, which works only because that branch
+/// pairs it with `add_special: false`; doing both here would double the BOS.
+///
+/// Every message is closed with `<|eot|>`, the trailing user turn included: the
+/// template's `{{ content + '<|eot|>' }}` runs unconditionally inside the loop.
+/// The generation prompt is the assistant header with its two literal newlines
+/// and deliberately no `<|eot|>` — that is the token the model must produce to
+/// end its turn, and it is what the GGUF declares as EOS.
+///
+/// Content is emitted untrimmed because the template has no `| trim`. The role
+/// is trimmed: it arrives from the HTTP wire, and stray whitespace inside
+/// `<|header_start|>…<|header_end|>` would break the header into ordinary text.
+fn render_llama4_header_prompt(messages: &[ChatMessage]) -> String {
+    let mut prompt = String::new();
+    for message in messages {
+        prompt.push_str("<|header_start|>");
+        prompt.push_str(message.role.trim());
+        prompt.push_str("<|header_end|>\n\n");
+        prompt.push_str(&message.content);
+        prompt.push_str("<|eot|>");
+    }
+    prompt.push_str("<|header_start|>assistant<|header_end|>\n\n");
     prompt
 }
 
@@ -24101,6 +24166,8 @@ fn detect_chat_template_format(template: &str) -> &'static str {
         "gemma2_it_exact"
     } else if is_gemma3_chat_template(template) {
         "gemma3_turn_markers"
+    } else if is_llama4_header_template(template) {
+        "llama4_header_markers"
     } else if is_llama3_instruct_template(template) {
         "llama3_instruct"
     } else if is_mistral_instruct_template(template) {
@@ -29878,6 +29945,117 @@ mod tests {
         assert!(
             reject_tools_for_windowed_arch("llama", Some(std::slice::from_ref(&tool))).is_none()
         );
+    }
+
+    /// The MobileMoE GGUF's chat template, verbatim. Before this family was
+    /// recognised it fell through to the role-colon renderer, and the model
+    /// answered a greeting by continuing the transcript forever.
+    const LLAMA4_HEADER_TEMPLATE: &str = "{{ bos_token }}{% set loop_messages = messages %}{% for message in loop_messages %}{% set content = '<|header_start|>' + message['role'] + '<|header_end|>\\n\\n' %}{% if message['content'] is string %}{% set content = content + message['content'] %}{% else %}{% for item in message['content'] %}{% if item['type'] == 'text' %}{% set content = content + item['text'] %}{% endif %}{% endfor %}{% endif %}{{ content + '<|eot|>' }}{% endfor %}{% if add_generation_prompt %}{{ '<|header_start|>assistant<|header_end|>\\n\\n' }}{% endif %}";
+
+    #[test]
+    fn renders_llama4_header_prompt_with_header_tokens_and_special_parsing() {
+        let _guard = crate::test_support::env_lock();
+        std::env::remove_var(METADATA_CHAT_TEMPLATE_ENV);
+        let tokenizer = Tokenizer {
+            model: TokenizerModel::Gpt2Bpe,
+            bpe_pre_tokenizer: BpePreTokenizer::default(),
+            tokens: Vec::new(),
+            token_to_id: HashMap::new(),
+            byte_token_to_id: HashMap::new(),
+            bpe_ranks: HashMap::new(),
+            bpe_registry: BpeRegistry::default(),
+            special: SpecialTokens::default(),
+            config: TokenizerConfig {
+                add_bos: true,
+                add_eos: false,
+                add_sep: false,
+                add_space_prefix: false,
+                remove_extra_whitespaces: false,
+            },
+            chat_template: Some(LLAMA4_HEADER_TEMPLATE.to_string()),
+            specials_index: OnceLock::new(),
+        };
+
+        assert!(tokenizer.chat_prompt_parse_special());
+        assert_eq!(
+            detect_chat_template_format(tokenizer.chat_template.as_deref().unwrap()),
+            "llama4_header_markers"
+        );
+        assert_eq!(
+            render_chat_prompt(
+                &[ChatMessage {
+                    image_urls: Vec::new(),
+                    unsupported_content_parts: Vec::new(),
+                    role: "user".to_string(),
+                    content: " hello ".to_string(),
+                }],
+                &tokenizer,
+            ),
+            "<|header_start|>user<|header_end|>\n\n hello <|eot|><|header_start|>assistant<|header_end|>\n\n"
+        );
+    }
+
+    #[test]
+    fn renders_llama4_header_prompt_with_system_and_multi_turn_messages() {
+        let _guard = crate::test_support::env_lock();
+        std::env::remove_var(METADATA_CHAT_TEMPLATE_ENV);
+        let tokenizer = Tokenizer {
+            model: TokenizerModel::Gpt2Bpe,
+            bpe_pre_tokenizer: BpePreTokenizer::default(),
+            tokens: Vec::new(),
+            token_to_id: HashMap::new(),
+            byte_token_to_id: HashMap::new(),
+            bpe_ranks: HashMap::new(),
+            bpe_registry: BpeRegistry::default(),
+            special: SpecialTokens::default(),
+            config: TokenizerConfig {
+                add_bos: true,
+                add_eos: false,
+                add_sep: false,
+                add_space_prefix: false,
+                remove_extra_whitespaces: false,
+            },
+            chat_template: Some(LLAMA4_HEADER_TEMPLATE.to_string()),
+            specials_index: OnceLock::new(),
+        };
+
+        let message = |role: &str, content: &str| ChatMessage {
+            image_urls: Vec::new(),
+            unsupported_content_parts: Vec::new(),
+            role: role.to_string(),
+            content: content.to_string(),
+        };
+
+        assert_eq!(
+            render_chat_prompt(
+                &[
+                    message("system", "Be helpful."),
+                    message("user", "Hello"),
+                    message("assistant", "Hi"),
+                    message("user", "Again"),
+                ],
+                &tokenizer,
+            ),
+            concat!(
+                "<|header_start|>system<|header_end|>\n\nBe helpful.<|eot|>",
+                "<|header_start|>user<|header_end|>\n\nHello<|eot|>",
+                "<|header_start|>assistant<|header_end|>\n\nHi<|eot|>",
+                "<|header_start|>user<|header_end|>\n\nAgain<|eot|>",
+                "<|header_start|>assistant<|header_end|>\n\n"
+            )
+        );
+    }
+
+    #[test]
+    fn llama4_header_recognizer_does_not_collide_with_llama3_instruct() {
+        // `<|eot|>` is not a substring of `<|eot_id|>`, and neither family's
+        // markers appear in the other's template. A collision here would route
+        // one family through the other's renderer and stop token.
+        let llama3 = "<|start_header_id|>{{ role }}<|end_header_id|>{{ content }}<|eot_id|>";
+        assert!(is_llama3_instruct_template(llama3));
+        assert!(!is_llama4_header_template(llama3));
+        assert!(is_llama4_header_template(LLAMA4_HEADER_TEMPLATE));
+        assert!(!is_llama3_instruct_template(LLAMA4_HEADER_TEMPLATE));
     }
 
     #[test]
