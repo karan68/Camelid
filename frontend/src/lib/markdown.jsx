@@ -48,7 +48,7 @@ const openLinkExternally = (event, href) => {
 
 const renderInlineMarkdown = (text, keyPrefix) => {
   const parts = String(text || '')
-    .split(/(`[^`]+`|\*\*[^*]+\*\*|\*[^*\s][^*]*\*|~~[^~]+~~|\[[^\]]+\]\([^()\s]+\))/g)
+    .split(/(`[^`]+`|\*\*[^*]+\*\*|\*[^*\s][^*]*\*|~~[^~]+~~|\[[^\]]+\]\([^()\s]+\)|\[(?:Citation\s+|Source\s+)?\d+\])/gi)
     .filter(Boolean)
   return parts.map((part, index) => {
     const key = `${keyPrefix}-${index}`
@@ -63,6 +63,23 @@ const renderInlineMarkdown = (text, keyPrefix) => {
     }
     if (part.startsWith('*') && part.endsWith('*') && part.length > 2) {
       return <em key={key}>{part.slice(1, -1)}</em>
+    }
+    const citeMatch = part.match(/^\[(?:Citation\s+|Source\s+)?(\d+)\]$/i)
+    if (citeMatch) {
+      const citeIndex = citeMatch[1]
+      return (
+        <button
+          key={key}
+          type="button"
+          className="citation-pill"
+          title={`View source citation [${citeIndex}]`}
+          onClick={() => {
+            window.dispatchEvent(new CustomEvent('camelid-citation-click', { detail: { index: citeIndex } }))
+          }}
+        >
+          <span>[{citeIndex}]</span>
+        </button>
+      )
     }
     const link = part.match(/^\[([^\]]+)\]\(([^()\s]+)\)$/)
     if (link) {

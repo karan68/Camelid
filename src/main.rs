@@ -3041,6 +3041,17 @@ enum Command {
         #[arg(long, value_name = "PATH")]
         output: Option<PathBuf>,
     },
+    /// Quantize a GGUF model file to Q8_0, Q4_0, or Q4_K_M.
+    Quantize {
+        /// Source input GGUF model file.
+        input: PathBuf,
+        /// Target output GGUF model file.
+        #[arg(short = 'o', long)]
+        output: PathBuf,
+        /// Target quantization format: q8_0, q4_0, or q4_k_m (default: q4_k_m).
+        #[arg(long = "type", default_value = "q4_k_m")]
+        quant_type: String,
+    },
 }
 
 /// Counts reported by the CUDA Gemma 4 development benchmark.
@@ -5591,6 +5602,44 @@ async fn main() -> anyhow::Result<()> {
                 "sealed receipt_id={} -> {}",
                 receipt.receipt_id,
                 out_path.display()
+            );
+        }
+        Command::Quantize {
+            input,
+            output,
+            quant_type,
+        } => {
+            let target = match quant_type.to_lowercase().as_str() {
+                "q8_0" | "q8" => camelid::quantize::TargetQuant::Q8_0,
+                "q4_0" | "q4" => camelid::quantize::TargetQuant::Q4_0,
+                "q4_k_m" | "q4_k" | "q4km" => camelid::quantize::TargetQuant::Q4_K_M,
+                other => anyhow::bail!(
+                    "Unsupported quantization type '{other}'. Supported: q8_0, q4_0, q4_k_m"
+                ),
+            };
+
+            println!(
+                "Quantizing {} -> {} ({:?})...",
+                input.display(),
+                output.display(),
+                target
+            );
+            let receipt = camelid::quantize::quantize_model(&input, &output, target)?;
+            println!("Quantization complete!");
+            println!("  SHA256:            {}", receipt.sha256);
+            println!("  Input bytes:       {}", receipt.input_bytes);
+            println!("  Output bytes:      {}", receipt.output_bytes);
+            println!(
+                "  Compression ratio: {:.2}x",
+                if receipt.compression_ratio > 0.0 {
+                    1.0 / receipt.compression_ratio
+                } else {
+                    1.0
+                }
+            );
+            println!(
+                "  Tensors:           {} quantized / {} total",
+                receipt.quantized_tensors, receipt.tensor_count
             );
         }
     }
