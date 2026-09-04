@@ -30,6 +30,7 @@ use tower_http::trace::TraceLayer;
 #[allow(dead_code)]
 mod continuous_batch;
 mod contract;
+pub(crate) mod documents;
 mod engine;
 mod metrics;
 mod responses;
@@ -2742,8 +2743,16 @@ fn router_with_state_and_policy(state: AppState, policy: server::ServerPolicy) -
             "/api/agent/workspace/sessions/:id/decisions",
             post(workspace::decide),
         )
+        .route("/api/documents/ingest", post(documents::ingest_document))
+        .route("/api/documents/search", post(documents::search_documents))
+        .route(
+            "/api/documents/:id",
+            axum::routing::delete(documents::delete_document),
+        )
+        .route("/api/documents", get(documents::list_documents))
         .route("/api/models/local", get(local_models))
         .route("/api/models/local/delete", post(delete_local_model))
+        .route("/api/models/quantize", post(quantize_model_endpoint))
         .route(
             "/api/models/default",
             get(default_model).post(set_default_model),
@@ -35389,6 +35398,86 @@ async fn delete_local_model(
         }),
     )
         .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct QuantizeModelRequest {
+    pub input_path: String,
+    pub output_path: Option<String>,
+    #[serde(default = "default_quant_type")]
+    pub quant_type: String,
+}
+
+fn default_quant_type() -> String {
+    "q4_k_m".to_string()
+}
+
+pub async fn quantize_model_endpoint(
+    State(_state): State<AppState>,
+    Json(payload): Json<QuantizeModelRequest>,
+) -> Result<Json<crate::quantize::QuantizeReceipt>, Response> {
+    let input = PathBuf::from(payload.input_path.trim());
+    if !input.exists() {
+        return Err(api_error(
+            StatusCode::NOT_FOUND,
+            "file_not_found",
+            format!("Input model file not found: {}", input.display()),
+            None,
+        ));
+    }
+
+    let target_quant = match payload.quant_type.to_lowercase().as_str() {
+        "q8_0" | "q8" => crate::quantize::TargetQuant::Q8_0,
+        "q4_0" | "q4" => crate::quantize::TargetQuant::Q4_0,
+        "q4_k_m" | "q4_k" | "q4km" => crate::quantize::TargetQuant::Q4_K_M,
+        other => {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_quant_type",
+                format!("Unsupported quantization type '{other}'. Supported: q8_0, q4_0, q4_k_m"),
+                None,
+            ));
+        }
+    };
+
+    let output = match payload.output_path {
+        Some(p) if !p.trim().is_empty() => PathBuf::from(p.trim()),
+        _ => {
+            let stem = input
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("model");
+            let suffix = match target_quant {
+                crate::quantize::TargetQuant::Q8_0 => "Q8_0",
+                crate::quantize::TargetQuant::Q4_0 => "Q4_0",
+                crate::quantize::TargetQuant::Q4_K_M => "Q4_K_M",
+            };
+            input.with_file_name(format!("{stem}-{suffix}.gguf"))
+        }
+    };
+
+    let receipt = tokio::task::spawn_blocking(move || {
+        crate::quantize::quantize_model(&input, &output, target_quant)
+    })
+    .await
+    .map_err(|e| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "quantize_thread_error",
+            format!("Quantization thread join failed: {e}"),
+            None,
+        )
+    })?
+    .map_err(|e| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "quantize_failed",
+            format!("Quantization failed: {e}"),
+            None,
+        )
+    })?;
+
+    Ok(Json(receipt))
 }
 
 /// Cached metadata-derived facts for one local model, keyed by (mtime, size) so a

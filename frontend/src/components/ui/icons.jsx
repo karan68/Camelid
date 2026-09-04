@@ -58,6 +58,23 @@ export const IconMonitor = (p) => <Svg {...p}><path d="M21 3H3a2 2 0 0 0-2 2v11a
 export const IconSearch = (p) => <Svg {...p} strokeIcon><circle cx="11" cy="11" r="7" /><path d="m20 20-3.5-3.5" /></Svg>
 export const IconTrash = (p) => <Svg {...p}><path d="M6 7h12l-1 14H7L6 7zm3-3h6l1 2h4v2H4V6h4l1-2zm1 6v8h2v-8h-2zm4 0v8h2v-8h-2z" /></Svg>
 export const IconClose = (p) => <Svg {...p}><path d="m18.3 5.7-1.4-1.4L12 9.2 7.1 4.3 5.7 5.7 10.6 10.6 5.7 15.5l1.4 1.4L12 12l4.9 4.9 1.4-1.4-4.9-4.9 4.9-4.9z" /></Svg>
+export const IconFile = (p) => (
+  <Svg {...p} strokeIcon>
+    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+    <polyline points="14 2 14 8 20 8" />
+    <line x1="16" y1="13" x2="8" y2="13" />
+    <line x1="16" y1="17" x2="8" y2="17" />
+  </Svg>
+)
+export const IconScale = (p) => (
+  <Svg {...p} strokeIcon>
+    <path d="m16 16 3-8 3 8c-.87.65-1.92 1-3 1s-2.13-.35-3-1Z" />
+    <path d="m2 16 3-8 3 8c-.87.65-1.92 1-3 1s-2.13-.35-3-1Z" />
+    <path d="M7 21h10" />
+    <path d="M12 3v18" />
+    <path d="M3 7h2c2 0 5-1 7-2 2 1 5 2 7 2h2" />
+  </Svg>
+)
 export const IconChevronDown = (p) => <Svg {...p} strokeIcon><path d="m6 9 6 6 6-6" /></Svg>
 export const IconChevronRight = (p) => <Svg {...p} strokeIcon><path d="m9 6 6 6-6 6" /></Svg>
 export const IconPlus = (p) => <Svg {...p}><path d="M11 5h2v6h6v2h-6v6h-2v-6H5v-2h6V5z" /></Svg>

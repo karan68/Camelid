@@ -42,6 +42,7 @@ pub mod model_source;
 pub mod offload;
 pub mod platform_fs;
 pub mod quality;
+pub mod quantize;
 pub mod receipt;
 pub mod remote_chat;
 pub mod runnable;
