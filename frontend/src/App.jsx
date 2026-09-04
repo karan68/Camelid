@@ -449,6 +449,9 @@ function App() {
             <ArenaView
               models={models}
               runtime={runtime}
+              apiBase={apiBase}
+              loadDashboard={loadDashboard}
+              setTab={navigateTab}
             />
           )}
 
