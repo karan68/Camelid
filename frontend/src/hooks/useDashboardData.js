@@ -54,7 +54,7 @@ const LOCAL_MODELS_STORAGE_KEY = 'camelid.localModels'
 const CONVERSATIONS_STORAGE_KEY = 'camelid.conversations'
 const MEMORIES_STORAGE_KEY = 'camelid.memories'
 const API_BASE_STORAGE_KEY = 'camelid.apiBase'
-const VALID_TABS = new Set(['chat', 'workspace', 'library', 'downloads', 'api', 'analytics', 'history', 'memory', 'system', 'settings', 'cluster', 'compatibility', 'telemetry'])
+const VALID_TABS = new Set(['chat', 'workspace', 'library', 'downloads', 'api', 'analytics', 'history', 'memory', 'system', 'settings', 'cluster', 'compatibility', 'telemetry', 'arena'])
 // Where the UI looks for the camelid API by default:
 //   1. an explicit VITE_CAMELID_API_BASE override always wins;
 //   2. otherwise use the page origin. Production is served by Camelid directly;
@@ -1137,13 +1137,19 @@ export function useDashboardData({ showNotice, clearNotice }) {
     return true
   }
 
-  /* options.overrideContent: send this text instead of the composer draft
-     (regenerate / edit-and-resend). options.truncateFromMessageId: drop that
-     message and everything after it first, so the resent turn replaces the
-     old tail instead of duplicating it. The gate checks below are identical
-     for every path — resends cannot bypass the fail-closed chat gate. */
+  /* options.overrideContent: replace the composer draft in both transcript and
+     request (regenerate / edit-and-resend). options.requestContent: replace only
+     the current request payload while preserving what the user typed in the
+     transcript. options.truncateFromMessageId drops that message and everything
+     after it first. The gate checks below are identical for every path. */
   const sendMessage = async (options = {}) => {
-    const { overrideContent = null, overrideImage = null, truncateFromMessageId = null } = options
+    const {
+      overrideContent = null,
+      overrideImage = null,
+      requestContent = null,
+      citations = [],
+      truncateFromMessageId = null,
+    } = options
     const draftContent = overrideContent ?? composer
     if (!draftContent.trim()) return
     // Supported rows chat through the full gate. Implemented-but-unsupported rows
@@ -1155,6 +1161,8 @@ export function useDashboardData({ showNotice, clearNotice }) {
     }
 
     const messageContent = draftContent.trim()
+    const requestMessageContent = String(requestContent ?? messageContent).trim()
+    if (!requestMessageContent) return
     setSending(true)
     let activeConversationId = null
     let assistantId = null
@@ -1205,15 +1213,18 @@ export function useDashboardData({ showNotice, clearNotice }) {
       history.forEach((message, index) => {
         if (message.image?.data_url) activeImageIndex = index
       })
-      const requestHistory = history.map(({ role, content, image }, index) => ({
-        role,
-        content: index === activeImageIndex
-          ? [
-              { type: 'image_url', image_url: { url: image.data_url } },
-              { type: 'text', text: content },
-            ]
-          : content,
-      }))
+      const requestHistory = history.map(({ id, role, content, image }, index) => {
+        const payloadContent = id === userMessage.id ? requestMessageContent : content
+        return {
+          role,
+          content: index === activeImageIndex
+            ? [
+                { type: 'image_url', image_url: { url: image.data_url } },
+                { type: 'text', text: payloadContent },
+              ]
+            : payloadContent,
+        }
+      })
       let requestMessages = applyLocalChatPolicy(requestHistory)
 
       /* Send-time compaction. Trims only this payload -- the stored transcript
@@ -1471,6 +1482,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
         first_event_ms: null,
         first_content_ms: null,
         web_research_ms: webResearchMs,
+        ...(Array.isArray(citations) && citations.length ? { citations } : {}),
         ...(researchAtSend ? { web_research: researchAtSend } : {}),
       }
       persistConversations((current) => current.map((item) => (

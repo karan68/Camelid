@@ -1,4 +1,4 @@
-import { memo, useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { createContext, memo, useContext, useEffect, useLayoutEffect, useRef, useState } from 'react'
 
 /* Assistant markdown + fenced-code rendering.
    Extracted verbatim from the original ChatWorkspace so the parsing/rendering
@@ -34,6 +34,27 @@ export const copyText = async (text) => {
 /* Only http(s)/mailto links render as anchors; any other scheme (javascript:,
    data:, file:) stays plain text — model output never picks the protocol. */
 const SAFE_LINK_SCHEME = /^(https?:|mailto:)/i
+const EMPTY_CITATIONS = []
+const CitationContext = createContext(EMPTY_CITATIONS)
+
+function CitationPill({ citeIndex }) {
+  const citations = useContext(CitationContext)
+  const citation = Array.isArray(citations) ? citations[Number(citeIndex) - 1] : undefined
+  return (
+    <button
+      type="button"
+      className="citation-pill"
+      title={`View source citation [${citeIndex}]`}
+      onClick={() => {
+        window.dispatchEvent(new CustomEvent('camelid-citation-click', {
+          detail: { index: citeIndex, citation },
+        }))
+      }}
+    >
+      <span>[{citeIndex}]</span>
+    </button>
+  )
+}
 
 /* The desktop (Tauri) webview has no browser tabs, so target="_blank" cannot
    open anything there; route http(s) links through the system browser via the
@@ -67,19 +88,7 @@ const renderInlineMarkdown = (text, keyPrefix) => {
     const citeMatch = part.match(/^\[(?:Citation\s+|Source\s+)?(\d+)\]$/i)
     if (citeMatch) {
       const citeIndex = citeMatch[1]
-      return (
-        <button
-          key={key}
-          type="button"
-          className="citation-pill"
-          title={`View source citation [${citeIndex}]`}
-          onClick={() => {
-            window.dispatchEvent(new CustomEvent('camelid-citation-click', { detail: { index: citeIndex } }))
-          }}
-        >
-          <span>[{citeIndex}]</span>
-        </button>
-      )
+      return <CitationPill key={key} citeIndex={citeIndex} />
     }
     const link = part.match(/^\[([^\]]+)\]\(([^()\s]+)\)$/)
     if (link) {
@@ -517,20 +526,26 @@ function renderFencedContent(normalized, streaming) {
   return blocks
 }
 
-function AssistantMarkdownInner({ content, streaming = false }) {
+function AssistantMarkdownInner({ content, streaming = false, citations = EMPTY_CITATIONS }) {
   const normalized = String(content || '').replace(/\r\n/g, '\n')
   if (!streaming) {
     const blocks = renderFencedContent(normalized, false)
-    return <div className="message-markdown">{blocks.length ? blocks : <p>{content}</p>}</div>
+    return (
+      <CitationContext.Provider value={citations}>
+        <div className="message-markdown">{blocks.length ? blocks : <p>{content}</p>}</div>
+      </CitationContext.Provider>
+    )
   }
   const boundary = splitStableBoundary(normalized)
   const stable = normalized.slice(0, boundary)
   const tail = normalized.slice(boundary)
   return (
-    <div className="message-markdown">
-      {stable && <StableMarkdownSegment content={stable} />}
-      {tail && renderFencedContent(tail, true)}
-    </div>
+    <CitationContext.Provider value={citations}>
+      <div className="message-markdown">
+        {stable && <StableMarkdownSegment content={stable} />}
+        {tail && renderFencedContent(tail, true)}
+      </div>
+    </CitationContext.Provider>
   )
 }
 

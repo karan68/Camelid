@@ -3,6 +3,7 @@
 //! Provides document ingestion, sliding-window chunking, SQLite FTS5 lexical indexing,
 //! and hybrid retrieval (BM25 + cosine vector similarity / RRF) for "Chat with Documents".
 
+use std::io::{Cursor, Read};
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -11,7 +12,7 @@ use axum::extract::{Path as AxumPath, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use rusqlite::{params, Connection};
+use rusqlite::{params, params_from_iter, types::Value, Connection};
 use serde::{Deserialize, Serialize};
 
 use super::{api_error, AppState};
@@ -144,7 +145,7 @@ pub fn chunk_text(text: &str, target_chars: usize, overlap_chars: usize) -> Vec<
     chunks
 }
 
-/// Extract clean textual tokens from arbitrary file types (plain text, markdown, CSV, basic PDF/DOCX stream inspection).
+/// Extract clean textual tokens from supported document formats.
 pub fn extract_text_from_bytes(filename: &str, raw_bytes: &[u8]) -> String {
     let lower = filename.to_lowercase();
     if lower.ends_with(".txt")
@@ -158,21 +159,24 @@ pub fn extract_text_from_bytes(filename: &str, raw_bytes: &[u8]) -> String {
         return String::from_utf8_lossy(raw_bytes).to_string();
     }
 
-    // DOCX handling: extract UTF-8 text from word/document.xml in zip stream
+    // DOCX is a ZIP container. Read the actual XML entry so deflated documents
+    // work as well as the uncommon uncompressed form.
     if lower.ends_with(".docx") {
         if let Ok(archive) = zip_extract_text(raw_bytes) {
             if !archive.is_empty() {
                 return archive;
             }
         }
+        return String::new();
     }
 
-    // PDF handling: extract stream text blocks (BT ... ET)
+    // Let a PDF parser handle compressed streams, encodings, and font maps.
     if lower.ends_with(".pdf") {
         let extracted = pdf_extract_text(raw_bytes);
         if !extracted.is_empty() {
             return extracted;
         }
+        return String::new();
     }
 
     // Fallback: extract readable UTF-8 strings
@@ -180,28 +184,12 @@ pub fn extract_text_from_bytes(filename: &str, raw_bytes: &[u8]) -> String {
 }
 
 fn zip_extract_text(bytes: &[u8]) -> Result<String, ()> {
-    // Simple scan for word/document.xml zip entry or flate decompression
-    let mut text_output = String::new();
-    let pattern = b"word/document.xml";
-    if let Some(pos) = bytes.windows(pattern.len()).position(|w| w == pattern) {
-        // Zip local file header starts 30 bytes before filename
-        if pos >= 30 {
-            let offset = pos + pattern.len();
-            // Try reading raw XML if stored uncompressed
-            if let Some(xml_end) = bytes[offset..]
-                .windows(16)
-                .position(|w| w == b"</w:document>")
-            {
-                let xml_slice = &bytes[offset..offset + xml_end + 16];
-                text_output = strip_xml_tags(xml_slice);
-            }
-        }
-    }
-    if text_output.is_empty() {
-        // Scan for standard text runs <w:t>...</w:t>
-        text_output = strip_xml_tags(bytes);
-    }
-    Ok(text_output)
+    let cursor = Cursor::new(bytes);
+    let mut archive = zip::ZipArchive::new(cursor).map_err(|_| ())?;
+    let mut document = archive.by_name("word/document.xml").map_err(|_| ())?;
+    let mut xml = String::new();
+    document.read_to_string(&mut xml).map_err(|_| ())?;
+    Ok(strip_xml_tags(xml.as_bytes()))
 }
 
 fn strip_xml_tags(bytes: &[u8]) -> String {
@@ -218,44 +206,27 @@ fn strip_xml_tags(bytes: &[u8]) -> String {
             out.push(ch);
         }
     }
-    out.split_whitespace().collect::<Vec<_>>().join(" ")
+    decode_xml_entities(&out)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn decode_xml_entities(value: &str) -> String {
+    value
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
 }
 
 fn pdf_extract_text(bytes: &[u8]) -> String {
-    let mut out = String::new();
-    let mut i = 0;
-    while i < bytes.len() {
-        // Look for string literal in PDF: `(` ... `)`
-        if bytes[i] == b'(' {
-            let start = i + 1;
-            let mut depth = 1;
-            let mut j = start;
-            while j < bytes.len() && depth > 0 {
-                if bytes[j] == b'\\' {
-                    j += 2;
-                    continue;
-                }
-                if bytes[j] == b'(' {
-                    depth += 1;
-                } else if bytes[j] == b')' {
-                    depth -= 1;
-                }
-                j += 1;
-            }
-            if depth == 0 && j > start {
-                let text_slice = &bytes[start..j - 1];
-                let decoded = String::from_utf8_lossy(text_slice);
-                if decoded.chars().any(|c| c.is_alphanumeric()) {
-                    out.push_str(&decoded);
-                    out.push(' ');
-                }
-            }
-            i = j;
-        } else {
-            i += 1;
-        }
-    }
-    out.split_whitespace().collect::<Vec<_>>().join(" ")
+    pdf_extract::extract_text_from_mem(bytes)
+        .unwrap_or_default()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[derive(Debug, Deserialize)]
@@ -373,7 +344,35 @@ pub async fn ingest_document(
         .unwrap_or("txt")
         .to_lowercase();
 
-    // Insert or replace metadata
+    // Remove any previous chunks and their external-content FTS rows for doc_id.
+    tx.execute(
+        "DELETE FROM document_chunks_fts WHERE rowid IN (SELECT id FROM document_chunks WHERE doc_id = ?1)",
+        params![doc_id],
+    )
+    .map_err(|e| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "delete_fts_error",
+            e.to_string(),
+            None,
+        )
+    })?;
+    tx.execute(
+        "DELETE FROM document_chunks WHERE doc_id = ?1",
+        params![doc_id],
+    )
+    .map_err(|e| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "delete_chunk_error",
+            e.to_string(),
+            None,
+        )
+    })?;
+
+    // Insert or replace metadata only after the old chunk ids have been
+    // available for FTS cleanup; REPLACE can otherwise cascade-delete them
+    // before the external-content index rows are found.
     tx.execute(
         "INSERT OR REPLACE INTO documents (id, filename, file_type, byte_size, chunk_count, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -381,13 +380,6 @@ pub async fn ingest_document(
     ).map_err(|e| {
         api_error(StatusCode::INTERNAL_SERVER_ERROR, "insert_doc_error", e.to_string(), None)
     })?;
-
-    // Remove any previous chunks for doc_id
-    tx.execute(
-        "DELETE FROM document_chunks WHERE doc_id = ?1",
-        params![doc_id],
-    )
-    .ok();
 
     // Insert chunks and index in FTS5
     for (idx, chunk) in chunks.iter().enumerate() {
@@ -465,6 +457,11 @@ pub async fn search_documents(
 
     let fts_pattern = sanitize_fts5_query(query_trimmed);
     let top_k = payload.top_k.clamp(1, 20);
+    if payload.doc_ids.as_ref().is_some_and(Vec::is_empty) {
+        return Ok(Json(SearchDocumentsResponse {
+            results: Vec::new(),
+        }));
+    }
 
     let _lock = db_lock().lock().unwrap();
     let conn = open_connection().map_err(|e| {
@@ -476,22 +473,43 @@ pub async fn search_documents(
         )
     })?;
 
-    // Perform BM25 query on FTS5
-    let mut stmt = conn.prepare(
+    // Apply the document scope before ranking and LIMIT. Filtering afterward
+    // can discard all globally top-ranked rows even when an attached document
+    // contains relevant matches just below them.
+    let mut sql = String::from(
         "SELECT c.doc_id, d.filename, c.chunk_index, c.content, bm25(document_chunks_fts) as score
          FROM document_chunks_fts AS f
          JOIN document_chunks AS c ON c.id = f.rowid
          JOIN documents AS d ON d.id = c.doc_id
-         WHERE document_chunks_fts MATCH ?1
-         ORDER BY score ASC
-         LIMIT ?2",
-    ).map_err(|e| {
-        api_error(StatusCode::INTERNAL_SERVER_ERROR, "prepare_fts_error", e.to_string(), None)
+         WHERE document_chunks_fts MATCH ?1",
+    );
+    let mut bind_values = vec![Value::Text(fts_pattern)];
+    if let Some(allowed_ids) = payload.doc_ids.as_ref() {
+        let placeholders = allowed_ids
+            .iter()
+            .map(|doc_id| {
+                bind_values.push(Value::Text(doc_id.clone()));
+                format!("?{}", bind_values.len())
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        sql.push_str(&format!(" AND c.doc_id IN ({placeholders})"));
+    }
+    bind_values.push(Value::Integer(top_k as i64));
+    sql.push_str(&format!(" ORDER BY score ASC LIMIT ?{}", bind_values.len()));
+
+    let mut stmt = conn.prepare(&sql).map_err(|e| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "prepare_fts_error",
+            e.to_string(),
+            None,
+        )
     })?;
 
     let mut query_results = Vec::new();
     let rows = stmt
-        .query_map(params![fts_pattern, (top_k * 2) as i64], |row| {
+        .query_map(params_from_iter(bind_values.iter()), |row| {
             let doc_id: String = row.get(0)?;
             let filename: String = row.get(1)?;
             let chunk_index: i64 = row.get(2)?;
@@ -510,11 +528,6 @@ pub async fn search_documents(
 
     for row_res in rows.flatten() {
         let (doc_id, filename, chunk_index, content, raw_bm25) = row_res;
-        if let Some(ref allowed_ids) = payload.doc_ids {
-            if !allowed_ids.contains(&doc_id) {
-                continue;
-            }
-        }
         // BM25 in sqlite returns negative values where lower/more negative is better match
         let normalized_score = (1.0 / (1.0 + raw_bm25.abs())) as f32;
         query_results.push(DocumentSearchResult {
@@ -526,7 +539,6 @@ pub async fn search_documents(
         });
     }
 
-    query_results.truncate(top_k);
     Ok(Json(SearchDocumentsResponse {
         results: query_results,
     }))
@@ -584,7 +596,7 @@ pub async fn delete_document(
     AxumPath(doc_id): AxumPath<String>,
 ) -> Result<impl IntoResponse, Response> {
     let _lock = db_lock().lock().unwrap();
-    let conn = open_connection().map_err(|e| {
+    let mut conn = open_connection().map_err(|e| {
         api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "sqlite_error",
@@ -593,7 +605,19 @@ pub async fn delete_document(
         )
     })?;
 
-    conn.execute("DELETE FROM documents WHERE id = ?1", params![doc_id])
+    let tx = conn.transaction().map_err(|e| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "sqlite_tx_error",
+            e.to_string(),
+            None,
+        )
+    })?;
+    tx.execute(
+        "DELETE FROM document_chunks_fts WHERE rowid IN (SELECT id FROM document_chunks WHERE doc_id = ?1)",
+        params![doc_id],
+    )
+    .and_then(|_| tx.execute("DELETE FROM documents WHERE id = ?1", params![doc_id]))
         .map_err(|e| {
             api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -602,6 +626,14 @@ pub async fn delete_document(
                 None,
             )
         })?;
+    tx.commit().map_err(|e| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "commit_error",
+            e.to_string(),
+            None,
+        )
+    })?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -609,6 +641,8 @@ pub async fn delete_document(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
 
     #[test]
     fn test_chunk_text_basic() {
@@ -622,5 +656,25 @@ mod tests {
     fn test_sanitize_fts5_query() {
         assert_eq!(sanitize_fts5_query("hello world"), "\"hello\" OR \"world\"");
         assert_eq!(sanitize_fts5_query("   "), "\"\"");
+    }
+
+    #[test]
+    fn test_extracts_text_from_deflated_docx_document_xml() {
+        let cursor = Cursor::new(Vec::new());
+        let mut writer = zip::ZipWriter::new(cursor);
+        let options =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        writer.start_file("word/document.xml", options).unwrap();
+        writer
+            .write_all(
+                br#"<?xml version="1.0"?><w:document><w:body><w:p><w:r><w:t>One &amp; two</w:t></w:r></w:p><w:p><w:r><w:t>three</w:t></w:r></w:p></w:body></w:document>"#,
+            )
+            .unwrap();
+        let bytes = writer.finish().unwrap().into_inner();
+
+        assert_eq!(
+            extract_text_from_bytes("NOTES.DOCX", &bytes),
+            "One & two three"
+        );
     }
 }

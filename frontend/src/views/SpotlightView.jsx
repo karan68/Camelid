@@ -3,11 +3,14 @@ import { IconSend, IconStop, IconCopy, IconCheck, IconClose, IconBolt } from '..
 import { AssistantMarkdown } from '../lib/markdown'
 import { formatModelLabel } from '../lib/formatters'
 
-export default function SpotlightView({ models = [], runtime }) {
+const EMPTY_MODELS = []
+
+export default function SpotlightView({ models = EMPTY_MODELS }) {
   const [query, setQuery] = useState('')
   const [response, setResponse] = useState('')
   const [isGenerating, setIsGenerating] = useState(false)
   const [copied, setCopied] = useState(false)
+  const [availableModels, setAvailableModels] = useState(models)
   const [activeModel, setActiveModel] = useState(() => models[0]?.id || '')
   const inputRef = useRef(null)
   const abortControllerRef = useRef(null)
@@ -26,10 +29,26 @@ export default function SpotlightView({ models = [], runtime }) {
   }, [])
 
   useEffect(() => {
-    if (!activeModel && models.length > 0) {
-      setActiveModel(models[0].id)
+    if (models.length > 0) {
+      setAvailableModels(models)
+      return undefined
     }
-  }, [models, activeModel])
+
+    let cancelled = false
+    fetch('/v1/models')
+      .then((res) => (res.ok ? res.json() : Promise.reject(new Error(`HTTP ${res.status}`))))
+      .then((payload) => {
+        if (!cancelled && Array.isArray(payload?.data)) setAvailableModels(payload.data)
+      })
+      .catch(() => {})
+    return () => { cancelled = true }
+  }, [models])
+
+  useEffect(() => {
+    if (!activeModel && availableModels.length > 0) {
+      setActiveModel(availableModels[0].id)
+    }
+  }, [availableModels, activeModel])
 
   const handleSend = async (customPrompt) => {
     const textToSend = (customPrompt || query).trim()
@@ -46,7 +65,7 @@ export default function SpotlightView({ models = [], runtime }) {
         headers: { 'Content-Type': 'application/json' },
         signal: controller.signal,
         body: JSON.stringify({
-          model: activeModel,
+          ...(activeModel ? { model: activeModel } : {}),
           messages: [{ role: 'user', content: textToSend }],
           stream: true,
           temperature: 0.7,
@@ -156,7 +175,7 @@ export default function SpotlightView({ models = [], runtime }) {
             disabled={isGenerating}
             style={{ background: 'rgba(0, 0, 0, 0.4)', color: '#94a3b8', border: '1px solid rgba(255, 255, 255, 0.1)', borderRadius: '6px', fontSize: '11px', padding: '2px 6px' }}
           >
-            {models.map((m) => (
+            {availableModels.map((m) => (
               <option key={m.id} value={m.id}>{formatModelLabel(m.name || m.id)}</option>
             ))}
           </select>

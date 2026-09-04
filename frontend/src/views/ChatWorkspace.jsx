@@ -201,7 +201,6 @@ export default function ChatWorkspace({
   const [attachedDocuments, setAttachedDocuments] = useState([])
   const [documentIngesting, setDocumentIngesting] = useState(false)
   const [activeCitation, setActiveCitation] = useState(null)
-  const [knownCitations, setKnownCitations] = useState({})
   const chatBottomRef = useRef(null)
   const composerRef = useRef(null)
   const imageInputRef = useRef(null)
@@ -507,22 +506,22 @@ export default function ChatWorkspace({
 
   useEffect(() => {
     const handleCitationClick = (e) => {
-      const index = e.detail?.index
-      const cite = window.__camelidCitations?.[index] || knownCitations[index]
+      const cite = e.detail?.citation
       if (cite) {
         setActiveCitation(cite)
       }
     }
     window.addEventListener('camelid-citation-click', handleCitationClick)
     return () => window.removeEventListener('camelid-citation-click', handleCitationClick)
-  }, [knownCitations])
+  }, [])
 
   const handleDocumentFiles = async (files) => {
     if (!files || !files.length) return
     setDocumentIngesting(true)
     for (const file of Array.from(files)) {
       try {
-        const isBinary = file.name.endsWith('.pdf') || file.name.endsWith('.docx')
+        const lowerName = file.name.toLowerCase()
+        const isBinary = lowerName.endsWith('.pdf') || lowerName.endsWith('.docx')
         let content = ''
         let is_base64 = false
         if (isBinary) {
@@ -557,6 +556,7 @@ export default function ChatWorkspace({
     setImageError('')
 
     let contentToSend = composer
+    let requestCitations = []
     if (attachedDocuments.length > 0) {
       try {
         const res = await fetch('/api/documents/search', {
@@ -572,19 +572,7 @@ export default function ChatWorkspace({
           const data = await res.json()
           if (data.results && data.results.length > 0) {
             const citations = data.results
-            setKnownCitations((prev) => {
-              const next = { ...prev }
-              citations.forEach((c, idx) => {
-                next[`${idx + 1}`] = c
-                next[c.doc_id] = c
-              })
-              return next
-            })
-            window.__camelidCitations = window.__camelidCitations || {}
-            citations.forEach((c, idx) => {
-              window.__camelidCitations[`${idx + 1}`] = c
-              window.__camelidCitations[c.doc_id] = c
-            })
+            requestCitations = citations
 
             const contextText = citations
               .map((c, idx) => `[Citation ${idx + 1} from ${c.filename}]:\n${c.excerpt}`)
@@ -598,7 +586,11 @@ export default function ChatWorkspace({
       }
     }
 
-    await sendMessage({ overrideImage: image, overrideContent: contentToSend !== composer ? contentToSend : null })
+    await sendMessage({
+      overrideImage: image,
+      requestContent: contentToSend !== composer ? contentToSend : null,
+      citations: requestCitations,
+    })
   }
 
   const handleVisionFile = async (event) => {

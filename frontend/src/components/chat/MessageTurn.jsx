@@ -315,7 +315,13 @@ export const MessageTurn = memo(function MessageTurn({ message, generationElapse
       </div>
       <div className="cxturn__body">
         {showStreamingStatus && <StreamingLoader elapsedSeconds={generationElapsedSeconds} label={liveStatusLabel} compact />}
-        {(messageContent || !assistantStreaming) && <AssistantMarkdown content={messageContent} streaming={assistantStreaming} />}
+        {(messageContent || !assistantStreaming) && (
+          <AssistantMarkdown
+            content={messageContent}
+            streaming={assistantStreaming}
+            citations={message.citations}
+          />
+        )}
         <WebResearchSources research={message.web_research} />
         {showLiveGenerationBadge && <LiveGenerationBadge elapsedSeconds={generationElapsedSeconds} label={liveStatusLabel} tokensPerSec={message.tokens_out_per_sec} />}
 

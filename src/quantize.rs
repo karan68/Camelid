@@ -56,6 +56,14 @@ impl TargetQuant {
             Self::Q4_K_M => 12,
         }
     }
+
+    pub fn file_type_id(&self) -> u32 {
+        match self {
+            Self::Q8_0 => 7,
+            Self::Q4_0 => 2,
+            Self::Q4_K_M => 15,
+        }
+    }
 }
 
 impl FromStr for TargetQuant {
@@ -116,16 +124,21 @@ pub fn quantize_block_q4_0(src: &[f32], dst: &mut [u8]) {
     debug_assert_eq!(dst.len(), 18);
 
     let mut amax = 0.0f32;
+    let mut vmax = 0.0f32;
     for &val in src {
         let abs = val.abs();
         if abs > amax {
             amax = abs;
+            vmax = val;
         }
     }
 
-    let d = amax / -8.0;
+    // GGML's Q4_0 scale carries the sign of the largest-magnitude value. The
+    // decoder reconstructs `(nibble - 8) * d`, so storing `-d` here would
+    // mirror every value around zero.
+    let d = vmax / -8.0;
     let id = if d != 0.0 { 1.0 / d } else { 0.0 };
-    let d_f16 = f32_to_f16_bits(-d);
+    let d_f16 = f32_to_f16_bits(d);
 
     dst[0..2].copy_from_slice(&d_f16.to_le_bytes());
     for i in 0..16 {
@@ -163,13 +176,14 @@ pub fn quantize_block_q4_k(src: &[f32], dst: &mut [u8]) {
     let mut super_min = 0.0f32;
     let mut super_max = 0.0f32;
     for g in 0..8 {
-        let diff = (maxs[g] - mins[g]).max(0.0);
-        if diff > super_max {
-            super_max = diff;
+        let effective_min = mins[g].min(0.0);
+        let group_scale = (maxs[g] - effective_min).max(0.0) / 15.0;
+        if group_scale > super_max {
+            super_max = group_scale;
         }
-        let abs_min = mins[g].abs();
-        if abs_min > super_min {
-            super_min = abs_min;
+        let min_magnitude = (-mins[g]).max(0.0);
+        if min_magnitude > super_min {
+            super_min = min_magnitude;
         }
     }
 
@@ -189,30 +203,42 @@ pub fn quantize_block_q4_k(src: &[f32], dst: &mut [u8]) {
     let mut sc = [0u8; 8];
     let mut m = [0u8; 8];
     for g in 0..8 {
-        sc[g] = ((maxs[g] - mins[g]) * id).round().clamp(0.0, 63.0) as u8;
-        m[g] = (mins[g].abs() * idmin).round().clamp(0.0, 63.0) as u8;
+        let effective_min = mins[g].min(0.0);
+        let group_scale = (maxs[g] - effective_min).max(0.0) / 15.0;
+        sc[g] = (group_scale * id).round().clamp(0.0, 63.0) as u8;
+        m[g] = ((-mins[g]).max(0.0) * idmin).round().clamp(0.0, 63.0) as u8;
     }
 
+    let mut packed_scales = [0u8; 12];
     for g in 0..4 {
-        dst[4 + g] = sc[g] & 63;
-        dst[8 + g] = m[g] & 63;
+        packed_scales[g] = sc[g] & 0x3f;
+        packed_scales[g + 4] = m[g] & 0x3f;
     }
-    for g in 0..4 {
-        dst[12 + g] = ((sc[g + 4] & 0x0F) << 4) | (m[g + 4] & 0x0F);
+    for g in 4..8 {
+        packed_scales[g - 4] |= (sc[g] >> 4) << 6;
+        packed_scales[g] |= (m[g] >> 4) << 6;
+        packed_scales[g + 4] = (sc[g] & 0x0f) | ((m[g] & 0x0f) << 4);
     }
+    dst[4..16].copy_from_slice(&packed_scales);
 
-    // Pack 256 nibbles into 128 bytes
-    let qs_offset = 16;
+    let mut quantized = [[0u8; 32]; 8];
     for g in 0..8 {
         let sub = &src[g * 32..(g + 1) * 32];
         let sub_d = d * (sc[g] as f32);
         let sub_min = -(dmin * (m[g] as f32));
-        let sub_id = if sub_d != 0.0 { 15.0 / sub_d } else { 0.0 };
+        let sub_id = if sub_d != 0.0 { 1.0 / sub_d } else { 0.0 };
 
-        for i in 0..16 {
-            let v0 = ((sub[i] - sub_min) * sub_id).round().clamp(0.0, 15.0) as u8;
-            let v1 = ((sub[i + 16] - sub_min) * sub_id).round().clamp(0.0, 15.0) as u8;
-            dst[qs_offset + g * 16 + i] = (v0 & 0x0F) | ((v1 & 0x0F) << 4);
+        for i in 0..32 {
+            quantized[g][i] = ((sub[i] - sub_min) * sub_id).round().clamp(0.0, 15.0) as u8;
+        }
+    }
+
+    // Each 32-byte run interleaves two adjacent 32-value groups, matching
+    // Q4KBlock::dequantize and the canonical GGML block_q4_K wire layout.
+    for pair in 0..4 {
+        for i in 0..32 {
+            dst[16 + pair * 32 + i] =
+                (quantized[pair * 2][i] & 0x0f) | (quantized[pair * 2 + 1][i] << 4);
         }
     }
 }
@@ -222,32 +248,57 @@ pub fn dequantize_to_f32(
     src_type: GgufTensorType,
     src_bytes: &[u8],
     num_elements: usize,
-) -> Vec<f32> {
+) -> Result<Vec<f32>> {
     match src_type {
         GgufTensorType::F32 => {
+            if src_bytes.len() != num_elements.saturating_mul(4) {
+                return Err(BackendError::InvalidTensorData(format!(
+                    "F32 tensor has {} bytes for {num_elements} elements",
+                    src_bytes.len()
+                )));
+            }
             let mut out = Vec::with_capacity(num_elements);
             for chunk in src_bytes.chunks_exact(4) {
                 out.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
             }
-            out
+            Ok(out)
         }
         GgufTensorType::F16 => {
+            if src_bytes.len() != num_elements.saturating_mul(2) {
+                return Err(BackendError::InvalidTensorData(format!(
+                    "F16 tensor has {} bytes for {num_elements} elements",
+                    src_bytes.len()
+                )));
+            }
             let mut out = Vec::with_capacity(num_elements);
             for chunk in src_bytes.chunks_exact(2) {
                 let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
                 out.push(fast_f16_to_f32(bits));
             }
-            out
+            Ok(out)
         }
         GgufTensorType::BF16 => {
+            if src_bytes.len() != num_elements.saturating_mul(2) {
+                return Err(BackendError::InvalidTensorData(format!(
+                    "BF16 tensor has {} bytes for {num_elements} elements",
+                    src_bytes.len()
+                )));
+            }
             let mut out = Vec::with_capacity(num_elements);
             for chunk in src_bytes.chunks_exact(2) {
                 let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
                 out.push(f32::from_bits((bits as u32) << 16));
             }
-            out
+            Ok(out)
         }
         GgufTensorType::Q8_0 => {
+            let expected_blocks = num_elements.div_ceil(32);
+            if !num_elements.is_multiple_of(32) || src_bytes.len() != expected_blocks * 34 {
+                return Err(BackendError::InvalidTensorData(format!(
+                    "Q8_0 tensor has {} bytes for {num_elements} elements",
+                    src_bytes.len()
+                )));
+            }
             let mut out = Vec::with_capacity(num_elements);
             for block in src_bytes.chunks_exact(34) {
                 let d = fast_f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
@@ -255,13 +306,19 @@ pub fn dequantize_to_f32(
                     out.push((b as i8 as f32) * d);
                 }
             }
-            out
+            Ok(out)
         }
-        _ => {
-            // Fallback for unsupported source types: convert via safe zero-fill
-            vec![0.0f32; num_elements]
-        }
+        other => Err(BackendError::UnsupportedTensorType(format!(
+            "the built-in quantizer cannot convert {other:?}; supported input tensor types are F32, F16, BF16, and Q8_0"
+        ))),
     }
+}
+
+fn is_supported_quantizer_input(tensor_type: GgufTensorType) -> bool {
+    matches!(
+        tensor_type,
+        GgufTensorType::F32 | GgufTensorType::F16 | GgufTensorType::BF16 | GgufTensorType::Q8_0
+    )
 }
 
 /// Checks if a tensor is a 2D weight matrix that should be quantized.
@@ -283,6 +340,23 @@ fn io_err(path: &Path, source: std::io::Error) -> BackendError {
     }
 }
 
+fn paths_refer_to_same_file(input: &Path, output: &Path) -> Result<bool> {
+    let input = std::fs::canonicalize(input).map_err(|e| io_err(input, e))?;
+    if output.exists() {
+        return same_file::is_same_file(&input, output).map_err(|e| io_err(output, e));
+    }
+
+    let parent = output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let parent = std::fs::canonicalize(parent).map_err(|e| io_err(parent, e))?;
+    Ok(output
+        .file_name()
+        .map(|name| parent.join(name) == input)
+        .unwrap_or(false))
+}
+
 /// Run full GGUF quantization workflow from `input_path` to `output_path`.
 pub fn quantize_model(
     input_path: impl AsRef<Path>,
@@ -292,31 +366,16 @@ pub fn quantize_model(
     let input_p = input_path.as_ref();
     let output_p = output_path.as_ref();
 
+    if paths_refer_to_same_file(input_p, output_p)? {
+        return Err(BackendError::InvalidGguf(
+            "input and output paths must refer to different files".to_string(),
+        ));
+    }
+
     let gguf = read_metadata(input_p)?;
     let in_file = File::open(input_p).map_err(|e| io_err(input_p, e))?;
     let in_len = in_file.metadata().map_err(|e| io_err(input_p, e))?.len();
     let mmap = unsafe { Mmap::map(&in_file).map_err(|e| io_err(input_p, e))? };
-
-    let out_file = File::create(output_p).map_err(|e| io_err(output_p, e))?;
-    let mut writer = BufWriter::new(out_file);
-
-    // GGUF v3 magic and header
-    writer.write_all(b"GGUF").map_err(|e| io_err(output_p, e))?;
-    writer
-        .write_all(&3u32.to_le_bytes())
-        .map_err(|e| io_err(output_p, e))?; // version 3
-    writer
-        .write_all(&(gguf.tensor_count as u64).to_le_bytes())
-        .map_err(|e| io_err(output_p, e))?;
-    writer
-        .write_all(&(gguf.metadata_count as u64).to_le_bytes())
-        .map_err(|e| io_err(output_p, e))?;
-
-    // Copy metadata entries
-    for (key, val) in &gguf.metadata {
-        write_string(&mut writer, key).map_err(|e| io_err(output_p, e))?;
-        write_metadata_value(&mut writer, val).map_err(|e| io_err(output_p, e))?;
-    }
 
     // Determine target tensor types and calculate new offsets
     let mut new_descriptors = Vec::with_capacity(gguf.tensors.len());
@@ -327,19 +386,26 @@ pub fn quantize_model(
         let is_weight = should_quantize_tensor(&tensor.name, &tensor.dimensions);
         let num_elements: u64 = tensor.dimensions.iter().product();
 
-        let (out_type, new_bytes) =
-            if is_weight && num_elements.is_multiple_of(target.block_size() as u64) {
-                quantized_count += 1;
-                let blocks = num_elements / (target.block_size() as u64);
-                let bytes_per_block = match target {
-                    TargetQuant::Q8_0 => 34,
-                    TargetQuant::Q4_0 => 18,
-                    TargetQuant::Q4_K_M => 144,
-                };
-                (target.gguf_type(), blocks * bytes_per_block)
-            } else {
-                (tensor.tensor_type, tensor.n_bytes)
+        let (out_type, new_bytes) = if is_weight
+            && num_elements.is_multiple_of(target.block_size() as u64)
+        {
+            if !is_supported_quantizer_input(tensor.tensor_type) {
+                return Err(BackendError::UnsupportedTensorType(format!(
+                        "tensor '{}' uses {:?}; supported quantizer inputs are F32, F16, BF16, and Q8_0",
+                        tensor.name, tensor.tensor_type
+                    )));
+            }
+            quantized_count += 1;
+            let blocks = num_elements / (target.block_size() as u64);
+            let bytes_per_block = match target {
+                TargetQuant::Q8_0 => 34,
+                TargetQuant::Q4_0 => 18,
+                TargetQuant::Q4_K_M => 144,
             };
+            (target.gguf_type(), blocks * bytes_per_block)
+        } else {
+            (tensor.tensor_type, tensor.n_bytes)
+        };
 
         new_descriptors.push((
             tensor.name.clone(),
@@ -349,8 +415,40 @@ pub fn quantize_model(
             new_bytes,
             is_weight,
         ));
-        // Align each tensor payload to 32 bytes
-        cur_offset += (new_bytes + 31) & !31;
+        cur_offset = cur_offset
+            .checked_add(new_bytes)
+            .and_then(|value| value.checked_add(gguf.alignment - 1))
+            .map(|value| value & !(gguf.alignment - 1))
+            .ok_or_else(|| BackendError::InvalidGguf("tensor offset overflow".to_string()))?;
+    }
+
+    // Do not create or truncate the destination until every tensor is known to
+    // be convertible.
+    let out_file = File::create(output_p).map_err(|e| io_err(output_p, e))?;
+    let mut writer = BufWriter::new(out_file);
+
+    // GGUF v3 magic and header
+    writer.write_all(b"GGUF").map_err(|e| io_err(output_p, e))?;
+    writer
+        .write_all(&3u32.to_le_bytes())
+        .map_err(|e| io_err(output_p, e))?;
+    writer
+        .write_all(&(gguf.tensor_count as u64).to_le_bytes())
+        .map_err(|e| io_err(output_p, e))?;
+    writer
+        .write_all(&(gguf.metadata_count as u64).to_le_bytes())
+        .map_err(|e| io_err(output_p, e))?;
+
+    // Copy metadata entries, updating the standard whole-file quantization
+    // label to match the new tensor payloads.
+    for (key, val) in &gguf.metadata {
+        write_string(&mut writer, key).map_err(|e| io_err(output_p, e))?;
+        if key == "general.file_type" {
+            write_metadata_value(&mut writer, &GgufMetadataValue::U32(target.file_type_id()))
+                .map_err(|e| io_err(output_p, e))?;
+        } else {
+            write_metadata_value(&mut writer, val).map_err(|e| io_err(output_p, e))?;
+        }
     }
 
     // Write tensor descriptors
@@ -373,9 +471,9 @@ pub fn quantize_model(
             .map_err(|e| io_err(output_p, e))?;
     }
 
-    // Pad to 32 bytes before tensor data
+    // Pad to the alignment declared by the source GGUF before tensor data.
     let cur_pos = writer.stream_position().map_err(|e| io_err(output_p, e))?;
-    let aligned_pos = (cur_pos + 31) & !31;
+    let aligned_pos = (cur_pos + gguf.alignment - 1) & !(gguf.alignment - 1);
     let pad_len = (aligned_pos - cur_pos) as usize;
     if pad_len > 0 {
         writer
@@ -392,7 +490,7 @@ pub fn quantize_model(
         let num_elements: usize = tensor.dimensions.iter().product::<u64>() as usize;
 
         if is_weight && out_type == target.gguf_type() {
-            let f32_vals = dequantize_to_f32(tensor.tensor_type, src_slice, num_elements);
+            let f32_vals = dequantize_to_f32(tensor.tensor_type, src_slice, num_elements)?;
             let block_size = target.block_size();
             let num_blocks = f32_vals.len() / block_size;
 
@@ -437,8 +535,9 @@ pub fn quantize_model(
                 .map_err(|e| io_err(output_p, e))?;
             hasher.update(&quantized_bytes);
 
-            // Pad to 32-byte alignment
-            let pad = ((quantized_bytes.len() + 31) & !31) - quantized_bytes.len();
+            let alignment = gguf.alignment as usize;
+            let pad = ((quantized_bytes.len() + alignment - 1) & !(alignment - 1))
+                - quantized_bytes.len();
             if pad > 0 {
                 let pad_bytes = vec![0u8; pad];
                 writer
@@ -453,7 +552,8 @@ pub fn quantize_model(
                 .map_err(|e| io_err(output_p, e))?;
             hasher.update(src_slice);
 
-            let pad = ((src_slice.len() + 31) & !31) - src_slice.len();
+            let alignment = gguf.alignment as usize;
+            let pad = ((src_slice.len() + alignment - 1) & !(alignment - 1)) - src_slice.len();
             if pad > 0 {
                 let pad_bytes = vec![0u8; pad];
                 writer
@@ -508,8 +608,22 @@ fn tensor_type_to_id(t: GgufTensorType) -> u32 {
         GgufTensorType::Q5K => 13,
         GgufTensorType::Q6K => 14,
         GgufTensorType::Q8K => 15,
-        GgufTensorType::BF16 => 25,
-        _ => 0,
+        GgufTensorType::IQ4NL => 20,
+        GgufTensorType::IQ4XS => 23,
+        GgufTensorType::I8 => 24,
+        GgufTensorType::I16 => 25,
+        GgufTensorType::I32 => 26,
+        GgufTensorType::I64 => 27,
+        GgufTensorType::F64 => 28,
+        GgufTensorType::BF16 => 30,
+        GgufTensorType::Tq1_0 => 34,
+        GgufTensorType::Tq2_0 => 35,
+        GgufTensorType::I2S => 36,
+        GgufTensorType::NVFP4 => 40,
+        GgufTensorType::Q1_0 => 41,
+        GgufTensorType::Q2_0 | GgufTensorType::Q2_0G64 | GgufTensorType::Q2_0G128 => 42,
+        GgufTensorType::Pq2_0 => 142,
+        GgufTensorType::Unknown(value) => value as u32,
     }
 }
 
@@ -642,7 +756,71 @@ mod tests {
         let mut block = [0u8; 18];
         quantize_block_q4_0(&original, &mut block);
 
-        let d = fast_f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
-        assert!(d > 0.0);
+        let decoded = crate::tensor::Q4_0Block::from_bytes(&block);
+        let d = decoded.scale_f32();
+        let values = decoded.unpack_values();
+        for i in 0..32 {
+            let recon = values[i] as f32 * d;
+            assert_eq!(recon.signum(), original[i].signum(), "sign mismatch at {i}");
+            assert!(
+                (original[i] - recon).abs() <= d.abs() + 0.01,
+                "error too high at {i}: original={}, reconstructed={recon}",
+                original[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_quantize_block_q4_k_matches_decoder_layout() {
+        let mut original = [0.0f32; 256];
+        for group in 0..8 {
+            for i in 0..32 {
+                let offset = if group == 6 {
+                    2.0
+                } else if group == 7 {
+                    -2.0
+                } else {
+                    0.0
+                };
+                original[group * 32 + i] =
+                    (i as f32 - 15.5) * (group as f32 + 1.0) * 0.03125 + offset;
+            }
+        }
+
+        let mut block = [0u8; 144];
+        quantize_block_q4_k(&original, &mut block);
+        let decoded = crate::tensor::Q4KBlock::from_bytes(&block);
+        let mut reconstructed = [0.0f32; 256];
+        decoded.dequantize(&mut reconstructed);
+
+        for group in 0..8 {
+            let group_error = (0..32)
+                .map(|i| {
+                    let index = group * 32 + i;
+                    (original[index] - reconstructed[index]).abs()
+                })
+                .fold(0.0f32, f32::max);
+            assert!(
+                group_error < 0.3,
+                "group {group} error too high: {group_error}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_unsupported_source_quantization_fails_instead_of_zero_filling() {
+        let err = dequantize_to_f32(GgufTensorType::Q4K, &[0u8; 144], 256).unwrap_err();
+        assert!(matches!(err, BackendError::UnsupportedTensorType(_)));
+    }
+
+    #[test]
+    fn test_same_file_detection_catches_hard_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("input.gguf");
+        let output = dir.path().join("output.gguf");
+        std::fs::write(&input, b"GGUF").unwrap();
+        std::fs::hard_link(&input, &output).unwrap();
+
+        assert!(paths_refer_to_same_file(&input, &output).unwrap());
     }
 }
