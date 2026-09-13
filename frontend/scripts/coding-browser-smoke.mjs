@@ -50,6 +50,14 @@ const server = createServer(async (req,res) => {
   if (path === `/api/agent/coding/sessions/${sessionId}` && req.method === 'GET') return json(res, session)
   if (path === `/api/agent/coding/sessions/${sessionId}/control`) {
    const data=await body(req); requests.push(data)
+   if (data.action==='auto_approve_files') {
+    assert.equal(data.run_id,session.run_id);assert.equal(typeof data.enabled,'boolean')
+    session.auto_approve_files=data.enabled
+    if (data.enabled && session.approval?.tool==='write_file') {
+     fileReview.status='applied';session.reviews=[{...fileReview}];session.approval=null;session.phase='running';session.agents.lead.status='working'
+    }
+    publish();return json(res,session)
+   }
    session.phase=data.action==='pause'?'paused':data.action==='stop'?'cancelled':'running'
    if (data.action==='stop') { session.agents.lead.status='cancelled'; session.approval=null }
    publish(); return json(res,session)
@@ -125,6 +133,10 @@ try {
  await clickText('Approve & apply')
  await page.waitForFunction(()=>!document.querySelector('.coding-approval'))
  assert.equal(approvals,1)
+ assert.equal(await page.$eval('.coding-file-approval-choice input',e=>e.checked),false)
+ await page.click('.coding-file-approval-choice input')
+ await page.waitForFunction(()=>document.querySelector('.coding-file-approval-choice input')?.checked)
+ assert.ok(requests.some(r=>r.action==='auto_approve_files' && r.enabled===true && r.run_id===session.run_id))
  await clickText('Pause');await page.waitForFunction(()=>document.querySelector('.coding-status.is-paused'))
  await clickText('Chat','.coding-mode-switch button');await page.waitForSelector('.coding-background')
  await clickText('Open coding session');await page.waitForSelector('.coding-workspace')
@@ -133,6 +145,7 @@ try {
  await page.reload({waitUntil:'networkidle2'})
  await page.waitForFunction(()=>document.querySelector('.coding-status.is-cancelled'))
  assert.equal(creates,1,'reload must not create/replay a run');assert.equal(approvals,1)
+ assert.equal(await page.$eval('.coding-file-approval-choice input',e=>e.checked),true,'browser reload reflects server policy without reenabling it')
  await page.type('[aria-label="Message coding agents"]','Run the approved verification.')
  await page.click('[aria-label="Send coding follow-up"]')
  await page.waitForSelector('.coding-approval-summary')
@@ -168,6 +181,14 @@ try {
  assert.equal(fileReview.status,'undone')
  await page.reload({waitUntil:'networkidle2'})
  await page.waitForFunction(()=>document.querySelector('.coding-proposals')?.textContent.includes('0 applied'))
+ await page.click('.coding-file-approval-choice input')
+ await page.waitForFunction(()=>!document.querySelector('.coding-file-approval-choice input')?.checked)
+ session.phase='waiting_approval';session.agents.lead.status='waiting_approval';session.approval={id:'approval-file-again',tool:'write_file',detail:{review:{...fileReview,status:'pending'}}};publish()
+ await page.reload({waitUntil:'networkidle2'})
+ await page.waitForSelector('.coding-approval-summary')
+ await page.click('.coding-file-approval-choice input')
+ await page.waitForFunction(()=>!document.querySelector('.coding-approval-summary'))
+ assert.equal(fileReview.status,'applied');assert.equal(commands,1);assert.equal(approvals,2,'mode toggle must not send a separate approval request')
  assert.deepEqual(errors,[])
  console.log('Coding browser smoke passed: shared Chat turns, description-only conversation, collapsed sidebar diffs/snippets/commands, real UI controls, versioned events, agent assignments, file/command approvals, pause/resume/stop, background navigation, reload without replay, follow-up, undo, and dark/light responsive layouts.')
 } catch(e) {

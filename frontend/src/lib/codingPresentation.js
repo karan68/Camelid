@@ -46,6 +46,9 @@ export function describeCodingAction(value, status) {
   return actions[tool] || (tool ? 'Using project tools' : 'Planning the next step')
 }
 export function describeCodingEvent(event) {
+  if (event.kind === 'approval.mode_changed') return event.detail?.auto_approve_files ? 'Enabled automatic file approvals' : 'File changes will ask for review'
+  if (event.kind === 'approval.automatic') return 'Preparing an automatic file change'
+  if (event.kind === 'approval.decided' && event.detail?.mode === 'automatic_files') return event.detail?.approved ? 'Automatically approved a file change' : 'Automatic file approval was cancelled'
   if (event.kind === 'tool.result') return event.detail?.ok ? ({ read_file: 'Read a project file', list_dir: 'Explored the project', search: 'Finished a search', write_file: 'Applied a new file', edit_file: 'Applied a file change', run_shell: 'Finished an approved command', update_plan: 'Updated the work plan', spawn_subagent: 'Assigned an investigation', check_subagent_status: 'Checked helper progress' })[event.detail?.tool] || 'Finished a project action' : 'An action needs attention'
   if (event.kind === 'tool.call') return describeCodingAction(event.detail?.detail)
   if (event.kind === 'review.updated') return ({ pending: 'Prepared a file for review', applied: 'Applied an approved change', rejected: 'Respected a denied change', undone: 'Restored a file' })[event.detail?.status] || 'Updated a file review'

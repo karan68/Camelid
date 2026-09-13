@@ -85,6 +85,10 @@ export function useCodingSession(apiBase, activeModelId, loadedNow) {
     accept(next); attempt.current = null; return next
   })
   const control = action => mutate(async () => accept(await codingRequest(apiBase, '/' + encodeURIComponent(selectedId) + '/control', { method: 'POST', body: { action } })))
+  const setAutoApproveFiles = enabled => mutate(async () => {
+    if (!snapshot?.run_id) return
+    accept(await codingRequest(apiBase, '/' + encodeURIComponent(selectedId) + '/control', { method: 'POST', body: { action: 'auto_approve_files', run_id: snapshot.run_id, enabled } }))
+  })
   const decide = approved => mutate(async () => {
     const id = snapshot?.approval?.id
     if (!id || decidingId === id) return
@@ -100,5 +104,5 @@ export function useCodingSession(apiBase, activeModelId, loadedNow) {
     await refresh()
     if (selectedId) { accept(await codingRequest(apiBase, '/' + encodeURIComponent(selectedId))); setConnection('connected') }
   })
-  return { snapshot, sessions, toolCapableModel, selectedId, select, send, control, decide, remove, retry, busy, error, connection, decidingId }
+  return { snapshot, sessions, toolCapableModel, selectedId, select, send, control, setAutoApproveFiles, decide, remove, retry, busy, error, connection, decidingId }
 }

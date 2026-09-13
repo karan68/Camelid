@@ -166,6 +166,7 @@
 .coding-review { margin-top: 14px; gap: 12px; }
 .coding-review h2 { font-size: 13px; overflow-wrap: anywhere; }
 .coding-review .coding-approval { margin-top: 0; }
+.coding-file-approval-choice { margin: 0 0 10px; }
 .coding-review-list { gap: 2px; padding: 12px 8px; }
 .coding-review-list button { border: 0; background: transparent; align-items: center; gap: 8px; padding: 12px 8px; }
 .coding-review-list button:hover { background: var(--color-surface-hover); }

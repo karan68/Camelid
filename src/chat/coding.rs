@@ -117,6 +117,10 @@ pub(crate) struct Snapshot {
     pub plan: Value,
     pub reviews: Vec<Value>,
     pub approval: Option<Value>,
+    // Session-scoped user choice. Saved observations must never restore this
+    // execution authority after the engine restarts.
+    #[serde(default, skip_deserializing)]
+    pub auto_approve_files: bool,
     pub error: String,
 }
 #[derive(Clone, Serialize, Deserialize)]
@@ -353,6 +357,7 @@ impl Manager {
                 plan: json!([]),
                 reviews: vec![],
                 approval: None,
+                auto_approve_files: false,
                 error: String::new(),
             },
             history: vec![],
@@ -552,6 +557,50 @@ impl Run {
         self.wake.notify_all();
         Ok(())
     }
+    pub fn set_auto_approve_files(&self, run_id: &str, enabled: bool) -> Result<(), String> {
+        if enabled && agent::is_production() {
+            return Err(
+                "Automatic file approval is unavailable when CAMELID_PRODUCTION is set.".into(),
+            );
+        }
+        // Serialize mode changes with decisions and run transitions. Persist
+        // before publishing; a failed save cannot enable automatic writes.
+        let _control = self
+            .control
+            .lock()
+            .map_err(|_| "Coding control unavailable.")?;
+        let mut current = self
+            .saved
+            .lock()
+            .map_err(|_| "Coding session unavailable.")?;
+        if current.snapshot.run_id != run_id || current.snapshot.phase == Phase::Stopping {
+            return Err("This coding run changed. Refresh before changing file approvals.".into());
+        }
+        if current.snapshot.auto_approve_files == enabled {
+            return Ok(());
+        }
+        let mut saved = current.clone();
+        let s = &mut saved.snapshot;
+        s.auto_approve_files = enabled;
+        s.seq += 1;
+        s.updated_at = now();
+        s.events.push(Event {
+            seq: s.seq,
+            time: s.updated_at,
+            run_id: s.run_id.clone(),
+            agent_id: "lead".into(),
+            kind: "approval.mode_changed".into(),
+            detail: json!({"auto_approve_files":enabled}),
+        });
+        if s.events.len() > MAX_EVENTS {
+            s.events.drain(..s.events.len() - MAX_EVENTS);
+        }
+        self.persist(&saved)?;
+        *current = saved;
+        self.version.send_replace(current.snapshot.seq);
+        self.wake.notify_all();
+        Ok(())
+    }
     fn approval(&self, tool: &str, detail: Value) -> bool {
         if !self.gate() {
             return false;
@@ -563,25 +612,43 @@ impl Run {
         }
         c.pending = Some(key.clone());
         c.decision = None;
+        let file_change = matches!(tool, "write_file" | "edit_file");
+        let automatic = file_change && self.snapshot().auto_approve_files;
         self.update(
             "lead",
-            "approval.required",
+            if automatic {
+                "approval.automatic"
+            } else {
+                "approval.required"
+            },
             json!({"id":key,"tool":tool}),
             true,
             |s| {
                 s.phase = if c.paused {
                     Phase::Paused
+                } else if automatic {
+                    Phase::Running
                 } else {
                     Phase::WaitingApproval
                 };
-                s.approval = Some(json!({"id":key,"tool":tool,"detail":detail}));
+                s.approval = if automatic {
+                    None
+                } else {
+                    Some(json!({"id":key,"tool":tool,"detail":detail}))
+                };
                 if let Some(a) = s.agents.get_mut("lead") {
-                    a.status = "waiting_approval".into();
+                    a.status = if automatic {
+                        "working"
+                    } else {
+                        "waiting_approval"
+                    }
+                    .into();
                 }
             },
         );
         let deadline = Instant::now() + APPROVAL_TIMEOUT;
-        while (c.decision.is_none() || c.paused)
+        while ((c.decision.is_none() && !(file_change && self.snapshot().auto_approve_files))
+            || c.paused)
             && !self.cancel.load(Ordering::Acquire)
             && Instant::now() < deadline
         {
@@ -591,7 +658,10 @@ impl Run {
                 .unwrap_or_else(|p| p.into_inner())
                 .0;
         }
-        let approved = c.decision.take() == Some(true)
+        let decision = c.decision.take();
+        // An explicit denial wins even if auto-approve was enabled while paused.
+        let automatic = decision.is_none() && file_change && self.snapshot().auto_approve_files;
+        let approved = (decision == Some(true) || automatic)
             && !self.cancel.load(Ordering::Acquire)
             && Instant::now() < deadline;
         c.pending = None;
@@ -599,7 +669,7 @@ impl Run {
         self.update(
             "lead",
             "approval.decided",
-            json!({"id":key,"approved":approved}),
+            json!({"id":key,"approved":approved,"mode":if automatic {"automatic_files"} else {"manual"}}),
             true,
             |s| {
                 s.approval = None;
@@ -1127,7 +1197,7 @@ impl Approver for RejectApprovals {
 }
 fn coding_system_prompt(sandbox: &Sandbox, cfg: &AgentConfig, instructions: &str) -> String {
     let specs = super::tools::specs_for(ToolProfile::Coding, false, cfg.shell_sandbox);
-    format!("{}\nYou are Camelid's lead coding agent. Act on requests to build or fix things using the available tools. A statement that you will create files does not create them. Use write_file with full contents for each new file, one file per call; use edit_file for existing files after reading them. Keep working until the requested files actually exist and you have checked them, or explain a concrete blocker. Use update_plan for multi-step work, keep plans to 3–5 concrete steps, and mark completed steps done. To verify changes, prefer read_file on the files you changed. Do not repeat an identical successful read or search unless the file changed; its result is already available. You may delegate up to two read-only investigations with spawn_subagent; collect findings before concluding. Only Lead can write or execute. Each write or command requires user approval. Respect denials and never bypass them with another tool. Commands may be unavailable; explicitly distinguish rereading files from running tests. File edits have durable reviews and Undo; command side effects do not. Do not modify .git or .camelid. The final reply should describe actual work and checks in plain language; code and diffs are available in the sidebar. Never end with a promise to do the requested work later.\n{}", agent::system_prompt(sandbox, &specs), instructions)
+    format!("{}\nYou are Camelid's lead coding agent. Act on requests to build or fix things using the available tools. A statement that you will create files does not create them. Use write_file with full contents for each new file, one file per call; use edit_file for existing files after reading them. Keep working until the requested files actually exist and you have checked them, or explain a concrete blocker. Use update_plan for multi-step work, keep plans to 3–5 concrete steps, and mark completed steps done. To verify changes, prefer read_file on the files you changed. Do not repeat an identical successful read or search unless the file changed; its result is already available. You may delegate up to two read-only investigations with spawn_subagent; collect findings before concluding. Only Lead can write or execute. File changes follow the session approval mode; commands always require individual user approval. Respect denials and never bypass them with another tool. Commands may be unavailable; explicitly distinguish rereading files from running tests. File edits have durable reviews and Undo; command side effects do not. Do not modify .git or .camelid. The final reply should describe actual work and checks in plain language; code and diffs are available in the sidebar. Never end with a promise to do the requested work later.\n{}", agent::system_prompt(sandbox, &specs), instructions)
 }
 
 fn promises_more_work(text: &str) -> bool {
@@ -1484,6 +1554,7 @@ mod tests {
             plan: json!([]),
             reviews: vec![],
             approval: None,
+            auto_approve_files: false,
             error: String::new(),
         };
         let file = root.join("saved").join(format!("{}.json", snapshot.id));
@@ -1526,6 +1597,107 @@ mod tests {
             answer_redirects: 0,
             read_recovery_used: false,
         }
+    }
+    #[test]
+    fn automatic_files_apply_pending_reviews_and_keep_the_journal() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = Arc::new(Journal::default());
+        let run = test_run(temp.path(), journal.clone());
+        let sb = Sandbox::new(temp.path(), false, Duration::from_secs(1)).unwrap();
+        let action = write_action(&sb, "automatic contents");
+        let mut c = controller(run.clone());
+        let worker = thread::spawn(move || {
+            assert_eq!(c.approve(&action, &sb), Decision::Once);
+            c.execute(&action, &sb, &AtomicBool::new(false))
+        });
+        let approval = pending(&run);
+        run.set_auto_approve_files(&run.snapshot().run_id, true)
+            .unwrap();
+        assert!(!worker.join().unwrap().is_err());
+        assert_eq!(
+            fs::read_to_string(temp.path().join("answer.txt")).unwrap(),
+            "automatic contents"
+        );
+        assert_eq!(*journal.applies.lock().unwrap(), 1);
+        assert_eq!(run.snapshot().reviews[0]["status"], "applied");
+        assert!(run.decide(&approval, true).is_err());
+        assert!(run
+            .snapshot()
+            .events
+            .iter()
+            .any(|e| e.kind == "approval.decided" && e.detail["mode"] == "automatic_files"));
+    }
+    #[test]
+    fn automatic_files_never_approve_commands_and_can_be_disabled() {
+        let temp = tempfile::tempdir().unwrap();
+        let run = test_run(temp.path(), Arc::new(Journal::default()));
+        let run_id = run.snapshot().run_id;
+        run.set_auto_approve_files(&run_id, true).unwrap();
+        let child = run.clone();
+        let worker =
+            thread::spawn(move || child.approval("run_shell", json!({"command":"echo test"})));
+        let approval = pending(&run);
+        run.set_auto_approve_files(&run_id, true).unwrap();
+        assert!(run.snapshot().approval.is_some());
+        run.decide(&approval, false).unwrap();
+        assert!(!worker.join().unwrap());
+        run.set_auto_approve_files(&run_id, false).unwrap();
+        let child = run.clone();
+        let worker = thread::spawn(move || child.approval("write_file", json!({})));
+        let approval = pending(&run);
+        run.decide(&approval, false).unwrap();
+        assert!(!worker.join().unwrap());
+    }
+    #[test]
+    fn automatic_file_authority_resets_on_restore_and_rejects_stale_or_failed_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let run = test_run(temp.path(), Arc::new(Journal::default()));
+        let run_id = run.snapshot().run_id;
+        assert!(run.set_auto_approve_files(&id(), true).is_err());
+        assert!(!run.snapshot().auto_approve_files);
+        run.set_auto_approve_files(&run_id, true).unwrap();
+        let restored: Saved = serde_json::from_slice(&fs::read(&run.store).unwrap()).unwrap();
+        assert!(!restored.snapshot.auto_approve_files);
+        assert!(run.snapshot().auto_approve_files);
+        run.set_auto_approve_files(&run_id, false).unwrap();
+        fs::remove_file(&run.store).unwrap();
+        fs::remove_dir(run.store.parent().unwrap()).unwrap();
+        fs::write(run.store.parent().unwrap(), "not a directory").unwrap();
+        assert!(run.set_auto_approve_files(&run_id, true).is_err());
+        assert!(!run.snapshot().auto_approve_files);
+    }
+    #[test]
+    fn automatic_files_preserve_pause_denial_and_conflict_checks() {
+        for stop in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let run = test_run(temp.path(), Arc::new(Journal::default()));
+            let child = run.clone();
+            let worker = thread::spawn(move || child.approval("write_file", json!({})));
+            let approval = pending(&run);
+            run.control("pause").unwrap();
+            run.decide(&approval, false).unwrap();
+            run.set_auto_approve_files(&run.snapshot().run_id, true)
+                .unwrap();
+            assert!(run.snapshot().approval.is_some());
+            run.control(if stop { "stop" } else { "resume" }).unwrap();
+            assert!(!worker.join().unwrap());
+        }
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("answer.txt"), "before").unwrap();
+        let run = test_run(temp.path(), Arc::new(Journal::default()));
+        run.set_auto_approve_files(&run.snapshot().run_id, true)
+            .unwrap();
+        let sb = Sandbox::new(temp.path(), false, Duration::from_secs(1)).unwrap();
+        let action = write_action(&sb, "after");
+        let mut c = controller(run.clone());
+        assert_eq!(c.approve(&action, &sb), Decision::Once);
+        assert!(run.snapshot().approval.is_none());
+        fs::write(temp.path().join("answer.txt"), "user edit").unwrap();
+        assert!(c.execute(&action, &sb, &AtomicBool::new(false)).is_err());
+        assert_eq!(
+            fs::read_to_string(temp.path().join("answer.txt")).unwrap(),
+            "user edit"
+        );
     }
     #[test]
     fn reviewed_write_waits_for_the_exact_decision_and_never_replays() {

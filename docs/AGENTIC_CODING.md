@@ -13,6 +13,8 @@ This UI preview uses deterministic test activity, not a model-validation receipt
 3. If the task needs tests or build commands, enable **Allow command requests** before starting. This setting is fixed for the session. Each command still requires its own decision.
 4. Describe the task. Read/search/plan tools run automatically. File edits pause for an exact diff approval; command requests pause for the command, working folder, and execution notice.
 
+After starting a session, **Auto-approve file changes** above the composer lets you apply pending and future file edits automatically. It starts off. You can change it while working or before a follow-up; it applies only to this session's project. Browser reloads retain the server's choice, while an engine restart resets it. File reviews, conflict checks, and Undo remain available. Commands still require their own approval. Turning it off restores review prompts for file changes that have not already been approved. This option is unavailable when `CAMELID_PRODUCTION` is set.
+
 File tools stay within the selected folder. File reviews reject path traversal, symbolic links, `.git`, and `.camelid` destinations. An approved command runs with the current user's account permissions and the project as its working directory; it is **not confined to that folder by an OS sandbox**. Commands are opt-in, approved individually, limited to 30 seconds, and cancellable. Their side effects are not covered by file Undo.
 
 ## Follow the work
@@ -59,11 +61,13 @@ All coding routes require a loopback listener and local same-origin request inte
 | `GET /api/agent/coding/sessions/:id` | Current full snapshot |
 | `GET /api/agent/coding/sessions/:id/events` | SSE `coding` events containing full versioned snapshots; reconnect never executes actions |
 | `POST /api/agent/coding/sessions/:id/messages` | Follow-up `{ "message": "…", "message_id": "32-hex-character-id" }` |
-| `POST /api/agent/coding/sessions/:id/control` | `{ "action": "pause" }`, `resume`, or `stop` |
+| `POST /api/agent/coding/sessions/:id/control` | `{ "action": "pause" }`, `resume`, or `stop`; file approval mode uses `{ "action": "auto_approve_files", "run_id": "current run ID", "enabled": true }` |
 | `POST /api/agent/coding/sessions/:id/approvals/:approval` | Exact pending decision `{ "approved": true }` or `false` |
 | `DELETE /api/agent/coding/sessions/:id` | Remove a finished session |
 
 Snapshots carry session ID, run ID, monotonic sequence, phase, project/model configuration, turns, agent assignments, plan, file review summaries, pending approval, and recent events. Each event carries run ID, agent ID, sequence, time, kind, and observed detail. Clients replace their view with newer snapshots rather than reconstructing execution from tool text.
+
+The snapshot's `auto_approve_files` flag reports the current server-owned choice. Changing it requires a matching run ID and is persisted before acceptance; stale requests and storage failures cannot enable it. It is deliberately not restored from saved state. An explicit pending denial takes precedence over automatic file approval, and pause/stop still control execution.
 
 ## Validation
 

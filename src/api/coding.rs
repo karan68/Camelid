@@ -69,6 +69,8 @@ pub(super) struct Message {
 #[serde(deny_unknown_fields)]
 pub(super) struct Control {
     action: String,
+    run_id: Option<String>,
+    enabled: Option<bool>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -329,7 +331,19 @@ pub(super) async fn control(
         Ok(r) => r,
         Err(e) => return *e,
     };
-    match run.control(&request.action) {
+    let result = if request.action == "auto_approve_files" {
+        match (request.run_id, request.enabled) {
+            (Some(run_id), Some(enabled)) => run.set_auto_approve_files(&run_id, enabled),
+            _ => {
+                Err("Provide the current run_id and an enabled boolean for file approvals.".into())
+            }
+        }
+    } else if request.run_id.is_some() || request.enabled.is_some() {
+        Err("File approval settings require the auto_approve_files action.".into())
+    } else {
+        run.control(&request.action)
+    };
+    match result {
         Ok(()) => Json(run.snapshot()).into_response(),
         Err(e) => failure(e),
     }
@@ -520,6 +534,27 @@ mod tests {
             authorize(&lan, &local_headers()).unwrap_err().status(),
             StatusCode::FORBIDDEN
         );
+    }
+    #[tokio::test]
+    async fn file_approval_mode_requires_local_authority() {
+        let mut headers = local_headers();
+        headers.insert("origin", "https://unrelated.example".parse().unwrap());
+        let response = control(
+            State(AppState::default()),
+            headers,
+            Path("a".repeat(32)),
+            Json(Control {
+                action: "auto_approve_files".into(),
+                run_id: Some("b".repeat(32)),
+                enabled: Some(true),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(serde_json::from_value::<Control>(
+            json!({"action":"auto_approve_files","run_id":"b".repeat(32),"enabled":"true"})
+        )
+        .is_err());
     }
     #[tokio::test]
     async fn create_fails_closed_without_a_loaded_certified_model() {
