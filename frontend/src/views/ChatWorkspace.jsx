@@ -1,3 +1,7 @@
+import { ConversationContext } from '../components/context/ContextEditors'
+import { contextSourceMessages, chatHistoryForRequest } from '../lib/projectContext.js'
+import { ToolOutputGallery } from '../components/outputs/OutputActions.jsx'
+import { ConnectedTools, McpRunPanel } from '../components/mcp/ConnectedTools'
 import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { getChatGateState } from '../lib/chatGate'
 import { getRuntimeRequestModelId } from '../lib/modelState'
@@ -28,7 +32,7 @@ import {
   setCompactionOverride,
 } from '../lib/conversationCompaction.js'
 import { PREPARING_STREAMING_LABEL, StreamingLoader } from '../components/chat/render/StreamingIndicator'
-import { classifyWebResearchNeed } from '../lib/webResearch.js'
+import { classifyWebResearchNeed, estimateWebResearchChatTokens } from '../lib/webResearch.js'
 import {
   ATTACHED_DOCUMENTS_STORAGE_KEY,
   normalizeAttachedDocuments,
@@ -170,6 +174,8 @@ async function prepareVisionAttachment(file) {
 }
 
 export default function ChatWorkspace({
+  projects = [], chatContext = {}, updateChatContext = null, contextSources = [], globalPrompt, updateGlobalPrompt,
+  mcp = null, mcpSelectedKeys = [], replaceMcpTools = null, mcpActivity = null, mcpApproval = null, decideMcpApproval = null,
   selectedConversation,
   selectedModel,
   selectedModelId,
@@ -274,10 +280,12 @@ export default function ChatWorkspace({
   const hasStreamingAssistant = rawVisibleMessages.some((m) => m.role === 'assistant' && m.streaming)
   const hasStreamingAssistantContent = rawVisibleMessages.some((m) => m.role === 'assistant' && m.streaming && String(m.content || '').trim())
   const requestActive = Boolean(sending)
+  const connectedToolsAvailable = Boolean(mcp && !demoMode && runtime?.api_surface !== 'lan_chat_only')
   // Sending is process-global (only one local-model request may run), while
   // loaders, stop controls, and auto-follow belong only to the conversation
   // that owns the pending/streaming turn.
   const generationActive = Boolean(pendingConversation || hasStreamingAssistant)
+  const followActive = generationActive || Boolean(mcpActivity && mcpActivity.phase !== 'idle')
   const visibleMessages = useMemo(() => {
     if (!generationActive) return rawVisibleMessages
     return rawVisibleMessages.filter((message, index, messages) => {
@@ -523,7 +531,7 @@ export default function ChatWorkspace({
   }, [])
 
   useEffect(() => {
-    if (!generationActive) return undefined
+    if (!followActive) return undefined
     autoFollowGenerationRef.current = true
     setUserScrolledAway(false)
     /* Auto-follow is released by the user's GESTURE, not by how far they got.
@@ -559,15 +567,15 @@ export default function ChatWorkspace({
       el?.removeEventListener('touchmove', releaseOnUpwardIntent)
       el?.removeEventListener('keydown', releaseOnUpwardIntent)
     }
-  }, [generationActive, selectedConversation?.id])
+  }, [followActive, selectedConversation?.id])
 
   useLayoutEffect(() => {
-    if (!generationActive || !autoFollowGenerationRef.current) return undefined
+    if (!followActive || !autoFollowGenerationRef.current) return undefined
     const frame = window.requestAnimationFrame(() => {
       chatBottomRef.current?.scrollIntoView({ block: 'end', behavior: 'auto' })
     })
     return () => window.cancelAnimationFrame(frame)
-  }, [generationActive, streamingScrollSignature])
+  }, [followActive, streamingScrollSignature, mcpActivity?.phase, mcpApproval?.id])
 
   useLayoutEffect(() => {
     const resize = () => resizeComposerInput(composerRef.current)
@@ -757,12 +765,12 @@ export default function ChatWorkspace({
      clamps to the context's remaining room, so an overshoot is a non-blocking
      notice — only a prompt that fills the whole context is a hard error. Prompt
      size is a client estimate, labeled as such. */
-  const estimatedPromptTokens = useMemo(() => {
-    const history = visibleMessages.map((m) => String(m.content || '')).join(' ')
-    const text = `${history} ${composer}`
-    const pieces = text.match(/[\p{L}\p{N}_]+|[^\s\p{L}\p{N}_]/gu) || []
-    return Math.max(1, Math.round(Math.max(pieces.length, text.length / 4)))
-  }, [visibleMessages, composer])
+  const previewMessages = [...contextSourceMessages(contextSources), ...chatHistoryForRequest([
+    ...visibleMessages.filter(message => !message.streaming),
+    ...(composer.trim() ? [{ id: 'context-preview-draft', role: 'user', content: composer.trim(), ...(composerImage ? { image: composerImage } : {}) }] : []),
+  ])]
+  const estimatePrompt = messages => estimateWebResearchChatTokens(messages, { visionTokenAllowance: runtime?.vision_token_allowance })
+  const untrimmedPromptTokens = estimatePrompt(previewMessages)
   const configuredMaxTokens = getConfiguredMaxTokens(selectedModelId)
   const effectiveMaxTokens = applyGemma4GhostChatTokenCap(
     configuredMaxTokens,
@@ -770,6 +778,39 @@ export default function ChatWorkspace({
   )
   const ghostBudgetCapped = effectiveMaxTokens < configuredMaxTokens
   const activeContextLength = runtime?.active_context_length || modelContextLength(selectedModel)
+  /* The meter reads the same three numbers the budget check does, so the chip
+     and the notice under the composer can never disagree. The verified bound is
+     drawn as a marker rather than a limit: past it the row is still served, it
+     simply has no committed evidence pack. */
+  const verifiedBound = verifiedContextBound(capabilities, selectedModel)
+  const executionLane = runtime?.execution_plan?.selected_backend || ''
+
+  /* Compaction preview. The panel must describe what the NEXT send will do, so
+     it runs the same pure trim the send path runs, over the same preference
+     store -- there is no second copy of the rule to drift. */
+  const conversationId = selectedConversation?.id || ''
+  const [autoCompact, setAutoCompactState] = useState(() => getAutoCompactEnabled())
+  const [compactionOverride, setCompactionOverrideState] = useState(null)
+  useEffect(() => {
+    setCompactionOverrideState(getCompactionOverride(conversationId))
+  }, [conversationId])
+
+  const contextBudget = composeContextBudget({
+    contextLength: activeContextLength,
+    promptTokens: untrimmedPromptTokens,
+    reservedTokens: effectiveMaxTokens,
+    verifiedBound,
+    warnAtPercent: AUTO_COMPACT_THRESHOLD_PERCENT,
+  })
+  const compactionPreview = applySendCompaction(previewMessages, {
+    enabled: compactionOverride === 'off' ? false : autoCompact,
+    forced: compactionOverride === 'force',
+    filledPercent: contextBudget?.filledPercent ?? 0,
+  })
+  const estimatedPromptTokens = estimatePrompt(compactionPreview.messages)
+  const systemTokens = estimatePrompt(compactionPreview.messages.filter(message => message.role === 'system'))
+  const elidedTokenEstimate = Math.max(0, untrimmedPromptTokens - estimatedPromptTokens)
+
   const rawSendBudget = validateSendBudget({
     promptTokens: estimatedPromptTokens,
     maxTokens: effectiveMaxTokens,
@@ -791,44 +832,6 @@ export default function ChatWorkspace({
   const sendBudget = segmentedVideoComposerBypass && rawSendBudget.level === 'error'
     ? { ...rawSendBudget, level: 'ok', message: null }
     : rawSendBudget
-
-  /* The meter reads the same three numbers the budget check does, so the chip
-     and the notice under the composer can never disagree. The verified bound is
-     drawn as a marker rather than a limit: past it the row is still served, it
-     simply has no committed evidence pack. */
-  const verifiedBound = verifiedContextBound(capabilities, selectedModel)
-  const executionLane = runtime?.execution_plan?.selected_backend || ''
-
-  /* Compaction preview. The panel must describe what the NEXT send will do, so
-     it runs the same pure trim the send path runs, over the same preference
-     store -- there is no second copy of the rule to drift. */
-  const conversationId = selectedConversation?.id || ''
-  const [autoCompact, setAutoCompactState] = useState(() => getAutoCompactEnabled())
-  const [compactionOverride, setCompactionOverrideState] = useState(null)
-  useEffect(() => {
-    setCompactionOverrideState(getCompactionOverride(conversationId))
-  }, [conversationId])
-
-  const contextBudget = composeContextBudget({
-    contextLength: activeContextLength,
-    promptTokens: estimatedPromptTokens,
-    reservedTokens: effectiveMaxTokens,
-    verifiedBound,
-    warnAtPercent: AUTO_COMPACT_THRESHOLD_PERCENT,
-  })
-  const compactionPreview = applySendCompaction(visibleMessages, {
-    enabled: compactionOverride === 'off' ? false : autoCompact,
-    forced: compactionOverride === 'force',
-    filledPercent: contextBudget?.filledPercent ?? 0,
-  })
-  const elidedTokenEstimate = compactionPreview.compacted    ? visibleMessages
-      .filter((message) => !compactionPreview.messages.includes(message))
-      .reduce((sum, message) => {
-        const text = String(message?.content || '')
-        const pieces = text.match(/[\p{L}\p{N}_]+|[^\s\p{L}\p{N}_]/gu) || []
-        return sum + Math.round(Math.max(pieces.length, text.length / 4))
-      }, 0)
-    : 0
 
   const handleToggleAutoCompact = (next) => {
     setAutoCompactEnabled(next)
@@ -859,11 +862,15 @@ export default function ChatWorkspace({
     'Camelid runs the loaded model locally. Verify important output.',
   ].filter(Boolean).join(' ')
 
+  const renderConversationContext = compact => (updateChatContext && <ConversationContext compact={compact} key={selectedConversation?.id || 'draft'} context={chatContext} projects={projects} sources={contextSources} globalPrompt={globalPrompt || ''} onSave={updateChatContext} onManageProjects={() => setTab('projects')} busy={sending} />)
+
   const renderComposer = () => (
     <div className={`cxcomposer is-${readinessState}`}>
+      {renderConversationContext(false)}
       {showControls && (
         <ChatControls
           capabilities={capabilities}
+          globalPrompt={globalPrompt} onGlobalPromptChange={updateGlobalPrompt} busy={sending}
           modelId={getRuntimeRequestModelId(selectedModel, runtime, selectedModelId)}
           onClose={() => setShowControls(false)}
         />
@@ -912,7 +919,7 @@ export default function ChatWorkspace({
           </p>
         </div>
       )}
-      {toolCapability.capable && toolsEnabled && setToolsText && (
+      {!connectedToolsAvailable && toolCapability.capable && toolsEnabled && setToolsText && !mcpSelectedKeys.length && (
         <div className="tooldef">
           <textarea
             className="tooldef__field"
@@ -1034,6 +1041,13 @@ export default function ChatWorkspace({
             ) : (
               <button type="button" className="cxcomposer__tool" onClick={() => setTab('library')}>Add a model</button>
             )}
+            {connectedToolsAvailable && <ConnectedTools key={'mcp-' + (selectedConversation?.id || 'draft')} connections={mcp.connections} selectedKeys={mcpSelectedKeys}
+              onSelectionChange={replaceMcpTools} onManage={() => setTab('connections')} disabled={requestActive} capability={toolCapability}
+              connectionBusy={mcp.busy} error={mcp.error} onRetry={() => mcp.refresh()}
+              onConnect={id => mcp.mutate('/connections/' + id + '/connect', { method: 'POST' })}
+              manualEnabled={toolsEnabled} onManualEnabledChange={setToolsEnabled} manualText={toolsText} onManualTextChange={setToolsText}
+              manualReadiness={toolsReadiness} structuredMode={structuredMode} />}
+            {renderConversationContext(true)}
             {visionReady && (
               <>
                 <input
@@ -1166,7 +1180,7 @@ export default function ChatWorkspace({
                 half is STRICTER than the engine — POST /v1/chat/completions gates
                 on the chat template and never reads tool_capable — so the copy
                 says Camelid declines, not that the engine refuses. */}
-            {!demoMode && setToolsEnabled && (
+            {!connectedToolsAvailable && !demoMode && setToolsEnabled && (
               <button
                 type="button"
                 className={`cxcomposer__tool cxcomposer__tool--collapsible ${toolsEnabled && toolCapability.capable ? 'is-on' : ''}`}
@@ -1265,13 +1279,14 @@ export default function ChatWorkspace({
         <ContextMeter
           contextLength={activeContextLength}
           promptTokens={estimatedPromptTokens}
+          systemTokens={systemTokens}
           reservedTokens={effectiveMaxTokens}
           verifiedBound={verifiedBound}
           executionLane={executionLane}
           autoCompact={autoCompact}
           onToggleAutoCompact={handleToggleAutoCompact}
           onCompactNow={compactionPreview.compacted ? null : handleCompactNow}
-          canCompact={compactForSend(visibleMessages) !== null}
+          canCompact={compactForSend(previewMessages) !== null}
           compaction={compactionPreview.compacted
             ? {
               active: true,
@@ -1382,6 +1397,7 @@ export default function ChatWorkspace({
                 const dayKey = dayKeyOf(message.created_at)
                 const priorDayKey = priorMessage ? dayKeyOf(priorMessage.created_at) : null
                 const showDaySeparator = Boolean(dayKey && priorDayKey && dayKey !== priorDayKey)
+                if (message.role === 'tool') return <details className="mcp-result" key={message.id}><summary>{message.mcp?.connection ? `${message.mcp.connection} · ` : ''}{message.mcp?.tool || 'Tool result'} · {message.mcp?.status || 'received'}{message.mcp?.is_error ? ' · error' : ''}</summary><ToolOutputGallery content={message.content} /><pre>{message.content}</pre></details>
                 return (
                   <Fragment key={message.id}>
                     {showDaySeparator && (
@@ -1414,7 +1430,7 @@ export default function ChatWorkspace({
                   </Fragment>
                 )
               })}
-              {generationActive && (
+              {followActive && (
                 <button
                   type="button"
                   className="cxchat__jump-latest"
@@ -1435,8 +1451,9 @@ export default function ChatWorkspace({
                   </article>
                 </>
               )}
+              <McpRunPanel activity={mcpActivity} approval={mcpApproval} onDecision={decideMcpApproval} onStop={stopGeneration} />
               {/* Follow-up prompts sit under the latest reply — they act on it. */}
-              {visibleMessages.length > 0 && !generationActive && canChat && (
+              {visibleMessages.length > 0 && !requestActive && canChat && (
                 <div className="cxchat__followups" aria-label="Follow-up prompts">
                   {FOLLOW_UP_PROMPTS.map((prompt) => (
                     <button key={prompt} type="button" className="cxchat__followup" onClick={() => handleSuggestion(prompt)}>{prompt}</button>
