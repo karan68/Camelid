@@ -85,7 +85,7 @@
 .coding-folder-field .coding-row { flex-wrap: nowrap; }
 .coding-folder-field input { flex: 1; min-width: 0; padding: 9px 11px; background: var(--color-surface); border: 1px solid var(--color-border-strong); border-radius: 7px; color: var(--color-text); font: inherit; font-size: 12px; }
 .coding-command-choice { display: flex; gap: 8px; align-items: flex-start; font-size: 12px; padding-top: 5px; }
-.coding-command-choice input { margin-top: 3px; }
+.coding-command-choice input { width: 14px; height: 14px; flex: 0 0 14px; margin: 3px 0 0; padding: 0; accent-color: var(--color-accent); }
 .coding-command-choice small { color: var(--color-text-muted); display: block; font-size: 11px; margin-top: 4px; }
 .coding-context { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 9px; color: var(--color-text-muted); font-size: 11px; }
 .coding-context span { overflow-wrap: anywhere; }
