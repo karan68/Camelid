@@ -72,10 +72,11 @@ export function ContextMeter({
   /* Same total the percentage is computed from, so the chip cannot read "0%"
      next to a token count that has already reached the window size. */
   const summary = `${formatTokenCount(budget.committedTokens)} / ${formatTokenCount(budget.contextLength)} tokens`
+  const pressure = budget.filledPercent >= 95 ? 'high' : budget.filledPercent >= AUTO_COMPACT_THRESHOLD_PERCENT ? 'warning' : 'low'
   const tone = budget.level === 'ok' && budget.nearLimit ? 'near' : budget.level
 
   return (
-    <div className="ctxmeter" ref={rootRef}>
+    <div className={`ctxmeter pressure-${pressure}`} ref={rootRef}>
       <button
         type="button"
         className={`ctxmeter__chip is-${tone}`}
@@ -83,7 +84,7 @@ export function ContextMeter({
         aria-label={`Context window ${formatPercent(budget.filledPercent)} used. ${summary}. Show breakdown.`}
         onClick={() => setOpen((value) => !value)}
       >
-        <IconMemory size={13} />
+        <IconMemory size={13} /><span className="ctxmeter__label">Context</span>
         <span className="ctxmeter__track" aria-hidden="true">
           <span className="ctxmeter__fill" style={{ width: `${Math.min(budget.usedPercent, 100)}%` }} />
           <span

@@ -317,7 +317,7 @@ function UserTurn({ message, messageContent, onEditResend }) {
   )
 }
 
-export const MessageTurn = memo(function MessageTurn({ message, generationElapsedSeconds, priorUserPrompt, onReusePrompt, onRegenerate, onEditResend, onContinue, onSelectVariant, onDiscardVariant, regenerateReplacesThread = false, tokenInspection = null, structuredRecord = null, toolCallRepeat = null }) {
+export const MessageTurn = memo(function MessageTurn({ hideManagedToolCalls = false, message, generationElapsedSeconds, priorUserPrompt, onReusePrompt, onRegenerate, onEditResend, onContinue, onSelectVariant, onDiscardVariant, regenerateReplacesThread = false, tokenInspection = null, structuredRecord = null, toolCallRepeat = null }) {
   const [copied, setCopied] = useState(false)
   const copiedResetRef = useRef(null)
   const messageContent = cleanLegacyDemoCapCopy(message.content)
@@ -492,7 +492,7 @@ export const MessageTurn = memo(function MessageTurn({ message, generationElapse
             absence={tokenInspection.absence}
           />
         )}
-        {message.role === 'assistant' && !assistantStreaming && message.tool_calls && (
+        {message.role === 'assistant' && !assistantStreaming && !hideManagedToolCalls && message.tool_calls && (
           <ToolCallsCard managed={message.mcp_managed} toolCalls={message.tool_calls} repeated={toolCallRepeat} replyContent={messageContent} />
         )}
         <DeveloperDiagnosticsBlock message={message} />

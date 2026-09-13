@@ -2792,10 +2792,11 @@ fn router_with_state_and_policy(state: AppState, policy: server::ServerPolicy) -
         .route("/api/mcp/connections", get(mcp::list).post(mcp::save))
         .route(
             "/api/mcp/connections/:id",
-            axum::routing::delete(mcp::remove),
+            axum::routing::delete(mcp::remove).put(mcp::update),
         )
         .route("/api/mcp/connections/:id/connect", post(mcp::connect))
         .route("/api/mcp/connections/:id/disconnect", post(mcp::disconnect))
+        .route("/api/mcp/connections/:id/test", post(mcp::test_connection))
         .route("/api/mcp/calls", post(mcp::prepare_call))
         .route(
             "/api/mcp/calls/:id",

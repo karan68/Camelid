@@ -308,6 +308,104 @@ pub(super) async fn save(
     r.connections.insert(c.config.id.clone(), c);
     (StatusCode::CREATED, Json(view)).into_response()
 }
+// A replacement receives a fresh identity so old per-conversation tool
+// selections and frozen approvals cannot silently target a different server.
+pub(super) async fn update(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(mut config): Json<ConnectionConfig>,
+) -> Response {
+    if let Err(e) = authorize(&state, &headers).await {
+        return e;
+    }
+    config.id = uuid::Uuid::new_v4().simple().to_string();
+    if let Err(e) = config.validate() {
+        return error(StatusCode::BAD_REQUEST, e);
+    }
+    let mut r = state.mcp.inner.lock().await;
+    if !r.connections.contains_key(&id) {
+        return error(StatusCode::NOT_FOUND, "Connection not found.");
+    }
+    let mut configs: Vec<_> = r
+        .connections
+        .values()
+        .filter(|c| c.config.id != id)
+        .map(|c| c.config.clone())
+        .collect();
+    configs.push(config.clone());
+    if let Err(e) = state.mcp.persist(configs).await {
+        return error(StatusCode::INTERNAL_SERVER_ERROR, e);
+    }
+    stop_connection(&mut r, &id);
+    r.connections.remove(&id);
+    let connection = Connection {
+        config,
+        client: None,
+        tools: vec![],
+        error: None,
+    };
+    let view = connection_view(&connection);
+    r.connections
+        .insert(connection.config.id.clone(), connection);
+    Json(view).into_response()
+}
+
+pub(super) async fn test_connection(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(e) = authorize(&state, &headers).await {
+        return e;
+    }
+    let (client, config) = {
+        let r = state.mcp.inner.lock().await;
+        let Some(c) = r.connections.get(&id) else {
+            return error(StatusCode::NOT_FOUND, "Connection not found.");
+        };
+        let Some(client) = c
+            .client
+            .as_ref()
+            .filter(|s| !s.is_closed() && !s.peer().is_transport_closed())
+        else {
+            return error(
+                StatusCode::CONFLICT,
+                "Connect this server before testing it.",
+            );
+        };
+        (client.clone(), c.config.clone())
+    };
+    // Discovery checks the live server and its complete bounded tool catalog.
+    // It never invokes a tool, launches a program, or holds the registry lock.
+    let start = Instant::now();
+    let result =
+        tokio::time::timeout(Duration::from_secs(10), discover_tools(&client, &config)).await;
+    let mut r = state.mcp.inner.lock().await;
+    let Some(c) = r.connections.get_mut(&id).filter(|c| {
+        c.client
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &client))
+    }) else {
+        return error(
+            StatusCode::CONFLICT,
+            "The connection changed during this test. Connect and test again.",
+        );
+    };
+    let message = match result {
+        Ok(Ok(tools)) => {
+            c.tools = tools;
+            c.error = None;
+            return Json(json!({"ok":true,"tools_count":c.tools.len(),"elapsed_ms":start.elapsed().as_millis(),"message":"Server responded and tool discovery passed."})).into_response();
+        }
+        Ok(Err(message)) => message,
+        Err(_) => "Connection test timed out after 10 seconds.".to_string(),
+    };
+    c.error = Some(message.clone());
+    Json(json!({"ok":false,"elapsed_ms":start.elapsed().as_millis(),"message":message}))
+        .into_response()
+}
+
 fn stop_connection(r: &mut Registry, id: &str) {
     if let Some(c) = r.connections.get_mut(id) {
         if let Some(client) = c.client.take() {
@@ -421,6 +519,13 @@ async fn open(config: &ConnectionConfig) -> Result<(Client, Vec<ToolView>), Stri
         }
         _ => return Err("Unsupported MCP transport.".into()),
     };
+    let tools = discover_tools(&client, config).await?;
+    Ok((client, tools))
+}
+async fn discover_tools(
+    client: &Client,
+    config: &ConnectionConfig,
+) -> Result<Vec<ToolView>, String> {
     let mut tools = Vec::new();
     let mut cursor = None;
     let mut seen = std::collections::HashSet::new();
@@ -475,7 +580,7 @@ async fn open(config: &ConnectionConfig) -> Result<(Client, Vec<ToolView>), Stri
             return Err("MCP tool pagination exceeded the limit.".into());
         }
     }
-    Ok((client, tools))
+    Ok(tools)
 }
 pub(super) async fn connect(
     State(state): State<AppState>,
@@ -803,6 +908,103 @@ mod tests {
         assert_eq!(value["truncated"], true);
         assert!(value.to_string().len() < MAX_RESULT_BYTES);
     }
+    #[tokio::test]
+    async fn mcp_test_and_edit_preserve_explicit_connection_and_tool_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let router = app(&dir);
+        let (url, count, fixture) = fixture().await;
+        let (_, saved) = api(
+            &router,
+            "POST",
+            "/api/mcp/connections",
+            serde_json::to_value(config(&url)).unwrap(),
+        )
+        .await;
+        let id = saved["config"]["id"].as_str().unwrap();
+        let base = format!("/api/mcp/connections/{id}");
+        assert_eq!(
+            api(&router, "POST", &format!("{base}/test"), Value::Null)
+                .await
+                .0,
+            StatusCode::CONFLICT
+        );
+        let (_, connected) = api(&router, "POST", &format!("{base}/connect"), Value::Null).await;
+        let old_key = connected["tools"][0]["key"].as_str().unwrap();
+        let (status, diagnostic) = api(&router, "POST", &format!("{base}/test"), Value::Null).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(diagnostic["ok"], true);
+        assert_eq!(diagnostic["tools_count"], 1);
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            0,
+            "testing must not invoke a tool"
+        );
+        let (_, pending) = api(
+            &router,
+            "POST",
+            "/api/mcp/calls",
+            json!({"tool_key":old_key,"arguments":{"text":"frozen"}}),
+        )
+        .await;
+        let mut replacement = config(&url);
+        replacement.name = "Updated connection".into();
+        let mut invalid = serde_json::to_value(&replacement).unwrap();
+        invalid["url"] = json!("http://example.com/mcp");
+        assert_eq!(
+            api(&router, "PUT", &base, invalid).await.0,
+            StatusCode::BAD_REQUEST
+        );
+        let (_, still_connected) = api(&router, "GET", "/api/mcp/connections", Value::Null).await;
+        assert_eq!(
+            still_connected["connections"][0]["connected"], true,
+            "invalid edits leave the live connection alone"
+        );
+        let (status, updated) = api(
+            &router,
+            "PUT",
+            &base,
+            serde_json::to_value(replacement).unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(updated["connected"], false);
+        assert_eq!(updated["tools"], json!([]));
+        let new_id = updated["config"]["id"].as_str().unwrap();
+        assert_ne!(new_id, id);
+        let (_, cancelled) = api(
+            &router,
+            "GET",
+            &format!("/api/mcp/calls/{}", pending["id"].as_str().unwrap()),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(cancelled["status"], "cancelled");
+        let (_, reloaded) = api(&app(&dir), "GET", "/api/mcp/connections", Value::Null).await;
+        assert_eq!(reloaded["connections"].as_array().unwrap().len(), 1);
+        assert_eq!(reloaded["connections"][0]["config"]["id"], new_id);
+        assert_eq!(reloaded["connections"][0]["connected"], false);
+        let (_, reconnected) = api(
+            &router,
+            "POST",
+            &format!("/api/mcp/connections/{new_id}/connect"),
+            Value::Null,
+        )
+        .await;
+        assert_ne!(
+            reconnected["tools"][0]["key"], old_key,
+            "old tool sets must not retarget edited settings"
+        );
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        api(
+            &router,
+            "DELETE",
+            &format!("/api/mcp/connections/{new_id}"),
+            Value::Null,
+        )
+        .await;
+        fixture.abort();
+    }
+
     #[tokio::test]
     async fn mcp_http_approval_denial_replay_and_persistence() {
         let dir = tempfile::tempdir().unwrap();
