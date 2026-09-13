@@ -9,7 +9,7 @@ This UI preview uses deterministic test activity, not a model-validation receipt
 ## Start a session
 
 1. Load an exact tool-capable model artifact with a recorded certified digest. Code uses the same artifact gate as Workspace; a historical `tool_capable` ledger row without a pinned digest is insufficient. The Code screen checks the active engine, and the server rechecks identity when starting or continuing a run.
-2. Select **Code**, choose your project folder, and optionally attach project instructions and references using the existing context editor.
+2. Select **Code** and choose your project folder. In **Browse**, navigate to its parent, choose **New folder**, enter a name, and select **Create & use** to create a project directory. This creates one empty folder on the engine's machine; existing files and folders are never overwritten. Optionally attach project instructions and references using the existing context editor.
 3. If the task needs tests or build commands, enable **Allow command requests** before starting. This setting is fixed for the session. Each command still requires its own decision.
 4. Describe the task. Read/search/plan tools run automatically. File edits pause for an exact diff approval; command requests pause for the command, working folder, and execution notice.
 
@@ -45,6 +45,7 @@ All coding routes require a loopback listener and local same-origin request inte
 
 | Method and path | Behavior |
 | --- | --- |
+| `POST /api/agent/coding/folders` | Explicit setup action `{ "parent": "absolute existing directory", "name": "new folder name" }`; returns `201` with its path, or an error for invalid names, unavailable parents, or collisions; does not require a loaded model |
 | `GET /api/agent/coding/sessions` | Saved-session summaries and the active certified tool-capable model ID, if available |
 | `POST /api/agent/coding/sessions` | Create with `workspace`, `goal`, `message_id`, `model_id`; optional `project_id`, `instructions`, `references`, `allow_commands`, `max_steps`, `max_tokens` |
 | `GET /api/agent/coding/sessions/:id` | Current full snapshot |

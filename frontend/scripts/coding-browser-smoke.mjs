@@ -13,7 +13,7 @@ const ledger = JSON.parse(readFileSync(resolve(root, 'ledger/camelid-ledger.json
 const capabilities = { ...ledger.capabilities, model_compatibility: ledger.model_rows.map(r => ({ ...r.contract, tool_capable: true })) }
 const model = 'qwen3_0_6b_instruct_q8_0', filename = 'Qwen3-0.6B-Q8_0.gguf'
 const sessionId = 'a'.repeat(32), reviewId = 'b'.repeat(32)
-const streams = new Set(), requests = [], errors = []
+const streams = new Set(), requests = [], errors = [], folderRequests = []
 let session = null, approvals = 0, creates = 0, commands = 0
 const fileReview = { id: reviewId, workspace: '/project', path: 'src/example.js', before: 'export const answer = 1', after: 'export const answer = 2', diff: '- export const answer = 1\n+ export const answer = 2', status: 'pending', source: 'Coding · Lead', before_bytes: 23, after_bytes: 23, created_at: Date.now() }
 function json(res, value, status = 200) { res.writeHead(status, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(value)) }
@@ -22,6 +22,12 @@ async function body(req) { const chunks=[]; for await (const chunk of req) chunk
 const server = createServer(async (req,res) => {
  try {
   const path = new URL(req.url, 'http://localhost').pathname
+  if (path === '/api/agent/workspace/browse') return json(res, { path: new URL(req.url, 'http://localhost').searchParams.get('path') || '/project', parent: '/', has_roots: false, separator: '/', entries: [], truncated: false })
+  if (path === '/api/agent/coding/folders' && req.method === 'POST') {
+   const data = await body(req); folderRequests.push(data)
+   if (data.name === 'Existing') return json(res, { error: { message: 'A file or folder with that name already exists.' } }, 409)
+   return json(res, { path: data.parent + '/' + data.name }, 201)
+  }
   if (path === '/v1/health') return json(res, { ok: true, engine: 'camelid', api_surface: 'full', backend: 'llama', model_family: 'qwen3', loaded_now: true, generation_ready: true, active_model_id: model, active_context_length: 4096, max_prompt_tokens: 4096, max_generation_tokens: 8192 })
   if (path === '/v1/models') return json(res, { object: 'list', data: [{ id: model, object: 'model', owned_by: 'camelid', meta: { n_ctx_train: 32768, n_params: 600000000, size: 639446688 } }] })
   if (path === '/api/capabilities') return json(res, capabilities)
@@ -86,12 +92,26 @@ try {
  await page.goto(`http://127.0.0.1:${server.address().port}`,{waitUntil:'networkidle2'})
  await clickText('Code','.coding-mode-switch button')
  await page.waitForSelector('#coding-folder');await page.type('#coding-folder','/project')
+ await clickText('Browse');await page.waitForFunction(()=>!document.querySelector('.folder-picker__up')?.disabled)
+ await clickText('New folder');await page.waitForSelector('#project-folder-name')
+ assert.equal(await page.evaluate(()=>[...document.querySelectorAll('button')].find(b=>b.textContent==='Create & use').disabled),true)
+ await page.type('#project-folder-name','Existing');await page.keyboard.press('Enter')
+ await page.waitForFunction(()=>document.querySelector('.folder-picker__create [role="alert"]')?.textContent.includes('already exists'))
+ await page.$eval('#project-folder-name',input=>input.select());await page.keyboard.press('Backspace');await page.type('#project-folder-name','Tiny Tasks')
+ await page.setViewport({width:390,height:1050,deviceScaleFactor:1})
+ assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1),true,'folder creation mobile overflow')
+ await page.screenshot({path:resolve(out,'coding-new-folder.png'),fullPage:true})
+ await clickText('Create & use')
+ await page.waitForFunction(()=>!document.querySelector('.folder-picker') && document.querySelector('#coding-folder')?.value==='/project/Tiny Tasks')
+ assert.deepEqual(folderRequests,[{parent:'/project',name:'Existing'},{parent:'/project',name:'Tiny Tasks'}])
+ await page.setViewport({width:1440,height:1050,deviceScaleFactor:1})
  await page.click('.coding-command-choice input')
  await page.type('[aria-label="Message coding agents"]','Update the answer and verify it.')
  await page.waitForFunction(()=>!document.querySelector('[aria-label="Start coding"]').disabled)
  await page.click('[aria-label="Start coding"]')
  await page.waitForSelector('.coding-approval')
  assert.equal(creates,1);assert.equal(requests[0].allow_commands,true)
+ assert.equal(requests[0].workspace,'/project/Tiny Tasks')
  assert.equal(requests[0].model_id,model);assert.match(requests[0].message_id,/^[a-f0-9]{32}$/)
  await clickText('Explorer', '.coding-agent strong').catch(async()=>{await page.click('.coding-agent:nth-child(2)')})
  await page.waitForFunction(()=>document.querySelector('.coding-agent-detail')?.textContent.includes('Read-only helper'))

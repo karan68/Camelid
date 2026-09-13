@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useCodingSession } from '../hooks/useCodingSession.js'
-import { codingActive, codingContext } from '../lib/codingSessions.js'
+import { codingActive, codingContext, createCodingFolder } from '../lib/codingSessions.js'
 import { readModelToolCapability } from '../lib/toolCalling.js'
 import { changeRequest } from '../lib/changeReviews.js'
 import { appStorage } from '../lib/appStorage.js'
@@ -149,7 +149,7 @@ export default function CodingWorkspace({ apiBase, runtime, selectedModel, capab
         <div className="coding-composer-tools"><span><span className="coding-dot" />{snapshot?.config.model_id || selectedModel?.name || 'No model'}</span><details><summary><IconBolt size={14} />Project tools</summary><p>Read files · search · plan · reviewed edits · read-only helpers{(snapshot?.config.allow_commands ?? allowCommands) ? ' · approved commands' : ''}</p></details><span><IconShield size={14} />Review changes</span><Button type="submit" size="sm" variant="primary" icon={<IconSend size={17} />} aria-label={snapshot ? 'Send coding follow-up' : 'Start coding'} disabled={!canSend} /></div>
       </form>
     </div>
-    {folderOpen && <FolderPicker apiBase={apiBase} initialPath={workspace || null} onPick={value => { setWorkspace(value); setFolderOpen(false) }} onClose={() => setFolderOpen(false)} />}
+    {folderOpen && <FolderPicker apiBase={apiBase} initialPath={workspace || null} onCreate={(parent, name) => createCodingFolder(apiBase, parent, name)} onPick={value => { setWorkspace(value); setFolderOpen(false) }} onClose={() => setFolderOpen(false)} />}
     <ConfirmDialog open={confirmRemove} title="Remove this coding session?" detail="This removes the saved conversation and agent activity. Reviewed file changes and their Undo history remain in Changes." confirmLabel="Remove session" onCancel={() => setConfirmRemove(false)} onConfirm={async () => { try { await coding.remove(); setConfirmRemove(false) } catch { /* visible hook error */ } }} />
   </section>
 }

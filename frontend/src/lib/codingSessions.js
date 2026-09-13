@@ -10,14 +10,20 @@ export function acceptCodingSnapshot(current, next, selectedId) {
 export function codingEndpoint(apiBase, suffix = '') {
   return String(apiBase || '').replace(/\/$/, '') + '/api/agent/coding/sessions' + suffix
 }
-export async function codingRequest(apiBase, suffix = '', { method = 'GET', body, signal } = {}) {
-  const response = await fetch(codingEndpoint(apiBase, suffix), {
+export function codingRequest(apiBase, suffix = '', options = {}) {
+  return requestCodingJson(codingEndpoint(apiBase, suffix), options)
+}
+export function createCodingFolder(apiBase, parent, name) {
+  return requestCodingJson(String(apiBase || '').replace(/\/$/, '') + '/api/agent/coding/folders', { method: 'POST', body: { parent, name } })
+}
+async function requestCodingJson(url, { method = 'GET', body, signal } = {}) {
+  const response = await fetch(url, {
     method, signal, headers: { 'Content-Type': 'application/json' },
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
   })
   const data = await response.json().catch(() => null)
   if (!response.ok) throw new Error(data?.error?.message || `Coding request failed (${response.status}).`)
-  if (!data) throw new Error('This engine did not return coding-session data. Update the engine and try again.')
+  if (!data) throw new Error('This engine did not return coding data. Update the engine and try again.')
   return data
 }
 export function codingContext(sources = []) {

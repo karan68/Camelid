@@ -1040,7 +1040,7 @@ fn list_child_directories(dir: &std::path::Path) -> (Vec<WorkspaceBrowseEntry>, 
 /// `std::fs::canonicalize` yields Windows extended-length (`\\?\C:\...`) paths.
 /// Strip that verbatim prefix so the picker shows and round-trips ordinary
 /// `C:\...` paths; selecting one canonicalizes again on the server anyway.
-fn simplify_path(path: &std::path::Path) -> String {
+pub(super) fn simplify_path(path: &std::path::Path) -> String {
     let text = path.to_string_lossy().into_owned();
     #[cfg(windows)]
     {

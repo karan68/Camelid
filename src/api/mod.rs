@@ -2785,6 +2785,7 @@ fn router_with_state_and_policy(state: AppState, policy: server::ServerPolicy) -
         )
         .route("/api/generation/preflight", post(preflight_generation))
         .route("/api/web/research", post(web_research::handler))
+        .route("/api/agent/coding/folders", post(coding::create_folder))
         .route(
             "/api/agent/coding/sessions",
             get(coding::list).post(coding::create),

@@ -76,6 +76,93 @@ pub(super) struct Decision {
     approved: bool,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct CreateFolder {
+    parent: PathBuf,
+    name: String,
+}
+
+/// Explicit user setup action, independent of model/agent execution.
+pub(super) async fn create_folder(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<CreateFolder>,
+) -> Response {
+    if let Err(e) = authorize(&state, &headers) {
+        return *e;
+    }
+    match tokio::task::spawn_blocking(move || create_project_folder(request)).await {
+        Ok(Ok(path)) => (
+            StatusCode::CREATED,
+            Json(json!({"path": workspace::simplify_path(&path)})),
+        )
+            .into_response(),
+        Ok(Err((status, message))) => {
+            api_error(status, "coding_folder_error", message.into(), None)
+        }
+        Err(_) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "coding_folder_error",
+            "Could not create the folder.".into(),
+            None,
+        ),
+    }
+}
+
+fn create_project_folder(request: CreateFolder) -> Result<PathBuf, (StatusCode, &'static str)> {
+    let name = request.name.trim();
+    if name.is_empty()
+        || name.len() > 255
+        || matches!(name, "." | "..")
+        || name.ends_with('.')
+        || name
+            .chars()
+            .any(|c| c.is_control() || "<>:\"/\\|?*".contains(c))
+        || name.eq_ignore_ascii_case(".git")
+        || name.eq_ignore_ascii_case(".camelid")
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Use one folder name without path separators, reserved characters, or a trailing dot.",
+        ));
+    }
+    if !request.parent.is_absolute() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Choose an existing parent folder first.",
+        ));
+    }
+    let parent = std::fs::canonicalize(request.parent).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            "The parent folder is not accessible.",
+        )
+    })?;
+    if !parent.is_dir() {
+        return Err((StatusCode::BAD_REQUEST, "The parent path is not a folder."));
+    }
+    if parent.components().any(|c| {
+        c.as_os_str()
+            .to_str()
+            .is_some_and(|s| s.eq_ignore_ascii_case(".git") || s.eq_ignore_ascii_case(".camelid"))
+    }) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Choose a project location outside .git and .camelid folders.",
+        ));
+    }
+    let path = parent.join(name);
+    // create_dir fails if any entry already occupies the name, including a
+    // symlink. Never reuse, overwrite, or recursively create a supplied path.
+    std::fs::create_dir(&path).map_err(|e| match e.kind() {
+        std::io::ErrorKind::AlreadyExists => (StatusCode::CONFLICT, "A file or folder with that name already exists. Choose another name or open the existing folder."),
+        std::io::ErrorKind::PermissionDenied => (StatusCode::FORBIDDEN, "You do not have permission to create a folder here."),
+        _ => (StatusCode::BAD_REQUEST, "Could not create that folder. Check the name and parent folder."),
+    })?;
+    Ok(path)
+}
+
 pub(super) async fn list(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(e) = authorize(&state, &headers) {
         return *e;
@@ -319,6 +406,101 @@ mod tests {
         headers.insert("host", "127.0.0.1:8181".parse().unwrap());
         headers.insert("origin", "http://127.0.0.1:8181".parse().unwrap());
         headers
+    }
+    #[tokio::test]
+    async fn project_folder_creation_requires_local_authority_without_a_model() {
+        let root = tempfile::tempdir().unwrap();
+        let mut headers = local_headers();
+        headers.insert("origin", "https://unrelated.example".parse().unwrap());
+        let request = || CreateFolder {
+            parent: root.path().into(),
+            name: "Tiny Tasks".into(),
+        };
+        let denied = create_folder(State(AppState::default()), headers, Json(request())).await;
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        assert!(!root.path().join("Tiny Tasks").exists());
+        let created =
+            create_folder(State(AppState::default()), local_headers(), Json(request())).await;
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let bytes = axum::body::to_bytes(created.into_body(), 4096)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            value["path"],
+            workspace::simplify_path(
+                &std::fs::canonicalize(root.path().join("Tiny Tasks")).unwrap()
+            )
+        );
+        let duplicate =
+            create_folder(State(AppState::default()), local_headers(), Json(request())).await;
+        assert_eq!(duplicate.status(), StatusCode::CONFLICT);
+    }
+    #[test]
+    fn project_folder_creation_does_not_overwrite_or_escape_parent() {
+        let root = tempfile::tempdir().unwrap();
+        for name in [
+            "",
+            "..",
+            "../escape",
+            "child/nested",
+            "child\\nested",
+            ".git",
+            ".camelid",
+            "x:y",
+        ] {
+            assert_eq!(
+                create_project_folder(CreateFolder {
+                    parent: root.path().into(),
+                    name: name.into()
+                })
+                .unwrap_err()
+                .0,
+                StatusCode::BAD_REQUEST
+            );
+        }
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+        let file = root.path().join("existing");
+        std::fs::write(&file, "preserve me").unwrap();
+        assert_eq!(
+            create_project_folder(CreateFolder {
+                parent: root.path().into(),
+                name: "existing".into()
+            })
+            .unwrap_err()
+            .0,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "preserve me");
+        assert!(create_project_folder(CreateFolder {
+            parent: file,
+            name: "child".into()
+        })
+        .is_err());
+        let protected = root.path().join(".git");
+        std::fs::create_dir(&protected).unwrap();
+        assert!(create_project_folder(CreateFolder {
+            parent: protected.clone(),
+            name: "child".into()
+        })
+        .is_err());
+        assert!(!protected.join("child").exists());
+        #[cfg(unix)]
+        {
+            let outside = tempfile::tempdir().unwrap();
+            let link = root.path().join("linked");
+            std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+            assert_eq!(
+                create_project_folder(CreateFolder {
+                    parent: root.path().into(),
+                    name: "linked".into()
+                })
+                .unwrap_err()
+                .0,
+                StatusCode::CONFLICT
+            );
+            assert_eq!(std::fs::read_link(link).unwrap(), outside.path());
+        }
     }
     #[test]
     fn coding_rejects_cross_origin_and_non_loopback_surfaces() {

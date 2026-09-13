@@ -465,6 +465,36 @@ pub(super) async fn remove(
     .await
 }
 
+impl crate::chat::coding::ChangeJournal for ChangeManager {
+    fn prepare(
+        &self,
+        workspace: &FsPath,
+        path: &str,
+        content: String,
+        source: String,
+    ) -> Result<Value> {
+        let _guard = self.lock.lock().map_err(|_| "Review store unavailable.")?;
+        self.propose(Proposal {
+            workspace: workspace.to_path_buf(),
+            path: path.into(),
+            content,
+            source,
+        })
+        .map(|review| view(&review, true))
+    }
+    fn decide(&self, id: &str, approved: bool) -> Result<Value> {
+        let _guard = self.lock.lock().map_err(|_| "Review store unavailable.")?;
+        // An explicit decision in the Changes page may win the race with the
+        // coding approval. Report that observed result without applying twice.
+        let existing = self.load(id)?;
+        if (approved && existing.status == "applied") || (!approved && existing.status != "pending")
+        {
+            return Ok(view(&existing, true));
+        }
+        ChangeManager::decide(self, id, approved).map(|review| view(&review, true))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -621,35 +651,5 @@ mod tests {
                 StatusCode::FORBIDDEN
             );
         }
-    }
-}
-
-impl crate::chat::coding::ChangeJournal for ChangeManager {
-    fn prepare(
-        &self,
-        workspace: &FsPath,
-        path: &str,
-        content: String,
-        source: String,
-    ) -> Result<Value> {
-        let _guard = self.lock.lock().map_err(|_| "Review store unavailable.")?;
-        self.propose(Proposal {
-            workspace: workspace.to_path_buf(),
-            path: path.into(),
-            content,
-            source,
-        })
-        .map(|review| view(&review, true))
-    }
-    fn decide(&self, id: &str, approved: bool) -> Result<Value> {
-        let _guard = self.lock.lock().map_err(|_| "Review store unavailable.")?;
-        // An explicit decision in the Changes page may win the race with the
-        // coding approval. Report that observed result without applying twice.
-        let existing = self.load(id)?;
-        if (approved && existing.status == "applied") || (!approved && existing.status != "pending")
-        {
-            return Ok(view(&existing, true));
-        }
-        ChangeManager::decide(self, id, approved).map(|review| view(&review, true))
     }
 }
