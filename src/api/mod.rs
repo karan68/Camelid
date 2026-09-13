@@ -2807,6 +2807,14 @@ fn router_with_state_and_policy(state: AppState, policy: server::ServerPolicy) -
             post(coding::decide),
         )
         .route("/api/agent/coding/sessions/:id/events", get(coding::events))
+        .route(
+            "/api/agent/coding/sessions/:id/project",
+            post(coding::project_action),
+        )
+        .route(
+            "/api/agent/coding/sessions/:id/preview",
+            get(coding::preview),
+        )
         .route("/api/changes", get(changes::list).post(changes::prepare))
         .route(
             "/api/changes/:id",

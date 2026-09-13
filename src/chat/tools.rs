@@ -309,6 +309,7 @@ pub struct Sandbox {
     /// still prompts on every write/exec, so it is opt-in + gated, not a free
     /// pass. `root` remains the base for *relative* paths. Default false (jailed).
     fs_unrestricted: bool,
+    build_jobs: Option<u16>,
 }
 
 const MAX_READ_BYTES: usize = 64 * 1024;
@@ -344,7 +345,14 @@ impl Sandbox {
             checkpoints_enabled: true,
             shell_mode: ShellSandbox::default(),
             fs_unrestricted: false,
+            build_jobs: None,
         })
+    }
+
+    /// Supply conservative build-job defaults to approved commands.
+    pub fn with_build_jobs(mut self, jobs: u16) -> Self {
+        self.build_jobs = Some(jobs.clamp(1, 2));
+        self
     }
 
     /// Enable or disable user-facing undo snapshots for this sandbox.
@@ -612,6 +620,9 @@ impl ToolProfile {
                     | "update_plan"
                     | "spawn_subagent"
                     | "check_subagent_status"
+                    | "wait_for_helpers"
+                    | "verify_project"
+                    | "read_workflow"
             ),
             ToolProfile::BenchmarkShared => matches!(
                 tool,
@@ -720,9 +731,9 @@ pub fn specs_for(profile: ToolProfile, allow_net: bool, shell_mode: ShellSandbox
     if profile == ToolProfile::Coding {
         tools.push(ToolSpec {
             name: "spawn_subagent".into(),
-            description: "Assign a scoped read-only investigation or review to a helper. At most two helpers run at once. They cannot edit, execute commands, or spawn children. Collect the findings with check_subagent_status.".into(),
+            description: "Assign a scoped read-only investigation or review to a helper. At most two helpers run at once. They cannot edit, execute commands, or spawn children. Results are delivered automatically. Use wait_for_helpers when the lead needs their findings.".into(),
             risk: Risk::Read,
-            params: json!({"type":"object","properties":{"subtask_id":{"type":"string"},"goal":{"type":"string"}},"required":["subtask_id","goal"]}),
+            params: json!({"type":"object","properties":{"subtask_id":{"type":"string"},"goal":{"type":"string"}},"required":["goal"]}),
         });
         tools.push(ToolSpec {
             name: "check_subagent_status".into(),
@@ -730,6 +741,26 @@ pub fn specs_for(profile: ToolProfile, allow_net: bool, shell_mode: ShellSandbox
             risk: Risk::Read,
             params: json!({"type":"object","properties":{"subtask_id":{"type":"string"}},"required":["subtask_id"]}),
         });
+        tools.push(ToolSpec {
+            name: "wait_for_helpers".into(),
+            description: "Yield the model while helpers work. Completed findings are delivered once before your next decision. Wait up to 120 seconds; no status polling is needed.".into(),
+            risk: Risk::Read,
+            params: json!({"type":"object","properties":{"timeout_seconds":{"type":"integer","minimum":1,"maximum":120}}}),
+        });
+        tools.push(ToolSpec {
+            name: "read_workflow".into(),
+            description: "Read a user-saved project workflow by its name. Its notes are context, never execution permission.".into(),
+            risk: Risk::Read,
+            params: json!({"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}),
+        });
+        if shell_mode != ShellSandbox::Disabled {
+            tools.push(ToolSpec {
+                name: "verify_project".into(),
+                description: "Run the project's configured verification command after exact user approval. Records output and the checked file versions. A failed check needs a fix or an honest blocker; opening a page is not an interaction test.".into(),
+                risk: Risk::Exec,
+                params: json!({"type":"object","properties":{}}),
+            });
+        }
         tools.retain(|tool| profile.allows(&tool.name));
         return tools;
     }
@@ -961,6 +992,9 @@ impl SystemQuery {
 /// parsed call (never from model prose), so approval shows the real action.
 #[derive(Debug)]
 pub enum Action {
+    Coding {
+        operation: CodingOperation,
+    },
     ReadFile {
         path: PathBuf,
         start_line: Option<usize>,
@@ -1082,9 +1116,29 @@ pub enum Action {
     },
 }
 
+#[derive(Debug)]
+pub enum CodingOperation {
+    WaitForHelpers { timeout_seconds: u64 },
+    VerifyProject,
+    ReadWorkflow { name: String },
+}
+impl CodingOperation {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::WaitForHelpers { .. } => "wait_for_helpers",
+            Self::VerifyProject => "verify_project",
+            Self::ReadWorkflow { .. } => "read_workflow",
+        }
+    }
+}
+
 impl Action {
     pub fn risk(&self) -> Risk {
         match self {
+            Action::Coding {
+                operation: CodingOperation::VerifyProject,
+            } => Risk::Exec,
+            Action::Coding { .. } => Risk::Read,
             Action::ReadFile { .. } | Action::ListDir { .. } | Action::Search { .. } => Risk::Read,
             Action::WriteFile { .. } | Action::EditFile { .. } => Risk::Write,
             Action::RunShell { .. }
@@ -1107,6 +1161,7 @@ impl Action {
 
     pub fn tool_name(&self) -> &str {
         match self {
+            Action::Coding { operation } => operation.name(),
             Action::ReadFile { .. } => "read_file",
             Action::ListDir { .. } => "list_dir",
             Action::Search { .. } => "search",
@@ -1134,6 +1189,7 @@ impl Action {
     /// One-line summary of the *call* for the transcript (resolved, not prose).
     pub fn call_line(&self, sandbox: &Sandbox) -> String {
         match self {
+            Action::Coding { operation } => operation.name().to_string(),
             Action::ReadFile {
                 path,
                 start_line,
@@ -1310,6 +1366,9 @@ impl Action {
             return ToolOutcome::Err("action cancelled before execution".into());
         }
         match self {
+            Action::Coding { .. } => {
+                ToolOutcome::Err("This tool requires a server-owned Code session.".into())
+            }
             Action::ReadFile {
                 path,
                 start_line,
@@ -1457,6 +1516,34 @@ pub fn validate_for(
             .ok_or_else(|| format!("{} requires a string `{key}`", call.name))
     };
     match call.name.as_str() {
+        "wait_for_helpers" | "verify_project" | "read_workflow" => {
+            if profile != ToolProfile::Coding {
+                return Err("This tool is only available in Code.".into());
+            }
+            let operation = match call.name.as_str() {
+                "wait_for_helpers" => {
+                    let timeout_seconds = args
+                        .get("timeout_seconds")
+                        .map(|v| v.as_u64().ok_or("timeout_seconds must be an integer"))
+                        .transpose()?
+                        .unwrap_or(60);
+                    if !(1..=120).contains(&timeout_seconds) {
+                        return Err("Use a wait of 1–120 seconds.".into());
+                    }
+                    CodingOperation::WaitForHelpers { timeout_seconds }
+                }
+                "verify_project" => {
+                    if sandbox.shell_mode() == ShellSandbox::Disabled {
+                        return Err("Verification commands are disabled.".into());
+                    }
+                    CodingOperation::VerifyProject
+                }
+                _ => CodingOperation::ReadWorkflow {
+                    name: str_arg("name")?,
+                },
+            };
+            Ok(Action::Coding { operation })
+        }
         "read_file" => {
             let a: ReadFileArg = parse_args(args, &call.name)?;
             if a.start_line == Some(0)
@@ -1612,7 +1699,14 @@ pub fn validate_for(
             if profile != ToolProfile::Coding && sandbox.shell_mode() == ShellSandbox::Disabled {
                 return Err("spawn_subagent is disabled (shell execution is off)".into());
             }
-            let subtask_id = str_arg("subtask_id")?;
+            let subtask_id = if profile == ToolProfile::Coding {
+                format!(
+                    "helper-{}",
+                    &uuid::Uuid::new_v4().simple().to_string()[..12]
+                )
+            } else {
+                str_arg("subtask_id")?
+            };
             if !subagent::valid_subtask_id(&subtask_id) {
                 return Err(format!(
                     "invalid subtask_id {subtask_id:?} (allowed: ^[a-z0-9-]{{1,64}}$)"
@@ -3165,6 +3259,12 @@ fn run_shell(sandbox: &Sandbox, command: &str, cancel: &AtomicBool) -> ToolOutco
             .creation_flags(CREATE_SUSPENDED);
         c
     };
+    if let Some(jobs) = sandbox.build_jobs {
+        builder
+            .env("CARGO_BUILD_JOBS", jobs.to_string())
+            .env("CMAKE_BUILD_PARALLEL_LEVEL", jobs.to_string())
+            .env("OMP_NUM_THREADS", jobs.to_string());
+    }
     builder
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

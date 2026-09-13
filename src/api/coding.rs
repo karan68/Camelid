@@ -58,12 +58,16 @@ pub(super) struct Create {
     allow_commands: bool,
     max_steps: Option<usize>,
     max_tokens: Option<u32>,
+    #[serde(default)]
+    project: crate::chat::coding_project::ProjectSettings,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Message {
     message: String,
     message_id: String,
+    mode: Option<String>,
+    run_id: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -169,6 +173,10 @@ pub(super) async fn list(State(state): State<AppState>, headers: HeaderMap) -> R
     if let Err(e) = authorize(&state, &headers) {
         return *e;
     }
+    let execution_engine = match state.coding_sessions.engine() {
+        Ok(value) => value,
+        Err(error) => return failure(error),
+    };
     let tool_capable_model = workspace::active_tool_capable_model(&state)
         .await
         .ok()
@@ -177,7 +185,7 @@ pub(super) async fn list(State(state): State<AppState>, headers: HeaderMap) -> R
         tokio::task::spawn_blocking(move || state.coding_sessions.list(Arc::new(state.changes)))
             .await;
     match result {
-        Ok(Ok(sessions)) => Json(json!({"tool_capable_model":tool_capable_model,"sessions":sessions.iter().map(|s| json!({"id":s.id,"title":s.title,"phase":s.phase,"updated_at":s.updated_at,"workspace":s.config.workspace,"project_id":s.config.project_id,"model_id":s.config.model_id})).collect::<Vec<_>>()})).into_response(),
+        Ok(Ok(sessions)) => Json(json!({"execution_engine":execution_engine,"tool_capable_model":tool_capable_model,"sessions":sessions.iter().map(|s| json!({"id":s.id,"title":s.title,"phase":s.phase,"updated_at":s.updated_at,"workspace":s.config.workspace,"project_id":s.config.project_id,"model_id":s.config.model_id})).collect::<Vec<_>>()})).into_response(),
         Ok(Err(e)) => failure(e), Err(e) => failure(e),
     }
 }
@@ -242,6 +250,7 @@ pub(super) async fn create(
         project_id: request.project_id,
         instructions: request.instructions,
         references: request.references,
+        project: request.project,
     };
     match state.coding_sessions.create(
         config,
@@ -262,7 +271,10 @@ pub(super) async fn get(
         return *e;
     }
     match run(&state, &id) {
-        Ok(run) => Json(run.snapshot()).into_response(),
+        Ok(run) => match tokio::task::spawn_blocking(move || run.observed_snapshot()).await {
+            Ok(snapshot) => Json(snapshot).into_response(),
+            Err(error) => failure(error),
+        },
         Err(e) => *e,
     }
 }
@@ -279,6 +291,17 @@ pub(super) async fn message(
         Ok(r) => r,
         Err(e) => return *e,
     };
+    if let Some(mode) = request.mode.as_deref().filter(|mode| *mode != "follow_up") {
+        return match request
+            .run_id
+            .as_deref()
+            .ok_or_else(|| "Bind active input to the current run_id.".to_string())
+            .and_then(|run_id| run.input(run_id, request.message_id, request.message, mode))
+        {
+            Ok(()) => Json(run.snapshot()).into_response(),
+            Err(error) => failure(error),
+        };
+    }
     let _transition = state.model_transition.lock().await;
     if state.workspace_sessions.blocks_model_transition().await {
         return failure("Wait for Workspace to finish.");
@@ -399,7 +422,14 @@ pub(super) async fn events(
     // an expired event backlog need no action replay and no guessed deltas.
     let stream = async_stream::stream! {
         loop {
-            let snapshot = run.snapshot();
+            let observed = run.clone();
+            let snapshot = match tokio::task::spawn_blocking(move || observed.observed_snapshot()).await {
+                Ok(snapshot) => snapshot,
+                Err(_) => {
+                    yield Ok(Event::default().event("error").data("Could not inspect current project evidence"));
+                    break;
+                }
+            };
             let terminal = !snapshot.phase.active();
             yield Ok::<Event, Infallible>(Event::default().event("coding").id(snapshot.seq.to_string()).json_data(&snapshot).unwrap_or_else(|_| Event::default().event("error").data("Could not encode coding state")));
             if terminal { break; }
@@ -412,14 +442,222 @@ pub(super) async fn events(
         .into_response()
 }
 
+#[derive(Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+pub(super) enum ProjectAction {
+    Settings {
+        run_id: String,
+        settings: crate::chat::coding_project::ProjectSettings,
+    },
+    SaveWorkflow {
+        name: String,
+        notes: String,
+    },
+    RestoreCheckpoint {
+        run_id: String,
+        checkpoint_id: String,
+    },
+}
+pub(super) async fn project_action(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(request): Json<ProjectAction>,
+) -> Response {
+    if let Err(error) = authorize(&state, &headers) {
+        return *error;
+    }
+    let run = match run(&state, &id) {
+        Ok(run) => run,
+        Err(error) => return *error,
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        match request {
+            ProjectAction::Settings {
+                run_id,
+                mut settings,
+            } => {
+                state.coding_sessions.bind_project(&mut settings)?;
+                run.settings(&run_id, settings)?;
+            }
+            ProjectAction::SaveWorkflow { name, notes } => run.save_workflow(name, notes)?,
+            ProjectAction::RestoreCheckpoint {
+                run_id,
+                checkpoint_id,
+            } => run.restore_checkpoint(&run_id, &checkpoint_id)?,
+        }
+        Ok::<_, String>(run.snapshot())
+    })
+    .await;
+    match result {
+        Ok(Ok(snapshot)) => Json(snapshot).into_response(),
+        Ok(Err(error)) => failure(error),
+        Err(error) => failure(error),
+    }
+}
+pub(super) async fn preview(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(error) = authorize(&state, &headers) {
+        return *error;
+    }
+    let run = match run(&state, &id) {
+        Ok(run) => run,
+        Err(error) => return *error,
+    };
+    match tokio::task::spawn_blocking(move || run.preview()).await {
+        Ok(Ok(html)) => Json(json!({"html":html,"kind":"static_html","limitations":"Static preview with an opaque frame origin. External scripts, stylesheets, fetch requests, and module imports are restricted. Opening this preview does not count as a passing check."})).into_response(),
+        Ok(Err(error)) => failure(error), Err(error) => failure(error)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
     fn local_headers() -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert("host", "127.0.0.1:8181".parse().unwrap());
         headers.insert("origin", "http://127.0.0.1:8181".parse().unwrap());
         headers
+    }
+    #[tokio::test]
+    async fn active_input_and_reconnect_preserve_identity_authority_and_evidence() {
+        let temp = tempfile::tempdir().unwrap();
+        // Hold model I/O at a real loopback listener so the lead remains active
+        // without inference or a race against an unavailable model endpoint.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let state = AppState {
+            coding_sessions: crate::chat::coding::Manager::new(temp.path().join("sessions")),
+            ..AppState::default()
+        };
+        let config = Config {
+            addr: listener.local_addr().unwrap(),
+            workspace: std::fs::canonicalize(temp.path()).unwrap(),
+            model_id: "fixture".into(),
+            model_sha256: "a".repeat(64),
+            family: "qwen3".into(),
+            context_tokens: 4096,
+            max_tokens: 512,
+            max_steps: 4,
+            allow_commands: false,
+            project_id: String::new(),
+            instructions: String::new(),
+            references: String::new(),
+            project: Default::default(),
+        };
+        let run = state
+            .coding_sessions
+            .create(
+                config,
+                "Inspect the fixture".into(),
+                "a".repeat(32),
+                Arc::new(state.changes.clone()),
+            )
+            .unwrap();
+        let snapshot = run.snapshot();
+        for (mode, key, text) in [
+            ("steer", "b", "Preserve count_open(tasks)"),
+            ("queue", "c", "Summarize the checks afterward"),
+        ] {
+            let request = || {
+                Json(Message {
+                    message: text.into(),
+                    message_id: key.repeat(32),
+                    mode: Some(mode.into()),
+                    run_id: Some(snapshot.run_id.clone()),
+                })
+            };
+            let mut foreign = local_headers();
+            foreign.insert("origin", "https://unrelated.example".parse().unwrap());
+            assert_eq!(
+                message(
+                    State(state.clone()),
+                    foreign,
+                    Path(snapshot.id.clone()),
+                    request()
+                )
+                .await
+                .status(),
+                StatusCode::FORBIDDEN
+            );
+            for _ in 0..2 {
+                assert_eq!(
+                    message(
+                        State(state.clone()),
+                        local_headers(),
+                        Path(snapshot.id.clone()),
+                        request()
+                    )
+                    .await
+                    .status(),
+                    StatusCode::OK
+                );
+            }
+        }
+        let incoming = run.snapshot().incoming;
+        assert_eq!(incoming.len(), 2);
+        assert_eq!(incoming[0].id, "b".repeat(32));
+        assert_eq!(incoming[0].text, "Preserve count_open(tasks)");
+        assert_eq!(incoming[1].mode, "queue");
+        run.control("stop").unwrap();
+        drop(listener);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while run.snapshot().phase.active() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Fixture worker did not stop"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // Restore a deterministic historical check receipt, then change its
+        // file externally. Both GET and the terminal SSE frame must expose
+        // stale evidence; reconnect must never replace it with a raw pass.
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        std::fs::write(root.join("answer.txt"), "verified version").unwrap();
+        let files =
+            crate::chat::coding_project::fingerprints(&root, ["answer.txt".into()].into_iter())
+                .unwrap();
+        let saved_path = temp
+            .path()
+            .join("sessions")
+            .join(format!("{}.json", snapshot.id));
+        let mut saved: Value =
+            serde_json::from_slice(&std::fs::read(&saved_path).unwrap()).unwrap();
+        saved["snapshot"]["reviews"] =
+            json!([{"id":"d".repeat(32),"path":"answer.txt","status":"applied"}]);
+        saved["snapshot"]["checks"] = json!([{"id":"e".repeat(32),"run_id":snapshot.run_id,"revision":0,"time":1,"command":"fixture check","status":"passed","output":"Deterministic test receipt","files":files}]);
+        std::fs::write(&saved_path, serde_json::to_vec(&saved).unwrap()).unwrap();
+        std::fs::write(root.join("answer.txt"), "later manual edit").unwrap();
+        let restored = AppState {
+            coding_sessions: crate::chat::coding::Manager::new(temp.path().join("sessions")),
+            ..state
+        };
+        let response = get(
+            State(restored.clone()),
+            local_headers(),
+            Path(snapshot.id.clone()),
+        )
+        .await;
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["checks"][0]["status"], "stale");
+        let response = events(State(restored), local_headers(), Path(snapshot.id)).await;
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let stream = String::from_utf8(bytes.to_vec()).unwrap();
+        let data = stream
+            .lines()
+            .find_map(|line| line.strip_prefix("data:"))
+            .unwrap();
+        let value: Value = serde_json::from_str(data).unwrap();
+        assert_eq!(value["checks"][0]["status"], "stale");
     }
     #[tokio::test]
     async fn project_folder_creation_requires_local_authority_without_a_model() {
@@ -570,6 +808,7 @@ mod tests {
             allow_commands: false,
             max_steps: None,
             max_tokens: None,
+            project: Default::default(),
         };
         let state = AppState::default();
         let response = create(State(state.clone()), local_headers(), Json(request)).await;

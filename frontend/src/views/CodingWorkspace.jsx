@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
+import { CodingProjectPanel } from '../components/coding/CodingProjectPanel.jsx'
 import { useCodingSession } from '../hooks/useCodingSession.js'
 import { codingActive, codingContext, createCodingFolder } from '../lib/codingSessions.js'
 import { readModelToolCapability } from '../lib/toolCalling.js'
@@ -14,7 +15,7 @@ import { ConfirmDialog } from '../components/ui/ConfirmDialog.jsx'
 import { CamelidMark } from '../components/ui/CamelidMark.jsx'
 import { IconApi, IconBolt, IconCheck, IconChevronRight, IconCpu, IconFile, IconFolder, IconHistory, IconPlus, IconReceipt, IconSearch, IconSend, IconShield, IconSidebar, IconStop, IconTrash } from '../components/ui/icons.jsx'
 
-const labels = { running: 'Working', queued: 'Queued', working: 'Working', waiting_approval: 'Needs approval', paused: 'Paused', stopping: 'Stopping', completed: 'Turn finished', done: 'Done', failed: 'Failed', cancelled: 'Stopped', interrupted: 'Interrupted' }
+const labels = { running: 'Working', queued: 'Queued', working: 'Working', waiting_approval: 'Needs approval', waiting_helpers: 'Waiting for helpers', paused: 'Paused', stopping: 'Stopping', completed: 'Turn finished', done: 'Done', failed: 'Failed', cancelled: 'Stopped', interrupted: 'Interrupted' }
 const label = value => labels[value] || value || 'Ready'
 const agentName = agent => agent.id === 'lead' ? 'Lead' : agent.id.replaceAll('-', ' ').replace(/^./, c => c.toUpperCase())
 const relativeName = path => path?.split(/[\\/]/).at(-1) || path
@@ -27,6 +28,8 @@ export default function CodingWorkspace({ apiBase, runtime, selectedModel, capab
   const [workspace, setWorkspace] = useState(() => appStorage.getItem('camelid.codingWorkspace') || '')
   const [goal, setGoal] = useState('')
   const [allowCommands, setAllowCommands] = useState(false)
+  const [inputMode, setInputMode] = useState('steer')
+  const [projectSettings, setProjectSettings] = useState({ verification_command: '', preview_entry: 'index.html', workflow: '', max_run_seconds: 1800, browser_check: false })
   const [folderOpen, setFolderOpen] = useState(false)
   const [sideOpen, setSideOpen] = useState(true)
   const [panel, setPanel] = useState('agents')
@@ -51,7 +54,7 @@ export default function CodingWorkspace({ apiBase, runtime, selectedModel, capab
   const pendingReview = snapshot?.approval?.detail?.review
   const approvalIsSelected = snapshot?.approval && (!reviewId || pendingReview?.id === reviewId)
   const working = agents.filter(a => ['working', 'queued', 'waiting_approval'].includes(a.status))
-  const canSend = Boolean(goal.trim() && !running && !busy && ready && (selectedId ? snapshot : workspace.trim()))
+  const canSend = Boolean(goal.trim() && !busy && (running ? connection === 'connected' && snapshot?.phase !== 'stopping' : ready) && (selectedId ? snapshot : workspace.trim()))
   const project = projects.find(p => p.id === (snapshot?.config.project_id || chatContext?.project_id))
   const selectedEvents = useMemo(() => (snapshot?.events || []).filter(e => e.agent_id === selectedAgent?.id && e.kind !== 'model.timing').slice(-20), [snapshot?.events, selectedAgent?.id])
   useEffect(() => { onActivity?.(snapshot ? { id: snapshot.id, title: snapshot.title, phase: snapshot.phase } : null) }, [snapshot?.id, snapshot?.title, snapshot?.phase, onActivity])
@@ -80,7 +83,7 @@ export default function CodingWorkspace({ apiBase, runtime, selectedModel, capab
   }, [sideOpen, reviewId, commandOpen, snippetsOpen])
   const submit = async () => {
     if (!canSend) return
-    const options = { workspace: workspace.trim(), model_id: runtime.active_model_id, project_id: chatContext?.project_id || '', ...codingContext(contextSources), allow_commands: allowCommands }
+    const options = { workspace: workspace.trim(), model_id: runtime.active_model_id, project_id: chatContext?.project_id || '', ...codingContext(contextSources), allow_commands: allowCommands, project: { ...projectSettings, engine_id: coding.executionEngine?.id || '' }, ...(selectedId ? { mode: running ? inputMode : 'follow_up' } : {}) }
     try { await coding.send(goal.trim(), options); setGoal(''); userAway.current = false; appStorage.setItem('camelid.codingWorkspace', workspace.trim()) } catch { /* hook presents the error */ }
   }
   const decide = async approved => { try { await coding.decide(approved); setReviewId(null); setCommandOpen(false) } catch { /* hook presents the error */ } }
@@ -151,14 +154,17 @@ export default function CodingWorkspace({ apiBase, runtime, selectedModel, capab
           {!snapshot ? <ConversationContext compact={false} context={chatContext} projects={projects} sources={contextSources} globalPrompt={globalPrompt || ''} onSave={updateChatContext} onManageProjects={() => setTab('projects')} busy={busy} /> : <div className="coding-context"><IconFolder size={15} /><strong>{project?.name || relativeName(snapshot.config.workspace)}</strong><span>{snapshot.config.workspace}</span></div>}
           {snapshot && <label className="coding-command-choice coding-file-approval-choice"><input type="checkbox" checked={Boolean(snapshot.auto_approve_files)} onChange={e => ignore(coding.setAutoApproveFiles(e.target.checked))} disabled={busy || connection !== 'connected' || snapshot.phase === 'stopping'} /><span>Auto-approve file changes<small>Applies pending and future file edits in this session. Reviews and Undo stay available. Commands still ask. Resets when the engine restarts.</small></span></label>}
           {!ready && <p className="coding-readiness" role="status">{capability.reason || 'Code needs an exact tool-capable model artifact with a certified digest.'} <button type="button" onClick={() => setTab('library')}>Open Models</button></p>}
+          {running && <div className="coding-input-mode"><label>Send as <select aria-label="Coding message mode" value={inputMode} onChange={e => setInputMode(e.target.value)}><option value="steer">Add to current task</option><option value="queue">Queue follow-up</option></select></label><small>{inputMode === 'steer' ? 'Applied before the next action. Pending proposals are reconsidered.' : 'Starts after this task finishes successfully.'}</small></div>}
+          {(snapshot?.incoming || []).filter(m => m.mode === 'steer' || m.status === 'accepted').slice(-6).map(m => <p className="coding-incoming" key={m.id}>{m.mode === 'steer' ? (m.status === 'consumed' ? 'Correction received by Lead' : 'Correction accepted') : 'Queued'}: {describeCodingMessage(m.text).description}{!running && m.mode === 'queue' && <Button size="sm" variant="ghost" onClick={() => ignore(coding.send(m.text, { message_id: m.id }))}>Continue queued task</Button>}</p>)}
           <form className="coding-composer cxcomposer" onSubmit={e => { e.preventDefault(); submit() }}>
-            <div className="cxcomposer__box"><textarea className="cxcomposer__input" aria-label="Message coding agents" value={goal} maxLength={16000} onChange={e => setGoal(e.target.value)} placeholder={running ? 'Wait for this run, or pause or stop it above…' : snapshot ? 'Give Lead a follow-up…' : 'What should Camelid build or fix?'} disabled={busy || running} onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); submit() } }} rows={2} />
-            <div className="coding-composer-tools cxcomposer__toolbar"><span><span className="coding-dot" />{snapshot?.config.model_id || selectedModel?.name || 'No model'}</span><details><summary><IconBolt size={14} />Project tools</summary><p>Read files · search · plan · reviewed edits · read-only helpers{(snapshot?.config.allow_commands ?? allowCommands) ? ' · approved commands' : ''}</p></details><span><IconShield size={14} />{snapshot?.auto_approve_files ? 'Auto-approve files' : 'Review changes'}</span><Button type="submit" size="sm" variant="primary" icon={<IconSend size={17} />} aria-label={snapshot ? 'Send coding follow-up' : 'Start coding'} disabled={!canSend} /></div>
+            <div className="cxcomposer__box"><textarea className="cxcomposer__input" aria-label="Message coding agents" value={goal} maxLength={16000} onChange={e => setGoal(e.target.value)} placeholder={running ? (inputMode === 'steer' ? 'Add a correction to the current task…' : 'Queue the next task…') : snapshot ? 'Give Lead a follow-up…' : 'What should Camelid build or fix?'} disabled={busy || snapshot?.phase === 'stopping'} onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); submit() } }} rows={2} />
+            <div className="coding-composer-tools cxcomposer__toolbar"><span><span className="coding-dot" />{snapshot?.config.model_id || selectedModel?.name || 'No model'}</span><details><summary><IconBolt size={14} />Project tools</summary><p>Read files · search · plan · reviewed edits · read-only helpers{(snapshot?.config.allow_commands ?? allowCommands) ? ' · approved commands' : ''}</p></details><span><IconShield size={14} />{snapshot?.auto_approve_files ? 'Auto-approve files' : 'Review changes'}</span><Button type="submit" size="sm" variant="primary" icon={<IconSend size={17} />} aria-label={running ? (inputMode === 'steer' ? 'Add to current task' : 'Queue follow-up') : snapshot ? 'Send coding follow-up' : 'Start coding'} disabled={!canSend} /></div>
             </div>
           </form>
         </div>
       </div>
       <aside ref={sidebar} id="coding-team" className="coding-team" hidden={!sideOpen} aria-label="Agent assignments">
+        <div className="coding-machine"><IconCpu size={14} /><span>Runs on {snapshot?.config.project?.engine_name || coding.executionEngine?.name || 'connected engine'}</span><button type="button" aria-pressed={panel === 'project'} onClick={() => setPanel('project')}>Project</button></div>
         <div className="coding-team-heading"><span className="coding-team-emblem"><IconApi size={19} /></span><div><strong>Project activity</strong><span>{snapshot ? relativeName(snapshot.config.workspace) : 'Your coding workspace'}</span></div><span className="coding-count">{working.length} active</span></div>
         {(reviewId || commandOpen || snippetsOpen) ? <div className="coding-side-detail">
           <Button size="sm" variant="ghost" onClick={closeDetail}>← Back to activity</Button>
@@ -166,8 +172,8 @@ export default function CodingWorkspace({ apiBase, runtime, selectedModel, capab
           {commandOpen && snapshot?.approval && !pendingReview && <section className="coding-approval" aria-label="Command review"><div className="coding-row"><IconShield size={17} /><strong>Review command</strong></div><pre>{snapshot.approval.detail.command}</pre><p className="coding-filepath">{snapshot.approval.detail.workspace}</p><p>{snapshot.approval.detail.execution} Timeout: {snapshot.approval.detail.timeout_seconds} seconds.</p>{decisionButtons}</section>}
           {snippetsOpen && <section className="coding-snippets"><h3>Code from the conversation</h3><p className="coding-muted">These are message excerpts. Applied changes are recorded under Changes.</p>{sourceSnippets.map(snippet => <details key={snippet.key}><summary>{snippet.title}{snippet.language ? ` · ${snippet.language}` : ''}</summary><pre>{snippet.content}</pre></details>)}</section>}
         </div> : <>
-          <div className="coding-tabs" role="group" aria-label="Coding sidebar"><button type="button" aria-pressed={panel === 'agents'} onClick={() => setPanel('agents')}>Overview <span>{agents.length}</span></button><button type="button" aria-pressed={panel === 'changes'} onClick={() => setPanel('changes')}>Changes <span>{reviews.length}</span></button></div>
-          {panel === 'agents' ? <>
+          <div className="coding-tabs" role="group" aria-label="Coding sidebar"><button type="button" aria-pressed={panel === 'agents'} onClick={() => setPanel('agents')}>Overview <span>{agents.length}</span></button><button type="button" aria-pressed={panel === 'changes'} onClick={() => setPanel('changes')}>Changes <span>{reviews.length}</span></button><button type="button" aria-pressed={panel === 'checks'} onClick={() => setPanel('checks')}>Checks <span>{snapshot?.checks?.length || 0}</span></button><button type="button" aria-pressed={panel === 'preview'} onClick={() => setPanel('preview')}>Preview</button></div>
+          {['checks', 'preview', 'project'].includes(panel) ? <CodingProjectPanel panel={panel} coding={coding} settings={projectSettings} setSettings={setProjectSettings} running={running} /> : panel === 'agents' ? <>
             {snapshot?.plan?.length > 0 && <section className="coding-plan-section"><div className="coding-section-heading"><strong>Work plan</strong><span>{snapshot.plan.filter(s => s.status === 'done').length}/{snapshot.plan.length}</span></div><ol className="coding-plan" aria-label="Agent task plan">{snapshot.plan.map((step, i) => <li key={i} className={'is-' + step.status}><span>{step.status === 'done' ? <IconCheck size={12} /> : step.status === 'in_progress' ? <span className="coding-dot" /> : i + 1}</span>{describeCodingMessage(step.text).description}</li>)}</ol></section>}
             <div className="coding-section-heading coding-agent-heading"><strong>Agents</strong><span>{agents.length || 'Ready'}</span></div>
             {!agents.length && <p className="coding-team-summary">Assignments will appear here when the work starts.</p>}

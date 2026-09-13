@@ -7,6 +7,7 @@ export function useCodingSession(apiBase, activeModelId, loadedNow) {
   const [snapshot, setSnapshot] = useState(null)
   const [sessions, setSessions] = useState([])
   const [toolCapableModel, setToolCapableModel] = useState(null)
+  const [executionEngine, setExecutionEngine] = useState(null)
   const [error, setError] = useState('')
   const [connection, setConnection] = useState('loading')
   const [busy, setBusy] = useState(false)
@@ -24,6 +25,7 @@ export function useCodingSession(apiBase, activeModelId, loadedNow) {
     if (!Array.isArray(data.sessions)) throw new Error('Coding sessions are unavailable from this engine.')
     setSessions(data.sessions)
     setToolCapableModel(data.tool_capable_model || null)
+    setExecutionEngine(data.execution_engine || null)
     return data.sessions
   }, [apiBase])
   useEffect(() => {
@@ -76,10 +78,11 @@ export function useCodingSession(apiBase, activeModelId, loadedNow) {
     finally { mutation.current = false; setBusy(false) }
   }, [])
   const send = async (goal, options) => mutate(async () => {
-    const signature = JSON.stringify({ selectedId, goal, ...(selectedId ? {} : options) })
-    if (attempt.current?.signature !== signature) attempt.current = { signature, message_id: codingMessageId() }
+    const mode = options?.mode || 'follow_up'
+    const signature = JSON.stringify({ selectedId, goal, mode, run_id: snapshot?.run_id, ...(selectedId ? {} : options) })
+    if (attempt.current?.signature !== signature) attempt.current = { signature, message_id: options?.message_id || codingMessageId() }
     const next = selectedId
-      ? await codingRequest(apiBase, '/' + encodeURIComponent(selectedId) + '/messages', { method: 'POST', body: { message: goal, message_id: attempt.current.message_id } })
+      ? await codingRequest(apiBase, '/' + encodeURIComponent(selectedId) + '/messages', { method: 'POST', body: { message: goal, message_id: attempt.current.message_id, mode, run_id: snapshot?.run_id } })
       : await codingRequest(apiBase, '', { method: 'POST', body: { ...options, goal, message_id: attempt.current.message_id } })
     if (!selectedId) { appStorage.setItem('camelid.codingSession', next.id); selected.current = next.id; setSelectedId(next.id) }
     accept(next); attempt.current = null; return next
@@ -96,6 +99,8 @@ export function useCodingSession(apiBase, activeModelId, loadedNow) {
     try { await codingRequest(apiBase, '/' + encodeURIComponent(selectedId) + '/approvals/' + encodeURIComponent(id), { method: 'POST', body: { approved } }) }
     catch (e) { setDecidingId(''); throw e }
   })
+  const projectAction = body => mutate(async () => accept(await codingRequest(apiBase, '/' + encodeURIComponent(selectedId) + '/project', { method: 'POST', body })))
+  const loadPreview = signal => codingRequest(apiBase, '/' + encodeURIComponent(selectedId) + '/preview', { signal })
   const remove = () => mutate(async () => {
     await codingRequest(apiBase, '/' + encodeURIComponent(selectedId), { method: 'DELETE' })
     select(''); await refresh()
@@ -104,5 +109,5 @@ export function useCodingSession(apiBase, activeModelId, loadedNow) {
     await refresh()
     if (selectedId) { accept(await codingRequest(apiBase, '/' + encodeURIComponent(selectedId))); setConnection('connected') }
   })
-  return { snapshot, sessions, toolCapableModel, selectedId, select, send, control, setAutoApproveFiles, decide, remove, retry, busy, error, connection, decidingId }
+  return { snapshot, sessions, toolCapableModel, executionEngine, projectAction, loadPreview, selectedId, select, send, control, setAutoApproveFiles, decide, remove, retry, busy, error, connection, decidingId }
 }

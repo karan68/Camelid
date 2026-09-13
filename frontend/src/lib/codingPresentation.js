@@ -35,9 +35,12 @@ export function describeCodingMessage(value) {
 const actions = {
   list_dir: 'Exploring the project', read_file: 'Reading project files', search: 'Searching the project',
   write_file: 'Preparing a new file', edit_file: 'Preparing a file change', run_shell: 'Running an approved command',
+  verify_project: 'Checking the project', wait_for_helpers: 'Waiting for helper findings', read_workflow: 'Reading a saved workflow',
   update_plan: 'Updating the work plan', spawn_subagent: 'Assigning an investigation', check_subagent_status: 'Collecting helper findings',
 }
 export function describeCodingAction(value, status) {
+  if (status === 'waiting_helpers') return 'Waiting for helper findings'
+  if (status === 'queued') return 'Waiting for the model'
   if (status === 'waiting_approval') return 'Waiting for your review'
   if (status === 'done') return 'Finished this assignment'
   if (status === 'failed') return 'Stopped with an error'
@@ -46,6 +49,11 @@ export function describeCodingAction(value, status) {
   return actions[tool] || (tool ? 'Using project tools' : 'Planning the next step')
 }
 export function describeCodingEvent(event) {
+  if (event.kind === 'input.accepted') return event.detail?.mode === 'queue' ? 'Queued a follow-up' : 'Accepted your correction'
+  if (event.kind === 'input.consumed') return 'Lead received new task input'
+  if (event.kind === 'check.started') return 'Running project checks'
+  if (event.kind === 'check.finished') return event.detail?.status === 'passed' ? 'Project check passed' : 'Project check needs attention'
+  if (event.kind === 'helpers.waiting') return 'Waiting for helper findings'
   if (event.kind === 'approval.mode_changed') return event.detail?.auto_approve_files ? 'Enabled automatic file approvals' : 'File changes will ask for review'
   if (event.kind === 'approval.automatic') return 'Preparing an automatic file change'
   if (event.kind === 'approval.decided' && event.detail?.mode === 'automatic_files') return event.detail?.approved ? 'Automatically approved a file change' : 'Automatic file approval was cancelled'

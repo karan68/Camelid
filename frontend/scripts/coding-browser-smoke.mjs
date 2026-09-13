@@ -35,10 +35,10 @@ const server = createServer(async (req,res) => {
   if (path === '/api/models/local') return json(res, { models_dir: 'models', models: [{ filename, size_bytes: 639446688, architecture: 'qwen3', quantization: 'Q8_0', admitted: true, oracle_qualified: true, chat_capable: true, generation_capable: true, context_length: 32768, lane_class: 'supported' }] })
   if (path === '/api/models/catalog/downloads') return json(res, [])
   if (path === '/api/mcp/connections') return json(res, { connections: [] })
-  if (path === '/api/agent/coding/sessions' && req.method === 'GET') return json(res, { tool_capable_model: model, sessions: session ? [{ id: session.id, title: session.title, phase: session.phase, updated_at: session.updated_at, workspace: '/project' }] : [] })
+  if (path === '/api/agent/coding/sessions' && req.method === 'GET') return json(res, { execution_engine: { id: 'engine-fixture', name: 'Test engine', build_jobs: 1 }, tool_capable_model: model, sessions: session ? [{ id: session.id, title: session.title, phase: session.phase, updated_at: session.updated_at, workspace: '/project' }] : [] })
   if (path === '/api/agent/coding/sessions' && req.method === 'POST') {
    const data = await body(req); requests.push(data); creates++
-   session = { id: sessionId, run_id: 'c'.repeat(32), title: data.goal, config: { workspace: data.workspace, model_id: model, project_id: data.project_id, allow_commands: data.allow_commands }, seq: 1, phase: 'waiting_approval', updated_at: Date.now(), error: '', turns: [{ user: data.goal, assistant: '', outcome: 'running' }], agents: {
+   session = { id: sessionId, run_id: 'c'.repeat(32), title: data.goal, config: { workspace: data.workspace, model_id: model, project_id: data.project_id, allow_commands: data.allow_commands, project: { ...data.project, engine_name: 'Test engine' } }, incoming: [], checks: [], checkpoints: [{id:'checkpoint-1',run_id:'c'.repeat(32),title:data.goal,review_ids:[reviewId],status:'available'}], seq: 1, phase: 'waiting_approval', updated_at: Date.now(), error: '', turns: [{ user: data.goal, assistant: '', outcome: 'running' }], agents: {
     lead: { id:'lead', parent_id:null, goal:data.goal, status:'waiting_approval', action:'write_file(src/example.js)', files:['src/example.js'], output:'' },
     explorer: { id:'explorer', parent_id:'lead', goal:'Find the answer definition', status:'done', action:'Read src/example.js', files:['src/example.js'], output:'The answer is defined in src/example.js.\n```js\nexport const answer = 1\n```' },
    }, plan:[{text:'Inspect the definition',status:'done'},{text:'Update the answer',status:'in_progress'}], reviews:[{...fileReview}], events:[{seq:1,time:Date.now(),run_id:'c'.repeat(32),agent_id:'explorer',kind:'tool.result',detail:{tool:'read_file',ok:true,content:'export const answer = 1'}}], approval:{id:'approval-file',tool:'write_file',detail:{review:{...fileReview}}} }
@@ -67,14 +67,30 @@ const server = createServer(async (req,res) => {
    assert.ok(session.approval, 'only pending approvals can be decided')
    if (session.approval.tool==='run_shell') {
     if (decision.approved) commands++
-    session.phase='completed'; session.agents.lead.status='done'; session.turns.at(-1).assistant=decision.approved?'The command completed successfully.\n```sh\necho coding-ok\n```':'I did not execute the denied command.'
+    session.checks=[{id:'check-1',status:'failed',time:Date.now(),command:'node --check app.js',output:'Unexpected token',files:{'app.js':'version'}}];session.phase='completed'; session.agents.lead.status='done'; session.turns.at(-1).assistant=decision.approved?'The command completed. A separate JavaScript check found an error; its details are in Checks.\n```sh\necho coding-ok\n```':'I did not execute the denied command.'
    } else {
     fileReview.status=decision.approved?'applied':'rejected'; session.reviews=[{...fileReview}]; session.phase='running'; session.agents.lead.status='working'; session.agents.lead.action='Preparing verification'
    }
    session.approval=null; publish(); return json(res,{accepted:true})
   }
   if (path === `/api/agent/coding/sessions/${sessionId}/messages`) {
-   const data=await body(req);requests.push(data);session.run_id='d'.repeat(32);session.phase='waiting_approval';session.turns.push({user:data.message,assistant:'',outcome:'running'});session.agents.lead.status='waiting_approval';session.approval={id:'approval-command',tool:'run_shell',detail:{command:'echo coding-ok',workspace:'/project',execution:'Runs with your account permissions.',timeout_seconds:30}};publish();return json(res,session)
+   const data=await body(req);requests.push(data);
+   if (['steer','queue'].includes(data.mode)) {
+    assert.equal(data.run_id,session.run_id)
+    session.incoming.push({id:data.message_id,run_id:data.run_id,mode:data.mode,text:data.message,status:'accepted'})
+    if (data.mode==='steer') { session.approval=null;session.phase='running';session.revision=(session.revision||0)+1 }
+    publish();return json(res,session)
+   }
+   session.turns.at(-1).assistant='Updated the project file and preserved the public API.';session.turns.at(-1).outcome='completed';session.run_id='d'.repeat(32);session.phase='waiting_approval';session.turns.push({user:data.message,assistant:'',outcome:'running'});session.agents.lead.status='waiting_approval';session.approval={id:'approval-command',tool:'run_shell',detail:{command:'echo coding-ok',workspace:'/project',execution:'Runs with your account permissions.',timeout_seconds:30}};publish();return json(res,session)
+  }
+  if (path===`/api/agent/coding/sessions/${sessionId}/preview`) return json(res,{html:'<!doctype html><html><head><style>body{margin:0;padding:28px 20px;font:15px system-ui;color:#18332b;background:#f3f8f4}h1{font-size:24px;letter-spacing:-.7px;margin:0 0 24px}button{border:0;border-radius:12px;background:#275e48;color:white;padding:12px 22px;font:inherit}output{display:block;margin-top:24px;background:white;border:1px solid #d7e6dc;border-radius:16px;padding:26px;font-size:40px;text-align:center}</style></head><body><h1>Preview fixture</h1><button id="add">Add</button><output id="count"></output><script>const show=()=>document.querySelector("#count").textContent=localStorage.getItem("count")||"0";document.querySelector("#add").onclick=()=>{localStorage.setItem("count",String(Number(localStorage.getItem("count")||0)+1));show()};show();try{parent.document.body.dataset.previewEscape="bad"}catch{document.body.dataset.isolated="yes"}</script></body></html>',limitations:'Static isolated fixture. No test result is inferred.'})
+  if (path===`/api/agent/coding/sessions/${sessionId}/project`) {
+   const data=await body(req);requests.push(data)
+   if (data.action==='settings') session.config.project=data.settings
+   else if(data.action==='restore_checkpoint') {assert.equal(data.checkpoint_id,'checkpoint-1');session.checkpoints[0].status='restored'}
+   else if(data.action==='save_workflow') assert.equal(data.name,'fixture-check')
+   else throw new Error('Unexpected project action')
+   publish();return json(res,session)
   }
   if (path===`/api/changes/${reviewId}/undo`) {fileReview.status='undone';return json(res,fileReview)}
   if (path===`/api/changes/${reviewId}`) return json(res,fileReview)
@@ -96,7 +112,7 @@ const clickText=async(text,selector='button')=>{
 }
 try {
  await page.setViewport({width:1440,height:1050,deviceScaleFactor:1})
- await page.evaluateOnNewDocument(()=>{localStorage.setItem('camelid.sidebarCollapsed','true');localStorage.setItem('camelid.theme','dark')})
+ await page.evaluateOnNewDocument(()=>{if(window.top!==window)return;localStorage.setItem('camelid.sidebarCollapsed','true');localStorage.setItem('camelid.theme','dark')})
  await page.goto(`http://127.0.0.1:${server.address().port}`,{waitUntil:'networkidle2'})
  await clickText('Code','.coding-mode-switch button')
  await page.waitForSelector('#coding-folder');await page.type('#coding-folder','/project')
@@ -137,6 +153,18 @@ try {
  await page.click('.coding-file-approval-choice input')
  await page.waitForFunction(()=>document.querySelector('.coding-file-approval-choice input')?.checked)
  assert.ok(requests.some(r=>r.action==='auto_approve_files' && r.enabled===true && r.run_id===session.run_id))
+ assert.equal(await page.$eval('[aria-label="Message coding agents"]',e=>e.disabled),false)
+ await page.type('[aria-label="Message coding agents"]','Preserve the public API')
+ await page.click('[aria-label="Add to current task"]')
+ await page.waitForFunction(()=>document.querySelector('.coding-incoming')?.textContent.includes('Correction accepted'))
+ assert.equal(session.incoming[0].mode,'steer');assert.equal(approvals,1)
+ session.incoming[0].status='consumed';publish()
+ await page.waitForFunction(()=>document.querySelector('.coding-incoming')?.textContent.includes('received by Lead'))
+ await page.select('[aria-label="Coding message mode"]','queue')
+ await page.type('[aria-label="Message coding agents"]','Then review accessibility')
+ await page.click('[aria-label="Queue follow-up"]')
+ await page.waitForFunction(()=>[...document.querySelectorAll('.coding-incoming')].some(e=>e.textContent.includes('Queued')))
+ assert.equal(session.incoming[1].mode,'queue')
  await clickText('Pause');await page.waitForFunction(()=>document.querySelector('.coding-status.is-paused'))
  await clickText('Chat','.coding-mode-switch button');await page.waitForSelector('.coding-background')
  await clickText('Open coding session');await page.waitForSelector('.coding-workspace')
@@ -155,7 +183,7 @@ try {
  assert.equal(commands,0,'command must not execute before approval')
  await clickText('Allow command once');await page.waitForFunction(()=>document.querySelector('.coding-status.is-completed'))
  assert.equal(commands,1)
- await page.waitForFunction(()=>document.querySelector('.coding-conversation')?.textContent.includes('The command completed successfully.'))
+ await page.waitForFunction(()=>document.querySelector('.coding-conversation')?.textContent.includes('The command completed. A separate JavaScript check found an error'))
  assert.equal(await page.$('.coding-conversation pre'), null)
  assert.equal(await page.evaluate(()=>document.querySelector('.coding-conversation').textContent.includes('echo coding-ok')),false)
  await clickText('View code in sidebar')
@@ -164,6 +192,27 @@ try {
  assert.equal(await page.$eval('.coding-snippets details',e=>e.open),true)
  assert.match(await page.$eval('.coding-snippets pre',e=>e.textContent),/echo coding-ok/)
  await clickText('← Back to activity')
+ await page.evaluate(()=>[...document.querySelectorAll('.coding-tabs button')].find(e=>e.textContent.startsWith('Checks')).click())
+ await page.waitForFunction(()=>document.querySelector('[aria-label="Project checks"]')?.textContent.includes('Needs fixing'))
+ await page.screenshot({path:resolve(out,'coding-features-checks.png'),fullPage:true})
+ assert.equal(await page.$('.coding-conversation pre'),null)
+ await clickText('Preview','.coding-tabs button');await clickText('Open preview')
+ await page.waitForSelector('iframe[title="Isolated project preview"]')
+ let previewFrame=await (await page.$('iframe[title="Isolated project preview"]')).contentFrame()
+ await previewFrame.waitForSelector('[data-isolated="yes"]')
+ assert.equal(await page.$eval('body',e=>e.dataset.previewEscape),undefined)
+ await previewFrame.click('#add');await previewFrame.waitForFunction(()=>document.querySelector('#count').textContent==='1')
+ await clickText('Refresh preview')
+ await page.waitForFunction(()=>[...document.querySelectorAll('button')].some(b=>b.textContent==='Refresh preview'&&!b.disabled))
+ previewFrame=await (await page.$('iframe[title="Isolated project preview"]')).contentFrame()
+ await previewFrame.waitForFunction(()=>document.querySelector('#count')?.textContent==='1')
+ await page.screenshot({path:resolve(out,'coding-features-preview.png'),fullPage:true})
+ await clickText('Project','.coding-machine button')
+ await page.$eval('[aria-label="Verification command"]',e=>e.select());await page.keyboard.press('Backspace');await page.type('[aria-label="Verification command"]','npm test')
+ await clickText('Save project settings')
+ await page.waitForFunction(()=>document.querySelector('[aria-label="Coding project settings"]')?.textContent.includes('Project settings saved'))
+ assert.equal(session.config.project.verification_command,'npm test')
+ await page.evaluate(()=>[...document.querySelectorAll('.coding-tabs button')].find(e=>e.textContent.startsWith('Overview')).click())
  for (const theme of ['dark','light']) {
   await page.evaluate(theme=>document.documentElement.dataset.theme=theme,theme)
   for (const width of [1440,1024,768,390,320]) {

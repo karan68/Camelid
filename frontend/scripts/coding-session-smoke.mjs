@@ -7,7 +7,7 @@ assert.equal(acceptCodingSnapshot(a, { ...a, seq: NaN }, 'a'), a)
 const next = { ...a, seq: 10 }
 assert.equal(acceptCodingSnapshot(a, next, 'a'), next)
 assert.equal(acceptCodingSnapshot(null, a, 'a'), a)
-for (const state of ['running', 'waiting_approval', 'paused', 'stopping']) assert.equal(codingActive(state), true)
+for (const state of ['running', 'waiting_approval', 'waiting_helpers', 'paused', 'stopping']) assert.equal(codingActive(state), true)
 for (const state of ['completed', 'cancelled', 'failed', 'interrupted', undefined]) assert.equal(codingActive(state), false)
 assert.deepEqual(codingContext([{ role: 'system', content: 'Project instructions' }, { role: 'user', label: 'notes.md', content: 'Untrusted reference' }]), { instructions: 'Project instructions', references: 'notes.md\nUntrusted reference' })
 console.log('Coding state smoke passed: stale/cross-session snapshots, active states, and context separation.')

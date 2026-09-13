@@ -207,3 +207,28 @@
 }
 
 .coding-turn.is-working .cxturn--assistant .cxturn__actions { display: none; }
+
+.coding-machine { display:flex;align-items:center;gap:8px;padding:12px 16px;color:var(--color-text-muted);font-size:12px;border-bottom:1px solid var(--color-border-strong); }
+.coding-tabs { flex-wrap:nowrap; gap:16px; }
+.coding-tabs button { gap:4px;font-size:11px; }
+.coding-machine button { margin-left:auto;flex-shrink:0;border:0;background:none;color:var(--color-accent-text);font:inherit;cursor:pointer; }
+.coding-machine button[aria-pressed=true] { text-decoration:underline;text-underline-offset:4px; }
+.coding-project-panel { padding:16px;display:flex;flex-direction:column;gap:12px;min-width:0; }
+.coding-project-panel h3,.coding-project-panel p { margin:0; }
+.coding-project-panel p { font-size:12px;line-height:1.6; }
+.coding-project-panel label { display:flex;flex-direction:column;gap:6px;font-size:12px;margin:12px 0; }
+.coding-project-panel input,.coding-project-panel select,.coding-project-panel textarea { width:100%;min-width:0;box-sizing:border-box; }
+.coding-project-panel iframe { width:100%;height:540px;border:1px solid var(--color-border-strong);border-radius:10px;background:white; }
+.coding-check { border:1px solid var(--color-border-strong);border-radius:10px;padding:12px;display:grid;gap:8px;overflow:hidden; }
+.coding-check.is-passed { border-left:3px solid #45a882; }
+.coding-check.is-failed { border-left:3px solid #d26f6f; }
+.coding-check.is-stale { border-left:3px solid #c89c56; }
+.coding-check pre { white-space:pre-wrap;overflow-wrap:anywhere;max-height:300px;overflow:auto; }
+.coding-check details { font-size:12px; }
+.coding-check .coding-row { justify-content:space-between;flex-wrap:wrap; }
+.coding-input-mode { display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:8px 0;font-size:12px; }
+.coding-input-mode label { display:flex;gap:8px;align-items:center; }
+.coding-input-mode small { color:var(--color-text-muted); }
+.coding-incoming { font-size:12px;border-left:2px solid var(--color-accent-text);padding:6px 10px;overflow-wrap:anywhere; }
+.coding-project-panel label.coding-project-checkbox { flex-direction:row;align-items:center; }
+.coding-project-panel .coding-project-checkbox input { width:14px;height:14px;flex:0 0 14px; }

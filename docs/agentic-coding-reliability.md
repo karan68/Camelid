@@ -1,37 +1,35 @@
-# Coding reliability follow-up
+# Coding reliability
 
-Status: proposed next iterations of Code in Chat. These capabilities are not implemented by the current UI and loop refresh.
+The current Code implementation adds verification and bounded recovery, helper completion delivery, active corrections and queued follow-ups, a pinned task record, static previews, engine binding, reusable workflows, and grouped file Undo. [Code in Chat](AGENTIC_CODING.md) describes the controls, HTTP interface, validation, and operational limits.
 
-The current runner owns sessions, exact approvals, file journals, bounded read-only helpers, and restart recovery. Live Tiny Tasks checks also show its limits: a model can spend steps polling or rereading, lose track of a failed call, and finish after creating invalid code. Recovery prompts bound some failures; coordination and verification need explicit runtime state.
+## Verification and recovery
 
-## 1. Helper completion and active-run corrections
+`verify_project` prepares the configured command and current changed-file fingerprints before asking for exact approval. It rechecks the fingerprints before execution and records the real result. Later changes make an earlier pass stale. A finishing lead that changed files receives a verification boundary when a check is configured; at most three attempts are allowed per turn. Failed checks provide concrete output for repair. Denials do not request a different execution route.
 
-Add a bounded `wait_for_helpers` operation and a `waiting_for_helpers` activity state. Completion should wake the waiting lead without polling the model. Release the inference slot while waiting so a helper can use the resident model. Keep status inspection available for the sidebar.
+The optional Chromium check captures page-load errors and unhandled rejections. Static previews inline bounded local assets and run in an opaque iframe with project-specific storage. Neither a preview nor a page-load pass proves interactions work; those require an actual project test command.
 
-Persist a completion record keyed by session, parent run, and helper run. Include terminal outcome, findings, observed file references, and delivery sequence. Insert each result into the parent history once and persist its delivery cursor with that history. A crash between notification and delivery must neither lose the result nor duplicate it. Reject results belonging to an older parent run. Stop cancels and joins workers; restart retains observations but does not automatically resume execution. An ordinary lead answer with unfinished helpers should enter a bounded collection boundary before declaring the turn finished.
+Validation and file errors receive at most two targeted recovery hints. Repeated promises, identical reads, and alternating calls with unchanged results are bounded. The model can still fail a task or write incorrect code. An accepted answer is labeled **Turn finished**, not independently certified success.
 
-OpenClaw separates yielding for announced child results from status inspection, which is a useful coordination pattern to adapt to Camelid's single resident model. [Sub-agent tool reference](https://docs.openclaw.ai/tools/subagents/tool-reference)
+## Coordination and corrections
 
-Enable the running composer with explicit **Add to current task** and **Queue follow-up** choices. Bind each request to the expected run and an idempotent message ID. Show separate accepted and consumed events. At a boundary before the next model decision or tool launch, persist incoming corrections, discard any unlaunched proposal based on the old task revision, then regenerate. Let an already-running tool finish and record its result; steering cannot undo it.
+`wait_for_helpers` releases the model while read-only helpers work. Each completion includes its parent run, outcome, findings, and observed file references. Delivery and the matching transcript are persisted together. Reconnect cannot duplicate delivery; a stale parent result cannot enter a newer run. A final answer encounters a collection boundary while helpers remain active. Stop cancels and joins workers; restart retains observations without resuming execution.
 
-An outstanding approval must be invalidated when steering supersedes its proposal. Check the task revision under the same control boundary as approval consumption and execution admission, so an approval arriving concurrently cannot authorize an obsolete action. User text never changes the session's command permission or artifact identity. Queued follow-ups are distinct from steering; restart leaves them visible but requires explicit continuation.
+The composer offers **Add to current task** and **Queue follow-up**. Incoming messages carry the expected run and an idempotent request ID. Corrections invalidate pending approval and any unlaunched proposal based on the older task revision. An already-admitted command can finish; steering cannot undo it. Final-answer acceptance closes correction admission under the same control lock, preventing a last-second accepted correction from being lost at completion.
 
-OpenClaw documents steering, queued follow-ups, and interruption as separate operations. Camelid can start with the first two without adopting every queue mode. [Command queue](https://docs.openclaw.ai/concepts/queue)
+Queued follow-ups start once after a normally finished turn while the session retains engine ownership. Failure, Stop, and restart leave the queue visible for explicit continuation. Persisted queues never grant restored execution authority.
 
-Acceptance checks: delayed helper completion with no status polling; two results delivered once; stop while waiting; stale completion after continuation; steering during generation, tool execution, and approval; duplicate/conflicting message IDs; restart at the delivery/consumption boundary.
+OpenClaw's distinction between yielding for results and inspecting status informed the helper boundary. Its separate steering and queue operations informed the active composer. [Sub-agent tools](https://docs.openclaw.ai/tools/subagents/tool-reference), [command queue](https://docs.openclaw.ai/concepts/queue).
 
-## 2. Task state through compaction
+## Task state and project controls
 
-Store a bounded, versioned task record alongside authoritative execution state. Preserve the objective, accepted user constraints, decisions, unresolved work, helper findings, and verification references. Build execution evidence deterministically from tool outcomes and journal entries. Label model-authored decisions as claims; an applied edit is not a successful test. Preserve exact file and run identifiers, cap excerpts, and treat helper/file content as untrusted observations.
+A deterministic task record preserves the original objective, current request, consumed corrections, plan claims, applied-change references, delivered helper findings, and recent check evidence. It is inserted into the pinned context after compaction. Required context that cannot fit stops the run rather than silently dropping constraints. Execution permissions remain in server state. This adapts the task-preservation concerns described in OpenClaw's [compaction documentation](https://docs.openclaw.ai/concepts/compaction).
 
-Reinsert this record after compaction and continuation, retaining recent tool-call/result pairs. Keep permissions and approvals exclusively in server state. When required task state cannot fit the context budget, stop with an explicit limit instead of silently dropping constraints. OpenClaw's persisted summaries and identifier preservation provide relevant examples. [Compaction](https://docs.openclaw.ai/concepts/compaction)
+Sessions bind to the connected engine's persistent identity and host name. They cannot silently continue on a different machine. Model generation is serialized across lead and helpers. Approved commands default Cargo, CMake, and OpenMP to one job; these are environment defaults, not OS resource limits. The total wall-clock budget defaults to 30 minutes and explicitly includes approval and pause time.
 
-Acceptance checks: repeated compaction preserves a user correction, failed call, helper finding, unresolved requirement, and successful test reference; restart after an applied edit preserves evidence and Undo without replaying authority.
+Users can save a project workflow after a current passing check. The named workflow carries notes and verification/preview settings; it never enables commands or automatic approvals. Task checkpoints group journaled edits and preflight all file versions before restoring in reverse order. They preserve later manual edits and support retry after a partial restoration. Command side effects remain outside Undo.
 
-## 3. Execution isolation and liveness
+## Remaining work
 
-Introduce an execution backend with explicit filesystem, network, environment, process cancellation, and isolation capabilities. Preserve exact approvals while adding an isolated backend; the current account-permission command runner must never be labeled sandboxed. Backend identity, working directory, command arguments, and relevant executable identity belong to the approval binding. Unattended command execution remains out of scope until isolation is available and verified.
+The connected-engine runner is not a general execution-backend interface, fleet manager, or OS sandbox. Broader unattended execution requires an isolated backend with explicit filesystem, network, environment, and cancellation capabilities. Exact command approval and execution isolation remain separate responsibilities.
 
-Keep the conservative inference limit, but expose queued-for-model, generating, running-tool, waiting-for-helper, and waiting-for-user separately. Guard worker updates with their run identity. Add a total active execution budget covering inference queues, generation, tools, and helper waits. Approval/pause waits should use explicit separate expiry rules rather than quietly renewing execution budgets. Record elapsed time and the reason for waiting so slow generation is distinguishable from a stalled run.
-
-Validate deterministic lifecycle invariants first, then run the correction, delayed-helper, compaction, and restart scenarios sequentially against the exact supported local model artifacts. Report model failures separately from application test results. A tool-capability gate is not a coding-quality certification.
+Richer browser interactions, independent helper budgets, and broader model scheduling remain future work. Validate lifecycle invariants with deterministic fixtures and report exact-artifact live-model failures separately. A tool-capability gate does not certify coding quality.

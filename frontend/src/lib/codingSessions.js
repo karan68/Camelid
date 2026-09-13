@@ -1,6 +1,6 @@
 // The server owns execution. A reconnect replaces the view from a versioned
 // snapshot; it never dispatches a saved tool call or an approval.
-export const codingActive = phase => ['running', 'paused', 'waiting_approval', 'stopping'].includes(phase)
+export const codingActive = phase => ['running', 'paused', 'waiting_approval', 'waiting_helpers', 'stopping'].includes(phase)
 export const codingMessageId = () => crypto.randomUUID().replaceAll('-', '')
 export function acceptCodingSnapshot(current, next, selectedId) {
   if (!next || next.id !== selectedId || !Number.isSafeInteger(next.seq) || next.seq < 0 || !Array.isArray(next.turns) || !Array.isArray(next.events) || !next.agents) return current
