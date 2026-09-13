@@ -331,6 +331,18 @@ fn repeat_notice(name: &str) -> String {
 /// Web coding uses it to route mutations through its durable review journal.
 pub(crate) trait ToolExecutor {
     fn execute(&mut self, action: &Action, sandbox: &Sandbox, cancel: &AtomicBool) -> ToolOutcome;
+
+    /// A controller may request another step before accepting a final answer.
+    /// This never executes prose or bypasses the normal tool approval path.
+    fn review_answer(&mut self, _text: &str) -> Result<Option<String>, String> {
+        Ok(None)
+    }
+
+    /// Optional bounded recovery after identical successful read-only results.
+    /// Denied, failed, and mutating calls keep the normal repeat-stop behavior.
+    fn recover_repeated_read(&mut self, _name: &str) -> Option<String> {
+        None
+    }
 }
 struct NativeExecutor;
 impl ToolExecutor for NativeExecutor {
@@ -594,6 +606,22 @@ pub(crate) fn run_loop_with_executor(
                     ));
                     continue;
                 }
+                match executor.review_answer(&text) {
+                    Ok(Some(feedback)) => {
+                        reporter.notice("Continuing: the agent described unfinished work");
+                        history.push(AgentMsg::Assistant(text));
+                        history.push(AgentMsg::Summary(
+                            "The preceding model response was rejected as unfinished. It was plain text and did not create or change files or run tools. Only recorded tool results establish executed actions.".into(),
+                        ));
+                        history.push(AgentMsg::System(feedback));
+                        continue;
+                    }
+                    Err(reason) => {
+                        reporter.notice(&reason);
+                        return LoopEnd::DriverError;
+                    }
+                    Ok(None) => {}
+                }
                 reporter.model_text(&text);
                 history.push(AgentMsg::Assistant(text));
                 return LoopEnd::Answered;
@@ -774,11 +802,27 @@ pub(crate) fn run_loop_with_executor(
                     // whose result keeps changing — e.g. polling
                     // check_subagent_status until a subagent finishes — is progress.
                     let stuck = note_no_progress(&mut no_progress, &signature, &outcome);
+                    let repeated_read = executed
+                        && !outcome.is_err()
+                        && matches!(
+                            action,
+                            Action::ReadFile { .. }
+                                | Action::ListDir { .. }
+                                | Action::Search { .. }
+                        );
                     history.push(AgentMsg::ToolResult {
                         name: name.to_string(),
                         outcome,
                     });
                     if stuck {
+                        if repeated_read {
+                            if let Some(feedback) = executor.recover_repeated_read(name) {
+                                reporter.notice("Repeated read result: asking the agent to change approach once");
+                                history.push(AgentMsg::System(feedback));
+                                no_progress = NoProgressState::default();
+                                continue;
+                            }
+                        }
                         reporter.notice(&repeat_notice(name));
                         return LoopEnd::Repeated;
                     }

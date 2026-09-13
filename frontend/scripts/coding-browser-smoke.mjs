@@ -40,7 +40,7 @@ const server = createServer(async (req,res) => {
    const data = await body(req); requests.push(data); creates++
    session = { id: sessionId, run_id: 'c'.repeat(32), title: data.goal, config: { workspace: data.workspace, model_id: model, project_id: data.project_id, allow_commands: data.allow_commands }, seq: 1, phase: 'waiting_approval', updated_at: Date.now(), error: '', turns: [{ user: data.goal, assistant: '', outcome: 'running' }], agents: {
     lead: { id:'lead', parent_id:null, goal:data.goal, status:'waiting_approval', action:'write_file(src/example.js)', files:['src/example.js'], output:'' },
-    explorer: { id:'explorer', parent_id:'lead', goal:'Find the answer definition', status:'done', action:'Read src/example.js', files:['src/example.js'], output:'The answer is defined in src/example.js.' },
+    explorer: { id:'explorer', parent_id:'lead', goal:'Find the answer definition', status:'done', action:'Read src/example.js', files:['src/example.js'], output:'The answer is defined in src/example.js.\n```js\nexport const answer = 1\n```' },
    }, plan:[{text:'Inspect the definition',status:'done'},{text:'Update the answer',status:'in_progress'}], reviews:[{...fileReview}], events:[{seq:1,time:Date.now(),run_id:'c'.repeat(32),agent_id:'explorer',kind:'tool.result',detail:{tool:'read_file',ok:true,content:'export const answer = 1'}}], approval:{id:'approval-file',tool:'write_file',detail:{review:{...fileReview}}} }
    return json(res, session)
   }
@@ -59,7 +59,7 @@ const server = createServer(async (req,res) => {
    assert.ok(session.approval, 'only pending approvals can be decided')
    if (session.approval.tool==='run_shell') {
     if (decision.approved) commands++
-    session.phase='completed'; session.agents.lead.status='done'; session.turns.at(-1).assistant=decision.approved?'The command completed successfully.':'I did not execute the denied command.'
+    session.phase='completed'; session.agents.lead.status='done'; session.turns.at(-1).assistant=decision.approved?'The command completed successfully.\n```sh\necho coding-ok\n```':'I did not execute the denied command.'
    } else {
     fileReview.status=decision.approved?'applied':'rejected'; session.reviews=[{...fileReview}]; session.phase='running'; session.agents.lead.status='working'; session.agents.lead.action='Preparing verification'
    }
@@ -81,7 +81,7 @@ const server = createServer(async (req,res) => {
 })
 await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve))
 const browser=await launchBrowser({headless:true})
-const page=await browser.newPage();page.on('pageerror',e=>errors.push(e.message))
+const page=await browser.newPage();page.on('pageerror',e=>{ errors.push(e.message); console.error(e.stack) })
 const clickText=async(text,selector='button')=>{
  const handle=await page.evaluateHandle((selector,text)=>[...document.querySelectorAll(selector)].find(e=>e.textContent.trim()===text),selector,text)
  const element=handle.asElement();assert.ok(element,`Missing ${text}`);await element.click();await handle.dispose()
@@ -110,12 +110,18 @@ try {
  await page.waitForFunction(()=>!document.querySelector('[aria-label="Start coding"]').disabled)
  await page.click('[aria-label="Start coding"]')
  await page.waitForSelector('.coding-approval')
+ assert.equal(await page.$('.coding-conversation [data-streaming-state="active"]'),null,'approval is not a streaming model response')
  assert.equal(creates,1);assert.equal(requests[0].allow_commands,true)
  assert.equal(requests[0].workspace,'/project/Tiny Tasks')
  assert.equal(requests[0].model_id,model);assert.match(requests[0].message_id,/^[a-f0-9]{32}$/)
  await clickText('Explorer', '.coding-agent strong').catch(async()=>{await page.click('.coding-agent:nth-child(2)')})
  await page.waitForFunction(()=>document.querySelector('.coding-agent-detail')?.textContent.includes('Read-only helper'))
  await page.screenshot({path:resolve(out,'coding-approval-dark.png'),fullPage:true})
+ assert.equal(await page.$('.coding-conversation pre'), null, 'source stays out of the conversation')
+ assert.equal(await page.$('.coding-diff'), null, 'diff is collapsed by default')
+ await clickText('Review file change')
+ await page.waitForSelector('.coding-team .coding-diff')
+ assert.ok(await page.$('.coding-conversation .cxturn--user'), 'opening a review preserves Chat turns')
  await clickText('Approve & apply')
  await page.waitForFunction(()=>!document.querySelector('.coding-approval'))
  assert.equal(approvals,1)
@@ -129,11 +135,22 @@ try {
  assert.equal(creates,1,'reload must not create/replay a run');assert.equal(approvals,1)
  await page.type('[aria-label="Message coding agents"]','Run the approved verification.')
  await page.click('[aria-label="Send coding follow-up"]')
- await page.waitForFunction(()=>document.querySelector('.coding-approval')?.textContent.includes('echo coding-ok'))
+ await page.waitForSelector('.coding-approval-summary')
+ assert.equal(await page.evaluate(()=>document.querySelector('.coding-conversation').textContent.includes('echo coding-ok')),false)
+ await clickText('Review command')
+ await page.waitForFunction(()=>document.querySelector('.coding-team .coding-approval')?.textContent.includes('echo coding-ok'))
  assert.equal(commands,0,'command must not execute before approval')
  await clickText('Allow command once');await page.waitForFunction(()=>document.querySelector('.coding-status.is-completed'))
  assert.equal(commands,1)
- await page.waitForFunction(()=>document.querySelector('.coding-answer')?.parentElement?.parentElement?.textContent.includes('The command completed successfully.'))
+ await page.waitForFunction(()=>document.querySelector('.coding-conversation')?.textContent.includes('The command completed successfully.'))
+ assert.equal(await page.$('.coding-conversation pre'), null)
+ assert.equal(await page.evaluate(()=>document.querySelector('.coding-conversation').textContent.includes('echo coding-ok')),false)
+ await clickText('View code in sidebar')
+ await page.waitForSelector('.coding-team .coding-snippets details:not([open])')
+ await page.click('.coding-snippets summary')
+ assert.equal(await page.$eval('.coding-snippets details',e=>e.open),true)
+ assert.match(await page.$eval('.coding-snippets pre',e=>e.textContent),/echo coding-ok/)
+ await clickText('← Back to activity')
  for (const theme of ['dark','light']) {
   await page.evaluate(theme=>document.documentElement.dataset.theme=theme,theme)
   for (const width of [1440,1024,768,390,320]) {
@@ -145,13 +162,14 @@ try {
  }
  await page.setViewport({width:1440,height:1050,deviceScaleFactor:1})
  await page.click('.coding-proposals > button')
- await page.waitForSelector('.coding-review .coding-diff')
+ await page.click('.coding-review-list button')
+ await page.waitForSelector('.coding-team .coding-review .coding-diff')
  await clickText('Undo change');await page.waitForFunction(()=>document.querySelector('.coding-review')?.textContent.includes('undone'))
  assert.equal(fileReview.status,'undone')
  await page.reload({waitUntil:'networkidle2'})
- await page.waitForFunction(()=>document.querySelector('.coding-proposals')?.textContent.includes('undone'))
+ await page.waitForFunction(()=>document.querySelector('.coding-proposals')?.textContent.includes('0 applied'))
  assert.deepEqual(errors,[])
- console.log('Coding browser smoke passed: real UI controls, versioned events, agent assignments, file/command approvals, pause/resume/stop, background navigation, reload without replay, follow-up, undo, and dark/light responsive layouts.')
+ console.log('Coding browser smoke passed: shared Chat turns, description-only conversation, collapsed sidebar diffs/snippets/commands, real UI controls, versioned events, agent assignments, file/command approvals, pause/resume/stop, background navigation, reload without replay, follow-up, undo, and dark/light responsive layouts.')
 } catch(e) {
  await page.screenshot({path:resolve(out,'failure.png'),fullPage:true}).catch(()=>{})
  console.error(errors);throw e

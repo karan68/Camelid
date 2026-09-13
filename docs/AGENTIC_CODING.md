@@ -17,8 +17,8 @@ File tools stay within the selected folder. File reviews reject path traversal, 
 
 ## Follow the work
 
-- **Agents** shows real assignments created by the lead's `spawn_subagent` calls. Selecting a card opens the helper's goal, files, findings, and activity. No synthetic completion percentages are shown.
-- **Changes** links to the existing durable file reviews. Each file is reviewed independently; multiple edits are not an atomic batch.
+- **Overview** shows the work plan and real agent activity. **Agents** shows real assignments created by the lead's `spawn_subagent` calls. Selecting a card opens the helper's goal, files, findings, and activity. No synthetic completion percentages are shown.
+- **Changes** opens file reviews inside the sidebar. The conversation uses the same message components and composer styling as Chat, with plain-language progress. Source snippets, command output, and diffs stay behind explicit sidebar controls. Each file is reviewed independently; multiple edits are not an atomic batch.
 - **Pause** waits before the next model request or tool action. A request or command already running may finish. **Resume** continues a paused run. **Stop** cancels generation/tools and joins the session's helper threads; it does not roll back completed edits.
 - Switching to Chat or another view keeps the server-owned coding run alive and shows an active-session link. Reloading reconnects to its current snapshot. Closing the browser does not stop it.
 - A completed, stopped, failed, or interrupted session accepts a follow-up. The folder, command permission, project context, and exact model artifact stay bound to that session. Runtime address and context limits are refreshed on continuation.
@@ -26,6 +26,8 @@ File tools stay within the selected folder. File reviews reject path traversal, 
 A lead may assign two helpers at once, up to eight across a run. Helpers have only `read_file`, `list_dir`, and `search`; they cannot edit, execute commands, or delegate. They share the same resident model, so concurrent assignments are not a throughput claim. Unfinished helpers are cancelled when the parent finishes.
 
 ## Review, Undo, and recovery
+
+When an approval is pending, choose **Review file change** or **Review command** in the conversation to expand its exact details and approval buttons in the sidebar. Opening a review keeps the conversation visible.
 
 An approved file edit uses the existing Changes journal. Application requires that the current file still matches the saved original. Undo requires that the file still matches the applied version, preserving intervening user edits. The Code review can undo a completed run's file change; the Changes page retains the independent review history.
 
@@ -38,6 +40,12 @@ After an engine restart, an active saved run becomes **Interrupted**. Pending au
 Code is local and same-origin only; the restricted LAN chat surface does not expose it. One coding run may be active per engine, and coding runs share model-transition exclusion with Workspace. The existing Workspace surface remains read-only. Normal Chat retains its separate connected-tool workflow.
 
 Sessions retain up to 100 turns and 8 MiB of saved state, with the latest 160 activity events. The engine retains at most 64 sessions; remove finished ones when full. Runs default to 32 model steps (API range 1–64), helper runs to at most 12. Approval requests expire after five minutes. File changes use the existing 256 KiB UTF-8 review limit and 128-review store limit. Hitting a context, step, storage, tool, or model limit is surfaced as a stopped/failed outcome with the observed activity, not a success claim.
+
+Text that promises further work or leaves a plan unfinished is sent back through the shared tool loop, with at most three recovery steps. It is never interpreted as executable code. Repeated promises stop with a visible failure, rather than a completion claim. Identical successful read-only results get one bounded hint to change approach; further repetition stops the turn. Failed, denied, or mutating calls retain the normal repeat-stop behavior. Concrete blockers and approval denials may end a turn. Follow-ups rebuild the system instructions while retaining prior observations. The UI labels an accepted answer **Turn finished**; it is not independent proof that every requested behavior works.
+
+Malformed native tool-call text receives explicit feedback that the call did not execute. Rejected answers retain a structural reminder through compaction that their prose did not create or change files. Helper assignments explicitly request inspection of the actual project, using the existing read-only observation checks.
+
+Helper completion notifications, active-run steering, and a durable task record are proposed follow-ups, not current capabilities. See the [reliability follow-up design](agentic-coding-reliability.md) for the implementation sequence and acceptance criteria.
 
 ## HTTP interface
 
@@ -72,3 +80,13 @@ On macOS / Apple M4, the selected Rust suites (`chat::`, `api::workspace::tests`
 The live fixture passed using the official Qwen3 4B Q4_K_M artifact with SHA-256 `7485fe6f11af29433bc51cab58009521f205840f5b4ae3a32fa7f92e8534fdf5`: two actual helpers completed, the reviewed edit applied, an individually approved Python test command succeeded, retrying the create request reused the same run, and Undo restored the original file. A browser check against that engine restored all three agents, the completed run, and the undone review without script errors.
 
 The exact Llama 3.2 3B Q8_0 artifact did not complete this multi-step fixture: it emitted malformed arguments and prose resembling tool calls. Those strings did not execute edits or commands. A separate Qwen attempt also honored a command denial. Tool capability is not a guarantee of coding-task completion; these results validate this bounded application workflow and do not expand model support, parity, or performance claims.
+
+For the new-project regression, run `CAMELID_CODING_LIVE_URL=http://127.0.0.1:18191 node scripts/coding-site-live-smoke.mjs` from `frontend` against an isolated engine. It gives the model an empty temporary project, approves only bounded changes to the three requested files, requires their actual journaled creation, and runs separate browser checks. This is model-dependent validation, not a deterministic CI gate.
+
+### UI and loop refresh — 2026-09-13
+
+The refreshed implementation passed 18 coding lifecycle tests and 91 shared-agent tests, strict all-target Clippy, a release build, and frontend build/state/browser checks on the test host. The browser checks exercised shared Chat components, descriptions in the conversation, collapsed sidebar code/diffs/commands, approval transitions, folder creation, reload, Undo, and responsive layouts. These deterministic results establish the application behavior, not the quality of generated projects.
+
+The new Tiny Tasks live fixture **did not pass** with the same Qwen artifact. An empty-project attempt created all three requested files through approved writes, then stopped after repeated reads. A follow-up with concrete defect feedback on the refreshed runner applied three real edits and ended its turn, but introduced invalid JavaScript (a duplicated `else`), and the independent browser check failed. No generated-site success is claimed. This remains a supervised coding preview; model prose and an accepted final answer cannot substitute for executable verification.
+
+To investigate an earlier fixture, `CAMELID_CODING_SITE_RESUME` may point to its saved `session.json`, with optional `CAMELID_CODING_SITE_FEEDBACK`. The harness verifies the original goal, session, model, and temporary workspace before sending the follow-up; it never resumes arbitrary user projects.
