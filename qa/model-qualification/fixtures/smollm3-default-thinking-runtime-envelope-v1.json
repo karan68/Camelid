@@ -27,7 +27,7 @@
   },
   "implementation": {
     "source_file": "src/api/mod.rs",
-    "source_git_blob_sha1": "0f4fdf006b1e2e7909db39bd60dbd301f9fafa98",
+    "source_git_blob_sha1": "e6bfbf72b636d3f9f457178ee3c63fa6d8af140c",
     "architecture": "smollm3",
     "renderer": "render_smollm3_production_chat_prompt",
     "public_chokepoints": [
