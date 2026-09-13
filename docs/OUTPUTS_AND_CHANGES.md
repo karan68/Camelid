@@ -11,6 +11,20 @@ up to 100 rows and 40 columns. Other text formats show their source. Downloads
 retain the full output even when a table preview is limited. Preview is limited
 to 256 KB. Unsupported MCP resource links are not fetched automatically.
 
+## Conversation files
+
+Open **Files** in Chat to browse completed code blocks, structured replies, and
+embedded tool outputs from the whole conversation. **Preview** on an output
+opens that file beside the conversation on desktop and in a sheet on narrow
+screens. Choose a file, switch between **Preview** and **Source**, edit its
+download filename, or choose **Download file**. Filenames are saved on this
+device; renaming does not write or rename a workspace file. Files are rebuilt
+from the saved transcript when a conversation is reopened. Incomplete streaming
+code blocks cannot be previewed or downloaded yet.
+
+Other surfaces retain the preview dialog. Previewing an older structured-output
+record that lacks saved file metadata also uses that dialog.
+
 ## Review a generated file
 
 1. Choose **Review file change** on a completed text output, or open

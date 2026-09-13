@@ -423,9 +423,12 @@ try {
   await waitForComposer()
 
   // Web Off is a hard zero-request mode, even when the prompt contains a URL.
+  await page.waitForSelector('.composer-menu-trigger')
+  await page.$$eval('.composer-menu-trigger', buttons => buttons.find(button => button.textContent.includes('Options')).click())
   await page.waitForSelector('button[aria-label="Turn off automatic web research"]')
   await page.click('button[aria-label="Turn off automatic web research"]')
   await page.waitForSelector('button[aria-label="Turn on automatic web research"]')
+  await page.keyboard.press('Escape')
   const researchCountBeforeOffSend = researchRequests.length
   const chatCountBeforeOffSend = chatRequests.length
   await sendPrompt(OFF_PROMPT)
@@ -440,8 +443,10 @@ try {
   )
 
   // Hold the fixture so progress is observed before either sources or answer.
+  await page.$$eval('.composer-menu-trigger', buttons => buttons.find(button => button.textContent.includes('Options')).click())
   await page.click('button[aria-label="Turn on automatic web research"]')
   await page.waitForSelector('button[aria-label="Turn off automatic web research"]')
+  await page.keyboard.press('Escape')
   const researchCountBeforeLocalSend = researchRequests.length
   const chatCountBeforeLocalSend = chatRequests.length
   await sendPrompt(LOCAL_PROMPT)

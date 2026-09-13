@@ -139,3 +139,23 @@
   .mcp-icon-button { min-width: 44px; min-height: 44px; }
   .mcp-filters button { min-height: 44px; }
 }
+
+.tool-activity { border: 1px solid var(--color-border-soft); border-radius: var(--radius-lg); background: var(--color-surface); overflow: hidden; }
+.tool-activity.is-approval { border-color: var(--color-warning); }
+.tool-activity__summary { display: flex; align-items: center; gap: 12px; width: 100%; padding: 14px 16px; text-align: left; color: var(--color-text); background: none; cursor: pointer; }
+.tool-activity__icon { display: grid; place-items: center; padding: 8px; border-radius: 10px; color: var(--color-accent); background: var(--color-accent-soft); }
+.tool-activity__name { display: grid; gap: 4px; flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.tool-activity__name strong { font-size: var(--text-sm); font-weight: 600; }
+.tool-activity__name small { color: var(--color-text-muted); font-size: var(--text-xs); }
+.tool-activity__status { display: grid; justify-items: end; gap: 4px; font-size: var(--text-xs); color: var(--color-text-muted); }
+.tool-activity.is-complete:not(.is-error) .tool-activity__status { color: var(--color-ready); }
+.tool-activity.is-approval .tool-activity__status { color: var(--color-warning); }
+.tool-activity.is-error .tool-activity__status { color: var(--color-error); }
+.tool-activity__body { padding: 0 16px 16px; font-size: var(--text-sm); overflow-wrap: anywhere; }
+.tool-activity__body h4 { font-size: var(--text-xs); color: var(--color-text-muted); margin: 12px 0 6px; font-weight: 500; }
+.tool-activity__body pre { max-height: 320px; overflow: auto; padding: 14px; border: 1px solid var(--color-border-soft); border-radius: 8px; background: var(--color-bg); font-size: var(--text-xs); white-space: pre-wrap; overflow-wrap: anywhere; }
+.tool-activity__body .mcp-actions { margin-top: 14px; }
+
+.mcp-diagnostics { display: grid; gap: 6px; margin: 0 20px 18px; padding: 14px 16px; background: var(--color-surface-subtle); border: 1px solid var(--color-border-soft); border-radius: 10px; font-size: var(--text-xs); color: var(--color-text-muted); }
+.mcp-diagnostics.is-passed strong { color: var(--color-ready); }
+.mcp-diagnostics.is-failed strong { color: var(--color-error); }
