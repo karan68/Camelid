@@ -2527,6 +2527,11 @@ fn cuda_prefill_chunk_unsupported(
     continuing: bool,
     reason: &'static str,
 ) -> Result<CudaResidentPrefillChunkOutcome> {
+    // CAMELID_RESIDENT_TRACE=1: say WHICH gate sent this prompt back to the CPU, the
+    // same way `resident_decode_eligible` reports its refusals.
+    if std::env::var_os("CAMELID_RESIDENT_TRACE").is_some() {
+        eprintln!("[resident-cuda] prefill declined: {reason}");
+    }
     if continuing {
         Err(BackendError::RuntimeShapeMismatch(format!(
             "resident CUDA prefill continuation became unsupported after partial KV mutation: {reason}"
@@ -3847,10 +3852,18 @@ impl LlamaInferenceSession {
                 v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off")
             })
             .unwrap_or_else(|| !slot.engine.prefers_batched_prefill());
-        if !paged_kv_enabled && (serial_prefill || !slot.engine.supports_batched_prefill()) {
+        // Q4_K/Q6_K lanes report `prefers_batched_prefill() == false`, and offloaded
+        // models have no batched prefill kernel at all. Both ran the SERIAL GPU prefill
+        // before continuous batching landed; bailing out here would push every such
+        // request back onto the CPU, which is the time-to-first-token cost this path
+        // exists to remove. `prefill_from` indexes its slices by absolute position, so
+        // it can only serve a whole prompt; a partial chunk still declines.
+        let serial_gpu_prefill =
+            !paged_kv_enabled && (serial_prefill || !slot.engine.supports_batched_prefill());
+        if serial_gpu_prefill && (continuing || end_position != total_prefill_tokens) {
             return cuda_prefill_chunk_unsupported(
                 continuing,
-                "batched resident prefill is unavailable",
+                "serial resident prefill cannot serve a partial chunk",
             );
         }
         if total_prefill_tokens > slot.engine.max_pos() {
@@ -3890,7 +3903,12 @@ impl LlamaInferenceSession {
         } else {
             base_position
         };
-        if reuse != base_position {
+        // Drop the watermark to the reused span before prefilling the rest, so a
+        // failure below leaves no claim on rows this prefill never wrote — and so a warm
+        // engine whose `filled` ran past a reseeded (therefore invalidated) resident-token
+        // record still presents a cursor that matches `reuse`. Continuation chunks keep
+        // the strict check below instead: their KV is mid-flight and must not be rewound.
+        if !paged_kv_enabled && !continuing {
             slot.engine.set_filled(reuse);
         }
         let gpu_cursor = if paged_kv_enabled {
@@ -3916,6 +3934,19 @@ impl LlamaInferenceSession {
                 prefill_tokens,
                 scale,
             )
+        } else if serial_gpu_prefill {
+            // `prefill_from` walks `reuse..end_position` and indexes the slices by that
+            // absolute position, so it takes the whole-prompt tables, not the offset ones.
+            slot.engine
+                .prefill_from(
+                    &embeddings.data,
+                    &tables.cos,
+                    &tables.sin,
+                    end_position,
+                    scale,
+                    reuse,
+                )
+                .map_err(BackendError::RuntimeShapeMismatch)
         } else {
             slot.engine
                 .prefill_batched_at(
@@ -3934,8 +3965,22 @@ impl LlamaInferenceSession {
                 self.cuda_sequence_lease = None;
                 drop(guard);
                 crate::cuda::release_async_pool();
+                return Err(error);
             }
-            return Err(error);
+            // A partial prefill leaves the GPU KV inconsistent; mark it unfilled so the
+            // decode path rebuilds/reseeds rather than trusting it. A whole-prompt attempt
+            // can still be served on the CPU, so a transient scratch-allocation failure
+            // must not reach the client as an error. A continuation chunk has already
+            // mutated KV the caller cannot rebuild, so it still fails loudly.
+            slot.engine.set_filled(0);
+            slot.engine.set_resident_tokens(&[]);
+            if trace {
+                eprintln!("[resident-cuda] GPU prefill failed ({error}); using CPU prefill");
+            }
+            if continuing {
+                return Err(error);
+            }
+            return Ok(CudaResidentPrefillChunkOutcome::Unsupported);
         }
         slot.engine.set_filled(end_position);
         let finalized = end_position == total_prefill_tokens;
@@ -3972,7 +4017,15 @@ impl LlamaInferenceSession {
             if let Err(error) = mirror_result {
                 slot.engine.set_filled(0);
                 slot.engine.set_resident_tokens(&[]);
-                return Err(error);
+                if paged_kv_enabled || continuing {
+                    return Err(error);
+                }
+                if trace {
+                    eprintln!(
+                        "[resident-cuda] KV readback to host failed ({error}); using CPU prefill"
+                    );
+                }
+                return Ok(CudaResidentPrefillChunkOutcome::Unsupported);
             }
             if trace {
                 eprintln!(
@@ -15413,6 +15466,12 @@ pub fn release_resident_cuda_model(model_cache_key: u64) -> std::result::Result<
     let removed = arena.remove_matching(|identity| identity.model_key == model_cache_key as usize);
     drop(arena);
     drop(removed);
+    // The drafter is a separate model, but it was admitted to speculate for THIS target.
+    // Leaving it resident strands an engine (and its VRAM) across a targeted unload,
+    // which the whole-process `reset_resident_caches` never did.
+    *resident_cuda_drafter_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     crate::cuda::release_async_pool();
     Ok(())
 }

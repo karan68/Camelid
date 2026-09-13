@@ -18285,3 +18285,221 @@ fn q8_0_owner_avxvnni_microkernel_is_bit_identical() {
         }
     }
 }
+
+
+// ---------------------------------------------------------------------------
+// PR #757 review gates: the resident CUDA prefill must keep serving the lanes
+// that continuous batching was not supposed to change.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "cuda")]
+struct ReviewRegressionModel {
+    config: crate::model::LlamaModelConfig,
+    weights: Arc<LlamaLoadedWeights>,
+    /// Two prompts that share NO leading token, so `resident_prefix_len` returns 0
+    /// for the second one against the first one's resident record.
+    prompts: [Vec<u32>; 2],
+}
+
+/// Opt-in loader: point `CAMELID_3B_GGUF` at any real GGUF. Deliberately unpinned
+/// (unlike `phase3_real_model`) because these gates assert control flow, not tokens.
+#[cfg(feature = "cuda")]
+fn review_regression_model() -> Option<ReviewRegressionModel> {
+    let path = std::env::var_os("CAMELID_3B_GGUF").map(std::path::PathBuf::from)?;
+    if !path.exists() {
+        eprintln!("skipping: no GGUF at {}", path.display());
+        return None;
+    }
+    let gguf = crate::gguf::read_metadata(&path).expect("read review GGUF metadata");
+    let config = crate::model::LlamaModelConfig::from_gguf(&gguf).expect("review model config");
+    let binding =
+        crate::model::LlamaTensorBinding::bind(&gguf, &config).expect("review tensor binding");
+    let store = crate::tensor::TensorStore::open(&path, &gguf);
+    let weights =
+        Arc::new(LlamaLoadedWeights::load(&store, &binding, None).expect("review weights"));
+    let tokenizer = crate::tokenizer::Tokenizer::from_gguf(&gguf).expect("review tokenizer");
+    // `add_special = false`: a shared BOS would make `resident_prefix_len` return 1, and
+    // a non-zero reuse takes the `reuse != base_position` branch that already worked.
+    let encode = |text: &str| {
+        let ids = tokenizer.encode(text, false, false).expect("encode review prompt");
+        assert!(ids.len() > 2, "prompt must clear the `prefill_count > 1` gate");
+        ids
+    };
+    let prompts = [
+        encode("Paged attention reclaims its key-value pages once a sequence finishes."),
+        encode("Zebras graze beside the harbour while cold lights flicker on the water."),
+    ];
+    assert_ne!(
+        prompts[0][0], prompts[1][0],
+        "review prompts must not share a leading token"
+    );
+    Some(ReviewRegressionModel {
+        config,
+        weights,
+        prompts,
+    })
+}
+
+#[cfg(feature = "cuda")]
+fn review_regression_session(
+    model: &ReviewRegressionModel,
+    cache_key: u64,
+) -> LlamaInferenceSession {
+    let mut session =
+        LlamaInferenceSession::new(model.config.clone(), Arc::clone(&model.weights)).unwrap();
+    session.set_resident_cache_key(cache_key);
+    session
+}
+
+/// `build_resident_cuda_engine` declines on plenty of host/model pairs (VRAM, quant lane,
+/// kernel availability) long before any of the logic these gates cover. Prove the engine
+/// builds in a KNOWN-GOOD configuration first, on a throwaway cache key, so an
+/// environment limit skips the gate instead of being reported as the regression.
+#[cfg(feature = "cuda")]
+fn resident_prefill_is_available(model: &ReviewRegressionModel, probe_key: u64) -> bool {
+    let restore = std::env::var_os("CAMELID_CUDA_RESIDENT_PREFILL_BATCHED");
+    std::env::set_var("CAMELID_CUDA_RESIDENT_PREFILL_BATCHED", "1");
+    let mut probe = review_regression_session(model, probe_key);
+    let built = matches!(probe.try_resident_prefill_cuda(&model.prompts[0]), Ok(true));
+    drop(probe);
+    match restore {
+        Some(value) => std::env::set_var("CAMELID_CUDA_RESIDENT_PREFILL_BATCHED", value),
+        None => std::env::remove_var("CAMELID_CUDA_RESIDENT_PREFILL_BATCHED"),
+    }
+    if !built {
+        eprintln!(
+            "SKIP: this host/model cannot build a resident CUDA engine \
+             (set CAMELID_RESIDENT_TRACE=1 for the reason)"
+        );
+    }
+    built
+}
+
+/// Blocker 3. `serial_prefill` defaults to `!prefers_batched_prefill()`, which is true
+/// for EVERY Q4_K/Q6_K model, and batched prefill is unsupported for offloaded models.
+/// Those cases must still prefill on the GPU. Returning "unsupported" instead sends them
+/// to a CPU prefill — a large time-to-first-token regression on the default path that no
+/// other test catches, because every other CUDA prefill test sets the override to "1".
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "requires CAMELID_3B_GGUF and a CUDA device"]
+fn serial_resident_prefill_stays_on_the_gpu_without_the_batched_override() {
+    let _env_guard = crate::test_support::env_lock();
+    let Some(model) = review_regression_model() else {
+        eprintln!("SKIP serial resident prefill gate: set CAMELID_3B_GGUF");
+        return;
+    };
+    if !resident_prefill_is_available(&model, 0xF157_0FF1) {
+        return;
+    }
+    let prompt = &model.prompts[0];
+
+    // No override at all: a Q4_K/Q6_K model takes the serial lane by default.
+    std::env::remove_var("CAMELID_CUDA_RESIDENT_PREFILL_BATCHED");
+    let mut defaulted = review_regression_session(&model, 0xF157_0301);
+    let defaulted_ran = defaulted.try_resident_prefill_cuda(prompt).unwrap();
+    let defaulted_position = defaulted.kv_position();
+    drop(defaulted);
+
+    // Forced serial, so the gate still means something on a model whose quant lane
+    // happens to prefer batched prefill.
+    std::env::set_var("CAMELID_CUDA_RESIDENT_PREFILL_BATCHED", "0");
+    let mut forced = review_regression_session(&model, 0xF157_0302);
+    let forced_ran = forced.try_resident_prefill_cuda(prompt).unwrap();
+    let forced_position = forced.kv_position();
+    drop(forced);
+    std::env::remove_var("CAMELID_CUDA_RESIDENT_PREFILL_BATCHED");
+
+    assert!(
+        defaulted_ran,
+        "the default (unset) lane must prefill on the GPU, not fall back to the CPU"
+    );
+    assert_eq!(defaulted_position, prompt.len());
+    assert!(
+        forced_ran,
+        "CAMELID_CUDA_RESIDENT_PREFILL_BATCHED=0 must stay a GPU A/B arm, not a CPU switch"
+    );
+    assert_eq!(forced_position, prompt.len());
+}
+
+/// Blocker 4. A warm engine whose resident-token record no longer matches the incoming
+/// prompt yields `reuse == base_position == 0` while the engine cursor still sits at the
+/// previous prompt's length. Skipping `set_filled` there made the cursor check fail, and
+/// nothing on the single-slot path resets `filled` afterwards — so every later GPU
+/// prefill failed too, until the engine was rebuilt.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "requires CAMELID_3B_GGUF and a CUDA device"]
+fn warm_resident_engine_prefills_a_request_that_shares_no_prefix() {
+    let _env_guard = crate::test_support::env_lock();
+    let Some(model) = review_regression_model() else {
+        eprintln!("SKIP warm-engine prefill gate: set CAMELID_3B_GGUF");
+        return;
+    };
+    std::env::remove_var("CAMELID_CUDA_PREFIX_CONTINUATION");
+    if !resident_prefill_is_available(&model, 0xF157_0FF2) {
+        return;
+    }
+    let cache_key = 0xF157_0401_u64;
+
+    let mut first = review_regression_session(&model, cache_key);
+    assert!(
+        first.try_resident_prefill_cuda(&model.prompts[0]).unwrap(),
+        "first prefill warms the shared engine"
+    );
+    assert_eq!(first.kv_position(), model.prompts[0].len());
+    drop(first);
+
+    // Same engine, a prompt with no shared leading token: reuse collapses to 0 while the
+    // engine cursor is still at the first prompt's length.
+    let mut second = review_regression_session(&model, cache_key);
+    let advanced = second
+        .try_resident_prefill_cuda(&model.prompts[1])
+        .expect("a warm engine with no reusable prefix must not fail the request");
+    assert!(advanced, "the second request must still prefill on the GPU");
+    assert_eq!(second.kv_position(), model.prompts[1].len());
+    drop(second);
+
+    // And once more, to prove the engine was not left in a state that poisons every
+    // later request.
+    let mut third = review_regression_session(&model, cache_key);
+    assert!(third
+        .try_resident_prefill_cuda(&model.prompts[0])
+        .expect("the engine must not be poisoned by the previous request"));
+    assert_eq!(third.kv_position(), model.prompts[0].len());
+}
+
+/// Blocker 4, second trigger. `CAMELID_CUDA_PREFIX_CONTINUATION=0` forces `reuse` to
+/// `base_position` for every request, so a warm engine hits the same cursor mismatch even
+/// when the prompt is byte-identical to the one that warmed it.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "requires CAMELID_3B_GGUF and a CUDA device"]
+fn resident_prefill_repeats_with_prefix_continuation_disabled() {
+    let _env_guard = crate::test_support::env_lock();
+    let Some(model) = review_regression_model() else {
+        eprintln!("SKIP continuation-off prefill gate: set CAMELID_3B_GGUF");
+        return;
+    };
+    if !resident_prefill_is_available(&model, 0xF157_0FF3) {
+        return;
+    }
+    std::env::set_var("CAMELID_CUDA_PREFIX_CONTINUATION", "0");
+    let cache_key = 0xF157_0402_u64;
+    let prompt = &model.prompts[0];
+
+    let mut warm = review_regression_session(&model, cache_key);
+    assert!(warm.try_resident_prefill_cuda(prompt).unwrap());
+    drop(warm);
+
+    let mut repeat = review_regression_session(&model, cache_key);
+    let advanced = repeat
+        .try_resident_prefill_cuda(prompt)
+        .expect("continuation=0 must re-prefill from scratch, not fail the request");
+    let position = repeat.kv_position();
+    drop(repeat);
+    std::env::remove_var("CAMELID_CUDA_PREFIX_CONTINUATION");
+
+    assert!(advanced, "the repeat request must still prefill on the GPU");
+    assert_eq!(position, prompt.len());
+}
