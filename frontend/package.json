@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite --host 127.0.0.1 --port 4175",
     "build": "vite build",
+    "smoke:chat-polish": "node scripts/chat-polish-smoke.mjs",
     "smoke:project-context": "node scripts/project-context-smoke.mjs",
     "smoke:project-context-browser": "node scripts/project-context-browser-smoke.mjs",
     "smoke:outputs-changes": "node scripts/outputs-changes-smoke.mjs",

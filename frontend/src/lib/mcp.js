@@ -76,6 +76,7 @@ export async function runMcpTurn({ initialOptions, tools, send, request, approve
     if (calls.length > MAX_MCP_TOOLS) throw new Error('The model requested too many tools in one turn.')
     if (calls.some(c => typeof c.id !== 'string' || !c.id) || new Set(calls.map(c => c.id)).size !== calls.length) throw new Error('The model returned missing or duplicate tool call IDs. Nothing was executed.')
     const results = []
+    const observations = new Map()
     let nextHistory
     try {
       for (const call of calls) {
@@ -88,20 +89,34 @@ export async function runMcpTurn({ initialOptions, tools, send, request, approve
         const signature = JSON.stringify([tool.key, argumentsObject])
         if (seen.has(signature)) throw new Error('Stopped a repeated tool call with identical arguments. Review the result before asking to retry.')
         seen.add(signature)
+        const identity = { messageId: generated.message.id, callId: call.id, tool: tool.name, connection: tool.connection_name, round }
+        observations.set(call.id, identity)
+        activity({ ...identity, phase: 'preparing' })
         const pending = await request('/calls', { method: 'POST', body: { tool_key: tool.key, arguments: argumentsObject }, signal })
         let receipt
+        let startedAt
         try {
           signal.throwIfAborted()
-          activity({ phase: 'approval', tool: tool.name, connection: tool.connection_name, round })
+          activity({ ...identity, phase: 'approval', receiptId: pending.id })
           const approved = await approve(pending, signal)
           signal.throwIfAborted()
+          if (approved) {
+            startedAt = Date.now()
+            observations.set(call.id, { ...identity, startedAt })
+            activity({ ...identity, phase: 'executing', startedAt, receiptId: pending.id })
+          }
           receipt = await request(`/calls/${pending.id}/decision`, { method: 'POST', body: { approved }, signal })
           while (receipt.status === 'running') {
-            activity({ phase: 'executing', tool: tool.name, connection: tool.connection_name, round })
+            activity({ ...identity, phase: 'executing', startedAt, receiptId: pending.id })
             await pause(400, signal)
             receipt = await request(`/calls/${pending.id}`, { signal })
           }
-          results.push({ role: 'tool', tool_call_id: call.id, content: mcpResultText(receipt), mcp: { tool: tool.name, connection: tool.connection_name, status: receipt.status, is_error: Boolean(receipt.result?.isError) } })
+          const result = { role: 'tool', tool_call_id: call.id, content: mcpResultText(receipt), mcp: {
+            tool: tool.name, connection: tool.connection_name, status: receipt.status, is_error: Boolean(receipt.result?.isError),
+            ...(startedAt ? { duration_ms: Math.max(0, Date.now() - startedAt) } : {}),
+          } }
+          results.push(result)
+          activity({ ...identity, phase: receipt.status, result })
           if (!['complete', 'denied'].includes(receipt.status)) throw new Error(`Tool ${receipt.status}. Review its outcome before retrying.`)
         } finally {
           if (!receipt || receipt.status === 'running') await request(`/calls/${pending.id}`, { method: 'DELETE' }).catch(() => {})
@@ -113,7 +128,9 @@ export async function runMcpTurn({ initialOptions, tools, send, request, approve
       const complete = calls.map(call => results.find(r => r.tool_call_id === call.id) || {
         role: 'tool', tool_call_id: call.id,
         content: 'Tool execution was stopped or unavailable. No successful result was received. Do not assume completion or retry without asking the user.',
-        mcp: { tool: call.function?.name || 'Tool', status: 'interrupted', is_error: true },
+        mcp: { tool: observations.get(call.id)?.tool || call.function?.name || 'Tool', connection: observations.get(call.id)?.connection, status: 'interrupted', is_error: true,
+          ...(observations.get(call.id)?.startedAt ? { duration_ms: Math.max(0, Date.now() - observations.get(call.id).startedAt) } : {}),
+        },
       })
       recordResults(generated.conversationId, complete)
       nextHistory = [...(generated.history || []), ...complete]

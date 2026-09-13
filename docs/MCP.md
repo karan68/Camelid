@@ -51,6 +51,24 @@ Use **Manage connections** to add or remove servers, inspect their tools, or
 filter by connection status. Disconnected servers can also be connected directly
 from the picker. Saving a server configuration does not connect it.
 
+## Test and edit a connection
+
+**Test connection** asks a connected server to list its tools again, validates
+its bounded catalog, and shows the measured duration and discovery result.
+It does not execute a tool. Connect a disconnected server first; testing does
+not launch it. Diagnostics time out after 10 seconds.
+
+**Edit settings** reuses the setup form. Saving validates and durably stores the
+replacement before disconnecting the old connection and cancelling its pending
+calls. The updated connection starts disconnected with fresh tool identifiers.
+Reconnect and select its tools again; existing selections and saved tool sets
+will show their old tools as unavailable until you replace them.
+
+Each call now has one expandable card for its request, approval, execution,
+and result. Completed calls show measured execution time when available; older
+records do not invent a duration. Approvals remain reachable when navigating
+away from their conversation.
+
 ## State and limits
 
 Connection configuration is stored in `mcp-connections.json` beside Camelid's
@@ -99,6 +117,8 @@ explicitly connected server.
 | --- | --- |
 | `GET /api/mcp/connections` | List saved configurations, connection state, and discovered tools |
 | `POST /api/mcp/connections` | Save a connection without starting it |
+| `PUT /api/mcp/connections/:id` | Replace settings, disconnect, and invalidate old tool identifiers |
+| `POST /api/mcp/connections/:id/test` | Check live discovery without executing tools |
 | `DELETE /api/mcp/connections/:id` | Disconnect and remove configuration |
 | `POST /api/mcp/connections/:id/connect` | Initialize the server and discover tools |
 | `POST /api/mcp/connections/:id/disconnect` | Close the connection and cancel its pending work |

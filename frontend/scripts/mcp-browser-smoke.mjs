@@ -43,7 +43,7 @@ const largeConnection = { config: { id: 'b'.repeat(32), name: 'Repository tools'
 const remoteTool = { ...tool, key: 'mcp_remote_search', name: 'search_docs' }
 const remoteConnection = { config: { id: 'c'.repeat(32), name: 'Remote docs', transport: 'http', url: 'https://docs.example/mcp' }, connected: false, tools: [] }
 const connections = [connection, largeConnection, remoteConnection]
-const connectionRequests = [], cancellations = []
+const connectionRequests = [], cancellations = [], edits = [], tests = []
 const decisions = [], prepared = []
 const chatRequests = []
 const pageErrors = []
@@ -152,11 +152,22 @@ const server = createServer(async (req, res) => {
       const config = { ...await readJsonBody(req), id: 'd'.repeat(32) }
       connectionRequests.push(config)
       connections.push({ config, connected: false, tools: [] })
-      return sendJson(res, 201, { saved: true })
+      return sendJson(res, 201, connections.at(-1))
     }
     if (path === '/api/mcp/connections') return sendJson(res, 200, { connections })
     if (path.startsWith('/api/mcp/connections/')) {
       const found = connections.find(item => path.includes(item.config.id))
+      if (found && req.method === 'PUT') {
+        const config = { ...await readJsonBody(req), id: 'e'.repeat(32) }
+        edits.push(config)
+        const updated = { config, connected: false, tools: [] }
+        connections.splice(connections.indexOf(found), 1, updated)
+        return sendJson(res, 200, updated)
+      }
+      if (found && path.endsWith('/test')) {
+        tests.push(found.config.id)
+        return sendJson(res, 200, { ok: true, tools_count: found.tools.length, elapsed_ms: 12, message: 'Server responded and tool discovery passed.' })
+      }
       if (found && path.endsWith('/connect')) {
         found.connected = true
         if (found === remoteConnection) found.tools = [remoteTool]
@@ -233,6 +244,21 @@ try {
   await clickText('button', 'Cancel')
   await clickText('button', 'Chat')
   await page.waitForSelector('.mcp-trigger')
+  await clickText('.composer-menu-trigger', 'Options')
+  await page.waitForSelector('.composer-menu')
+  await click('[aria-label="Verification receipt"]')
+  await page.screenshot({ path: resolve(scriptDir, '../../target/chat-options-desktop.png'), fullPage: true })
+  await page.keyboard.press('Escape')
+  await click('[aria-label="Remove Receipt"]')
+  assert.equal(await page.$('[aria-label="Remove Receipt"]'), null, 'active option chips really disable their option')
+  await clickText('.composer-menu-trigger', 'Attach')
+  await page.waitForSelector('[aria-label="Attach documents for RAG"]')
+  await page.keyboard.press('Escape')
+  await clickText('.composer-menu-trigger', 'Options')
+  await click('[aria-label="Generation controls"]')
+  await page.waitForSelector('[aria-label="System prompt"]')
+  assert.equal(await page.$('.composer-menu'), null, 'generation controls are reached through Options')
+  await clickText('.chat-controls button', 'Close')
   await click('.mcp-trigger')
   await page.waitForSelector('.mcp-tool-options input:not([disabled])', { timeout: 20000 })
   await click('.mcp-tool-options input')
@@ -311,16 +337,21 @@ try {
   await page.waitForSelector('.mcp-approval', { timeout: 20000 })
   assert.equal(decisions.length, 0, 'execution requires a human decision')
   assert.equal(prepared.length, 1)
+  assert.equal((await page.$$('.tool-activity')).length, 1, 'one card owns the entire call lifecycle')
+  assert.equal(await page.$('.toolcalls-card'), null, 'managed arguments are not duplicated')
   assert.equal(await page.$eval('.mcp-approval', element => Boolean(element.closest('.cxchat__thread'))), true, 'approval is part of the conversation')
   assert.equal((await page.$$('.mcp-trigger')).length, 1, 'starting a conversation keeps exactly one tool picker')
   assert.equal(await page.$eval('.mcp-trigger', element => element.disabled), true, 'tool selection is locked throughout approval')
   await page.screenshot({ path: resolve(scriptDir, '../../target/mcp-approval-desktop.png'), fullPage: true })
   await clickText('button', 'Allow once')
   await page.waitForFunction(() => document.body.textContent.includes('The connected tool returned: Hello from MCP.'), { timeout: 20000 })
-  await page.waitForFunction(() => !document.querySelector('.mcp-run'), { timeout: 20000 })
+  await page.waitForFunction(() => document.querySelector('.mcp-trigger:not(:disabled)'), { timeout: 20000 })
   assert.equal(chatRequests.length, 2)
   assert.equal(decisions.length, 1)
   assert.equal(await page.$('.mcp-picker'), null, 'completing a turn never reopens the picker')
+  assert.equal((await page.$$('.tool-activity')).length, 1, 'completion updates the original card')
+  assert.match(await page.$eval('.tool-activity__status', e => e.textContent), /Completed.*s/)
+  assert.equal(await page.$('.mcp-result'), null, 'the result stays inside its request card')
   const payload = chatRequests[1]
   assert.equal(payload.messages.at(-1).role, 'tool')
   assert.equal(payload.messages.at(-1).tool_call_id, 'call_1')
@@ -345,14 +376,14 @@ try {
   await clickText('button', 'Chat')
   await page.waitForSelector('.cxchat__thread .mcp-approval')
   await clickText('button', 'Deny')
-  await page.waitForFunction(() => !document.querySelector('.mcp-run'), { timeout: 20000 })
+  await page.waitForFunction(() => document.querySelector('.mcp-trigger:not(:disabled)'), { timeout: 20000 })
   assert.equal(decisions.at(-1).approved, false)
   assert.match(chatRequests.at(-1).messages.at(-1).content, /denied/)
   await page.type('textarea[aria-label="Message Camelid"]', 'Prepare another tool request.')
   await click('button[aria-label="Send message"]')
   await page.waitForSelector('.mcp-approval', { timeout: 20000 })
-  await clickText('.mcp-run button', 'Stop')
-  await page.waitForFunction(() => !document.querySelector('.mcp-run'), { timeout: 20000 })
+  await clickText('.tool-activity button', 'Stop')
+  await page.waitForFunction(() => document.querySelector('.mcp-trigger:not(:disabled)'), { timeout: 20000 })
   assert.equal(decisions.length, 2, 'Stop must not submit an approval')
   assert.ok(cancellations.length)
   await page.setViewport({ width: 390, height: 844, deviceScaleFactor: 1 })
@@ -373,6 +404,21 @@ try {
   assert.equal(connectionRequests.length, 1)
   assert.equal(connectionRequests[0].bearer_env, 'MY_MCP_TOKEN')
   assert.equal(connections.at(-1).connected, false, 'saving never connects or launches a server')
+  const editTarget = connections.at(-1).config.id
+  await clickText('.mcp-connection:last-child button', 'Edit settings')
+  await page.waitForSelector('.mcp-form')
+  await page.$eval('.mcp-form input', input => { const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set; setter.call(input, 'Updated docs'); input.dispatchEvent(new Event('input', {bubbles:true})) })
+  await clickText('button', 'Save settings')
+  await page.waitForSelector('.mcp-connection-modal', {hidden:true})
+  assert.equal(edits.length, 1)
+  assert.notEqual(connections.at(-1).config.id, editTarget)
+  assert.equal(connections.at(-1).connected, false)
+  await clickText('.mcp-connection:last-child button', 'Connect')
+  await clickText('.mcp-connection:last-child button', 'Test connection')
+  await page.waitForSelector('.mcp-diagnostics.is-passed')
+  assert.equal(tests.length, 1)
+  assert.equal(decisions.length, 2, 'connection diagnostics never approve or execute tools')
+  await page.screenshot({ path: resolve(scriptDir, '../../target/chat-connections-diagnostics.png'), fullPage: true })
   await page.goto(origin + '/?picker-mobile=1#chat', { waitUntil: 'networkidle0' })
   await click('.mcp-trigger')
   await page.waitForSelector('.mcp-picker.is-mobile')
@@ -396,6 +442,17 @@ try {
   await page.screenshot({ path: resolve(scriptDir, '../../target/mcp-picker-light.png'), fullPage: true })
   await page.keyboard.press('Escape')
   await page.waitForSelector('.mcp-picker', { hidden: true })
+  await clickText('.composer-menu-trigger', 'Options')
+  for (const [width, height] of [[320,640],[390,420],[800,400],[1280,900]]) {
+    await page.setViewport({width,height,deviceScaleFactor:1})
+    await page.waitForFunction(() => {
+      const box = document.querySelector('.composer-menu')?.getBoundingClientRect()
+      return box && box.left >= 0 && box.top >= 0 && box.right <= innerWidth + 1 && box.bottom <= innerHeight + 1
+    })
+    assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1), 'Options fits narrow and short windows')
+  }
+  await page.screenshot({ path: resolve(scriptDir, '../../target/chat-options-light.png'), fullPage: true })
+  await page.keyboard.press('Escape')
   assert.deepEqual(pageErrors, [])
   assert.deepEqual(externalRequests, [])
   console.log('MCP browser smoke passed: picker limits/search, saved sets/storage failure, manual mode, reconnect, allow/deny/stop, conversation history, server setup, keyboard dismissal, and responsive layout.')

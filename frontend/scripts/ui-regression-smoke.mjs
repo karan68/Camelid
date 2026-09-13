@@ -225,7 +225,7 @@ assert.match(messageTurnSource, /message\.support_row && !message\.experimental_
 assert.doesNotMatch(messageTurnSource, /cxturn__meta--reserve/, 'the invisible footer placeholder is gone; the live footer itself holds the layout slot')
 assert.doesNotMatch(read('../src/styles/chat.css'), /cxturn__meta--reserve/, 'the reserved-footer spacer css must not outlive the placeholder it styled')
 assert.match(messageTurnSource, /streaming=\{assistantStreaming\}/, 'assistant markdown should know when an assistant row is still streaming')
-assert.match(markdownSource, /splitFenceInfo/, 'streaming/incomplete fenced code blocks should be parsed as code instead of prose')
+assert.match(read('../src/lib/codeFences.js'), /splitFenceInfo/, 'streaming/incomplete fenced code blocks should be parsed as code instead of prose')
 assert.match(markdownSource, /pushCodeBlock/, 'code block rendering should stay centralized for complete and incomplete fences')
 assert.match(markdownSource, /CODE_CARD_STREAMING_LABEL\s*=\s*'Still generating — code block incomplete'/, 'incomplete streaming code blocks should visibly say the code is still incomplete')
 assert.match(markdownSource, /data-code-streaming-state=\{stillGenerating \? 'open' : undefined\}/, 'open streaming code fences should expose an active code state marker')

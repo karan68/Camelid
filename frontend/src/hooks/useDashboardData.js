@@ -2239,6 +2239,8 @@ export function useDashboardData({ showNotice, clearNotice }) {
       const streamedContent = paceDrain(pacer, streamed.content || '')
       const assistantMessage = {
         ...assistantMessageBase,
+        // File format describes the saved text, not evidence of decoder enforcement.
+        output_format: constraining ? (structuredMode === 'grammar' ? 'text' : 'json') : null,
         content: continuedMessage
           ? joinContinuation(continuationPrefix, streamedContent)
           : streamedContent,
@@ -2398,7 +2400,9 @@ export function useDashboardData({ showNotice, clearNotice }) {
         return result
       },
         request: (path, init) => mcpRequest(apiBase, path, init),
-        signal: controller.signal, activity: next => setMcpActivity({ ...next, conversationId }),
+        signal: controller.signal, activity: next => setMcpActivity(previous => ({ ...next, conversationId,
+          calls: next.callId ? { ...previous.calls, [JSON.stringify([next.messageId, next.callId])]: next } : previous.calls,
+        })),
         approve: (call, signal) => new Promise(resolve => {
           if (signal.aborted) { resolve(false); return }
           setMcpApproval(call)

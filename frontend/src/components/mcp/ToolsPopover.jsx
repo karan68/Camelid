@@ -5,7 +5,7 @@ const FOCUSABLE = 'button:not(:disabled), input:not(:disabled), select:not(:disa
 
 // Portal out of the composer's scrolling toolbar. Position against the visual
 // viewport so zoom, short windows, and an on-screen keyboard keep it reachable.
-export function ToolsPopover({ anchorRef, id, titleId, onClose, children }) {
+export function ToolsPopover({ anchorRef, id, titleId, onClose, children, className = '', width: preferredWidth = 388, initialFocus = 'input[type="search"]' }) {
   const panelRef = useRef(null)
   const closeRef = useRef(onClose)
   closeRef.current = onClose
@@ -27,7 +27,7 @@ export function ToolsPopover({ anchorRef, id, titleId, onClose, children }) {
       const below = Math.max(0, top + height - rect.bottom - 20)
       const atTop = above >= Math.min(380, below)
       const maxHeight = Math.max(0, Math.min(height - 24, mobile ? 680 : atTop ? above : below))
-      const panelWidth = Math.min(388, width - 24)
+      const panelWidth = Math.min(preferredWidth, width - 24)
       const actualHeight = Math.min(panel.scrollHeight, maxHeight)
       const next = {
         mobile,
@@ -54,11 +54,11 @@ export function ToolsPopover({ anchorRef, id, titleId, onClose, children }) {
       window.visualViewport?.removeEventListener('resize', update)
       window.visualViewport?.removeEventListener('scroll', update)
     }
-  }, [anchorRef])
+  }, [anchorRef, preferredWidth])
   useEffect(() => {
     const panel = panelRef.current
     const anchor = anchorRef.current
-    const frame = requestAnimationFrame(() => panel?.querySelector('input[type="search"]')?.focus({ preventScroll: true }))
+    const frame = requestAnimationFrame(() => panel?.querySelector(initialFocus)?.focus({ preventScroll: true }))
     const outside = event => {
       if (!panel?.contains(event.target) && !anchor?.contains(event.target)) closeRef.current(event.target.classList?.contains('mcp-picker-scrim'))
     }
@@ -83,7 +83,7 @@ export function ToolsPopover({ anchorRef, id, titleId, onClose, children }) {
   return createPortal(<>
     {position?.mobile && <div className="mcp-picker-scrim" aria-hidden="true" />}
     <section ref={panelRef} id={id} role="dialog" aria-modal={position?.mobile || undefined} aria-labelledby={titleId}
-      className={'mcp-picker' + (position?.mobile ? ' is-mobile' : '')}
+      className={'mcp-picker ' + className + (position?.mobile ? ' is-mobile' : '')}
       style={{ left: position?.left, top: position?.top, width: position?.width, maxHeight: position?.maxHeight, visibility: position ? 'visible' : 'hidden' }}>
       {children}
     </section>
