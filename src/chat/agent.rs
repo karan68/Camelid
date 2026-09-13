@@ -139,6 +139,10 @@ pub enum Decision {
 /// Approves (or denies) gated actions, shown the *validated* action.
 pub trait Approver {
     fn approve(&mut self, action: &Action, sandbox: &Sandbox) -> Decision;
+    /// An adapter may fail to prepare a review before asking the user.
+    fn denial_reason(&mut self) -> Option<String> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -163,6 +167,8 @@ pub trait Reporter {
     fn notice(&mut self, text: &str);
     fn context_budget(&mut self, _usage: ContextBudgetUsage) {}
     fn model_timing(&mut self, _metrics: ModelStepMetrics) {}
+    /// Structured, validated action before approval; never inferred from prose.
+    fn tool_action(&mut self, _action: &Action, _sandbox: &Sandbox) {}
 }
 
 /// How the loop ended.
@@ -321,6 +327,18 @@ fn repeat_notice(name: &str) -> String {
     format!("stopping: `{name}` repeated {REPEAT_LIMIT}× with the same result and no progress")
 }
 
+/// Execution adapter invoked only after validation, policy, and cancellation checks.
+/// Web coding uses it to route mutations through its durable review journal.
+pub(crate) trait ToolExecutor {
+    fn execute(&mut self, action: &Action, sandbox: &Sandbox, cancel: &AtomicBool) -> ToolOutcome;
+}
+struct NativeExecutor;
+impl ToolExecutor for NativeExecutor {
+    fn execute(&mut self, action: &Action, sandbox: &Sandbox, cancel: &AtomicBool) -> ToolOutcome {
+        action.execute_with_cancel(sandbox, cancel)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn run_loop(
     driver: &mut dyn ModelDriver,
@@ -331,6 +349,31 @@ pub fn run_loop(
     cancel: &AtomicBool,
     policy: &mut Policy,
     history: &mut Vec<AgentMsg>,
+) -> LoopEnd {
+    run_loop_with_executor(
+        driver,
+        approver,
+        reporter,
+        sandbox,
+        cfg,
+        cancel,
+        policy,
+        history,
+        &mut NativeExecutor,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_loop_with_executor(
+    driver: &mut dyn ModelDriver,
+    approver: &mut dyn Approver,
+    reporter: &mut dyn Reporter,
+    sandbox: &Sandbox,
+    cfg: &AgentConfig,
+    cancel: &AtomicBool,
+    policy: &mut Policy,
+    history: &mut Vec<AgentMsg>,
+    executor: &mut dyn ToolExecutor,
 ) -> LoopEnd {
     let tools = tools::specs_for(cfg.tool_profile, cfg.allow_net, sandbox.shell_mode());
     // One global consecutive-call record. An intervening different call is
@@ -611,6 +654,7 @@ pub fn run_loop(
                         }
                     };
                     reporter.tool_call(&action.call_line(sandbox));
+                    reporter.tool_action(&action, sandbox);
 
                     // Consult the approval policy for the effective tier — the one
                     // chokepoint for "may this run?". Auto runs; Confirm prompts the
@@ -646,7 +690,9 @@ pub fn run_loop(
                                     action.tool_name()
                                 )
                             } else {
-                                "the user denied this action".to_string()
+                                approver
+                                    .denial_reason()
+                                    .unwrap_or_else(|| "the user denied this action".to_string())
                             };
                             ToolOutcome::Err(msg)
                         }
@@ -659,6 +705,7 @@ pub fn run_loop(
                                 &call.args,
                                 cfg.audit.as_ref(),
                                 cancel,
+                                executor,
                             )
                         }
                         Decision::Once => execute_audited(
@@ -668,6 +715,7 @@ pub fn run_loop(
                             &call.args,
                             cfg.audit.as_ref(),
                             cancel,
+                            executor,
                         ),
                     };
                     let outcome = match cfg.tool_profile.observation_limit() {
@@ -1276,6 +1324,7 @@ fn execute_audited(
     raw_args: &Value,
     sink: &dyn AuditSink,
     cancel: &AtomicBool,
+    executor: &mut dyn ToolExecutor,
 ) -> ToolOutcome {
     if cancel.load(Ordering::Acquire) {
         return ToolOutcome::Err("cancelled before tool execution".to_string());
@@ -1284,7 +1333,7 @@ fn execute_audited(
     let digest = audit::digest_args(raw_args);
     sink.emit(&AuditEvent::call(tool, tier.label(), digest.clone()));
     let start = Instant::now();
-    let outcome = action.execute_with_cancel(sandbox, cancel);
+    let outcome = executor.execute(action, sandbox, cancel);
     sink.emit(&AuditEvent::result(
         tool,
         tier.label(),

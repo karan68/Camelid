@@ -4,6 +4,8 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
+    "smoke:coding": "node scripts/coding-session-smoke.mjs",
+    "smoke:coding-browser": "node scripts/coding-browser-smoke.mjs",
     "dev": "vite --host 127.0.0.1 --port 4175",
     "build": "vite build",
     "smoke:chat-polish": "node scripts/chat-polish-smoke.mjs",

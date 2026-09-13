@@ -28,6 +28,7 @@ use tokio::sync::RwLock;
 use tower_http::trace::TraceLayer;
 
 mod changes;
+mod coding;
 #[allow(dead_code)]
 mod continuous_batch;
 mod contract;
@@ -196,6 +197,7 @@ pub struct AppState {
     /// idempotency key) are serialized through a process-local keyed lock.
     responses_locks: responses_store::ResponseLockPool,
     workspace_sessions: workspace::WorkspaceSessionManager,
+    coding_sessions: coding::CodingSessionManager,
     mcp: mcp::McpManager,
     changes: changes::ChangeManager,
     /// Process-rotated bearer capability for same-user Workspace CLI clients.
@@ -276,6 +278,7 @@ impl Default for AppState {
             responses_store: responses_store::ResponsesStore::default(),
             responses_locks: responses_store::ResponseLockPool::default(),
             workspace_sessions: workspace::WorkspaceSessionManager::default(),
+            coding_sessions: coding::CodingSessionManager::default(),
             mcp: mcp::McpManager::default(),
             changes: changes::ChangeManager::default(),
             workspace_cli_token: None,
@@ -2782,6 +2785,27 @@ fn router_with_state_and_policy(state: AppState, policy: server::ServerPolicy) -
         )
         .route("/api/generation/preflight", post(preflight_generation))
         .route("/api/web/research", post(web_research::handler))
+        .route(
+            "/api/agent/coding/sessions",
+            get(coding::list).post(coding::create),
+        )
+        .route(
+            "/api/agent/coding/sessions/:id",
+            get(coding::get).delete(coding::remove),
+        )
+        .route(
+            "/api/agent/coding/sessions/:id/messages",
+            post(coding::message),
+        )
+        .route(
+            "/api/agent/coding/sessions/:id/control",
+            post(coding::control),
+        )
+        .route(
+            "/api/agent/coding/sessions/:id/approvals/:approval",
+            post(coding::decide),
+        )
+        .route("/api/agent/coding/sessions/:id/events", get(coding::events))
         .route("/api/changes", get(changes::list).post(changes::prepare))
         .route(
             "/api/changes/:id",
@@ -8714,7 +8738,8 @@ async fn load_model(State(state): State<AppState>, Json(req): Json<LoadModelRequ
     // decision is made, so this cannot manufacture a false "fits" (this host has
     // OOM'd under memory pressure, so the guard must never be optimistic).
     if (replace || lan_chat_only) && !reclaim.ids.is_empty() {
-        if state.workspace_sessions.blocks_model_transition().await {
+        if state.workspace_sessions.blocks_model_transition().await || state.coding_sessions.busy()
+        {
             return api_error(
                 StatusCode::CONFLICT,
                 "model_operation_in_progress",
@@ -8725,7 +8750,9 @@ async fn load_model(State(state): State<AppState>, Json(req): Json<LoadModelRequ
         let ids = reclaim.ids.clone();
         {
             let _transition = state.model_transition.lock().await;
-            if state.workspace_sessions.blocks_model_transition().await {
+            if state.workspace_sessions.blocks_model_transition().await
+                || state.coding_sessions.busy()
+            {
                 return api_error(
                     StatusCode::CONFLICT,
                     "model_operation_in_progress",
@@ -16191,11 +16218,11 @@ async fn load_model_from_path_with_activation(
     id: Option<String>,
     set_active: bool,
 ) -> Result<LoadedModel, BackendError> {
-    if state.workspace_sessions.blocks_model_transition().await {
+    if state.workspace_sessions.blocks_model_transition().await || state.coding_sessions.busy() {
         return Err(BackendError::ModelOperationInProgress);
     }
     let _transition = state.model_transition.lock().await;
-    if state.workspace_sessions.blocks_model_transition().await {
+    if state.workspace_sessions.blocks_model_transition().await || state.coding_sessions.busy() {
         return Err(BackendError::ModelOperationInProgress);
     }
     let _reader = state.model_file_lifecycle.read().await;
@@ -16716,7 +16743,7 @@ async fn unload_model(
     State(state): State<AppState>,
     payload: Option<Json<UnloadModelRequest>>,
 ) -> Response {
-    if state.workspace_sessions.blocks_model_transition().await {
+    if state.workspace_sessions.blocks_model_transition().await || state.coding_sessions.busy() {
         return api_error(
             StatusCode::CONFLICT,
             "model_operation_in_progress",
@@ -16725,7 +16752,7 @@ async fn unload_model(
         );
     }
     let _transition = state.model_transition.lock().await;
-    if state.workspace_sessions.blocks_model_transition().await {
+    if state.workspace_sessions.blocks_model_transition().await || state.coding_sessions.busy() {
         return api_error(
             StatusCode::CONFLICT,
             "model_operation_in_progress",

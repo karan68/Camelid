@@ -56,6 +56,12 @@ _Avoid_: treating a resolver cleanup as throughput, RSS, profiling, support-cont
 The exact model, quantization, prompt, context, token count, and sampling settings where Camelid has proven equality or bounded equivalence.
 _Avoid_: extending a parity result beyond its envelope.
 
+**Coding session**
+A server-owned Code conversation bound to one local project folder and exact model artifact. Each follow-up creates a new run; reconnecting observes the run without repeating actions.
+
+**Lead and helper**
+The lead owns reviewed file edits and explicitly approved commands. A coding helper performs a scoped read-only investigation and reports findings to the lead. Helpers share the resident model; concurrent assignments do not promise parallel inference or parallel writing.
+
 ## Relationships
 
 - A **support contract** is justified by one or more **evidence bundles**.

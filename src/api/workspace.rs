@@ -1137,6 +1137,14 @@ pub(super) async fn create_session(
     // load/unload. This closes the check-then-act window where a model could be
     // replaced after identity validation but before the session became active.
     let _model_transition = state.model_transition.lock().await;
+    if state.coding_sessions.busy() {
+        return api_error(
+            StatusCode::CONFLICT,
+            "coding_session_active",
+            "Wait for the coding session to finish before starting Workspace.".into(),
+            None,
+        );
+    }
     let (model, family) = match active_tool_capable_model(&state).await {
         Ok(value) => value,
         Err(response) => return response,
@@ -1709,6 +1717,14 @@ pub(super) async fn send_message(
     // transitions. A transition that wins the lock first is observed below; a
     // follow-up that wins first becomes blocking before the lock is released.
     let _model_transition = state.model_transition.lock().await;
+    if state.coding_sessions.busy() {
+        return api_error(
+            StatusCode::CONFLICT,
+            "coding_session_active",
+            "Wait for the coding session to finish before starting Workspace.".into(),
+            None,
+        );
+    }
     let (model, family) = match active_tool_capable_model(&state).await {
         Ok(value) => value,
         Err(response) => return response,
@@ -2005,7 +2021,9 @@ async fn workspace_semantic_retriever(
     }
 }
 
-async fn active_tool_capable_model(state: &AppState) -> Result<(LoadedModel, String), Response> {
+pub(super) async fn active_tool_capable_model(
+    state: &AppState,
+) -> Result<(LoadedModel, String), Response> {
     let active_id = state.active_model_id.read().await.clone().ok_or_else(|| {
         api_error(
             StatusCode::CONFLICT,

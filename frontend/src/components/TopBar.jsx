@@ -2,7 +2,7 @@ import { memo } from 'react'
 import { clampText } from '../lib/formatters'
 import { getChatGateState } from '../lib/chatGate'
 import { modelRuntimeIdMatches } from '../lib/modelState'
-import { IconMenu } from './ui/icons'
+import { IconMenu, IconApi, IconChat } from './ui/icons'
 import { StatusDot } from './ui/StatusDot'
 import { CamelidMark } from './ui/CamelidMark'
 
@@ -42,6 +42,8 @@ function TopBar({
   mobileNavOpen = false,
   menuButtonRef = null,
   demoMode = false,
+  chatMode = 'chat',
+  onChatModeChange = null,
 }) {
   const rawTitle = selectedConversationTitle?.trim()
   const hasCustomTitle = Boolean(rawTitle && rawTitle.toLowerCase() !== 'new conversation')
@@ -77,6 +79,7 @@ function TopBar({
       <CamelidMark size={18} className="topbar__mark" />
       <h1 className="topbar__title" title={tab === 'chat' && hasCustomTitle ? rawTitle : heading}>{heading}</h1>
       <div className="topbar__spacer" />
+      {tab === 'chat' && onChatModeChange && <div className="coding-mode-switch" role="group" aria-label="Conversation mode"><button type="button" aria-pressed={chatMode === 'chat'} onClick={() => onChatModeChange('chat')}><IconChat size={15} />Chat</button><button type="button" aria-pressed={chatMode === 'code'} onClick={() => onChatModeChange('code')}><IconApi size={15} />Code</button></div>}
       {!demoMode && (
         <div className="topbar__gate">
           {/* Model chip only. Support detail lives in the Models and System

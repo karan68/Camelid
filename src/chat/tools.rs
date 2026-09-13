@@ -593,12 +593,26 @@ pub enum ToolProfile {
     Full,
     BenchmarkShared,
     WorkspaceReadOnly,
+    /// Web coding: confined file tools, reviewed commands, and in-process read-only helpers.
+    Coding,
 }
 
 impl ToolProfile {
     pub fn allows(self, tool: &str) -> bool {
         match self {
             ToolProfile::Full => true,
+            ToolProfile::Coding => matches!(
+                tool,
+                "read_file"
+                    | "list_dir"
+                    | "search"
+                    | "write_file"
+                    | "edit_file"
+                    | "run_shell"
+                    | "update_plan"
+                    | "spawn_subagent"
+                    | "check_subagent_status"
+            ),
             ToolProfile::BenchmarkShared => matches!(
                 tool,
                 "read_file" | "list_dir" | "search" | "write_file" | "edit_file" | "run_shell"
@@ -620,6 +634,7 @@ impl ToolProfile {
     pub fn observation_limit(self) -> Option<usize> {
         match self {
             Self::Full | Self::BenchmarkShared => None,
+            Self::Coding => Some(16 * 1024),
             Self::WorkspaceReadOnly => Some(2 * 1024),
         }
     }
@@ -701,6 +716,22 @@ pub fn specs_for(profile: ToolProfile, allow_net: bool, shell_mode: ShellSandbox
             risk: Risk::Exec,
             params: json!({"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}),
         });
+    }
+    if profile == ToolProfile::Coding {
+        tools.push(ToolSpec {
+            name: "spawn_subagent".into(),
+            description: "Assign a scoped read-only investigation or review to a helper. At most two helpers run at once. They cannot edit, execute commands, or spawn children. Collect the findings with check_subagent_status.".into(),
+            risk: Risk::Read,
+            params: json!({"type":"object","properties":{"subtask_id":{"type":"string"},"goal":{"type":"string"}},"required":["subtask_id","goal"]}),
+        });
+        tools.push(ToolSpec {
+            name: "check_subagent_status".into(),
+            description: "Collect a helper's observed status and findings. Running work is not completion.".into(),
+            risk: Risk::Read,
+            params: json!({"type":"object","properties":{"subtask_id":{"type":"string"}},"required":["subtask_id"]}),
+        });
+        tools.retain(|tool| profile.allows(&tool.name));
+        return tools;
     }
     if profile == ToolProfile::BenchmarkShared {
         tools.retain(|tool| profile.allows(&tool.name));
@@ -1578,7 +1609,7 @@ pub fn validate_for(
             // Spawning a child agent is process execution → fail closed under the
             // exec kill-switch in validate (run_loop validates any model-emitted
             // tool name regardless of the advertised set).
-            if sandbox.shell_mode() == ShellSandbox::Disabled {
+            if profile != ToolProfile::Coding && sandbox.shell_mode() == ShellSandbox::Disabled {
                 return Err("spawn_subagent is disabled (shell execution is off)".into());
             }
             let subtask_id = str_arg("subtask_id")?;

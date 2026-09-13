@@ -39,6 +39,7 @@ const CompatibilityView = lazy(() => import('./views/CompatibilityView'))
 const TelemetryView = lazy(() => import('./views/TelemetryView'))
 const InferenceObservatoryView = lazy(() => import('./views/InferenceObservatoryView'))
 const WorkspaceView = lazy(() => import('./views/WorkspaceView'))
+const CodingWorkspace = lazy(() => import('./views/CodingWorkspace'))
 const ArenaView = lazy(() => import('./views/ArenaView'))
 const SpotlightView = lazy(() => import('./views/SpotlightView'))
 
@@ -57,6 +58,10 @@ function App() {
   const { notice, noticeTone, showNotice, clearNotice } = useNotice()
   const { preference, resolved, cyclePreference, setPreference } = useTheme()
 
+  const [chatMode, setChatMode] = useState(() => appStorage.getItem('camelid.chatMode') === 'code' ? 'code' : 'chat')
+  const [codingVisited, setCodingVisited] = useState(() => appStorage.getItem('camelid.chatMode') === 'code' || Boolean(appStorage.getItem('camelid.codingSession')))
+  const [codingActivity, setCodingActivity] = useState(null)
+  const chooseChatMode = useCallback(mode => { setChatMode(mode); if (mode === 'code') setCodingVisited(true); appStorage.setItem('camelid.chatMode', mode) }, [])
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
     if (DEMO_UI) return true
     if (typeof window === 'undefined') return false
@@ -265,12 +270,14 @@ function App() {
   }
 
   const selectConversation = (id) => {
+    chooseChatMode('chat')
     setSelectedConversationId(id)
     navigateTab('chat')
     closeMobileNav()
   }
 
   const startNewChat = (projectId = '') => {
+    chooseChatMode('chat')
     showNewChatLanding(typeof projectId === 'string' ? projectId : '')
     navigateTab('chat')
     closeMobileNav()
@@ -396,7 +403,9 @@ function App() {
         <TopBar
           tab={tab}
           setTab={navigateTab}
-          selectedConversationTitle={selectedConversation?.title || ''}
+          selectedConversationTitle={chatMode === 'code' && !isLanChatOnly(apiSurface) ? codingActivity?.title || 'Code' : selectedConversation?.title || ''}
+          chatMode={chatMode}
+          onChatModeChange={!DEMO_UI && !isLanChatOnly(apiSurface) ? chooseChatMode : null}
           runtime={runtime}
           capabilities={dashboard?.capabilities}
           selectedModelId={selectedModelId}
@@ -407,7 +416,9 @@ function App() {
           demoMode={DEMO_UI}
         />
 
-        {(tab !== 'chat' || (mcpActivity.conversationId && mcpActivity.conversationId !== selectedConversation?.id)) && mcpActivity.phase !== 'idle' && <div className="camelid-notice-slot"><McpRunPanel activity={mcpActivity} approval={mcpApproval} onDecision={decideMcpApproval} onStop={stopGeneration} /></div>}
+        {codingActivity && ['running', 'paused', 'waiting_approval', 'stopping'].includes(codingActivity.phase) && (tab !== 'chat' || chatMode !== 'code') && <div className="coding-background" role="status"><span>Code · {codingActivity.title} · {codingActivity.phase.replaceAll('_', ' ')}</span><button type="button" onClick={() => { chooseChatMode('code'); navigateTab('chat') }}>Open coding session</button></div>}
+
+        {(tab !== 'chat' || chatMode === 'code' || (mcpActivity.conversationId && mcpActivity.conversationId !== selectedConversation?.id)) && mcpActivity.phase !== 'idle' && <div className="camelid-notice-slot"><McpRunPanel activity={mcpActivity} approval={mcpApproval} onDecision={decideMcpApproval} onStop={stopGeneration} /></div>}
 
         {notice && (
           <div className="camelid-notice-slot">
@@ -436,7 +447,10 @@ function App() {
            other view is a .cxv page and needs the padded page frame. */}
         <div ref={viewRef} className={`camelid-view ${(tab === 'chat' || tab === 'workspace' || tab === 'cluster') ? 'camelid-view--chat' : 'camelid-view--page'}`}>
           <Suspense fallback={<div className="view-loading" role="status" aria-label="Loading view">Loading view…</div>}>
-          {tab === 'chat' && (
+          {codingVisited && !isLanChatOnly(apiSurface) && <div className="coding-mount" hidden={tab !== 'chat' || chatMode !== 'code'}>
+            <CodingWorkspace apiBase={apiBase} runtime={runtime} selectedModel={selectedModel} capabilities={dashboard?.capabilities} projects={projects} chatContext={chatContext} contextSources={contextSources} updateChatContext={updateChatContext} globalPrompt={globalPrompt} setTab={navigateTab} onActivity={setCodingActivity} active={tab === 'chat' && chatMode === 'code'} />
+          </div>}
+          {tab === 'chat' && (chatMode === 'chat' || isLanChatOnly(apiSurface)) && (
             <ChatWorkspace
               projects={projects} chatContext={chatContext} updateChatContext={updateChatContext} contextSources={contextSources}
               globalPrompt={globalPrompt} updateGlobalPrompt={updateGlobalPrompt}
