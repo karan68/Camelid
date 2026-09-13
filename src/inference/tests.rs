@@ -18286,7 +18286,6 @@ fn q8_0_owner_avxvnni_microkernel_is_bit_identical() {
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // PR #757 review gates: the resident CUDA prefill must keep serving the lanes
 // that continuous batching was not supposed to change.
@@ -18321,8 +18320,13 @@ fn review_regression_model() -> Option<ReviewRegressionModel> {
     // `add_special = false`: a shared BOS would make `resident_prefix_len` return 1, and
     // a non-zero reuse takes the `reuse != base_position` branch that already worked.
     let encode = |text: &str| {
-        let ids = tokenizer.encode(text, false, false).expect("encode review prompt");
-        assert!(ids.len() > 2, "prompt must clear the `prefill_count > 1` gate");
+        let ids = tokenizer
+            .encode(text, false, false)
+            .expect("encode review prompt");
+        assert!(
+            ids.len() > 2,
+            "prompt must clear the `prefill_count > 1` gate"
+        );
         ids
     };
     let prompts = [

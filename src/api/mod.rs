@@ -28578,7 +28578,10 @@ mod tests {
             "evictions",
             "admission_failures",
         ] {
-            assert!(expected[key].is_u64(), "cuda_resident_arena.{key} must be a number");
+            assert!(
+                expected[key].is_u64(),
+                "cuda_resident_arena.{key} must be a number"
+            );
         }
         assert_eq!(expected["resident_models"], 0, "no model is loaded");
         assert_eq!(expected["active_models"], 0, "no request is running");
