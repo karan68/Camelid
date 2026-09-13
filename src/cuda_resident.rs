@@ -7638,7 +7638,10 @@ __device__ void flash_attention_prefill_tiled_impl(
     int max_pos,
     float scale
 ) {
-    constexpr int D_STEPS = HEAD_DIM / 32;
+    // `const`, not `constexpr`: NVRTC defaults to C++03 on CUDA 11.x, where the
+    // keyword is undefined and this one line fails the whole kernel module. HEAD_DIM
+    // is a template parameter, so this is still an integral constant expression.
+    const int D_STEPS = HEAD_DIM / 32;
 
     int head = blockIdx.x;
     int q_tile = blockIdx.y;

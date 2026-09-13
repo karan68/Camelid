@@ -16197,7 +16197,7 @@ fn build_resident_cuda_engine(
             return None;
         }
     }
-    let mut engine = if paged_kv {
+    let built = if paged_kv {
         crate::cuda_resident::CudaResidentDecode::new_paged_with_kv_quant(
             n_layers,
             n_heads,
@@ -16227,10 +16227,26 @@ fn build_resident_cuda_engine(
             split_half_pairing,
             kv_quant,
         )
-    }
-    .ok()?;
+    };
+    // Swallowing this with `.ok()?` left the caller reporting only "construction
+    // failed", with the actual driver/shape reason lost — undiagnosable on any box
+    // where the resident lane silently declines.
+    let mut engine = match built {
+        Ok(engine) => engine,
+        Err(error) => {
+            if std::env::var_os("CAMELID_RESIDENT_TRACE").is_some() {
+                eprintln!("[resident-cuda] engine construction failed: {error}");
+            }
+            return None;
+        }
+    };
     if kv_slot_count == 2 && !paged_kv {
-        engine.enable_second_kv_slot().ok()?;
+        if let Err(error) = engine.enable_second_kv_slot() {
+            if std::env::var_os("CAMELID_RESIDENT_TRACE").is_some() {
+                eprintln!("[resident-cuda] second KV slot unavailable: {error}");
+            }
+            return None;
+        }
     }
     for (idx, l) in weights.layers[range.clone()].iter().enumerate() {
         let (q, k, v, o, gate, up, down) = match (
@@ -16245,7 +16261,15 @@ fn build_resident_cuda_engine(
             (Some(q), Some(k), Some(v), Some(o), Some(g), Some(u), Some(d)) => {
                 (q, k, v, o, g, u, d)
             }
-            _ => return None,
+            _ => {
+                if std::env::var_os("CAMELID_RESIDENT_TRACE").is_some() {
+                    eprintln!(
+                        "[resident-cuda] layer {idx}: a projection weight has no raw \
+                         quant block the resident kernels can read"
+                    );
+                }
+                return None;
+            }
         };
         // Per-projection quant lanes (q,k,v,o,gate,up,down) ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â drives the per-tensor
         // repack + GEMV kernel + activation quantizer. Q4_K_M is mixed: most
