@@ -14,6 +14,7 @@ mkdirSync(out, { recursive: true })
 const workspace = mkdtempSync(join(tmpdir(), 'camelid-coding-live-'))
 const before = 'def greet(name):\n    return "Hello"\n'
 const after = 'def greet(name):\n    return f"Hello, {name}!"\n'
+const testCommands = ['python3 -m unittest -q', 'python3 -m unittest -q test_greet.py']
 writeFileSync(join(workspace, 'greet.py'), before)
 writeFileSync(join(workspace, 'test_greet.py'), 'import unittest\nfrom greet import greet\n\nclass GreetingTests(unittest.TestCase):\n    def test_greeting(self):\n        self.assertEqual(greet("Camelid"), "Hello, Camelid!")\n')
 async function request(path, method = 'GET', body, extra = {}) {
@@ -39,7 +40,7 @@ try {
    const a = session.approval, review = a.detail.review
    const approved = review
     ? review.path === 'greet.py' && [after.trim(), after.trim().replaceAll('"', "'")].includes(review.after.trim())
-    : a.tool === 'run_shell' && ['run_shell(python3 -m unittest -q)', 'python3 -m unittest -q'].includes(a.detail.command.trim())
+    : a.tool === 'run_shell' && testCommands.some(command => [command, `run_shell(${command})`].includes(a.detail.command.trim()))
    decisions.push({ id: a.id, tool: a.tool, approved, path: review?.path, command: a.detail.command })
    console.log(JSON.stringify({ approval: decisions.at(-1) }))
    await request(`${route}/${id}/approvals/${a.id}`, 'POST', { approved })
