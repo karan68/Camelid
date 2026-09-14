@@ -1,6 +1,9 @@
 use super::*;
 use crate::test_support::env_lock;
-use std::io::{Read, Write};
+// `Read` is only used by the CUDA-only real-model loaders below.
+#[cfg(feature = "cuda")]
+use std::io::Read;
+use std::io::Write;
 
 fn assert_close(actual: f32, expected: f32) {
     assert!(

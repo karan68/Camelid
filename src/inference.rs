@@ -2522,6 +2522,21 @@ pub(crate) enum CudaResidentPrefillChunkOutcome {
     },
 }
 
+/// Keep a capacity refusal typed. Every other paged-batch failure stays an opaque
+/// shape mismatch, because only this one is known to have written nothing.
+#[cfg(feature = "cuda")]
+fn paged_batch_backend_error(
+    error: crate::cuda_resident::CudaIndependentPagedBatchError,
+) -> BackendError {
+    match error {
+        crate::cuda_resident::CudaIndependentPagedBatchError::PositionOutOfRange {
+            position,
+            capacity,
+        } => BackendError::ResidentPositionOutOfRange { position, capacity },
+        other => BackendError::RuntimeShapeMismatch(other.to_string()),
+    }
+}
+
 #[cfg(feature = "cuda")]
 fn cuda_prefill_chunk_unsupported(
     continuing: bool,
@@ -2640,6 +2655,8 @@ pub(crate) enum CudaTruePagedBatchContractError {
     CancelledBeforeDispatch(u64),
     #[error("CUDA true paged batch resident engine is unavailable")]
     EngineUnavailable,
+    #[error("CUDA true paged batch position {position} exceeds capacity {capacity}")]
+    PositionOutOfRange { position: usize, capacity: usize },
     #[error("CUDA true paged batch backend failed: {0}")]
     Backend(String),
 }
@@ -6727,6 +6744,13 @@ pub(crate) fn execute_cuda_true_paged_prefill_step(
     let batch_elapsed_micros = started.elapsed().as_micros();
     let backend = match backend {
         Ok(backend) => backend,
+        // Refused by a bounds check before any page is written, and the slot wrapper
+        // rolled the pending appends back, so the engine and every other row's KV are
+        // untouched. Tearing the arena down here would end EVERY live sequence because
+        // one row reached its context limit.
+        Err(BackendError::ResidentPositionOutOfRange { position, capacity }) => {
+            return Err(CudaTruePagedBatchContractError::PositionOutOfRange { position, capacity });
+        }
         Err(error) => {
             *guard = None;
             for session in sessions.iter_mut() {
@@ -6901,6 +6925,13 @@ pub(crate) fn execute_cuda_true_paged_batch(
     let batch_elapsed_micros = started.elapsed().as_micros();
     let backend = match backend {
         Ok(backend) => backend,
+        // Refused by a bounds check before any page is written, and the slot wrapper
+        // rolled the pending appends back, so the engine and every other row's KV are
+        // untouched. Tearing the arena down here would end EVERY live sequence because
+        // one row reached its context limit.
+        Err(BackendError::ResidentPositionOutOfRange { position, capacity }) => {
+            return Err(CudaTruePagedBatchContractError::PositionOutOfRange { position, capacity });
+        }
         Err(error) => {
             *guard = None;
             for session in sessions.iter_mut() {
@@ -14937,7 +14968,7 @@ impl ResidentCudaSlot {
             Err(error) => {
                 let rollback = self.abort_paged_appends(pending_rows);
                 return match rollback {
-                    Ok(()) => Err(BackendError::RuntimeShapeMismatch(error.to_string())),
+                    Ok(()) => Err(paged_batch_backend_error(error)),
                     Err(rollback_error) => Err(BackendError::RuntimeShapeMismatch(format!(
                         "{error}; paged CUDA batch kernel rollback failed: {rollback_error}"
                     ))),
@@ -14997,7 +15028,7 @@ impl ResidentCudaSlot {
             Err(error) => {
                 let rollback = self.abort_paged_appends(pending_rows);
                 return match rollback {
-                    Ok(()) => Err(BackendError::RuntimeShapeMismatch(error.to_string())),
+                    Ok(()) => Err(paged_batch_backend_error(error)),
                     Err(rollback_error) => Err(BackendError::RuntimeShapeMismatch(format!(
                         "{error}; paged CUDA prefill kernel rollback failed: {rollback_error}"
                     ))),

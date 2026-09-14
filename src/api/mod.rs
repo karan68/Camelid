@@ -24255,6 +24255,7 @@ fn cuda_true_paged_batch_scalar_fallback_safe(
             | crate::inference::CudaTruePagedBatchContractError::IncompatibleRows
             | crate::inference::CudaTruePagedBatchContractError::MissingLease(_)
             | crate::inference::CudaTruePagedBatchContractError::CancelledBeforeDispatch(_)
+            | crate::inference::CudaTruePagedBatchContractError::PositionOutOfRange { .. }
     )
 }
 
@@ -24443,6 +24444,8 @@ impl CooperativeStreamDecodeJob {
             store_prompt_prefix_cache(&mut self.prepared, &step);
         }
         if self.generated.is_empty() {
+            // Only the CUDA block below mutates it.
+            #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
             let mut prompt_evaluation = prompt_evaluation_timings_from_step(&step);
             #[cfg(feature = "cuda")]
             if let Some(prefill) = self.cuda_prefill.filter(|prefill| prefill.finalized) {
@@ -25503,6 +25506,19 @@ impl engine::BatchableCooperativeJob for CooperativeStreamDecodeTask {
     }
 }
 
+/// Whether a streaming decode may share the engine's cooperative slots.
+///
+/// A single-sequence resident CUDA engine is a PROCESS-GLOBAL slot keyed by model id, so
+/// two cooperative sessions of the same model would interleave one KV cache. Only the
+/// multi-sequence lane (paged KV / the residency arena) can hold a row per session.
+fn cooperative_routing_admitted(
+    total_slots: usize,
+    resident_cuda_active: bool,
+    cuda_multi_sequence: bool,
+) -> bool {
+    total_slots > 1 && (!resident_cuda_active || cuda_multi_sequence)
+}
+
 fn stream_completion(
     state: &AppState,
     mut prepared: PreparedGeneration,
@@ -25559,7 +25575,15 @@ fn stream_completion(
     if cuda_multi_sequence && !prepared.session.supports_cuda_multi_sequence_kv() {
         prepared.session.set_resident_paths_disabled(true);
     }
-    let task = if state.engine.total_slots() > 1 {
+    // Re-checked per request, not at engine start: `admitted_slots` is resolved once in
+    // `EngineHandle::spawn`, but `POST /api/runtime/gpu` can turn the GPU on later, and a
+    // build that started with the GPU off has already admitted cooperative slots.
+    let cooperative = cooperative_routing_admitted(
+        state.engine.total_slots(),
+        crate::inference::resident_decode_cuda_active(),
+        cuda_multi_sequence,
+    );
+    let task = if cooperative {
         let job = CooperativeStreamDecodeTask::new(
             prepared,
             events_tx,
@@ -28488,6 +28512,7 @@ mod tests {
         env::remove_var(CUDA_COOPERATIVE_PREFILL_ENV);
     }
 
+    #[cfg(feature = "cuda")]
     #[test]
     fn phase7_batched_prefill_solo_work_yields_after_one_token() {
         assert_eq!(cuda_scalar_prefill_step_tokens(256, false), 256);
@@ -28591,6 +28616,24 @@ mod tests {
         for slot in slots.as_array().expect("slots response is an array") {
             assert_eq!(&slot["camelid"]["cuda_resident_arena"], expected);
         }
+    }
+
+    #[test]
+    fn a_single_sequence_resident_cuda_stream_never_shares_cooperative_slots() {
+        // One slot is exclusive regardless.
+        assert!(!cooperative_routing_admitted(1, false, false));
+        assert!(!cooperative_routing_admitted(1, true, true));
+
+        // No resident CUDA engine: Metal/CPU decode state is per session.
+        assert!(cooperative_routing_admitted(2, false, false));
+
+        // The regression: a CUDA build started with the GPU off admits cooperative
+        // slots, then `POST /api/runtime/gpu` brings a SINGLE-sequence resident engine
+        // up behind them. Its KV cache is process-global, so these must stay exclusive.
+        assert!(!cooperative_routing_admitted(2, true, false));
+
+        // Multi-sequence (paged KV / arena) gives each session its own row.
+        assert!(cooperative_routing_admitted(2, true, true));
     }
 
     #[test]

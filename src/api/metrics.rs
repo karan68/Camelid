@@ -385,17 +385,27 @@ impl ServerMetrics {
                 load(&self.inner.cuda_batched_prefill_size_forwards[batch_size]),
             );
         }
+        // `cuda_paged_kv` only exists on a CUDA build, but the SERIES must not vanish on
+        // the others: a scraper cannot tell a removed time series from a dead exporter.
+        // Zero off CUDA, mirroring `resident_cuda_arena_status`.
+        #[cfg(feature = "cuda")]
+        let (paged_kv_allocation_failures, paged_kv_reclaimed_pages) = (
+            crate::inference::cuda_paged_kv::allocation_failures_total(),
+            crate::inference::cuda_paged_kv::reclaimed_pages_total(),
+        );
+        #[cfg(not(feature = "cuda"))]
+        let (paged_kv_allocation_failures, paged_kv_reclaimed_pages) = (0_u64, 0_u64);
         metric_counter(
             &mut out,
             "camelid_cuda_paged_kv_allocation_failures_total",
             "Paged CUDA KV reservations refused atomically for insufficient capacity.",
-            crate::inference::cuda_paged_kv::allocation_failures_total(),
+            paged_kv_allocation_failures,
         );
         metric_counter(
             &mut out,
             "camelid_cuda_paged_kv_reclaimed_pages_total",
             "Paged CUDA KV pages reclaimed from completed, cancelled, or aborted sequences.",
-            crate::inference::cuda_paged_kv::reclaimed_pages_total(),
+            paged_kv_reclaimed_pages,
         );
         let resident_arena = crate::inference::resident_cuda_arena_status();
         for (name, help, value) in [
