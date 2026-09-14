@@ -1,0 +1,52 @@
+.retro-transition-filters { position: absolute; pointer-events: none; }
+.retro-transition-stage { display: flex; flex-direction: column; flex: 1; min-height: 0; position: relative; }
+.retro-transition-stage[data-retro-phase] {
+  overflow: hidden;
+  isolation: isolate;
+  background-color: var(--color-canvas);
+  background-image: linear-gradient(var(--color-border-soft) 1px, transparent 1px), linear-gradient(90deg, var(--color-border-soft) 1px, transparent 1px);
+  background-size: 32px 32px;
+}
+.retro-transition-stage[data-retro-phase] > .camelid-view {
+  background: var(--color-canvas);
+  transform-origin: center;
+  will-change: transform, filter;
+}
+.retro-transition-stage[data-retro-phase='mosaic'] { background-image: none; }
+.retro-transition-stage[data-retro-phase='waiting']::after {
+  content: '';
+  position: absolute;
+  left: 50%; top: 50%;
+  width: 4px; height: 4px;
+  background: var(--color-accent);
+}
+.settings-retro { display: flex; align-items: center; justify-content: space-between; gap: var(--space-4); margin-top: var(--space-5); padding-top: var(--space-5); border-top: 1px solid var(--color-border-soft); cursor: pointer; }
+.settings-retro__copy { display: grid; gap: var(--space-2); }
+.settings-retro__copy small { color: var(--color-text-muted); line-height: 1.5; }
+.settings-retro input { flex: none; width: 20px; height: 20px; accent-color: var(--color-accent); cursor: pointer; }
+@media (prefers-reduced-motion: reduce) {
+  .retro-transition-stage[data-retro-phase] > .camelid-view { transform: none !important; filter: none !important; visibility: visible !important; }
+  .retro-transition-stage[data-retro-phase]::before,
+  .retro-transition-stage[data-retro-phase]::after { display: none; }
+}
+
+/* The outline marks the exact tile the camera is about to enter. It sits
+   outside the filtered view, so its color never becomes the sampled pixel. */
+.retro-transition-stage[data-retro-phase='dive']::before {
+  content: '';
+  position: absolute;
+  z-index: 1;
+  pointer-events: none;
+  left: var(--retro-target-x);
+  top: var(--retro-target-y);
+  width: 12px;
+  height: 12px;
+  transform: translate(-50%, -50%);
+  border: 1px solid var(--color-accent);
+  box-shadow: 0 0 0 2px var(--color-canvas);
+  animation: retro-pixel-lock var(--retro-dive-duration) linear both;
+}
+@keyframes retro-pixel-lock {
+  0%, 22% { opacity: 1; }
+  38%, 100% { opacity: 0; }
+}
