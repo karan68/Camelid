@@ -37,6 +37,7 @@ const ApiView = lazy(() => import('./views/ApiView'))
 const SystemView = lazy(() => import('./views/SystemView'))
 const SettingsView = lazy(() => import('./views/SettingsView'))
 const ClusterView = lazy(() => import('./views/ClusterView'))
+const DivergenceView = lazy(() => import('./views/DivergenceView'))
 const CompatibilityView = lazy(() => import('./views/CompatibilityView'))
 const TelemetryView = lazy(() => import('./views/TelemetryView'))
 const InferenceObservatoryView = lazy(() => import('./views/InferenceObservatoryView'))
@@ -46,7 +47,7 @@ const ArenaView = lazy(() => import('./views/ArenaView'))
 const SpotlightView = lazy(() => import('./views/SpotlightView'))
 
 const DEMO_UI = import.meta.env?.VITE_CAMELID_DEMO_UI === 'true'
-const HASH_TABS = new Set(['projects', 'changes', 'connections', 'chat', 'workspace', 'arena', 'library', 'downloads', 'api', 'analytics', 'history', 'memory', 'system', 'settings', 'cluster', 'observatory', 'compatibility', 'telemetry'])
+const HASH_TABS = new Set(['projects', 'changes', 'connections', 'chat', 'workspace', 'arena', 'library', 'downloads', 'api', 'analytics', 'history', 'memory', 'system', 'settings', 'cluster', 'divergence', 'observatory', 'compatibility', 'telemetry'])
 
 function App() {
   if (typeof window !== 'undefined' && window.location.hash === '#spotlight') {
@@ -456,10 +457,10 @@ function App() {
         )}
 
         {/* --chat is the full-bleed frame for views that own their own edges and
-           manage their own height (chat, workspace, cluster canvas). Every
-           other view is a .cxv page and needs the padded page frame. */}
+           manage their own height (chat, workspace). Every other view is a .cxv
+           page and needs the padded page frame. */}
         <div ref={stageRef} className="retro-transition-stage">
-        <div ref={viewRef} className={`camelid-view ${(tab === 'chat' || tab === 'workspace' || tab === 'cluster') ? 'camelid-view--chat' : 'camelid-view--page'}`}>
+        <div ref={viewRef} className={`camelid-view ${(tab === 'chat' || tab === 'workspace') ? 'camelid-view--chat' : 'camelid-view--page'}`}>
           <Suspense fallback={<div className="view-loading" role="status" aria-label="Loading view">Loading view…</div>}>
           {codingVisited && !isLanChatOnly(apiSurface) && <div className="coding-mount" hidden={tab !== 'chat' || chatMode !== 'code'}>
             <CodingWorkspace apiBase={apiBase} runtime={runtime} selectedModel={selectedModel} capabilities={dashboard?.capabilities} projects={projects} chatContext={chatContext} contextSources={contextSources} updateChatContext={updateChatContext} globalPrompt={globalPrompt} setTab={navigateTab} onActivity={setCodingActivity} active={tab === 'chat' && chatMode === 'code'} />
@@ -644,7 +645,9 @@ function App() {
             />
           )}
 
-          {tab === 'cluster' && <ClusterView showNotice={showNotice} />}
+          {tab === 'cluster' && <ClusterView />}
+
+          {tab === 'divergence' && <DivergenceView />}
 
           {tab === 'observatory' && <InferenceObservatoryView apiBase={apiBase} runtime={runtime} selectedModel={selectedModel} capabilities={dashboard?.capabilities} />}
           </Suspense>
