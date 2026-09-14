@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os'
 import { resolve, join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { spawnSync } from 'node:child_process'
+import { codingActive } from '../src/lib/codingSessions.js'
 
 const base = process.env.CAMELID_CODING_LIVE_URL
 assert.ok(base && ['127.0.0.1', 'localhost', '[::1]'].includes(new URL(base).hostname), 'Use an isolated loopback engine.')
@@ -49,7 +50,7 @@ let session = await request(route, 'POST', {
   project: { engine_id: listing.execution_engine.id, verification_command: command, browser_check: false, max_run_seconds: 900 },
 })
 const sessionId = session.id, firstRun = session.run_id, decisions = []
-const active = () => ['running', 'waiting_helpers', 'waiting_approval', 'paused', 'stopping'].includes(session.phase)
+const active = () => codingActive(session.phase)
 const started = Date.now()
 let seq = -1
 try {

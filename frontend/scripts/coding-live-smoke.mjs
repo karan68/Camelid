@@ -5,6 +5,7 @@ import { mkdtempSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { randomUUID } from 'node:crypto'
+import { codingActive } from '../src/lib/codingSessions.js'
 const base = process.env.CAMELID_CODING_LIVE_URL
 assert.ok(base, 'Set CAMELID_CODING_LIVE_URL to an isolated loopback engine URL.')
 const url = new URL(base)
@@ -14,7 +15,8 @@ mkdirSync(out, { recursive: true })
 const workspace = mkdtempSync(join(tmpdir(), 'camelid-coding-live-'))
 const before = 'def greet(name):\n    return "Hello"\n'
 const after = 'def greet(name):\n    return f"Hello, {name}!"\n'
-const testCommands = ['python3 -m unittest -q', 'python3 -m unittest -q test_greet.py']
+const python = process.platform === 'win32' ? 'python' : 'python3'
+const testCommands = [`${python} -m unittest -q`, `${python} -m unittest -q test_greet.py`]
 writeFileSync(join(workspace, 'greet.py'), before)
 writeFileSync(join(workspace, 'test_greet.py'), 'import unittest\nfrom greet import greet\n\nclass GreetingTests(unittest.TestCase):\n    def test_greeting(self):\n        self.assertEqual(greet("Camelid"), "Hello, Camelid!")\n')
 async function request(path, method = 'GET', body, extra = {}) {
@@ -25,7 +27,7 @@ async function request(path, method = 'GET', body, extra = {}) {
 }
 const health = await request('/v1/health')
 assert.ok(health.loaded_now && health.generation_ready, 'Load a certified tool-capable model first.')
-const goal = 'Fix greet.py so greet(name) returns f"Hello, {name}!". First use spawn_subagent to assign explorer to read greet.py and reviewer to read test_greet.py. Collect both findings with check_subagent_status. Use edit_file to fix greet.py; do not change test_greet.py. Then request exactly the shell command python3 -m unittest -q. Report only the test result you observed. This is a small fixture; keep each response brief.'
+const goal = `Fix greet.py so greet(name) returns f"Hello, {name}!". First use spawn_subagent to assign explorer to read greet.py and reviewer to read test_greet.py. Collect both findings with wait_for_helpers. Use edit_file to fix greet.py; do not change test_greet.py. Then request exactly the shell command ${testCommands[0]}. Report only the test result you observed. This is a small fixture; keep each response brief.`
 const creation = { workspace, goal, message_id: randomUUID().replaceAll('-', ''), model_id: health.active_model_id, allow_commands: true, max_steps: 32, max_tokens: 768 }
 const route = '/api/agent/coding/sessions'
 let session = await request(route, 'POST', creation)
@@ -33,7 +35,7 @@ const id = session.id, decisions = [], started = Date.now()
 console.log(JSON.stringify({ session: id, workspace, model: health.active_model_id }))
 let last = ''
 try {
- while (['running', 'paused', 'waiting_approval', 'stopping'].includes(session.phase)) {
+ while (codingActive(session.phase)) {
   const status = JSON.stringify({ phase: session.phase, agents: Object.fromEntries(Object.entries(session.agents).map(([id,a]) => [id,{status:a.status,action:a.action}])) })
   if (status !== last) { console.log(status); last = status }
   if (session.approval && !decisions.some(d => d.id === session.approval.id)) {
@@ -66,7 +68,7 @@ try {
  assert.equal(readFileSync(join(workspace, 'greet.py'), 'utf8'), before, 'Undo did not restore the fixture.')
  console.log('Live coding smoke passed: two actual helpers, exact reviewed edit, approved command/test output, idempotent retry, and durable Undo.')
 } catch (error) {
- if (['running','paused','waiting_approval'].includes(session.phase)) await request(`${route}/${id}/control`, 'POST', { action: 'stop' }).catch(() => {})
+ if (codingActive(session.phase)) await request(`${route}/${id}/control`, 'POST', { action: 'stop' }).catch(() => {})
  writeFileSync(join(out, 'session.json'), JSON.stringify(session, null, 2))
  writeFileSync(join(out, 'decisions.json'), JSON.stringify(decisions, null, 2))
  throw error

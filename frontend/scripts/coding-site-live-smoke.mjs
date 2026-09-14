@@ -7,6 +7,7 @@ import { join, resolve, dirname, basename } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { createServer } from 'node:http'
 import { launchBrowser } from './lib/launch-browser.mjs'
+import { codingActive } from '../src/lib/codingSessions.js'
 const base = process.env.CAMELID_CODING_LIVE_URL
 assert.ok(base && ['127.0.0.1','localhost','[::1]'].includes(new URL(base).hostname), 'Set an isolated loopback engine URL.')
 const out = resolve(process.env.CAMELID_CODING_LIVE_OUT || '../target/coding-site-live')
@@ -29,14 +30,14 @@ if (prior) {
  assert.equal(realpathSync(current.config.workspace),workspace,'Saved receipt must match the live fixture workspace')
  assert.equal(current.config.model_id,health.active_model_id)
  assert.equal(current.turns[0].user,goal,'Only a session created by this harness may be resumed')
- assert.ok(!['running','paused','waiting_approval','stopping'].includes(current.phase),'Wait for the fixture run to stop before resuming')
+ assert.ok(!codingActive(current.phase),'Wait for the fixture run to stop before resuming')
 }
 let session = prior ? await request(`${route}/${prior.id}/messages`, 'POST', { message: process.env.CAMELID_CODING_SITE_FEEDBACK || 'Inspect the generated site, finish its remaining requirements, and accurately summarize your checks.', message_id:randomUUID().replaceAll('-','') }) : await request(route, 'POST', { workspace, goal, message_id:randomUUID().replaceAll('-',''), model_id:health.active_model_id, allow_commands:false, max_steps:32, max_tokens:2048 })
 const id = session.id, decisions = [], started = Date.now()
 console.log(JSON.stringify({ session:id, workspace, model:health.active_model_id }))
 let seq = -1
 try {
- while (['running','paused','waiting_approval','stopping'].includes(session.phase)) {
+ while (codingActive(session.phase)) {
   if (session.seq !== seq) { console.log(JSON.stringify({ seq:session.seq, phase:session.phase, action:session.agents.lead?.action, reviews:session.reviews.length })); seq = session.seq }
   if (session.approval && !decisions.some(d => d.id === session.approval.id)) {
    const a = session.approval, review = a.detail.review
@@ -117,7 +118,7 @@ try {
   console.log('Independent browser checks passed: real HTML/CSS/JS links, add by button and Enter, blank rejection, input clearing, safe task text, reload persistence, completion styling and reversal, unfinished count, individual deletion, empty state, and mobile width.')
  } finally { await browser.close();await new Promise(resolve=>server.close(resolve)) }
 } catch (error) {
- if (['running','paused','waiting_approval','stopping'].includes(session.phase)) await request(`${route}/${id}/control`,'POST',{action:'stop'}).catch(()=>{})
+ if (codingActive(session.phase)) await request(`${route}/${id}/control`,'POST',{action:'stop'}).catch(()=>{})
  throw error
 } finally {
  writeFileSync(join(out,'session.json'),JSON.stringify(session,null,2))
