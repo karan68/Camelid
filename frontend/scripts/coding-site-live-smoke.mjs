@@ -13,8 +13,9 @@ assert.ok(base && ['127.0.0.1','localhost','[::1]'].includes(new URL(base).hostn
 const out = resolve(process.env.CAMELID_CODING_LIVE_OUT || '../target/coding-site-live')
 mkdirSync(out, { recursive: true })
 const prior = process.env.CAMELID_CODING_SITE_RESUME ? JSON.parse(readFileSync(process.env.CAMELID_CODING_SITE_RESUME, 'utf8')) : null
-const workspace = prior ? realpathSync(prior.config.workspace) : mkdtempSync(join(tmpdir(), 'camelid-tiny-tasks-'))
-assert.equal(realpathSync(dirname(workspace)), realpathSync(tmpdir()), 'Only this harness’s temporary fixtures may be resumed.')
+// Rust returns verbatim Windows paths; the JS realpath fallback rejects them.
+const workspace = prior ? realpathSync.native(prior.config.workspace) : mkdtempSync(join(tmpdir(), 'camelid-tiny-tasks-'))
+assert.equal(realpathSync.native(dirname(workspace)), realpathSync.native(tmpdir()), 'Only this harness’s temporary fixtures may be resumed.')
 assert.ok(basename(workspace).startsWith('camelid-tiny-tasks-'))
 const paths = ['index.html','style.css','app.js']
 const route = '/api/agent/coding/sessions'
@@ -27,7 +28,7 @@ const goal = 'Build a small task-list website called Tiny Tasks in this project 
 if (prior) {
  assert.match(prior.id,/^[a-f0-9]{32}$/)
  const current = await request(`${route}/${prior.id}`)
- assert.equal(realpathSync(current.config.workspace),workspace,'Saved receipt must match the live fixture workspace')
+ assert.equal(realpathSync.native(current.config.workspace),workspace,'Saved receipt must match the live fixture workspace')
  assert.equal(current.config.model_id,health.active_model_id)
  assert.equal(current.turns[0].user,goal,'Only a session created by this harness may be resumed')
  assert.ok(!codingActive(current.phase),'Wait for the fixture run to stop before resuming')
