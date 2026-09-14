@@ -1,18 +1,17 @@
-import { memo, useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { Fragment, createContext, memo, useContext, useEffect, useLayoutEffect, useRef, useState } from 'react'
+
+import { copyText } from './clipboard.js'
+import { displayMathOnlyLine, splitMathSegments } from './mathSegments.js'
+import { MathSpan } from '../components/chat/render/MathSpan.jsx'
+import { OutputActions } from '../components/outputs/OutputActions.jsx'
+import { MermaidDiagram } from '../components/chat/render/MermaidDiagram.jsx'
 
 /* Assistant markdown + fenced-code rendering.
    Extracted verbatim from the original ChatWorkspace so the parsing/rendering
    behavior (and the markup the CI smokes assert on) is preserved exactly. */
 
-export const normalizeCodeLanguage = (value) => {
-  const language = String(value || '').trim().replace(/[^a-zA-Z0-9_+#.-].*$/, '')
-  if (!language) return 'Code'
-  if (language.toLowerCase() === 'js') return 'JavaScript'
-  if (language.toLowerCase() === 'ts') return 'TypeScript'
-  if (language.toLowerCase() === 'html') return 'HTML'
-  if (language.toLowerCase() === 'css') return 'CSS'
-  return language.toUpperCase()
-}
+export { normalizeCodeLanguage } from './codeFences.js'
+import { codeFences } from './codeFences.js'
 
 /* Returns whether the text actually reached the clipboard. `navigator.clipboard`
    is undefined outside secure contexts — which includes reaching a Camelid served
@@ -20,20 +19,36 @@ export const normalizeCodeLanguage = (value) => {
    would otherwise make that indistinguishable from success, letting a caller show
    a "Copied" confirmation for a copy that never happened. Callers that ignore the
    result behave exactly as before. */
-export const copyText = async (text) => {
-  try {
-    if (!navigator.clipboard?.writeText) return false
-    await navigator.clipboard.writeText(text)
-    return true
-  } catch {
-    // Clipboard access can be denied even in a secure context; rendering still works.
-    return false
-  }
-}
+/* Re-exported so the many existing `from '../../lib/markdown'` call sites keep
+   working; the implementation moved to lib/clipboard.js because components
+   rendered BY this module now need it too, and importing it back from here
+   would be a cycle. */
+export { copyText }
 
 /* Only http(s)/mailto links render as anchors; any other scheme (javascript:,
    data:, file:) stays plain text — model output never picks the protocol. */
 const SAFE_LINK_SCHEME = /^(https?:|mailto:)/i
+const EMPTY_CITATIONS = []
+const CitationContext = createContext(EMPTY_CITATIONS)
+
+function CitationPill({ citeIndex }) {
+  const citations = useContext(CitationContext)
+  const citation = Array.isArray(citations) ? citations[Number(citeIndex) - 1] : undefined
+  return (
+    <button
+      type="button"
+      className="citation-pill"
+      title={`View source citation [${citeIndex}]`}
+      onClick={() => {
+        window.dispatchEvent(new CustomEvent('camelid-citation-click', {
+          detail: { index: citeIndex, citation },
+        }))
+      }}
+    >
+      <span>[{citeIndex}]</span>
+    </button>
+  )
+}
 
 /* The desktop (Tauri) webview has no browser tabs, so target="_blank" cannot
    open anything there; route http(s) links through the system browser via the
@@ -48,7 +63,7 @@ const openLinkExternally = (event, href) => {
 
 const renderInlineMarkdown = (text, keyPrefix) => {
   const parts = String(text || '')
-    .split(/(`[^`]+`|\*\*[^*]+\*\*|\*[^*\s][^*]*\*|~~[^~]+~~|\[[^\]]+\]\([^()\s]+\))/g)
+    .split(/(`[^`]+`|\*\*[^*]+\*\*|\*[^*\s][^*]*\*|~~[^~]+~~|\[[^\]]+\]\([^()\s]+\)|\[(?:Citation\s+|Source\s+)?\d+\])/gi)
     .filter(Boolean)
   return parts.map((part, index) => {
     const key = `${keyPrefix}-${index}`
@@ -64,6 +79,11 @@ const renderInlineMarkdown = (text, keyPrefix) => {
     if (part.startsWith('*') && part.endsWith('*') && part.length > 2) {
       return <em key={key}>{part.slice(1, -1)}</em>
     }
+    const citeMatch = part.match(/^\[(?:Citation\s+|Source\s+)?(\d+)\]$/i)
+    if (citeMatch) {
+      const citeIndex = citeMatch[1]
+      return <CitationPill key={key} citeIndex={citeIndex} />
+    }
     const link = part.match(/^\[([^\]]+)\]\(([^()\s]+)\)$/)
     if (link) {
       const [, label, href] = link
@@ -72,8 +92,21 @@ const renderInlineMarkdown = (text, keyPrefix) => {
       }
       return <span key={key}>{label} ({href})</span>
     }
-    return <span key={key}>{part}</span>
+    return <span key={key}>{renderMathInText(part, key)}</span>
   })
+}
+
+/* Math is applied ONLY to the parts the inline splitter left as plain text.
+   Running it earlier would mathify a $ inside `inline code`, a link target or
+   a bold run; running it here means those all still win. */
+const renderMathInText = (value, keyPrefix) => {
+  const segments = splitMathSegments(value)
+  if (segments.length === 1 && segments[0].type === 'text') return value
+  return segments.map((segment, index) => (
+    segment.type === 'math'
+      ? <MathSpan key={`${keyPrefix}-m${index}`} tex={segment.value} display={segment.display} />
+      : <Fragment key={`${keyPrefix}-m${index}`}>{segment.value}</Fragment>
+  ))
 }
 
 /* ---- Tables: header + |---| separator + body rows, cells get inline markdown ---- */
@@ -249,6 +282,17 @@ const renderMarkdownText = (text, keyPrefix) => {
       blocks.push(<hr key={`${keyPrefix}-hr-${blocks.length}`} />)
       return
     }
+    /* A line that is nothing but one display formula becomes its own centred
+       block rather than a paragraph that happens to contain a formula. */
+    const displayMath = displayMathOnlyLine(line)
+    if (displayMath) {
+      flushParagraph()
+      flushList()
+      blocks.push(
+        <MathSpan key={`${keyPrefix}-math-${blocks.length}`} tex={displayMath} display />,
+      )
+      return
+    }
     const heading = line.match(/^(#{1,6})\s+(.+)$/)
     if (heading) {
       flushParagraph()
@@ -369,19 +413,9 @@ const renderHighlightedCode = (code, language, keyPrefix) => {
   return nodes
 }
 
-const splitFenceInfo = (value) => {
-  const trimmed = String(value || '').trim()
-  if (!trimmed) return { language: 'Code', firstCodeLine: '' }
-  const [, rawLanguage = '', firstCodeLine = ''] = trimmed.match(/^([a-zA-Z0-9_+#.-]+)?\s*([\s\S]*)$/) || []
-  return {
-    language: normalizeCodeLanguage(rawLanguage),
-    firstCodeLine: firstCodeLine.trimStart(),
-  }
-}
-
 export const CODE_CARD_STREAMING_LABEL = 'Still generating — code block incomplete'
 
-export function CodeBlockCard({ language, code, keyPrefix, stillGenerating }) {
+export function CodeBlockCard({ language, code, sourceCode = code, keyPrefix, stillGenerating }) {
   const preRef = useRef(null)
   const autoFollowCodeRef = useRef(true)
   const [copied, setCopied] = useState(false)
@@ -427,6 +461,7 @@ export function CodeBlockCard({ language, code, keyPrefix, stillGenerating }) {
       <figcaption>
         <span className="message-code-card-title">{language}</span>
         {stillGenerating && <span className="message-code-card-status" aria-live="polite" data-live-status="active">{CODE_CARD_STREAMING_LABEL}</span>}
+        <OutputActions code={sourceCode} language={language} disabled={stillGenerating} />
         <button type="button" onClick={handleCopy} aria-label={`Copy ${language} code`}>{copied ? 'Copied' : 'Copy'}</button>
       </figcaption>
       {/* Highlighting deferred while the fence is open (Phase 8B): plain text
@@ -437,18 +472,32 @@ export function CodeBlockCard({ language, code, keyPrefix, stillGenerating }) {
   )
 }
 
+const isMermaidLanguage = (language) => String(language || '').trim().toLowerCase() === 'mermaid'
+
 const pushCodeBlock = (blocks, language, code, keyPrefix, { incomplete = false, streaming = false } = {}) => {
   const trimmedCode = String(code || '').replace(/^\n+|\n+$/g, '')
   const stillGenerating = Boolean(incomplete && streaming)
-  blocks.push(
+  const card = (
     <CodeBlockCard
       key={`code-${blocks.length}`}
       language={language}
       code={trimmedCode}
+      sourceCode={code}
       keyPrefix={keyPrefix}
       stillGenerating={stillGenerating}
-    />,
+    />
   )
+  /* A mermaid fence draws only once it is CLOSED. Handing Mermaid a half-typed
+     diagram on every frame would flash parse failures through the whole
+     stream, so until the fence closes this stays the ordinary code card --
+     which is also what it falls back to if the diagram never parses. */
+  if (isMermaidLanguage(language) && trimmedCode && !incomplete) {
+    blocks.push(
+      <MermaidDiagram key={`mermaid-${blocks.length}`} source={trimmedCode} fallback={card} />,
+    )
+    return
+  }
+  blocks.push(card)
 }
 
 export const hasOpenCodeFence = (content) => {
@@ -478,42 +527,35 @@ function splitStableBoundary(content) {
 function renderFencedContent(normalized, streaming) {
   const blocks = []
   let cursor = 0
-  let fenceStart = normalized.indexOf('```', cursor)
-  while (fenceStart !== -1) {
-    const before = normalized.slice(cursor, fenceStart)
-    blocks.push(...renderMarkdownText(before, `md-${blocks.length}`))
-    const infoStart = fenceStart + 3
-    const nextLine = normalized.indexOf('\n', infoStart)
-    const infoEnd = nextLine === -1 ? normalized.length : nextLine
-    const { language, firstCodeLine } = splitFenceInfo(normalized.slice(infoStart, infoEnd))
-    const codeStart = nextLine === -1 ? infoEnd : nextLine + 1
-    const fenceEnd = normalized.indexOf('```', codeStart)
-    const incompleteFence = fenceEnd === -1
-    const codeEnd = fenceEnd === -1 ? normalized.length : fenceEnd
-    const codeBody = normalized.slice(codeStart, codeEnd)
-    const code = firstCodeLine ? `${firstCodeLine}${codeBody ? `\n${codeBody}` : ''}` : codeBody
-    pushCodeBlock(blocks, language, code, `code-${blocks.length}`, { incomplete: incompleteFence, streaming })
-    cursor = fenceEnd === -1 ? normalized.length : fenceEnd + 3
-    fenceStart = normalized.indexOf('```', cursor)
+  for (const fence of codeFences(normalized)) {
+    blocks.push(...renderMarkdownText(normalized.slice(cursor, fence.start), `md-${blocks.length}`))
+    pushCodeBlock(blocks, fence.language, fence.code, `code-${blocks.length}`, { incomplete: fence.incomplete, streaming })
+    cursor = fence.end
   }
   blocks.push(...renderMarkdownText(normalized.slice(cursor), `md-${blocks.length}`))
   return blocks
 }
 
-function AssistantMarkdownInner({ content, streaming = false }) {
+function AssistantMarkdownInner({ content, streaming = false, citations = EMPTY_CITATIONS }) {
   const normalized = String(content || '').replace(/\r\n/g, '\n')
   if (!streaming) {
     const blocks = renderFencedContent(normalized, false)
-    return <div className="message-markdown">{blocks.length ? blocks : <p>{content}</p>}</div>
+    return (
+      <CitationContext.Provider value={citations}>
+        <div className="message-markdown">{blocks.length ? blocks : <p>{content}</p>}</div>
+      </CitationContext.Provider>
+    )
   }
   const boundary = splitStableBoundary(normalized)
   const stable = normalized.slice(0, boundary)
   const tail = normalized.slice(boundary)
   return (
-    <div className="message-markdown">
-      {stable && <StableMarkdownSegment content={stable} />}
-      {tail && renderFencedContent(tail, true)}
-    </div>
+    <CitationContext.Provider value={citations}>
+      <div className="message-markdown">
+        {stable && <StableMarkdownSegment content={stable} />}
+        {tail && renderFencedContent(tail, true)}
+      </div>
+    </CitationContext.Provider>
   )
 }
 

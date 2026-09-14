@@ -216,6 +216,7 @@ impl ResponsesRequest {
         let response_format = responses_text_format(self.text.as_ref())?;
         Ok(ChatCompletionRequest {
             model: self.model.clone(),
+            camelid_expected_gguf_sha256: None,
             messages: Some(messages),
             stream: self.stream,
             max_tokens: self.max_output_tokens,
@@ -242,6 +243,8 @@ impl ResponsesRequest {
             camelid_context_budget_tokens: None,
             camelid_receipt: None,
             camelid_enable_thinking: None,
+            camelid_target_verified_render_draft_token_ids: None,
+            camelid_target_verified_render_segments: None,
             camelid_image_min_tokens: None,
             camelid_image_max_tokens: None,
             tools,

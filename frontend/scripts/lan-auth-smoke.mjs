@@ -338,12 +338,12 @@ async function assertCompactInteractions(viewport) {
       y: Math.round(viewport.height / 2),
     },
   })
-  await page.waitForFunction(() => !document.querySelector('.camelid-app')?.classList.contains('is-mobile-open'))
+  await page.waitForFunction(() => !document.querySelector('.camelid-app')?.classList.contains('is-mobile-open') && document.querySelector('#camelid-sidebar')?.getBoundingClientRect().right <= 1)
 
   const toolReachability = await page.evaluate(() => {
     const tools = document.querySelector('.cxcomposer__tools')
     const model = tools?.querySelector('.cxcomposer__model-select')
-    const control = tools?.querySelector('button[aria-label="Generation controls"]')
+    const control = tools?.querySelector('button[aria-label="Options"]')
     if (!tools || !model || !control) return null
     tools.scrollLeft = tools.scrollWidth
     const toolsRect = tools.getBoundingClientRect()
@@ -365,7 +365,9 @@ async function assertCompactInteractions(viewport) {
   assert.ok(toolReachability.controlLeft >= toolReachability.toolsLeft, `${viewport.name} last composer control cannot scroll into view: ${JSON.stringify(toolReachability)}`)
   assert.ok(toolReachability.controlRight <= toolReachability.toolsRight + 1, `${viewport.name} last composer control remains clipped: ${JSON.stringify(toolReachability)}`)
   assert.ok(toolReachability.modelRight <= toolReachability.controlLeft, `${viewport.name} compact composer controls overlap: ${JSON.stringify(toolReachability)}`)
-  await page.$eval('button[aria-label="Generation controls"]', (button) => button.click())
+  await page.click('button[aria-label="Options"]')
+  await page.waitForSelector('button[aria-label="Generation controls"]')
+  await page.click('button[aria-label="Generation controls"]')
   await page.waitForSelector('.chat-controls')
   await page.click('.chat-controls__head button')
   await page.waitForFunction(() => !document.querySelector('.chat-controls'))

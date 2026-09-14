@@ -3,7 +3,7 @@ use std::{
     convert::Infallible,
     env, mem,
     net::SocketAddr,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant},
 };
@@ -27,15 +27,22 @@ use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 use tower_http::trace::TraceLayer;
 
+mod changes;
 #[allow(dead_code)]
 mod continuous_batch;
 mod contract;
+pub(crate) mod documents;
 mod engine;
+mod mcp;
 mod metrics;
 mod responses;
 mod responses_store;
 mod server;
-mod workspace;
+mod tool_envelope;
+mod web_research;
+pub(crate) mod workspace;
+
+pub(crate) use web_research::fetch_public_http;
 
 /// Re-exported so anything else in the crate that fronts this server bounds
 /// request bodies at the same size the server itself does.
@@ -46,13 +53,6 @@ pub(crate) use server::{resolve_api_key, ApiAuth};
 pub use server::{ApiSurface, ServeOptions};
 
 use crate::{
-    eagle3::Eagle3DraftModel,
-    eagle3_serving::{
-        clamp_max_tokens_to_logical_budget as clamp_eagle3_max_tokens,
-        configured_logical_token_limit as configured_eagle3_logical_token_limit,
-        validate_logical_budget as validate_eagle3_logical_budget, Eagle3ServeHeadKey,
-        Eagle3ServingConfig, Eagle3ServingState, MAX_DRAFT_TOKENS as EAGLE3_MAX_DRAFT_TOKENS,
-    },
     embedding::{
         cosine_similarity, validate_bitnet_embedding_metadata, EmbeddingRuntime, EncoderConfig,
     },
@@ -103,7 +103,6 @@ const STREAM_TIMING_DIAGNOSTICS_ENV: &str = "CAMELID_STREAM_TIMING_DIAGNOSTICS";
 const SPEC_DECODE_ENV: &str = "CAMELID_SPEC_DECODE";
 const SPEC_DRAFT_MODEL_ENV: &str = "CAMELID_SPEC_DRAFT_MODEL";
 const SPEC_DRAFT_TOKENS_ENV: &str = "CAMELID_SPEC_DRAFT_TOKENS";
-const EAGLE3_MODEL_ENV: &str = "CAMELID_EAGLE3_MODEL";
 const SPEC_NGRAM_MIN_ENV: &str = "CAMELID_SPEC_NGRAM_MIN";
 const SPEC_NGRAM_MAX_ENV: &str = "CAMELID_SPEC_NGRAM_MAX";
 const PROMPT_PREFIX_CACHE_CAPACITY_ENV: &str = "CAMELID_PREFIX_CACHE_CAPACITY";
@@ -113,22 +112,6 @@ const DEFAULT_PROMPT_PREFIX_CACHE_MIN_TOKENS: usize = 16;
 /// Reserved model id for the speculative draft model; loaded without becoming
 /// the active model.
 const SPEC_DRAFT_MODEL_ID: &str = "spec-draft";
-const EAGLE3_TARGET_SHA256: &str =
-    "6c1a2b41161032677be168d354123594c0e6e67d2b9227c84f296ad037c728ff";
-const EAGLE3_THOUGHTWORKS_SHA256: &str =
-    "c0713251464a9b6b5fcf9fb229587bbe59b6fd1521027aef32101d11b9ebbdaf";
-const EAGLE3_SHAREGPT_E8_SHA256: &str =
-    "0694d52a4c7ebf3d4f9bb833cf5f2610f0cc0d30bf62a2376e0b2ee06cbe3662";
-const EAGLE3_SHAREGPT_E8_CONFIG_SHA256: &str =
-    "1f6f8e7dcf67648757016925e28b09c40461e22b0ffe522b9abc9802ec14eff8";
-const EAGLE3_SHAREGPT_E9_SHA256: &str =
-    "0192ee37dff4b7a86d13011d40e9cf622b331fe76f637d7d1ea24c4b81574304";
-const EAGLE3_SHAREGPT_E9_CONFIG_SHA256: &str =
-    "a5b3a9b3674e3233cdc4f34d201a7c366a2b089ec00a41a9da6b430ca8fd3136";
-const EAGLE3_SHAREGPT_SW512_E9_SHA256: &str =
-    "cf879511aa0e931ac2cfdaf0cc3dfa2e1ec9773c41f3c093a967420222fa84d0";
-const EAGLE3_SHAREGPT_SW512_E9_CONFIG_SHA256: &str =
-    "c7997a68fd0f2324b41ab779c13909115b67cac9a36f758cc5b542cba12c2568";
 const STREAM_POLL_YIELD_ENV: &str = "CAMELID_STREAM_POLL_YIELD";
 const DEFAULT_GENERATION_TIMEOUT_MS: u64 = 15 * 60 * 1000;
 const DEFAULT_PUBLIC_CHAT_MAX_TOKENS: u32 = 800;
@@ -138,21 +121,22 @@ const JINJA_CHAT_TEMPLATE_CACHE_LIMIT: usize = 16;
 static JINJA_CHAT_TEMPLATE_ENV_CACHE: OnceLock<Mutex<HashMap<String, Arc<Environment<'static>>>>> =
     OnceLock::new();
 
-struct CachedEagle3Checkpoint {
-    path: PathBuf,
-    sha256: String,
-    model: Arc<Eagle3DraftModel>,
-}
-
-/// Host-side EAGLE checkpoint cache: avoids re-reading and reallocating the
-/// ~486 MB checkpoint on every chat. The Metal-resident upload built from it is
-/// pooled separately (`eagle3_serving::Eagle3ServeHeadKey`), so a pool miss
-/// re-uploads from these bytes without touching disk.
-static EAGLE3_CHECKPOINT_CACHE: OnceLock<Mutex<Option<CachedEagle3Checkpoint>>> = OnceLock::new();
-
 #[derive(Clone)]
 pub struct AppState {
     loaded_models: Arc<RwLock<HashMap<String, LoadedModel>>>,
+    /// Cleared while the startup warm-up generation is still building the
+    /// engine, so `/health` cannot answer `generation_ready` before the engine
+    /// that will serve the first request exists.
+    ///
+    /// The warm-up runs with the listener already accepting — a client must be
+    /// able to read a health page during a long load — and it builds the engine
+    /// by firing one self-request through the ordinary chat path. Without this
+    /// flag a client that health-gates and sends immediately races that
+    /// self-request and can win, and the request that wins is served by a
+    /// colder path than the one every later request gets. `true` whenever no
+    /// warm-up is pending, so nothing changes for a server started without a
+    /// startup model.
+    generation_warm: Arc<std::sync::atomic::AtomicBool>,
     /// Gemma 4 serve runtimes (local single-node or distributed layer-sharding),
     /// keyed by model id. Populated when a gemma4 model is loaded (lane on by
     /// default; opt out with `CAMELID_GEMMA4_SERVE=0`). This is an additive,
@@ -212,6 +196,8 @@ pub struct AppState {
     /// idempotency key) are serialized through a process-local keyed lock.
     responses_locks: responses_store::ResponseLockPool,
     workspace_sessions: workspace::WorkspaceSessionManager,
+    mcp: mcp::McpManager,
+    changes: changes::ChangeManager,
     /// Process-rotated bearer capability for same-user Workspace CLI clients.
     /// Browser requests continue to use the independent same-origin predicate.
     workspace_cli_token: Option<Arc<str>>,
@@ -254,12 +240,20 @@ pub struct AppState {
     api_surface: ApiSurface,
     /// Lock-free process metrics shared by middleware and decode jobs.
     metrics: metrics::ServerMetrics,
+    /// Bounded public-web transport used only by `/api/web/research` before an
+    /// ordinary chat generation. It never receives request headers or model
+    /// state, so Camelid API credentials cannot be forwarded and model tool
+    /// support is irrelevant. Its optional GitHub provider credential comes
+    /// only from the operator environment and is host-scoped inside the
+    /// transport. The trait seam keeps route tests fully offline.
+    web_research_transport: Arc<dyn web_research::WebTransport>,
 }
 
 impl Default for AppState {
     fn default() -> Self {
         Self {
             loaded_models: Arc::new(RwLock::new(HashMap::new())),
+            generation_warm: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             gemma4_runtimes: Arc::new(RwLock::new(HashMap::new())),
             gemma4_serve_lanes: Arc::new(RwLock::new(HashMap::new())),
             gemma4_catalog_managed_ghosts: Arc::new(RwLock::new(HashMap::new())),
@@ -282,6 +276,8 @@ impl Default for AppState {
             responses_store: responses_store::ResponsesStore::default(),
             responses_locks: responses_store::ResponseLockPool::default(),
             workspace_sessions: workspace::WorkspaceSessionManager::default(),
+            mcp: mcp::McpManager::default(),
+            changes: changes::ChangeManager::default(),
             workspace_cli_token: None,
             serve_addr: SocketAddr::from(([127, 0, 0, 1], 8181)),
             engine: engine::EngineHandle::spawn(),
@@ -293,6 +289,7 @@ impl Default for AppState {
             server_limits: server::ServerPolicy::loopback_default().limits,
             api_surface: ApiSurface::Full,
             metrics: metrics::ServerMetrics::default(),
+            web_research_transport: web_research::default_transport(),
         }
     }
 }
@@ -353,6 +350,15 @@ impl AppState {
     fn with_server_policy(mut self, policy: &server::ServerPolicy) -> Self {
         self.server_limits = policy.limits;
         self.api_surface = policy.api_surface();
+        self
+    }
+
+    #[cfg(test)]
+    fn with_web_research_transport_for_tests(
+        mut self,
+        transport: Arc<dyn web_research::WebTransport>,
+    ) -> Self {
+        self.web_research_transport = transport;
         self
     }
 
@@ -572,6 +578,15 @@ pub struct LoadModelRequest {
     /// explicitly. Omitted preserves the historical activate-on-load behavior.
     #[serde(default)]
     pub set_active: Option<bool>,
+    /// Skip the fit preflight for this one request — the per-request equivalent of
+    /// `CAMELID_SKIP_FIT_CHECK=1`.
+    ///
+    /// Exists because the preflight's only escape hatch used to be a process-wide env
+    /// var, which the desktop app cannot set (its sidecar is spawned args-only). An
+    /// error whose stated remedy its own audience cannot perform is a dead end, so the
+    /// UI needs an override it can put on a button.
+    #[serde(default)]
+    pub force: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -581,6 +596,9 @@ pub enum Gemma4ServeLane {
     Local,
     Distributed,
     Cuda,
+    /// Exact Gemma 4 12B QAT Q4_0 target plus the pinned MTP12 assistant on
+    /// Apple Metal. This lane is never selected implicitly.
+    Mtp12Metal,
 }
 
 /// Effective accelerator serving the single-node Ghost-MoE lane.
@@ -621,27 +639,22 @@ pub struct HealthResponse {
     pub build: String,
     pub loaded_now: bool,
     pub generation_ready: bool,
+    /// Effective context window of the active loaded runtime, not a catalog or
+    /// training-context guess. WebUI prompt budgeting uses this value.
+    pub active_context_length: Option<u32>,
+    /// Operator ceilings applied by this server process.
+    pub max_prompt_tokens: usize,
+    pub max_generation_tokens: u32,
     /// True when the active runnable model has a resident Prism/Qwen3-VL
     /// projector and can accept OpenAI `image_url` chat content parts.
     pub vision_ready: bool,
+    /// Merged image tokens one attached image is charged by default, so a client
+    /// can budget its context window without guessing. `None` when the active
+    /// model cannot accept an image at all. This is the default ceiling only: a
+    /// request that sets `camelid_image_max_tokens` may legitimately cost more,
+    /// up to the hard bound this server enforces.
+    pub vision_token_allowance: Option<u32>,
     pub active_model_id: Option<String>,
-    /// Active speculative serving mode. Omitted for ordinary decode so older
-    /// clients retain their existing behavior.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub speculative_decode: Option<&'static str>,
-    /// Exact prompt-plus-output envelope for serving lanes with a narrower
-    /// verified context than the model metadata advertises.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub logical_token_limit: Option<usize>,
-    /// Effective context exposed for WebUI budgeting. These are present for
-    /// EAGLE-3 because its explicitly selected serving rung can be narrower
-    /// than Llama's model-native metadata.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub active_context_length: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_prompt_tokens: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_generation_tokens: Option<u32>,
     pub q8_runtime: Q8RuntimeHealth,
     pub execution_plan: Option<ExecutionPlan>,
     /// Which backend serves the active model: "gemma4-runtime", "runnable-runtime",
@@ -851,6 +864,10 @@ pub struct ModelListItem {
     pub object: &'static str,
     pub created: u64,
     pub owned_by: &'static str,
+    /// Camelid extension: identity of the exact loaded GGUF. Agent clients use
+    /// this to avoid transferring tool capability to a same-named replacement.
+    pub filename: Option<String>,
+    pub gguf_sha256: String,
     pub meta: Option<ModelListMeta>,
 }
 
@@ -873,6 +890,11 @@ pub struct ModelListMeta {
 #[derive(Debug, Deserialize)]
 pub struct ChatCompletionRequest {
     pub model: Option<String>,
+    /// Camelid-private optimistic binding for agent requests. When present, the
+    /// request is accepted only while `model` resolves to these exact GGUF
+    /// bytes. Ordinary OpenAI-compatible callers omit it and retain the
+    /// existing model-selection behavior.
+    pub camelid_expected_gguf_sha256: Option<String>,
     pub messages: Option<Vec<ChatMessage>>,
     pub stream: Option<bool>,
     pub max_tokens: Option<u32>,
@@ -921,6 +943,16 @@ pub struct ChatCompletionRequest {
     /// channels are stripped from chat output either way. Default: false (the
     /// reference's `enable_thinking:false` rendering).
     pub camelid_enable_thinking: Option<bool>,
+    /// Private two-pass presentation seam. These ids are never trusted as
+    /// output: only the exact MTP12 target lane may accept them, and each id is
+    /// target-greedy-verified for this request's rendered prompt before its text
+    /// enters the SSE stream.
+    pub camelid_target_verified_render_draft_token_ids: Option<Vec<u32>>,
+    /// Private capture-only synthesis seam. Each prepared section is rendered
+    /// against its own messages and target-greedy-verified before any text is
+    /// emitted. The route admits only the exact hash-pinned MTP12 Metal lane,
+    /// and every section must fit the receipted 512-position envelope.
+    pub camelid_target_verified_render_segments: Option<Vec<CamelidTargetVerifiedRenderSegment>>,
     /// Private Prism image sizing extensions. Values are merged image-token
     /// counts (Qwen3-VL emits one token per aligned 32x32-pixel tile).
     pub camelid_image_min_tokens: Option<u32>,
@@ -959,6 +991,12 @@ pub struct ChatCompletionRequest {
     pub stream_options: Option<serde_json::Value>,
     #[serde(flatten)]
     pub unsupported_fields: HashMap<String, serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct CamelidTargetVerifiedRenderSegment {
+    pub messages: Vec<ChatMessage>,
+    pub token_ids: Vec<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1005,6 +1043,113 @@ pub struct CompletionRequest {
     pub camelid_receipt: Option<bool>,
     #[serde(flatten)]
     pub unsupported_fields: HashMap<String, serde_json::Value>,
+}
+
+fn valid_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn artifact_binding_error(
+    status: StatusCode,
+    code: &'static str,
+    message: impl Into<String>,
+) -> Response {
+    api_error(
+        status,
+        code,
+        message.into(),
+        Some("camelid_expected_gguf_sha256"),
+    )
+}
+
+// Axum handlers return `Response` directly, so preserving the typed HTTP error
+// here avoids lossy remapping at every artifact-bound generation entry point.
+#[expect(clippy::result_large_err)]
+fn verify_loaded_artifact_binding(
+    model: &LoadedModel,
+    expected_sha256: Option<&str>,
+) -> std::result::Result<(), Response> {
+    let Some(expected_sha256) = expected_sha256 else {
+        return Ok(());
+    };
+    if !valid_sha256_hex(expected_sha256) {
+        return Err(artifact_binding_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_expected_model_artifact",
+            "camelid_expected_gguf_sha256 must be a 64-character hexadecimal SHA-256 digest",
+        ));
+    }
+    let actual_sha256 = model.lane.gguf_sha256.trim();
+    if !valid_sha256_hex(actual_sha256) {
+        return Err(artifact_binding_error(
+            StatusCode::CONFLICT,
+            "model_artifact_identity_unavailable",
+            "the selected model does not expose a usable GGUF SHA-256 identity; reload it before continuing the agent session",
+        ));
+    }
+    if !actual_sha256.eq_ignore_ascii_case(expected_sha256) {
+        return Err(artifact_binding_error(
+            StatusCode::CONFLICT,
+            "model_artifact_mismatch",
+            "the selected model id now refers to different GGUF bytes; restart or explicitly resume the agent with the newly loaded artifact",
+        ));
+    }
+    Ok(())
+}
+
+/// Resolve and bind an opt-in exact-artifact request while holding the same
+/// transition lock used by load/unload. Callers keep the returned guard only
+/// until they have cloned a dedicated serve runtime. Dense generation drops it
+/// before prompt preparation: [`prepare_generation`] resolves one `LoadedModel`
+/// clone and re-verifies the digest on that clone, so a concurrent transition
+/// either supplies the expected runtime or fails closed without nesting this
+/// lock when a cold speculative draft model is loaded.
+async fn bind_expected_loaded_artifact(
+    state: &AppState,
+    requested_model: Option<&str>,
+    expected_sha256: Option<&str>,
+) -> std::result::Result<Option<tokio::sync::OwnedMutexGuard<()>>, Response> {
+    let Some(expected_sha256) = expected_sha256 else {
+        return Ok(None);
+    };
+    if !valid_sha256_hex(expected_sha256) {
+        return Err(artifact_binding_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_expected_model_artifact",
+            "camelid_expected_gguf_sha256 must be a 64-character hexadecimal SHA-256 digest",
+        ));
+    }
+
+    let transition = Arc::clone(&state.model_transition).lock_owned().await;
+    let active_id = state.active_model_id.read().await.clone();
+    let loaded = state.loaded_models.read().await;
+    let target = if let Some(requested) = requested_model {
+        loaded.get(requested).or_else(|| {
+            loaded.values().find(|model| {
+                model.id == requested
+                    || model
+                        .path
+                        .file_name()
+                        .is_some_and(|name| name.to_string_lossy() == requested)
+            })
+        })
+    } else if let Some(active) = active_id.as_deref() {
+        loaded.get(active)
+    } else if loaded.len() == 1 {
+        loaded.values().next()
+    } else {
+        None
+    };
+    let model = target.ok_or_else(|| {
+        artifact_binding_error(
+            StatusCode::CONFLICT,
+            "model_artifact_identity_unavailable",
+            "the requested model artifact is not currently loaded; reload it before continuing the agent session",
+        )
+    })?;
+    verify_loaded_artifact_binding(model, Some(expected_sha256))?;
+    drop(loaded);
+    Ok(Some(transition))
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1565,6 +1710,10 @@ pub struct LlamaServerSlotCamelid {
 #[derive(Clone, Debug, Deserialize)]
 pub struct GenerationSessionRequest {
     pub model: Option<String>,
+    /// See [`ChatCompletionRequest::camelid_expected_gguf_sha256`]. Agent
+    /// preflights carry the same exact-artifact binding as the generation they
+    /// size, so a same-id replacement cannot silently cross a model step.
+    pub camelid_expected_gguf_sha256: Option<String>,
     pub prompt: Option<String>,
     pub messages: Option<Vec<ChatMessage>>,
     pub max_tokens: Option<u32>,
@@ -2111,21 +2260,6 @@ enum SpecDecodeMode {
     /// Suffix-decoding drafting, flattened to a chain so it rides the batched
     /// column verify rather than the (much more expensive) tree verify.
     Suffix,
-    /// Llama-3.2-3B EAGLE-3: full-width suffix-first verification with the
-    /// certified N8/K4/X5 learned-tree fallback (operator-overridable through
-    /// `CAMELID_EAGLE3_SERVE_TREE_{NODES,TOP_K,EXPANSIONS}`).
-    Eagle3,
-}
-
-impl SpecDecodeMode {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::NGram => "ngram",
-            Self::DraftModel => "draft",
-            Self::Suffix => "suffix",
-            Self::Eagle3 => "eagle3",
-        }
-    }
 }
 
 fn spec_decode_mode_from_env() -> Option<SpecDecodeMode> {
@@ -2133,7 +2267,6 @@ fn spec_decode_mode_from_env() -> Option<SpecDecodeMode> {
         Ok(value) if value.eq_ignore_ascii_case("ngram") => Some(SpecDecodeMode::NGram),
         Ok(value) if value.eq_ignore_ascii_case("draft") => Some(SpecDecodeMode::DraftModel),
         Ok(value) if value.eq_ignore_ascii_case("suffix") => Some(SpecDecodeMode::Suffix),
-        Ok(value) if value.eq_ignore_ascii_case("eagle3") => Some(SpecDecodeMode::Eagle3),
         _ => None,
     }
 }
@@ -2173,147 +2306,6 @@ fn spec_draft_tokens_from_env(default: usize) -> usize {
         .unwrap_or(default)
 }
 
-fn eagle3_draft_tokens_from_env() -> std::result::Result<usize, String> {
-    let draft_tokens = match env::var(SPEC_DRAFT_TOKENS_ENV) {
-        Ok(value) => value.trim().parse::<usize>().map_err(|_| {
-            format!(
-                "{SPEC_DRAFT_TOKENS_ENV} must be an integer in 1..={EAGLE3_MAX_DRAFT_TOKENS}, got {value:?}"
-            )
-        })?,
-        Err(_) => EAGLE3_MAX_DRAFT_TOKENS,
-    };
-    if !(1..=EAGLE3_MAX_DRAFT_TOKENS).contains(&draft_tokens) {
-        return Err(format!(
-            "{SPEC_DRAFT_TOKENS_ENV} must be in 1..={EAGLE3_MAX_DRAFT_TOKENS}, got {draft_tokens}"
-        ));
-    }
-    Ok(draft_tokens)
-}
-
-fn eagle3_target_contract_error(config: &LlamaModelConfig, target_sha256: &str) -> Option<String> {
-    let geometry_matches = config.architecture == "llama"
-        && config.embedding_length == 3_072
-        && config.block_count == 28
-        && config.feed_forward_length == 8_192
-        && config.attention_head_count == 24
-        && config.attention_head_count_kv == 8
-        && config.vocab_size == Some(128_256);
-    if target_sha256.eq_ignore_ascii_case(EAGLE3_TARGET_SHA256) && geometry_matches {
-        None
-    } else {
-        Some(format!(
-            "EAGLE-3 serving is pinned to Llama-3.2-3B target SHA-256 {EAGLE3_TARGET_SHA256} and geometry llama/3072/28/8192/24/8/128256; got sha256={target_sha256}, arch={}, hidden={}, layers={}, ffn={}, heads={}/{}, vocab={:?}",
-            config.architecture,
-            config.embedding_length,
-            config.block_count,
-            config.feed_forward_length,
-            config.attention_head_count,
-            config.attention_head_count_kv,
-            config.vocab_size,
-        ))
-    }
-}
-
-/// Returns the host checkpoint and its weights SHA-256 (the serve head pool's
-/// identity component).
-fn load_eagle3_checkpoint_cached(
-    path: &std::path::Path,
-) -> crate::error::Result<(Arc<Eagle3DraftModel>, String)> {
-    let weights_path = path.join("model.safetensors");
-    let sha256 = receipt::sha256_file_hex_cached(&weights_path).map_err(|error| {
-        BackendError::InvalidModelMetadata(format!(
-            "could not hash EAGLE-3 checkpoint {}: {error}",
-            weights_path.display()
-        ))
-    })?;
-    let is_pinned_serving_artifact = sha256 == EAGLE3_THOUGHTWORKS_SHA256
-        || sha256 == EAGLE3_SHAREGPT_E8_SHA256
-        || sha256 == EAGLE3_SHAREGPT_E9_SHA256
-        || sha256 == EAGLE3_SHAREGPT_SW512_E9_SHA256;
-    let derived_provenance = if is_pinned_serving_artifact {
-        None
-    } else {
-        crate::eagle3::require_derived_opt_in()?;
-        Some(crate::eagle3::validate_derived_checkpoint(path, &sha256)?)
-    };
-    let pinned_sharegpt_config = match sha256.as_str() {
-        EAGLE3_SHAREGPT_E8_SHA256 => Some(("ShareGPT-E8", EAGLE3_SHAREGPT_E8_CONFIG_SHA256)),
-        EAGLE3_SHAREGPT_E9_SHA256 => Some(("ShareGPT-E9", EAGLE3_SHAREGPT_E9_CONFIG_SHA256)),
-        EAGLE3_SHAREGPT_SW512_E9_SHA256 => {
-            Some(("ShareGPT-SW512-E9", EAGLE3_SHAREGPT_SW512_E9_CONFIG_SHA256))
-        }
-        _ => None,
-    };
-    if let Some((label, expected_config_sha256)) = pinned_sharegpt_config {
-        let config_path = path.join("config.json");
-        let config_sha256 = receipt::sha256_file_hex_cached(&config_path).map_err(|error| {
-            BackendError::InvalidModelMetadata(format!(
-                "could not hash EAGLE-3 config {}: {error}",
-                config_path.display()
-            ))
-        })?;
-        if config_sha256 != expected_config_sha256 {
-            return Err(BackendError::InvalidModelMetadata(format!(
-                "{label} EAGLE-3 config SHA-256 is {config_sha256}, expected {expected_config_sha256}"
-            )));
-        }
-    }
-    let cache = EAGLE3_CHECKPOINT_CACHE.get_or_init(|| Mutex::new(None));
-    let cached_model = {
-        let guard = cache
-            .lock()
-            .expect("EAGLE-3 checkpoint cache mutex poisoned");
-        guard
-            .as_ref()
-            .filter(|hit| hit.path == path && hit.sha256 == sha256)
-            .map(|hit| Arc::clone(&hit.model))
-    };
-    if let Some(model) = cached_model {
-        return Ok((model, sha256));
-    }
-
-    let model = Arc::new(Eagle3DraftModel::load(path)?);
-    let config_contract_sha256 = derived_provenance
-        .as_ref()
-        .map(|provenance| provenance.source_weights_sha256.as_str())
-        .unwrap_or(sha256.as_str());
-    let config_variant_matches = if config_contract_sha256 == EAGLE3_THOUGHTWORKS_SHA256 {
-        model.config.architectures == ["LlamaForCausalLM"]
-            && model.config.rope_theta == crate::eagle3::ROPE_THETA
-            && model.config.sliding_window.is_none()
-    } else if config_contract_sha256 == EAGLE3_SHAREGPT_E8_SHA256 {
-        model.config.architectures == ["LlamaForCausalLMEagle3"]
-            && model.config.rope_theta == crate::eagle3::SHAREGPT_ROPE_THETA
-            && model.config.sliding_window.is_none()
-    } else if config_contract_sha256 == EAGLE3_SHAREGPT_E9_SHA256 {
-        model.config.architectures == ["LlamaForCausalLMEagle3"]
-            && model.config.rope_theta == crate::eagle3::SHAREGPT_ROPE_THETA
-            && model.config.sliding_window == Some(256)
-    } else if config_contract_sha256 == EAGLE3_SHAREGPT_SW512_E9_SHA256 {
-        model.config.architectures == ["LlamaForCausalLMEagle3"]
-            && model.config.rope_theta == crate::eagle3::SHAREGPT_ROPE_THETA
-            && model.config.sliding_window == Some(512)
-    } else {
-        model.config.architectures == ["LlamaForCausalLMEagle3"]
-            && model.config.rope_theta == crate::eagle3::SHAREGPT_ROPE_THETA
-            && model.config.sliding_window == Some(512)
-    };
-    if !config_variant_matches {
-        return Err(BackendError::InvalidModelMetadata(format!(
-            "EAGLE-3 checkpoint/config pairing is invalid for model SHA-256 {sha256}: architectures={:?}, rope_theta={}, sliding_window={:?}",
-            model.config.architectures, model.config.rope_theta, model.config.sliding_window
-        )));
-    }
-    *cache
-        .lock()
-        .expect("EAGLE-3 checkpoint cache mutex poisoned") = Some(CachedEagle3Checkpoint {
-        path: path.to_path_buf(),
-        sha256: sha256.clone(),
-        model: Arc::clone(&model),
-    });
-    Ok((model, sha256))
-}
-
 fn spec_ngram_min_from_env() -> usize {
     env::var(SPEC_NGRAM_MIN_ENV)
         .ok()
@@ -2341,43 +2333,12 @@ fn prompt_prefix_cache_min_tokens_from_env() -> usize {
 /// Per-request speculative decoding state: the drafter plus round counters
 /// for the end-of-request acceptance summary.
 struct PreparedSpeculative {
-    drafter: PreparedSpeculativeDrafter,
+    drafter: SpeculativeDrafter,
     draft_tokens: usize,
     latch: SpecLatch,
     rounds: u64,
     drafted: u64,
     accepted_drafts: u64,
-    verify_nodes: u64,
-    suffix_rounds: u64,
-    learned_rounds: u64,
-    suffix_candidate_rounds: u64,
-    suffix_confidence_declines: u64,
-    suffix_raw_depth_sum: u64,
-    suffix_confident_depth_sum: u64,
-    suffix_root_match_len_sum: u64,
-    suffix_root_support_sum: u64,
-    suffix_root_branch_count_sum: u64,
-    suffix_expected_accepted_q16_sum: u64,
-    suffix_terminal_survival_q16_sum: u64,
-}
-
-enum PreparedSpeculativeDrafter {
-    Standard(SpeculativeDrafter),
-    Eagle3(Box<Eagle3ServingState>),
-}
-
-impl PreparedSpeculative {
-    fn is_eagle3(&self) -> bool {
-        matches!(self.drafter, PreparedSpeculativeDrafter::Eagle3(_))
-    }
-}
-
-impl PreparedGeneration {
-    fn is_eagle3(&self) -> bool {
-        self.speculative
-            .as_ref()
-            .is_some_and(PreparedSpeculative::is_eagle3)
-    }
 }
 
 /// One token's logprob plus its decoded piece and raw UTF-8 bytes (OpenAI-shaped).
@@ -2458,6 +2419,11 @@ struct RawLogitDiagnostic {
 #[derive(Debug, Serialize)]
 pub struct ErrorEnvelope {
     pub error: ErrorBody,
+    /// Exact rendered prompt size for the typed prompt-limit error. This lets a
+    /// count-only preflight trim optional context without weakening the normal
+    /// generation ceiling. Other errors omit the field and remain fatal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_token_count: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2815,6 +2781,28 @@ fn router_with_state_and_policy(state: AppState, policy: server::ServerPolicy) -
             get(generation_sessions).post(create_generation_session),
         )
         .route("/api/generation/preflight", post(preflight_generation))
+        .route("/api/web/research", post(web_research::handler))
+        .route("/api/changes", get(changes::list).post(changes::prepare))
+        .route(
+            "/api/changes/:id",
+            get(changes::get).delete(changes::remove),
+        )
+        .route("/api/changes/:id/decision", post(changes::decide))
+        .route("/api/changes/:id/undo", post(changes::undo))
+        .route("/api/mcp/connections", get(mcp::list).post(mcp::save))
+        .route(
+            "/api/mcp/connections/:id",
+            axum::routing::delete(mcp::remove).put(mcp::update),
+        )
+        .route("/api/mcp/connections/:id/connect", post(mcp::connect))
+        .route("/api/mcp/connections/:id/disconnect", post(mcp::disconnect))
+        .route("/api/mcp/connections/:id/test", post(mcp::test_connection))
+        .route("/api/mcp/calls", post(mcp::prepare_call))
+        .route(
+            "/api/mcp/calls/:id",
+            get(mcp::call_status).delete(mcp::cancel_call),
+        )
+        .route("/api/mcp/calls/:id/decision", post(mcp::decide_call))
         .route(
             "/api/agent/workspace/models",
             get(workspace::compatible_models),
@@ -2849,8 +2837,16 @@ fn router_with_state_and_policy(state: AppState, policy: server::ServerPolicy) -
             "/api/agent/workspace/sessions/:id/decisions",
             post(workspace::decide),
         )
+        .route("/api/documents/ingest", post(documents::ingest_document))
+        .route("/api/documents/search", post(documents::search_documents))
+        .route(
+            "/api/documents/:id",
+            axum::routing::delete(documents::delete_document),
+        )
+        .route("/api/documents", get(documents::list_documents))
         .route("/api/models/local", get(local_models))
         .route("/api/models/local/delete", post(delete_local_model))
+        .route("/api/models/quantize", post(quantize_model_endpoint))
         .route(
             "/api/models/default",
             get(default_model).post(set_default_model),
@@ -2964,14 +2960,6 @@ pub async fn serve(
     models_dir: Option<PathBuf>,
     options: ServeOptions,
 ) -> std::io::Result<()> {
-    // Reject a misspelled or unqualified EAGLE context rung before binding the
-    // listener. Health and request admission must never disagree about the
-    // active logical envelope.
-    if spec_decode_mode_from_env() == Some(SpecDecodeMode::Eagle3) {
-        configured_eagle3_logical_token_limit().map_err(|error| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
-        })?;
-    }
     let policy = server::ServerPolicy::resolve(addr, options)?;
     let std_listener = std::net::TcpListener::bind(addr)?;
     std_listener.set_nonblocking(true)?;
@@ -3075,6 +3063,12 @@ pub async fn serve(
     // user needs to choose a different model. Reinstalling does not help —
     // the models directory outlives the app — so the failure is permanent.
     if let Some(StartupModel { path, explicit, .. }) = initial_model {
+        // Held low from here until the warm-up below has finished, so the
+        // health gate every client is told to use cannot go green in the window
+        // where the engine is loaded but not yet built.
+        startup_state
+            .generation_warm
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         if let Err(err) = load_model_from_path(&startup_state, path.clone(), None, true).await {
             tracing::error!(error=%err, "failed to load startup model");
             if explicit {
@@ -3132,6 +3126,12 @@ pub async fn serve(
             warmup_generation_blocking(addr, model_id, policy.auth.bearer_header_line()).await;
         }
     }
+    // Every exit from the block above — warmed, skipped, or no startup model at
+    // all — ends with the engine as built as it is going to get before the first
+    // client request, so the health gate opens here, with the banner.
+    startup_state
+        .generation_warm
+        .store(true, std::sync::atomic::Ordering::SeqCst);
     print_ready_banner(&url);
     if workspace_cli_credential.is_some() {
         eprintln!("  Workspace CLI: ready");
@@ -3546,10 +3546,48 @@ async fn health_registry_snapshot(state: &AppState) -> HealthResponse {
         dg_serve_ready,
         model.is_some(),
     );
-    let generation_ready = gemma4_available
-        || runnable_serve_ready
-        || dg_serve_ready
-        || model.is_some_and(loaded_model_generation_ready);
+    let generation_ready = health_generation_ready(
+        gemma4_available
+            || runnable_serve_ready
+            || dg_serve_ready
+            || model.is_some_and(loaded_model_generation_ready),
+        state
+            .generation_warm
+            .load(std::sync::atomic::Ordering::SeqCst),
+    );
+    // The explicit MTP12 runtime allocates a bounded resident KV cache. Report
+    // that allocation, never the model metadata's much larger training window,
+    // so Web Auto budgets the actual lane that will execute the request.
+    let runtime_context_length = gemma4_runtime
+        .as_deref()
+        .and_then(Gemma4ServeRuntime::effective_context_length);
+    let runtime_context_headroom = gemma4_runtime
+        .as_deref()
+        .map(Gemma4ServeRuntime::reserved_context_headroom)
+        .unwrap_or(0);
+    let runtime_usable_context =
+        runtime_context_length.map(|context| context.saturating_sub(runtime_context_headroom));
+    let active_context_length = runtime_context_length.or_else(|| {
+        model
+            .and_then(|model| model.llama_config.as_ref())
+            .map(|config| config.context_length)
+    });
+    let max_prompt_tokens = runtime_usable_context
+        .map(|context| {
+            state
+                .server_limits
+                .max_prompt_tokens
+                .min(context.saturating_sub(1) as usize)
+        })
+        .unwrap_or(state.server_limits.max_prompt_tokens);
+    let max_generation_tokens = runtime_usable_context
+        .map(|context| {
+            state
+                .server_limits
+                .max_generation_tokens
+                .min(context.saturating_sub(1))
+        })
+        .unwrap_or(state.server_limits.max_generation_tokens);
     let execution_plans = state.execution_plans.read().await;
     let execution_plan = active_id_lock
         .as_ref()
@@ -3594,15 +3632,6 @@ async fn health_registry_snapshot(state: &AppState) -> HealthResponse {
         crate::inference::deterministic_mode_enabled(),
     );
     let slot = state.engine.slot_snapshot();
-    let speculative_decode = spec_decode_mode_from_env();
-    let eagle3_logical_limit = if speculative_decode == Some(SpecDecodeMode::Eagle3) {
-        Some(
-            configured_eagle3_logical_token_limit()
-                .expect("EAGLE-3 logical token rung was validated before server bind"),
-        )
-    } else {
-        None
-    };
     HealthResponse {
         ok: true,
         engine: "camelid",
@@ -3611,19 +3640,12 @@ async fn health_registry_snapshot(state: &AppState) -> HealthResponse {
         build: crate::receipt::camelid_version(),
         loaded_now,
         generation_ready,
+        active_context_length,
+        max_prompt_tokens,
+        max_generation_tokens,
         vision_ready,
+        vision_token_allowance: vision_ready.then_some(DEFAULT_MAX_IMAGE_TOKENS),
         active_model_id: active_id_lock.clone(),
-        speculative_decode: speculative_decode.map(SpecDecodeMode::as_str),
-        logical_token_limit: eagle3_logical_limit,
-        active_context_length: eagle3_logical_limit,
-        max_prompt_tokens: eagle3_logical_limit.map(|limit| {
-            state
-                .server_limits
-                .max_prompt_tokens
-                .min(limit.saturating_sub(1))
-        }),
-        max_generation_tokens: eagle3_logical_limit
-            .map(|limit| state.server_limits.max_generation_tokens.min(limit as u32)),
         q8_runtime: q8_runtime_health(),
         execution_plan,
         backend,
@@ -3732,15 +3754,6 @@ async fn purge_kv_cache(State(state): State<AppState>) -> Json<PurgeKvCacheRespo
 /// live. The process is alive and serving, so `ok` remains true.
 fn busy_health_response(state: &AppState) -> HealthResponse {
     let slot = state.engine.slot_snapshot();
-    let speculative_decode = spec_decode_mode_from_env();
-    let eagle3_logical_limit = if speculative_decode == Some(SpecDecodeMode::Eagle3) {
-        Some(
-            configured_eagle3_logical_token_limit()
-                .expect("EAGLE-3 logical token rung was validated before server bind"),
-        )
-    } else {
-        None
-    };
     HealthResponse {
         ok: true,
         engine: "camelid",
@@ -3749,19 +3762,14 @@ fn busy_health_response(state: &AppState) -> HealthResponse {
         build: crate::receipt::camelid_version(),
         loaded_now: false,
         generation_ready: false,
+        active_context_length: None,
+        max_prompt_tokens: state.server_limits.max_prompt_tokens,
+        max_generation_tokens: state.server_limits.max_generation_tokens,
         vision_ready: false,
+        // The busy snapshot cannot read the runnable registry, so it cannot know
+        // whether vision is ready — reporting an allowance here would be a guess.
+        vision_token_allowance: None,
         active_model_id: None,
-        speculative_decode: speculative_decode.map(SpecDecodeMode::as_str),
-        logical_token_limit: eagle3_logical_limit,
-        active_context_length: eagle3_logical_limit,
-        max_prompt_tokens: eagle3_logical_limit.map(|limit| {
-            state
-                .server_limits
-                .max_prompt_tokens
-                .min(limit.saturating_sub(1))
-        }),
-        max_generation_tokens: eagle3_logical_limit
-            .map(|limit| state.server_limits.max_generation_tokens.min(limit as u32)),
         q8_runtime: q8_runtime_health(),
         execution_plan: None,
         backend: health_backend(false, false, false, false),
@@ -3894,6 +3902,7 @@ mod gemma4_serve_lane_health_tests {
             ("ghost".to_string(), Gemma4ServeLane::GhostMoe),
             ("local".to_string(), Gemma4ServeLane::Local),
             ("distributed".to_string(), Gemma4ServeLane::Distributed),
+            ("mtp12".to_string(), Gemma4ServeLane::Mtp12Metal),
         ]);
         assert_eq!(
             active_gemma4_serve_lane(Some("ghost"), &lanes),
@@ -3910,6 +3919,7 @@ mod gemma4_serve_lane_health_tests {
             (Gemma4ServeLane::GhostMoe, "ghost_moe"),
             (Gemma4ServeLane::Local, "local"),
             (Gemma4ServeLane::Distributed, "distributed"),
+            (Gemma4ServeLane::Mtp12Metal, "mtp12_metal"),
         ] {
             assert_eq!(serde_json::to_value(lane).unwrap(), expected);
         }
@@ -3962,6 +3972,36 @@ mod gemma4_serve_lane_health_tests {
         );
         assert_eq!(value["gemma4_available"], false);
         assert_eq!(value["generation_ready"], false);
+    }
+
+    /// `generation_ready` needs BOTH halves, and the warm half is the one a
+    /// client cannot see for itself.
+    ///
+    /// Clients are told to gate their first request on this field, so it has to
+    /// mean "an engine is ready to serve you", not "the weights finished
+    /// loading". Between those two moments the startup warm-up is still
+    /// building the engine with the listener already up, and a request sent in
+    /// that window is served by a colder path than every request after it.
+    #[test]
+    fn generation_ready_needs_a_loaded_engine_and_a_finished_warm_up() {
+        assert!(health_generation_ready(true, true));
+
+        // Loaded but still warming: the window this gate exists to close.
+        assert!(!health_generation_ready(true, false));
+
+        // Warm is never on its own sufficient — it defaults true precisely so a
+        // server with no startup model is unaffected by it.
+        assert!(!health_generation_ready(false, true));
+        assert!(!health_generation_ready(false, false));
+    }
+
+    /// A server that never runs a startup warm-up must not be held closed by a
+    /// flag that nothing will ever set.
+    #[test]
+    fn a_fresh_state_is_warm_so_only_the_startup_path_can_gate_on_it() {
+        assert!(AppState::default()
+            .generation_warm
+            .load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[tokio::test]
@@ -4791,6 +4831,7 @@ async fn llama_server_completion(
     };
     let req = GenerationSessionRequest {
         model: req.model,
+        camelid_expected_gguf_sha256: None,
         prompt,
         messages: None,
         max_tokens,
@@ -5389,6 +5430,17 @@ async fn unsupported_messages() -> Response {
     )
 }
 
+/// `/health`'s `generation_ready`: a loaded engine AND a finished warm-up.
+///
+/// Split out as a pure function because the conjunction is the whole point and
+/// the alternative — an `AtomicBool` read inside a handler — is not reachable
+/// from a unit test. `loaded` alone answers "are the weights here"; clients use
+/// this field to decide when to send their first request, which additionally
+/// needs the engine those weights get built into.
+fn health_generation_ready(loaded: bool, warm: bool) -> bool {
+    loaded && warm
+}
+
 fn loaded_model_generation_ready(model: &LoadedModel) -> bool {
     let Some(binding) = model.llama_tensors.as_ref() else {
         return false;
@@ -5850,7 +5902,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             SupportItem {
                 id: "Q4_0 (QAT rows)",
                 status: "supported_named_exact_rows_only",
-                notes: "gemma4_26b_a4b_it_q4_0 (Q4_0 experts + Q6_K tied head) is supported_exact_row_smoke through either two-Mac distributed serve or the catalog-managed Windows CUDA Ghost-MoE lane; the Gemma 4 E4B QAT row runs the Metal GPU-resident path token-identical to CPU. Engine Q4_0 dequant plus parity-gated wire GEMV kernels (CUDA/Metal) exist as engine facts, not broad quant support; no LLaMA/SPM Q4_0 row is certified (see planned_quantization).",
+                notes: "gemma4_26b_a4b_it_q4_0 (Q4_0 experts + Q6_K tied head) is supported_exact_row_smoke through either its distributed lane or the catalog-managed Windows CUDA Ghost-MoE lane; its single-M4 Ghost-MoE/MTP path remains explicitly experimental. gemma4_12b_it_qat_q4_0 is a downloadable, single-M4 active-validation row, not a supported row yet. The Gemma 4 E4B QAT row runs the Metal GPU-resident path token-identical to CPU. Engine Q4_0 dequant plus parity-gated wire GEMV kernels (CUDA/Metal) exist as engine facts, not broad quant support; no LLaMA/SPM Q4_0 row is certified (see planned_quantization).",
             },
             SupportItem {
                 id: "TQ2_0",
@@ -6743,6 +6795,90 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 latest_checked_output: "Paris",
                 evidence: "the exact tracked gemma-4-12b-it-Q8_0 GGUF (12,669,646,240 bytes, general.architecture=gemma4, 48 layers with the per-layer attention.head_count_kv array and V-less full-attention layers parsed from the GGUF) runs as two-Mac distributed layer sharding: the CLI lane is token-identical to single-node camelid on all five basic_v1 prompts (qa/evidence-bundles/gemma4-12b-it-q8-0-two-mac-20260610T103711Z-head-96a75007b156; decode 6.2-6.75 tok/s across the pair, both 16GB nodes within budget; 3/5 prompts match the pinned comparator full-budget with two recorded reference-comparator frontiers), and the distributed SERVE lane answers /v1/chat/completions (non-streaming and SSE) and /v1/completions end-to-end across the pair (qa/evidence-bundles/gemma4-12b-it-q8-0-distributed-serve-20260610T235155Z-head-80e3dddfbdb4; master shard 0..24 + worker 24..48, wire protocol v1 with per-request worker sessions). Camelid supports exact-row text-token generation + serve smoke for this row only, and only through the two-Mac distributed lane; no single-node, bounded-context, performance, portability, multimodal, or full support is implied",
                 next_step: "durable current-head refresh, bounded context buckets through the distributed lane, and performance/RSS gates before any wider 12B claim; single-node support is not a goal on 16GB hosts",
+            },
+            ModelCompatibilityTarget {
+                id: "gemma4_12b_it_qat_q4_0_mtp12",
+                tool_capable: false,
+                family: "gemma4_dense_decoder_mtp12",
+                quantization: "Q4_0",
+                status: "supported_exact_row_smoke",
+                support_scope: "exact_row_single_node_base_m4_mini_mac16_10_macos_26_5_metal_lossless_mtp12_performance_smoke_only",
+                full_support_status: "blocked_pending_normalized_full_support",
+                full_support_blockers: "the supported claim is pinned to one target SHA and one assistant SHA on Apple Metal with the explicit MTP12 serve opt-in; the 51 tok/s receipts cover a 96-token qualification prompt at a 512-row KV capacity, not arbitrary long-form quality or a bounded-context ladder; portability, normalized API/WebUI evidence, broader prompts, and durable current-head performance/RSS gates remain pending",
+                metadata_parses: "validated_exact_gemma4_12b_qat_q4_0_target",
+                tokenizer_works: "validated_for_gemma4_spm",
+                tensors_load: "validated_single_node_metal_resident_q4_0_target_plus_exact_resident_mtp12_assistant",
+                generation_runs: "lossless_ordered_target_verified_mtp12_greedy_decode",
+                parity_audited: "ordered_k1_token_ids_and_text_exact_for_the_qualified_96_token_run",
+                performance_measured: "51_494_tok_s_confirmation_51_305_two_run_mean_51_399_zero_swap_on_base_m4_16gb",
+                frontend_load_path_verified: "explicit_mtp12_api_serve_lane_pending_normalized_webui_capture",
+                frontend_readiness_gate: "green only on the receipted base-M4 Mac mini profile (Mac16,10 / Apple M4 / macOS 26.5.x / Metal available) when the exact target filename and SHA match this row, CAMELID_GEMMA4_MTP12_ASSISTANT names the exact admitted assistant, and health reports the mtp12_metal serve lane",
+                tested_context: "96_output_token_performance_qualification_with_512_row_kv_capacity",
+                chat_template_renderer: "gemma4_marker",
+                chat_template_shape_pack: "not_promoted",
+                chat_template_shape_pack_id: "not_selected",
+                bounded_context_512_pack: "performance_qualification_only_not_promoted_as_context_pack",
+                bounded_context_512_pack_id: "not_selected",
+                bounded_context_window: 512,
+                bounded_context_1024_pack: "not_promoted",
+                bounded_context_1024_pack_id: "not_selected",
+                bounded_context_1024_window: 1024,
+                bounded_context_2048_pack: "not_promoted",
+                bounded_context_2048_pack_id: "not_selected",
+                bounded_context_2048_window: 2048,
+                bounded_context_4096_pack: "not_promoted",
+                bounded_context_4096_pack_id: "not_selected",
+                bounded_context_4096_window: 4096,
+                bounded_context_8192_pack: "not_promoted",
+                bounded_context_8192_pack_id: "not_selected",
+                bounded_context_8192_window: 8192,
+                latest_checked_bucket: "single_node_macos_metal_mtp12_96_token_performance_qualification",
+                latest_checked_result: "pass",
+                latest_checked_output: "51.494 tok/s; confirmation 51.305 tok/s; ordered-K1 token ids and text exact; zero swaps",
+                evidence: "The exact Gemma 4 12B QAT Q4_0 target (SHA-256 93567e57a8fe10b23569b9d9ec38cd005deedf71e29477c421a4b83f418a538b) and exact official MTP12 assistant (SHA-256 67f1420cf24aa5065089aaed175223f7c245ccfda16111b6c56765afd7280db6) ran the lossless ordered target-verification lane on a 16GB base Apple M4. The primary 96-token qualification measured 51.493947835 tok/s and the confirmation measured 51.304677961 tok/s (mean 51.399), with ordered-K1 token IDs and decoded text exact and zero swaps. The winning selector was CAMELID_GEMMA4_MTP_W16_ONESHOT_W8_PAD16=1. These are native decode-forward receipts using (emitted_tokens-1)/decode_us; they do not establish response quality or transfer that rate to arbitrary prompts/context sizes. The claim covers this row only: the exact target and assistant SHAs named above, on Apple Metal, behind the explicit MTP12 serve opt-in.",
+                next_step: "capture the normalized long-form API/WebUI run at a larger KV allocation, verify quality and memory behavior, and add bounded-context and portable performance gates before widening this exact-row claim",
+            },
+            ModelCompatibilityTarget {
+                id: "gemma4_12b_it_qat_q4_0",
+                tool_capable: false,
+                family: "gemma4_dense_decoder",
+                quantization: "Q4_0",
+                status: "active_validation_single_node_metal",
+                support_scope: "active_validation_only",
+                full_support_status: "blocked_pending_normalized_full_support",
+                full_support_blockers: "the single-node Apple M4 lane has load, generation, component-parity, and whole-output K=1 evidence, but the final speculative-throughput promotion, guarded API/WebUI smoke, bounded-context ladder, broader sampling, portability, and normalized performance/RSS gates remain open",
+                metadata_parses: "validated_including_per_layer_kv_head_array_and_vless_layers",
+                tokenizer_works: "validated_for_gemma4_spm",
+                tensors_load: "validated_mmap_wire_backed_q4_0_decoder_and_q6_k_tied_head",
+                generation_runs: "validated_single_node_apple_m4_metal_greedy_generation",
+                parity_audited: "validated_component_parity_and_whole_output_k1_identity_with_speculative_promotion_pending",
+                performance_measured: "single_apple_m4_measurement_exists_not_a_portable_throughput_claim",
+                frontend_load_path_verified: "catalog_download_added_promotion_smoke_pending",
+                frontend_readiness_gate: "download is available from the Models page; after load, chat remains on the explicitly experimental runtime lane until the exact guarded API/WebUI promotion gate passes",
+                tested_context: "short_single_node_apple_m4_generation_smoke",
+                chat_template_renderer: "gemma4_marker",
+                chat_template_shape_pack: "not_promoted",
+                chat_template_shape_pack_id: "not_selected",
+                bounded_context_512_pack: "not_promoted",
+                bounded_context_512_pack_id: "not_selected",
+                bounded_context_window: 512,
+                bounded_context_1024_pack: "not_promoted",
+                bounded_context_1024_pack_id: "not_selected",
+                bounded_context_1024_window: 1024,
+                bounded_context_2048_pack: "not_promoted",
+                bounded_context_2048_pack_id: "not_selected",
+                bounded_context_2048_window: 2048,
+                bounded_context_4096_pack: "not_promoted",
+                bounded_context_4096_pack_id: "not_selected",
+                bounded_context_4096_window: 4096,
+                bounded_context_8192_pack: "not_promoted",
+                bounded_context_8192_pack_id: "not_selected",
+                bounded_context_8192_window: 8192,
+                latest_checked_bucket: "single_node_apple_m4_qat_q4_0_generation",
+                latest_checked_result: "pass_active_validation",
+                latest_checked_output: "single-node generation completed",
+                evidence: "the exact official gemma-4-12b-it-qat-q4_0.gguf artifact (6,975,879,296 bytes, SHA-256 93567e57a8fe10b23569b9d9ec38cd005deedf71e29477c421a4b83f418a538b, general.architecture=gemma4) loads and generates on one tested 16 GB Apple M4 Mac through Camelid's Metal path. The model-development receipts anchored at agent/gemma4-w16-bootstrap commit cf0b54a6 record the external baseline, exact Q4 projection checks, Q6_K head check, and whole-output ordered K=1 identity. This is an active-validation claim for this row only; it is not Supported and makes no portable throughput, broad hardware, bounded-context, multimodal, or speculative-acceptance claim",
+                next_step: "finish the end-to-end speculative throughput receipt and guarded Models-page/API/WebUI smoke, then run bounded-context and normalized memory/performance gates before any support promotion",
             },
             ModelCompatibilityTarget {
                 id: "gemma4_26b_a4b_it_q4_0",
@@ -8184,7 +8320,70 @@ fn resident_load_is_idempotent(
     requested_id.is_none_or(|id| id == resident_id)
 }
 
-/// The refusal for a load-blocking verdict: a stable error code plus its message.
+/// What the pre-load fit preflight decided: proceed silently, proceed with advice, or
+/// refuse.
+///
+/// The three states exist because the fit axis mixes two different kinds of "no". A
+/// host that is *busy right now* is a moment; a host that is *too small* is a machine.
+/// Collapsing them into one refusal is what made an explicitly advisory check
+/// (`src/fit.rs`) start returning 422 for ordinary models on healthy laptops. The
+/// verdict's own classification is unchanged — [`crate::fit::FitVerdict::refuses_load`]
+/// still governs catalog rows — this type governs only what the *load endpoint* does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FitPreflight {
+    /// Nothing to say; load normally.
+    Proceed,
+    /// Load anyway, but tell the caller what it is walking into.
+    Warn { code: &'static str, message: String },
+    /// Do not load. Either the machine cannot hold this at all, or there is a
+    /// specific action that would make it fit.
+    Refuse { code: &'static str, message: String },
+}
+
+#[cfg(test)]
+impl FitPreflight {
+    fn refusal(self) -> Option<(&'static str, String)> {
+        match self {
+            FitPreflight::Refuse { code, message } => Some((code, message)),
+            _ => None,
+        }
+    }
+
+    fn warning(self) -> Option<(&'static str, String)> {
+        match self {
+            FitPreflight::Warn { code, message } => Some((code, message)),
+            _ => None,
+        }
+    }
+
+    fn proceeds(&self) -> bool {
+        matches!(self, FitPreflight::Proceed)
+    }
+}
+
+/// A non-fatal advisory attached to an otherwise successful response.
+///
+/// Serialized into `POST /api/models/load`'s 200 body as `warnings: [...]`, and omitted
+/// entirely when empty so an existing client's parse is unchanged.
+#[derive(Debug, Clone, Serialize)]
+pub struct LoadWarning {
+    pub code: &'static str,
+    pub severity: &'static str,
+    pub message: String,
+}
+
+/// `POST /api/models/load`'s success body: the loaded model, flattened, plus any
+/// advisories. Wrapping rather than adding a field to [`LoadedModel`] keeps the
+/// warning out of every other surface that serializes a loaded model.
+#[derive(Debug, Serialize)]
+struct LoadModelResponse {
+    #[serde(flatten)]
+    model: LoadedModel,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<LoadWarning>,
+}
+
+/// The preflight decision for a (host, footprint) pair: a stable code plus its message.
 ///
 /// A host that is out of room *because something else is already loaded* is a
 /// different situation from a host that is too small for the model, and it has a
@@ -8194,81 +8393,102 @@ fn resident_load_is_idempotent(
 ///
 /// There is a third case with a third remedy: nothing of ours is resident, the
 /// machine is big enough, but *other applications* have the memory right now
-/// (`FitVerdict::InsufficientFreeMemory`). Closing something is the fix, and saying
-/// "larger than this machine can hold" there is simply false.
+/// (`FitVerdict::InsufficientFreeMemory`). That one is transient by construction, so
+/// it **warns and proceeds** — the operator can see the cost and decide. The one thing
+/// that still stops it is [`crate::fit::exceeds_hard_floor`]: an allocation larger than
+/// total RAM minus wired pages cannot succeed no matter what is closed, and on Metal
+/// hosts no downstream guard would catch it (`VramShortfall` is CUDA-only; the KV
+/// budget guards cache growth, not weights).
 fn fit_preload_message(
     hw: &crate::capability::HardwareProfile,
     footprint: &crate::fit::FitInputs,
     size_bytes: u64,
     reclaim: Option<&ResidentReclaim>,
-) -> Option<(&'static str, String)> {
+) -> FitPreflight {
     let verdict = crate::fit::assess(hw, footprint);
     if !verdict.refuses_load() {
-        return None;
+        return FitPreflight::Proceed;
     }
     let size_gb = size_bytes as f64 / 1e9;
     // Something else of ours is resident: name it, and point at the remedy that
-    // works. Checked first because it is the most specific and most actionable.
+    // works. Checked first because it is the most specific and most actionable —
+    // and because it is the one refusal a caller can clear in a single retry, which
+    // is why it stays a refusal rather than joining the warn path.
     if let Some(r) = reclaim.filter(|r| !r.is_empty()) {
         let names = r.ids.join(", ");
         let freed = r.bytes as f64 / 1e9;
-        return Some((
-            "model_requires_unload",
-            format!(
+        return FitPreflight::Refuse {
+            code: "model_requires_unload",
+            message: format!(
                 "This model (~{size_gb:.1} GB) does not fit while {names} is still loaded. \
                  Releasing it frees ~{freed:.1} GB, which should be enough. \
                  Retry with \"replace\": true to swap models in one step (the app's \
                  Load button does this), or POST /api/models/unload first."
             ),
-        ));
+        };
     }
-    // The machine is big enough; it is just busy. Do not send the user shopping
-    // for smaller models — tell them what is actually in the way.
-    if verdict == crate::fit::FitVerdict::InsufficientFreeMemory {
+    let footprint_bytes = footprint.footprint_bytes();
+    let footprint_gb = footprint_bytes as f64 / 1e9;
+    let total_gb = hw.host_ram_total_bytes as f64 / 1e9;
+    // The machine is big enough; it is just busy. Do not send the user shopping for
+    // smaller models, and do not refuse — say what it will cost and load it.
+    if verdict.is_transient() {
+        // ...unless it physically cannot be satisfied. Wired memory is the one part of
+        // the shortfall that closing an application cannot recover.
+        if crate::fit::exceeds_hard_floor(hw, footprint_bytes) {
+            let floor_gb = crate::fit::hard_floor_bytes(hw).unwrap_or(0) as f64 / 1e9;
+            let wired_gb = hw.host_ram_unevictable_bytes as f64 / 1e9;
+            return FitPreflight::Refuse {
+                code: "host_memory_exhausted",
+                message: format!(
+                    "This model's estimated in-memory footprint is ~{footprint_gb:.1} GB, but \
+                     this machine can supply at most ~{floor_gb:.1} GB even after evicting \
+                     everything evictable: ~{wired_gb:.1} GB of its ~{total_gb:.1} GB is wired \
+                     and cannot be freed. Closing applications will not recover this. \
+                     The app's \"Load anyway\" button attempts it regardless, or send \
+                     \"force\": true."
+                ),
+            };
+        }
         let free_gb = hw.host_ram_free_bytes as f64 / 1e9;
-        let total_gb = hw.host_ram_total_bytes as f64 / 1e9;
-        let footprint_gb = footprint.footprint_bytes() as f64 / 1e9;
-        let usable_gb = crate::fit::usable_host_ram_bytes(hw).unwrap_or(0) as f64 / 1e9;
-        return Some((
-            "host_memory_unavailable",
-            format!(
+        return FitPreflight::Warn {
+            code: "host_memory_unavailable",
+            message: format!(
                 "This model's ~{size_gb:.1} GB file fits this machine, but its estimated \
                  in-memory footprint is ~{footprint_gb:.1} GB including weights, KV cache, \
-                 and scratch space. Only ~{free_gb:.1} GB of ~{total_gb:.1} GB memory is free \
-                 right now; after Camelid's safety reserve, ~{usable_gb:.1} GB is usable. \
-                 Close some applications and retry, or set \
-                 CAMELID_SKIP_FIT_CHECK=1 to attempt the load anyway."
+                 and scratch space, and only ~{free_gb:.1} GB of ~{total_gb:.1} GB memory is \
+                 free right now. Loading anyway: expect a slower load, slower generation, and \
+                 possible swapping. Close some applications for more headroom."
             ),
-        ));
+        };
     }
     let base =
         format!("This model (~{size_gb:.1} GB) is larger than this machine can hold in memory.");
-    Some((
-        "model_too_large_for_host",
-        match best_fitting_catalog_suggestion(hw) {
+    FitPreflight::Refuse {
+        code: "model_too_large_for_host",
+        message: match best_fitting_catalog_suggestion(hw) {
             Some(alt) => format!(
                 "{base} The largest catalog model that fits here is {alt}. \
-                 Set CAMELID_SKIP_FIT_CHECK=1 to attempt the load anyway."
+                 The app's \"Load anyway\" button attempts it regardless, or send \
+                 \"force\": true."
             ),
-            None => format!("{base} Set CAMELID_SKIP_FIT_CHECK=1 to attempt the load anyway."),
+            None => format!(
+                "{base} The app's \"Load anyway\" button attempts it regardless, or send \
+                 \"force\": true."
+            ),
         },
-    ))
+    }
 }
 
-/// Env + filesystem wrapper around [`fit_preload_message`]. Probes **live** host
-/// memory and computes an **exact** footprint from the GGUF's real dimensions
-/// (weights + KV + a bounded scratch margin) whenever the header parses. Resident
-/// Metal uses its real on-demand initial KV allocation; CPU/CUDA retain the normal-
-/// use advisory context. Falls back to the coarse size pad otherwise. Returns a typed
-/// 422 only on a load-refusing verdict ([`crate::fit::FitVerdict::refuses_load`]);
-/// `None` (proceed unchanged) on the `CAMELID_SKIP_FIT_CHECK=1` override, a
-/// missing/zero-size file, or any `Fits*`/`Unknown` verdict — a fail-fast
-/// convenience, never a new hard gate.
 /// Whether the load-time fit preflight is overridden off. `CAMELID_SKIP_FIT_CHECK=1`
 /// restores the pre-advisor behavior: `POST /api/models/load` attempts the load
 /// unconditionally, letting the authoritative `VramShortfall`/`KvCache` guards be
 /// the only gate. Exactly the trimmed value `"1"` enables the override; anything
 /// else (including unset) keeps the preflight on.
+///
+/// The env var is a process-wide operator escape hatch and is **not** reachable from
+/// the desktop app, whose sidecar is spawned args-only. `LoadModelRequest::force` is
+/// the per-request equivalent that a UI can actually offer; both must stay wired.
 fn fit_check_skipped(raw: Option<&str>) -> bool {
     raw.map(str::trim) == Some("1")
 }
@@ -8329,16 +8549,29 @@ fn exact_preload_footprint(
     crate::fit::exact_footprint_with_scratch(size, dims, context_tokens, kv_dtype, scratch_bytes)
 }
 
+/// Env + filesystem wrapper around [`fit_preload_message`]. Probes **live** host
+/// memory and computes an **exact** footprint from the GGUF's real dimensions
+/// (weights + KV + a bounded scratch margin) whenever the header parses. Resident
+/// Metal uses its real on-demand initial KV allocation; CPU/CUDA retain the normal-
+/// use advisory context. Falls back to the coarse size pad otherwise.
+///
+/// [`FitPreflight::Proceed`] on the `CAMELID_SKIP_FIT_CHECK=1` override, a `force`
+/// request, a missing/zero-size file, or any non-refusing verdict. A busy host warns;
+/// only a footprint this machine could never hold refuses.
 fn fit_preload_guard(
     path: &std::path::Path,
     reclaim: Option<&ResidentReclaim>,
-) -> Option<Response> {
-    if fit_check_skipped(std::env::var("CAMELID_SKIP_FIT_CHECK").ok().as_deref()) {
-        return None;
+    force: bool,
+) -> FitPreflight {
+    if force || fit_check_skipped(std::env::var("CAMELID_SKIP_FIT_CHECK").ok().as_deref()) {
+        return FitPreflight::Proceed;
     }
-    let size = std::fs::metadata(path).ok()?.len();
+    let Ok(meta) = std::fs::metadata(path) else {
+        return FitPreflight::Proceed;
+    };
+    let size = meta.len();
     if size == 0 {
-        return None;
+        return FitPreflight::Proceed;
     }
     // Live probe (not the cached startup snapshot): free VRAM/RAM shift as other
     // apps run or a model is already loaded, and this decision must reflect *now*.
@@ -8371,20 +8604,18 @@ fn fit_preload_guard(
             })
             .unwrap_or_else(|| crate::fit::advisory_footprint(size))
     });
-    let (code, message) = fit_preload_message(&hw, &footprint, size, reclaim)?;
-    Some(api_error(
-        StatusCode::UNPROCESSABLE_ENTITY,
-        code,
-        message,
-        Some("path"),
-    ))
+    fit_preload_message(&hw, &footprint, size, reclaim)
 }
 
 fn enforce_distributed_model_sha256(state: &AppState, path: &std::path::Path) -> crate::Result<()> {
     let Some(expected) = &state.distributed_model_sha256 else {
         return Ok(());
     };
-    let actual = crate::receipt::sha256_file_hex_cached(path).map_err(|err| {
+    // A distributed identity is an authorization boundary. The persistent
+    // digest cache is deliberately only a performance hint and is writable by
+    // the local user, so it must never decide whether coordinator and worker
+    // bytes match.
+    let actual = crate::receipt::sha256_file_hex(path).map_err(|err| {
         BackendError::InvalidModelMetadata(format!(
             "could not verify the distributed model {}: {err}",
             path.display()
@@ -8406,6 +8637,7 @@ async fn load_model(State(state): State<AppState>, Json(req): Json<LoadModelRequ
         id,
         replace,
         set_active,
+        force,
     } = req;
     let lan_chat_only = state.api_surface == ApiSurface::LanChatOnly;
     // Full mode keeps the operator's historical path semantics. LAN Chat uses
@@ -8493,6 +8725,14 @@ async fn load_model(State(state): State<AppState>, Json(req): Json<LoadModelRequ
         let ids = reclaim.ids.clone();
         {
             let _transition = state.model_transition.lock().await;
+            if state.workspace_sessions.blocks_model_transition().await {
+                return api_error(
+                    StatusCode::CONFLICT,
+                    "model_operation_in_progress",
+                    BackendError::ModelOperationInProgress.to_string(),
+                    None,
+                );
+            }
             let _exclusive = state.model_file_lifecycle.write().await;
             for id in &ids {
                 if let Err(resp) = release_model(&state, Some(id.clone())).await {
@@ -8508,24 +8748,41 @@ async fn load_model(State(state): State<AppState>, Json(req): Json<LoadModelRequ
         reclaim = ResidentReclaim::default();
     }
 
-    // Advisory fail-fast (fit axis, never a support claim): steer away from a
-    // near-certain OOM before the expensive load. Overridable via
-    // CAMELID_SKIP_FIT_CHECK=1; only fires on a WontFit verdict from a probed host.
+    // Fit preflight (capacity axis, never a support claim): steer away from a
+    // near-certain OOM before the expensive load, and describe a merely-busy host
+    // without refusing it. Overridable per request via `force` or process-wide via
+    // CAMELID_SKIP_FIT_CHECK=1.
     //
     // The guard does blocking I/O (metadata + GGUF header read) and a live hardware
     // probe (HardwareProfile::detect initializes a CUDA context on GPU hosts), so run
     // it on a blocking thread rather than stalling the async worker — consistent with
     // how the header fetches use spawn_blocking. A panic in the probe is non-fatal: we
-    // fall through to the load, where VramShortfall/KvCache remain the hard net.
+    // fall through to the load, where VramShortfall/KvCache remain what net there is.
+    let mut warnings: Vec<LoadWarning> = Vec::new();
     if !idempotent_resident {
         let guard_path = path.clone();
-        {
+        let preflight = {
             let _reader = state.model_file_lifecycle.read().await;
-            if let Ok(Some(resp)) =
-                tokio::task::spawn_blocking(move || fit_preload_guard(&guard_path, Some(&reclaim)))
-                    .await
-            {
-                return resp;
+            tokio::task::spawn_blocking(move || {
+                fit_preload_guard(&guard_path, Some(&reclaim), force)
+            })
+            .await
+            .unwrap_or(FitPreflight::Proceed)
+        };
+        match preflight {
+            FitPreflight::Proceed => {}
+            FitPreflight::Warn { code, message } => warnings.push(LoadWarning {
+                code,
+                severity: "warning",
+                message,
+            }),
+            FitPreflight::Refuse { code, message } => {
+                return api_error(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    code,
+                    message,
+                    Some("path"),
+                );
             }
         }
     }
@@ -8541,7 +8798,14 @@ async fn load_model(State(state): State<AppState>, Json(req): Json<LoadModelRequ
     )
     .await
     {
-        Ok(loaded) => (StatusCode::OK, Json(loaded)).into_response(),
+        Ok(loaded) => (
+            StatusCode::OK,
+            Json(LoadModelResponse {
+                model: loaded,
+                warnings,
+            }),
+        )
+            .into_response(),
         // Fail closed with the exact typed reason and a stable, switchable code.
         // The message already carries the offending architecture/quant and any
         // dedicated-lane redirect (e.g. `camelid diffusion-gemma-chat`).
@@ -8585,9 +8849,7 @@ mod distributed_model_pin_tests {
         std::fs::write(&other, b"other model").unwrap();
         let state = AppState {
             models_dir: temp.path().to_path_buf(),
-            distributed_model_sha256: Some(
-                crate::receipt::sha256_file_hex_cached(&startup).unwrap(),
-            ),
+            distributed_model_sha256: Some(crate::receipt::sha256_file_hex(&startup).unwrap()),
             ..AppState::default()
         };
 
@@ -8605,6 +8867,7 @@ mod distributed_model_pin_tests {
                 id: None,
                 replace: true,
                 set_active: None,
+                force: false,
             }),
         )
         .await;
@@ -8930,6 +9193,138 @@ fn gemma4_serve_flag(value: Option<&str>) -> bool {
                 || v.eq_ignore_ascii_case("disabled")
         })
         .unwrap_or(false)
+}
+
+const GEMMA4_MTP12_ASSISTANT_ENV: &str = "CAMELID_GEMMA4_MTP12_ASSISTANT";
+const GEMMA4_MTP12_MAX_POSITIONS_ENV: &str = "CAMELID_GEMMA4_MTP12_MAX_POSITIONS";
+const GEMMA4_MTP12_VERIFY_WIDTH_ENV: &str = "CAMELID_GEMMA4_MTP12_VERIFY_WIDTH";
+const GEMMA4_MTP12_QUALIFIED_TARGET_SHA256: &str =
+    "93567e57a8fe10b23569b9d9ec38cd005deedf71e29477c421a4b83f418a538b";
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const GEMMA4_MTP12_QUALIFIED_ASSISTANT_SHA256: &str =
+    "67f1420cf24aa5065089aaed175223f7c245ccfda16111b6c56765afd7280db6";
+const DEFAULT_GEMMA4_MTP12_MAX_POSITIONS: usize = 4096;
+// Ordinary chat rarely accepts all fifteen drafts. W8 amortizes the target
+// pass without paying for long rejected tails; explicit W16 remains available
+// for workloads with sustained high acceptance.
+const DEFAULT_GEMMA4_MTP12_VERIFY_WIDTH: usize = 8;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Gemma4Mtp12ServeConfig {
+    assistant_path: PathBuf,
+    max_positions: usize,
+    verify_width: usize,
+}
+
+/// Parse the explicit single-node MTP12 serve lane. The assistant path is the
+/// opt-in; setting either tuning variable without it is a half-configuration
+/// and fails closed instead of silently serving through the scalar runtime.
+fn parse_gemma4_mtp12_serve_config(
+    assistant_path: Option<PathBuf>,
+    max_positions: Option<&str>,
+    verify_width: Option<&str>,
+) -> std::result::Result<Option<Gemma4Mtp12ServeConfig>, String> {
+    let Some(assistant_path) = assistant_path else {
+        if max_positions.is_some() || verify_width.is_some() {
+            return Err(format!(
+                "{GEMMA4_MTP12_MAX_POSITIONS_ENV}/{GEMMA4_MTP12_VERIFY_WIDTH_ENV} require {GEMMA4_MTP12_ASSISTANT_ENV}"
+            ));
+        }
+        return Ok(None);
+    };
+    if assistant_path.as_os_str().is_empty() {
+        return Err(format!("{GEMMA4_MTP12_ASSISTANT_ENV} must name a file"));
+    }
+    let max_positions = match max_positions {
+        Some(raw) => raw.trim().parse::<usize>().map_err(|_| {
+            format!("{GEMMA4_MTP12_MAX_POSITIONS_ENV} must be an integer >= 512, got {raw:?}")
+        })?,
+        None => DEFAULT_GEMMA4_MTP12_MAX_POSITIONS,
+    };
+    if max_positions < 512 {
+        return Err(format!(
+            "{GEMMA4_MTP12_MAX_POSITIONS_ENV} must be >= 512, got {max_positions}"
+        ));
+    }
+    let verify_width = match verify_width {
+        Some(raw) => raw.trim().parse::<usize>().map_err(|_| {
+            format!("{GEMMA4_MTP12_VERIFY_WIDTH_ENV} must be one of 2, 4, 8, or 16, got {raw:?}")
+        })?,
+        None => DEFAULT_GEMMA4_MTP12_VERIFY_WIDTH,
+    };
+    if !matches!(verify_width, 2 | 4 | 8 | 16) {
+        return Err(format!(
+            "{GEMMA4_MTP12_VERIFY_WIDTH_ENV} must be one of 2, 4, 8, or 16, got {verify_width}"
+        ));
+    }
+    Ok(Some(Gemma4Mtp12ServeConfig {
+        assistant_path,
+        max_positions,
+        verify_width,
+    }))
+}
+
+fn gemma4_mtp12_serve_config() -> std::result::Result<Option<Gemma4Mtp12ServeConfig>, String> {
+    parse_gemma4_mtp12_serve_config(
+        std::env::var_os(GEMMA4_MTP12_ASSISTANT_ENV).map(PathBuf::from),
+        std::env::var(GEMMA4_MTP12_MAX_POSITIONS_ENV)
+            .ok()
+            .as_deref(),
+        std::env::var(GEMMA4_MTP12_VERIFY_WIDTH_ENV).ok().as_deref(),
+    )
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn gemma4_mtp12_support_scope_matches(
+    operating_system: &str,
+    architecture: &str,
+    mac_model_identifier: Option<&str>,
+    cpu_model: Option<&str>,
+    operating_system_version: Option<&str>,
+    metal_available: bool,
+    explicit_lane_configured: bool,
+) -> bool {
+    let receipted_macos = operating_system_version
+        .is_some_and(|version| version == "26.5" || version.starts_with("26.5."));
+    operating_system == "macos"
+        && architecture == "aarch64"
+        && mac_model_identifier == Some("Mac16,10")
+        && cpu_model == Some("Apple M4")
+        && receipted_macos
+        && metal_available
+        && explicit_lane_configured
+}
+
+fn gemma4_mtp12_supported_on_current_host() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        static HOST_FACTS: OnceLock<(String, String, String)> = OnceLock::new();
+        static METAL_AVAILABLE: OnceLock<bool> = OnceLock::new();
+        let (model_identifier, cpu_model, operating_system_version) =
+            HOST_FACTS.get_or_init(|| {
+                (
+                    lfm2_support_command_output("sysctl", &["-n", "hw.model"])
+                        .unwrap_or_else(|| "unknown".into()),
+                    lfm2_support_command_output("sysctl", &["-n", "machdep.cpu.brand_string"])
+                        .unwrap_or_else(|| "unknown".into()),
+                    lfm2_support_command_output("sw_vers", &["-productVersion"])
+                        .unwrap_or_else(|| "unknown".into()),
+                )
+            });
+        gemma4_mtp12_support_scope_matches(
+            env::consts::OS,
+            env::consts::ARCH,
+            Some(model_identifier),
+            Some(cpu_model),
+            Some(operating_system_version),
+            *METAL_AVAILABLE.get_or_init(|| crate::metal::detect_metal_device().available),
+            gemma4_mtp12_serve_config().ok().flatten().is_some(),
+        )
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
 }
 
 const GEMMA4_GHOST_CGHOST_ENV: &str = "CAMELID_GEMMA4_GHOST_CGHOST";
@@ -9941,6 +10336,544 @@ mod gemma4_template_tests {
     }
 
     #[test]
+    fn gemma4_mtp12_serve_config_is_explicit_and_fail_closed() {
+        assert_eq!(
+            parse_gemma4_mtp12_serve_config(None, None, None).unwrap(),
+            None
+        );
+        for (max_positions, verify_width) in [(Some("4096"), None), (None, Some("16"))] {
+            let error =
+                parse_gemma4_mtp12_serve_config(None, max_positions, verify_width).unwrap_err();
+            assert!(error.contains(GEMMA4_MTP12_ASSISTANT_ENV));
+        }
+
+        let path = PathBuf::from("/models/assistant/model.safetensors");
+        assert_eq!(
+            parse_gemma4_mtp12_serve_config(Some(path.clone()), None, None).unwrap(),
+            Some(Gemma4Mtp12ServeConfig {
+                assistant_path: path.clone(),
+                max_positions: 4096,
+                verify_width: 8,
+            })
+        );
+        assert_eq!(
+            parse_gemma4_mtp12_serve_config(Some(path), Some("2048"), Some("8")).unwrap(),
+            Some(Gemma4Mtp12ServeConfig {
+                assistant_path: PathBuf::from("/models/assistant/model.safetensors"),
+                max_positions: 2048,
+                verify_width: 8,
+            })
+        );
+
+        for (max_positions, verify_width, expected_env) in [
+            (Some("511"), None, GEMMA4_MTP12_MAX_POSITIONS_ENV),
+            (Some("many"), None, GEMMA4_MTP12_MAX_POSITIONS_ENV),
+            (None, Some("15"), GEMMA4_MTP12_VERIFY_WIDTH_ENV),
+            (None, Some("wide"), GEMMA4_MTP12_VERIFY_WIDTH_ENV),
+        ] {
+            let error = parse_gemma4_mtp12_serve_config(
+                Some(PathBuf::from("assistant.safetensors")),
+                max_positions,
+                verify_width,
+            )
+            .unwrap_err();
+            assert!(error.contains(expected_env), "{error}");
+        }
+    }
+
+    #[test]
+    fn gemma4_mtp12_support_scope_is_the_receipted_base_m4_mini_only() {
+        let scope = |os, arch, model, cpu, version, metal, configured| {
+            gemma4_mtp12_support_scope_matches(os, arch, model, cpu, version, metal, configured)
+        };
+        assert!(scope(
+            "macos",
+            "aarch64",
+            Some("Mac16,10"),
+            Some("Apple M4"),
+            Some("26.5.2"),
+            true,
+            true,
+        ));
+        assert!(scope(
+            "macos",
+            "aarch64",
+            Some("Mac16,10"),
+            Some("Apple M4"),
+            Some("26.5"),
+            true,
+            true,
+        ));
+        for (os, arch, model, cpu, version, metal, configured) in [
+            (
+                "macos",
+                "aarch64",
+                Some("Mac16,10"),
+                Some("Apple M4"),
+                Some("26.5.2"),
+                true,
+                false,
+            ),
+            (
+                "macos",
+                "aarch64",
+                Some("Mac16,10"),
+                Some("Apple M4"),
+                Some("26.5.2"),
+                false,
+                true,
+            ),
+            (
+                "macos",
+                "aarch64",
+                Some("Mac16,11"),
+                Some("Apple M4"),
+                Some("26.5.2"),
+                true,
+                true,
+            ),
+            (
+                "macos",
+                "aarch64",
+                Some("Mac16,10"),
+                Some("Apple M4 Pro"),
+                Some("26.5.2"),
+                true,
+                true,
+            ),
+            (
+                "macos",
+                "aarch64",
+                Some("Mac16,10"),
+                Some("Apple M4"),
+                Some("26.6"),
+                true,
+                true,
+            ),
+            (
+                "linux",
+                "aarch64",
+                Some("Mac16,10"),
+                Some("Apple M4"),
+                Some("26.5.2"),
+                true,
+                true,
+            ),
+        ] {
+            assert!(!scope(os, arch, model, cpu, version, metal, configured));
+        }
+    }
+
+    #[test]
+    fn gemma4_mtp12_exact_target_is_hash_pinned_to_its_capability_row() {
+        assert!(filename_is_supported_exact_row(
+            GEMMA4_12B_QAT_Q4_0_MTP12_FILENAME
+        ));
+        assert_eq!(
+            supported_artifact_expected_sha256(GEMMA4_12B_QAT_Q4_0_MTP12_FILENAME),
+            Some("93567e57a8fe10b23569b9d9ec38cd005deedf71e29477c421a4b83f418a538b")
+        );
+    }
+
+    #[test]
+    fn gemma4_mtp12_startup_id_canonicalizes_only_the_exact_receipted_artifact() {
+        let exact_path = Path::new("/models/gemma-4-12b-it-qat-q4_0.gguf");
+        let exact_sha = "93567e57a8fe10b23569b9d9ec38cd005deedf71e29477c421a4b83f418a538b";
+        assert_eq!(
+            canonical_mtp12_startup_model_id(false, exact_path, exact_sha),
+            Some(GEMMA4_12B_QAT_Q4_0_MTP12_ROW_ID)
+        );
+        assert_eq!(
+            canonical_mtp12_startup_model_id(false, exact_path, &exact_sha.to_uppercase()),
+            Some(GEMMA4_12B_QAT_Q4_0_MTP12_ROW_ID)
+        );
+
+        // Caller-owned ids, neighbouring filenames, and same-named wrong bytes
+        // all retain the generic load pipeline's existing behavior.
+        assert_eq!(
+            canonical_mtp12_startup_model_id(true, exact_path, exact_sha),
+            None
+        );
+        assert_eq!(
+            canonical_mtp12_startup_model_id(
+                false,
+                Path::new("/models/gemma-4-12b-it-Q8_0.gguf"),
+                exact_sha,
+            ),
+            None
+        );
+        assert_eq!(
+            canonical_mtp12_startup_model_id(false, exact_path, &"0".repeat(64)),
+            None
+        );
+    }
+
+    #[test]
+    fn gemma4_mtp12_clamps_an_over_budget_response_limit_like_every_other_lane() {
+        // max_tokens is an UPPER BOUND: an over-budget limit is clamped to the
+        // room left, matching the shared generation path's contract that the
+        // bundled web UI is written against.
+        assert_eq!(
+            gemma4_mtp12_clamp_output_tokens(12, 2_031, 2_048),
+            Ok(2_020)
+        );
+        assert_eq!(gemma4_mtp12_clamp_output_tokens(12, 96, 2_048), Ok(96));
+        assert_eq!(gemma4_mtp12_clamp_output_tokens(0, 4_096, 2_048), Ok(2_032));
+        // Exactly-fitting and one-token-of-room requests survive unclamped.
+        assert_eq!(
+            gemma4_mtp12_clamp_output_tokens(3_000, 1_080, 4_096),
+            Ok(1_080)
+        );
+        assert_eq!(gemma4_mtp12_clamp_output_tokens(2_031, 500, 2_048), Ok(1));
+        // A prompt that leaves no room is the only genuine failure.
+        for prompt in [2_032, 2_048, 9_000] {
+            let error = gemma4_mtp12_clamp_output_tokens(prompt, 1, 2_048)
+                .expect_err("a prompt that fills the window must fail");
+            assert!(error.contains("leaves no room for generation"), "{error}");
+        }
+        assert!(gemma4_mtp12_clamp_output_tokens(usize::MAX, 1, 4_096)
+            .unwrap_err()
+            .contains("overflowed usize"));
+    }
+
+    #[test]
+    fn gemma4_mtp12_context_budget_reserves_physical_w16_headroom() {
+        assert!(gemma4_mtp12_context_budget_check(3_000, 1_080, 4_096).is_ok());
+        let error = gemma4_mtp12_context_budget_check(3_000, 1_081, 4_096)
+            .expect_err("one token beyond prompt + output + W16 must fail");
+        assert!(error.contains("4097 resident positions"), "{error}");
+        assert!(
+            error.contains("16 physical W16 verifier headroom"),
+            "{error}"
+        );
+        assert!(gemma4_mtp12_context_budget_check(usize::MAX, 1, 4_096)
+            .unwrap_err()
+            .contains("overflowed"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn gemma4_mtp12_terminal_diagnostics_use_native_decode_forward_timing() {
+        let generation = crate::gemma4_runtime::Gemma4Mtp12MetalGeneration {
+            text: "ok".to_string(),
+            token_ids: vec![1, 2, 3, 4, 5, 6],
+            prompt_token_count: 3,
+            target_model_sha256: "93567e57a8fe10b23569b9d9ec38cd005deedf71e29477c421a4b83f418a538b",
+            assistant_model_sha256:
+                "67f1420cf24aa5065089aaed175223f7c245ccfda16111b6c56765afd7280db6",
+            assistant_source_path: PathBuf::from("assistant.safetensors"),
+            assistant_resident_ledger: Default::default(),
+            stats: crate::gemma4_runtime::Gemma4Mtp12MetalStats {
+                configured_verify_width: 16,
+                rounds: 2,
+                drafted: 8,
+                accepted_drafts: 4,
+                emitted_tokens: 6,
+                decode_us: 100_000,
+                tree_proposal_rounds: 2,
+                tree_branch_rounds: 1,
+                tree_compaction_us: 750,
+                ..Default::default()
+            },
+        };
+        let diagnostics = gemma4_mtp12_diagnostics(&generation, None);
+        assert_eq!(diagnostics["mtp12"]["lossless_target_verified"], true);
+        assert_eq!(diagnostics["mtp12"]["decode_output_tokens"], 5);
+        assert_eq!(diagnostics["mtp12"]["decode_tokens_per_second"], 50.0);
+        assert_eq!(diagnostics["mtp12"]["configured_verify_width"], 16);
+        assert_eq!(diagnostics["mtp12"]["accepted_drafts"], 4);
+        assert_eq!(diagnostics["mtp12"]["drafted"], 8);
+        assert_eq!(diagnostics["mtp12"]["alpha"], 2.0);
+        assert_eq!(diagnostics["mtp12"]["tree_proposal_rounds"], 2);
+        assert_eq!(diagnostics["mtp12"]["tree_branch_rounds"], 1);
+        assert_eq!(diagnostics["mtp12"]["tree_compaction_us"], 750);
+        let qualification = &diagnostics["mtp12"]["native_receipt_qualification"];
+        assert_eq!(
+            qualification["workload"],
+            "short_context_lossless_mtp_qualification"
+        );
+        assert_eq!(
+            qualification["primary_decode_tokens_per_second"],
+            51.493947835
+        );
+        assert_eq!(
+            qualification["confirmation_decode_tokens_per_second"],
+            51.304677961
+        );
+        assert_eq!(qualification["mean_decode_tokens_per_second"], 51.399);
+        assert_eq!(qualification["prompt_tokens"], 14);
+        assert_eq!(qualification["output_tokens"], 96);
+        assert_eq!(qualification["max_positions"], 512);
+        assert_eq!(
+            qualification["selector"],
+            "CAMELID_GEMMA4_MTP_W16_ONESHOT_W8_PAD16"
+        );
+        assert!(gemma4_mtp12_native_receipt_qualification(
+            "03567e57a8fe10b23569b9d9ec38cd005deedf71e29477c421a4b83f418a538b",
+            generation.assistant_model_sha256,
+        )
+        .is_none());
+
+        let render = gemma4_mtp12_diagnostics(&generation, Some(&[1, 2, 3, 4, 5, 6]));
+        assert_eq!(render["target_verified_render"]["token_ids_exact"], true);
+        assert_eq!(render["target_verified_render"]["verified_tokens"], 6);
+        assert_eq!(
+            render["target_verified_render"]["render_tokens_per_second"],
+            50.0
+        );
+        assert_eq!(
+            render["target_verified_render"]["mode"],
+            "caller_token_ids_target_greedy_verify"
+        );
+    }
+
+    #[test]
+    fn target_verified_render_request_shape_is_streaming_exact_and_bounded() {
+        let ids = [11, 12, 13];
+        assert_eq!(
+            validate_target_verified_render_request_shape(true, 1, Some(3), Some(&ids)),
+            Ok(Some(3))
+        );
+        assert_eq!(
+            validate_target_verified_render_request_shape(false, 1, Some(3), Some(&ids))
+                .unwrap_err(),
+            "target-verified render drafts require stream:true"
+        );
+        assert!(
+            validate_target_verified_render_request_shape(true, 2, Some(3), Some(&ids))
+                .unwrap_err()
+                .contains("exactly one choice")
+        );
+        assert!(
+            validate_target_verified_render_request_shape(true, 1, Some(2), Some(&ids))
+                .unwrap_err()
+                .contains("did not equal the draft length")
+        );
+        assert!(
+            validate_target_verified_render_request_shape(true, 1, Some(0), Some(&[]))
+                .unwrap_err()
+                .contains("at least one")
+        );
+        assert_eq!(
+            validate_target_verified_render_request_shape(true, 1, None, None),
+            Ok(None)
+        );
+    }
+
+    fn target_verified_test_segment(token_ids: &[u32]) -> CamelidTargetVerifiedRenderSegment {
+        CamelidTargetVerifiedRenderSegment {
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: "Write one focused roadmap section.".to_string(),
+                image_urls: Vec::new(),
+                unsupported_content_parts: Vec::new(),
+            }],
+            token_ids: token_ids.to_vec(),
+        }
+    }
+
+    #[test]
+    fn segmented_target_verified_render_shape_is_private_exact_and_bounded() {
+        let segments = vec![
+            target_verified_test_segment(&[11, 12, 13]),
+            target_verified_test_segment(&[21, 22]),
+        ];
+        assert_eq!(
+            validate_target_verified_segmented_render_request_shape(
+                true,
+                1,
+                Some(5),
+                false,
+                Some(&segments),
+            ),
+            Ok(Some(5))
+        );
+        assert!(validate_target_verified_segmented_render_request_shape(
+            true,
+            1,
+            Some(5),
+            true,
+            Some(&segments),
+        )
+        .unwrap_err()
+        .contains("mutually exclusive"));
+        assert!(validate_target_verified_segmented_render_request_shape(
+            false,
+            1,
+            Some(5),
+            false,
+            Some(&segments),
+        )
+        .unwrap_err()
+        .contains("stream:true"));
+        assert!(validate_target_verified_segmented_render_request_shape(
+            true,
+            2,
+            Some(5),
+            false,
+            Some(&segments),
+        )
+        .unwrap_err()
+        .contains("exactly one choice"));
+        assert!(validate_target_verified_segmented_render_request_shape(
+            true,
+            1,
+            Some(4),
+            false,
+            Some(&segments),
+        )
+        .unwrap_err()
+        .contains("total draft length 5"));
+        assert!(validate_target_verified_segmented_render_request_shape(
+            true,
+            1,
+            Some(3),
+            false,
+            Some(&segments[..1]),
+        )
+        .unwrap_err()
+        .contains("2..=8 segments"));
+
+        let wire: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "gemma4_12b_it_qat_q4_0_mtp12",
+            "stream": true,
+            "n": 1,
+            "max_tokens": 5,
+            "camelid_expected_gguf_sha256": GEMMA4_MTP12_QUALIFIED_TARGET_SHA256,
+            "camelid_target_verified_render_segments": [
+                {"messages": [{"role": "user", "content": "section one"}], "token_ids": [11, 12, 13]},
+                {"messages": [{"role": "user", "content": "section two"}], "token_ids": [21, 22]}
+            ]
+        }))
+        .unwrap();
+        assert!(matches!(
+            validate_target_verified_render_request(&wire),
+            Ok(Some(5))
+        ));
+        assert_eq!(
+            wire.camelid_target_verified_render_segments
+                .as_ref()
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn segmented_target_verified_render_requires_request_hash_pin_and_512_envelope() {
+        assert!(validate_segmented_render_expected_sha(
+            true,
+            Some(GEMMA4_MTP12_QUALIFIED_TARGET_SHA256)
+        )
+        .is_ok());
+        assert!(validate_segmented_render_expected_sha(
+            true,
+            Some(&GEMMA4_MTP12_QUALIFIED_TARGET_SHA256.to_uppercase())
+        )
+        .is_ok());
+        assert!(validate_segmented_render_expected_sha(true, None)
+            .unwrap_err()
+            .contains("camelid_expected_gguf_sha256"));
+        assert!(
+            validate_segmented_render_expected_sha(true, Some(&"0".repeat(64)))
+                .unwrap_err()
+                .contains(GEMMA4_MTP12_QUALIFIED_TARGET_SHA256)
+        );
+        assert!(gemma4_mtp12_context_budget_check(
+            400,
+            96,
+            GEMMA4_TARGET_VERIFIED_SEGMENT_MAX_POSITIONS,
+        )
+        .is_ok());
+        assert!(gemma4_mtp12_context_budget_check(
+            401,
+            96,
+            GEMMA4_TARGET_VERIFIED_SEGMENT_MAX_POSITIONS,
+        )
+        .unwrap_err()
+        .contains("513 resident positions"));
+    }
+
+    #[test]
+    fn segmented_target_verified_diagnostics_use_ratio_of_native_sums() {
+        fn receipt(
+            prompt_tokens: usize,
+            requested_tokens: usize,
+            decode_output_tokens: u64,
+            decode_us: u64,
+        ) -> Gemma4VerifiedRenderSegmentReceipt {
+            Gemma4VerifiedRenderSegmentReceipt {
+                prompt_tokens,
+                requested_tokens,
+                verified_tokens: requested_tokens,
+                diagnostics: serde_json::json!({
+                    "mtp12": {
+                        "lossless_target_verified": true,
+                        "decode_output_tokens": decode_output_tokens,
+                        "decode_us": decode_us,
+                        "accepted_drafts": 0,
+                        "drafted": 0,
+                        "target_model_sha256": GEMMA4_MTP12_QUALIFIED_TARGET_SHA256,
+                        "assistant_model_sha256": GEMMA4_MTP12_QUALIFIED_ASSISTANT_SHA256,
+                        "selector": "fixed_w16_target_verified_render",
+                        "width_schedule": {"widths": [16]},
+                        "native_receipt_qualification": {
+                            "target_sha256": GEMMA4_MTP12_QUALIFIED_TARGET_SHA256,
+                            "assistant_sha256": GEMMA4_MTP12_QUALIFIED_ASSISTANT_SHA256
+                        }
+                    },
+                    "target_verified_render": {
+                        "verified_tokens": requested_tokens,
+                        "token_ids_exact": true
+                    }
+                }),
+            }
+        }
+        let mut receipts = vec![receipt(100, 6, 5, 100_000), receipt(80, 4, 3, 50_000)];
+        let diagnostics = gemma4_segmented_target_verified_diagnostics(&receipts).unwrap();
+        let expected_tps = 8.0 * 1_000_000.0 / 150_000.0;
+        assert_eq!(diagnostics["mtp12"]["decode_output_tokens"], 8);
+        assert_eq!(diagnostics["mtp12"]["decode_us"], 150_000);
+        assert_eq!(
+            diagnostics["mtp12"]["decode_tokens_per_second"],
+            expected_tps
+        );
+        let segmented = &diagnostics["target_verified_segmented_render"];
+        assert_eq!(
+            segmented["mode"],
+            "prepared_web_research_segmented_target_verify"
+        );
+        assert_eq!(segmented["segment_count"], 2);
+        assert_eq!(segmented["segments_exact"], true);
+        assert_eq!(segmented["total_prompt_tokens"], 180);
+        assert_eq!(segmented["requested_tokens"], 10);
+        assert_eq!(segmented["verified_tokens"], 10);
+        assert_eq!(segmented["decode_output_tokens"], 8);
+        assert_eq!(segmented["decode_us"], 150_000);
+        assert_eq!(segmented["render_tokens_per_second"], expected_tps);
+        assert_eq!(segmented["qualification_envelope_max_positions"], 512);
+        assert_eq!(segmented["segments"][0]["render_tokens_per_second"], 50.0);
+        assert_eq!(segmented["segments"][1]["render_tokens_per_second"], 60.0);
+
+        let progress = gemma4_target_verified_segment_progress(0, &receipts[0], "\n\n").unwrap();
+        let delta = gemma4_target_verified_segment_delta(&progress);
+        assert_eq!(delta["camelid_segment"]["index"], 0);
+        assert_eq!(delta["camelid_segment"]["token_ids_exact"], true);
+        assert_eq!(delta["camelid_segment"]["requested_tokens"], 6);
+        assert_eq!(delta["camelid_segment"]["verified_tokens"], 6);
+        assert_eq!(delta["camelid_segment"]["decode_output_tokens"], 5);
+        assert_eq!(delta["camelid_segment"]["decode_us"], 100_000);
+        assert_eq!(delta["camelid_segment"]["render_tokens_per_second"], 50.0);
+        assert_eq!(delta["camelid_segment"]["boundary"], "\n\n");
+
+        receipts[1].diagnostics["target_verified_render"]["token_ids_exact"] =
+            serde_json::Value::Bool(false);
+        assert!(gemma4_segmented_target_verified_diagnostics(&receipts)
+            .unwrap_err()
+            .contains("did not exactly target-verify"));
+    }
+
+    #[test]
     fn dg_serve_lane_defaults_on_with_explicit_opt_out() {
         // Maintainer-directed: the DiffusionGemma serve lane defaults on like the
         // runnable and gemma4 lanes — a loaded diffusion-gemma model has no other
@@ -10224,6 +11157,8 @@ mod gemma4_template_tests {
         assert_eq!(gemma4_finish_reason(8, 8), "length");
         assert_eq!(gemma4_finish_reason(0, 8), "stop");
         assert_eq!(gemma4_finish_reason(5, 8), "stop");
+        assert_eq!(gemma4_streaming_finish_reason(8, 8, false), "length");
+        assert_eq!(gemma4_streaming_finish_reason(8, 8, true), "stop");
     }
 
     #[test]
@@ -10378,6 +11313,21 @@ fn gemma4_finish_reason(completion_tokens: usize, max_tokens: usize) -> &'static
     }
 }
 
+/// A completed target-verified render consumed a finite, already naturally
+/// terminated planner draft. Its exact draft length is carried in `max_tokens`
+/// only as an integrity bound, not as a generation truncation boundary.
+fn gemma4_streaming_finish_reason(
+    completion_tokens: usize,
+    max_tokens: usize,
+    target_verified_render: bool,
+) -> &'static str {
+    if target_verified_render {
+        "stop"
+    } else {
+        gemma4_finish_reason(completion_tokens, max_tokens)
+    }
+}
+
 fn gemma4_usage(prompt_tokens: usize, completion_tokens: usize) -> CompletionUsage {
     CompletionUsage {
         prompt_tokens,
@@ -10407,10 +11357,600 @@ async fn gemma4_prompt_token_count(
     }
 }
 
+/// Effective output budget for an MTP12 request. `max_tokens` is an upper bound,
+/// so an over-budget limit is clamped to the room left rather than rejected;
+/// only a prompt that fills the resident window is an error.
+#[allow(clippy::result_large_err)] // Err is the shared axum Response type used by every handler
+fn clamp_gemma4_mtp12_request_context(
+    runtime: &Gemma4ServeRuntime,
+    prompt_tokens: usize,
+    requested_output_tokens: usize,
+) -> std::result::Result<usize, Response> {
+    runtime
+        .clamp_mtp12_output_tokens(prompt_tokens, requested_output_tokens)
+        .map_err(|message| {
+            api_error_with_prompt_token_count(
+                StatusCode::BAD_REQUEST,
+                "context_length_exceeded",
+                message,
+                Some("max_tokens"),
+                Some(prompt_tokens),
+            )
+        })
+}
+
+fn validate_target_verified_render_request_shape(
+    stream: bool,
+    n: u32,
+    max_tokens: Option<u32>,
+    render_draft_token_ids: Option<&[u32]>,
+) -> std::result::Result<Option<usize>, String> {
+    let Some(token_ids) = render_draft_token_ids else {
+        return Ok(None);
+    };
+    if !stream {
+        return Err("target-verified render drafts require stream:true".to_string());
+    }
+    if n != 1 {
+        return Err("target-verified render drafts require exactly one choice".to_string());
+    }
+    if token_ids.is_empty() {
+        return Err("target-verified render drafts must contain at least one token id".to_string());
+    }
+    if token_ids.len() > 4096 {
+        return Err("target-verified render drafts are limited to 4096 token ids".to_string());
+    }
+    let requested = max_tokens.ok_or_else(|| {
+        "target-verified render drafts require max_tokens equal to the draft length".to_string()
+    })? as usize;
+    if requested != token_ids.len() {
+        return Err(format!(
+            "target-verified render max_tokens {requested} did not equal the draft length {}",
+            token_ids.len(),
+        ));
+    }
+    Ok(Some(token_ids.len()))
+}
+
+const GEMMA4_TARGET_VERIFIED_SEGMENT_MIN_COUNT: usize = 2;
+const GEMMA4_TARGET_VERIFIED_SEGMENT_MAX_COUNT: usize = 8;
+const GEMMA4_TARGET_VERIFIED_SEGMENT_MAX_POSITIONS: usize = 512;
+
+fn validate_target_verified_segmented_render_request_shape(
+    stream: bool,
+    n: u32,
+    max_tokens: Option<u32>,
+    single_render_draft_present: bool,
+    segments: Option<&[CamelidTargetVerifiedRenderSegment]>,
+) -> std::result::Result<Option<usize>, String> {
+    let Some(segments) = segments else {
+        return Ok(None);
+    };
+    if single_render_draft_present {
+        return Err(
+            "segmented and single target-verified render drafts are mutually exclusive".to_string(),
+        );
+    }
+    if !stream {
+        return Err("segmented target-verified renders require stream:true".to_string());
+    }
+    if n != 1 {
+        return Err("segmented target-verified renders require exactly one choice".to_string());
+    }
+    if !(GEMMA4_TARGET_VERIFIED_SEGMENT_MIN_COUNT..=GEMMA4_TARGET_VERIFIED_SEGMENT_MAX_COUNT)
+        .contains(&segments.len())
+    {
+        return Err(format!(
+            "segmented target-verified renders require {}..={} segments, got {}",
+            GEMMA4_TARGET_VERIFIED_SEGMENT_MIN_COUNT,
+            GEMMA4_TARGET_VERIFIED_SEGMENT_MAX_COUNT,
+            segments.len(),
+        ));
+    }
+    let mut total_tokens = 0usize;
+    for (index, segment) in segments.iter().enumerate() {
+        if segment.messages.is_empty() {
+            return Err(format!(
+                "target-verified render segment {index} must contain at least one message"
+            ));
+        }
+        if segment.token_ids.is_empty() {
+            return Err(format!(
+                "target-verified render segment {index} must contain at least one token id"
+            ));
+        }
+        if segment.messages.iter().any(|message| {
+            !message.image_urls.is_empty() || !message.unsupported_content_parts.is_empty()
+        }) {
+            return Err(format!(
+                "target-verified render segment {index} supports text messages only"
+            ));
+        }
+        total_tokens = total_tokens
+            .checked_add(segment.token_ids.len())
+            .ok_or_else(|| "segmented target-verified render token count overflowed".to_string())?;
+    }
+    if total_tokens > 4096 {
+        return Err(
+            "segmented target-verified renders are limited to 4096 total token ids".to_string(),
+        );
+    }
+    let requested = max_tokens.ok_or_else(|| {
+        "segmented target-verified renders require max_tokens equal to the total draft length"
+            .to_string()
+    })? as usize;
+    if requested != total_tokens {
+        return Err(format!(
+            "segmented target-verified render max_tokens {requested} did not equal the total draft length {total_tokens}"
+        ));
+    }
+    Ok(Some(total_tokens))
+}
+
+#[allow(clippy::result_large_err)] // Err is the shared axum Response type used by every handler
+fn validate_target_verified_render_request(
+    req: &ChatCompletionRequest,
+) -> std::result::Result<Option<usize>, Response> {
+    if req.camelid_target_verified_render_draft_token_ids.is_some()
+        && req.camelid_target_verified_render_segments.is_some()
+    {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_target_verified_render_segments",
+            "segmented and single target-verified render drafts are mutually exclusive".to_string(),
+            Some("camelid_target_verified_render_segments"),
+        ));
+    }
+    let single = validate_target_verified_render_request_shape(
+        req.stream.unwrap_or(false),
+        req.n.unwrap_or(1),
+        req.max_tokens,
+        req.camelid_target_verified_render_draft_token_ids
+            .as_deref(),
+    )
+    .map_err(|message| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_target_verified_render_draft",
+            message,
+            Some("camelid_target_verified_render_draft_token_ids"),
+        )
+    })?;
+    let segmented = validate_target_verified_segmented_render_request_shape(
+        req.stream.unwrap_or(false),
+        req.n.unwrap_or(1),
+        req.max_tokens,
+        single.is_some(),
+        req.camelid_target_verified_render_segments.as_deref(),
+    )
+    .map_err(|message| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_target_verified_render_segments",
+            message,
+            Some("camelid_target_verified_render_segments"),
+        )
+    })?;
+    Ok(single.or(segmented))
+}
+
+fn validate_segmented_render_expected_sha(
+    segmented_render_present: bool,
+    expected_sha256: Option<&str>,
+) -> std::result::Result<(), String> {
+    if !segmented_render_present {
+        return Ok(());
+    }
+    match expected_sha256 {
+        Some(value) if value.eq_ignore_ascii_case(GEMMA4_MTP12_QUALIFIED_TARGET_SHA256) => Ok(()),
+        Some(value) => Err(format!(
+            "segmented target-verified renders require the qualified target SHA-256 {}, got {value}",
+            GEMMA4_MTP12_QUALIFIED_TARGET_SHA256
+        )),
+        None => Err(format!(
+            "segmented target-verified renders require camelid_expected_gguf_sha256={}",
+            GEMMA4_MTP12_QUALIFIED_TARGET_SHA256
+        )),
+    }
+}
+
 enum Gemma4StreamItem {
     Delta(String),
-    Complete { completion_tokens: usize },
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    SegmentBoundary(Gemma4TargetVerifiedSegmentProgress),
+    Complete {
+        completion_tokens: usize,
+        /// Native engine evidence, present only for an execution lane that
+        /// reports target-authoritative decode timing.
+        diagnostics: Option<serde_json::Value>,
+    },
     Error(String),
+}
+
+#[derive(Clone, Debug)]
+struct Gemma4TargetVerifiedSegmentProgress {
+    index: usize,
+    requested_tokens: usize,
+    verified_tokens: usize,
+    decode_output_tokens: u64,
+    decode_us: u64,
+    render_tokens_per_second: f64,
+    boundary: &'static str,
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn gemma4_target_verified_segment_progress(
+    index: usize,
+    receipt: &Gemma4VerifiedRenderSegmentReceipt,
+    boundary: &'static str,
+) -> std::result::Result<Gemma4TargetVerifiedSegmentProgress, String> {
+    let exact = receipt
+        .diagnostics
+        .pointer("/target_verified_render/token_ids_exact")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let native_verified_tokens = gemma4_required_diagnostic_u64(
+        &receipt.diagnostics,
+        "/target_verified_render/verified_tokens",
+    )
+    .and_then(|value| {
+        usize::try_from(value).map_err(|_| "native verified token count exceeded usize".to_string())
+    })?;
+    if !exact
+        || receipt.requested_tokens != receipt.verified_tokens
+        || native_verified_tokens != receipt.verified_tokens
+    {
+        return Err(format!(
+            "segment {index} did not exactly target-verify every requested token"
+        ));
+    }
+    let decode_output_tokens =
+        gemma4_required_diagnostic_u64(&receipt.diagnostics, "/mtp12/decode_output_tokens")?;
+    let decode_us = gemma4_required_diagnostic_u64(&receipt.diagnostics, "/mtp12/decode_us")?;
+    let render_tokens_per_second = if decode_us == 0 {
+        0.0
+    } else {
+        decode_output_tokens as f64 * 1_000_000.0 / decode_us as f64
+    };
+    Ok(Gemma4TargetVerifiedSegmentProgress {
+        index,
+        requested_tokens: receipt.requested_tokens,
+        verified_tokens: receipt.verified_tokens,
+        decode_output_tokens,
+        decode_us,
+        render_tokens_per_second,
+        boundary,
+    })
+}
+
+fn gemma4_target_verified_segment_delta(
+    progress: &Gemma4TargetVerifiedSegmentProgress,
+) -> serde_json::Value {
+    serde_json::json!({
+        "camelid_segment": {
+            "index": progress.index,
+            "token_ids_exact": true,
+            "requested_tokens": progress.requested_tokens,
+            "verified_tokens": progress.verified_tokens,
+            "decode_output_tokens": progress.decode_output_tokens,
+            "decode_us": progress.decode_us,
+            "render_tokens_per_second": progress.render_tokens_per_second,
+            "boundary": progress.boundary,
+        }
+    })
+}
+
+struct Gemma4StreamingOutcome {
+    outcome: crate::gemma4_runtime::Gemma4GenerationOutcome,
+    diagnostics: Option<serde_json::Value>,
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+struct Gemma4PreparedRenderSegment {
+    prompt: String,
+    prompt_tokens: usize,
+    token_ids: Vec<u32>,
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+struct Gemma4VerifiedRenderSegmentReceipt {
+    prompt_tokens: usize,
+    requested_tokens: usize,
+    verified_tokens: usize,
+    diagnostics: serde_json::Value,
+}
+
+#[cfg(target_os = "macos")]
+fn gemma4_mtp12_native_receipt_qualification(
+    target_model_sha256: &str,
+    assistant_model_sha256: &str,
+) -> Option<serde_json::Value> {
+    if !target_model_sha256.eq_ignore_ascii_case(GEMMA4_MTP12_QUALIFIED_TARGET_SHA256)
+        || !assistant_model_sha256.eq_ignore_ascii_case(GEMMA4_MTP12_QUALIFIED_ASSISTANT_SHA256)
+    {
+        return None;
+    }
+    Some(serde_json::json!({
+        "workload": "short_context_lossless_mtp_qualification",
+        "primary_decode_tokens_per_second": 51.493947835_f64,
+        "confirmation_decode_tokens_per_second": 51.304677961_f64,
+        "mean_decode_tokens_per_second": 51.399_f64,
+        "prompt_tokens": 14,
+        "output_tokens": 96,
+        "max_positions": 512,
+        "selector": "CAMELID_GEMMA4_MTP_W16_ONESHOT_W8_PAD16",
+        "target_sha256": GEMMA4_MTP12_QUALIFIED_TARGET_SHA256,
+        "assistant_sha256": GEMMA4_MTP12_QUALIFIED_ASSISTANT_SHA256,
+    }))
+}
+
+#[cfg(target_os = "macos")]
+fn gemma4_mtp12_diagnostics(
+    generation: &crate::gemma4_runtime::Gemma4Mtp12MetalGeneration,
+    render_draft_token_ids: Option<&[u32]>,
+) -> serde_json::Value {
+    let stats = &generation.stats;
+    let decode_output_tokens = stats.emitted_tokens.saturating_sub(1);
+    let mut diagnostics = serde_json::json!({
+        "mtp12": {
+            "lossless_target_verified": true,
+            "decode_us": stats.decode_us,
+            "prefill_us": stats.prefill_us,
+            "assistant_us": stats.assistant_us,
+            "target_verify_us": stats.target_verify_us,
+            "rounds": stats.rounds,
+            "target_verify_rows": stats.target_verify_rows,
+            "tree_proposal_rounds": stats.tree_proposal_rounds,
+            "tree_branch_rounds": stats.tree_branch_rounds,
+            "tree_compaction_us": stats.tree_compaction_us,
+            "decode_output_tokens": decode_output_tokens,
+            "decode_tokens_per_second": stats.decode_tokens_per_second(),
+            "configured_verify_width": stats.configured_verify_width,
+            "accepted_drafts": stats.accepted_drafts,
+            "drafted": stats.drafted,
+            "alpha": stats.alpha(),
+            "target_model_sha256": generation.target_model_sha256,
+            "assistant_model_sha256": generation.assistant_model_sha256,
+            "assistant_dense_bf16": generation.assistant_resident_ledger.dense_bf16_enabled,
+            "assistant_dense_bf16_matrix_bytes": generation.assistant_resident_ledger.dense_bf16_matrix_bytes,
+            "selector": stats.width_schedule.selector,
+            "width_schedule": &stats.width_schedule,
+        }
+    });
+    if let Some(qualification) = gemma4_mtp12_native_receipt_qualification(
+        generation.target_model_sha256,
+        generation.assistant_model_sha256,
+    ) {
+        diagnostics["mtp12"]["native_receipt_qualification"] = qualification;
+    }
+    if let Some(render_draft_token_ids) = render_draft_token_ids {
+        let requested_tokens = render_draft_token_ids.len();
+        let verified_tokens = generation.token_ids.len();
+        diagnostics["target_verified_render"] = serde_json::json!({
+            "mode": "caller_token_ids_target_greedy_verify",
+            "requested_tokens": requested_tokens,
+            "verified_tokens": verified_tokens,
+            "token_ids_exact": generation.token_ids == render_draft_token_ids,
+            "render_verify_us": stats.decode_us,
+            "render_tokens_per_second": stats.decode_tokens_per_second(),
+        });
+    }
+    diagnostics
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn gemma4_required_diagnostic_u64(
+    diagnostics: &serde_json::Value,
+    pointer: &str,
+) -> std::result::Result<u64, String> {
+    diagnostics
+        .pointer(pointer)
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| format!("native MTP12 diagnostics omitted {pointer}"))
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn gemma4_required_diagnostic_str<'a>(
+    diagnostics: &'a serde_json::Value,
+    pointer: &str,
+) -> std::result::Result<&'a str, String> {
+    diagnostics
+        .pointer(pointer)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("native MTP12 diagnostics omitted {pointer}"))
+}
+
+/// Combine only native verifier timing. This is deliberately a ratio of sums:
+/// averaging per-section rates would overweight short sections, while wall/UI
+/// timing would not be the target decoder's measured work.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn gemma4_segmented_target_verified_diagnostics(
+    receipts: &[Gemma4VerifiedRenderSegmentReceipt],
+) -> std::result::Result<serde_json::Value, String> {
+    if !(GEMMA4_TARGET_VERIFIED_SEGMENT_MIN_COUNT..=GEMMA4_TARGET_VERIFIED_SEGMENT_MAX_COUNT)
+        .contains(&receipts.len())
+    {
+        return Err(format!(
+            "segmented verifier returned an invalid section count {}",
+            receipts.len()
+        ));
+    }
+
+    let mut total_prompt_tokens = 0usize;
+    let mut total_requested_tokens = 0usize;
+    let mut total_verified_tokens = 0usize;
+    let mut total_decode_output_tokens = 0u64;
+    let mut total_decode_us = 0u64;
+    let mut total_accepted_drafts = 0u64;
+    let mut total_drafted = 0u64;
+    let mut segment_metrics = Vec::with_capacity(receipts.len());
+    let mut target_sha256: Option<String> = None;
+    let mut assistant_sha256: Option<String> = None;
+    let mut selector: Option<serde_json::Value> = None;
+    let mut width_schedule: Option<serde_json::Value> = None;
+    let mut qualification: Option<serde_json::Value> = None;
+
+    for (index, receipt) in receipts.iter().enumerate() {
+        let mtp12 = receipt
+            .diagnostics
+            .get("mtp12")
+            .ok_or_else(|| format!("segment {index} omitted native MTP12 diagnostics"))?;
+        if mtp12
+            .get("lossless_target_verified")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+        {
+            return Err(format!(
+                "segment {index} was not marked lossless_target_verified"
+            ));
+        }
+        let render = receipt
+            .diagnostics
+            .get("target_verified_render")
+            .ok_or_else(|| format!("segment {index} omitted target-verifier diagnostics"))?;
+        let token_ids_exact = render
+            .get("token_ids_exact")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+        let native_verified_tokens = render
+            .get("verified_tokens")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| format!("segment {index} omitted verified_tokens"))?;
+        if !token_ids_exact
+            || receipt.verified_tokens != receipt.requested_tokens
+            || native_verified_tokens != receipt.requested_tokens
+        {
+            return Err(format!(
+                "segment {index} did not exactly target-verify every requested token"
+            ));
+        }
+
+        let decode_output_tokens =
+            gemma4_required_diagnostic_u64(&receipt.diagnostics, "/mtp12/decode_output_tokens")?;
+        let decode_us = gemma4_required_diagnostic_u64(&receipt.diagnostics, "/mtp12/decode_us")?;
+        let segment_tps = if decode_us == 0 {
+            0.0
+        } else {
+            decode_output_tokens as f64 * 1_000_000.0 / decode_us as f64
+        };
+        let segment_target_sha =
+            gemma4_required_diagnostic_str(&receipt.diagnostics, "/mtp12/target_model_sha256")?;
+        let segment_assistant_sha =
+            gemma4_required_diagnostic_str(&receipt.diagnostics, "/mtp12/assistant_model_sha256")?;
+        if let Some(expected) = target_sha256.as_deref() {
+            if !expected.eq_ignore_ascii_case(segment_target_sha) {
+                return Err(format!("segment {index} changed target model identity"));
+            }
+        } else {
+            target_sha256 = Some(segment_target_sha.to_string());
+        }
+        if let Some(expected) = assistant_sha256.as_deref() {
+            if !expected.eq_ignore_ascii_case(segment_assistant_sha) {
+                return Err(format!("segment {index} changed assistant model identity"));
+            }
+        } else {
+            assistant_sha256 = Some(segment_assistant_sha.to_string());
+        }
+
+        let segment_qualification = mtp12
+            .get("native_receipt_qualification")
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "segment {index} was not produced by the exact hash-pinned qualified MTP12 lane"
+                )
+            })?;
+        if let Some(expected) = qualification.as_ref() {
+            if expected != &segment_qualification {
+                return Err(format!(
+                    "segment {index} changed MTP12 qualification identity"
+                ));
+            }
+        } else {
+            qualification = Some(segment_qualification);
+        }
+
+        total_prompt_tokens = total_prompt_tokens
+            .checked_add(receipt.prompt_tokens)
+            .ok_or_else(|| "segmented verifier prompt token count overflowed".to_string())?;
+        total_requested_tokens = total_requested_tokens
+            .checked_add(receipt.requested_tokens)
+            .ok_or_else(|| "segmented verifier requested token count overflowed".to_string())?;
+        total_verified_tokens = total_verified_tokens
+            .checked_add(receipt.verified_tokens)
+            .ok_or_else(|| "segmented verifier verified token count overflowed".to_string())?;
+        total_decode_output_tokens = total_decode_output_tokens
+            .checked_add(decode_output_tokens)
+            .ok_or_else(|| "segmented verifier decode token count overflowed".to_string())?;
+        total_decode_us = total_decode_us
+            .checked_add(decode_us)
+            .ok_or_else(|| "segmented verifier decode timing overflowed".to_string())?;
+        total_accepted_drafts = total_accepted_drafts.saturating_add(
+            mtp12
+                .get("accepted_drafts")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+        );
+        total_drafted = total_drafted.saturating_add(
+            mtp12
+                .get("drafted")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+        );
+        selector.get_or_insert_with(|| mtp12["selector"].clone());
+        width_schedule.get_or_insert_with(|| mtp12["width_schedule"].clone());
+        segment_metrics.push(serde_json::json!({
+            "index": index,
+            "prompt_tokens": receipt.prompt_tokens,
+            "requested_tokens": receipt.requested_tokens,
+            "verified_tokens": receipt.verified_tokens,
+            "token_ids_exact": true,
+            "decode_output_tokens": decode_output_tokens,
+            "decode_us": decode_us,
+            "render_tokens_per_second": segment_tps,
+        }));
+    }
+
+    let aggregate_tps = if total_decode_us == 0 {
+        0.0
+    } else {
+        total_decode_output_tokens as f64 * 1_000_000.0 / total_decode_us as f64
+    };
+    let target_sha256 = target_sha256.expect("nonempty receipt set has target SHA");
+    let assistant_sha256 = assistant_sha256.expect("nonempty receipt set has assistant SHA");
+    let qualification = qualification.expect("nonempty qualified receipt set");
+    Ok(serde_json::json!({
+        "mtp12": {
+            "lossless_target_verified": true,
+            "decode_us": total_decode_us,
+            "decode_output_tokens": total_decode_output_tokens,
+            "decode_tokens_per_second": aggregate_tps,
+            "configured_verify_width": 16,
+            "accepted_drafts": total_accepted_drafts,
+            "drafted": total_drafted,
+            "target_model_sha256": target_sha256.clone(),
+            "assistant_model_sha256": assistant_sha256.clone(),
+            "selector": selector.unwrap_or(serde_json::Value::Null),
+            "width_schedule": width_schedule.unwrap_or(serde_json::Value::Null),
+            "native_receipt_qualification": qualification,
+        },
+        "target_verified_segmented_render": {
+            "mode": "prepared_web_research_segmented_target_verify",
+            "segment_count": receipts.len(),
+            "segments_exact": true,
+            "total_prompt_tokens": total_prompt_tokens,
+            "requested_tokens": total_requested_tokens,
+            "verified_tokens": total_verified_tokens,
+            "decode_output_tokens": total_decode_output_tokens,
+            "decode_us": total_decode_us,
+            "render_tokens_per_second": aggregate_tps,
+            "qualification_envelope_max_positions": GEMMA4_TARGET_VERIFIED_SEGMENT_MAX_POSITIONS,
+            "target_model_sha256": target_sha256,
+            "assistant_model_sha256": assistant_sha256,
+            "segments": segment_metrics,
+        }
+    }))
 }
 
 /// Resolve the Gemma 4 runtime for a chat request, if this request targets one.
@@ -10430,6 +11970,16 @@ enum Gemma4StreamItem {
 pub enum Gemma4ServeRuntime {
     Local(crate::gemma4_runtime::Gemma4Runtime),
     Distributed(crate::gemma4_distributed::Gemma4DistributedRuntime),
+    /// Explicit, exact-artifact single-node Metal lane. The target and
+    /// assistant each perform their own SHA admission before this variant can
+    /// be installed in AppState.
+    #[cfg(target_os = "macos")]
+    Mtp12Metal {
+        runtime: crate::gemma4_runtime::Gemma4GpuRuntime,
+        assistant: std::sync::Mutex<crate::metal::Gemma4Mtp12AssistantMetal>,
+        verify_width: usize,
+        max_positions: usize,
+    },
     /// CUDA decode engine (stateful GPU runtime -> Mutex; one request at a time).
     #[cfg(feature = "cuda")]
     Cuda {
@@ -10439,7 +11989,105 @@ pub enum Gemma4ServeRuntime {
     },
 }
 
+const GEMMA4_MTP12_PHYSICAL_W16_HEADROOM: usize = 16;
+
+/// Room left for generation after the prompt and the physical W16 verifier
+/// headroom. `max_tokens` is an UPPER BOUND on every other lane (see the
+/// clamping contract in the shared generation path), so this lane clamps to the
+/// same rule instead of rejecting: the only genuine failure is a prompt that
+/// already fills the resident window, leaving no room for a single token.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn gemma4_mtp12_available_output_tokens(
+    prompt_tokens: usize,
+    max_positions: usize,
+) -> std::result::Result<usize, String> {
+    let reserved = prompt_tokens
+        .checked_add(GEMMA4_MTP12_PHYSICAL_W16_HEADROOM)
+        .ok_or_else(|| "Gemma 4 MTP12 context budget overflowed usize".to_string())?;
+    let available = max_positions.saturating_sub(reserved);
+    if available == 0 {
+        return Err(format!(
+            "Gemma 4 MTP12 prompt of {prompt_tokens} tokens plus {GEMMA4_MTP12_PHYSICAL_W16_HEADROOM} physical W16 verifier headroom leaves no room for generation in the runtime capacity of {max_positions}"
+        ));
+    }
+    Ok(available)
+}
+
+/// Strict fit check for replays whose output length is a DEMAND, not an upper
+/// bound (verified-render segments must emit exactly their recorded tokens).
+fn gemma4_mtp12_context_budget_check(
+    prompt_tokens: usize,
+    requested_output_tokens: usize,
+    max_positions: usize,
+) -> std::result::Result<(), String> {
+    let required = prompt_tokens
+        .checked_add(requested_output_tokens)
+        .and_then(|tokens| tokens.checked_add(GEMMA4_MTP12_PHYSICAL_W16_HEADROOM))
+        .ok_or_else(|| "Gemma 4 MTP12 context budget overflowed usize".to_string())?;
+    if required > max_positions {
+        return Err(format!(
+            "Gemma 4 MTP12 request requires {required} resident positions ({prompt_tokens} prompt + {requested_output_tokens} requested output + {GEMMA4_MTP12_PHYSICAL_W16_HEADROOM} physical W16 verifier headroom), above the runtime capacity of {max_positions}"
+        ));
+    }
+    Ok(())
+}
+
+/// Clamp a requested response limit to what actually fits. Returns the effective
+/// output budget; errors only when the prompt itself leaves no room.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn gemma4_mtp12_clamp_output_tokens(
+    prompt_tokens: usize,
+    requested_output_tokens: usize,
+    max_positions: usize,
+) -> std::result::Result<usize, String> {
+    let available = gemma4_mtp12_available_output_tokens(prompt_tokens, max_positions)?;
+    Ok(requested_output_tokens.min(available))
+}
+
 impl Gemma4ServeRuntime {
+    fn is_mtp12_metal(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        if matches!(self, Self::Mtp12Metal { .. }) {
+            return true;
+        }
+        false
+    }
+
+    fn effective_context_length(&self) -> Option<u32> {
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::Mtp12Metal { max_positions, .. } => u32::try_from(*max_positions).ok(),
+            _ => None,
+        }
+    }
+
+    fn reserved_context_headroom(&self) -> u32 {
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::Mtp12Metal { .. } => GEMMA4_MTP12_PHYSICAL_W16_HEADROOM as u32,
+            _ => 0,
+        }
+    }
+
+    /// Effective output budget for this lane: the request's own limit, clamped
+    /// to the room left after the prompt and the verifier headroom.
+    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+    fn clamp_mtp12_output_tokens(
+        &self,
+        prompt_tokens: usize,
+        requested_output_tokens: usize,
+    ) -> std::result::Result<usize, String> {
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::Mtp12Metal { max_positions, .. } => gemma4_mtp12_clamp_output_tokens(
+                prompt_tokens,
+                requested_output_tokens,
+                *max_positions,
+            ),
+            _ => Ok(requested_output_tokens),
+        }
+    }
+
     /// Metal components still owned by this live runtime. The process-wide GPU
     /// and deterministic gates are deliberately applied by the health snapshot,
     /// not latched here.
@@ -10449,6 +12097,8 @@ impl Gemma4ServeRuntime {
         match self {
             Self::Local(runtime) => runtime.ghost_metal_components(),
             Self::Distributed(_) => Default::default(),
+            #[cfg(target_os = "macos")]
+            Self::Mtp12Metal { .. } => Default::default(),
             #[cfg(feature = "cuda")]
             Self::Cuda { .. } => Default::default(),
         }
@@ -10476,6 +12126,8 @@ impl Gemma4ServeRuntime {
         let tokens = match self {
             Self::Local(runtime) => runtime.tokenizer().encode(prompt, true, true)?,
             Self::Distributed(runtime) => runtime.tokenizer().encode(prompt, true, true)?,
+            #[cfg(target_os = "macos")]
+            Self::Mtp12Metal { runtime, .. } => runtime.tokenizer().encode(prompt, true, true)?,
             #[cfg(feature = "cuda")]
             Self::Cuda { runtime, .. } => runtime
                 .lock()
@@ -10491,16 +12143,56 @@ impl Gemma4ServeRuntime {
         prompt: &str,
         max_new: usize,
         should_cancel: C,
-    ) -> crate::Result<crate::gemma4_runtime::Gemma4GenerationOutcome> {
-        match self {
+    ) -> crate::Result<Gemma4StreamingOutcome> {
+        let outcome = match self {
             Self::Local(r) => r.generate_greedy_cancellable(prompt, max_new, should_cancel),
             Self::Distributed(r) => r.generate_greedy_cancellable(prompt, max_new, should_cancel),
+            #[cfg(target_os = "macos")]
+            Self::Mtp12Metal {
+                runtime,
+                assistant,
+                verify_width,
+                ..
+            } => {
+                let mut assistant = assistant.lock().expect("gemma4 mtp12 assistant lock");
+                match runtime.generate_greedy_mtp12_ordered_q4_streaming_cancellable(
+                    &mut assistant,
+                    prompt,
+                    max_new,
+                    *verify_width,
+                    |_| {},
+                    should_cancel,
+                )? {
+                    crate::gemma4_runtime::Gemma4Mtp12MetalGenerationOutcome::Complete(result) => {
+                        let diagnostics = gemma4_mtp12_diagnostics(&result, None);
+                        return Ok(Gemma4StreamingOutcome {
+                            outcome: crate::gemma4_runtime::Gemma4GenerationOutcome::Complete {
+                                text: result.text,
+                                token_ids: result.token_ids,
+                            },
+                            diagnostics: Some(diagnostics),
+                        });
+                    }
+                    crate::gemma4_runtime::Gemma4Mtp12MetalGenerationOutcome::Cancelled(result) => {
+                        return Ok(Gemma4StreamingOutcome {
+                            outcome: crate::gemma4_runtime::Gemma4GenerationOutcome::Cancelled {
+                                generated_tokens: result.token_ids.len(),
+                            },
+                            diagnostics: None,
+                        })
+                    }
+                }
+            }
             #[cfg(feature = "cuda")]
             Self::Cuda { runtime: m, .. } => m
                 .lock()
                 .expect("gemma4 cuda runtime lock")
                 .generate_greedy_cancellable(prompt, max_new, should_cancel),
-        }
+        }?;
+        Ok(Gemma4StreamingOutcome {
+            outcome,
+            diagnostics: None,
+        })
     }
 
     fn generate_greedy_streaming_cancellable<F: FnMut(&str), C: FnMut() -> bool>(
@@ -10509,19 +12201,105 @@ impl Gemma4ServeRuntime {
         max_new: usize,
         on_delta: F,
         should_cancel: C,
-    ) -> crate::Result<crate::gemma4_runtime::Gemma4GenerationOutcome> {
-        match self {
+    ) -> crate::Result<Gemma4StreamingOutcome> {
+        let outcome = match self {
             Self::Local(r) => {
                 r.generate_greedy_streaming_cancellable(prompt, max_new, on_delta, should_cancel)
             }
             Self::Distributed(r) => {
                 r.generate_greedy_streaming_cancellable(prompt, max_new, on_delta, should_cancel)
             }
+            #[cfg(target_os = "macos")]
+            Self::Mtp12Metal {
+                runtime,
+                assistant,
+                verify_width,
+                ..
+            } => {
+                let mut assistant = assistant.lock().expect("gemma4 mtp12 assistant lock");
+                return match runtime.generate_greedy_mtp12_ordered_q4_streaming_cancellable(
+                    &mut assistant,
+                    prompt,
+                    max_new,
+                    *verify_width,
+                    on_delta,
+                    should_cancel,
+                )? {
+                    crate::gemma4_runtime::Gemma4Mtp12MetalGenerationOutcome::Complete(result) => {
+                        let diagnostics = gemma4_mtp12_diagnostics(&result, None);
+                        Ok(Gemma4StreamingOutcome {
+                            outcome: crate::gemma4_runtime::Gemma4GenerationOutcome::Complete {
+                                text: result.text,
+                                token_ids: result.token_ids,
+                            },
+                            diagnostics: Some(diagnostics),
+                        })
+                    }
+                    crate::gemma4_runtime::Gemma4Mtp12MetalGenerationOutcome::Cancelled(result) => {
+                        Ok(Gemma4StreamingOutcome {
+                            outcome: crate::gemma4_runtime::Gemma4GenerationOutcome::Cancelled {
+                                generated_tokens: result.token_ids.len(),
+                            },
+                            diagnostics: None,
+                        })
+                    }
+                };
+            }
             #[cfg(feature = "cuda")]
             Self::Cuda { runtime: m, .. } => m
                 .lock()
                 .expect("gemma4 cuda runtime lock")
                 .generate_greedy_streaming_cancellable(prompt, max_new, on_delta, should_cancel),
+        }?;
+        Ok(Gemma4StreamingOutcome {
+            outcome,
+            diagnostics: None,
+        })
+    }
+
+    #[cfg(target_os = "macos")]
+    fn render_target_verified_streaming_cancellable<F: FnMut(&str), C: FnMut() -> bool>(
+        &self,
+        prompt: &str,
+        render_draft_token_ids: &[u32],
+        on_delta: F,
+        should_cancel: C,
+    ) -> crate::Result<Gemma4StreamingOutcome> {
+        let Self::Mtp12Metal {
+            runtime, assistant, ..
+        } = self
+        else {
+            return Err(BackendError::RuntimeShapeMismatch(
+                "target-verified render drafts require the exact Gemma 4 MTP12 Metal lane".into(),
+            ));
+        };
+        let assistant = assistant.lock().expect("gemma4 mtp12 assistant lock");
+        match runtime.render_target_verified_mtp12_ordered_q4_streaming_cancellable(
+            &assistant,
+            prompt,
+            render_draft_token_ids,
+            16,
+            on_delta,
+            should_cancel,
+        )? {
+            crate::gemma4_runtime::Gemma4Mtp12MetalGenerationOutcome::Complete(result) => {
+                let diagnostics = gemma4_mtp12_diagnostics(&result, Some(render_draft_token_ids));
+                Ok(Gemma4StreamingOutcome {
+                    outcome: crate::gemma4_runtime::Gemma4GenerationOutcome::Complete {
+                        text: result.text,
+                        token_ids: result.token_ids,
+                    },
+                    diagnostics: Some(diagnostics),
+                })
+            }
+            crate::gemma4_runtime::Gemma4Mtp12MetalGenerationOutcome::Cancelled(result) => {
+                Ok(Gemma4StreamingOutcome {
+                    outcome: crate::gemma4_runtime::Gemma4GenerationOutcome::Cancelled {
+                        generated_tokens: result.token_ids.len(),
+                    },
+                    diagnostics: None,
+                })
+            }
         }
     }
 }
@@ -10554,7 +12332,7 @@ async fn gemma4_generate_on_engine(
     runtime: Arc<Gemma4ServeRuntime>,
     prompt: String,
     max_tokens: usize,
-) -> std::result::Result<crate::gemma4_runtime::Gemma4GenerationOutcome, Box<Response>> {
+) -> std::result::Result<Gemma4StreamingOutcome, Box<Response>> {
     match run_cancellable_gemma4_job(state, move |worker_cancel| {
         runtime.generate_greedy_cancellable(&prompt, max_tokens, || worker_cancel.is_cancelled())
     })
@@ -10580,6 +12358,7 @@ fn gemma4_stream_on_engine(
     runtime: Arc<Gemma4ServeRuntime>,
     prompt: String,
     max_tokens: usize,
+    render_draft_token_ids: Option<Vec<u32>>,
 ) -> std::result::Result<(tokio::sync::mpsc::Receiver<Gemma4StreamItem>, CancelOnDrop), Box<Response>>
 {
     let cancel = tokio_util::sync::CancellationToken::new();
@@ -10588,26 +12367,49 @@ fn gemma4_stream_on_engine(
     let task = engine::EngineTask::Exclusive(Box::new(move || {
         let delta_cancel = cancel.clone();
         let send_tx = tx.clone();
-        let result = runtime.generate_greedy_streaming_cancellable(
-            &prompt,
-            max_tokens,
-            move |delta| {
-                if send_tx
-                    .blocking_send(Gemma4StreamItem::Delta(delta.to_string()))
-                    .is_err()
-                {
-                    delta_cancel.cancel();
-                }
-            },
-            || cancel.is_cancelled(),
-        );
+        let on_delta = move |delta: &str| {
+            if send_tx
+                .blocking_send(Gemma4StreamItem::Delta(delta.to_string()))
+                .is_err()
+            {
+                delta_cancel.cancel();
+            }
+        };
+        #[cfg(target_os = "macos")]
+        let result = match render_draft_token_ids.as_deref() {
+            Some(render_draft) => runtime.render_target_verified_streaming_cancellable(
+                &prompt,
+                render_draft,
+                on_delta,
+                || cancel.is_cancelled(),
+            ),
+            None => {
+                runtime.generate_greedy_streaming_cancellable(&prompt, max_tokens, on_delta, || {
+                    cancel.is_cancelled()
+                })
+            }
+        };
+        #[cfg(not(target_os = "macos"))]
+        let result = {
+            let _ = render_draft_token_ids;
+            runtime.generate_greedy_streaming_cancellable(&prompt, max_tokens, on_delta, || {
+                cancel.is_cancelled()
+            })
+        };
         match result {
-            Ok(crate::gemma4_runtime::Gemma4GenerationOutcome::Complete { token_ids, .. }) => {
+            Ok(Gemma4StreamingOutcome {
+                outcome: crate::gemma4_runtime::Gemma4GenerationOutcome::Complete { token_ids, .. },
+                diagnostics,
+            }) => {
                 let _ = tx.blocking_send(Gemma4StreamItem::Complete {
                     completion_tokens: token_ids.len(),
+                    diagnostics,
                 });
             }
-            Ok(crate::gemma4_runtime::Gemma4GenerationOutcome::Cancelled { .. }) => {}
+            Ok(Gemma4StreamingOutcome {
+                outcome: crate::gemma4_runtime::Gemma4GenerationOutcome::Cancelled { .. },
+                ..
+            }) => {}
             Err(error) => {
                 let _ = tx.blocking_send(Gemma4StreamItem::Error(error.to_string()));
             }
@@ -10618,6 +12420,143 @@ fn gemma4_stream_on_engine(
         .post(task)
         .map_err(engine_post_error_response)?;
     Ok((rx, body_guard))
+}
+
+/// Run all prepared sections under one exclusive engine lease. No separator or
+/// other server-authored text is injected: callers include headings/newlines in
+/// the target-verified drafts, and SSE sees their decoded suffixes in order.
+#[cfg(target_os = "macos")]
+fn gemma4_segmented_render_stream_on_engine(
+    state: &AppState,
+    runtime: Arc<Gemma4ServeRuntime>,
+    segments: Vec<Gemma4PreparedRenderSegment>,
+) -> std::result::Result<(tokio::sync::mpsc::Receiver<Gemma4StreamItem>, CancelOnDrop), Box<Response>>
+{
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let body_guard = CancelOnDrop(cancel.clone());
+    let (tx, rx) = tokio::sync::mpsc::channel(32);
+    let task = engine::EngineTask::Exclusive(Box::new(move || {
+        let mut receipts = Vec::with_capacity(segments.len());
+        let mut total_completion_tokens = 0usize;
+        let segment_count = segments.len();
+        for (index, segment) in segments.into_iter().enumerate() {
+            if cancel.is_cancelled() {
+                return;
+            }
+            let delta_cancel = cancel.clone();
+            let send_tx = tx.clone();
+            let on_delta = move |delta: &str| {
+                if send_tx
+                    .blocking_send(Gemma4StreamItem::Delta(delta.to_string()))
+                    .is_err()
+                {
+                    delta_cancel.cancel();
+                }
+            };
+            let result = runtime.render_target_verified_streaming_cancellable(
+                &segment.prompt,
+                &segment.token_ids,
+                on_delta,
+                || cancel.is_cancelled(),
+            );
+            match result {
+                Ok(Gemma4StreamingOutcome {
+                    outcome:
+                        crate::gemma4_runtime::Gemma4GenerationOutcome::Complete { token_ids, .. },
+                    diagnostics: Some(diagnostics),
+                }) if token_ids == segment.token_ids => {
+                    total_completion_tokens = match total_completion_tokens
+                        .checked_add(token_ids.len())
+                    {
+                        Some(total) => total,
+                        None => {
+                            let _ = tx.blocking_send(Gemma4StreamItem::Error(
+                                "segmented verifier completion token count overflowed".to_string(),
+                            ));
+                            return;
+                        }
+                    };
+                    let receipt = Gemma4VerifiedRenderSegmentReceipt {
+                        prompt_tokens: segment.prompt_tokens,
+                        requested_tokens: segment.token_ids.len(),
+                        verified_tokens: token_ids.len(),
+                        diagnostics,
+                    };
+                    let boundary = if index + 1 < segment_count {
+                        "\n\n"
+                    } else {
+                        ""
+                    };
+                    let progress =
+                        match gemma4_target_verified_segment_progress(index, &receipt, boundary) {
+                            Ok(progress) => progress,
+                            Err(error) => {
+                                let _ = tx.blocking_send(Gemma4StreamItem::Error(error));
+                                return;
+                            }
+                        };
+                    receipts.push(receipt);
+                    if tx
+                        .blocking_send(Gemma4StreamItem::SegmentBoundary(progress))
+                        .is_err()
+                    {
+                        cancel.cancel();
+                        return;
+                    }
+                }
+                Ok(Gemma4StreamingOutcome {
+                    outcome: crate::gemma4_runtime::Gemma4GenerationOutcome::Complete { .. },
+                    ..
+                }) => {
+                    let _ = tx.blocking_send(Gemma4StreamItem::Error(
+                        "segmented target verifier returned non-exact token ids or omitted native diagnostics"
+                            .to_string(),
+                    ));
+                    return;
+                }
+                Ok(Gemma4StreamingOutcome {
+                    outcome: crate::gemma4_runtime::Gemma4GenerationOutcome::Cancelled { .. },
+                    ..
+                }) => return,
+                Err(error) => {
+                    let _ = tx.blocking_send(Gemma4StreamItem::Error(error.to_string()));
+                    return;
+                }
+            }
+        }
+        match gemma4_segmented_target_verified_diagnostics(&receipts) {
+            Ok(diagnostics) => {
+                let _ = tx.blocking_send(Gemma4StreamItem::Complete {
+                    completion_tokens: total_completion_tokens,
+                    diagnostics: Some(diagnostics),
+                });
+            }
+            Err(error) => {
+                let _ = tx.blocking_send(Gemma4StreamItem::Error(error));
+            }
+        }
+    }));
+    state
+        .engine
+        .post(task)
+        .map_err(engine_post_error_response)?;
+    Ok((rx, body_guard))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn gemma4_segmented_render_stream_on_engine(
+    _state: &AppState,
+    _runtime: Arc<Gemma4ServeRuntime>,
+    _segments: Vec<Gemma4PreparedRenderSegment>,
+) -> std::result::Result<(tokio::sync::mpsc::Receiver<Gemma4StreamItem>, CancelOnDrop), Box<Response>>
+{
+    Err(Box::new(api_error(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "target_verified_render_lane_required",
+        "segmented target-verified renders require the exact Gemma 4 12B MTP12 Metal lane"
+            .to_string(),
+        Some("camelid_target_verified_render_segments"),
+    )))
 }
 
 #[cfg(test)]
@@ -10795,19 +12734,30 @@ async fn gemma4_completion_nonstreaming(
         );
     };
     let max_tokens = req.max_tokens.unwrap_or(64).min(4096) as usize;
+    let prompt_tokens = match gemma4_prompt_token_count(Arc::clone(&runtime), prompt.clone()).await
+    {
+        Ok(count) => count,
+        Err(response) => return response,
+    };
+    let max_tokens = match clamp_gemma4_mtp12_request_context(&runtime, prompt_tokens, max_tokens) {
+        Ok(budget) => budget,
+        Err(response) => return response,
+    };
     let t_generate = std::time::Instant::now();
     let result = gemma4_generate_on_engine(state, runtime, prompt, max_tokens).await;
     let generate_ms = t_generate.elapsed().as_secs_f64() * 1e3;
-    let (text, ids) = match result {
-        Ok(crate::gemma4_runtime::Gemma4GenerationOutcome::Complete { text, token_ids }) => {
-            (text, token_ids)
-        }
-        Ok(crate::gemma4_runtime::Gemma4GenerationOutcome::Cancelled { generated_tokens }) => {
-            return *generation_cancelled_response(generated_tokens)
-        }
+    let (text, ids, native_diagnostics) = match result {
+        Ok(Gemma4StreamingOutcome {
+            outcome: crate::gemma4_runtime::Gemma4GenerationOutcome::Complete { text, token_ids },
+            diagnostics,
+        }) => (text, token_ids, diagnostics),
+        Ok(Gemma4StreamingOutcome {
+            outcome: crate::gemma4_runtime::Gemma4GenerationOutcome::Cancelled { generated_tokens },
+            ..
+        }) => return *generation_cancelled_response(generated_tokens),
         Err(response) => return *response,
     };
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "id": "cmpl-gemma4",
         "object": "text_completion",
         "created": unix_secs(),
@@ -10818,7 +12768,7 @@ async fn gemma4_completion_nonstreaming(
             "logprobs": null,
             "finish_reason": gemma4_finish_reason(ids.len(), max_tokens),
         }],
-        "usage": { "prompt_tokens": 0, "completion_tokens": ids.len(), "total_tokens": ids.len() },
+        "usage": { "prompt_tokens": prompt_tokens, "completion_tokens": ids.len(), "total_tokens": prompt_tokens + ids.len() },
         "camelid": {
             "generated_token_ids": ids,
             // Wall-clock totals only: the gemma4 lane does not (yet) report
@@ -10831,6 +12781,12 @@ async fn gemma4_completion_nonstreaming(
             },
         },
     });
+    if let Some(mtp12) = native_diagnostics
+        .as_ref()
+        .and_then(|diagnostics| diagnostics.get("mtp12"))
+    {
+        body["camelid"]["mtp12"] = mtp12.clone();
+    }
     (StatusCode::OK, Json(body)).into_response()
 }
 
@@ -10851,12 +12807,21 @@ async fn gemma4_completion_streaming(
     };
     let max_tokens = req.max_tokens.unwrap_or(64).min(4096) as usize;
     let created = unix_secs();
-
-    let (mut rx, cancel_on_drop) = match gemma4_stream_on_engine(state, runtime, prompt, max_tokens)
+    let prompt_tokens = match gemma4_prompt_token_count(Arc::clone(&runtime), prompt.clone()).await
     {
-        Ok(stream) => stream,
-        Err(response) => return *response,
+        Ok(count) => count,
+        Err(response) => return response,
     };
+    let max_tokens = match clamp_gemma4_mtp12_request_context(&runtime, prompt_tokens, max_tokens) {
+        Ok(budget) => budget,
+        Err(response) => return response,
+    };
+
+    let (mut rx, cancel_on_drop) =
+        match gemma4_stream_on_engine(state, runtime, prompt, max_tokens, None) {
+            Ok(stream) => stream,
+            Err(response) => return *response,
+        };
 
     let events = async_stream::stream! {
         let _cancel_on_drop = cancel_on_drop;
@@ -10875,7 +12840,9 @@ async fn gemma4_completion_streaming(
                     });
                     yield Ok::<Event, std::convert::Infallible>(Event::default().data(chunk.to_string()));
                 }
-                Gemma4StreamItem::Complete { completion_tokens: actual } => {
+                // Text completions never enter the private segmented chat lane.
+                Gemma4StreamItem::SegmentBoundary(_) => {}
+                Gemma4StreamItem::Complete { completion_tokens: actual, .. } => {
                     completion_tokens = actual;
                     completed = true;
                 }
@@ -10906,9 +12873,9 @@ async fn gemma4_completion_streaming(
                 "model": id,
                 "choices": [{ "index": 0, "text": "", "logprobs": null, "finish_reason": finish_reason }],
                 "usage": {
-                    "prompt_tokens": 0,
+                    "prompt_tokens": prompt_tokens,
                     "completion_tokens": completion_tokens,
-                    "total_tokens": completion_tokens,
+                    "total_tokens": prompt_tokens + completion_tokens,
                 },
             });
             yield Ok(Event::default().data(done.to_string()));
@@ -10932,6 +12899,10 @@ async fn gemma4_chat_nonstreaming(
         Ok(count) => count,
         Err(response) => return response,
     };
+    let max_tokens = match clamp_gemma4_mtp12_request_context(&runtime, prompt_tokens, max_tokens) {
+        Ok(budget) => budget,
+        Err(response) => return response,
+    };
     let t_generate = std::time::Instant::now();
     let telemetry_guard = telemetry::RequestGuard::begin(gemma4_telemetry_start(
         &id,
@@ -10941,11 +12912,15 @@ async fn gemma4_chat_nonstreaming(
     ));
     let result = gemma4_generate_on_engine(state, runtime, prompt, max_tokens).await;
     let generate_ms = t_generate.elapsed().as_secs_f64() * 1e3;
-    let (text, ids) = match result {
-        Ok(crate::gemma4_runtime::Gemma4GenerationOutcome::Complete { text, token_ids }) => {
-            (text, token_ids)
-        }
-        Ok(crate::gemma4_runtime::Gemma4GenerationOutcome::Cancelled { generated_tokens }) => {
+    let (text, ids, native_diagnostics) = match result {
+        Ok(Gemma4StreamingOutcome {
+            outcome: crate::gemma4_runtime::Gemma4GenerationOutcome::Complete { text, token_ids },
+            diagnostics,
+        }) => (text, token_ids, diagnostics),
+        Ok(Gemma4StreamingOutcome {
+            outcome: crate::gemma4_runtime::Gemma4GenerationOutcome::Cancelled { generated_tokens },
+            ..
+        }) => {
             telemetry_guard.finish(gemma4_telemetry_error(
                 "gemma4 generation cancelled by disconnected request".to_string(),
             ));
@@ -10968,7 +12943,7 @@ async fn gemma4_chat_nonstreaming(
         prefill_tps: None,
         error: None,
     });
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "id": "chatcmpl-gemma4",
         "object": "chat.completion",
         "created": unix_secs(),
@@ -10993,6 +12968,12 @@ async fn gemma4_chat_nonstreaming(
             },
         },
     });
+    if let Some(mtp12) = native_diagnostics
+        .as_ref()
+        .and_then(|diagnostics| diagnostics.get("mtp12"))
+    {
+        body["camelid"]["mtp12"] = mtp12.clone();
+    }
     (StatusCode::OK, Json(body)).into_response()
 }
 
@@ -11166,6 +13147,30 @@ impl RunnableServeRuntime {
             .is_some_and(crate::runnable::PrismVisionProjector::backend_ready)
     }
 
+    /// Text stop-sequence predicate for the runnable decode loops.
+    ///
+    /// The loops terminate on EOG *token ids*; an OpenAI `stop` is a *string*, which
+    /// can span several tokens and can land mid-token, so it can only be judged over
+    /// decoded text. `Tokenizer::decode` is stateless and append-only (incomplete
+    /// trailing UTF-8 is held back rather than replaced), so decoding the growing
+    /// prefix each step is exactly right.
+    ///
+    /// Returns a predicate that is `false` for every input when no sequences were
+    /// requested, so a request without `stop` takes a byte-identical path to before
+    /// — which is what keeps the hash-pinned rows on this lane unaffected.
+    fn stop_text_predicate<'a>(
+        &'a self,
+        stop_sequences: &'a [String],
+    ) -> impl Fn(&[u32]) -> bool + 'a {
+        move |ids: &[u32]| {
+            if stop_sequences.is_empty() {
+                return false;
+            }
+            let text = self.tokenizer.decode(ids, true).unwrap_or_default();
+            contains_stop_sequence(&text, stop_sequences)
+        }
+    }
+
     /// Greedy-generate from already-tokenized `prompt_ids`, stopping at the first EOG
     /// (`<|im_end|>` / eos). Returns the detokenized text + the generated token ids.
     fn generate_greedy(
@@ -11173,13 +13178,21 @@ impl RunnableServeRuntime {
         prompt_ids: &[u32],
         max_new: usize,
         sampling: &SamplingConfig,
+        stop_sequences: &[String],
     ) -> std::result::Result<(String, Vec<u32>), BackendError> {
         let stop: Vec<u32> = self.tokenizer.special.eog.iter().copied().collect();
-        let ids = self
-            .model
-            .generate_stopping_with_sampling(prompt_ids, max_new, &stop, sampling)?;
+        let should_stop = self.stop_text_predicate(stop_sequences);
+        let ids = self.model.generate_stopping_with_sampling(
+            prompt_ids,
+            max_new,
+            &stop,
+            sampling,
+            &should_stop,
+        )?;
         let text = self.tokenizer.decode(&ids, true).unwrap_or_default();
-        Ok((text, ids))
+        // The ids and the token count keep the stop-triggering token; only the text
+        // is cut. That asymmetry is the dense lane's shipped contract.
+        Ok((truncate_at_stop_sequence(text, stop_sequences), ids))
     }
 
     /// Streaming generation with a cooperative disconnect check. The generic
@@ -11192,9 +13205,11 @@ impl RunnableServeRuntime {
         max_new: usize,
         sampling: &SamplingConfig,
         is_cancelled: &dyn Fn() -> bool,
+        stop_sequences: &[String],
         mut on_token: F,
     ) -> std::result::Result<(String, Vec<u32>), BackendError> {
         let stop: Vec<u32> = self.tokenizer.special.eog.iter().copied().collect();
+        let should_stop = self.stop_text_predicate(stop_sequences);
         let ids = self
             .model
             .generate_stopping_streaming_with_sampling_cancelled(
@@ -11203,10 +13218,11 @@ impl RunnableServeRuntime {
                 &stop,
                 sampling,
                 is_cancelled,
+                &should_stop,
                 &mut on_token,
             )?;
         let text = self.tokenizer.decode(&ids, true).unwrap_or_default();
-        Ok((text, ids))
+        Ok((truncate_at_stop_sequence(text, stop_sequences), ids))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -11219,6 +13235,7 @@ impl RunnableServeRuntime {
         max_image_tokens: usize,
         max_new: usize,
         sampling: &SamplingConfig,
+        stop_sequences: &[String],
     ) -> std::result::Result<(String, Vec<u32>, usize), BackendError> {
         self.generate_vision_greedy_streaming(
             prefix,
@@ -11228,6 +13245,7 @@ impl RunnableServeRuntime {
             max_image_tokens,
             max_new,
             sampling,
+            stop_sequences,
             |_| {},
         )
     }
@@ -11242,6 +13260,7 @@ impl RunnableServeRuntime {
         max_image_tokens: usize,
         max_new: usize,
         sampling: &SamplingConfig,
+        stop_sequences: &[String],
         mut on_token: F,
     ) -> std::result::Result<(String, Vec<u32>, usize), BackendError> {
         let projector = self.vision.as_ref().ok_or_else(|| {
@@ -11251,6 +13270,7 @@ impl RunnableServeRuntime {
             projector.encode_image_bytes(image_bytes, min_image_tokens, max_image_tokens)?;
         let prompt_tokens = prefix.len() + image.embeddings.len() + suffix.len();
         let stop: Vec<u32> = self.tokenizer.special.eog.iter().copied().collect();
+        let should_stop = self.stop_text_predicate(stop_sequences);
         let ids = self
             .model
             .generate_vision_stopping_streaming_with_sampling(
@@ -11260,10 +13280,17 @@ impl RunnableServeRuntime {
                 max_new,
                 &stop,
                 sampling,
+                &should_stop,
                 &mut on_token,
             )?;
         let text = self.tokenizer.decode(&ids, true).unwrap_or_default();
-        Ok((text, ids, prompt_tokens))
+        // Same asymmetry as the text lane: the ids and the token count keep the
+        // stop-triggering token; only the text is cut.
+        Ok((
+            truncate_at_stop_sequence(text, stop_sequences),
+            ids,
+            prompt_tokens,
+        ))
     }
 }
 
@@ -11284,9 +13311,9 @@ fn prism_vision_companion_for_model(
 }
 
 /// Exact identity gate for a capability-bearing artifact. Size is checked
-/// before hashing so truncated files fail cheaply; the existing GGUF hash
-/// cache keeps subsequent Models scans and model loads from re-reading a valid
-/// 600 MiB projector.
+/// before hashing so truncated files fail cheaply. The digest is intentionally
+/// uncached: a user-writable performance cache cannot authorize a vision
+/// projector or any other capability-bearing artifact.
 fn file_matches_expected_identity(
     path: &std::path::Path,
     expected_size: u64,
@@ -11295,7 +13322,7 @@ fn file_matches_expected_identity(
     let has_expected_size = std::fs::metadata(path)
         .is_ok_and(|metadata| metadata.is_file() && metadata.len() == expected_size);
     has_expected_size
-        && receipt::sha256_file_hex_cached(path)
+        && receipt::sha256_file_hex(path)
             .is_ok_and(|actual| actual.eq_ignore_ascii_case(expected_sha256))
 }
 
@@ -11789,11 +13816,140 @@ mod bitnet_runnable_api_tests {
         );
     }
 
+    /* The runnable lane parsed `stop` and threw it away, so an OpenAI stop
+    sequence was silently a no-op on every model this lane serves — qwen35/Ornith,
+    gemma3, LFM2, BitNet, command-r — while the dense lane honored it. These pin
+    the two halves of the fix that can be tested without a model: that an absent
+    `stop` leaves behavior byte-identical, and that the text semantics match the
+    dense lane exactly. */
+
+    #[test]
+    fn absent_stop_sequences_are_a_no_op() {
+        // The whole change rests on this: the pinned rows on the runnable lane must
+        // take the path they took before, so an empty sequence set can never match
+        // and can never truncate.
+        assert!(!contains_stop_sequence("anything at all", &[]));
+        assert_eq!(
+            truncate_at_stop_sequence("untouched".to_string(), &[]),
+            "untouched"
+        );
+        assert!(stop_sequences_from_request(None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn stop_truncation_cuts_at_the_earliest_match_and_survives_utf8() {
+        let seqs = |values: &[&str]| values.iter().map(|v| v.to_string()).collect::<Vec<_>>();
+        // Earliest match wins, not first-listed.
+        assert_eq!(
+            truncate_at_stop_sequence("alpha BETA gamma".to_string(), &seqs(&["gamma", "BETA"])),
+            "alpha "
+        );
+        // Mid-token truncation: the dense lane returns "<unk" for a single <unk>
+        // token stopped on ">". The runnable lane now shares this helper, so the
+        // two lanes cannot disagree about the same request.
+        assert_eq!(
+            truncate_at_stop_sequence("<unk>".to_string(), &seqs(&[">"])),
+            "<unk"
+        );
+        // A stop sequence landing after a multi-byte character must not panic:
+        // `str::find` returns a byte index, and String::truncate panics unless that
+        // index is a char boundary.
+        assert_eq!(
+            truncate_at_stop_sequence("café STOP au lait".to_string(), &seqs(&["STOP"])),
+            "café "
+        );
+        // A sequence that never occurs leaves the text alone.
+        assert_eq!(
+            truncate_at_stop_sequence("no match here".to_string(), &seqs(&["zzz"])),
+            "no match here"
+        );
+    }
+
+    #[test]
+    fn stop_hold_back_is_inert_without_stop_sequences() {
+        // The streaming lane runs this on EVERY token of EVERY request. With no stop
+        // sequences it must return the whole length, or the pinned rows on this lane
+        // would stream different bytes than they did before.
+        assert_eq!(stop_safe_stream_len("anything at all", &[]), 15);
+        assert_eq!(stop_safe_stream_len("", &[]), 0);
+        assert_eq!(stop_safe_stream_len("caf\u{e9}", &[]), 5);
+    }
+
+    #[test]
+    fn stop_hold_back_withholds_text_a_stop_sequence_would_cut() {
+        let seqs = |values: &[&str]| values.iter().map(|v| v.to_string()).collect::<Vec<_>>();
+        // Nothing resembling the sequence: everything is safe.
+        assert_eq!(stop_safe_stream_len("hello", &seqs(&["STOP"])), 5);
+        // A complete match cuts at its start, exactly like truncate_at_stop_sequence.
+        assert_eq!(stop_safe_stream_len("abcSTOPdef", &seqs(&["STOP"])), 3);
+        // A trailing PROPER prefix is held back — it may complete next token.
+        assert_eq!(stop_safe_stream_len("abcST", &seqs(&["STOP"])), 3);
+        assert_eq!(stop_safe_stream_len("abcS", &seqs(&["STOP"])), 3);
+        // ...and released once it turns out not to be one.
+        assert_eq!(stop_safe_stream_len("abcSTx", &seqs(&["STOP"])), 6);
+        // The straddling case the whole hold-back exists for: "ST" then "OP" must
+        // never have streamed the "ST", because the final text is cut before it.
+        let straddle = seqs(&["STOP"]);
+        assert_eq!(stop_safe_stream_len("abcST", &straddle), 3);
+        assert_eq!(stop_safe_stream_len("abcSTOP", &straddle), 3);
+    }
+
+    #[test]
+    fn stop_hold_back_never_moves_backwards_on_overlapping_sequences() {
+        // The reason this takes the MIN of both limits instead of returning at the
+        // first complete match: with the early-return form "AB" reports 1 and then
+        // "ABC" reports 0, asking the stream to take back a byte it already sent.
+        let seqs = ["B".to_string(), "ABC".to_string()];
+        assert_eq!(stop_safe_stream_len("A", &seqs), 0);
+        assert_eq!(stop_safe_stream_len("AB", &seqs), 0);
+        assert_eq!(stop_safe_stream_len("ABC", &seqs), 0);
+        // Monotonic across a whole realistic reply.
+        let stop = ["\n\nUser:".to_string()];
+        let mut previous = 0usize;
+        for end in 1..="Sure.\n\nUse it well.".len() {
+            let text = &"Sure.\n\nUse it well."[..end];
+            if !text.is_char_boundary(end) {
+                continue;
+            }
+            let safe = stop_safe_stream_len(text, &stop);
+            assert!(safe >= previous, "safe_len moved backwards at {end}");
+            previous = safe;
+        }
+    }
+
+    #[test]
+    fn stop_hold_back_returns_a_char_boundary_on_multibyte_text() {
+        // Every returned index is sliced directly by the SSE emitter, so a value in
+        // the middle of a code point is an immediate panic inside a live 200 body.
+        let cases: [(&str, &str); 4] = [
+            ("caf\u{e9}", "\u{e9}x"),
+            ("\u{20ac}uro", "uro!"),
+            ("na\u{ef}ve \u{2014} yes", "\u{2014} no"),
+            ("\u{1f600}\u{1f600}", "\u{1f600}!"),
+        ];
+        for (text, sequence) in cases {
+            let stop = [sequence.to_string()];
+            let safe = stop_safe_stream_len(text, &stop);
+            assert!(safe <= text.len());
+            assert!(
+                text.is_char_boundary(safe),
+                "{safe} splits a code point in {text:?}"
+            );
+            // The slice the emitter performs must not panic.
+            let _ = &text[..safe];
+        }
+    }
+
     #[test]
     fn runnable_finish_reason_reports_a_capped_bitnet_reply_as_length() {
-        assert_eq!(runnable_finish_reason(false, 64, 64), "length");
-        assert_eq!(runnable_finish_reason(false, 12, 64), "stop");
-        assert_eq!(runnable_finish_reason(true, 64, 64), "tool_calls");
+        assert_eq!(runnable_finish_reason(false, 64, 64, false), "length");
+        assert_eq!(runnable_finish_reason(false, 12, 64, false), "stop");
+        assert_eq!(runnable_finish_reason(true, 64, 64, false), "tool_calls");
+        // A stop sequence completing on the max_tokens-th token is "stop", not
+        // "length" — the stop-triggering token is retained in the ids, and the dense
+        // lane reports "stop" for the same request.
+        assert_eq!(runnable_finish_reason(false, 64, 64, true), "stop");
+        assert_eq!(runnable_finish_reason(true, 64, 64, true), "tool_calls");
     }
 
     #[test]
@@ -12206,7 +14362,9 @@ fn runnable_completions_rejection(model_id: &str) -> Response {
 /// covers EVERY raw-completions surface (`/completion`,
 /// `/api/generation/preflight`, `/api/generation/sessions`, multi-choice
 /// fan-out, receipt replay) lives at the dense chokepoint in
-/// [`prepare_generation`].
+/// [`prepare_generation`]. The chat-shaped, count-only form of
+/// `/api/generation/preflight` is the deliberate exception: it resolves this
+/// same runtime and tokenizes the exact chat prompt without decoding.
 async fn reject_completions_for_runnable_arch(
     state: &AppState,
     model: &Option<String>,
@@ -12257,6 +14415,16 @@ async fn load_runnable_serve_runtime(
 
 const PRISM_IMAGE_PAD: &str = "<|image_pad|>";
 const MAX_PRISM_IMAGE_BYTES: usize = 8 * 1024 * 1024;
+
+/// Merged image-token floor a chat request is charged when it does not set
+/// `camelid_image_min_tokens`.
+const DEFAULT_MIN_IMAGE_TOKENS: u32 = 8;
+/// Merged image-token ceiling a chat request is charged when it does not set
+/// `camelid_image_max_tokens`. `/v1/health` advertises this as
+/// `vision_token_allowance` so a client can budget context without guessing.
+const DEFAULT_MAX_IMAGE_TOKENS: u32 = 128;
+/// Hard bound on either override, whatever the request asks for.
+const IMAGE_TOKEN_HARD_CEILING: u32 = 1024;
 
 enum RunnablePreparedPrompt {
     Text(Vec<u32>),
@@ -12361,10 +14529,11 @@ fn decode_prism_image_data_url(url: &str) -> std::result::Result<Vec<u8>, Respon
 #[allow(clippy::result_large_err)]
 fn prepare_runnable_prompt(
     runtime: &RunnableServeRuntime,
-    req: &ChatCompletionRequest,
     messages: &[ChatMessage],
     prompt_text: &str,
     tools_present: bool,
+    image_min_tokens: Option<u32>,
+    image_max_tokens: Option<u32>,
 ) -> std::result::Result<RunnablePreparedPrompt, Response> {
     let image_urls: Vec<&str> = messages
         .iter()
@@ -12415,7 +14584,7 @@ fn prepare_runnable_prompt(
         return Err(api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "vision_projector_not_ready",
-            "the language model is loaded, but no Prism mmproj GGUF was found; place a *mmproj*.gguf beside the model or set CAMELID_MMPROJ before loading it"
+            "the language model is loaded, but no Prism image projector is ready: either no *mmproj*.gguf was found beside the model (set CAMELID_MMPROJ before loading it), or this build has no Metal or CUDA lane to decode with image embeddings"
                 .to_string(),
             Some("model"),
         ));
@@ -12460,11 +14629,13 @@ fn prepare_runnable_prompt(
                 None,
             )
         })?;
-    let min_image_tokens = req.camelid_image_min_tokens.unwrap_or(8).clamp(1, 1024) as usize;
-    let max_image_tokens = req
-        .camelid_image_max_tokens
-        .unwrap_or(128)
-        .clamp(min_image_tokens as u32, 1024) as usize;
+    let min_image_tokens = image_min_tokens
+        .unwrap_or(DEFAULT_MIN_IMAGE_TOKENS)
+        .clamp(1, IMAGE_TOKEN_HARD_CEILING) as usize;
+    let max_image_tokens = image_max_tokens
+        .unwrap_or(DEFAULT_MAX_IMAGE_TOKENS)
+        .clamp(min_image_tokens as u32, IMAGE_TOKEN_HARD_CEILING)
+        as usize;
     Ok(RunnablePreparedPrompt::Vision {
         prefix,
         image_bytes: decode_prism_image_data_url(image_urls[0])?,
@@ -12490,9 +14661,15 @@ fn runnable_finish_reason(
     has_tool_calls: bool,
     completion_tokens: usize,
     max_tokens: usize,
+    stopped_on_stop_sequence: bool,
 ) -> &'static str {
     if has_tool_calls {
         "tool_calls"
+    } else if stopped_on_stop_sequence {
+        // The stop-triggering token is RETAINED in the ids, so a stop sequence that
+        // completes on the max_tokens-th token would otherwise be reported as
+        // "length" while the dense lane reports "stop" for the same request.
+        "stop"
     } else if completion_tokens >= max_tokens {
         "length"
     } else {
@@ -12607,6 +14784,77 @@ fn runnable_vision_receipt_rejection() -> Response {
     )
 }
 
+/// Render one runnable-lane chat request through the same architecture-specific
+/// template gate used by both generation transports and count-only preflight.
+/// Keeping this decision in one place is important for agent budgeting: a
+/// preflight count is authoritative only when it includes the exact tool schema
+/// and marker dialect the following generation will consume.
+#[allow(clippy::result_large_err)]
+fn render_runnable_chat_prompt_for_request(
+    runtime: &RunnableServeRuntime,
+    id: &str,
+    messages: &[ChatMessage],
+    tools: &[serde_json::Value],
+    enable_thinking: bool,
+) -> std::result::Result<String, Response> {
+    if runtime.architecture == "gemma2" {
+        if !tools.is_empty() {
+            return Err(gemma_runnable_lane_tools_rejection());
+        }
+        return prepare_gemma2_runnable_chat_prompt(runtime, id, messages)
+            .map_err(|rejection| *rejection);
+    }
+    if runtime.architecture == "gemma3" {
+        if !tools.is_empty() {
+            return Err(gemma_runnable_lane_tools_rejection());
+        }
+        return Ok(render_gemma3_prompt(messages));
+    }
+    if runtime.architecture == "bitnet-b1.58" {
+        if let Some(rejection) = bitnet_b158_request_rejection(tools, enable_thinking) {
+            return Err(rejection);
+        }
+        return prepare_bitnet_b158_chat_prompt(runtime, id, messages);
+    }
+    if runtime.architecture == "lfm2" {
+        if !tools.is_empty() {
+            return Err(lfm2_runnable_lane_tools_rejection());
+        }
+        if let Some(rejection) = reject_lfm2_with_unrecognized_template(runtime, id) {
+            return Err(rejection);
+        }
+        return Ok(render_lfm2_chatml_prompt_for_template(
+            messages,
+            runtime
+                .tokenizer
+                .chat_template
+                .as_deref()
+                .unwrap_or_default(),
+        ));
+    }
+    if runtime.architecture == "command-r" {
+        if !tools.is_empty() {
+            return Err(aya_runnable_lane_tools_rejection());
+        }
+        if enable_thinking {
+            return Err(aya_runnable_lane_thinking_rejection());
+        }
+        return prepare_aya_runnable_chat_prompt(runtime, id, messages);
+    }
+    Ok(if tools.is_empty() {
+        render_ornith_chatml_prompt(messages, enable_thinking)
+    } else {
+        render_ornith_chatml_prompt_with_tools(messages, tools, enable_thinking)
+    })
+}
+
+/// One reply allowance for runnable generation and its count-only preflight.
+/// Keeping the default/cap shared prevents a successful fit from reserving a
+/// different number of tokens than the generation that immediately follows.
+fn runnable_effective_max_tokens(requested: Option<u32>) -> u32 {
+    requested.unwrap_or(256).min(4096)
+}
+
 /// Non-streaming chat for a runnable-served model (qwen35/Ornith): render the Ornith
 /// ChatML prompt (with tools when present), greedy-generate to EOG, split the
 /// `<think>` reasoning, and lift `<function=â€¦>` tool calls into structured `tool_calls`
@@ -12624,69 +14872,27 @@ async fn runnable_chat_nonstreaming(
     let messages = req.messages.clone().unwrap_or_default();
     let enable_thinking = req.camelid_enable_thinking.unwrap_or(false);
     let tools = runnable_request_tools(req);
-    let prompt_text = if runtime.architecture == "gemma2" {
-        if !tools.is_empty() {
-            return gemma_runnable_lane_tools_rejection();
-        }
-        match prepare_gemma2_runnable_chat_prompt(&runtime, &id, &messages) {
-            Ok(prompt) => prompt,
-            Err(rejection) => return *rejection,
-        }
-    } else if runtime.architecture == "gemma3" {
-        if !tools.is_empty() {
-            return gemma_runnable_lane_tools_rejection();
-        }
-        render_gemma3_prompt(&messages)
-    } else if runtime.architecture == "bitnet-b1.58" {
-        if let Some(rejection) = bitnet_b158_request_rejection(&tools, enable_thinking) {
-            return rejection;
-        }
-        match prepare_bitnet_b158_chat_prompt(&runtime, &id, &messages) {
-            Ok(prompt) => prompt,
-            Err(rejection) => return rejection,
-        }
-    } else if runtime.architecture == "lfm2" {
-        // LFM2 has its own template AND its own tool-call envelope; borrowing
-        // the qwen35 tools renderer would emit a format these weights were
-        // never trained on. Fail closed until an LFM2 tool lane is proven.
-        if !tools.is_empty() {
-            return lfm2_runnable_lane_tools_rejection();
-        }
-        // Keyed on the FILE's template, not the arch string alone. LFM2.5 ships
-        // both an open-think dialect and a plain assistant-generation dialect;
-        // select only after the exact marker contract is recognized.
-        if let Some(rejection) = reject_lfm2_with_unrecognized_template(&runtime, &id) {
-            return rejection;
-        }
-        render_lfm2_chatml_prompt_for_template(
-            &messages,
-            runtime
-                .tokenizer
-                .chat_template
-                .as_deref()
-                .unwrap_or_default(),
-        )
-    } else if runtime.architecture == "command-r" {
-        if !tools.is_empty() {
-            return aya_runnable_lane_tools_rejection();
-        }
-        if enable_thinking {
-            return aya_runnable_lane_thinking_rejection();
-        }
-        match prepare_aya_runnable_chat_prompt(&runtime, &id, &messages) {
-            Ok(prompt) => prompt,
-            Err(rejection) => return rejection,
-        }
-    } else if tools.is_empty() {
-        render_ornith_chatml_prompt(&messages, enable_thinking)
-    } else {
-        render_ornith_chatml_prompt_with_tools(&messages, &tools, enable_thinking)
+    let prompt_text = match render_runnable_chat_prompt_for_request(
+        &runtime,
+        &id,
+        &messages,
+        &tools,
+        enable_thinking,
+    ) {
+        Ok(prompt) => prompt,
+        Err(rejection) => return rejection,
     };
-    let prepared =
-        match prepare_runnable_prompt(&runtime, req, &messages, &prompt_text, !tools.is_empty()) {
-            Ok(prepared) => prepared,
-            Err(response) => return response,
-        };
+    let prepared = match prepare_runnable_prompt(
+        &runtime,
+        &messages,
+        &prompt_text,
+        !tools.is_empty(),
+        req.camelid_image_min_tokens,
+        req.camelid_image_max_tokens,
+    ) {
+        Ok(prepared) => prepared,
+        Err(response) => return response,
+    };
     if receipt_stamp.is_some() && matches!(&prepared, RunnablePreparedPrompt::Vision { .. }) {
         return runnable_vision_receipt_rejection();
     }
@@ -12694,19 +14900,27 @@ async fn runnable_chat_nonstreaming(
         Ok(config) => config,
         Err(response) => return response,
     };
-    let max_tokens = req.max_tokens.unwrap_or(256).min(4096) as usize;
+    // Already parsed and validated for this lane by the preflight; previously the
+    // value was dropped on the floor, so `stop` was silently a no-op here.
+    let stop_sequences = match stop_sequences_from_request(req.stop.as_ref()) {
+        Ok(sequences) => sequences,
+        Err(response) => return *response,
+    };
+    let max_tokens = runnable_effective_max_tokens(req.max_tokens) as usize;
+    // The closure below MOVES `stop_sequences`; the response path needs it again to
+    // re-apply truncation across the think split and to classify finish_reason.
+    let response_stop_sequences = stop_sequences.clone();
     let rt = runtime.clone();
     let result = tokio::task::spawn_blocking(move || match prepared {
         RunnablePreparedPrompt::Text(prompt_ids) => {
             let prompt_token_count = prompt_ids.len();
-            rt.generate_greedy(&prompt_ids, max_tokens, &sampling).map(
-                |(text, generated_token_ids)| RunnableGenerationResult {
+            rt.generate_greedy(&prompt_ids, max_tokens, &sampling, &stop_sequences)
+                .map(|(text, generated_token_ids)| RunnableGenerationResult {
                     text,
                     generated_token_ids,
                     prompt_token_ids: Some(prompt_ids),
                     prompt_token_count,
-                },
-            )
+                })
         }
         RunnablePreparedPrompt::Vision {
             prefix,
@@ -12723,6 +14937,7 @@ async fn runnable_chat_nonstreaming(
                 max_image_tokens,
                 max_tokens,
                 &sampling,
+                &stop_sequences,
             )
             .map(
                 |(text, generated_token_ids, prompt_token_count)| RunnableGenerationResult {
@@ -12765,7 +14980,30 @@ async fn runnable_chat_nonstreaming(
     let (reasoning, content) = if runtime.architecture == "bitnet-b1.58" {
         (None, text.clone())
     } else {
-        split_think_by_token(&ids, &runtime.tokenizer).unwrap_or_else(|| split_ornith_think(&text))
+        match split_think_by_token(&ids, &runtime.tokenizer) {
+            // The token-level split re-decodes the RAW ids, which discards the stop
+            // truncation applied above — so without re-applying it here a stop
+            // sequence is a no-op for every reply carrying a `</think>` token (every
+            // lfm2 reply, and every thinking-on qwen35/Ornith reply). The cut is
+            // defined over the whole text, so a match inside the reasoning empties
+            // the content half rather than truncating it independently.
+            Some((reasoning, content)) if !response_stop_sequences.is_empty() => {
+                let reasoning_cut = reasoning
+                    .as_deref()
+                    .is_some_and(|value| contains_stop_sequence(value, &response_stop_sequences));
+                let reasoning = reasoning
+                    .map(|value| truncate_at_stop_sequence(value, &response_stop_sequences))
+                    .filter(|value| !value.is_empty());
+                let content = if reasoning_cut {
+                    String::new()
+                } else {
+                    truncate_at_stop_sequence(content, &response_stop_sequences)
+                };
+                (reasoning, content)
+            }
+            Some(split) => split,
+            None => split_ornith_think(&text),
+        }
     };
     // Structured tool_calls (OpenAI shape) lifted from the Ornith `<function=â€¦>` XML.
     // The agent loop ALSO re-parses the content text client-side (chat-lane
@@ -12787,7 +15025,17 @@ async fn runnable_chat_nonstreaming(
     } else {
         Vec::new()
     };
-    let finish_reason = runnable_finish_reason(!tool_calls.is_empty(), ids.len(), max_tokens);
+    let stopped_on_stop_sequence = !response_stop_sequences.is_empty()
+        && contains_stop_sequence(
+            &runtime.tokenizer.decode(&ids, true).unwrap_or_default(),
+            &response_stop_sequences,
+        );
+    let finish_reason = runnable_finish_reason(
+        !tool_calls.is_empty(),
+        ids.len(),
+        max_tokens,
+        stopped_on_stop_sequence,
+    );
     let camelid_receipt = match (receipt_stamp, prompt_token_ids.as_deref()) {
         (Some(stamp), Some(prompt_token_ids)) => {
             build_runnable_server_receipt(
@@ -12861,74 +15109,39 @@ async fn runnable_chat_streaming(
     let messages = req.messages.clone().unwrap_or_default();
     let enable_thinking = req.camelid_enable_thinking.unwrap_or(false);
     let tools = runnable_request_tools(req);
-    let prompt_text = if runtime.architecture == "gemma2" {
-        if !tools.is_empty() {
-            return gemma_runnable_lane_tools_rejection();
-        }
-        match prepare_gemma2_runnable_chat_prompt(&runtime, &id, &messages) {
-            Ok(prompt) => prompt,
-            Err(rejection) => return *rejection,
-        }
-    } else if runtime.architecture == "gemma3" {
-        if !tools.is_empty() {
-            return gemma_runnable_lane_tools_rejection();
-        }
-        render_gemma3_prompt(&messages)
-    } else if runtime.architecture == "bitnet-b1.58" {
-        if let Some(rejection) = bitnet_b158_request_rejection(&tools, enable_thinking) {
-            return rejection;
-        }
-        match prepare_bitnet_b158_chat_prompt(&runtime, &id, &messages) {
-            Ok(prompt) => prompt,
-            Err(rejection) => return rejection,
-        }
-    } else if runtime.architecture == "lfm2" {
-        // LFM2 has its own template AND its own tool-call envelope; borrowing
-        // the qwen35 tools renderer would emit a format these weights were
-        // never trained on. Fail closed until an LFM2 tool lane is proven.
-        if !tools.is_empty() {
-            return lfm2_runnable_lane_tools_rejection();
-        }
-        // Keyed on the FILE's template, not the arch string alone. LFM2.5 ships
-        // both an open-think dialect and a plain assistant-generation dialect;
-        // select only after the exact marker contract is recognized.
-        if let Some(rejection) = reject_lfm2_with_unrecognized_template(&runtime, &id) {
-            return rejection;
-        }
-        render_lfm2_chatml_prompt_for_template(
-            &messages,
-            runtime
-                .tokenizer
-                .chat_template
-                .as_deref()
-                .unwrap_or_default(),
-        )
-    } else if runtime.architecture == "command-r" {
-        if !tools.is_empty() {
-            return aya_runnable_lane_tools_rejection();
-        }
-        if enable_thinking {
-            return aya_runnable_lane_thinking_rejection();
-        }
-        match prepare_aya_runnable_chat_prompt(&runtime, &id, &messages) {
-            Ok(prompt) => prompt,
-            Err(rejection) => return rejection,
-        }
-    } else if tools.is_empty() {
-        render_ornith_chatml_prompt(&messages, enable_thinking)
-    } else {
-        render_ornith_chatml_prompt_with_tools(&messages, &tools, enable_thinking)
+    let prompt_text = match render_runnable_chat_prompt_for_request(
+        &runtime,
+        &id,
+        &messages,
+        &tools,
+        enable_thinking,
+    ) {
+        Ok(prompt) => prompt,
+        Err(rejection) => return rejection,
     };
-    let prepared =
-        match prepare_runnable_prompt(&runtime, req, &messages, &prompt_text, !tools.is_empty()) {
-            Ok(prepared) => prepared,
-            Err(response) => return response,
-        };
+    let prepared = match prepare_runnable_prompt(
+        &runtime,
+        &messages,
+        &prompt_text,
+        !tools.is_empty(),
+        req.camelid_image_min_tokens,
+        req.camelid_image_max_tokens,
+    ) {
+        Ok(prepared) => prepared,
+        Err(response) => return response,
+    };
     let sampling = match runnable_sampling_config(req) {
         Ok(config) => config,
         Err(response) => return response,
     };
-    let max_tokens = req.max_tokens.unwrap_or(256).min(4096) as usize;
+    // Same value the preflight already validates for this lane. Threaded into the
+    // decode loop so a stop sequence terminates generation here exactly as it does
+    // on the dense lane, rather than being silently dropped.
+    let stop_sequences = match stop_sequences_from_request(req.stop.as_ref()) {
+        Ok(sequences) => sequences,
+        Err(response) => return *response,
+    };
+    let max_tokens = runnable_effective_max_tokens(req.max_tokens) as usize;
     let include_usage = stream_options_include_usage(req.stream_options.as_ref());
     let parse_stream_tool_calls = !tools.is_empty();
     // Post-hoc envelope lifting is gated on tool_choice, not tool presence:
@@ -12952,6 +15165,11 @@ async fn runnable_chat_streaming(
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<StreamItem>();
     let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let worker_cancelled = cancelled.clone();
+    // The worker MOVES `stop_sequences` into its decode closure below; the SSE emitter
+    // needs the same list to hold back text a stop sequence will cut. Both arms of the
+    // worker now terminate and truncate on these sequences, so the emitter mirrors it
+    // unconditionally.
+    let stream_stop_sequences = stop_sequences.clone();
     let rt = runtime.clone();
     tokio::task::spawn_blocking(move || {
         let send_tx = tx.clone();
@@ -12964,6 +15182,7 @@ async fn runnable_chat_streaming(
                     max_tokens,
                     &sampling,
                     &is_cancelled,
+                    &stop_sequences,
                     |tok| {
                         if send_tx.send(StreamItem::Token(tok)).is_err() {
                             worker_cancelled.store(true, std::sync::atomic::Ordering::Release);
@@ -12992,6 +15211,7 @@ async fn runnable_chat_streaming(
                     max_image_tokens,
                     max_tokens,
                     &sampling,
+                    &stop_sequences,
                     |tok| {
                         if send_tx.send(StreamItem::Token(tok)).is_err() {
                             worker_cancelled.store(true, std::sync::atomic::Ordering::Release);
@@ -13070,9 +15290,18 @@ async fn runnable_chat_streaming(
                     if decoded.ends_with('\u{FFFD}') {
                         continue;
                     }
+                    // Stop hold-back, the exact analogue of the UTF-8 one above. The
+                    // decode loop calls `on_token` BEFORE its `should_stop` predicate
+                    // breaks it, so the token completing a stop string always reaches
+                    // this channel; and with no tools in the request these deltas are
+                    // the ONLY content the client ever sees, because the truncated final
+                    // text below is sent only under `parse_stream_tool_calls`. Without
+                    // this the streamed reply would contain the stop string while the
+                    // non-streamed answer to the same request does not.
+                    let safe_len = stop_safe_stream_len(&decoded, &stream_stop_sequences);
                     let mut new_start = emitted;
                     if !seen_visible {
-                        let vis = decoded[new_start..]
+                        let vis = decoded[new_start..safe_len]
                             .find(|c: char| !c.is_whitespace())
                             .map(|off| new_start + off);
                         match vis {
@@ -13083,11 +15312,11 @@ async fn runnable_chat_streaming(
                             None => continue, // still leading whitespace — hold
                         }
                     }
-                    if new_start >= decoded.len() {
+                    if new_start >= safe_len {
                         continue;
                     }
-                    let delta_text = decoded[new_start..].to_string();
-                    emitted = decoded.len();
+                    let delta_text = decoded[new_start..safe_len].to_string();
+                    emitted = safe_len;
                     let delta = if in_think {
                         serde_json::json!({ "reasoning_content": delta_text })
                     } else {
@@ -13105,6 +15334,44 @@ async fn runnable_chat_streaming(
                     ));
                 }
                 StreamItem::Done(result) => {
+                    // Release any tail the stop hold-back is still holding. Generation
+                    // is over, so a proper prefix of a stop sequence can no longer
+                    // complete into one and only a COMPLETE match still cuts. Without
+                    // this a reply ending in such a prefix loses those bytes outright
+                    // (stop `"\n\nUser:"` and a reply ending `"\n\n"`), because with no
+                    // tools in the request the per-token deltas above are the only
+                    // content the client ever receives.
+                    if !parse_stream_tool_calls && !stream_stop_sequences.is_empty() {
+                        let decoded = tokenizer.decode(&phase_ids, true).unwrap_or_default();
+                        // A dangling incomplete code point is dropped here exactly as it
+                        // is in the token arm above; releasing it would emit U+FFFD.
+                        if !decoded.ends_with('\u{FFFD}') {
+                            let final_len =
+                                truncate_at_stop_sequence(decoded.clone(), &stream_stop_sequences)
+                                    .len();
+                            let mut start = emitted;
+                            if !seen_visible {
+                                match decoded[start..final_len]
+                                    .find(|c: char| !c.is_whitespace())
+                                {
+                                    Some(offset) => start += offset,
+                                    None => start = final_len,
+                                }
+                            }
+                            if start < final_len {
+                                let delta_text = decoded[start..final_len].to_string();
+                                let delta = if in_think {
+                                    serde_json::json!({ "reasoning_content": delta_text })
+                                } else {
+                                    serde_json::json!({ "content": delta_text })
+                                };
+                                yield Ok(Event::default().data(
+                                    runnable_stream_chunk(&id, created, delta, None, None)
+                                        .to_string(),
+                                ));
+                            }
+                        }
+                    }
                     final_state = Some(Ok(result));
                     break;
                 }
@@ -13132,8 +15399,17 @@ async fn runnable_chat_streaming(
                 } else {
                     Vec::new()
                 };
-                let finish =
-                    runnable_finish_reason(!tool_calls.is_empty(), ids.len(), max_tokens);
+                let stopped_on_stop_sequence = !stream_stop_sequences.is_empty()
+                    && contains_stop_sequence(
+                        &tokenizer.decode(&ids, true).unwrap_or_default(),
+                        &stream_stop_sequences,
+                    );
+                let finish = runnable_finish_reason(
+                    !tool_calls.is_empty(),
+                    ids.len(),
+                    max_tokens,
+                    stopped_on_stop_sequence,
+                );
                 if !tool_calls.is_empty() {
                     let deltas: Vec<serde_json::Value> = tool_calls
                         .iter()
@@ -13662,21 +15938,119 @@ async fn gemma4_chat_streaming(
     runtime: Arc<Gemma4ServeRuntime>,
     req: &ChatCompletionRequest,
 ) -> Response {
-    let messages = req.messages.clone().unwrap_or_default();
-    let prompt = gemma4_chat_prompt(&messages, req.camelid_enable_thinking.unwrap_or(false));
-    let max_tokens = req.max_tokens.unwrap_or(256).min(4096) as usize;
+    let render_draft_token_ids = req.camelid_target_verified_render_draft_token_ids.clone();
+    let render_segments = req.camelid_target_verified_render_segments.clone();
+    let target_verified_render = render_draft_token_ids.is_some() || render_segments.is_some();
     let created = unix_secs();
-    let prompt_tokens = match gemma4_prompt_token_count(Arc::clone(&runtime), prompt.clone()).await
-    {
-        Ok(count) => count,
-        Err(response) => return response,
+    let (prompt_tokens, max_tokens, stream) = if let Some(segments) = render_segments {
+        let mut prepared = Vec::with_capacity(segments.len());
+        let mut total_prompt_tokens = 0usize;
+        let mut total_output_tokens = 0usize;
+        for (index, segment) in segments.into_iter().enumerate() {
+            let prompt = gemma4_chat_prompt(
+                &segment.messages,
+                req.camelid_enable_thinking.unwrap_or(false),
+            );
+            let segment_prompt_tokens =
+                match gemma4_prompt_token_count(Arc::clone(&runtime), prompt.clone()).await {
+                    Ok(count) => count,
+                    Err(response) => return response,
+                };
+            if let Err(message) = gemma4_mtp12_context_budget_check(
+                segment_prompt_tokens,
+                segment.token_ids.len(),
+                GEMMA4_TARGET_VERIFIED_SEGMENT_MAX_POSITIONS,
+            ) {
+                return api_error_with_prompt_token_count(
+                    StatusCode::BAD_REQUEST,
+                    "target_verified_render_segment_context_exceeded",
+                    format!("target-verified render segment {index}: {message}"),
+                    Some("camelid_target_verified_render_segments"),
+                    Some(segment_prompt_tokens),
+                );
+            }
+            total_prompt_tokens = match total_prompt_tokens.checked_add(segment_prompt_tokens) {
+                Some(total) => total,
+                None => {
+                    return api_error(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_target_verified_render_segments",
+                        "segmented target-verified render prompt token count overflowed"
+                            .to_string(),
+                        Some("camelid_target_verified_render_segments"),
+                    )
+                }
+            };
+            total_output_tokens = match total_output_tokens.checked_add(segment.token_ids.len()) {
+                Some(total) => total,
+                None => {
+                    return api_error(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_target_verified_render_segments",
+                        "segmented target-verified render output token count overflowed"
+                            .to_string(),
+                        Some("camelid_target_verified_render_segments"),
+                    )
+                }
+            };
+            prepared.push(Gemma4PreparedRenderSegment {
+                prompt,
+                prompt_tokens: segment_prompt_tokens,
+                token_ids: segment.token_ids,
+            });
+        }
+        let stream = match gemma4_segmented_render_stream_on_engine(state, runtime, prepared) {
+            Ok(stream) => stream,
+            Err(response) => return *response,
+        };
+        (total_prompt_tokens, total_output_tokens, stream)
+    } else {
+        let messages = req.messages.clone().unwrap_or_default();
+        let prompt = gemma4_chat_prompt(&messages, req.camelid_enable_thinking.unwrap_or(false));
+        let max_tokens = render_draft_token_ids
+            .as_ref()
+            .map(Vec::len)
+            .unwrap_or_else(|| req.max_tokens.unwrap_or(256).min(4096) as usize);
+        let prompt_tokens =
+            match gemma4_prompt_token_count(Arc::clone(&runtime), prompt.clone()).await {
+                Ok(count) => count,
+                Err(response) => return response,
+            };
+        // A verified-render replay must emit exactly its recorded draft, so its
+        // budget is a demand, not an upper bound: refuse rather than clamp. An
+        // ordinary request keeps the shared max_tokens contract and is clamped.
+        let max_tokens = match clamp_gemma4_mtp12_request_context(
+            &runtime,
+            prompt_tokens,
+            max_tokens,
+        ) {
+            Ok(budget) if render_draft_token_ids.is_some() && budget < max_tokens => {
+                return api_error_with_prompt_token_count(
+                    StatusCode::BAD_REQUEST,
+                    "context_length_exceeded",
+                    format!(
+                        "verified render of {max_tokens} tokens does not fit the resident window after a {prompt_tokens}-token prompt (room for {budget})"
+                    ),
+                    Some("max_tokens"),
+                    Some(prompt_tokens),
+                );
+            }
+            Ok(budget) => budget,
+            Err(response) => return response,
+        };
+        let stream = match gemma4_stream_on_engine(
+            state,
+            runtime,
+            prompt,
+            max_tokens,
+            render_draft_token_ids,
+        ) {
+            Ok(stream) => stream,
+            Err(response) => return *response,
+        };
+        (prompt_tokens, max_tokens, stream)
     };
-
-    let (mut rx, cancel_on_drop) = match gemma4_stream_on_engine(state, runtime, prompt, max_tokens)
-    {
-        Ok(stream) => stream,
-        Err(response) => return *response,
-    };
+    let (mut rx, cancel_on_drop) = stream;
 
     let events = async_stream::stream! {
         let _cancel_on_drop = cancel_on_drop;
@@ -13689,6 +16063,7 @@ async fn gemma4_chat_streaming(
             true,
         )));
         let mut completion_tokens = 0usize;
+        let mut native_diagnostics = None;
         let mut completed = false;
         // Role chunk.
         let role = serde_json::json!({
@@ -13728,8 +16103,28 @@ async fn gemma4_chat_streaming(
                     });
                     yield Ok(Event::default().data(chunk.to_string()));
                 }
-                Gemma4StreamItem::Complete { completion_tokens: actual } => {
+                Gemma4StreamItem::SegmentBoundary(progress) => {
+                    // Each section has an independent chat prompt; hidden
+                    // channel state must not leak across that prompt boundary.
+                    if !progress.boundary.is_empty() {
+                        channel_filter = Gemma4ChannelFilter::new();
+                    }
+                    let chunk = serde_json::json!({
+                        "id": "chatcmpl-gemma4",
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": id,
+                        "choices": [{
+                            "index": 0,
+                            "delta": gemma4_target_verified_segment_delta(&progress),
+                            "finish_reason": null
+                        }],
+                    });
+                    yield Ok(Event::default().data(chunk.to_string()));
+                }
+                Gemma4StreamItem::Complete { completion_tokens: actual, diagnostics } => {
                     completion_tokens = actual;
+                    native_diagnostics = diagnostics;
                     completed = true;
                 }
                 Gemma4StreamItem::Error(e) => {
@@ -13755,7 +16150,11 @@ async fn gemma4_chat_streaming(
         }
 
         if !errored {
-            let finish_reason = gemma4_finish_reason(completion_tokens, max_tokens);
+            let finish_reason = gemma4_streaming_finish_reason(
+                completion_tokens,
+                max_tokens,
+                target_verified_render,
+            );
             if let Some(guard) = telemetry_guard.take() {
                 guard.finish(telemetry::RequestFinish {
                     status: "ok",
@@ -13775,6 +16174,10 @@ async fn gemma4_chat_streaming(
                 "choices": [{ "index": 0, "delta": {}, "finish_reason": finish_reason }],
                 "usage": gemma4_usage(prompt_tokens, completion_tokens),
             });
+            let mut done = done;
+            if let Some(camelid) = native_diagnostics {
+                done["camelid"] = camelid;
+            }
             yield Ok(Event::default().data(done.to_string()));
         }
         yield Ok(Event::default().data("[DONE]"));
@@ -13792,6 +16195,9 @@ async fn load_model_from_path_with_activation(
         return Err(BackendError::ModelOperationInProgress);
     }
     let _transition = state.model_transition.lock().await;
+    if state.workspace_sessions.blocks_model_transition().await {
+        return Err(BackendError::ModelOperationInProgress);
+    }
     let _reader = state.model_file_lifecycle.read().await;
     // Every load funnels through here, so resolve relative paths against the
     // configured models dir at this one chokepoint (absolute paths and
@@ -13799,6 +16205,10 @@ async fn load_model_from_path_with_activation(
     // Resolution runs BEFORE the idempotent fast path so a repeated relative
     // request compares equal to the resolved path the first load stored.
     let path = resolve_request_model_path(&state.models_dir, path)?;
+    // Preserve caller authority over model ids. The one startup-only canonical
+    // remap below is allowed only when no id was supplied and exact artifact
+    // identity has subsequently been proven by the phase-2 receipt hash.
+    let explicit_id_present = id.is_some();
     enforce_distributed_model_sha256(state, &path)?;
     // Idempotent fast path: the same id already loaded from the same file
     // returns the existing record instead of re-running the full load pipeline
@@ -13888,18 +16298,33 @@ async fn load_model_from_path_with_activation(
         BackendError::InvalidModelMetadata(format!("model metadata task panicked: {join_error}"))
     })??;
     state.planner_env.apply(&outcome.env_updates);
-    let id = id
+    let mut id = id
         .or_else(|| gguf.model_name().map(ToOwned::to_owned))
         .or_else(|| path.file_stem().map(|s| s.to_string_lossy().to_string()))
         .unwrap_or_else(|| "loaded-model".to_string());
     // Phase 2: config/tensor binding, tokenizer construction, and the
     // multi-gigabyte lane hash.
     let build_id = id.clone();
-    let loaded = tokio::task::spawn_blocking(move || build_loaded_model(path, build_id, gguf))
+    let mut loaded = tokio::task::spawn_blocking(move || build_loaded_model(path, build_id, gguf))
         .await
         .map_err(|join_error| {
             BackendError::InvalidModelMetadata(format!("model load task panicked: {join_error}"))
         })??;
+    // `general.name` is presentation metadata, and the certified Gemma 4 12B
+    // artifact currently records the unhelpful value "Hf" there. Only after
+    // the full-file hash proves both the exact filename and bytes do we replace
+    // that provisional fallback with its compatibility-row id. This keeps the
+    // active id, lane identity, request selection, and model APIs aligned while
+    // leaving explicit ids and every neighbouring artifact untouched.
+    if let Some(canonical_id) = canonical_mtp12_startup_model_id(
+        explicit_id_present,
+        &loaded.path,
+        &loaded.lane.gguf_sha256,
+    ) {
+        id = canonical_id.to_string();
+        loaded.id = id.clone();
+        loaded.lane.model_id = id.clone();
+    }
     finalize_execution_plan_support_for_loaded_artifact(
         &mut outcome.plan,
         &loaded.path,
@@ -14012,16 +16437,13 @@ fn build_loaded_model(
     let tokenizer_result = Tokenizer::from_gguf(&gguf);
     let tokenizer = tokenizer_state_from_result(tokenizer_result.as_ref());
     let tokenizer_runtime = tokenizer_result.ok().map(Arc::new);
-    // Hash the exact GGUF bytes once at load time so receipts can name the
-    // lane without re-hashing per request.
-    //
-    // Memoized across process starts on (path, len, mtime, dev, ino): this
-    // read is the dominant cost of loading a large row — ~85 s for a 2.5 GB
-    // artifact on an external SSD — and it is paid before the first request
-    // can be served. The digest is unchanged, and no verification path reads
-    // the cache, so a stale entry can only cost a false alarm at verify time,
-    // never a false pass. See `receipt::gguf_hash_cache`.
-    let gguf_sha256 = receipt::sha256_file_hex_cached(&path).map_err(|err| match err {
+    // Hash the exact GGUF bytes once at load time so receipts and capability
+    // gates can name the lane without re-hashing per request. This must bypass
+    // the persistent performance cache: loaded-model identity authorizes exact
+    // tool-capable rows, and a writable cache entry is not cryptographic proof
+    // of the bytes that were loaded. Repeat loads in this process still take
+    // the idempotent fast path above and reuse this already-proven identity.
+    let gguf_sha256 = receipt::sha256_file_hex(&path).map_err(|err| match err {
         receipt::ReceiptError::Io { path, source } => BackendError::Io { path, source },
         other => BackendError::InvalidModelMetadata(other.to_string()),
     })?;
@@ -14065,9 +16487,13 @@ async fn load_gemma4_serve_runtime(
         gemma4_distributed_serve_config().map_err(BackendError::InvalidModelMetadata)?;
     let ghost_moe =
         gemma4_ghost_moe_serve_config(model_path).map_err(BackendError::InvalidModelMetadata)?;
-    if distributed.is_some() && ghost_moe.is_some() {
+    let mtp12 = gemma4_mtp12_serve_config().map_err(BackendError::InvalidModelMetadata)?;
+    let requested_lanes = usize::from(distributed.is_some())
+        + usize::from(ghost_moe.is_some())
+        + usize::from(mtp12.is_some());
+    if requested_lanes > 1 {
         return Err(BackendError::InvalidModelMetadata(
-            "Gemma 4 Ghost-MoE and distributed serve are mutually exclusive; unset either CAMELID_GEMMA4_GHOST_CGHOST or CAMELID_GEMMA4_WORKER/CAMELID_GEMMA4_SPLIT"
+            "Gemma 4 MTP12 Metal, Ghost-MoE, and distributed serve are mutually exclusive; configure exactly one lane"
                 .to_string(),
         ));
     }
@@ -14079,7 +16505,38 @@ async fn load_gemma4_serve_runtime(
         crate::ghost_install::apply_catalog_cuda_defaults();
     }
     let load_path = model_path.to_path_buf();
-    let runtime = tokio::task::spawn_blocking(move || match (ghost_moe, distributed) {
+    let runtime = tokio::task::spawn_blocking(move || {
+        if let Some(mtp12) = mtp12 {
+            #[cfg(target_os = "macos")]
+            {
+                // The target hash is admitted before the assistant allocation,
+                // and the assistant loader independently validates its exact
+                // config, tensor manifest, byte length, and SHA-256.
+                let runtime = crate::gemma4_runtime::Gemma4GpuRuntime::load(
+                    &load_path,
+                    mtp12.max_positions,
+                )?;
+                runtime.admit_mtp12_target_identity()?;
+                let assistant =
+                    crate::metal::Gemma4Mtp12AssistantMetal::load(&mtp12.assistant_path)?;
+                return Ok(Gemma4ServeRuntime::Mtp12Metal {
+                    runtime,
+                    assistant: std::sync::Mutex::new(assistant),
+                    verify_width: mtp12.verify_width,
+                    max_positions: mtp12.max_positions,
+                });
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = mtp12;
+                return Err(BackendError::InvalidModelMetadata(
+                    "CAMELID_GEMMA4_MTP12_ASSISTANT selects a macOS Metal-only serve lane"
+                        .to_string(),
+                ));
+            }
+        }
+
+        match (ghost_moe, distributed) {
         (Some(ghost), None) => {
             #[cfg(feature = "cuda")]
             if gemma4_ghost_cuda_enabled(ghost.catalog_managed) {
@@ -14190,6 +16647,7 @@ async fn load_gemma4_serve_runtime(
             crate::gemma4_runtime::Gemma4Runtime::load(&load_path).map(Gemma4ServeRuntime::Local)
         }
         (Some(_), Some(_)) => unreachable!("mutual exclusion checked before runtime load"),
+        }
     })
     .await
     .map_err(|e| {
@@ -14201,6 +16659,8 @@ async fn load_gemma4_serve_runtime(
         match &runtime {
             Gemma4ServeRuntime::Local(_) => Gemma4ServeLane::Local,
             Gemma4ServeRuntime::Distributed(_) => Gemma4ServeLane::Distributed,
+            #[cfg(target_os = "macos")]
+            Gemma4ServeRuntime::Mtp12Metal { .. } => Gemma4ServeLane::Mtp12Metal,
             #[cfg(feature = "cuda")]
             Gemma4ServeRuntime::Cuda { .. } => Gemma4ServeLane::Cuda,
         }
@@ -14265,6 +16725,14 @@ async fn unload_model(
         );
     }
     let _transition = state.model_transition.lock().await;
+    if state.workspace_sessions.blocks_model_transition().await {
+        return api_error(
+            StatusCode::CONFLICT,
+            "model_operation_in_progress",
+            BackendError::ModelOperationInProgress.to_string(),
+            None,
+        );
+    }
     let _exclusive = state.model_file_lifecycle.write().await;
     let model_id = if let Some(Json(req)) = payload {
         req.id
@@ -15129,6 +17597,12 @@ async fn llama_server_apply_template(
             )
         }
     };
+    // Ahead of validate_chat_messages: an audio-only or video-only message
+    // renders to empty content, so the generic empty-content refusal would
+    // otherwise answer first and hide which part type was actually rejected.
+    if let Some(response) = reject_unsupported_multimodal_content(&messages) {
+        return response;
+    }
     if let Err(response) = validate_chat_messages(&messages) {
         return *response;
     }
@@ -15137,6 +17611,49 @@ async fn llama_server_apply_template(
         Ok(model) => model,
         Err(response) => return response,
     };
+    // An image_url part renders to a Qwen vision marker unconditionally (see the
+    // ChatMessage Deserialize impl), so without this ladder every non-vision row
+    // answers 200 with `<|vision_start|>` sitting in the returned prompt. Refuse
+    // on the same three rungs, codes and wording the chat lane uses, so a client
+    // cannot tell the two routes apart. Architecture alone is not the predicate:
+    // the text-only qwen35 rows share it with the two Prism vision rows and are
+    // only separated by projector readiness.
+    let image_count: usize = messages
+        .iter()
+        .map(|message| message.image_urls.len())
+        .sum();
+    if image_count > 0 {
+        if image_count != 1 {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "unsupported_image_count",
+                "Prism chat currently accepts exactly one image per request".to_string(),
+                Some("messages"),
+            );
+        }
+        if model.gguf.architecture() != Some("qwen35") {
+            return api_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "vision_model_required",
+                "image_url content requires a Prism/Qwen3.5 vision model".to_string(),
+                Some("model"),
+            );
+        }
+        let vision_ready = match resolve_runnable_runtime(&state, &None).await {
+            Ok(Some((_, runtime))) => runtime.vision_ready(),
+            Ok(None) => false,
+            Err(response) => return response,
+        };
+        if !vision_ready {
+            return api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "vision_projector_not_ready",
+                "the language model is loaded, but no Prism image projector is ready: either no *mmproj*.gguf was found beside the model (set CAMELID_MMPROJ before loading it), or this build has no Metal or CUDA lane to decode with image embeddings"
+                    .to_string(),
+                Some("model"),
+            );
+        }
+    }
     let tokenizer = match model.tokenizer_runtime.clone() {
         Some(tokenizer) => tokenizer,
         None => match Tokenizer::from_gguf(&model.gguf) {
@@ -15227,6 +17744,12 @@ fn model_list_item(model: &LoadedModel) -> ModelListItem {
         object: "model",
         created: 0,
         owned_by: "camelid",
+        filename: model
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_string),
+        gguf_sha256: model.lane.gguf_sha256.clone(),
         meta: model_list_meta(model),
     }
 }
@@ -15271,6 +17794,20 @@ async fn create_generation_session(
         Ok(payload) => payload,
         Err(err) => return malformed_json_error(err),
     };
+    let artifact_binding = match bind_expected_loaded_artifact(
+        &state,
+        req.model.as_deref(),
+        req.camelid_expected_gguf_sha256.as_deref(),
+    )
+    .await
+    {
+        Ok(binding) => binding,
+        Err(response) => return response,
+    };
+    // Validation prepares a concrete model clone and verifies the digest again.
+    // Do not carry the transition guard into that path: a cold speculative
+    // draft load legitimately needs the same transition lock.
+    drop(artifact_binding);
     match validate_generation_request(&state, req).await {
         Ok(summary) => {
             state
@@ -15292,10 +17829,209 @@ async fn preflight_generation(
         Ok(payload) => payload,
         Err(err) => return malformed_json_error(err),
     };
+    let artifact_binding = match bind_expected_loaded_artifact(
+        &state,
+        req.model.as_deref(),
+        req.camelid_expected_gguf_sha256.as_deref(),
+    )
+    .await
+    {
+        Ok(binding) => binding,
+        Err(response) => return response,
+    };
+
+    // Agent prompt fitting sends chat messages plus tool definitions through
+    // this count-only endpoint. Runnable-only rows (notably certified
+    // Ornith/qwen35 agent rows) cannot enter `prepare_generation`: that is a
+    // dense/raw-completions path and deliberately rejects their architecture.
+    // Resolve the same dedicated runtime as real chat while the transition
+    // guard is still held for artifact-bound agent requests, then count with
+    // its exact renderer/tokenizer.
+    if req.prompt.is_none() && req.messages.is_some() {
+        match resolve_runnable_runtime(&state, &req.model).await {
+            Ok(Some((id, runtime))) => {
+                drop(artifact_binding);
+                return match validate_runnable_generation_preflight(
+                    &state,
+                    &id,
+                    runtime.as_ref(),
+                    &req,
+                ) {
+                    Ok(summary) => Json(summary).into_response(),
+                    Err(response) => response,
+                };
+            }
+            Ok(None) => {}
+            Err(response) => return response,
+        }
+    }
+    drop(artifact_binding);
     match validate_generation_request(&state, req).await {
         Ok(summary) => Json(summary).into_response(),
         Err(response) => response,
     }
+}
+
+/// Count one runnable-lane chat prompt without decoding. This mirrors the
+/// runnable chat renderer, tool-schema normalization, tokenizer special-token
+/// policy, and effective reply cap. It intentionally refuses vision prompts:
+/// their projected image-token count is data-dependent and is known only after
+/// projector execution, while the coding-agent lane is text-only.
+#[allow(clippy::result_large_err)]
+fn validate_runnable_generation_preflight(
+    state: &AppState,
+    id: &str,
+    runtime: &RunnableServeRuntime,
+    req: &GenerationSessionRequest,
+) -> std::result::Result<GenerationSessionSummary, Response> {
+    validate_unsupported_generation_fields(req).map_err(|response| *response)?;
+    validate_choice_and_logprob_fields(req).map_err(|response| *response)?;
+    sampling_config_from_request(req).map_err(|response| *response)?;
+    stop_sequences_from_request(req.stop.as_ref()).map_err(|response| *response)?;
+    if req.max_tokens == Some(0) {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_max_tokens",
+            "max_tokens must be greater than zero".to_string(),
+            Some("max_tokens"),
+        ));
+    }
+
+    let messages = req
+        .messages
+        .as_deref()
+        .filter(|messages| !messages.is_empty())
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                "missing_generation_input",
+                "generation requires a non-empty messages array".to_string(),
+                Some("messages"),
+            )
+        })?;
+    if let Some(response) = reject_unsupported_multimodal_content(messages) {
+        return Err(response);
+    }
+    if messages
+        .iter()
+        .any(|message| !message.image_urls.is_empty())
+    {
+        return Err(api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "vision_preflight_unavailable",
+            "count-only generation preflight is unavailable for projected image prompts"
+                .to_string(),
+            Some("messages"),
+        ));
+    }
+    let tools = normalize_runnable_tools(req.tools.as_deref(), true);
+    let prompt_text = render_runnable_chat_prompt_for_request(
+        runtime,
+        id,
+        messages,
+        &tools,
+        req.camelid_enable_thinking.unwrap_or(false),
+    )?;
+    let prepared = prepare_runnable_prompt(
+        runtime,
+        messages,
+        &prompt_text,
+        !tools.is_empty(),
+        None,
+        None,
+    )?;
+    let prompt_token_count = match prepared {
+        RunnablePreparedPrompt::Text(token_ids) => token_ids.len(),
+        // Kept as a defensive backstop if prompt preparation ever learns a
+        // second route to projected inputs.
+        RunnablePreparedPrompt::Vision { .. } => {
+            return Err(api_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "vision_preflight_unavailable",
+                "count-only generation preflight is unavailable for projected image prompts"
+                    .to_string(),
+                Some("messages"),
+            ))
+        }
+    };
+    let max_tokens = validate_runnable_preflight_budget(
+        prompt_token_count,
+        req.max_tokens,
+        req.camelid_context_budget_tokens,
+        state.server_limits,
+    )?;
+
+    Ok(GenerationSessionSummary {
+        id: format!("preflight-{id}"),
+        object: "generation.preflight",
+        model: id.to_string(),
+        prompt_token_count,
+        max_tokens,
+        state: "validated",
+        dense_session_ready: false,
+        next_step: "the runnable chat prompt is template-rendered and token-counted; no model decode or session allocation occurred",
+    })
+}
+
+/// Apply the same reply cap used by runnable chat and reserve it against the
+/// caller's runtime context budget. Kept separate from tokenization so the
+/// exact-boundary behavior can be regression-tested without loading multi-GB
+/// model weights merely to construct a runnable runtime.
+#[allow(clippy::result_large_err)]
+fn validate_runnable_preflight_budget(
+    prompt_token_count: usize,
+    requested_max_tokens: Option<u32>,
+    context_budget_tokens: Option<u32>,
+    server_limits: server::ServerLimits,
+) -> std::result::Result<u32, Response> {
+    if prompt_token_count > server_limits.max_prompt_tokens {
+        return Err(api_error_with_prompt_token_count(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "prompt_token_limit_exceeded",
+            format!(
+                "prompt encoded to {prompt_token_count} tokens, above the server ceiling of {}",
+                server_limits.max_prompt_tokens
+            ),
+            Some("prompt"),
+            Some(prompt_token_count),
+        ));
+    }
+
+    // These are the exact runnable chat defaults/caps used by both generation
+    // transports below. Agent callers normally provide an explicit value already
+    // intersected with the live server ceiling.
+    let max_tokens = runnable_effective_max_tokens(requested_max_tokens);
+    if max_tokens > server_limits.max_generation_tokens {
+        return Err(api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "generation_token_limit_exceeded",
+            format!(
+                "effective max_tokens exceeds the server ceiling of {}",
+                server_limits.max_generation_tokens
+            ),
+            Some("max_tokens"),
+        ));
+    }
+    if let Some(budget_tokens) = context_budget_tokens {
+        if budget_tokens == 0 {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_context_budget",
+                "camelid_context_budget_tokens must be greater than zero".to_string(),
+                Some("camelid_context_budget_tokens"),
+            ));
+        }
+        if let Err(message) = enforce_context_budget(prompt_token_count, max_tokens, budget_tokens)
+        {
+            return Err(api_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "context_budget_exceeded",
+                message,
+                Some("camelid_context_budget_tokens"),
+            ));
+        }
+    }
+    Ok(max_tokens)
 }
 
 /// Every choice of an n>1 request, prepared upfront (KV caches allocate
@@ -15543,6 +18279,7 @@ async fn completions(
     }
     let req = GenerationSessionRequest {
         model: req.model,
+        camelid_expected_gguf_sha256: None,
         prompt: req.prompt,
         messages: None,
         max_tokens: req.max_tokens,
@@ -15591,7 +18328,7 @@ async fn completions(
     if stream {
         // Text-completion streaming does not implement stream_options yet
         // (scope: chat-completions only), so usage is never emitted here.
-        return stream_completion(&state, prepared, false, false, false);
+        return stream_completion(&state, prepared, false, false, None);
     }
 
     // The decode runs on the engine worker; CancelOnDrop stops it within one
@@ -15771,6 +18508,32 @@ async fn chat_completions(
         Ok(payload) => payload,
         Err(err) => return malformed_json_error(err),
     };
+    let artifact_binding = match bind_expected_loaded_artifact(
+        &state,
+        req.model.as_deref(),
+        req.camelid_expected_gguf_sha256.as_deref(),
+    )
+    .await
+    {
+        Ok(binding) => binding,
+        Err(response) => return response,
+    };
+    let target_verified_render_tokens = match validate_target_verified_render_request(&req) {
+        Ok(tokens) => tokens,
+        Err(response) => return response,
+    };
+    let segmented_render_present = req.camelid_target_verified_render_segments.is_some();
+    if let Err(message) = validate_segmented_render_expected_sha(
+        segmented_render_present,
+        req.camelid_expected_gguf_sha256.as_deref(),
+    ) {
+        return api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "target_verified_render_artifact_binding_required",
+            message,
+            Some("camelid_expected_gguf_sha256"),
+        );
+    }
     // Fail closed on unsupported multimodal types before routing. Prism
     // `image_url` parts are collected separately and handled by the qwen35
     // runnable lane; audio, video, and malformed parts never degrade into a
@@ -15816,6 +18579,12 @@ async fn chat_completions(
     };
     let tools_active = req.tools.as_ref().is_some_and(|tools| !tools.is_empty())
         && tool_choice_allows_calls(req.tool_choice.as_ref());
+    let tools_declared = req.tools.as_ref().is_some_and(|tools| !tools.is_empty());
+    // Captured before `req` is consumed downstream. This is the only thing that
+    // authorises undoing a schema envelope the model echoed around its arguments.
+    let declared_tool_parameters = tool_envelope::ToolParameterNames::from_request_tools(
+        req.tools.as_deref().unwrap_or_default(),
+    );
     let tools_unsupported_on_lane = |lane: &str| {
         api_error(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -15831,15 +18600,31 @@ async fn chat_completions(
     // through to the existing Llama/3B path unchanged.
     match resolve_gemma4_runtime(&state, &req).await {
         Ok(Some((id, runtime))) => {
+            if target_verified_render_tokens.is_some() && !runtime.is_mtp12_metal() {
+                return api_error(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "target_verified_render_lane_required",
+                    "target-verified render drafts require the exact Gemma 4 12B MTP12 Metal lane"
+                        .to_string(),
+                    Some(if segmented_render_present {
+                        "camelid_target_verified_render_segments"
+                    } else {
+                        "camelid_target_verified_render_draft_token_ids"
+                    }),
+                );
+            }
             if has_image_input {
                 return vision_unsupported_on_lane("gemma4");
             }
             if constraint.is_some() {
                 return constraint_unsupported_on_lane();
             }
-            if tools_active {
+            if tools_active || (segmented_render_present && tools_declared) {
                 return tools_unsupported_on_lane("gemma4");
             }
+            // The runtime Arc was cloned while model transitions were locked;
+            // it is now self-contained for this response.
+            drop(artifact_binding);
             return if req.stream.unwrap_or(false) {
                 gemma4_chat_streaming(&state, id, runtime, &req).await
             } else {
@@ -15849,6 +18634,19 @@ async fn chat_completions(
         Ok(None) => {}
         Err(resp) => return resp,
     }
+    if target_verified_render_tokens.is_some() {
+        return api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "target_verified_render_lane_required",
+            "target-verified render drafts require the exact Gemma 4 12B MTP12 Metal lane"
+                .to_string(),
+            Some(if segmented_render_present {
+                "camelid_target_verified_render_segments"
+            } else {
+                "camelid_target_verified_render_draft_token_ids"
+            }),
+        );
+    }
     // Runnable serve path (additive, on by default; opt-out CAMELID_RUNNABLE_SERVE=0):
     // short-circuits a qwen35/Ornith or gemma3 model to the runnable lane. Streaming
     // mirrors the OpenAI chunk shape with think tokens as `reasoning_content` deltas.
@@ -15857,6 +18655,7 @@ async fn chat_completions(
             if constraint.is_some() {
                 return constraint_unsupported_on_lane();
             }
+            drop(artifact_binding);
             if req.stream.unwrap_or(false) {
                 return runnable_chat_streaming(id, runtime, &req).await;
             }
@@ -15879,6 +18678,7 @@ async fn chat_completions(
             if tools_active {
                 return tools_unsupported_on_lane("diffusion-gemma");
             }
+            drop(artifact_binding);
             if req.stream.unwrap_or(false) {
                 return dg_chat_streaming(id, runtime, &req).await;
             }
@@ -15887,6 +18687,10 @@ async fn chat_completions(
         Ok(None) => {}
         Err(resp) => return resp,
     }
+    // The dense path re-resolves and verifies a concrete LoadedModel clone in
+    // prepare_generation. Releasing here avoids a recursive transition-lock
+    // acquisition when speculative decoding has to load its draft model.
+    drop(artifact_binding);
     if has_image_input {
         return vision_unsupported_on_lane("dense");
     }
@@ -15994,6 +18798,7 @@ async fn chat_completions(
     let include_usage = stream_options_include_usage(req.stream_options.as_ref());
     let req = GenerationSessionRequest {
         model: req.model,
+        camelid_expected_gguf_sha256: req.camelid_expected_gguf_sha256,
         prompt: None,
         messages: req.messages,
         max_tokens: req.max_tokens,
@@ -16057,7 +18862,11 @@ async fn chat_completions(
             prepared,
             true,
             include_usage,
-            tools_active && !constraint_active,
+            if tools_active && !constraint_active {
+                Some(declared_tool_parameters)
+            } else {
+                None
+            },
         );
     }
 
@@ -16104,7 +18913,7 @@ async fn chat_completions(
             // request supplied tools and tool_choice permits it. On a tool call,
             // content is emptied and finish_reason flips to "tool_calls".
             let tool_calls = if should_parse_tool_calls(tools_active, constraint_active) {
-                parse_tool_calls(&content)
+                parse_tool_calls(&content, &declared_tool_parameters)
             } else {
                 None
             };
@@ -16508,6 +19317,7 @@ async fn replay_loaded_receipt_request(
     };
     let session_request = GenerationSessionRequest {
         model: Some(loaded.id.clone()),
+        camelid_expected_gguf_sha256: Some(loaded.lane.gguf_sha256.clone()),
         prompt,
         messages,
         max_tokens: Some(request.max_tokens),
@@ -17268,6 +20078,7 @@ fn estimate_cpu_weight_materialization_bytes_with_q8_storage_and_ownership(
                 gate_experts,
                 up_experts,
                 down_experts,
+                ..
             } => {
                 for desc in [shared_gate, shared_up, shared_down] {
                     total = total
@@ -17498,110 +20309,6 @@ enum SpeculativeRound {
     Committed,
 }
 
-fn commit_target_tokens(
-    prepared: &PreparedGeneration,
-    emitted: &[u32],
-    generated: &mut Vec<u32>,
-    history: &mut Vec<u32>,
-    finish_reason: &mut &'static str,
-) -> std::result::Result<(), Box<Response>> {
-    for &token in emitted {
-        if generated.len() >= prepared.max_tokens as usize {
-            break;
-        }
-        generated.push(token);
-        history.push(token);
-        prepared.engine_progress.record_progress(generated.len());
-        if prepared.tokenizer.special.eog.contains(&token) {
-            *finish_reason = "stop";
-            break;
-        }
-        if !prepared.stop_sequences.is_empty() {
-            let text = prepared
-                .tokenizer
-                .decode(generated.as_slice(), true)
-                .map_err(|err| {
-                    Box::new(api_error(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "token_decode_failed",
-                        err.to_string(),
-                        None,
-                    ))
-                })?;
-            if contains_stop_sequence(&text, &prepared.stop_sequences) {
-                *finish_reason = "stop";
-                break;
-            }
-        }
-    }
-    Ok(())
-}
-
-fn bootstrap_eagle3_generation(
-    prepared: &mut PreparedGeneration,
-    input: &mut Vec<u32>,
-    generated: &mut Vec<u32>,
-    history: &mut Vec<u32>,
-    finish_reason: &mut &'static str,
-) -> std::result::Result<Option<LlamaForwardTimings>, Box<Response>> {
-    if !prepared.is_eagle3() {
-        return Ok(None);
-    }
-    let already_initialized =
-        prepared
-            .speculative
-            .as_ref()
-            .is_some_and(|spec| match &spec.drafter {
-                PreparedSpeculativeDrafter::Eagle3(state) => state.is_initialized(),
-                PreparedSpeculativeDrafter::Standard(_) => false,
-            });
-    if already_initialized {
-        return Ok(None);
-    }
-    if !generated.is_empty() || history.as_slice() != prepared.token_ids.as_slice() {
-        return Err(Box::new(api_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "eagle3_bootstrap_state_invalid",
-            "EAGLE-3 bootstrap requires untouched prompt history".to_string(),
-            None,
-        )));
-    }
-    let weights = Arc::clone(&prepared.session.weights);
-    let prompt_tokens = prepared.token_ids.clone();
-    let max_tokens = prepared.max_tokens as usize;
-    let bootstrap = {
-        let (session, speculative) = (&mut prepared.session, &mut prepared.speculative);
-        let spec = speculative
-            .as_mut()
-            .expect("EAGLE-3 speculative state checked above");
-        let PreparedSpeculativeDrafter::Eagle3(state) = &mut spec.drafter else {
-            unreachable!("EAGLE-3 variant changed during bootstrap")
-        };
-        state
-            .bootstrap(session, &weights, &prompt_tokens, max_tokens)
-            .map_err(|error| {
-                Box::new(api_error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "eagle3_bootstrap_failed",
-                    error.to_string(),
-                    None,
-                ))
-            })?
-    };
-    commit_target_tokens(
-        prepared,
-        &[bootstrap.first_token],
-        generated,
-        history,
-        finish_reason,
-    )?;
-    input.clear();
-    if *finish_reason == "length" {
-        input.push(bootstrap.first_token);
-    }
-    Ok(Some(bootstrap.timings))
-}
-
 /// One lossless speculative round: draft, verify in a single batched target
 /// forward, commit the accepted prefix.
 ///
@@ -17632,81 +20339,9 @@ fn run_speculative_round(
     if !eligible || input.len() != 1 {
         return Ok(SpeculativeRound::Declined);
     }
-    let Some(is_eagle3) = prepared
-        .speculative
-        .as_ref()
-        .map(PreparedSpeculative::is_eagle3)
-    else {
+    let Some(spec) = prepared.speculative.as_mut() else {
         return Ok(SpeculativeRound::Declined);
     };
-    if is_eagle3 {
-        let remaining = (prepared.max_tokens as usize).saturating_sub(generated.len());
-        let weights = Arc::clone(&prepared.session.weights);
-        let round = {
-            let (session, speculative) = (&mut prepared.session, &mut prepared.speculative);
-            let spec = speculative.as_mut().expect("EAGLE-3 spec checked above");
-            let PreparedSpeculativeDrafter::Eagle3(state) = &mut spec.drafter else {
-                unreachable!("EAGLE-3 variant changed inside one round")
-            };
-            state
-                .run_round(session, &weights, history, remaining)
-                .map_err(|err| {
-                    Box::new(api_error(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "eagle3_round_failed",
-                        err.to_string(),
-                        None,
-                    ))
-                })?
-        }
-        .ok_or_else(|| {
-            Box::new(api_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "eagle3_context_exhausted",
-                "EAGLE-3 target context was exhausted before the requested output completed"
-                    .to_string(),
-                None,
-            ))
-        })?;
-        forward_timings.add_assign(&round.timings);
-        {
-            let spec = prepared
-                .speculative
-                .as_mut()
-                .expect("EAGLE-3 spec remains installed");
-            let evidence = round.suffix_evidence;
-            if evidence.raw_depth > 0 {
-                spec.suffix_candidate_rounds += 1;
-                spec.suffix_raw_depth_sum += evidence.raw_depth as u64;
-                spec.suffix_confident_depth_sum += evidence.confident_depth as u64;
-                spec.suffix_root_match_len_sum += evidence.root_match_len as u64;
-                spec.suffix_root_support_sum += evidence.root_support as u64;
-                spec.suffix_root_branch_count_sum += evidence.root_branch_count as u64;
-                spec.suffix_expected_accepted_q16_sum += evidence.expected_accepted_q16 as u64;
-                spec.suffix_terminal_survival_q16_sum += evidence.terminal_survival_q16 as u64;
-                if !evidence.admitted {
-                    spec.suffix_confidence_declines += 1;
-                }
-            }
-            if round.offered > 0 {
-                spec.rounds += 1;
-                spec.drafted += round.offered as u64;
-                spec.accepted_drafts += round.emitted.len().saturating_sub(1) as u64;
-                spec.verify_nodes += round.verify_nodes as u64;
-                if round.suffix {
-                    spec.suffix_rounds += 1;
-                } else {
-                    spec.learned_rounds += 1;
-                }
-            }
-        }
-        commit_target_tokens(prepared, &round.emitted, generated, history, finish_reason)?;
-        return Ok(SpeculativeRound::Committed);
-    }
-    let spec = prepared
-        .speculative
-        .as_mut()
-        .expect("standard speculative state checked above");
     if !spec.latch.should_speculate() {
         spec.latch.note_skip();
         return Ok(SpeculativeRound::Declined);
@@ -17718,10 +20353,7 @@ fn run_speculative_round(
             .draft_tokens
             .min(remaining.saturating_sub(1))
             .min(context_room.saturating_sub(1));
-        let PreparedSpeculativeDrafter::Standard(drafter) = &mut spec.drafter else {
-            unreachable!("EAGLE-3 handled above")
-        };
-        drafter
+        spec.drafter
             .draft(history.as_slice(), draft_budget)
             .map_err(|err| {
                 Box::new(api_error(
@@ -17768,7 +20400,6 @@ fn run_speculative_round(
         spec.rounds += 1;
         spec.drafted += drafts.len() as u64;
         spec.accepted_drafts += accepted_count;
-        spec.verify_nodes += (drafts.len() + 1) as u64;
         spec.latch.note_verified(accepted_count as u32);
         acc
     } else {
@@ -17845,7 +20476,6 @@ fn run_speculative_round(
         spec.rounds += 1;
         spec.drafted += drafts.len() as u64;
         spec.accepted_drafts += accepted as u64;
-        spec.verify_nodes += (drafts.len() + 1) as u64;
         spec.latch.note_verified(accepted as u32);
         forward_timings.add_assign(&round_timings);
         round_emitted
@@ -17853,7 +20483,32 @@ fn run_speculative_round(
     // A stop reason inside the accepted run truncates it: the tokens after the
     // stop are verified but never emitted, exactly as a sequential run would
     // have stopped there.
-    commit_target_tokens(prepared, &emitted, generated, history, finish_reason)?;
+    for &token in &emitted {
+        generated.push(token);
+        history.push(token);
+        prepared.engine_progress.record_progress(generated.len());
+        if prepared.tokenizer.special.eog.contains(&token) {
+            *finish_reason = "stop";
+            break;
+        }
+        if !prepared.stop_sequences.is_empty() {
+            let text = prepared
+                .tokenizer
+                .decode(generated.as_slice(), true)
+                .map_err(|err| {
+                    Box::new(api_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "token_decode_failed",
+                        err.to_string(),
+                        None,
+                    ))
+                })?;
+            if contains_stop_sequence(&text, &prepared.stop_sequences) {
+                *finish_reason = "stop";
+                break;
+            }
+        }
+    }
     Ok(SpeculativeRound::Committed)
 }
 
@@ -17863,6 +20518,7 @@ async fn prepare_generation(
 ) -> std::result::Result<PreparedGeneration, Response> {
     let requested_max_tokens = req.max_tokens;
     let context_budget_tokens = req.camelid_context_budget_tokens;
+    let expected_gguf_sha256 = req.camelid_expected_gguf_sha256.clone();
     let request_tools = req.tools.clone();
     validate_unsupported_generation_fields(&req).map_err(|response| *response)?;
     validate_choice_and_logprob_fields(&req).map_err(|response| *response)?;
@@ -17912,15 +20568,17 @@ async fn prepare_generation(
         Ok(m) => m,
         Err(res) => return Err(res),
     };
+    verify_loaded_artifact_binding(&model, expected_gguf_sha256.as_deref())?;
     // Fail closed for runnable-served archs at the dense chokepoint. Every
     // raw completions-style surface funnels through here (`/completion`,
-    // `/v1/completions` and its n>1 fan-out, `/api/generation/preflight`,
-    // `/api/generation/sessions`, receipt replay), and no engine this function
-    // can reach runs those archs correctly — falling through would produce
+    // `/v1/completions` and its n>1 fan-out, the raw-prompt form of
+    // `/api/generation/preflight`, `/api/generation/sessions`, receipt replay),
+    // and no engine this function can reach runs those archs correctly — falling through would produce
     // fluent-looking garbage (qwen35/gemma2) or a windowed-arch H4 error
     // (gemma3 on a fallback host), not a useful completion. Chat requests for
     // runnable-served archs never reach this: the runnable short-circuit in
-    // `chat_completions` serves them or returns a typed 503 first. gemma3 on a
+    // `chat_completions` (and its count-only preflight counterpart) serves them
+    // or returns a typed 503 first. gemma3 on a
     // resident-capable host is NOT runnable-served (capability-aware Phase 3b
     // predicate): its chat AND raw completions flow through here onto the
     // dense/resident lane deliberately.
@@ -17966,6 +20624,11 @@ async fn prepare_generation(
             Some("model"),
         )
     })?;
+    // A cold speculative-draft load temporarily releases the request's outer
+    // transition binding. Re-verify the post-transition clone, not just its id
+    // and path: a same-id replacement at the same pathname must not cross an
+    // exact-artifact agent boundary.
+    verify_loaded_artifact_binding(&model, expected_gguf_sha256.as_deref())?;
 
     let mut timings = GenerationTimings::default();
     let tokenization_started = Instant::now();
@@ -18101,7 +20764,7 @@ async fn prepare_generation(
         ));
     }
     if token_ids.len() > state.server_limits.max_prompt_tokens {
-        return Err(api_error(
+        return Err(api_error_with_prompt_token_count(
             StatusCode::PAYLOAD_TOO_LARGE,
             "prompt_token_limit_exceeded",
             format!(
@@ -18110,6 +20773,7 @@ async fn prepare_generation(
                 state.server_limits.max_prompt_tokens
             ),
             Some("prompt"),
+            Some(token_ids.len()),
         ));
     }
 
@@ -18168,25 +20832,6 @@ async fn prepare_generation(
             .default_max_tokens_cap
             .map(|cap| cap.min(available_max_tokens))
             .unwrap_or(available_max_tokens),
-    };
-    // EAGLE-3 has a deliberately narrower verified logical envelope than the
-    // target GGUF's native context metadata. Apply the same API contract as the
-    // generic context clamp above: max_tokens is an upper bound, so shorten it
-    // to the exact room left after authoritative tokenization. Prompts that
-    // already fill the EAGLE envelope still fail closed.
-    let max_tokens = if speculative_mode == Some(SpecDecodeMode::Eagle3) {
-        clamp_eagle3_max_tokens(token_ids.len(), max_tokens as usize)
-            .map(|value| value as u32)
-            .map_err(|error| {
-                api_error(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    "eagle3_context_limit_exceeded",
-                    error.to_string(),
-                    Some("prompt"),
-                )
-            })?
-    } else {
-        max_tokens
     };
     // Enforce the operator's ceiling against the effective generation budget,
     // after preserving the existing API contract that max_tokens is clamped to
@@ -18343,25 +20988,6 @@ async fn prepare_generation(
     // `speculation_admissible` for the remaining disqualifiers.
     let speculative = match speculative_mode {
         None => None,
-        Some(SpecDecodeMode::Eagle3)
-            if !speculation_admissible(
-                &sampling,
-                collect_dense_diagnostics,
-                !logit_diagnostic_token_ids.is_empty(),
-                session.weights.layer_range.is_some(),
-                &session.config,
-            ) || matches!(req.chat_logprobs, Some(true))
-                || req.completion_logprobs.is_some()
-                || req.constraint.is_some() =>
-        {
-            return Err(api_error(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "eagle3_request_unsupported",
-                "CAMELID_SPEC_DECODE=eagle3 requires unconstrained greedy generation with no logprobs, dense/logit diagnostics, or pipeline sharding"
-                    .to_string(),
-                None,
-            ));
-        }
         Some(_)
             if !speculation_admissible(
                 &sampling,
@@ -18374,206 +21000,47 @@ async fn prepare_generation(
             None
         }
         Some(SpecDecodeMode::Suffix) => Some(PreparedSpeculative {
-            drafter: PreparedSpeculativeDrafter::Standard(SpeculativeDrafter::Suffix(Box::new(
-                crate::inference::suffix_decoding::SuffixDecodingDrafter::default(),
-            ))),
+            drafter: SpeculativeDrafter::Suffix(Box::default()),
             draft_tokens: spec_draft_tokens_from_env(DEFAULT_NGRAM_DRAFT_TOKENS),
             latch: SpecLatch::default(),
             rounds: 0,
             drafted: 0,
             accepted_drafts: 0,
-            verify_nodes: 0,
-            suffix_rounds: 0,
-            learned_rounds: 0,
-            suffix_candidate_rounds: 0,
-            suffix_confidence_declines: 0,
-            suffix_raw_depth_sum: 0,
-            suffix_confident_depth_sum: 0,
-            suffix_root_match_len_sum: 0,
-            suffix_root_support_sum: 0,
-            suffix_root_branch_count_sum: 0,
-            suffix_expected_accepted_q16_sum: 0,
-            suffix_terminal_survival_q16_sum: 0,
         }),
         Some(SpecDecodeMode::NGram) => Some(PreparedSpeculative {
-            drafter: PreparedSpeculativeDrafter::Standard(SpeculativeDrafter::NGram(
-                NGramDrafter::new(spec_ngram_min_from_env(), spec_ngram_max_from_env()),
+            drafter: SpeculativeDrafter::NGram(NGramDrafter::new(
+                spec_ngram_min_from_env(),
+                spec_ngram_max_from_env(),
             )),
             draft_tokens: spec_draft_tokens_from_env(DEFAULT_NGRAM_DRAFT_TOKENS),
             latch: SpecLatch::default(),
             rounds: 0,
             drafted: 0,
             accepted_drafts: 0,
-            verify_nodes: 0,
-            suffix_rounds: 0,
-            learned_rounds: 0,
-            suffix_candidate_rounds: 0,
-            suffix_confidence_declines: 0,
-            suffix_raw_depth_sum: 0,
-            suffix_confident_depth_sum: 0,
-            suffix_root_match_len_sum: 0,
-            suffix_root_support_sum: 0,
-            suffix_root_branch_count_sum: 0,
-            suffix_expected_accepted_q16_sum: 0,
-            suffix_terminal_survival_q16_sum: 0,
         }),
         Some(SpecDecodeMode::DraftModel) => Some(PreparedSpeculative {
-            drafter: PreparedSpeculativeDrafter::Standard(
-                build_model_drafter(state, &model, &tokenizer).await?,
-            ),
+            drafter: build_model_drafter(state, &model, &tokenizer).await?,
             draft_tokens: spec_draft_tokens_from_env(DEFAULT_MODEL_DRAFT_TOKENS),
             latch: SpecLatch::default(),
             rounds: 0,
             drafted: 0,
             accepted_drafts: 0,
-            verify_nodes: 0,
-            suffix_rounds: 0,
-            learned_rounds: 0,
-            suffix_candidate_rounds: 0,
-            suffix_confidence_declines: 0,
-            suffix_raw_depth_sum: 0,
-            suffix_confident_depth_sum: 0,
-            suffix_root_match_len_sum: 0,
-            suffix_root_support_sum: 0,
-            suffix_root_branch_count_sum: 0,
-            suffix_expected_accepted_q16_sum: 0,
-            suffix_terminal_survival_q16_sum: 0,
         }),
-        Some(SpecDecodeMode::Eagle3) => {
-            validate_eagle3_logical_budget(token_ids.len(), max_tokens as usize).map_err(
-                |error| {
-                    api_error(
-                        StatusCode::PAYLOAD_TOO_LARGE,
-                        "eagle3_context_limit_exceeded",
-                        error.to_string(),
-                        Some("max_tokens"),
-                    )
-                },
-            )?;
-            if token_ids.len() < 3 {
-                return Err(api_error(
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    "eagle3_prompt_too_short",
-                    format!(
-                        "EAGLE-3 resident activation capture needs at least 3 prompt tokens, got {}",
-                        token_ids.len()
-                    ),
-                    Some("prompt"),
-                ));
-            }
-            if let Some(message) = eagle3_target_contract_error(config, &model.lane.gguf_sha256) {
-                return Err(api_error(
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    "eagle3_target_mismatch",
-                    message,
-                    Some("model"),
-                ));
-            }
-            let draft_tokens = eagle3_draft_tokens_from_env().map_err(|message| {
-                api_error(
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    "eagle3_invalid_width",
-                    message,
-                    None,
-                )
-            })?;
-            let config = Eagle3ServingConfig::new(draft_tokens).map_err(|error| {
-                api_error(
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    "eagle3_invalid_width",
-                    error.to_string(),
-                    None,
-                )
-            })?;
-            let sidecar_path = env::var_os(EAGLE3_MODEL_ENV)
-                .map(PathBuf::from)
-                .ok_or_else(|| {
-                    api_error(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "eagle3_model_missing",
-                        format!(
-                            "CAMELID_SPEC_DECODE=eagle3 requires {EAGLE3_MODEL_ENV} to point at a pinned EAGLE-3 checkpoint directory"
-                        ),
-                        None,
-                    )
-                })?;
-            let checkpoint_path = sidecar_path.clone();
-            let (checkpoint, checkpoint_sha256) =
-                tokio::task::spawn_blocking(move || load_eagle3_checkpoint_cached(&sidecar_path))
-                    .await
-                    .map_err(|error| {
-                        api_error(
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            "eagle3_model_load_failed",
-                            format!("EAGLE-3 checkpoint loader task failed: {error}"),
-                            None,
-                        )
-                    })?
-                    .map_err(|error| {
-                        api_error(
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            "eagle3_model_load_failed",
-                            error.to_string(),
-                            None,
-                        )
-                    })?;
-            // The uploaded draft wire is request-independent: the serving state
-            // checks it out of the serve-wide single-slot pool at bootstrap
-            // (keyed by head, target, wire gates and envelope) instead of
-            // re-uploading ~486 MB (~1.2 s) on every request.
-            let head_key = Eagle3ServeHeadKey::current(
-                &checkpoint_path,
-                &checkpoint_sha256,
-                &model.lane.gguf_sha256,
-            )
-            .map_err(|error| {
-                api_error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "eagle3_model_load_failed",
-                    error.to_string(),
-                    None,
-                )
-            })?;
-            Some(PreparedSpeculative {
-                drafter: PreparedSpeculativeDrafter::Eagle3(Box::new(
-                    Eagle3ServingState::new(checkpoint, config).with_pooled_head(head_key),
-                )),
-                draft_tokens,
-                // EAGLE's hybrid scheduler is itself the measured admission
-                // policy; the generic acceptance latch would disable learned
-                // fallback on exactly the arbitrary prompts it is for.
-                latch: SpecLatch::default(),
-                rounds: 0,
-                drafted: 0,
-                accepted_drafts: 0,
-                verify_nodes: 0,
-                suffix_rounds: 0,
-                learned_rounds: 0,
-                suffix_candidate_rounds: 0,
-                suffix_confidence_declines: 0,
-                suffix_raw_depth_sum: 0,
-                suffix_confident_depth_sum: 0,
-                suffix_root_match_len_sum: 0,
-                suffix_root_support_sum: 0,
-                suffix_root_branch_count_sum: 0,
-                suffix_expected_accepted_q16_sum: 0,
-                suffix_terminal_survival_q16_sum: 0,
-            })
-        }
     };
-    let eagle3_active = speculative
-        .as_ref()
-        .is_some_and(PreparedSpeculative::is_eagle3);
     // CPU speculation needs CPU-authoritative KV for chunk-verify rollback. The GPU verifier
     // currently returns greedy token IDs rather than full target distributions, so stochastic
-    // speculation also uses the CPU verify path even when CAMELID_SPEC_GPU is enabled. EAGLE-3
-    // is a Metal-only lane and must keep resident target KV enabled regardless of that generic
-    // toggle.
+    // speculation also uses the CPU verify path even when CAMELID_SPEC_GPU is enabled.
     session.set_resident_paths_disabled(
-        speculative.is_some()
-            && !eagle3_active
-            && (!spec_gpu_enabled() || sampling != SamplingConfig::default()),
+        speculative.is_some() && (!spec_gpu_enabled() || sampling != SamplingConfig::default()),
     );
+    // A CUDA-resident prefill can skip the eager GPU->host KV mirror only for a request
+    // that cannot reach `rollback_to_position`. Speculation is the caller that reaches it
+    // (`run_speculative_round` rolls back to the accepted prefix after every round), and a
+    // rollback taken with drafts written past `position` is exactly the case the lazy
+    // recovery declines. So the mirror stays eager whenever this request may speculate,
+    // and only a non-speculating request opts into lazy. The session defaults to eager, so
+    // any path that never reaches this line keeps the historical behaviour.
+    session.set_cpu_kv_mirror_eager(speculative.is_some());
 
     let telemetry_backend = {
         let plans = state.execution_plans.read().await;
@@ -19735,6 +22202,24 @@ fn store_prompt_prefix_cache(prepared: &mut PreparedGeneration, step: &LlamaGene
 /// A malformed/stale cache entry must never make generation fail: when
 /// rollback cannot establish the requested prefix position the caller retains
 /// the fresh session and performs a cold prefill.
+/// `1` restores the unconditional partial resume this function used to do, so the
+/// regression it now avoids can be measured against the SAME binary. Not a tuning knob:
+/// the only reason to set it is to reproduce the A/B in
+/// `qa/evidence-bundles/metal-partial-prefix-hit-*`.
+fn partial_resume_forced() -> bool {
+    partial_resume_forced_from(
+        std::env::var("CAMELID_METAL_PREFIX_PARTIAL_RESUME")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// The env half of [`partial_resume_forced`], split out so the DEFAULT is covered by a
+/// test rather than by whatever the ambient environment happens to hold.
+fn partial_resume_forced_from(value: Option<&str>) -> bool {
+    matches!(value, Some(v) if v == "1" || v.eq_ignore_ascii_case("true"))
+}
+
 fn resume_partial_prefix_hit(
     prepared: &mut PreparedGeneration,
     mut cached_session: LlamaInferenceSession,
@@ -19742,6 +22227,24 @@ fn resume_partial_prefix_hit(
     input: &mut Vec<u32>,
 ) {
     if crate::model::arch_has_windowed_attention(&prepared.session.config) {
+        return;
+    }
+    // A partial hit is only worth taking if the divergent suffix can still be prefilled
+    // on the GPU. It cannot: resuming sets `kv_position = prefix_len > 0`, and the
+    // batched Metal prefill declines outright on a non-zero position, dropping the
+    // suffix onto the CPU dense forward. Measured on an M4 / 16 GiB,
+    // Llama-3.2-3B-Instruct-Q4_K_M, ~500-token prompt: cold miss 1.33 s, partial hit
+    // 20.79 s. Taking the hit was a 15.6x LOSS on exactly the shape it was built for —
+    // turn 2 of a conversation with a system prompt.
+    //
+    // Declining leaves `prepared.session` as the fresh session, so the caller prefills
+    // the whole prompt on the GPU from position 0: faster, and the bit-exact reference
+    // path. Exact hits never reach here (they replay stored logits and skip prefill).
+    if !partial_resume_forced()
+        && prepared
+            .session
+            .metal_resident_prefill_would_apply(prepared.token_ids.len())
+    {
         return;
     }
     if cached_session.rollback_to_position(prefix_len).is_ok() {
@@ -19882,41 +22385,11 @@ fn log_speculative_summary(prepared: &PreparedGeneration, generated: usize) {
     } else {
         spec.accepted_drafts as f64 * 100.0 / spec.drafted as f64
     };
-    let (eagle3_head_reused, eagle3_early_exit_rounds, eagle3_tree) = match &spec.drafter {
-        PreparedSpeculativeDrafter::Eagle3(state) => (
-            state.head_reused(),
-            state.early_exit_rounds(),
-            Some(format!("{:?}", state.dynamic_tree())),
-        ),
-        PreparedSpeculativeDrafter::Standard(_) => (false, 0, None),
-    };
     tracing::info!(
         rounds = spec.rounds,
         drafted = spec.drafted,
         accepted_drafts = spec.accepted_drafts,
         acceptance_pct,
-        verify_nodes = spec.verify_nodes,
-        suffix_rounds = spec.suffix_rounds,
-        learned_rounds = spec.learned_rounds,
-        suffix_candidate_rounds = spec.suffix_candidate_rounds,
-        suffix_confidence_declines = spec.suffix_confidence_declines,
-        suffix_raw_depth_sum = spec.suffix_raw_depth_sum,
-        suffix_confident_depth_sum = spec.suffix_confident_depth_sum,
-        suffix_root_match_len_sum = spec.suffix_root_match_len_sum,
-        suffix_root_support_sum = spec.suffix_root_support_sum,
-        suffix_root_branch_count_sum = spec.suffix_root_branch_count_sum,
-        suffix_expected_accepted_q16_sum = spec.suffix_expected_accepted_q16_sum,
-        suffix_terminal_survival_q16_sum = spec.suffix_terminal_survival_q16_sum,
-        suffix_confidence_q16_scale = crate::inference::suffix_decoding::SUFFIX_CONFIDENCE_Q16_ONE,
-        suffix_min_prefix_survival_q16 =
-            crate::inference::suffix_decoding::SUFFIX_MIN_PREFIX_SURVIVAL_Q16,
-        suffix_min_expected_accepted_q16 =
-            crate::inference::suffix_decoding::SUFFIX_MIN_EXPECTED_ACCEPTED_Q16,
-        suffix_min_confident_depth = crate::inference::suffix_decoding::SUFFIX_MIN_CONFIDENT_DEPTH,
-        eagle3 = spec.is_eagle3(),
-        eagle3_head_reused,
-        eagle3_early_exit_rounds,
-        eagle3_tree,
         generated,
         "speculative decode summary"
     );
@@ -19975,21 +22448,7 @@ fn generate_token_ids(
     // and keeps the cache.
     let resident_cuda_active = crate::inference::resident_decode_cuda_active();
 
-    if let Some(bootstrap_timings) = bootstrap_eagle3_generation(
-        &mut prepared,
-        &mut input,
-        &mut generated,
-        &mut history,
-        &mut finish_reason,
-    )? {
-        forward_timings.add_assign(&bootstrap_timings);
-    }
-
-    if !prepared.is_eagle3()
-        && !prepared.collect_dense_diagnostics
-        && !want_execution_trace
-        && !resident_cuda_active
-    {
+    if !prepared.collect_dense_diagnostics && !want_execution_trace && !resident_cuda_active {
         if let Some(match_res) = lookup_prompt_prefix_cache(&prepared) {
             let mut cached_session = match_res.cached.session.clone();
             // The cached session's resident-path pin reflects the request
@@ -20083,7 +22542,7 @@ fn generate_token_ids(
             && !collect_step_top_logits
             && prepared.logprobs_top_n.is_none()
             && grammar.is_none()
-            && (prepared.is_eagle3() || !top_logits.is_empty());
+            && !top_logits.is_empty();
         let spec_round = run_speculative_round(
             &mut prepared,
             &sampler,
@@ -20629,16 +23088,26 @@ fn tool_choice_allows_calls(tool_choice: Option<&serde_json::Value>) -> bool {
 /// opted out of. The lanes' post-hoc `<function=...>` lifting is gated
 /// separately on `tool_choice_allows_calls` (not on this list being empty,
 /// because the agent loop lifts envelopes with no tools in the request).
-fn runnable_request_tools(req: &ChatCompletionRequest) -> Vec<serde_json::Value> {
-    if !tool_choice_allows_calls(req.tool_choice.as_ref()) {
+fn normalize_runnable_tools(
+    tools: Option<&[serde_json::Value]>,
+    calls_allowed: bool,
+) -> Vec<serde_json::Value> {
+    if !calls_allowed {
         return Vec::new();
     }
-    req.tools
-        .clone()
+    tools
         .unwrap_or_default()
-        .into_iter()
-        .map(|t| t.get("function").cloned().unwrap_or(t))
+        .iter()
+        .cloned()
+        .map(|tool| tool.get("function").cloned().unwrap_or(tool))
         .collect()
+}
+
+fn runnable_request_tools(req: &ChatCompletionRequest) -> Vec<serde_json::Value> {
+    normalize_runnable_tools(
+        req.tools.as_deref(),
+        tool_choice_allows_calls(req.tool_choice.as_ref()),
+    )
 }
 
 /// Whether the model's raw content should be probed for a tool call.
@@ -20662,7 +23131,14 @@ fn should_parse_tool_calls(tools_active: bool, constraint_active: bool) -> bool 
 /// The parser tolerates trailing junk after a complete JSON value but remains
 /// strict about function names and JSON arguments, so ordinary prose is never
 /// reclassified as a call.
-fn parse_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
+///
+/// `declared` carries the parameter names the request advertised, which is what
+/// authorises undoing a schema envelope the model echoed around its arguments;
+/// see [`tool_envelope`].
+fn parse_tool_calls(
+    text: &str,
+    declared: &tool_envelope::ToolParameterNames,
+) -> Option<Vec<ToolCall>> {
     let trimmed = text.trim();
     let trimmed = trimmed
         .strip_prefix("<|python_tag|>")
@@ -20698,7 +23174,7 @@ fn parse_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
         .collect::<Vec<_>>();
     let calls = values
         .iter()
-        .filter_map(tool_call_from_value)
+        .filter_map(|value| tool_call_from_value(value, declared))
         .collect::<Vec<_>>();
     (!calls.is_empty()).then_some(calls)
 }
@@ -20710,7 +23186,10 @@ fn first_json_value(text: &str) -> Option<serde_json::Value> {
         .ok()
 }
 
-fn tool_call_from_value(value: &serde_json::Value) -> Option<ToolCall> {
+fn tool_call_from_value(
+    value: &serde_json::Value,
+    declared: &tool_envelope::ToolParameterNames,
+) -> Option<ToolCall> {
     let obj = value.as_object()?;
     let function = obj.get("function").and_then(serde_json::Value::as_object);
     let name = function
@@ -20733,6 +23212,7 @@ fn tool_call_from_value(value: &serde_json::Value) -> Option<ToolCall> {
         }
         args => args,
     };
+    let args = tool_envelope::unwrap_schema_envelope(name, args, declared);
     let arguments = serde_json::to_string(&args).ok()?;
     Some(ToolCall {
         id: format!("call_{}", uuid::Uuid::new_v4().simple()),
@@ -21060,9 +23540,8 @@ fn stream_first_content_accounting_json(
 /// SSE layer needs to reproduce the pre-inversion byte stream (chunk shapes
 /// unchanged; only timing VALUES may differ).
 enum StreamDecodeEvent {
-    /// One committed token's non-empty text delta (already stop-sequence-
-    /// truncated and diffed against previously streamed text; a token whose
-    /// UTF-8 bytes are still pending produces none).
+    /// A non-empty text delta (already stop-sequence-truncated and diffed
+    /// against previously streamed text).
     Delta(String),
     /// Clean end of generation; terminal.
     Finished {
@@ -21157,17 +23636,7 @@ fn stream_prompt_cache_prologue(
         streamed_text,
         first_content_ms,
     } = state;
-    if let Err(response) =
-        bootstrap_eagle3_generation(prepared, input, generated, history, finish_reason)
-    {
-        let (code, message) = stream_error_parts(&response);
-        send(StreamDecodeEvent::Failed { code, message });
-        return StreamPrologue::Stop;
-    }
-    if !prepared.is_eagle3()
-        && !prepared.collect_dense_diagnostics
-        && !crate::inference::resident_decode_cuda_active()
-    {
+    if !prepared.collect_dense_diagnostics && !crate::inference::resident_decode_cuda_active() {
         if let Some(match_res) = lookup_prompt_prefix_cache(prepared) {
             let mut cached_session = match_res.cached.session.clone();
             cached_session
@@ -21217,7 +23686,7 @@ fn stream_prompt_cache_prologue(
     // with correct usage but no content delta. Longer cached streams also must
     // establish `streamed_text` before subsequent deltas are diffed.
     if !generated.is_empty() {
-        let mut text = match prepared.tokenizer.decode(generated, true) {
+        let text = match prepared.tokenizer.decode(generated, true) {
             Ok(text) => text,
             Err(err) => {
                 send(StreamDecodeEvent::Failed {
@@ -21227,9 +23696,10 @@ fn stream_prompt_cache_prologue(
                 return StreamPrologue::Stop;
             }
         };
-        if *finish_reason == "stop" {
-            text = truncate_at_stop_sequence(text, &prepared.stop_sequences);
-        }
+        // A cached prefix must seed `streamed_text` with the SAME stop-safe bound the
+        // loop below uses, or the first post-prologue step diffs against an
+        // untruncated seed and reproduces the duplication this bound prevents.
+        let text = stop_visible_text(text, &prepared.stop_sequences, *finish_reason == "stop");
         if !text.is_empty() {
             *streamed_text = text.clone();
             *first_content_ms = Some(generation_started.elapsed().as_millis());
@@ -21333,6 +23803,19 @@ fn run_stream_decode_job(
             .checked_sub(generation_started.elapsed())
             .is_none()
         {
+            // The run is over: nothing further can complete a stop sequence, so
+            // release whatever the hold-back is still sitting on before the client
+            // sees the timeout frame.
+            let pending = stop_hold_back_flush(
+                &prepared.tokenizer,
+                &generated,
+                &streamed_text,
+                &prepared.stop_sequences,
+            );
+            if !pending.is_empty() {
+                streamed_text.push_str(&pending);
+                send(StreamDecodeEvent::Delta(pending));
+            }
             send(StreamDecodeEvent::TimedOut {
                 timeout: request_timeout,
                 elapsed: generation_started.elapsed(),
@@ -21341,12 +23824,12 @@ fn run_stream_decode_job(
             return;
         }
         // Speculation first. A committed round appends its whole accepted run to
-        // `generated`; `stream_step_deltas` below then streams that run as one
-        // delta per committed token.
+        // `generated`; the delta below is a text diff of the entire decoded
+        // output, so the client simply receives one larger delta.
         let spec_eligible = !collect_dense_for_step
             && prepared.logprobs_top_n.is_none()
             && prepared.constraint.is_none()
-            && (prepared.is_eagle3() || !top_logits.is_empty());
+            && !top_logits.is_empty();
         let spec_round = match run_speculative_round(
             &mut prepared,
             &sampler,
@@ -21417,16 +23900,8 @@ fn run_stream_decode_job(
             }
         }
 
-        let tokenizer = Arc::clone(&prepared.tokenizer);
-        let deltas = match stream_step_deltas(
-            |ids| tokenizer.decode(ids, true),
-            &generated,
-            generated_index,
-            finish_reason == "stop",
-            &prepared.stop_sequences,
-            &mut streamed_text,
-        ) {
-            Ok(deltas) => deltas,
+        let text = match prepared.tokenizer.decode(&generated, true) {
+            Ok(text) => text,
             Err(err) => {
                 send(StreamDecodeEvent::Failed {
                     code: "token_decode_failed".to_string(),
@@ -21435,9 +23910,13 @@ fn run_stream_decode_job(
                 return;
             }
         };
-        // One event per committed token, sent back to back so a speculative
-        // round still leaves the engine in a single burst.
-        for delta in deltas {
+        // Whether the loop below will terminate on this step. Computed BEFORE the
+        // emit so the final step can release the hold-back in the same delta.
+        let is_final = finish_reason != "length" || generated.len() >= prepared.max_tokens as usize;
+        let text = stop_visible_text(text, &prepared.stop_sequences, is_final);
+        let delta = stream_delta(&text, &streamed_text, &prepared.stop_sequences);
+        streamed_text = text;
+        if !delta.is_empty() {
             if first_content_ms.is_none() {
                 first_content_ms = Some(generation_started.elapsed().as_millis());
             }
@@ -21631,6 +24110,19 @@ impl CooperativeStreamDecodeJob {
         if self.finished {
             return engine::StepOutcome::Complete;
         }
+        // Every clean termination funnels through here, including the re-entry path
+        // at the top of `step` that never re-decodes. Release any held tail before
+        // the Finished event; a no-op when the emit above already released it.
+        let pending = stop_hold_back_flush(
+            &self.prepared.tokenizer,
+            &self.generated,
+            &self.streamed_text,
+            &self.prepared.stop_sequences,
+        );
+        if !pending.is_empty() {
+            self.streamed_text.push_str(&pending);
+            self.send(StreamDecodeEvent::Delta(pending));
+        }
         log_speculative_summary(&self.prepared, self.generated.len());
         self.prepared.timings.generate = self.generation_started.elapsed().as_millis();
         self.prepared.timings.generation =
@@ -21696,10 +24188,9 @@ impl CooperativeStreamDecodeJob {
         // Preserve the fast single-request pipeline when this is the only active stream.
         // With contention, consume any already-prepared current graph but do not enqueue
         // another session-local future graph ahead of the next round-robin participant.
-        let encode_ahead = context.active_slots <= 1 && !self.prepared.is_eagle3();
         self.prepared
             .session
-            .set_resident_encode_ahead_enabled(encode_ahead);
+            .set_resident_encode_ahead_enabled(context.active_slots <= 1);
         if let Some(guard) = &self.telemetry_guard {
             guard.activate();
         }
@@ -21717,6 +24208,18 @@ impl CooperativeStreamDecodeJob {
             .checked_sub(self.generation_started.elapsed())
             .is_none()
         {
+            // Same reasoning as the exclusive job: release the hold-back before the
+            // client sees the timeout frame, or those bytes are lost.
+            let pending = stop_hold_back_flush(
+                &self.prepared.tokenizer,
+                &self.generated,
+                &self.streamed_text,
+                &self.prepared.stop_sequences,
+            );
+            if !pending.is_empty() {
+                self.streamed_text.push_str(&pending);
+                self.send(StreamDecodeEvent::Delta(pending));
+            }
             self.send(StreamDecodeEvent::TimedOut {
                 timeout: self.request_timeout,
                 elapsed: self.generation_started.elapsed(),
@@ -21739,12 +24242,12 @@ impl CooperativeStreamDecodeJob {
             LlamaSampler::Sampling(sampling)
         };
         // Speculation first. A committed round appends its whole accepted run to
-        // `generated`; `stream_step_deltas` below then streams that run as one
-        // delta per committed token.
+        // `generated`; the delta below is a text diff of the entire decoded
+        // output, so the client simply receives one larger delta.
         let spec_eligible = !collect_dense_for_step
             && self.prepared.logprobs_top_n.is_none()
             && self.prepared.constraint.is_none()
-            && (self.prepared.is_eagle3() || !self.top_logits.is_empty());
+            && !self.top_logits.is_empty();
         let spec_round = match run_speculative_round(
             &mut self.prepared,
             &sampler,
@@ -21807,16 +24310,8 @@ impl CooperativeStreamDecodeJob {
                 .record_progress(self.generated.len());
         }
 
-        let tokenizer = Arc::clone(&self.prepared.tokenizer);
-        let deltas = match stream_step_deltas(
-            |ids| tokenizer.decode(ids, true),
-            &self.generated,
-            generated_index,
-            self.finish_reason == "stop",
-            &self.prepared.stop_sequences,
-            &mut self.streamed_text,
-        ) {
-            Ok(deltas) => deltas,
+        let text = match self.prepared.tokenizer.decode(&self.generated, true) {
+            Ok(text) => text,
             Err(err) => {
                 self.send(StreamDecodeEvent::Failed {
                     code: "token_decode_failed".to_string(),
@@ -21826,9 +24321,14 @@ impl CooperativeStreamDecodeJob {
                 return engine::StepOutcome::Complete;
             }
         };
-        // One event per committed token, sent back to back so a speculative
-        // round still leaves the engine in a single burst.
-        for delta in deltas {
+        // Whether this step terminates the job (same condition as the tail below).
+        // Computed BEFORE the emit so the final step releases the hold-back here.
+        let is_final = self.finish_reason != "length"
+            || self.generated.len() >= self.prepared.max_tokens as usize;
+        let text = stop_visible_text(text, &self.prepared.stop_sequences, is_final);
+        let delta = stream_delta(&text, &self.streamed_text, &self.prepared.stop_sequences);
+        self.streamed_text = text;
+        if !delta.is_empty() {
             if self.first_content_ms.is_none() {
                 self.first_content_ms = Some(self.generation_started.elapsed().as_millis());
             }
@@ -21874,14 +24374,14 @@ fn stream_completion(
     mut prepared: PreparedGeneration,
     chat: bool,
     include_usage: bool,
-    parse_stream_tool_calls: bool,
+    stream_tool_calls: Option<tool_envelope::ToolParameterNames>,
 ) -> Response {
     // Streaming keeps whatever speculation `prepare_generation` admitted, and
     // with it that call's resident-path decision. Forcing both off here meant a
     // spec-enabled server never speculated for streaming clients — i.e. never
     // for the agent traffic the lane exists to speed up. Both streaming jobs
-    // stream an accepted run through `stream_step_deltas`, one delta per
-    // committed token, so clients counting events see real tokens.
+    // emit an accepted run through the same text-delta path a single token
+    // takes, so a committed round streams as one delta.
     //
     // `CAMELID_SPEC_STREAM=0` is the narrow rollback lever: it restores the
     // previous streaming-only behaviour by dropping the drafter AND un-pinning
@@ -21979,7 +24479,7 @@ fn stream_completion(
                             Some(stream_started.elapsed().as_millis());
                     }
                     if chat {
-                        if parse_stream_tool_calls {
+                        if stream_tool_calls.is_some() {
                             tool_candidate.push_str(&delta);
                             continue;
                         }
@@ -22042,8 +24542,8 @@ fn stream_completion(
                     });
                     if chat {
                         let mut resolved_finish_reason = finish_reason;
-                        if parse_stream_tool_calls {
-                            if let Some(tool_calls) = parse_tool_calls(&tool_candidate) {
+                        if let Some(declared) = stream_tool_calls.as_ref() {
+                            if let Some(tool_calls) = parse_tool_calls(&tool_candidate, declared) {
                                 resolved_finish_reason = "tool_calls";
                                 let tool_calls = tool_calls
                                     .into_iter()
@@ -22192,81 +24692,6 @@ fn sse_json_event<T: Serialize>(value: &T) -> Result<Event, Infallible> {
     ))
 }
 
-/// Per-token SSE deltas for one streaming decode step.
-///
-/// A speculative round commits `generated[committed_before..]` in one step.
-/// Streaming used to diff the whole decoded output once per step, so a round
-/// of ~3.5 accepted tokens reached the client as ONE `delta.content` event;
-/// clients that count events as tokens (this UI's live tok/s counter, most
-/// OpenAI-style clients) then read ~25 tok/s while the receipt said ~97. This
-/// walks the step token by token: each prefix `generated[..k]` is decoded with
-/// the same whole-output decoder the single-token path uses, and each token's
-/// increment over the text streamed so far becomes its own delta, in order. A
-/// token whose UTF-8 bytes are still pending yields no text of its own (the
-/// tokenizer's `flush_bytes` holds an incomplete tail back; a lossy decoder
-/// would end in U+FFFD) and is skipped, so its bytes ride with the token that
-/// completes them.
-///
-/// Byte-exactness is enforced, not assumed: the returned deltas must
-/// concatenate to exactly the single delta the whole-step diff produces, and on
-/// any mismatch that single delta is returned instead. A single-token step is
-/// therefore unchanged, and `streamed_text` always ends up equal to the step's
-/// full (stop-truncated) text.
-fn stream_step_deltas<E>(
-    decode: impl Fn(&[u32]) -> std::result::Result<String, E>,
-    generated: &[u32],
-    committed_before: usize,
-    stop_reached: bool,
-    stop_sequences: &[String],
-    streamed_text: &mut String,
-) -> std::result::Result<Vec<String>, E> {
-    let mut step_text = decode(generated)?;
-    if stop_reached {
-        step_text = truncate_at_stop_sequence(step_text, stop_sequences);
-    }
-    // The whole-step delta: what a single-token step streams, and the exact
-    // text any per-token split below must add up to.
-    let step_delta = step_text
-        .strip_prefix(streamed_text.as_str())
-        .map(str::to_owned)
-        .unwrap_or_else(|| step_text.clone());
-
-    let first_new = committed_before.min(generated.len());
-    let mut deltas = Vec::new();
-    if generated.len() > first_new + 1 {
-        let mut streamed = streamed_text.clone();
-        for prefix_len in first_new + 1..generated.len() {
-            let prefix_text = decode(&generated[..prefix_len])?;
-            if prefix_text.ends_with('\u{FFFD}') {
-                continue;
-            }
-            let increment = prefix_text
-                .strip_prefix(streamed.as_str())
-                .filter(|increment| !increment.is_empty())
-                .map(str::to_owned);
-            if let Some(increment) = increment {
-                deltas.push(increment);
-                streamed = prefix_text;
-            }
-        }
-        match step_text.strip_prefix(streamed.as_str()) {
-            Some(increment) if !increment.is_empty() => deltas.push(increment.to_owned()),
-            Some(_) => {}
-            None => deltas.push(step_text.clone()),
-        }
-        if deltas.concat() != step_delta {
-            deltas.clear();
-            if !step_delta.is_empty() {
-                deltas.push(step_delta);
-            }
-        }
-    } else if !step_delta.is_empty() {
-        deltas.push(step_delta);
-    }
-    *streamed_text = step_text;
-    Ok(deltas)
-}
-
 fn contains_stop_sequence(text: &str, stop_sequences: &[String]) -> bool {
     stop_sequences
         .iter()
@@ -22281,6 +24706,109 @@ fn truncate_at_stop_sequence(mut text: String, stop_sequences: &[String]) -> Str
     {
         text.truncate(stop_index);
     }
+    text
+}
+
+/// Longest prefix of `text` that is safe to STREAM given `stop_sequences`.
+///
+/// A delta cannot be un-sent, so the SSE lane may only emit bytes the completed answer
+/// is guaranteed to keep. Two things make a byte unsafe: it sits at or after a COMPLETE
+/// stop match (`truncate_at_stop_sequence` cuts the final text there), or it belongs to
+/// a trailing run that is a non-empty PROPER prefix of some stop sequence — the next
+/// token may complete that sequence, retroactively putting the run inside the cut.
+///
+/// The answer is the SMALLER of the two limits. Taking the min rather than returning at
+/// the first complete match is what makes this value non-decreasing as `text` grows by
+/// appending, which the emitter depends on: with overlapping sequences
+/// (`stop = ["B", "ABC"]`) the complete-match limit alone reports 1 for `"AB"` and then
+/// 0 for `"ABC"` — it would ask the emitter to take back a byte it already sent. The
+/// hold-back on `"AB"` pins both at 0 instead.
+///
+/// Returns `text.len()` when `stop_sequences` is empty, so a request without `stop`
+/// streams exactly the bytes it streamed before this existed.
+fn stop_safe_stream_len(text: &str, stop_sequences: &[String]) -> usize {
+    if stop_sequences.is_empty() {
+        return text.len();
+    }
+    // Earliest complete match — the same rule `truncate_at_stop_sequence` applies to the
+    // final text. `str::find` returns the start of a run equal to a valid UTF-8 string,
+    // so the index is a char boundary.
+    let complete = stop_sequences
+        .iter()
+        .filter_map(|sequence| text.find(sequence.as_str()))
+        .min()
+        .unwrap_or(text.len());
+    // Longest trailing run that could still grow into a match. `char_indices().skip(1)`
+    // enumerates exactly the boundaries of the non-empty PROPER prefixes of `sequence`:
+    // it drops offset 0 and never yields `sequence.len()`, so `&sequence[..offset]`
+    // cannot panic and a whole-sequence match stays the `complete` limit's job.
+    let mut held = 0usize;
+    for sequence in stop_sequences {
+        for (offset, _) in sequence.char_indices().skip(1) {
+            if offset > held && text.ends_with(&sequence[..offset]) {
+                held = offset;
+            }
+        }
+    }
+    // `ends_with` can only succeed for `held <= text.len()`, so this cannot underflow;
+    // a byte-equal tail of a valid UTF-8 string starts on a char boundary.
+    complete.min(text.len() - held)
+}
+
+/// Incremental delta for a streaming reply.
+///
+/// With stop sequences live the visible text can be CUT, and a cut can land behind
+/// what the client already holds. The right answer then is "nothing new" — never
+/// "here is the whole reply again", which is precisely what duplicated the reply on
+/// this lane when a stop string straddled a token boundary. With no stop sequences
+/// requested the original fallback is preserved byte-for-byte, so those requests
+/// cannot take a different branch than they did before.
+fn stream_delta(visible: &str, streamed: &str, stop_sequences: &[String]) -> String {
+    match visible.strip_prefix(streamed) {
+        Some(rest) => rest.to_string(),
+        None if !stop_sequences.is_empty() => String::new(),
+        None => visible.to_string(),
+    }
+}
+
+/// Release whatever the stop hold-back is still withholding, as a delta to send.
+///
+/// Generation is over at every call site, so nothing further can complete a stop
+/// sequence and only a COMPLETE match still cuts. Without this a run that ends
+/// while a proper prefix of a stop string is held — max_tokens reached, or the
+/// request timing out — silently loses those trailing bytes.
+///
+/// Empty when no sequences were requested, so the certified no-stop path never
+/// gains an event.
+fn stop_hold_back_flush(
+    tokenizer: &Tokenizer,
+    generated: &[u32],
+    streamed_text: &str,
+    stop_sequences: &[String],
+) -> String {
+    if stop_sequences.is_empty() {
+        return String::new();
+    }
+    let Ok(text) = tokenizer.decode(generated, true) else {
+        return String::new();
+    };
+    truncate_at_stop_sequence(text, stop_sequences)
+        .strip_prefix(streamed_text)
+        .map(str::to_owned)
+        .unwrap_or_default()
+}
+
+/// The text of an in-progress reply that may be streamed on THIS step.
+///
+/// `is_final` is the step on which the decode loop terminates: the cut is settled,
+/// so the whole truncated text is released. Until then a stop string may still be
+/// straddling the token boundary, and bytes streamed before the match completes
+/// cannot be taken back — so the reply is bounded at the stop-safe length.
+fn stop_visible_text(mut text: String, stop_sequences: &[String], is_final: bool) -> String {
+    if is_final {
+        return truncate_at_stop_sequence(text, stop_sequences);
+    }
+    text.truncate(stop_safe_stream_len(&text, stop_sequences));
     text
 }
 
@@ -22329,45 +24857,6 @@ pub fn render_single_user_chat_prompt_for_benchmark(
     let rendered =
         render_chat_prompt_for_tokenization_for_model_result(&messages, tokenizer, None, false)
             .map_err(|error| error.to_string())?;
-    Ok((rendered.text, rendered.add_special, rendered.parse_special))
-}
-
-/// Render a deterministic Llama 3.x no-tools training conversation through the
-/// tokenizer's own pinned metadata template.
-///
-/// Unlike the general serving entry, this narrow offline-corpus entry is not
-/// controlled by `CAMELID_METADATA_CHAT_TEMPLATE`: materialization must produce
-/// the same bytes after a restart, so the GGUF template is always authoritative.
-/// The caller is responsible for pinning the GGUF/tokenizer hashes in its run
-/// manifest. Only the Llama header/EOT grammar is admitted; a neighboring model
-/// cannot silently borrow this prompt shape.
-pub fn render_llama3_training_chat_prompt(
-    messages: &[(String, String)],
-    tokenizer: &Tokenizer,
-) -> std::result::Result<(String, bool, bool), String> {
-    if messages.is_empty() {
-        return Err("Llama 3 training chat requires at least one message".to_string());
-    }
-    let template = tokenizer
-        .chat_template
-        .as_deref()
-        .ok_or_else(|| "Llama 3 training chat requires tokenizer.chat_template".to_string())?;
-    if !is_llama3_instruct_template(template) {
-        return Err(
-            "Llama 3 training chat requires start-header, end-header, and EOT markers".to_string(),
-        );
-    }
-    let messages = messages
-        .iter()
-        .map(|(role, content)| ChatMessage {
-            role: role.clone(),
-            content: content.clone(),
-            image_urls: Vec::new(),
-            unsupported_content_parts: Vec::new(),
-        })
-        .collect::<Vec<_>>();
-    let rendered = render_metadata_jinja_chat_template_prompt(&messages, tokenizer, template, None)
-        .map_err(|error| error.to_string())?;
     Ok((rendered.text, rendered.add_special, rendered.parse_special))
 }
 
@@ -23016,6 +25505,22 @@ fn render_chat_prompt_for_tokenization_fallback(
                 parse_special: tokenizer.chat_prompt_parse_special(),
             };
         }
+        // Llama 4's header-marker family (Meta MobileMoE and siblings). Kept
+        // ahead of the Llama 3 branch because the two are one lineage with two
+        // marker spellings; neither recognizer can fire on the other's
+        // template, so the order documents the kinship rather than guarding it.
+        if is_llama4_header_template(template) {
+            return RenderedPrompt {
+                text: render_llama4_header_prompt(messages),
+                // No BOS text in the rendered string; add_bos_token=true puts
+                // <|begin_of_text|> in exactly once at token level.
+                add_special: true,
+                // <|header_start|>/<|header_end|>/<|eot|> are control tokens in
+                // this vocabulary; special parsing is what turns them into their
+                // ids instead of spelling them out as ordinary text.
+                parse_special: tokenizer.chat_prompt_parse_special(),
+            };
+        }
         if is_llama3_instruct_template(template) {
             return RenderedPrompt {
                 text: render_llama3_instruct_prompt(messages),
@@ -23614,6 +26119,22 @@ fn is_llama3_instruct_template(template: &str) -> bool {
         && template.contains("<|eot_id|>")
 }
 
+/// Llama 4's header-marker chat template — the family Meta's MobileMoE ships
+/// (`general.architecture = mobilemoe`): every turn is
+/// `<|header_start|>{role}<|header_end|>\n\n{content}<|eot|>`, closed by a bare
+/// assistant header. Same shape as Llama 3 instruct with different marker
+/// spellings, and the two cannot cross-match: `<|header_start|>` never appears
+/// in a Llama 3 template, and `<|eot|>` is not a substring of `<|eot_id|>`
+/// (after `<|eot` comes `_`, not `|`). Without this branch the template fell
+/// through the whole chain to `render_role_colon_prompt` and served a
+/// `"User: …"` transcript these weights were never trained on, so the model
+/// continued the transcript instead of ending its turn.
+fn is_llama4_header_template(template: &str) -> bool {
+    template.contains("<|header_start|>")
+        && template.contains("<|header_end|>")
+        && template.contains("<|eot|>")
+}
+
 fn is_exact_llama31_instruct_template(template: &str) -> bool {
     template.len() == 4613
         && format!("{:x}", Sha256::digest(template.as_bytes()))
@@ -23955,6 +26476,39 @@ fn render_llama3_instruct_prompt_with_options(
     if append_generation_prompt {
         prompt.push_str("<|start_header_id|>assistant<|end_header_id|>\n\n");
     }
+    prompt
+}
+
+/// Render Llama 4's header-marker template byte-faithfully for the
+/// `add_generation_prompt = true` case.
+///
+/// The source template opens with `{{ bos_token }}`, but the rendered string
+/// carries NO BOS text. The GGUF declares `add_bos_token = true` and this
+/// branch encodes with `add_special = true`, so `<|begin_of_text|>` lands
+/// exactly once at token level — the resolution `render_llama3_instruct_prompt`
+/// and `render_gemma3_prompt` took for the same conflict. Spelling BOS into the
+/// text as well is the Mistral shape, which works only because that branch
+/// pairs it with `add_special: false`; doing both here would double the BOS.
+///
+/// Every message is closed with `<|eot|>`, the trailing user turn included: the
+/// template's `{{ content + '<|eot|>' }}` runs unconditionally inside the loop.
+/// The generation prompt is the assistant header with its two literal newlines
+/// and deliberately no `<|eot|>` — that is the token the model must produce to
+/// end its turn, and it is what the GGUF declares as EOS.
+///
+/// Content is emitted untrimmed because the template has no `| trim`. The role
+/// is trimmed: it arrives from the HTTP wire, and stray whitespace inside
+/// `<|header_start|>…<|header_end|>` would break the header into ordinary text.
+fn render_llama4_header_prompt(messages: &[ChatMessage]) -> String {
+    let mut prompt = String::new();
+    for message in messages {
+        prompt.push_str("<|header_start|>");
+        prompt.push_str(message.role.trim());
+        prompt.push_str("<|header_end|>\n\n");
+        prompt.push_str(&message.content);
+        prompt.push_str("<|eot|>");
+    }
+    prompt.push_str("<|header_start|>assistant<|header_end|>\n\n");
     prompt
 }
 
@@ -24562,6 +27116,16 @@ fn api_error(
     message: String,
     param: Option<&'static str>,
 ) -> Response {
+    api_error_with_prompt_token_count(status, code, message, param, None)
+}
+
+fn api_error_with_prompt_token_count(
+    status: StatusCode,
+    code: &'static str,
+    message: String,
+    param: Option<&'static str>,
+    prompt_token_count: Option<usize>,
+) -> Response {
     // Surface failures that happen while a generation is live on the
     // telemetry stream. Errors raised outside an active generation
     // (request validation, model management) are not inference errors and
@@ -24592,6 +27156,7 @@ fn api_error(
                 code,
                 param,
             },
+            prompt_token_count,
         }),
     )
         .into_response();
@@ -24654,6 +27219,8 @@ fn detect_chat_template_format(template: &str) -> &'static str {
         "gemma2_it_exact"
     } else if is_gemma3_chat_template(template) {
         "gemma3_turn_markers"
+    } else if is_llama4_header_template(template) {
+        "llama4_header_markers"
     } else if is_llama3_instruct_template(template) {
         "llama3_instruct"
     } else if is_mistral_instruct_template(template) {
@@ -24728,6 +27295,83 @@ mod tests {
                 "KV cache budget exceeded; shorten this conversation".to_string(),
             )
         );
+    }
+
+    #[tokio::test]
+    async fn prompt_limit_error_carries_count_without_weakening_its_typed_failure() {
+        let response = api_error_with_prompt_token_count(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "prompt_token_limit_exceeded",
+            "prompt encoded to 110 tokens, above the server ceiling of 100".to_string(),
+            Some("prompt"),
+            Some(110),
+        );
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            stream_error_parts(&response).0,
+            "prompt_token_limit_exceeded"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["code"], "prompt_token_limit_exceeded");
+        assert_eq!(body["prompt_token_count"], 110);
+    }
+
+    fn runnable_preflight_test_limits() -> server::ServerLimits {
+        server::ServerLimits {
+            max_request_body_bytes: 1_024,
+            max_prompt_tokens: 100,
+            max_generation_tokens: 8_192,
+            max_download_bytes: 1_024,
+        }
+    }
+
+    #[test]
+    fn runnable_preflight_budget_reserves_the_exact_effective_reply_allowance() {
+        let limits = runnable_preflight_test_limits();
+
+        assert_eq!(
+            validate_runnable_preflight_budget(73, Some(27), Some(100), limits).unwrap(),
+            27,
+            "an exact prompt-plus-reply boundary must fit"
+        );
+        let response =
+            validate_runnable_preflight_budget(73, Some(27), Some(99), limits).unwrap_err();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let details = response.extensions().get::<ApiErrorDetails>().unwrap();
+        assert_eq!(details.code, "context_budget_exceeded");
+        assert!(details.message.contains("73 tokens"));
+        assert!(details.message.contains("27 tokens"));
+        assert!(details.message.contains("99 tokens"));
+
+        assert_eq!(
+            validate_runnable_preflight_budget(10, Some(9_000), None, limits).unwrap(),
+            4_096,
+            "preflight must reserve the same hard reply cap as runnable generation"
+        );
+    }
+
+    #[tokio::test]
+    async fn runnable_preflight_prompt_ceiling_returns_the_count_that_was_measured() {
+        let response = validate_runnable_preflight_budget(
+            101,
+            Some(1),
+            None,
+            runnable_preflight_test_limits(),
+        )
+        .unwrap_err();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            response.extensions().get::<ApiErrorDetails>().unwrap().code,
+            "prompt_token_limit_exceeded"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["prompt_token_count"], 101);
     }
 
     #[test]
@@ -25108,7 +27752,7 @@ mod tests {
             orphan_test_prepared("model-a.gguf"),
             true,
             false,
-            false,
+            None,
         );
 
         // Drive the SSE body the way a client does. The reader task polls the
@@ -25323,108 +27967,6 @@ mod tests {
         // The usage frame is omitted from the wire on every non-terminal chunk
         // (stream_options.include_usage off), keeping the baseline byte-identical.
         assert!(value.get("usage").is_none());
-    }
-
-    /// Byte-level decoder stand-in: tokens are byte pieces and decoding follows
-    /// the tokenizer's own `flush_bytes` rule (valid UTF-8 prefix only; an
-    /// incomplete tail is held back for the token that completes it).
-    fn decode_byte_pieces<'a>(
-        pieces: &'a [&'a [u8]],
-    ) -> impl Fn(&[u32]) -> std::result::Result<String, String> + 'a {
-        move |ids: &[u32]| {
-            let bytes: Vec<u8> = ids
-                .iter()
-                .flat_map(|&id| pieces[id as usize].iter().copied())
-                .collect();
-            Ok(match std::str::from_utf8(&bytes) {
-                Ok(text) => text.to_owned(),
-                Err(err) => std::str::from_utf8(&bytes[..err.valid_up_to()])
-                    .unwrap_or("")
-                    .to_owned(),
-            })
-        }
-    }
-
-    #[test]
-    fn stream_step_deltas_split_a_speculative_round_per_token_and_stay_byte_exact() {
-        // "Hi 😀日本語!" with the emoji and the CJK scalars split across byte
-        // tokens, the way a byte-level BPE vocabulary emits them.
-        let pieces: [&[u8]; 10] = [
-            b"Hi",
-            b" ",
-            &[0xF0, 0x9F],
-            &[0x98, 0x80],
-            &[0xE6, 0x97],
-            &[0xA5],
-            &[0xE6, 0x9C, 0xAC],
-            &[0xE8, 0xAA],
-            &[0x9E],
-            b"!",
-        ];
-        let decode = decode_byte_pieces(&pieces);
-        let generated: Vec<u32> = (0..10).collect();
-        let round_text = decode(&generated).unwrap();
-        assert_eq!(round_text, "Hi 😀日本語!");
-
-        // Token 0 was streamed by an earlier step; this round committed nine.
-        let mut streamed = "Hi".to_string();
-        let whole_round_delta = round_text.strip_prefix("Hi").unwrap().to_owned();
-        let deltas = stream_step_deltas(&decode, &generated, 1, false, &[], &mut streamed).unwrap();
-        assert_eq!(deltas, vec![" ", "😀", "日", "本", "語", "!"]);
-        assert_eq!(deltas.concat(), whole_round_delta);
-        assert_eq!(deltas.concat(), " 😀日本語!");
-        assert_eq!(streamed, round_text);
-
-        // A single-token step (the non-speculative path) is one delta, unchanged.
-        let mut streamed = "Hi ".to_string();
-        let deltas =
-            stream_step_deltas(&decode, &generated[..4], 3, false, &[], &mut streamed).unwrap();
-        assert_eq!(deltas, vec!["😀"]);
-        assert_eq!(streamed, "Hi 😀");
-        // ...and a single token whose bytes are still pending yields nothing yet.
-        let mut streamed = "Hi ".to_string();
-        let deltas =
-            stream_step_deltas(&decode, &generated[..3], 2, false, &[], &mut streamed).unwrap();
-        assert!(deltas.is_empty(), "{deltas:?}");
-        assert_eq!(streamed, "Hi ");
-    }
-
-    #[test]
-    fn stream_step_deltas_fall_back_to_the_whole_step_delta_when_a_split_would_differ() {
-        // A stop sequence completed by the round's last token truncates text its
-        // earlier tokens produced: the client must see exactly today's " world".
-        let pieces: [&[u8]; 4] = [b"Hello", b" wor", b"ld<", b"/s>"];
-        let decode = decode_byte_pieces(&pieces);
-        let generated: Vec<u32> = (0..4).collect();
-        let stop = vec!["</s>".to_string()];
-        let mut streamed = "Hello".to_string();
-        let deltas =
-            stream_step_deltas(&decode, &generated, 1, true, &stop, &mut streamed).unwrap();
-        assert_eq!(deltas, vec![" world"]);
-        assert_eq!(streamed, "Hello world");
-
-        // A decoder whose prefix text is not a prefix of the step text cannot be
-        // split without changing bytes; the whole-step delta wins.
-        let inconsistent = |ids: &[u32]| -> std::result::Result<String, String> {
-            Ok(match ids.len() {
-                2 => "AZ".to_string(),
-                n => "ABC"[..n].to_string(),
-            })
-        };
-        let generated = [0u32, 1, 2];
-        let mut streamed = "A".to_string();
-        let deltas =
-            stream_step_deltas(inconsistent, &generated, 1, false, &[], &mut streamed).unwrap();
-        assert_eq!(deltas, vec!["BC"]);
-        assert_eq!(streamed, "ABC");
-
-        // Decode errors surface instead of being swallowed into a delta.
-        let failing = |_: &[u32]| -> std::result::Result<String, String> { Err("bad id".into()) };
-        let mut streamed = String::new();
-        assert_eq!(
-            stream_step_deltas(failing, &generated, 0, false, &[], &mut streamed).unwrap_err(),
-            "bad id"
-        );
     }
 
     #[test]
@@ -25672,6 +28214,12 @@ mod tests {
         assert!(validate_choice_and_logprob_fields(&oob).is_err());
     }
 
+    /// No tools declared, so the schema-envelope repair can never fire: these
+    /// cases must behave exactly as they did before it existed.
+    fn no_declared_tools() -> tool_envelope::ToolParameterNames {
+        tool_envelope::ToolParameterNames::from_request_tools(&[])
+    }
+
     #[test]
     fn constrained_output_is_never_reclassified_as_tool_call() {
         // M3 regression: a schema that legitimately declares a `name` property
@@ -25681,7 +28229,7 @@ mod tests {
         // "tool_calls"). OpenAI allows tools + response_format together.
         let constrained_content = r#"{"name":"x","parameters":{}}"#;
         assert!(
-            parse_tool_calls(constrained_content).is_some(),
+            parse_tool_calls(constrained_content, &no_declared_tools()).is_some(),
             "the gate, not the parser, is what protects constrained output"
         );
         assert!(!should_parse_tool_calls(true, true));
@@ -25693,8 +28241,11 @@ mod tests {
     #[test]
     fn parse_tool_calls_extracts_llama_format() {
         // Llama 3.x: {"name", "parameters"}; arguments becomes a JSON string.
-        let tc = parse_tool_calls(r#"{"name": "get_weather", "parameters": {"city": "Paris"}}"#)
-            .unwrap();
+        let tc = parse_tool_calls(
+            r#"{"name": "get_weather", "parameters": {"city": "Paris"}}"#,
+            &no_declared_tools(),
+        )
+        .unwrap();
         assert_eq!(tc.len(), 1);
         assert_eq!(tc[0].function.name, "get_weather");
         assert_eq!(tc[0].kind, "function");
@@ -25704,16 +28255,51 @@ mod tests {
     }
 
     #[test]
+    fn a_schema_envelope_echoed_by_the_model_is_unwrapped_for_the_client() {
+        // Observed on Llama-3.2-1B-Instruct-Q8_0: the model replied with the
+        // schema shape it was shown, leaving `arguments.city` unreachable to an
+        // ordinary OpenAI client.
+        let echoed = r#"{"name": "get_weather", "parameters": {"properties": {"city": "Paris"}}}"#;
+        let declared =
+            tool_envelope::ToolParameterNames::from_request_tools(&[serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                        "required": ["city"]
+                    }
+                }
+            })]);
+
+        let repaired = parse_tool_calls(echoed, &declared).unwrap();
+        let args: serde_json::Value =
+            serde_json::from_str(&repaired[0].function.arguments).unwrap();
+        assert_eq!(args, serde_json::json!({"city": "Paris"}));
+
+        // The declared schema is the only thing that authorises the rewrite: with
+        // no tools declared the model's output is relayed exactly as produced.
+        let untouched = parse_tool_calls(echoed, &no_declared_tools()).unwrap();
+        let args: serde_json::Value =
+            serde_json::from_str(&untouched[0].function.arguments).unwrap();
+        assert_eq!(args, serde_json::json!({"properties": {"city": "Paris"}}));
+    }
+
+    #[test]
     fn parse_tool_calls_tolerates_python_tag_and_junk() {
         // python_tag prefix + trailing junk small models emit; "arguments" variant.
-        let tc = parse_tool_calls(r#"<|python_tag|>{"name": "f", "arguments": {"x": 1}} trailing"#)
-            .unwrap();
+        let tc = parse_tool_calls(
+            r#"<|python_tag|>{"name": "f", "arguments": {"x": 1}} trailing"#,
+            &no_declared_tools(),
+        )
+        .unwrap();
         assert_eq!(tc[0].function.name, "f");
         let args: serde_json::Value = serde_json::from_str(&tc[0].function.arguments).unwrap();
         assert_eq!(args["x"], 1);
         // prose is not a tool call; a JSON object without "name" is not either.
-        assert!(parse_tool_calls("The weather in Paris is sunny.").is_none());
-        assert!(parse_tool_calls(r#"{"parameters": {"x": 1}}"#).is_none());
+        assert!(parse_tool_calls("The weather in Paris is sunny.", &no_declared_tools()).is_none());
+        assert!(parse_tool_calls(r#"{"parameters": {"x": 1}}"#, &no_declared_tools()).is_none());
     }
 
     #[test]
@@ -25721,6 +28307,7 @@ mod tests {
         let qwen = parse_tool_calls(
             r#"<tool_call>{"name":"read_file","arguments":{"path":"a.txt"}}</tool_call>
 <tool_call>{"name":"list_dir","arguments":{"path":"."}}</tool_call>"#,
+            &no_declared_tools(),
         )
         .unwrap();
         assert_eq!(qwen.len(), 2);
@@ -25730,6 +28317,7 @@ mod tests {
 
         let mistral = parse_tool_calls(
             r#"[TOOL_CALLS] [{"name":"read_file","arguments":"{\"path\":\"b.txt\"}"}]"#,
+            &no_declared_tools(),
         )
         .unwrap();
         assert_eq!(mistral.len(), 1);
@@ -25770,9 +28358,12 @@ mod tests {
 
     #[test]
     fn chat_tool_call_delta_uses_openai_stream_shape() {
-        let call = parse_tool_calls(r#"{"name":"weather","parameters":{"city":"Paris"}}"#)
-            .unwrap()
-            .remove(0);
+        let call = parse_tool_calls(
+            r#"{"name":"weather","parameters":{"city":"Paris"}}"#,
+            &no_declared_tools(),
+        )
+        .unwrap()
+        .remove(0);
         let delta = ChatCompletionDelta {
             role: None,
             content: None,
@@ -25822,6 +28413,56 @@ mod tests {
         let tools = runnable_request_tools(&with_choice(None));
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["name"], "weather");
+    }
+
+    #[test]
+    fn runnable_preflight_and_chat_normalize_the_same_tool_schema_into_the_prompt() {
+        let wrapped_tool = serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read a workspace file",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"]
+                }
+            }
+        });
+        let chat: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "ornith",
+            "messages": [{"role": "user", "content": "read notes.txt"}],
+            "tools": [wrapped_tool.clone()]
+        }))
+        .unwrap();
+        let preflight: GenerationSessionRequest = serde_json::from_value(serde_json::json!({
+            "model": "ornith",
+            "messages": [{"role": "user", "content": "read notes.txt"}],
+            "tools": [wrapped_tool]
+        }))
+        .unwrap();
+
+        let chat_tools = runnable_request_tools(&chat);
+        let preflight_tools = normalize_runnable_tools(preflight.tools.as_deref(), true);
+        assert_eq!(preflight_tools, chat_tools);
+        assert_eq!(preflight_tools[0]["name"], "read_file");
+        assert!(preflight_tools[0].get("function").is_none());
+
+        let messages = preflight.messages.as_deref().unwrap();
+        let chat_prompt = render_ornith_chatml_prompt_with_tools(messages, &chat_tools, false);
+        let preflight_prompt =
+            render_ornith_chatml_prompt_with_tools(messages, &preflight_tools, false);
+        assert_eq!(preflight_prompt, chat_prompt);
+        let rendered_tool = preflight_prompt
+            .split_once("<tools>\n")
+            .and_then(|(_, rest)| rest.split_once("\n</tools>"))
+            .map(|(tool, _)| tool)
+            .expect("the runnable tool renderer emits one JSON object in the tools block");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(rendered_tool).unwrap(),
+            preflight_tools[0]
+        );
+        assert!(preflight_prompt.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"));
     }
 
     #[test]
@@ -27434,6 +30075,10 @@ mod tests {
                 // distributed layer-sharding serve lane (single-node 16GB is
                 // memory-bound); promotion bundle + WebUI closure committed.
                 "gemma4_12b_it_q8_0",
+                // Exact 12B QAT Q4_0 + MTP12 assistant, single-node Apple Metal;
+                // native target-verified performance receipt only, explicitly
+                // configured and hash-pinned through the non-catalog allowlist.
+                "gemma4_12b_it_qat_q4_0_mtp12",
                 // 26B A4B QAT (Q4_0 experts + Q6_K head) is supported_exact_row_smoke
                 // SCOPED TO the same two-Mac distributed lane: full basic_v1 parity
                 // pack (2/5 full + 3/5 probe-verified frontiers) + distributed serve
@@ -27588,6 +30233,7 @@ mod tests {
     #[test]
     fn mixtral_multi_token_generation_stays_fail_closed_until_explicitly_enabled() {
         let mixtral = crate::model::MixtralMoeMetadata {
+            expert_shared_feed_forward_length: None,
             family_label: "Mixtral",
             expert_count: 8,
             expert_used_count: 2,
@@ -29374,6 +32020,60 @@ mod tests {
         );
     }
 
+    /// The partial-resume escape hatch is OFF unless explicitly set to 1/true. It exists
+    /// only to reproduce the A/B against one binary, so anything else — unset, empty, 0,
+    /// or a stray value — must leave the regression avoided.
+    #[test]
+    fn partial_resume_is_forced_only_by_an_explicit_opt_in() {
+        assert!(!partial_resume_forced_from(None));
+        assert!(!partial_resume_forced_from(Some("")));
+        assert!(!partial_resume_forced_from(Some("0")));
+        assert!(!partial_resume_forced_from(Some("false")));
+        assert!(!partial_resume_forced_from(Some("yes")));
+        assert!(partial_resume_forced_from(Some("1")));
+        assert!(partial_resume_forced_from(Some("true")));
+        assert!(partial_resume_forced_from(Some("TRUE")));
+    }
+
+    /// A partial resume must be declined whenever the batched Metal prefill would have
+    /// taken the prompt, because resuming forces the divergent suffix onto the CPU dense
+    /// forward: measured 1.33 s -> 20.79 s on Llama-3.2-3B-Instruct-Q4_K_M, and the CPU
+    /// tail also diverges from the cold-prefill reference tokens. This covers the
+    /// bookkeeping half with no GPU: a tiny CPU fixture is never resident-eligible, so
+    /// the predicate must answer `false` and the resume must still happen — which is what
+    /// keeps every non-Metal deployment on exactly its previous behaviour.
+    #[test]
+    fn a_cpu_only_session_still_takes_the_partial_resume() {
+        let _env_guard = crate::test_support::env_lock();
+        let cold = LlamaInferenceSession::new(tiny_config(), tiny_weights()).unwrap();
+        assert!(
+            !cold.metal_resident_prefill_would_apply(3),
+            "a tiny CPU fixture must not claim the batched Metal prefill applies"
+        );
+        assert!(
+            !cold.metal_resident_prefill_would_apply(0),
+            "a degenerate length must never admit the batched prefill"
+        );
+
+        let mut warm = LlamaInferenceSession::new(tiny_config(), tiny_weights()).unwrap();
+        warm.generate_next_token_with_history_diagnostics(
+            &[1, 2],
+            crate::inference::LlamaSampler::Greedy,
+            &[1, 2],
+            false,
+            None,
+        )
+        .unwrap();
+        let mut prepared = prepared_for_cache("tiny", "model-a.gguf", vec![1, 2, 1], cold);
+        let mut input = prepared.token_ids.clone();
+        resume_partial_prefix_hit(&mut prepared, warm, 2, &mut input);
+        assert!(
+            prepared.timings.prompt_cache_hit,
+            "the CPU path keeps its partial resume: nothing about it regressed"
+        );
+        assert_eq!(input, vec![1], "the CPU path resumes from the suffix");
+    }
+
     /// gemma3→Metal Phase 3a hazard H1, resume sites: a windowed-attention
     /// arch must never take a PARTIAL prefix-cache resume. Drives
     /// `resume_partial_prefix_hit` — the single decision point both the
@@ -30363,6 +33063,117 @@ mod tests {
         );
     }
 
+    /// The MobileMoE GGUF's chat template, verbatim. Before this family was
+    /// recognised it fell through to the role-colon renderer, and the model
+    /// answered a greeting by continuing the transcript forever.
+    const LLAMA4_HEADER_TEMPLATE: &str = "{{ bos_token }}{% set loop_messages = messages %}{% for message in loop_messages %}{% set content = '<|header_start|>' + message['role'] + '<|header_end|>\\n\\n' %}{% if message['content'] is string %}{% set content = content + message['content'] %}{% else %}{% for item in message['content'] %}{% if item['type'] == 'text' %}{% set content = content + item['text'] %}{% endif %}{% endfor %}{% endif %}{{ content + '<|eot|>' }}{% endfor %}{% if add_generation_prompt %}{{ '<|header_start|>assistant<|header_end|>\\n\\n' }}{% endif %}";
+
+    #[test]
+    fn renders_llama4_header_prompt_with_header_tokens_and_special_parsing() {
+        let _guard = crate::test_support::env_lock();
+        std::env::remove_var(METADATA_CHAT_TEMPLATE_ENV);
+        let tokenizer = Tokenizer {
+            model: TokenizerModel::Gpt2Bpe,
+            bpe_pre_tokenizer: BpePreTokenizer::default(),
+            tokens: Vec::new(),
+            token_to_id: HashMap::new(),
+            byte_token_to_id: HashMap::new(),
+            bpe_ranks: HashMap::new(),
+            bpe_registry: BpeRegistry::default(),
+            special: SpecialTokens::default(),
+            config: TokenizerConfig {
+                add_bos: true,
+                add_eos: false,
+                add_sep: false,
+                add_space_prefix: false,
+                remove_extra_whitespaces: false,
+            },
+            chat_template: Some(LLAMA4_HEADER_TEMPLATE.to_string()),
+            specials_index: OnceLock::new(),
+        };
+
+        assert!(tokenizer.chat_prompt_parse_special());
+        assert_eq!(
+            detect_chat_template_format(tokenizer.chat_template.as_deref().unwrap()),
+            "llama4_header_markers"
+        );
+        assert_eq!(
+            render_chat_prompt(
+                &[ChatMessage {
+                    image_urls: Vec::new(),
+                    unsupported_content_parts: Vec::new(),
+                    role: "user".to_string(),
+                    content: " hello ".to_string(),
+                }],
+                &tokenizer,
+            ),
+            "<|header_start|>user<|header_end|>\n\n hello <|eot|><|header_start|>assistant<|header_end|>\n\n"
+        );
+    }
+
+    #[test]
+    fn renders_llama4_header_prompt_with_system_and_multi_turn_messages() {
+        let _guard = crate::test_support::env_lock();
+        std::env::remove_var(METADATA_CHAT_TEMPLATE_ENV);
+        let tokenizer = Tokenizer {
+            model: TokenizerModel::Gpt2Bpe,
+            bpe_pre_tokenizer: BpePreTokenizer::default(),
+            tokens: Vec::new(),
+            token_to_id: HashMap::new(),
+            byte_token_to_id: HashMap::new(),
+            bpe_ranks: HashMap::new(),
+            bpe_registry: BpeRegistry::default(),
+            special: SpecialTokens::default(),
+            config: TokenizerConfig {
+                add_bos: true,
+                add_eos: false,
+                add_sep: false,
+                add_space_prefix: false,
+                remove_extra_whitespaces: false,
+            },
+            chat_template: Some(LLAMA4_HEADER_TEMPLATE.to_string()),
+            specials_index: OnceLock::new(),
+        };
+
+        let message = |role: &str, content: &str| ChatMessage {
+            image_urls: Vec::new(),
+            unsupported_content_parts: Vec::new(),
+            role: role.to_string(),
+            content: content.to_string(),
+        };
+
+        assert_eq!(
+            render_chat_prompt(
+                &[
+                    message("system", "Be helpful."),
+                    message("user", "Hello"),
+                    message("assistant", "Hi"),
+                    message("user", "Again"),
+                ],
+                &tokenizer,
+            ),
+            concat!(
+                "<|header_start|>system<|header_end|>\n\nBe helpful.<|eot|>",
+                "<|header_start|>user<|header_end|>\n\nHello<|eot|>",
+                "<|header_start|>assistant<|header_end|>\n\nHi<|eot|>",
+                "<|header_start|>user<|header_end|>\n\nAgain<|eot|>",
+                "<|header_start|>assistant<|header_end|>\n\n"
+            )
+        );
+    }
+
+    #[test]
+    fn llama4_header_recognizer_does_not_collide_with_llama3_instruct() {
+        // `<|eot|>` is not a substring of `<|eot_id|>`, and neither family's
+        // markers appear in the other's template. A collision here would route
+        // one family through the other's renderer and stop token.
+        let llama3 = "<|start_header_id|>{{ role }}<|end_header_id|>{{ content }}<|eot_id|>";
+        assert!(is_llama3_instruct_template(llama3));
+        assert!(!is_llama4_header_template(llama3));
+        assert!(is_llama4_header_template(LLAMA4_HEADER_TEMPLATE));
+        assert!(!is_llama3_instruct_template(LLAMA4_HEADER_TEMPLATE));
+    }
+
     #[test]
     fn renders_llama3_instruct_prompt_with_header_tokens_and_special_parsing() {
         let _guard = crate::test_support::env_lock();
@@ -30820,28 +33631,6 @@ mod tests {
             "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: 26 Jul 2024\n\nBe brief.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nhello<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
         );
         std::env::remove_var(METADATA_CHAT_TEMPLATE_ENV);
-    }
-
-    #[test]
-    fn eagle3_corpus_renderer_pins_full_llama32_template_and_generation_boundary() {
-        let _guard = crate::test_support::env_lock();
-        // The offline materializer must ignore this serving toggle and always
-        // execute the exact GGUF metadata template.
-        std::env::remove_var(METADATA_CHAT_TEMPLATE_ENV);
-        let tokenizer = llama3_tokenizer_with_template(LLAMA3_METADATA_FULL_TEMPLATE);
-        let messages = vec![
-            ("system".to_string(), "  Be brief.  ".to_string()),
-            ("user".to_string(), "  hello  ".to_string()),
-        ];
-        let (rendered, add_special, parse_special) =
-            render_llama3_training_chat_prompt(&messages, &tokenizer).unwrap();
-        assert!(!add_special, "the metadata template already emits BOS");
-        assert!(parse_special);
-        assert_eq!(
-            rendered,
-            "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: 26 Jul 2024\n\nBe brief.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nhello<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
-        );
-        assert!(rendered.ends_with("<|start_header_id|>assistant<|end_header_id|>\n\n"));
     }
 
     #[test]
@@ -32420,6 +35209,7 @@ mod tests {
             )),
             rope_freqs: None,
             layers: vec![LlamaLayerWeights {
+                moe_expert_bias: None,
                 attention_norm: ones("blk.0.attn_norm.weight", hidden),
                 attention_q: select_rows("blk.0.attn_q.weight", hidden, hidden, &[0, 1, 2, 3]),
                 attention_k: select_rows("blk.0.attn_k.weight", 2, hidden, &[0, 1]),
@@ -33397,8 +36187,21 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             task_tags: &["general"],
         },
         CatalogItem {
+            catalog_id: "gemma4_12b_it_qat_q4_0",
+            name: "Gemma 4 12B-It QAT Q4_0 (single-Mac)",
+            repo_id: "google/gemma-4-12B-it-qat-q4_0-gguf",
+            filename: "gemma-4-12b-it-qat-q4_0.gguf",
+            size_bytes: 6_975_879_296,
+            downloads: 0,
+            likes: 0,
+            quant: "Q4_0",
+            architecture: "gemma4",
+            license: "gemma",
+            task_tags: &["general", "reasoning"],
+        },
+        CatalogItem {
             catalog_id: "gemma4_12b_it_q8_0",
-            name: "Gemma 4 12B-It Q8_0 (two-Mac distributed)",
+            name: "Gemma 4 12B-It Q8_0 (legacy two-Mac distributed)",
             repo_id: "unsloth/gemma-4-12b-it-GGUF",
             filename: "gemma-4-12b-it-Q8_0.gguf",
             size_bytes: 12669646240,
@@ -33411,7 +36214,7 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
         },
         CatalogItem {
             catalog_id: "gemma4_26b_a4b_it_q4_0",
-            name: "Gemma 4 26B-A4B-It QAT Q4_0 (Ghost MoE)",
+            name: "Gemma 4 26B-A4B-It QAT Q4_0 (single-Mac Ghost MoE)",
             repo_id: "google/gemma-4-26B-A4B-it-qat-q4_0-gguf",
             filename: "gemma-4-26B_q4_0-it.gguf",
             size_bytes: 14439361440,
@@ -35092,6 +37895,89 @@ mod runnable_completions_gate_api_tests {
     }
 
     #[tokio::test]
+    async fn runnable_preflight_chat_shape_uses_the_chat_lane_not_dense_preparation() {
+        let app = router_with_state(state_with_loaded_arch("qwen35").await);
+        let (status, body) = post_json(
+            app,
+            "/api/generation/preflight",
+            json!({
+                "model": "gate-test",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "parameters": {"type": "object", "properties": {}}
+                    }
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body["error"]["code"], "model_not_ready");
+        assert_ne!(body["error"]["code"], "unsupported_completions_lane");
+    }
+
+    #[tokio::test]
+    async fn agent_request_binding_detects_same_id_artifact_swap_between_steps() {
+        let state = state_with_loaded_arch("qwen35").await;
+        let original = "ab".repeat(32);
+        let binding =
+            match bind_expected_loaded_artifact(&state, Some("gate-test"), Some(&original)).await {
+                Ok(Some(binding)) => binding,
+                Ok(None) => panic!("an expected digest must acquire a transition binding"),
+                Err(response) => panic!("matching artifact was rejected: {}", response.status()),
+            };
+        drop(binding);
+
+        state
+            .loaded_models
+            .write()
+            .await
+            .get_mut("gate-test")
+            .expect("synthetic model")
+            .lane
+            .gguf_sha256 = "cd".repeat(32);
+
+        let rejection =
+            match bind_expected_loaded_artifact(&state, Some("gate-test"), Some(&original)).await {
+                Err(response) => response,
+                Ok(_) => panic!("same-id replacement must not inherit an agent request"),
+            };
+        assert_eq!(rejection.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn generation_preflight_rejects_an_expected_artifact_mismatch_first() {
+        let app = router_with_state(state_with_loaded_arch("qwen35").await);
+        let (status, body) = post_json(
+            app,
+            "/api/generation/preflight",
+            json!({
+                "model": "gate-test",
+                "camelid_expected_gguf_sha256": "cd".repeat(32),
+                "prompt": "hi"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["error"]["code"], "model_artifact_mismatch");
+    }
+
+    #[tokio::test]
+    async fn chat_without_artifact_binding_preserves_existing_routing() {
+        let app = router_with_state(state_with_loaded_arch("qwen35").await);
+        let (status, body) = post_json(
+            app,
+            "/v1/chat/completions",
+            json!({"model":"gate-test", "messages":[{"role":"user", "content":"hi"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body["error"]["code"], "model_not_ready");
+    }
+
+    #[tokio::test]
     async fn generation_session_create_fails_closed_for_runnable_arch() {
         let state = state_with_loaded_arch("gemma2").await;
         let app = router_with_state(state.clone());
@@ -35634,6 +38520,86 @@ async fn delete_local_model(
         .into_response()
 }
 
+#[derive(Debug, Deserialize)]
+pub struct QuantizeModelRequest {
+    pub input_path: String,
+    pub output_path: Option<String>,
+    #[serde(default = "default_quant_type")]
+    pub quant_type: String,
+}
+
+fn default_quant_type() -> String {
+    "q4_k_m".to_string()
+}
+
+pub async fn quantize_model_endpoint(
+    State(_state): State<AppState>,
+    Json(payload): Json<QuantizeModelRequest>,
+) -> Result<Json<crate::quantize::QuantizeReceipt>, Response> {
+    let input = PathBuf::from(payload.input_path.trim());
+    if !input.exists() {
+        return Err(api_error(
+            StatusCode::NOT_FOUND,
+            "file_not_found",
+            format!("Input model file not found: {}", input.display()),
+            None,
+        ));
+    }
+
+    let target_quant = match payload.quant_type.to_lowercase().as_str() {
+        "q8_0" | "q8" => crate::quantize::TargetQuant::Q8_0,
+        "q4_0" | "q4" => crate::quantize::TargetQuant::Q4_0,
+        "q4_k_m" | "q4_k" | "q4km" => crate::quantize::TargetQuant::Q4_K_M,
+        other => {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_quant_type",
+                format!("Unsupported quantization type '{other}'. Supported: q8_0, q4_0, q4_k_m"),
+                None,
+            ));
+        }
+    };
+
+    let output = match payload.output_path {
+        Some(p) if !p.trim().is_empty() => PathBuf::from(p.trim()),
+        _ => {
+            let stem = input
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("model");
+            let suffix = match target_quant {
+                crate::quantize::TargetQuant::Q8_0 => "Q8_0",
+                crate::quantize::TargetQuant::Q4_0 => "Q4_0",
+                crate::quantize::TargetQuant::Q4_K_M => "Q4_K_M",
+            };
+            input.with_file_name(format!("{stem}-{suffix}.gguf"))
+        }
+    };
+
+    let receipt = tokio::task::spawn_blocking(move || {
+        crate::quantize::quantize_model(&input, &output, target_quant)
+    })
+    .await
+    .map_err(|e| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "quantize_thread_error",
+            format!("Quantization thread join failed: {e}"),
+            None,
+        )
+    })?
+    .map_err(|e| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "quantize_failed",
+            format!("Quantization failed: {e}"),
+            None,
+        )
+    })?;
+
+    Ok(Json(receipt))
+}
+
 /// Cached metadata-derived facts for one local model, keyed by (mtime, size) so a
 /// re-download invalidates it. Parsing a GGUF's tensor index is slow for big models
 /// (the 16 GB MoE alone is seconds), and this endpoint is polled â€” so we re-parse
@@ -36078,6 +39044,15 @@ fn numerical_variance_compatibility_row_ids() -> &'static std::collections::Hash
 /// what made every pinned row read "Experimental" in v0.6.0. See
 /// `classify_model_lane_with_verified_sha256` for that boundary.
 const NON_CATALOG_SUPPORTED_ARTIFACTS: &[(&str, &str, &str)] = &[
+    // Exact target of the single-node lossless Metal MTP12 performance lane.
+    // It is intentionally catalog-free: the assistant is a separately pinned
+    // artifact and the lane must be explicitly configured before this row is
+    // host-eligible.
+    (
+        "gemma-4-12b-it-qat-q4_0.gguf",
+        "gemma4_12b_it_qat_q4_0_mtp12",
+        "93567e57a8fe10b23569b9d9ec38cd005deedf71e29477c421a4b83f418a538b",
+    ),
     // HF pristine upload; local recompute matches the HF LFS oid (9,527,500,992 B).
     (
         "ornith-1.0-9b-Q8_0.gguf",
@@ -36398,6 +39373,29 @@ fn filename_is_numerical_variance_exact_row(filename: &str) -> bool {
 
 const LFM2_5_2_6B_Q8_0_FILENAME: &str = "LFM2.5-2.6B-Q8_0.gguf";
 const PHI3_MINI_4K_Q8_0_FILENAME: &str = "Phi-3-mini-4k-instruct-Q8_0.gguf";
+const GEMMA4_12B_QAT_Q4_0_MTP12_FILENAME: &str = "gemma-4-12b-it-qat-q4_0.gguf";
+const GEMMA4_12B_QAT_Q4_0_MTP12_ROW_ID: &str = "gemma4_12b_it_qat_q4_0_mtp12";
+
+/// Canonicalize the one certified side-loaded MTP12 target after phase 2 has
+/// computed its receipt hash. The generic GGUF-name fallback remains unchanged:
+/// this exact filename + digest pair is the only artifact whose compatibility
+/// row id supersedes cosmetic `general.name` metadata, and an explicit caller id
+/// always wins.
+fn canonical_mtp12_startup_model_id(
+    explicit_id_present: bool,
+    path: &Path,
+    gguf_sha256: &str,
+) -> Option<&'static str> {
+    if explicit_id_present
+        || path.file_name().and_then(|name| name.to_str())
+            != Some(GEMMA4_12B_QAT_Q4_0_MTP12_FILENAME)
+        || !supported_artifact_identity_matches(GEMMA4_12B_QAT_Q4_0_MTP12_FILENAME, gguf_sha256)
+    {
+        return None;
+    }
+
+    Some(GEMMA4_12B_QAT_Q4_0_MTP12_ROW_ID)
+}
 
 /// The exact platform envelope carried by the LFM2 promotion receipts.
 ///
@@ -36498,6 +39496,7 @@ fn supported_exact_row_host_eligible(filename: &str) -> bool {
     match filename {
         LFM2_5_2_6B_Q8_0_FILENAME => lfm2_supported_on_current_host(),
         PHI3_MINI_4K_Q8_0_FILENAME => phi3_supported_on_current_host(),
+        GEMMA4_12B_QAT_Q4_0_MTP12_FILENAME => gemma4_mtp12_supported_on_current_host(),
         _ => true,
     }
 }
@@ -38166,6 +41165,7 @@ mod catalog_fit_tests {
             cpu_logical_cores: 8,
             host_ram_total_bytes: ram_total,
             host_ram_free_bytes: ram_free,
+            host_ram_unevictable_bytes: 0,
             simd: SimdCaps::default(),
         }
     }
@@ -38553,12 +41553,15 @@ mod catalog_fit_tests {
         // 8 GB RAM, no GPU: a 40 GB model won't fit → actionable message.
         let hw = host(false, 0, 8 * GIB, 5 * GIB);
         let fp = crate::fit::advisory_footprint(40 * GIB);
-        let (code, msg) =
-            super::fit_preload_message(&hw, &fp, 40 * GIB, None).expect("won't fit -> message");
+        let (code, msg) = super::fit_preload_message(&hw, &fp, 40 * GIB, None)
+            .refusal()
+            .expect("won't fit -> refusal");
         assert_eq!(code, "model_too_large_for_host");
         assert!(msg.contains("larger than this machine"));
         assert!(msg.contains("camelid pull"));
-        assert!(msg.contains("CAMELID_SKIP_FIT_CHECK=1"));
+        // The override a UI can actually offer, not the env var it cannot set.
+        assert!(msg.contains("\"force\": true"), "{msg}");
+        assert!(!msg.contains("CAMELID_SKIP_FIT_CHECK"), "{msg}");
     }
 
     #[test]
@@ -38573,7 +41576,8 @@ mod catalog_fit_tests {
             bytes: 3 * GIB,
         };
         let (code, msg) = super::fit_preload_message(&hw, &fp, 40 * GIB, Some(&reclaim))
-            .expect("won't fit -> message");
+            .refusal()
+            .expect("won't fit -> refusal");
         assert_eq!(code, "model_requires_unload");
         assert!(msg.contains("Llama-3.2-1B-Instruct-Q8_0.gguf"), "{msg}");
         assert!(msg.contains("replace"), "{msg}");
@@ -38589,7 +41593,8 @@ mod catalog_fit_tests {
         let fp = crate::fit::advisory_footprint(40 * GIB);
         let empty = super::ResidentReclaim::default();
         let (code, _) = super::fit_preload_message(&hw, &fp, 40 * GIB, Some(&empty))
-            .expect("won't fit -> message");
+            .refusal()
+            .expect("won't fit -> refusal");
         assert_eq!(code, "model_too_large_for_host");
     }
 
@@ -38597,7 +41602,7 @@ mod catalog_fit_tests {
     fn preload_message_is_none_when_the_model_fits() {
         let hw = host(false, 0, 64 * GIB, 48 * GIB);
         let fp = crate::fit::advisory_footprint(2 * GIB);
-        assert!(super::fit_preload_message(&hw, &fp, 2 * GIB, None).is_none());
+        assert!(super::fit_preload_message(&hw, &fp, 2 * GIB, None).proceeds());
     }
 
     #[test]
@@ -38609,7 +41614,7 @@ mod catalog_fit_tests {
             ids: vec!["other.gguf".to_string()],
             bytes: 3 * GIB,
         };
-        assert!(super::fit_preload_message(&hw, &fp, 2 * GIB, Some(&reclaim)).is_none());
+        assert!(super::fit_preload_message(&hw, &fp, 2 * GIB, Some(&reclaim)).proceeds());
     }
 
     #[test]
@@ -38617,7 +41622,7 @@ mod catalog_fit_tests {
         // Unknown verdict must never hard-block a load.
         let hw = host(false, 0, 0, 0);
         let fp = crate::fit::advisory_footprint(40 * GIB);
-        assert!(super::fit_preload_message(&hw, &fp, 40 * GIB, None).is_none());
+        assert!(super::fit_preload_message(&hw, &fp, 40 * GIB, None).proceeds());
     }
 
     #[test]
@@ -38636,7 +41641,10 @@ mod catalog_fit_tests {
             crate::fit::ADVISORY_CONTEXT_TOKENS,
             crate::fit::KvDtype::F32,
         );
-        assert!(super::fit_preload_message(&hw, &fp, 5 * GIB, None).is_some());
+        let (code, _) = super::fit_preload_message(&hw, &fp, 5 * GIB, None)
+            .refusal()
+            .expect("5 GiB of weights cannot fit a 4 GiB host");
+        assert_eq!(code, "model_too_large_for_host");
     }
 
     #[test]
@@ -38653,14 +41661,19 @@ mod catalog_fit_tests {
 
         // Regression: the old policy treated a Metal host as CPU-only and demanded
         // a full 4096-position F32 cache before load, producing the confusing
-        // "0.6 GB model / 1.6 GB free" refusal on this 8 GiB Mac.
+        // "0.6 GB model / 1.6 GB free" complaint on this 8 GiB Mac. That footprint
+        // still trips the advisor — but as a WARNING now, because an 8 GiB machine is
+        // plainly big enough for a 0.6 GB model and refusing said otherwise.
         let old = crate::fit::exact_footprint(
             size,
             dims,
             crate::fit::ADVISORY_CONTEXT_TOKENS,
             crate::fit::KvDtype::F32,
         );
-        assert!(super::fit_preload_message(&hw, &old, size, None).is_some());
+        let (code, _) = super::fit_preload_message(&hw, &old, size, None)
+            .warning()
+            .expect("a busy host warns, it does not refuse");
+        assert_eq!(code, "host_memory_unavailable");
 
         let metal = super::exact_preload_footprint(size, dims, &hw, true, crate::fit::KvDtype::F16);
         assert_eq!(
@@ -38674,8 +41687,8 @@ mod catalog_fit_tests {
             )
         );
         assert!(
-            super::fit_preload_message(&hw, &metal, size, None).is_none(),
-            "the real initial Metal allocation fits the live-memory scenario"
+            super::fit_preload_message(&hw, &metal, size, None).proceeds(),
+            "the real initial Metal allocation fits the live-memory scenario silently"
         );
     }
 
@@ -38844,23 +41857,79 @@ mod catalog_fit_tests {
     }
 
     #[test]
-    fn a_busy_host_is_refused_without_being_called_too_small() {
-        // 64 GB machine with 2 GB free, asked for a ~4 GB model. It is refused (the
-        // load would be at risk), but telling the operator to buy a smaller model
-        // would be false: the machine is one of the biggest in the catalog's range.
+    fn a_busy_host_warns_and_loads_instead_of_refusing() {
+        // 64 GB machine with 2 GB free, asked for a ~4 GB model. The machine is one of
+        // the biggest in the catalog's range and the shortfall is a moment, not a
+        // property — so this advises and proceeds. Refusing here is the bug: it told
+        // operators to close applications before an ordinary model would load.
         let hw = host(false, 0, 64 * GIB, 2 * GIB);
         let fp = crate::fit::advisory_footprint(4 * GIB);
-        let (code, msg) =
-            super::fit_preload_message(&hw, &fp, 4 * GIB, None).expect("refused -> message");
+        let (code, msg) = super::fit_preload_message(&hw, &fp, 4 * GIB, None)
+            .warning()
+            .expect("busy host -> warning");
         assert_eq!(code, "host_memory_unavailable");
         assert!(msg.contains("free right now"), "{msg}");
-        assert!(msg.contains("Close some applications"), "{msg}");
+        assert!(msg.contains("Loading anyway"), "{msg}");
         assert!(msg.contains("estimated in-memory footprint"), "{msg}");
-        assert!(msg.contains("safety reserve"), "{msg}");
-        assert!(msg.contains("usable"), "{msg}");
         assert!(!msg.contains("larger than this machine"), "{msg}");
-        // The override is still offered, exactly as for the too-large case.
-        assert!(msg.contains("CAMELID_SKIP_FIT_CHECK=1"), "{msg}");
+        // A warning must not send the operator to a terminal for an env var.
+        assert!(!msg.contains("CAMELID_SKIP_FIT_CHECK"), "{msg}");
+    }
+
+    #[test]
+    fn a_busy_host_still_refuses_what_the_machine_cannot_physically_hold() {
+        // Same transient verdict, but the shortfall is wired memory: closing
+        // applications cannot recover it, and on Metal nothing downstream would catch
+        // the oversized weight allocation. This is the floor that makes warning safe.
+        let mut hw = host(false, 0, 8 * GIB, 2 * GIB);
+        hw.host_ram_unevictable_bytes = 7 * GIB;
+        let fp = crate::fit::advisory_footprint(4 * GIB);
+        let (code, msg) = super::fit_preload_message(&hw, &fp, 4 * GIB, None)
+            .refusal()
+            .expect("beyond the hard floor -> refusal");
+        assert_eq!(code, "host_memory_exhausted");
+        assert!(msg.contains("wired"), "{msg}");
+        assert!(msg.contains("\"force\": true"), "{msg}");
+    }
+
+    #[test]
+    fn an_unprobed_wired_figure_never_manufactures_a_refusal() {
+        // host_ram_unevictable_bytes == 0 means "not measured on this platform", not
+        // "nothing is wired". An unmeasured host must warn, exactly as before.
+        let hw = host(false, 0, 8 * GIB, 2 * GIB);
+        assert_eq!(hw.host_ram_unevictable_bytes, 0);
+        let fp = crate::fit::advisory_footprint(4 * GIB);
+        assert_eq!(
+            super::fit_preload_message(&hw, &fp, 4 * GIB, None)
+                .warning()
+                .map(|(code, _)| code),
+            Some("host_memory_unavailable")
+        );
+    }
+
+    #[test]
+    fn force_bypasses_the_preflight_entirely() {
+        // The per-request override must short-circuit before any probe or file read,
+        // so it works on a path that does not exist and cannot be defeated by a
+        // refusing verdict. This is what the UI's "Load anyway" button rides on.
+        assert!(super::fit_preload_guard(
+            std::path::Path::new("/nonexistent/model.gguf"),
+            None,
+            true,
+        )
+        .proceeds());
+    }
+
+    #[test]
+    fn a_missing_or_empty_file_is_left_to_the_loader() {
+        // The preflight is a capacity check, not a validation layer: a path problem
+        // must surface as the loader's own typed error, not as a fit refusal.
+        assert!(super::fit_preload_guard(
+            std::path::Path::new("/nonexistent/model.gguf"),
+            None,
+            false,
+        )
+        .proceeds());
     }
 
     #[test]
@@ -38874,7 +41943,8 @@ mod catalog_fit_tests {
             bytes: 4 * GIB,
         };
         let (code, msg) = super::fit_preload_message(&hw, &fp, 4 * GIB, Some(&reclaim))
-            .expect("refused -> message");
+            .refusal()
+            .expect("a releasable resident model -> refusal");
         assert_eq!(code, "model_requires_unload");
         assert!(msg.contains("Qwen3-4B-Q8_0.gguf"), "{msg}");
     }

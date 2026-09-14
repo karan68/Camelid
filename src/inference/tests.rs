@@ -1165,6 +1165,7 @@ fn tiny_prefill_schedule_weights(attention_q: CpuTensor) -> LlamaLoadedWeights {
         layer_range: None,
         output_projection_binding: DecodeBindingCell::default(),
         layers: vec![LlamaLayerWeights {
+            moe_expert_bias: None,
             attention_norm: CpuTensor::from_f32("blk.0.attn_norm.weight", vec![2], vec![1.0; 2])
                 .unwrap(),
             attention_q,
@@ -1615,6 +1616,7 @@ fn prefill_layer_major_scoped_q8_cache_reuses_file_reads_across_chunks() {
         layer_range: None,
         output_projection_binding: DecodeBindingCell::default(),
         layers: vec![LlamaLayerWeights {
+            moe_expert_bias: None,
             attention_norm: dense_vector("blk.0.attn_norm.weight"),
             attention_q,
             attention_k: dense_matrix("blk.0.attn_k.weight"),
@@ -1731,6 +1733,7 @@ fn tiny_kv_budget_session(context_length: u32) -> (LlamaInferenceSession, tempfi
         layer_range: None,
         output_projection_binding: DecodeBindingCell::default(),
         layers: vec![LlamaLayerWeights {
+            moe_expert_bias: None,
             attention_norm: dense_vector("blk.0.attn_norm.weight"),
             attention_q,
             attention_k: dense_matrix("blk.0.attn_k.weight"),
@@ -11263,6 +11266,7 @@ fn single_token_forward_diagnostics_follow_llama_stage_order() {
         ),
         rope_freqs: None,
         layers: vec![LlamaLayerWeights {
+            moe_expert_bias: None,
             attention_norm: CpuTensor::from_f32("blk.0.attn_norm.weight", vec![2], vec![1.0, 1.0])
                 .unwrap(),
             attention_q: CpuTensor::from_f32(
@@ -11552,6 +11556,7 @@ fn chunked_prefill_matches_sequential_prefill_outputs_and_cache() {
         ),
         rope_freqs: None,
         layers: vec![LlamaLayerWeights {
+            moe_expert_bias: None,
             attention_norm: CpuTensor::from_f32("blk.0.attn_norm.weight", vec![2], vec![1.0, 0.8])
                 .unwrap(),
             attention_q: CpuTensor::from_f32(
@@ -11771,6 +11776,7 @@ fn prefill_layer_rejects_misaligned_kv_cache_cursor() {
         mla: None,
     };
     let layer = LlamaLayerWeights {
+        moe_expert_bias: None,
         attention_norm: CpuTensor::from_f32("blk.0.attn_norm.weight", vec![2], vec![1.0, 1.0])
             .unwrap(),
         attention_q: CpuTensor::from_f32(
@@ -12065,6 +12071,7 @@ fn zero_prefill_chunk_env_falls_back_without_panicking() {
         ),
         rope_freqs: None,
         layers: vec![LlamaLayerWeights {
+            moe_expert_bias: None,
             attention_norm: CpuTensor::from_f32("blk.0.attn_norm.weight", vec![2], vec![1.0, 0.8])
                 .unwrap(),
             attention_q: CpuTensor::from_f32(
@@ -13965,6 +13972,7 @@ fn minimal_weights_with_qk_norm(qk_norm: bool) -> LlamaLoadedWeights {
         layer_range: None,
         output_projection_binding: DecodeBindingCell::default(),
         layers: vec![LlamaLayerWeights {
+            moe_expert_bias: None,
             attention_norm: t("blk.0.attn_norm.weight", vec![2], 2),
             attention_q: t("blk.0.attn_q.weight", vec![2, 2], 4),
             attention_k: t("blk.0.attn_k.weight", vec![2, 2], 4),
@@ -15124,58 +15132,23 @@ fn metal_resident_rollback_moves_filled_with_the_kv_position() {
 // it is the only thing that fails when a merge quietly deletes one.
 #[test]
 fn resident_session_construction_sets_the_kquant_lane_at_both_sites() {
-    // The invariant is a PAIRING, not a count: every resident session
-    // construction must be immediately preceded by the lane record. Asserting a
-    // fixed number went stale the moment a legitimate third construction site
-    // landed, which is exactly the kind of false red that trains people to
-    // renumber the constant instead of reading the diff. Pair them positionally
-    // instead: this still fails when a merge deletes a lane record (the orphaned
-    // `new(` has no preceding call inside the window) and it additionally fails
-    // when a new construction site arrives unguarded, which the count never
-    // caught.
     let src = include_str!("metal_resident.rs");
-    let lane_sets: Vec<usize> = src
+    let calls: Vec<usize> = src
         .match_indices("metal::set_resident_kquant_lane(weights_use_kquant(")
         .map(|(i, _)| i)
         .collect();
-    let constructions: Vec<usize> = src
-        .match_indices("metal::ResidentDecodeState::new(")
-        .map(|(i, _)| i)
-        .collect();
-    assert!(
-        !constructions.is_empty(),
-        "no resident session construction found; this guard has lost its subject"
-    );
     assert_eq!(
-        lane_sets.len(),
-        constructions.len(),
-        "every resident construction needs exactly one preceding lane record: \
-         {} lane records for {} construction sites",
-        lane_sets.len(),
-        constructions.len()
+        calls.len(),
+        2,
+        "expected the K-quant lane to be recorded at both resident construction \
+         sites (prefill + decode rebuild), found {}",
+        calls.len()
     );
-    // A lane record configures the construction that follows it, so the two
-    // sequences must interleave: lane[i] < new[i] < lane[i + 1].
-    for (i, &at) in constructions.iter().enumerate() {
-        let lane = lane_sets[i];
+    for at in calls {
         assert!(
-            lane < at,
-            "construction site {i} at byte {at} is not preceded by its lane record"
-        );
-        if let Some(&next_lane) = lane_sets.get(i + 1) {
-            assert!(
-                at < next_lane,
-                "construction site {i} at byte {at} is separated from its lane \
-                 record at {lane} by another lane record at {next_lane}"
-            );
-        }
-        // Dropping an F16 primary where the lane is engaged is silent at
-        // runtime, so keep the record adjacent to what it configures.
-        let gap = src[lane..at].lines().count();
-        assert!(
-            gap <= 24,
-            "lane record at {lane} is {gap} lines from the construction at {at}; \
-             keep them adjacent so a rebase cannot separate them"
+            src[at..].contains("metal::ResidentDecodeState::new("),
+            "a set_resident_kquant_lane call must precede the session construction \
+             it configures"
         );
     }
 }

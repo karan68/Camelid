@@ -7,8 +7,12 @@ import { StatusDot } from './ui/StatusDot'
 import { CamelidMark } from './ui/CamelidMark'
 
 const TITLES = {
+  projects: 'Projects',
+  changes: 'Changes',
+  connections: 'Connections',
   chat: 'Chat',
   workspace: 'Workspace',
+  arena: 'Model Arena',
   library: 'Models',
   downloads: 'Downloaded models',
   api: 'API',
