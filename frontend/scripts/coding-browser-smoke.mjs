@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
 import { readFileSync, existsSync, mkdirSync } from 'node:fs'
-import { extname, resolve } from 'node:path'
+import { extname, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { launchBrowser } from './lib/launch-browser.mjs'
 const root = fileURLToPath(new URL('../..', import.meta.url))
@@ -98,7 +98,7 @@ const server = createServer(async (req,res) => {
   if (path==='/api/telemetry/stream') {res.writeHead(200,{'Content-Type':'text/event-stream'});res.end();return}
   if (path.startsWith('/api/') || path.startsWith('/v1/')) return json(res, {})
   const file=resolve(dist,'.'+(path==='/'?'/index.html':path))
-  if (!file.startsWith(dist+'/') || !existsSync(file)) {res.writeHead(404);res.end();return}
+  if (!file.startsWith(dist+sep) || !existsSync(file)) {res.writeHead(404);res.end();return}
   const mime={'.html':'text/html','.js':'text/javascript','.css':'text/css','.svg':'image/svg+xml','.woff2':'font/woff2','.woff':'font/woff'}
   res.writeHead(200,{'Content-Type':mime[extname(file)]||'application/octet-stream'});res.end(readFileSync(file))
  } catch (e) {errors.push(e.message);json(res,{error:{message:e.message}},500)}

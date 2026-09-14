@@ -265,6 +265,20 @@ jobs:
           RUST_MIN_STACK: 8388608
         run: cargo test --all-targets ${{ matrix.features }}
 
+      # Explicitly run the browser regression that stays ignored on developer
+      # machines without Chromium. Missing browser/report is a failure here.
+      - name: Setup Node for project browser verification
+        if: runner.os == 'macOS'
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+
+      - name: Code project Chromium verification
+        if: runner.os == 'macOS'
+        env:
+          CAMELID_BROWSER_PATH: /Applications/Google Chrome.app/Contents/MacOS/Google Chrome
+        run: cargo test --lib chat::coding_project::tests::chromium_load_check_distinguishes_valid_and_broken_javascript -- --ignored --exact --nocapture
+
       # Everything above this line is a DEBUG build, and that is exactly how a
       # release-only defect in the NVFP4 encoder sat in main unnoticed: while
       # `amax` is still the literal 0.0, LLVM peels the first compare of the
@@ -431,6 +445,28 @@ jobs:
       - name: Build frontend
         id: build
         run: npm run build
+
+      - name: Code session state smoke
+        if: ${{ !cancelled() }}
+        run: npm run smoke:coding
+
+      - name: Code browser smoke
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: npm run smoke:coding-browser
+
+      - name: Chat and Code transition browser smoke
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          npm run preview -- --host 127.0.0.1 --port 4176 --strictPort > /tmp/camelid-retro-preview.log 2>&1 &
+          preview_pid=$!
+          trap 'kill "$preview_pid" 2>/dev/null || true' EXIT
+          for i in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:4176/ >/dev/null; then break; fi
+            sleep 1
+          done
+          curl --fail --silent http://127.0.0.1:4176/ >/dev/null
+          CAMELID_CAPTURE_URL=http://127.0.0.1:4176 npm run smoke:retro-transitions
 
       # Every smoke below carries this. The smokes are independent of each other,
       # so stopping at the first failure only hides the rest: a red gate then

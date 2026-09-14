@@ -84,8 +84,8 @@ const server = await createServer({
   logLevel: 'silent',
   // SSR needs no browser dependency scan; closing during a cold Rolldown scan
   // can crash the native worker after every assertion has already passed.
-  optimizeDeps: { noDiscovery: true },
-  server: { middlewareMode: true },
+  optimizeDeps: { noDiscovery: true, include: [] },
+  server: { middlewareMode: true, watch: null },
 })
 
 try {
@@ -207,7 +207,7 @@ try {
   const PLANNER = resolve(frontendRoot, '..', 'src', 'execution_plan.rs')
   function plannerBackends() {
     const production = readFileSync(PLANNER, 'utf8').split(/^#\[cfg\(test\)\]/m)[0]
-    const lines = production.split('\n')
+    const lines = production.split(/\r?\n/)
     const found = new Set()
     for (let i = 0; i < lines.length - 1; i += 1) {
       if (!/^\s*(return )?\($/.test(lines[i])) continue
