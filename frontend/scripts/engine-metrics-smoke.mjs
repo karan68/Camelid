@@ -82,6 +82,9 @@ const server = await createServer({
   root: frontendRoot,
   appType: 'custom',
   logLevel: 'silent',
+  // SSR needs no browser dependency scan; closing during a cold Rolldown scan
+  // can crash the native worker after every assertion has already passed.
+  optimizeDeps: { noDiscovery: true },
   server: { middlewareMode: true },
 })
 
