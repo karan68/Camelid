@@ -51,6 +51,7 @@ pub mod spec_tree;
 mod spec_tree_lossless;
 pub mod speculative;
 pub mod suffix_decoding;
+pub mod target_row_hedge;
 pub mod token_recycling;
 mod win_pin;
 
@@ -112,9 +113,7 @@ use crate::{
     tensor::{
         dot_product,
         kv_quant::{
-            axpy_row_fp8_e4m3, axpy_row_fp8_e5m2, axpy_row_q4_0, axpy_row_q8_0,
-            vec_dot_row_fp8_e4m3, vec_dot_row_fp8_e5m2, vec_dot_row_q4_0, vec_dot_row_q8_0,
-            KV_QUANT_BLOCK_VALUES,
+            axpy_row_q4_0, axpy_row_q8_0, vec_dot_row_q4_0, vec_dot_row_q8_0, KV_QUANT_BLOCK_VALUES,
         },
         parse_byte_count_env, q8_0_file_read_stats, should_parallelize_linear_output,
         with_q8_file_cache_capacity_override, CpuTensor, Q8_0Block, Q8_0FileBacking,
@@ -334,9 +333,6 @@ pub struct LlamaLayerWeights {
     pub mla_kv_b_proj: Option<CpuTensor>,
 
     // DeepSeekMoE Shared Experts
-    /// Frozen per-expert selection bias (`exp_probs_b`). Added to the sigmoid
-    /// scores for top-k SELECTION only; committed weights use the unbiased scores.
-    pub moe_expert_bias: Option<CpuTensor>,
     pub moe_shared_gate: Option<CpuTensor>,
     pub moe_shared_up: Option<CpuTensor>,
     pub moe_shared_down: Option<CpuTensor>,
@@ -560,6 +556,33 @@ fn preflight_resident_moe_experts(estimate: MoeResidentMemoryEstimate) -> Result
 impl LlamaLoadedWeights {
     pub fn output_projection(&self) -> &CpuTensor {
         self.output.as_ref().unwrap_or(&self.token_embedding)
+    }
+
+    /// Whether the output projection reuses the token-embedding tensor's physical backing.
+    ///
+    /// The first indexed-output-head diagnostic is deliberately restricted to tied Q6_K. A
+    /// separately loaded but byte-equal output tensor is declined: physical Arc identity is a
+    /// simple fail-closed proof that the candidate token ids index the embedding/output rows.
+    pub fn output_projection_is_tied_embedding(&self) -> bool {
+        let Some(output) = self.output.as_ref() else {
+            return true;
+        };
+        match (
+            output.kquant_wire_pages.as_ref(),
+            self.token_embedding.kquant_wire_pages.as_ref(),
+        ) {
+            (Some(output), Some(embedding)) if std::sync::Arc::ptr_eq(output, embedding) => {
+                return true;
+            }
+            _ => {}
+        }
+        matches!(
+            (
+                output.q6_k_wire_bytes.as_ref(),
+                self.token_embedding.q6_k_wire_bytes.as_ref(),
+            ),
+            (Some(output), Some(embedding)) if std::sync::Arc::ptr_eq(output, embedding)
+        )
     }
 
     /// Audit where this node's Q8_0 weights physically live. Every owned dense Q8_0 linear
@@ -943,7 +966,6 @@ impl LlamaLoadedWeights {
                         gate_experts,
                         up_experts,
                         down_experts,
-                        ..
                     } => (
                         load_moe_experts(gate_experts)?,
                         load_moe_experts(up_experts)?,
@@ -1183,13 +1205,6 @@ impl LlamaLoadedWeights {
                     ffn_up,
                     ffn_down,
                     moe_router,
-                    moe_expert_bias: match &layer.ffn {
-                        LlamaFfnTensors::DeepSeekMoE {
-                            expert_bias: Some(desc),
-                            ..
-                        } => Some(store.load_cpu_f32(&desc.name)?),
-                        _ => None,
-                    },
                     moe_shared_gate,
                     moe_shared_up,
                     moe_shared_down,
@@ -1239,7 +1254,6 @@ impl LlamaLoadedWeights {
                         gate_experts,
                         up_experts,
                         down_experts,
-                        ..
                     } => (
                         match gate_experts {
                             LlamaMoeExpertTensors::Merged(desc) => &desc.name,
@@ -1337,7 +1351,6 @@ impl LlamaLoadedWeights {
                     ffn_down: CpuTensor::from_f32(ffn_down_name, vec![0], vec![])?,
                     moe_router: moe_router_name
                         .map(|n| CpuTensor::from_f32(n, vec![0], vec![]).unwrap()),
-                    moe_expert_bias: None,
                     moe_shared_gate: moe_shared_gate_name
                         .map(|n| CpuTensor::from_f32(n, vec![0], vec![]).unwrap()),
                     moe_shared_up: moe_shared_up_name
@@ -1527,6 +1540,58 @@ pub struct LlamaGreedyVerifyCapture {
     pub predictions: Vec<u32>,
     pub layer_inputs: Vec<CpuTensor>,
     pub timings: LlamaForwardTimings,
+}
+
+/// Teacher-forced target features used to train a one-layer EAGLE-3 head.
+///
+/// All tensors retain the input-token row order. `output_norm_state` is the residual
+/// stream after the target's final RMSNorm and immediately before its output projection;
+/// `layer_inputs` are the selected pre-layer residual streams. The target predictions are
+/// the exact greedy argmax ids produced by the same Q4 resident forward.
+#[derive(Debug, Clone)]
+pub struct LlamaEagle3TrainingCapture {
+    pub predictions: Vec<u32>,
+    pub layer_inputs: Vec<CpuTensor>,
+    pub output_norm_state: CpuTensor,
+    /// Full target-vocabulary logits in row-major `[rows, vocab]` order. The exporter
+    /// immediately gathers the fixed checkpoint d2t rows and releases this transient buffer.
+    pub logits: CpuTensor,
+    pub timings: LlamaForwardTimings,
+}
+
+/// Opt-in resident target verification result with compact top-8 candidates per verifier row.
+///
+/// `predictions` is still produced by the ordinary greedy verifier path. `target_top_k` is an
+/// additional deterministic readback in verifier-row order, and `emitted` is the target-approved
+/// sequence actually committed by the host acceptance rule.
+#[derive(Debug, Clone)]
+pub struct LlamaTargetTopKVerify {
+    pub predictions: Vec<u32>,
+    pub target_top_k: Vec<[u32; 8]>,
+    pub emitted: Vec<u32>,
+    pub timings: LlamaForwardTimings,
+}
+
+/// EAGLE-capable target verification with both decoder captures and compact target candidates.
+///
+/// This remains opt-in: ordinary greedy, EAGLE, and Token Recycling callers keep their existing
+/// result types and Metal entry points. `layer_inputs` and `target_top_k` share verifier-row order,
+/// while `predictions` continues to come from the production greedy argmax buffer.
+#[derive(Debug, Clone)]
+pub struct LlamaTargetTopKVerifyCapture {
+    pub predictions: Vec<u32>,
+    pub target_top_k: Vec<[u32; 8]>,
+    pub emitted: Vec<u32>,
+    pub layer_inputs: Vec<CpuTensor>,
+    pub timings: LlamaForwardTimings,
+}
+
+/// Benchmark-only wrapper pairing the unchanged authoritative verifier result with indexed-head
+/// diagnostics computed after the full output head has already selected the target predictions.
+#[derive(Debug, Clone)]
+pub struct LlamaIndexedHeadShadowVerify<T> {
+    pub authoritative: T,
+    pub shadow: crate::metal::ResidentIndexedHeadShadow,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -2503,36 +2568,12 @@ pub struct LlamaInferenceSession {
     /// Lazily-built GPU resident-decode session (a transient on-GPU cache; rebuilt on demand
     /// and not part of the session's logical identity, so it is skipped by Clone/PartialEq/Debug).
     resident_decode: Option<metal_resident::ResidentDecodeState>,
-    /// The exact prompt whose KV rows `resident_decode` holds in `[0, len)`, or empty when
-    /// nothing is vouched for.
-    ///
-    /// This is the record prefix continuation needs: a KV row is a pure function of the
-    /// token prefix that produced it, so the next turn can reuse the leading run its prompt
-    /// shares with THIS one. Over-claiming is not a slow path, it is silently wrong output,
-    /// so the record is set only by a prefill that actually wrote those rows and is cleared
-    /// by anything that writes the cache another way. Skipped by Clone/PartialEq/Debug for
-    /// the same reason `resident_decode` is: a clone gets no engine, so it vouches for
-    /// nothing.
-    resident_tokens: Vec<u32>,
     /// CUDA analog of `resident_decode` (the GPU-resident decode engine on
     /// NVIDIA hardware). Same transient-cache role; skipped by Clone/PartialEq/Debug.
     /// When set, the session never takes the GPU-resident prefill/decode paths, keeping the
     /// CPU KV buffers authoritative. Speculative decoding requires this: KV rollback after a
     /// rejected draft only exists for CPU state.
     resident_paths_disabled: bool,
-    /// Whether a CUDA-resident prefill mirrors its KV back to the host EAGERLY.
-    ///
-    /// Defaults to `true`, which is the historical behaviour, so any caller this was not
-    /// audited against keeps it. `prepare_generation` clears it for requests that cannot
-    /// reach `rollback_to_position` — that is, requests with no speculation — and those get
-    /// the lazy mirror instead.
-    ///
-    /// The direction of the default is the point. `rollback_to_position` needs
-    /// CPU-authoritative KV, and the lazy recovery can only supply it while
-    /// `filled == position`; a speculative rollback may run with drafts written past
-    /// `position`, where it cannot. Rather than argue about whether that is reachable,
-    /// speculating sessions simply keep the eager copy.
-    cpu_kv_mirror_eager: bool,
     /// Whether Metal resident decode may pre-commit the next token graph. Continuous-batch
     /// jobs disable this because another session can run before this one is scheduled again:
     /// a session-local graph waiting at the head of Metal's shared serial queue would
@@ -2557,21 +2598,6 @@ pub struct LlamaInferenceSession {
     /// True for a speculative draft-model session: routes its GPU resident engine to
     /// the dedicated drafter cache so draft + target models stay resident at once.
     is_drafter: bool,
-}
-
-/// Park the resident Metal engine instead of dropping it.
-///
-/// The API builds a fresh `LlamaInferenceSession` per request and lets it fall out of
-/// scope, so `Drop` is the only hook that catches every way a request can end — including
-/// the error paths, where dropping the engine is exactly what we want and parking refuses
-/// on its own (a failed prefill leaves the record and the watermark disagreeing).
-///
-/// A hollow placeholder from `take_for_step`, and every `clone()`, carry no engine, so this
-/// is a no-op for them.
-impl Drop for LlamaInferenceSession {
-    fn drop(&mut self) {
-        self.park_resident_metal_engine();
-    }
 }
 
 impl LlamaInferenceSession {
@@ -2629,10 +2655,6 @@ impl LlamaInferenceSession {
                     values_q8_0: Vec::new(),
                     keys_q4_0: Vec::new(),
                     values_q4_0: Vec::new(),
-                    keys_fp8_e4m3: Vec::new(),
-                    values_fp8_e4m3: Vec::new(),
-                    keys_fp8_e5m2: Vec::new(),
-                    values_fp8_e5m2: Vec::new(),
                     allocated_sequence_length: 0,
                     position: 0,
                     materialized_through: 0,
@@ -2640,9 +2662,7 @@ impl LlamaInferenceSession {
                 },
             ),
             resident_decode: self.resident_decode.take(),
-            resident_tokens: std::mem::take(&mut self.resident_tokens),
             resident_paths_disabled: self.resident_paths_disabled,
-            cpu_kv_mirror_eager: self.cpu_kv_mirror_eager,
             resident_encode_ahead_enabled: self.resident_encode_ahead_enabled,
             execution_trace: self.execution_trace.take(),
             resident_cache_key: self.resident_cache_key,
@@ -2733,9 +2753,7 @@ impl Clone for LlamaInferenceSession {
             weights: self.weights.clone(),
             kv_cache: self.kv_cache.clone(),
             resident_decode: None,
-            resident_tokens: Vec::new(),
             resident_paths_disabled: self.resident_paths_disabled,
-            cpu_kv_mirror_eager: self.cpu_kv_mirror_eager,
             resident_encode_ahead_enabled: self.resident_encode_ahead_enabled,
             execution_trace: None,
             resident_cache_key: self.resident_cache_key,
@@ -2776,9 +2794,7 @@ impl LlamaInferenceSession {
             weights,
             kv_cache: LlamaKvCache::new(plan, kv_quant)?,
             resident_decode: None,
-            resident_tokens: Vec::new(),
             resident_paths_disabled: false,
-            cpu_kv_mirror_eager: true,
             resident_encode_ahead_enabled: true,
             execution_trace: None,
             resident_cache_key: None,
@@ -2811,16 +2827,6 @@ impl LlamaInferenceSession {
     /// pins sessions to CPU because KV rollback only exists for CPU state.
     pub fn set_resident_paths_disabled(&mut self, disabled: bool) {
         self.resident_paths_disabled = disabled;
-    }
-
-    /// Allow a CUDA-resident prefill to skip the eager GPU->host KV mirror.
-    ///
-    /// Only safe for a request that cannot reach `rollback_to_position`, because that is
-    /// the one CPU-KV consumer the lazy path cannot always satisfy (it needs
-    /// `filled == position`, and a speculative rollback may run with drafts written past
-    /// `position`). Callers that do not know pass nothing and keep the eager default.
-    pub fn set_cpu_kv_mirror_eager(&mut self, eager: bool) {
-        self.cpu_kv_mirror_eager = eager;
     }
 
     /// Enable or disable Metal's single-session next-token encode-ahead pipeline.
@@ -2871,12 +2877,6 @@ impl LlamaInferenceSession {
     /// rollback, so any resident session is dropped and reseeds from CPU on
     /// next use.
     pub fn rollback_to_position(&mut self, position: usize) -> Result<()> {
-        // Materialize on demand, exactly as the three CPU forward readers do. A
-        // GPU-resident prefill no longer mirrors its KV back eagerly, so on that lane
-        // the history this rollback needs lives only on the device until something
-        // asks for it — and this is one of the things that asks. Never returns Err for
-        // a failed recovery, so the authority check below still decides.
-        self.ensure_cpu_kv_materialized()?;
         if !self.cpu_kv_authoritative() {
             return Err(BackendError::RuntimeShapeMismatch(
                 "KV rollback requires CPU-authoritative KV state; the GPU-resident prefill \
@@ -2885,9 +2885,6 @@ impl LlamaInferenceSession {
             ));
         }
         self.resident_decode = None;
-        // The engine is gone, so nothing vouches for those rows any more. Leaving the
-        // record behind would let a later turn claim a prefix no engine holds.
-        self.resident_tokens.clear();
         self.kv_cache.rollback_to_position(position)
     }
 
@@ -3014,7 +3011,7 @@ impl LlamaInferenceSession {
         if !resident_decode_metal_enabled() && !resident_decode_cuda_enabled() {
             bail!("neither CAMELID_METAL_RESIDENT_DECODE nor CAMELID_CUDA_RESIDENT_DECODE enabled");
         }
-        if self.config.moe.is_some() && self.config.architecture != "mobilemoe" {
+        if self.config.moe.is_some() {
             bail!("moe config");
         }
         if want_logits && self.config.logit_scale.is_some() {
@@ -3149,36 +3146,16 @@ impl LlamaInferenceSession {
                  drops the gemma3 embed scale; serve falls back to the runnable bridge"
             );
         }
-        // mobilemoe rides the resident lane with its routed experts: the layer's "dense"
-        // FFN slots carry the always-on shared expert, and the stacked expert tensors
-        // (retained as RAM-resident Q8 blocks behind the shared-Arc accessor, which the
-        // `q8_0_blocks` field does not see) must be Q8_0 with materialized blocks.
-        let moe_arch = self.config.architecture == "mobilemoe";
-        let is_q8_expert_stack = |t: &CpuTensor| {
-            t.source_type == Some(GgufTensorType::Q8_0) && t.q8_0_block_slice().is_some()
-        };
         for (idx, layer) in self.weights.layers[range].iter().enumerate() {
-            let moe_layer = moe_arch && layer.moe_router.is_some();
-            let ffn_ok = if moe_layer {
-                matches!(
-                    (&layer.moe_shared_gate, &layer.moe_shared_up, &layer.moe_shared_down),
-                    (Some(g), Some(u), Some(d))
-                        if is_resident_quant(g) && is_resident_quant(u) && is_resident_quant(d)
-                ) && is_q8_expert_stack(&layer.ffn_gate)
-                    && is_q8_expert_stack(&layer.ffn_up)
-                    && is_q8_expert_stack(&layer.ffn_down)
-            } else {
-                is_resident_quant(&layer.ffn_gate)
-                    && is_resident_quant(&layer.ffn_up)
-                    && is_resident_quant(&layer.ffn_down)
-            };
             if layer.attention_biases.is_some()
-                || (layer.moe_router.is_some() && !moe_layer)
+                || layer.moe_router.is_some()
                 || !is_resident_quant(&layer.attention_q)
                 || !is_resident_quant(&layer.attention_k)
                 || !is_resident_quant(&layer.attention_v)
                 || !is_resident_quant(&layer.attention_output)
-                || !ffn_ok
+                || !is_resident_quant(&layer.ffn_gate)
+                || !is_resident_quant(&layer.ffn_up)
+                || !is_resident_quant(&layer.ffn_down)
             {
                 bail!(format!(
                     "layer {idx} not resident-eligible (attention_biases={}, q8 blocks/pages present: q={}/{} k={}/{} v={}/{} o={}/{} gate={}/{} up={}/{} down={}/{})",
@@ -3420,126 +3397,34 @@ impl LlamaInferenceSession {
                 v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off")
             })
             .unwrap_or_else(|| !slot.engine.prefers_batched_prefill());
-        // Prefix continuation: every turn of a conversation re-sends the whole
-        // history, so the leading positions of this prompt are usually the exact
-        // positions the resident engine just built for the previous turn. A KV row
-        // is a pure function of the token prefix that produced it, so those rows
-        // ARE the rows this prompt needs — reusing them is not an approximation and
-        // needs no host mirror. (That distinction is what makes this safe on a lane
-        // where the prompt-prefix cache is deliberately bypassed: the cache reseeds
-        // GPU KV from f16-rounded host history, which is NOT bit-identical to a
-        // fresh prefill. Continuation never leaves the GPU.)
-        //
-        // The last shared token is always recomputed (`.min(n - 1)`) so the prefill
-        // still ends by writing position n-1, which is the state the decode lane
-        // expects. `CAMELID_CUDA_PREFIX_CONTINUATION=0` forces a full prefill so the
-        // saving can be A/B'd against the same binary.
-        let continuation_enabled = !std::env::var_os("CAMELID_CUDA_PREFIX_CONTINUATION")
-            .map(|v| {
-                let v = v.to_string_lossy();
-                let v = v.trim();
-                v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off")
-            })
-            .unwrap_or(false);
-        let reuse = if continuation_enabled {
-            slot.engine
-                .resident_prefix_len(token_ids)
-                .min(n.saturating_sub(1))
-        } else {
-            0
-        };
-        // Drop the watermark to the reused span before prefilling the rest, so a
-        // failure below leaves no claim on rows this prefill never wrote.
-        slot.engine.set_filled(reuse);
         let prefill_result = if serial_prefill {
             slot.engine
-                .prefill_from(&embeddings.data, &tables.cos, &tables.sin, n, scale, reuse)
+                .prefill(&embeddings.data, &tables.cos, &tables.sin, n, scale)
         } else {
-            slot.engine.prefill_batched_from(
-                &embeddings.data,
-                &tables.cos,
-                &tables.sin,
-                n,
-                scale,
-                reuse,
-            )
+            slot.engine
+                .prefill_batched(&embeddings.data, &tables.cos, &tables.sin, n, scale)
         };
         if prefill_result.is_err() {
             // A partial prefill leaves the GPU KV inconsistent; mark unfilled so the
             // decode path rebuilds/reseeds rather than trusting it.
             slot.engine.set_filled(0);
-            slot.engine.set_resident_tokens(&[]);
             return Ok(false);
         }
         slot.engine.set_filled(n);
-        // Record the sequence these rows now hold, so the NEXT turn can continue
-        // from it. Ordered after `set_filled(n)`, which truncates the record to the
-        // watermark.
-        slot.engine.set_resident_tokens(token_ids);
-        if trace && reuse > 0 {
-            eprintln!(
-                "[resident-cuda] prefix continuation: reused {reuse} of {n} positions, \
-                 prefilled {}",
-                n - reuse
-            );
-        }
-        // The GPU prefill fills only the GPU KV cache. The CPU-side cache is mirrored
-        // back LAZILY, by `ensure_cpu_kv_materialized`, at the moment a CPU reader
-        // actually needs the history — not here.
-        //
-        // This used to mirror eagerly on every request, justified by a comment saying
-        // the copy was "a few MB of device->host transfer, negligible next to the
-        // prefill compute it follows". Both halves stopped being true. The copy is
-        // `n_layers * n_kv * n * head_dim * 2` elements, so it scales with the WHOLE
-        // context (~170 MiB on the wire for a 3B at 1.5k positions, plus a scalar
-        // host-side expansion loop); and once prefix continuation cut the prefill down
-        // to the newly appended tokens, there was no longer a large compute for it to
-        // be negligible next to. Measured on the RTX 3060 Laptop reference, the mirror
-        // was 62-74% of a follow-up turn's reported prefill time.
-        //
-        // Lazy is safe for the readers that can always be satisfied on demand: the three
-        // CPU forward readers (`forward_layer_range_from_hidden`,
-        // `forward_single_token_timed_internal`, and the verify path) call
-        // `ensure_cpu_kv_materialized` before touching the history, and they do so while
-        // `filled == position` still holds, which is what the recovery requires. On the
-        // common path — GPU prefill, GPU decode, no fallback — nothing reads it at all.
-        //
-        // `rollback_to_position` is the one that CANNOT always be satisfied that way: a
-        // speculative rollback may run with drafts written past `position`, and the
-        // recovery declines whenever `filled != position`. So rather than reason about
-        // whether that is reachable, sessions that speculate keep the eager copy
-        // (`cpu_kv_mirror_eager`, default true, cleared only by `prepare_generation` for
-        // requests with no speculation).
-        //
-        // REMAINING EXPOSURE, stated rather than argued away: if the resident engine is
-        // rebuilt or evicted BETWEEN this prefill and a later decode of the same request,
-        // a reseed is needed (`filled != position`) at exactly the moment the recovery
-        // declines for the same reason, and that forward attends over a zero-filled
-        // prefix — degraded output with only a one-shot stderr warning. The eager copy
-        // left a host copy that covered this. It needs the engine displaced DURING a
-        // request, which run-to-completion scheduling on this lane makes very hard to
-        // reach, but it is not proven unreachable.
-        // `CAMELID_CUDA_EAGER_KV_MIRROR=1` restores the eager copy everywhere.
-        if self.cpu_kv_mirror_eager || eager_kv_mirror_enabled() {
-            let mirror_started = Instant::now();
-            if let Err(e) =
-                self.copy_resident_cuda_kv_to_host(&slot.engine, n_layers, n, n_kv, head_dim)
-            {
-                if trace {
-                    eprintln!(
-                        "[resident-cuda] KV readback to host failed ({e}); using CPU prefill"
-                    );
-                }
-                slot.engine.set_filled(0);
-                slot.engine.set_resident_tokens(&[]);
-                return Ok(false);
-            }
+        // The GPU prefill only fills the GPU KV cache. Copy it back so the CPU-side
+        // KV cache is authoritative too: otherwise any later forward that takes the
+        // CPU path (dense diagnostics, a GPU-decode fallback, or a KV rollback) reads
+        // an all-zero history and generation degenerates. The copy is a few MB of
+        // device->host transfer ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â negligible next to the prefill compute it follows,
+        // and it keeps both backends in lockstep.
+        if let Err(e) =
+            self.copy_resident_cuda_kv_to_host(&slot.engine, n_layers, n, n_kv, head_dim)
+        {
             if trace {
-                eprintln!(
-                    "[resident-cuda] KV mirror to host: {n} positions in {} ms",
-                    mirror_started.elapsed().as_millis()
-                );
+                eprintln!("[resident-cuda] KV readback to host failed ({e}); using CPU prefill");
             }
+            slot.engine.set_filled(0);
+            return Ok(false);
         }
         drop(guard);
         self.kv_cache.position = n;
@@ -5739,9 +5624,7 @@ impl LlamaInferenceSession {
             });
         }
         let resident_prefill_started = Instant::now();
-        let resident_prefill_ok =
-            prefill_count > 1 && self.try_resident_prefill(&token_ids[..prefill_count])?;
-        if resident_prefill_ok {
+        if prefill_count > 1 && self.try_resident_prefill(&token_ids[..prefill_count])? {
             // Whole prompt prefilled on the GPU in one command buffer; the last prompt
             // token below decodes through the resident session. The wall-clock covers
             // session setup + the command buffer; per-stage GPU splits aren't available.
@@ -8067,26 +7950,6 @@ fn forward_layer_timed(
             &cached_layer_label!(layer_idx, "attention_k_rope"),
         )?
     };
-    // MobileMoE applies a PARAMETERLESS L2 QK-norm AFTER RoPE — the reverse of
-    // qwen3, which applies a weighted per-head RMSNorm BEFORE it. The checkpoint
-    // ships no attn_q_norm/attn_k_norm tensors at all, so the weighted path above
-    // is a no-op here and this is where the normalisation actually happens.
-    let (q, k) = if config.architecture == "mobilemoe" {
-        (
-            q.per_head_l2_norm(
-                config.attention_head_count as usize,
-                rms_norm_epsilon,
-                cached_layer_label!(layer_idx, "attention_q_l2_norm"),
-            )?,
-            k.per_head_l2_norm(
-                config.attention_head_count_kv as usize,
-                rms_norm_epsilon,
-                cached_layer_label!(layer_idx, "attention_k_l2_norm"),
-            )?,
-        )
-    } else {
-        (q, k)
-    };
     let attention_q_rope_stats = collect_diagnostics
         .then(|| LlamaTensorStats::from_tensor(&q))
         .transpose()?;
@@ -8276,7 +8139,6 @@ fn forward_layer_timed(
                 &ffn_norm,
                 DeepSeekMoeWeights {
                     router,
-                    expert_bias: layer.moe_expert_bias.as_ref(),
                     shared_gate,
                     shared_up,
                     shared_down,
@@ -8711,24 +8573,6 @@ fn forward_prefill_layer_chunk_timed(
     } else {
         k
     };
-    // MobileMoE: parameterless L2 QK-norm AFTER RoPE (see the decode path). Both
-    // paths must agree or the KV written during prefill would not match decode.
-    let (q, k) = if config.architecture == "mobilemoe" {
-        (
-            q.per_head_l2_norm(
-                config.attention_head_count as usize,
-                params.rms_norm_epsilon,
-                cached_layer_label!(layer_idx, "prefill_attention_q_l2_norm"),
-            )?,
-            k.per_head_l2_norm(
-                config.attention_head_count_kv as usize,
-                params.rms_norm_epsilon,
-                cached_layer_label!(layer_idx, "prefill_attention_k_l2_norm"),
-            )?,
-        )
-    } else {
-        (q, k)
-    };
     timings.attention_rope = started.elapsed().as_micros();
     if let Some(memory) = &mut memory {
         memory.record_after_attention_rope(capture_memory_sample(kv_cache));
@@ -8812,7 +8656,6 @@ fn forward_prefill_layer_chunk_timed(
                 &ffn_norm,
                 DeepSeekMoeWeights {
                     router,
-                    expert_bias: layer.moe_expert_bias.as_ref(),
                     shared_gate,
                     shared_up,
                     shared_down,
@@ -12618,7 +12461,6 @@ fn mixtral_moe_ffn(
 
 struct DeepSeekMoeWeights<'a> {
     router: &'a CpuTensor,
-    expert_bias: Option<&'a CpuTensor>,
     shared_gate: &'a CpuTensor,
     shared_up: &'a CpuTensor,
     shared_down: &'a CpuTensor,
@@ -12642,7 +12484,6 @@ fn deepseek_moe_ffn(
 )> {
     let DeepSeekMoeWeights {
         router,
-        expert_bias: _expert_bias,
         shared_gate,
         shared_up,
         shared_down,
@@ -12670,12 +12511,13 @@ fn deepseek_moe_ffn(
     let mut down_elapsed = 0;
 
     // 1. Shared Expert Pass
-    // NOTE: must be the BATCH helper. `gated_ffn_activation` hard-refuses rows != 1
-    // (see its rank/rows guard), yet the loop below indexes `shared_expert_out` over
-    // `rows` rows — so prefill died on layer 0 the moment a shared-expert model
-    // became reachable. This path had never executed before MobileMoE.
-    let shared_activated =
-        gated_ffn_activation_batch(input, shared_gate, shared_up, "shared_expert_activated")?;
+    let shared_activated = gated_ffn_activation(
+        input,
+        shared_gate,
+        shared_up,
+        "shared_expert_activated",
+        false,
+    )?;
     gate_elapsed += shared_activated.gate;
     up_elapsed += shared_activated.up;
     activation_elapsed += shared_activated.activation;
@@ -12708,25 +12550,16 @@ fn deepseek_moe_ffn(
 
         let mut weights_and_indices = match moe.expert_gating_func {
             2 => {
-                // SIGMOID. When the row ships a frozen `exp_probs_b` bias
-                // (DeepSeek-V3 loss-free balancing, and MobileMoE), that bias is
-                // added ONLY to steer top-k selection — the committed weights are
-                // gathered from the UNBIASED sigmoid scores. Ranking on the biased
-                // score while returning the biased value would change the mixture,
-                // not just which experts are consulted.
+                // SIGMOID
                 let mut scored = Vec::with_capacity(expert_count);
                 for col in 0..expert_count {
                     let logit = logits.data[row * expert_count + col];
                     let sigmoid = 1.0 / (1.0 + (-logit).exp());
-                    let selection_score = match weights.expert_bias {
-                        Some(bias) => sigmoid + bias.data[col],
-                        None => sigmoid,
-                    };
-                    scored.push((col, sigmoid, selection_score));
+                    scored.push((col, sigmoid));
                 }
-                scored.sort_by(|a, b| b.2.total_cmp(&a.2));
+                scored.sort_by(|a, b| b.1.total_cmp(&a.1));
                 scored.truncate(moe.expert_used_count as usize);
-                scored.into_iter().map(|(c, w, _)| (c, w)).collect()
+                scored
             }
             _ => {
                 // SOFTMAX (DeepSeek V2 uses softmax, but not renormalized like Mixtral)
@@ -13560,32 +13393,8 @@ pub fn reset_resident_caches() {
     // unload path exists to prevent).
     crate::cuda::release_async_pool();
 }
-/// Non-CUDA hosts have no resident CUDA engine to drop, but macOS still holds resident
-/// weights: the process-global Metal buffer cache pins each model's page-aligned wire
-/// allocation, and on the default `serve` path (`CAMELID_METAL_NOCOPY`) that allocation IS
-/// the weights. This arm was an empty stub, so `release_model` freed the registries and
-/// none of the memory — the outgoing model stayed resident for the life of the process,
-/// a reload took a second full copy at a new address, and the fit advisor's "releasing it
-/// frees ~N GB" was false on this platform. Evicting only what no live model still owns
-/// makes the existing call site do on macOS what it already did on CUDA.
 #[cfg(not(feature = "cuda"))]
-pub fn reset_resident_caches() {
-    #[cfg(target_os = "macos")]
-    {
-        // Drop the parked resident engine FIRST. It holds this model's GPU KV cache and,
-        // more to the point, it is the thing standing between the weight buffers and the
-        // eviction sweep below — a parked engine outliving its model would keep its
-        // allocation referenced and make the sweep a no-op.
-        metal_resident::clear_parked_resident_metal();
-        let freed = crate::metal::evict_unreferenced_resident_weights();
-        if freed > 0 && std::env::var_os("CAMELID_RESIDENT_TRACE").is_some() {
-            eprintln!(
-                "[resident-cache] evicted {:.2} GiB of unreferenced resident weights",
-                freed as f64 / (1024.0 * 1024.0 * 1024.0)
-            );
-        }
-    }
-}
+pub fn reset_resident_caches() {}
 
 /// Prompt-lookup n-gram drafter: find the most recent earlier occurrence of the
 /// last `ngram` tokens and propose the up-to-`max_draft` tokens that followed it.
@@ -14230,25 +14039,6 @@ fn resident_cuda_max_context() -> usize {
         .and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|v| *v >= 256)
         .unwrap_or(usize::MAX)
-}
-
-/// Restore the eager GPU->host KV mirror after a CUDA-resident prefill.
-///
-/// Default OFF: the mirror is lazy, performed by `ensure_cpu_kv_materialized` when a
-/// CPU reader actually needs the history. This exists so the saving can be A/B'd
-/// against the same binary, and as an escape hatch if a host turns out to reach the
-/// CPU KV through a path that does not materialize on demand.
-#[cfg(feature = "cuda")]
-fn eager_kv_mirror_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        matches!(
-            std::env::var("CAMELID_CUDA_EAGER_KV_MIRROR")
-                .ok()
-                .as_deref(),
-            Some("1") | Some("true") | Some("on") | Some("yes")
-        )
-    })
 }
 
 #[allow(dead_code)]
@@ -27414,16 +27204,6 @@ fn attention_context_for_head_into_with_kernels(
                     [key_block_start..key_block_start + key_blocks_per_row];
                 vec_dot_row_q4_0(params.query_slice, key_blocks) * params.scale
             }
-            KvDtype::Fp8E4m3 => {
-                let key_blocks = &params.kv_cache.keys_fp8_e4m3
-                    [key_block_start..key_block_start + key_blocks_per_row];
-                vec_dot_row_fp8_e4m3(params.query_slice, key_blocks) * params.scale
-            }
-            KvDtype::Fp8E5m2 => {
-                let key_blocks = &params.kv_cache.keys_fp8_e5m2
-                    [key_block_start..key_block_start + key_blocks_per_row];
-                vec_dot_row_fp8_e5m2(params.query_slice, key_blocks) * params.scale
-            }
         };
         scores.push(score);
         if position + 1 < params.position_count {
@@ -27508,26 +27288,6 @@ fn attention_context_for_head_into_with_kernels(
                         [quantized_value_start..quantized_value_start + value_blocks_per_row]
                 };
                 axpy_row_q4_0(out_slice, probability, value_blocks);
-            }
-            KvDtype::Fp8E4m3 => {
-                let value_blocks = if is_mla {
-                    &params.kv_cache.keys_fp8_e4m3[quantized_key_value_start
-                        ..quantized_key_value_start + value_blocks_per_row]
-                } else {
-                    &params.kv_cache.values_fp8_e4m3
-                        [quantized_value_start..quantized_value_start + value_blocks_per_row]
-                };
-                axpy_row_fp8_e4m3(out_slice, probability, value_blocks);
-            }
-            KvDtype::Fp8E5m2 => {
-                let value_blocks = if is_mla {
-                    &params.kv_cache.keys_fp8_e5m2[quantized_key_value_start
-                        ..quantized_key_value_start + value_blocks_per_row]
-                } else {
-                    &params.kv_cache.values_fp8_e5m2
-                        [quantized_value_start..quantized_value_start + value_blocks_per_row]
-                };
-                axpy_row_fp8_e5m2(out_slice, probability, value_blocks);
             }
         }
         if position + 1 < params.position_count {

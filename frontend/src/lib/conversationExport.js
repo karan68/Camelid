@@ -8,16 +8,9 @@ const MESSAGE_EXPORT_FIELDS = [
   'id', 'role', 'content', 'created_at', 'model_id', 'model_name',
   'finish_reason', 'usage', 'usage_source', 'elapsed_ms',
   'first_content_ms', 'tokens_out_per_sec', 'support_row',
-  'web_research', 'image',
 ]
 
 const SUPPORT_ROW_FIELDS = ['id', 'status', 'supported']
-/* data_url LAST on purpose: pick() preserves this order, so the multi-megabyte
-   string lands at the end of each message object and the descriptive fields
-   stay readable at the top instead of sitting behind a wall of base64. */
-const IMAGE_EXPORT_FIELDS = ['name', 'type', 'size', 'width', 'height', 'data_url']
-const WEB_RESEARCH_FIELDS = ['reason', 'query', 'sources', 'warnings']
-const WEB_SOURCE_FIELDS = ['title', 'url']
 
 function pick(source, fields) {
   const out = {}
@@ -25,19 +18,6 @@ function pick(source, fields) {
     if (source?.[field] !== undefined && source?.[field] !== null) out[field] = source[field]
   }
   return out
-}
-
-function safeWebUrl(value) {
-  try {
-    const url = new URL(String(value || ''))
-    return ['http:', 'https:'].includes(url.protocol) ? url.toString() : null
-  } catch {
-    return null
-  }
-}
-
-function markdownLabel(value) {
-  return String(value || '').replace(/([\\\[\]`*_<>])/g, '\\$1').replace(/[\r\n]+/g, ' ').trim()
 }
 
 export function exportableConversation(conversation) {
@@ -53,15 +33,6 @@ export function exportableConversation(conversation) {
     messages: (conversation?.messages || []).map((message) => {
       const picked = pick(message, MESSAGE_EXPORT_FIELDS)
       if (picked.support_row) picked.support_row = pick(picked.support_row, SUPPORT_ROW_FIELDS)
-      if (picked.image) picked.image = pick(picked.image, IMAGE_EXPORT_FIELDS)
-      if (picked.web_research) {
-        picked.web_research = pick(picked.web_research, WEB_RESEARCH_FIELDS)
-        picked.web_research.sources = (picked.web_research.sources || [])
-          .map((source) => pick(source, WEB_SOURCE_FIELDS))
-          .map((source) => ({ ...source, url: safeWebUrl(source.url) }))
-          .filter((source) => source.url)
-        picked.web_research.warnings = (picked.web_research.warnings || []).map(String).filter(Boolean)
-      }
       return picked
     }),
   }
@@ -69,45 +40,6 @@ export function exportableConversation(conversation) {
 
 export function conversationToJson(conversation) {
   return JSON.stringify(exportableConversation(conversation), null, 2)
-}
-
-/* Bulk export. Same per-conversation whitelist, so the field policy above is
-   the only place that decides what may leave this machine -- a second shape
-   here is how an export starts leaking local paths again. Tags ride along so
-   an import lands organized; pinned/archived deliberately do not, because
-   they describe THIS machine's list, not the conversation. */
-export function exportableConversations(conversations) {
-  return {
-    format: 'camelid.conversations/v1',
-    exported_at: new Date().toISOString(),
-    telemetry_note: 'Timing/token fields are operational telemetry (client-measured unless usage_source=backend). They are not compatibility or support evidence.',
-    conversation_count: (conversations || []).length,
-    conversations: (conversations || []).map((conversation) => {
-      const exported = exportableConversation(conversation)
-      const tags = Array.isArray(conversation?.tags)
-        ? conversation.tags.map((tag) => String(tag)).filter(Boolean)
-        : []
-      if (tags.length) exported.tags = tags
-      return exported
-    }),
-  }
-}
-
-export function conversationsToJson(conversations) {
-  return JSON.stringify(exportableConversations(conversations), null, 2)
-}
-
-export function downloadAllConversations(conversations) {
-  const blob = new Blob([conversationsToJson(conversations)], { type: 'application/json' })
-  const url = URL.createObjectURL(blob)
-  const anchor = document.createElement('a')
-  const stamp = new Date().toISOString().slice(0, 10)
-  anchor.href = url
-  anchor.download = `camelid-conversations-${stamp}.json`
-  document.body.appendChild(anchor)
-  anchor.click()
-  anchor.remove()
-  URL.revokeObjectURL(url)
 }
 
 export function conversationToMarkdown(conversation) {
@@ -120,19 +52,6 @@ export function conversationToMarkdown(conversation) {
     if (message.role !== 'user' && message.role !== 'assistant') continue
     lines.push(`## ${message.role === 'user' ? 'You' : 'Camelid'}`, '')
     lines.push(message.content || '', '')
-    /* Outside the assistant branch below: the attachment rides on the user
-       turn. Metadata only — a data URL would put megabytes on one line and
-       destroy the pasteability every other note here preserves. */
-    if (message.role === 'user' && message.image) {
-      const size = `${Math.round((message.image.size || 0) / 1024)} KB`
-      const dims = message.image.width && message.image.height
-        ? ` · ${message.image.width}×${message.image.height}`
-        : ''
-      lines.push(
-        `> Attached image: ${markdownLabel(message.image.name)} (${markdownLabel(message.image.type)} · ${size}${dims}) — image data is not included in Markdown; export JSON to keep it.`,
-        '',
-      )
-    }
     if (message.role === 'assistant') {
       const meta = []
       if (message.model_id) meta.push(`model \`${message.model_id}\``)
@@ -141,12 +60,6 @@ export function conversationToMarkdown(conversation) {
         meta.push(`${message.usage.prompt_tokens}→${message.usage.completion_tokens} tokens${message.usage_source === 'backend' ? '' : ' (client estimate)'}`)
       }
       if (meta.length) lines.push(`> ${meta.join(' · ')} — telemetry, not support evidence`, '')
-      if (message.web_research?.sources?.length || message.web_research?.warnings?.length) {
-        lines.push('### Web sources', '')
-        message.web_research.sources.forEach((source) => lines.push(`- [${markdownLabel(source.title || source.url)}](<${source.url}>)`))
-        message.web_research.warnings.forEach((warning) => lines.push(`> Web research warning: ${markdownLabel(warning)}`))
-        lines.push('')
-      }
     }
   }
   return lines.join('\n')

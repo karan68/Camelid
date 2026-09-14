@@ -1,11 +1,14 @@
 use std::{
-    collections::BTreeMap,
-    io::Write,
+    collections::{BTreeMap, BTreeSet, VecDeque},
+    fs::File,
+    io::{BufRead, BufReader, Write},
     net::{SocketAddr, TcpListener, TcpStream},
     path::PathBuf,
     sync::Arc,
     time::Instant,
 };
+
+use anyhow::Context;
 
 #[cfg(target_os = "macos")]
 extern "C" {
@@ -13,52 +16,6 @@ extern "C" {
         qos_class: u32,
         relative_priority: std::os::raw::c_int,
     ) -> std::os::raw::c_int;
-}
-
-/// Commit prefixes used by the rejected-tail overwrite receipt for one physical
-/// verifier width. The middle case straddles the boundary between the two K8
-/// fragments at W16, while zero/full pin rollback and complete-commit behavior.
-#[cfg(any(target_os = "macos", test))]
-fn gemma4_rejected_tail_commit_prefixes(width: usize) -> Option<Vec<usize>> {
-    if !matches!(width, 1 | 2 | 4 | 8 | 16) {
-        return None;
-    }
-    let mut prefixes = vec![
-        0,
-        1,
-        (width / 2).saturating_sub(1),
-        width.saturating_sub(1),
-        width,
-    ];
-    prefixes.sort_unstable();
-    prefixes.dedup();
-    Some(prefixes)
-}
-
-#[cfg(test)]
-mod gemma4_verifier_receipt_tests {
-    use super::gemma4_rejected_tail_commit_prefixes;
-
-    #[test]
-    fn rejected_tail_prefixes_scale_through_physical_w16() {
-        let cases: [(usize, &[usize]); 5] = [
-            (1, &[0, 1]),
-            (2, &[0, 1, 2]),
-            (4, &[0, 1, 3, 4]),
-            (8, &[0, 1, 3, 7, 8]),
-            (16, &[0, 1, 7, 15, 16]),
-        ];
-        for (width, expected) in cases {
-            assert_eq!(
-                gemma4_rejected_tail_commit_prefixes(width).as_deref(),
-                Some(expected),
-                "physical W{width}",
-            );
-        }
-        for refused in [0usize, 3, 6, 12, 15, 17, usize::MAX] {
-            assert!(gemma4_rejected_tail_commit_prefixes(refused).is_none());
-        }
-    }
 }
 
 #[cfg(test)]
@@ -135,6 +92,48 @@ mod ghost_moe_cli_tests {
     }
 
     #[test]
+    fn eagle3_corpus_materializer_cli_pins_target_and_resume_shape() {
+        on_cli_test_stack(|| {
+            let cli = Cli::try_parse_from([
+                "camelid",
+                "materialize-eagle3-corpus",
+                "target.gguf",
+                "--target-sha256",
+                "1111111111111111111111111111111111111111111111111111111111111111",
+                "--jobs",
+                "train.jobs.jsonl",
+                "--jobs-sha256",
+                "2222222222222222222222222222222222222222222222222222222222222222",
+                "--output",
+                "materialized",
+                "--resume",
+                "--max-shards",
+                "1",
+            ])
+            .expect("parse materializer flags");
+            match cli.command {
+                Some(Command::MaterializeEagle3Corpus {
+                    model,
+                    jobs,
+                    output,
+                    shard_size,
+                    resume,
+                    max_shards,
+                    ..
+                }) => {
+                    assert_eq!(model, PathBuf::from("target.gguf"));
+                    assert_eq!(jobs, PathBuf::from("train.jobs.jsonl"));
+                    assert_eq!(output, PathBuf::from("materialized"));
+                    assert_eq!(shard_size, 64);
+                    assert!(resume);
+                    assert_eq!(max_shards, Some(1));
+                }
+                other => panic!("expected MaterializeEagle3Corpus, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
     fn bench_eagle3_dynamic_tree_flags_are_optional_and_deterministic() {
         on_cli_test_stack(|| {
             let defaults =
@@ -142,6 +141,7 @@ mod ghost_moe_cli_tests {
                     .expect("parse EAGLE-3 linear defaults");
             match defaults.command {
                 Some(Command::BenchEagle3 {
+                    eagle3_secondary,
                     draft_tokens,
                     tree_nodes,
                     tree_topk,
@@ -150,6 +150,7 @@ mod ghost_moe_cli_tests {
                     ..
                 }) => {
                     assert_eq!(draft_tokens, 4);
+                    assert_eq!(eagle3_secondary, None);
                     assert_eq!(tree_nodes, None);
                     assert_eq!(tree_topk, 4);
                     assert_eq!(tree_expansions, 4);
@@ -206,24 +207,68 @@ mod ghost_moe_cli_tests {
                 suffix_without_tree.kind(),
                 clap::error::ErrorKind::MissingRequiredArgument
             );
+
+            let paired = Cli::try_parse_from([
+                "camelid",
+                "bench-eagle3",
+                "target.gguf",
+                "--eagle3",
+                "e9",
+                "--eagle3-secondary",
+                "sw512",
+                "--tree-nodes",
+                "8",
+            ])
+            .expect("parse dual-EAGLE checkpoint paths");
+            match paired.command {
+                Some(Command::BenchEagle3 {
+                    eagle3,
+                    eagle3_secondary,
+                    ..
+                }) => {
+                    assert_eq!(eagle3, PathBuf::from("e9"));
+                    assert_eq!(eagle3_secondary, Some(PathBuf::from("sw512")));
+                }
+                other => panic!("expected BenchEagle3, got {other:?}"),
+            }
         });
     }
 
     #[test]
-    fn deepest_suffix_chain_prefers_the_first_deepest_branch_within_budget() {
-        let tree = camelid::inference::spec_tree::TokenTree {
-            tokens: vec![10, 20, 30, 21, 31, 22],
-            parent: vec![-1, 0, 0, 1, 2, 3],
-            depth: vec![0, 1, 1, 2, 2, 3],
-        };
-        assert_eq!(deepest_suffix_chain(&tree, 3), vec![20, 21, 22]);
-        assert_eq!(deepest_suffix_chain(&tree, 2), vec![20, 21]);
-        assert!(deepest_suffix_chain(&tree, 0).is_empty());
-        assert!(deepest_suffix_chain(
-            &camelid::inference::spec_tree::TokenTree::linear(10, &[]),
-            4
-        )
-        .is_empty());
+    fn eagle3_feature_export_requires_explicit_input_and_output() {
+        on_cli_test_stack(|| {
+            let cli = Cli::try_parse_from([
+                "camelid",
+                "export-eagle3-features",
+                "target-q4.gguf",
+                "--eagle3",
+                "sw512-head",
+                "--input",
+                "corpus.jsonl",
+                "--output",
+                "features",
+                "--limit",
+                "7",
+            ])
+            .expect("parse EAGLE feature exporter");
+            match cli.command {
+                Some(Command::ExportEagle3Features {
+                    model,
+                    eagle3,
+                    input,
+                    output,
+                    limit,
+                    ..
+                }) => {
+                    assert_eq!(model, PathBuf::from("target-q4.gguf"));
+                    assert_eq!(eagle3, PathBuf::from("sw512-head"));
+                    assert_eq!(input, PathBuf::from("corpus.jsonl"));
+                    assert_eq!(output, PathBuf::from("features"));
+                    assert_eq!(limit, Some(7));
+                }
+                other => panic!("expected ExportEagle3Features, got {other:?}"),
+            }
+        });
     }
 
     #[test]
@@ -237,67 +282,6 @@ mod ghost_moe_cli_tests {
                 }
                 other => panic!("expected InspectSource, got {other:?}"),
             }
-        });
-    }
-
-    #[test]
-    fn gemma4_mtp12_gpu_parses_exact_assistant_and_target_widths() {
-        on_cli_test_stack(|| {
-            let cli = Cli::try_parse_from([
-                "camelid",
-                "gemma4-mtp12-gpu",
-                "target.gguf",
-                "--assistant",
-                "assistant/model.safetensors",
-                "--max-tokens",
-                "96",
-                "--widths",
-                "2,4,8,16",
-            ])
-            .expect("parse Gemma 4 MTP12 Metal harness");
-            match cli.command {
-                Some(Command::Gemma4Mtp12Gpu {
-                    path,
-                    assistant,
-                    max_tokens,
-                    widths,
-                    ..
-                }) => {
-                    assert_eq!(path, PathBuf::from("target.gguf"));
-                    assert_eq!(assistant, PathBuf::from("assistant/model.safetensors"));
-                    assert_eq!(max_tokens, 96);
-                    assert_eq!(widths, vec![2, 4, 8, 16]);
-                }
-                other => panic!("expected Gemma4Mtp12Gpu, got {other:?}"),
-            }
-        });
-    }
-
-    #[test]
-    fn gemma4_q4_repack_requires_an_explicit_sidecar_destination() {
-        on_cli_test_stack(|| {
-            let cli = Cli::try_parse_from([
-                "camelid",
-                "gemma4-q4-repack",
-                "target.gguf",
-                "--output",
-                "target.q4-native",
-            ])
-            .expect("parse Gemma 4 native Q4 repack command");
-            match cli.command {
-                Some(Command::Gemma4Q4Repack { path, output }) => {
-                    assert_eq!(path, PathBuf::from("target.gguf"));
-                    assert_eq!(output, PathBuf::from("target.q4-native"));
-                }
-                other => panic!("expected Gemma4Q4Repack, got {other:?}"),
-            }
-
-            let missing = Cli::try_parse_from(["camelid", "gemma4-q4-repack", "target.gguf"])
-                .expect_err("native Q4 repack must not invent an output path");
-            assert_eq!(
-                missing.kind(),
-                clap::error::ErrorKind::MissingRequiredArgument
-            );
         });
     }
 
@@ -656,6 +640,8 @@ use camelid::{
     cluster::{
         recv_activation_packet, recv_token_feedback, send_activation_packet, send_token_feedback,
     },
+    eagle3_runtime::Eagle3AuthoritativeFusionTelemetry,
+    eagle3_serving::cap_verify_nodes_for_position,
     gguf::{read_metadata, read_metadata_with_len, GgufTensorType},
     ghost::{GhostFile, GhostPipelinePrefetcher, GhostPrefetcher},
     inference::{
@@ -682,7 +668,7 @@ fn lan_chat_serve_command(key_path: &std::path::Path) -> String {
 }
 use clap::{Args, Parser, Subcommand};
 use rayon::ThreadPoolBuilder;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 // Prefer the git describe stamped in by build.rs (e.g. "v0.1.1" or
 // "v0.1.1-3-gabcdef-dirty"); fall back to the crate version for builds without
@@ -717,6 +703,7 @@ fn default_launch_command() -> Command {
         apple_accelerate_min_elements: None,
         metal_linear: false,
         metal_q8: false,
+        kquant_v4_stream16: false,
         log_acceleration: true,
         spec_decode: None,
         spec_draft_model: None,
@@ -1164,59 +1151,13 @@ enum AgentAction {
         allow_fs: bool,
         #[arg(long, default_value_t = false)]
         allow_mcp: bool,
-        /// Trust and immediately execute this named server from the workspace's
-        /// camelid.mcp.json. Repeat for each reviewed server. Has no effect
-        /// unless --allow-mcp is also present.
-        #[arg(long = "trust-mcp-server", action = clap::ArgAction::Append)]
-        trust_mcp_server: Vec<String>,
         #[arg(long, default_value = "sandboxed")]
         shell_sandbox: String,
         #[arg(long, default_value_t = 30)]
         shell_timeout: u64,
         #[arg(long)]
         models_dir: Option<PathBuf>,
-        /// Write a secret-safe, versioned benchmark trace after the agent loop
-        /// reaches a typed terminal state. The path must not already exist.
-        #[arg(long)]
-        benchmark_events: Option<PathBuf>,
     },
-}
-
-#[cfg(test)]
-mod agent_command_tests {
-    use super::*;
-
-    #[test]
-    fn agent_exec_parses_a_benchmark_event_destination() {
-        std::thread::Builder::new()
-            .name("agent-cli-parse-test".into())
-            .stack_size(8 * 1024 * 1024)
-            .spawn(|| {
-                let cli = Cli::try_parse_from([
-                    "camelid",
-                    "agent",
-                    "exec",
-                    "fix the boundary",
-                    "--model",
-                    "model.gguf",
-                    "--benchmark-events",
-                    "trace.json",
-                ])
-                .unwrap();
-                match cli.command {
-                    Some(Command::Agent {
-                        action:
-                            AgentAction::Exec {
-                                benchmark_events, ..
-                            },
-                    }) => assert_eq!(benchmark_events, Some(PathBuf::from("trace.json"))),
-                    other => panic!("expected agent exec, got {other:?}"),
-                }
-            })
-            .expect("spawn agent CLI parse test")
-            .join()
-            .expect("agent CLI parse test panicked");
-    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -2134,6 +2075,9 @@ enum Command {
         /// Enable the experimental Metal Q8_0 encoded row-dot path on macOS.
         #[arg(long, env = "CAMELID_METAL_Q8", default_value_t = false)]
         metal_q8: bool,
+        /// Enable the opt-in width-16 V4 K-quant verifier path on macOS.
+        #[arg(long, env = "CAMELID_KQUANT_V4_STREAM16", default_value_t = false)]
+        kquant_v4_stream16: bool,
         /// Log the current acceleration/runtime discovery state at startup.
         #[arg(long, default_value_t = true)]
         log_acceleration: bool,
@@ -2203,11 +2147,7 @@ enum Command {
         #[arg(long = "gpu", value_enum, default_value_t = GpuMode::Auto, env = "CAMELID_GPU")]
         gpu: GpuMode,
         /// KV cache quantization format: "f16" (default, unquantized), "q8_0"
-        /// (50% memory savings), "q4_0" (75% memory savings), or "fp8_e4m3" /
-        /// "fp8_e5m2" (same 50% savings as q8_0, trading uniform accuracy for
-        /// outlier headroom — see docs/kv-cache-fp8.md). CPU lanes only: the
-        /// resident CUDA decoder honours f16 and q8_0, and runs every other
-        /// format's KV as f16 on the GPU.
+        /// (50% memory savings), or "q4_0" (75% memory savings).
         #[arg(long, env = "CAMELID_KV_QUANT", default_value_t = KvCacheQuantization::F16)]
         kv_quant: KvCacheQuantization,
         #[command(flatten)]
@@ -2293,11 +2233,6 @@ enum Command {
         /// CAMELID_PRODUCTION. Off by default.
         #[arg(long, default_value_t = false)]
         allow_mcp: bool,
-        /// Agent: trust and immediately execute this named server command from
-        /// the workspace's camelid.mcp.json during startup. Repeat for each
-        /// reviewed server. Requires --allow-mcp.
-        #[arg(long = "trust-mcp-server", action = clap::ArgAction::Append)]
-        trust_mcp_server: Vec<String>,
         /// Agent: shell-command timeout in seconds.
         #[arg(long, default_value_t = 30)]
         shell_timeout: u64,
@@ -2603,11 +2538,7 @@ enum Command {
         /// Maximum draft tokens proposed per verify round. The default-off
         /// `CAMELID_GEMMA4_MTP_WIDTH_SCHEDULE` instead names verifier widths
         /// (current target row plus drafts), each bounded by this value plus one.
-        /// Default 7: on the frozen H40 fixture K=7 accepted every draft
-        /// (alpha 7.00) and beat both K=6 and K=8 paired
-        /// (BASELINE-2026-08-24 §16); K=8's extra row hit the known
-        /// content-boundary miss and paid union bytes for nothing.
-        #[arg(long, default_value_t = 7)]
+        #[arg(long, default_value_t = 8)]
         mtp_draft_k: usize,
         /// OpenAI-shaped chat request to run instead of `--prompt`, templated through the
         /// SAME renderer `/v1/chat/completions` uses. This is how an offline throughput
@@ -2628,14 +2559,6 @@ enum Command {
         #[arg(long)]
         receipt: Option<PathBuf>,
     },
-    /// Offline, exact-target repack of dense Gemma 4 Q4_0 projections into the
-    /// native scale-plane/quant-plane sidecar consumed by the Metal runtime.
-    /// The source GGUF is never modified and an existing output is refused.
-    Gemma4Q4Repack {
-        path: PathBuf,
-        #[arg(long)]
-        output: PathBuf,
-    },
     /// Generate text with a Gemma 4 model on the GPU (resident decode; macOS/Metal).
     Gemma4GenerateGpu {
         path: PathBuf,
@@ -2643,50 +2566,6 @@ enum Command {
         prompt: String,
         #[arg(long, default_value_t = 24)]
         max_tokens: usize,
-    },
-    /// Qualify and benchmark lossless Gemma 4 12B MTP speculative decode on
-    /// Metal. The exact official assistant drafts 1/3/7/15 tokens for target
-    /// verifier widths 2/4/8/16; every run must reproduce ordered K1 token IDs.
-    /// For an explicitly configured W16 run, the default-off strict selector
-    /// `CAMELID_GEMMA4_MTP_W16_WARMUP8=1` starts at W8 and promotes only after
-    /// a complete W8 acceptance round.
-    /// `CAMELID_GEMMA4_MTP_W16_ONESHOT_W8_PAD16=1` is a mutually-exclusive
-    /// experiment: run one W8 bootstrap, stay W16 regardless of its acceptance,
-    /// and admit a causally padded physical-W16 tail when it replaces two tails.
-    /// With configured W8, `CAMELID_GEMMA4_MTP12_W8_PADDED_TAIL=1` executes
-    /// remaining budgets 5–8 as a padded physical W8, reserves the exact bonus
-    /// anchor, and falls back to the existing tail if eight KV slots do not fit.
-    Gemma4Mtp12Gpu {
-        path: PathBuf,
-        /// Exact official 12B assistant `model.safetensors` file.
-        #[arg(long)]
-        assistant: PathBuf,
-        #[arg(long, default_value = "The capital of France is")]
-        prompt: String,
-        #[arg(long, default_value_t = 96)]
-        max_tokens: usize,
-        /// Target verifier widths. The anchor row is included, so these map to
-        /// assistant draft counts 1/3/7/15. The default remains the established
-        /// 2/4/8 sweep; pass 16 explicitly to exercise the opt-in K16 Q4 lane.
-        #[arg(long, value_delimiter = ',', default_value = "2,4,8")]
-        widths: Vec<usize>,
-    },
-    /// Qualify and time the strict K<=16 ordered-Q4 Gemma 4 target verifier.
-    /// This is a developer harness: it first requires whole-output K=1 parity
-    /// with the established GPU lane, then teacher-forces one fixed sequence
-    /// through each requested width and requires every target prediction to
-    /// equal the ordered K=1 result.
-    Gemma4VerifyGpu {
-        path: PathBuf,
-        #[arg(long, default_value = "The capital of France is")]
-        prompt: String,
-        #[arg(long, default_value_t = 96)]
-        max_tokens: usize,
-        /// Verifier row widths. Only 1,2,4,8,16 are admitted; each timed batch
-        /// is full-width so rows/s cannot be inflated by a scalar tail. The
-        /// default remains the established K<=8 sweep.
-        #[arg(long, value_delimiter = ',', default_value = "1,2,4,8")]
-        widths: Vec<usize>,
     },
     /// Chat with a DiffusionGemma model: render the chat template, run the
     /// bit-exact multi-canvas block-autoregressive denoise loop, detokenize.
@@ -2955,6 +2834,39 @@ enum Command {
         #[arg(long, env = "CAMELID_DETERMINISTIC", default_value_t = false)]
         deterministic: bool,
     },
+    /// Hidden: render deterministic prose-corpus jobs, generate each assistant
+    /// continuation with the exact Q4 target, and emit canonical token-aligned
+    /// exporter input shards plus tamper-evident provenance.
+    #[command(hide = true)]
+    MaterializeEagle3Corpus {
+        /// Exact Llama-3.2-3B-Instruct Q4_K_M GGUF target.
+        model: PathBuf,
+        /// Lowercase SHA-256 pin for the exact target GGUF.
+        #[arg(long)]
+        target_sha256: String,
+        /// Deterministic corpus job JSONL produced by tools/eagle3_corpus.
+        #[arg(long)]
+        jobs: PathBuf,
+        /// Optional lowercase SHA-256 pin for the job JSONL.
+        #[arg(long)]
+        jobs_sha256: Option<String>,
+        /// New output directory, or the exact sealed directory with --resume.
+        #[arg(long)]
+        output: PathBuf,
+        /// Records committed together as one atomic shard.
+        #[arg(long, default_value_t = 64)]
+        shard_size: usize,
+        /// Resume only when every run-identity field and completed shard hash matches.
+        #[arg(long, default_value_t = false)]
+        resume: bool,
+        /// Process at most this many new shards, then exit cleanly for serialized
+        /// export/train workflows on a 16 GB host.
+        #[arg(long)]
+        max_shards: Option<usize>,
+        /// Override Rayon worker threads for the target.
+        #[arg(long)]
+        threads: Option<usize>,
+    },
     /// Hidden: end-to-end Prism Qwen3-VL image encode plus Qwen3.5 Metal/CUDA decode.
     #[command(hide = true)]
     BenchGenerateVision {
@@ -3158,6 +3070,11 @@ enum Command {
         /// Directory containing the pinned EAGLE-3 config.json and model.safetensors.
         #[arg(long)]
         eagle3: PathBuf,
+        /// Second pinned EAGLE-3 checkpoint for the benchmark-only paired-root selector.
+        /// Accepted only when CAMELID_BENCH_DUAL_EAGLE_SELECTOR is enabled; the primary
+        /// --eagle3 must be ShareGPT-E9 and this checkpoint must be ShareGPT-SW512-E9.
+        #[arg(long)]
+        eagle3_secondary: Option<PathBuf>,
         /// Top-1 draft-chain length per verify round.
         #[arg(long, default_value_t = 4)]
         draft_tokens: usize,
@@ -3193,6 +3110,28 @@ enum Command {
         #[arg(long, default_value_t = 96)]
         max_tokens: usize,
         /// Override Rayon worker threads for the target verifier.
+        #[arg(long)]
+        threads: Option<usize>,
+    },
+    /// Offline exact-Q4 teacher-feature export for one-layer Llama-3.2 EAGLE-3 training.
+    /// Input is JSONL with `{input_ids:[...], loss_mask:[...], id?:"..."}` records.
+    #[command(hide = true)]
+    ExportEagle3Features {
+        /// Exact Llama-3.2-3B-Instruct Q4 GGUF teacher.
+        model: PathBuf,
+        /// Pinned EAGLE-3 checkpoint directory supplying the fixed d2t/t2d draft vocabulary.
+        #[arg(long)]
+        eagle3: PathBuf,
+        /// Tokenized JSONL corpus. `loss_mask[P]` marks whether `input_ids[P]` is trainable.
+        #[arg(long)]
+        input: PathBuf,
+        /// New output dataset directory (must not already exist).
+        #[arg(long)]
+        output: PathBuf,
+        /// Stop after this many non-empty JSONL records.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Override Rayon worker threads used during model loading/fallback checks.
         #[arg(long)]
         threads: Option<usize>,
     },
@@ -3339,17 +3278,6 @@ enum Command {
         /// Output path; defaults to sealing in place.
         #[arg(long, value_name = "PATH")]
         output: Option<PathBuf>,
-    },
-    /// Quantize a GGUF model file to Q8_0, Q4_0, or Q4_K_M.
-    Quantize {
-        /// Source input GGUF model file.
-        input: PathBuf,
-        /// Target output GGUF model file.
-        #[arg(short = 'o', long)]
-        output: PathBuf,
-        /// Target quantization format: q8_0, q4_0, or q4_k_m (default: q4_k_m).
-        #[arg(long = "type", default_value = "q4_k_m")]
-        quant_type: String,
     },
 }
 
@@ -3905,6 +3833,7 @@ async fn main() -> anyhow::Result<()> {
             apple_accelerate_min_elements,
             metal_linear,
             metal_q8,
+            kquant_v4_stream16,
             log_acceleration,
             spec_decode,
             spec_draft_model,
@@ -3931,6 +3860,7 @@ async fn main() -> anyhow::Result<()> {
                 apple_accelerate_min_elements,
                 metal_linear && !deterministic,
                 metal_q8 && !deterministic,
+                kquant_v4_stream16 && !deterministic,
             );
             apply_spec_decode_env(spec_decode, spec_draft_model, spec_draft_tokens);
             if let Some(cghost) = cghost {
@@ -4033,7 +3963,6 @@ async fn main() -> anyhow::Result<()> {
             allow_net,
             allow_fs,
             allow_mcp,
-            trust_mcp_server,
             shell_timeout,
             enable_thinking,
             audit_webhook,
@@ -4052,7 +3981,6 @@ async fn main() -> anyhow::Result<()> {
                 plain,
                 models_dir: models_dir.unwrap_or_else(|| PathBuf::from("models")),
                 exec_goal: None,
-                benchmark_events: None,
                 agent,
                 workdir,
                 max_steps,
@@ -4061,7 +3989,6 @@ async fn main() -> anyhow::Result<()> {
                 allow_net,
                 allow_fs,
                 allow_mcp,
-                trust_mcp_servers: trust_mcp_server,
                 shell_timeout,
                 enable_thinking,
                 audit_webhook,
@@ -4967,30 +4894,6 @@ async fn main() -> anyhow::Result<()> {
                 .as_deref()
                 .map(gemma4_harness_expected)
                 .transpose()?;
-            // The MTP lane's receipted profile becomes the default the moment the
-            // lane is selected — BEFORE the model load, where every gate resolves.
-            // An explicitly set variable always wins, so receipted arms reproduce
-            // byte-for-byte, and the plain lane (no --mtp-assistant) is untouched.
-            if mtp_assistant.is_some() {
-                let applied =
-                    camelid::gemma4_runtime::gemma4_mtp_profile_defaults_to_apply(|key| {
-                        std::env::var_os(key).is_some()
-                    });
-                if !applied.is_empty() {
-                    for (key, value) in &applied {
-                        std::env::set_var(key, value);
-                    }
-                    eprintln!(
-                        "[gemma4-mtp] promoted profile: {} default(s) applied ({})",
-                        applied.len(),
-                        applied
-                            .iter()
-                            .map(|(key, value)| format!("{key}={value}"))
-                            .collect::<Vec<_>>()
-                            .join(" ")
-                    );
-                }
-            }
             eprintln!("[gemma4-cuda] loading resident {}...", path.display());
             let t0 = std::time::Instant::now();
             let mut runtime = match cghost.as_deref() {
@@ -5202,16 +5105,6 @@ async fn main() -> anyhow::Result<()> {
                 std::process::exit(1);
             }
         }
-        Command::Gemma4Q4Repack { path, output } => {
-            eprintln!(
-                "[gemma4-q4-repack] validating and repacking {} -> {}",
-                path.display(),
-                output.display()
-            );
-            let manifest =
-                camelid::gemma4_q4_sidecar::repack_exact_gemma4_q4_sidecar(&path, &output)?;
-            println!("{}", serde_json::to_string_pretty(&manifest)?);
-        }
         Command::Gemma4GenerateGpu {
             path,
             prompt,
@@ -5243,708 +5136,6 @@ async fn main() -> anyhow::Result<()> {
                 let _ = (&path, &prompt, max_tokens);
                 return Err(camelid::BackendError::UnsupportedModelArchitecture(
                     "gemma4 GPU runtime requires macOS/Metal".into(),
-                )
-                .into());
-            }
-        }
-        #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
-        Command::Gemma4Mtp12Gpu {
-            path,
-            assistant,
-            prompt,
-            max_tokens,
-            mut widths,
-        } => {
-            #[cfg(target_os = "macos")]
-            {
-                widths.sort_unstable();
-                widths.dedup();
-                if widths.is_empty() || widths.iter().any(|width| !matches!(width, 2 | 4 | 8 | 16))
-                {
-                    return Err(camelid::BackendError::UnsupportedModelArchitecture(format!(
-                        "Gemma 4 MTP12 verifier widths must be a non-empty subset of 2,4,8,16; got {widths:?}"
-                    ))
-                    .into());
-                }
-                let max_width = *widths.last().expect("non-empty MTP12 widths");
-                if max_tokens == 0 {
-                    return Err(camelid::BackendError::UnsupportedModelArchitecture(
-                        "Gemma 4 MTP12 qualification requires max_tokens > 0".into(),
-                    )
-                    .into());
-                }
-                for forbidden_env in [
-                    "CAMELID_GEMMA4_DENSE_ORDERED_Q4",
-                    "CAMELID_GEMMA4_VERIFY_TRACE",
-                    "CAMELID_GEMMA4_METAL_HEAD_TIMING",
-                    "CAMELID_GEMMA4_GPU_TIMING",
-                ] {
-                    if std::env::var(forbidden_env)
-                        .ok()
-                        .as_deref()
-                        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-                    {
-                        return Err(camelid::BackendError::UnsupportedModelArchitecture(format!(
-                            "Gemma 4 MTP12 benchmark requires {forbidden_env} to be unset"
-                        ))
-                        .into());
-                    }
-                }
-
-                let max_positions = 512usize;
-                let conservative_positions = prompt
-                    .len()
-                    .saturating_add(max_tokens)
-                    .saturating_add(max_width);
-                if conservative_positions > max_positions {
-                    return Err(camelid::BackendError::UnsupportedModelArchitecture(format!(
-                        "Gemma 4 MTP12 benchmark is capped at {max_positions} KV rows; UTF-8-byte upper bound is {conservative_positions}"
-                    ))
-                    .into());
-                }
-                let model_bytes = std::fs::metadata(&path)?.len();
-                let assistant_bytes = std::fs::metadata(&assistant)?.len();
-
-                eprintln!(
-                    "[gemma4-mtp12] loading target {} with KV capacity {max_positions}...",
-                    path.display()
-                );
-                let load_started = std::time::Instant::now();
-                let runtime =
-                    camelid::gemma4_runtime::Gemma4GpuRuntime::load(&path, max_positions)?;
-                let target_load_us = load_started.elapsed().as_micros();
-                eprintln!("[gemma4-mtp12] admitting exact target SHA-256...");
-                let target_identity_us = runtime.admit_mtp12_target_identity()?;
-                let prompt_tokens = runtime.tokenizer().encode(&prompt, true, true)?;
-                let required_positions = prompt_tokens
-                    .len()
-                    .saturating_add(max_tokens)
-                    .saturating_add(max_width);
-                if required_positions > max_positions {
-                    return Err(camelid::BackendError::UnsupportedModelArchitecture(format!(
-                        "Gemma 4 MTP12 needs {required_positions} KV positions, capacity is {max_positions}"
-                    ))
-                    .into());
-                }
-
-                eprintln!("[gemma4-mtp12] qualifying established vs ordered K1 target output...");
-                let qualification = runtime.qualify_ordered_q4_k1(&prompt, max_tokens)?;
-                if qualification.token_ids.len() < max_width {
-                    return Err(camelid::BackendError::UnsupportedModelArchitecture(format!(
-                        "Gemma 4 MTP12 benchmark needs at least {max_width} qualified outputs; got {}",
-                        qualification.token_ids.len(),
-                    ))
-                    .into());
-                }
-                let qualification_decode_forwards_per_s = if qualification.decode_us == 0 {
-                    0.0
-                } else {
-                    qualification.decode_forward_count as f64 * 1_000_000.0
-                        / qualification.decode_us as f64
-                };
-
-                eprintln!(
-                    "[gemma4-mtp12] loading exact assistant {}...",
-                    assistant.display()
-                );
-                let assistant_load_started = std::time::Instant::now();
-                let mut drafter = camelid::metal::Gemma4Mtp12AssistantMetal::load(&assistant)?;
-                let assistant_load_us = assistant_load_started.elapsed().as_micros();
-                let mut runs = Vec::with_capacity(widths.len());
-                let mut exact_all = true;
-
-                for width in widths.iter().copied() {
-                    eprintln!(
-                        "[gemma4-mtp12] lossless decode W={width} / drafts={}...",
-                        width - 1
-                    );
-                    let wall_started = std::time::Instant::now();
-                    let generation = runtime.generate_greedy_mtp12_ordered_q4(
-                        &mut drafter,
-                        &prompt,
-                        max_tokens,
-                        width,
-                    )?;
-                    let generation_wall_us = wall_started.elapsed().as_micros();
-                    let first_id_divergence = qualification
-                        .token_ids
-                        .iter()
-                        .zip(&generation.token_ids)
-                        .position(|(left, right)| left != right)
-                        .or_else(|| {
-                            (qualification.token_ids.len() != generation.token_ids.len()).then_some(
-                                qualification
-                                    .token_ids
-                                    .len()
-                                    .min(generation.token_ids.len()),
-                            )
-                        });
-                    let ids_exact = first_id_divergence.is_none()
-                        && generation.token_ids.len() == qualification.token_ids.len();
-                    let text_exact = generation.text == qualification.text;
-                    let exact = ids_exact && text_exact;
-                    exact_all &= exact;
-                    let decode_outputs = generation.token_ids.len().saturating_sub(1);
-                    let decode_output_tok_s = if generation.stats.decode_us == 0 {
-                        0.0
-                    } else {
-                        decode_outputs as f64 * 1_000_000.0 / generation.stats.decode_us as f64
-                    };
-                    let end_to_end_tok_s = if generation_wall_us == 0 {
-                        0.0
-                    } else {
-                        generation.token_ids.len() as f64 * 1_000_000.0 / generation_wall_us as f64
-                    };
-                    let qualified_generation_us =
-                        generation_wall_us.saturating_sub(generation.stats.target_identity_us);
-                    let qualified_end_to_end_tok_s = if qualified_generation_us == 0 {
-                        0.0
-                    } else {
-                        generation.token_ids.len() as f64 * 1_000_000.0
-                            / qualified_generation_us as f64
-                    };
-                    eprintln!(
-                        "[gemma4-mtp12] W={width}: {decode_output_tok_s:.3} decode tok/s, alpha={:.3}, accepted={}/{}, exact={exact}",
-                        generation.stats.alpha(),
-                        generation.stats.accepted_drafts,
-                        generation.stats.drafted,
-                    );
-                    runs.push(serde_json::json!({
-                        "configured_verify_width": width,
-                        "cold_generation_wall_us": generation_wall_us,
-                        "qualified_generation_wall_us": qualified_generation_us,
-                        "decode_output_count": decode_outputs,
-                        "decode_output_tok_s": decode_output_tok_s,
-                        "cold_end_to_end_output_tok_s": end_to_end_tok_s,
-                        "qualified_end_to_end_output_tok_s": qualified_end_to_end_tok_s,
-                        "first_id_divergence_vs_ordered_k1": first_id_divergence.map(|index| index as i64).unwrap_or(-1),
-                        "ids_exact": ids_exact,
-                        "text_exact": text_exact,
-                        "exact": exact,
-                        "target_model_sha256": generation.target_model_sha256,
-                        "assistant_model_sha256": generation.assistant_model_sha256,
-                        "assistant_source_path": generation.assistant_source_path,
-                        "assistant_resident_ledger": generation.assistant_resident_ledger,
-                        "stats": generation.stats,
-                        "token_ids": generation.token_ids,
-                        "text": generation.text
-                    }));
-                }
-
-                let receipt = serde_json::json!({
-                    "schema": "camelid.gemma4_mtp12_metal_lossless_sweep.v1",
-                    "camelid_version": VERSION,
-                    "source_commit": option_env!("CAMELID_GIT_COMMIT"),
-                    "model_path": path,
-                    "model_bytes": model_bytes,
-                    "assistant_path": assistant,
-                    "assistant_bytes": assistant_bytes,
-                    "prompt": prompt,
-                    "prompt_tokens": prompt_tokens.len(),
-                    "max_tokens": max_tokens,
-                    "max_positions": max_positions,
-                    "target_load_us": target_load_us,
-                    "target_identity_us": target_identity_us,
-                    "assistant_load_us": assistant_load_us,
-                    "environment": {
-                        "CAMELID_GEMMA4_MTP_W16_WARMUP8": std::env::var("CAMELID_GEMMA4_MTP_W16_WARMUP8").ok(),
-                        "CAMELID_GEMMA4_MTP_W16_ONESHOT_W8_PAD16": std::env::var("CAMELID_GEMMA4_MTP_W16_ONESHOT_W8_PAD16").ok(),
-                        "CAMELID_GEMMA4_MTP12_W8_PADDED_TAIL": std::env::var("CAMELID_GEMMA4_MTP12_W8_PADDED_TAIL").ok(),
-                        "CAMELID_GEMMA4_MTP12_DENSE_BF16": std::env::var("CAMELID_GEMMA4_MTP12_DENSE_BF16").ok(),
-                        "CAMELID_GEMMA4_MTP12_SINGLE_POSITION": std::env::var("CAMELID_GEMMA4_MTP12_SINGLE_POSITION").ok(),
-                        "CAMELID_GEMMA4_Q4_NATIVE_SIDECAR": std::env::var_os("CAMELID_GEMMA4_Q4_NATIVE_SIDECAR").map(|value| value.to_string_lossy().into_owned()),
-                        "CAMELID_GEMMA4_Q4_NATIVE_REGISTER_FRAGMENT": std::env::var("CAMELID_GEMMA4_Q4_NATIVE_REGISTER_FRAGMENT").ok(),
-                        "CAMELID_GEMMA4_Q4_MMA": std::env::var("CAMELID_GEMMA4_Q4_MMA").ok(),
-                        "CAMELID_GEMMA4_Q4_ROW_OPS": std::env::var("CAMELID_GEMMA4_Q4_ROW_OPS").ok(),
-                        "CAMELID_GEMMA4_Q4_MMA_ROWMAJOR": std::env::var("CAMELID_GEMMA4_Q4_MMA_ROWMAJOR").ok(),
-                        "CAMELID_GEMMA4_Q4_MMA_FRAGMENT": std::env::var("CAMELID_GEMMA4_Q4_MMA_FRAGMENT").ok(),
-                        "CAMELID_GEMMA4_Q4_MMA_REGISTER_FRAGMENT": std::env::var("CAMELID_GEMMA4_Q4_MMA_REGISTER_FRAGMENT").ok(),
-                        "CAMELID_GEMMA4_Q4_MMA_REGISTER_FRAGMENT_K16": std::env::var("CAMELID_GEMMA4_Q4_MMA_REGISTER_FRAGMENT_K16").ok(),
-                        "CAMELID_GEMMA4_Q4_NATIVE_REGISTER_FRAGMENT_K16": std::env::var("CAMELID_GEMMA4_Q4_NATIVE_REGISTER_FRAGMENT_K16").ok(),
-                        "CAMELID_GEMMA4_Q4_DIRECT_TG": std::env::var("CAMELID_GEMMA4_Q4_DIRECT_TG").ok(),
-                        "CAMELID_GEMMA4_DENSE_METAL_Q6K_HEAD": std::env::var("CAMELID_GEMMA4_DENSE_METAL_Q6K_HEAD").ok(),
-                        "CAMELID_GEMMA4_DENSE_ORDERED_Q4": std::env::var("CAMELID_GEMMA4_DENSE_ORDERED_Q4").ok(),
-                        "CAMELID_GEMMA4_DENSE_ATTN_ROWS": std::env::var("CAMELID_GEMMA4_DENSE_ATTN_ROWS").ok(),
-                        "CAMELID_GEMMA4_VERIFY_TRACE": std::env::var("CAMELID_GEMMA4_VERIFY_TRACE").ok(),
-                        "CAMELID_GEMMA4_METAL_HEAD_TIMING": std::env::var("CAMELID_GEMMA4_METAL_HEAD_TIMING").ok(),
-                        "CAMELID_GEMMA4_GPU_TIMING": std::env::var("CAMELID_GEMMA4_GPU_TIMING").ok()
-                    },
-                    "dense_attention_rows_contract": {
-                        "selector": "CAMELID_GEMMA4_DENSE_ATTN_ROWS",
-                        "explicit_request_admission": "all_48_dense_layers_per_target_batch_or_fail_closed",
-                        "default_when_unset": "per_row_split3"
-                    },
-                    "ordered_k1_qualification": {
-                        "exact_vs_established": true,
-                        "prefill_us": qualification.prefill_us,
-                        "decode_us": qualification.decode_us,
-                        "decode_forward_count": qualification.decode_forward_count,
-                        "decode_target_forwards_per_s": qualification_decode_forwards_per_s,
-                        "token_ids": qualification.token_ids,
-                        "text": qualification.text
-                    },
-                    "runs": runs,
-                    "exact_all_widths": exact_all,
-                    "timing_scope": "Qualified generation wall includes ordered prompt replay plus lossless decode; decode_output_tok_s excludes prompt and first output produced by prefill; one-time target identity hash and assistant load are separately accounted"
-                });
-                println!("{}", serde_json::to_string_pretty(&receipt)?);
-                if !exact_all {
-                    return Err(camelid::BackendError::UnsupportedModelArchitecture(
-                        "Gemma 4 MTP12 output diverged from qualified ordered K1".into(),
-                    )
-                    .into());
-                }
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                let _ = (&path, &assistant, &prompt, max_tokens, &widths);
-                return Err(camelid::BackendError::UnsupportedModelArchitecture(
-                    "Gemma 4 MTP12 Metal runtime requires macOS".into(),
-                )
-                .into());
-            }
-        }
-        #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
-        Command::Gemma4VerifyGpu {
-            path,
-            prompt,
-            max_tokens,
-            mut widths,
-        } => {
-            #[cfg(target_os = "macos")]
-            {
-                let established_ordered_env = std::env::var("CAMELID_GEMMA4_DENSE_ORDERED_Q4").ok();
-                if established_ordered_env
-                    .as_deref()
-                    .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-                {
-                    return Err(camelid::BackendError::UnsupportedModelArchitecture(
-                        "gemma4 verifier qualification requires the production established baseline; unset CAMELID_GEMMA4_DENSE_ORDERED_Q4"
-                            .into(),
-                    )
-                    .into());
-                }
-                for timing_env in [
-                    "CAMELID_GEMMA4_VERIFY_TRACE",
-                    "CAMELID_GEMMA4_METAL_HEAD_TIMING",
-                    "CAMELID_GEMMA4_GPU_TIMING",
-                ] {
-                    if std::env::var(timing_env)
-                        .ok()
-                        .as_deref()
-                        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-                    {
-                        return Err(camelid::BackendError::UnsupportedModelArchitecture(format!(
-                            "gemma4 verifier timing receipt requires {timing_env} to be unset"
-                        ))
-                        .into());
-                    }
-                }
-                if max_tokens == 0 {
-                    return Err(camelid::BackendError::UnsupportedModelArchitecture(
-                        "gemma4 verifier qualification requires max_tokens > 0".into(),
-                    )
-                    .into());
-                }
-                widths.sort_unstable();
-                widths.dedup();
-                if widths.is_empty()
-                    || widths
-                        .iter()
-                        .any(|width| !matches!(width, 1 | 2 | 4 | 8 | 16))
-                {
-                    return Err(camelid::BackendError::UnsupportedModelArchitecture(format!(
-                        "Gemma 4 ordered verifier widths must be a non-empty subset of 1,2,4,8,16; got {widths:?}"
-                    ))
-                    .into());
-                }
-                if !widths.contains(&1) {
-                    widths.insert(0, 1);
-                }
-                let max_width = *widths.last().expect("non-empty verifier widths");
-                // UTF-8 bytes are a conservative upper bound for the tokenizer's
-                // byte-fallback pieces. Keep this Mini2 harness deliberately
-                // short-context: never turn a long raw prompt into an accidental
-                // multi-GiB KV allocation on a 16 GB machine.
-                let max_positions = 512usize;
-                let conservative_positions = prompt
-                    .len()
-                    .saturating_add(max_tokens)
-                    .saturating_add(max_width);
-                if conservative_positions > max_positions {
-                    return Err(camelid::BackendError::UnsupportedModelArchitecture(format!(
-                        "gemma4 verifier is capped at {max_positions} KV rows; UTF-8-byte upper bound is {conservative_positions}"
-                    ))
-                    .into());
-                }
-                let model_bytes = std::fs::metadata(&path)?.len();
-                let model_sha256 = camelid::receipt::sha256_file_hex_cached(&path)?;
-                eprintln!(
-                    "[gemma4-verify] loading {} with KV capacity {max_positions}...",
-                    path.display()
-                );
-                let load_started = std::time::Instant::now();
-                let runtime =
-                    camelid::gemma4_runtime::Gemma4GpuRuntime::load(&path, max_positions)?;
-                let prompt_tokens = runtime.tokenizer().encode(&prompt, true, true)?;
-                let required_positions = prompt_tokens
-                    .len()
-                    .saturating_add(max_tokens)
-                    .saturating_add(max_width);
-                if required_positions > max_positions {
-                    return Err(camelid::BackendError::UnsupportedModelArchitecture(format!(
-                        "Gemma 4 verifier needs {required_positions} KV positions for prompt={} + max_new={max_tokens} + K={max_width}, but capacity is {max_positions}",
-                        prompt_tokens.len(),
-                    ))
-                    .into());
-                }
-                let load_us = load_started.elapsed().as_micros();
-
-                eprintln!(
-                    "[gemma4-verify] whole-target established-vs-ordered K1 qualification..."
-                );
-                let qualification = runtime.qualify_ordered_q4_k1(&prompt, max_tokens)?;
-                let qualification_decode_forwards_per_s = if qualification.decode_us == 0 {
-                    0.0
-                } else {
-                    qualification.decode_forward_count as f64 * 1_000_000.0
-                        / qualification.decode_us as f64
-                };
-                eprintln!(
-                    "[gemma4-verify] K1 IDs exact: {} outputs; ordered prefill {:.3}s, decode {:.3}s ({qualification_decode_forwards_per_s:.3} target forwards/s)",
-                    qualification.token_ids.len(),
-                    qualification.prefill_us as f64 / 1_000_000.0,
-                    qualification.decode_us as f64 / 1_000_000.0,
-                );
-
-                let timed_rows = qualification.token_ids.len() / max_width * max_width;
-                if timed_rows == 0 {
-                    return Err(camelid::BackendError::UnsupportedModelArchitecture(format!(
-                        "Gemma 4 verifier generated sequence has {} rows, fewer than K={max_width}",
-                        qualification.token_ids.len(),
-                    ))
-                    .into());
-                }
-                let teacher_tokens = &qualification.token_ids[..timed_rows];
-
-                let run_width = |width: usize,
-                                 tokens: &[u32]|
-                 -> anyhow::Result<(Vec<u32>, Vec<u32>, u128)> {
-                    if !tokens.len().is_multiple_of(width) {
-                        return Err(camelid::BackendError::UnsupportedModelArchitecture(format!(
-                            "teacher-forced row count {} is not divisible by K={width}",
-                            tokens.len(),
-                        ))
-                        .into());
-                    }
-                    // Replay the prompt into this width's fresh ordered cache
-                    // outside the clock. Only post-prompt candidate rows are
-                    // part of the target-verifier throughput receipt.
-                    let prefill = runtime.prefill_ordered_q4(&prompt)?;
-                    if prefill.first_greedy_id != tokens[0] {
-                        return Err(camelid::BackendError::UnsupportedModelArchitecture(format!(
-                            "ordered prefill predicted {}, but the qualified teacher trajectory starts with {}",
-                            prefill.first_greedy_id, tokens[0],
-                        ))
-                        .into());
-                    }
-                    let started = std::time::Instant::now();
-                    let mut predictions = Vec::with_capacity(tokens.len());
-                    let mut hidden_bits = Vec::with_capacity(tokens.len().saturating_mul(3_840));
-                    let mut position = prefill.prompt_token_count;
-                    for chunk in tokens.chunks_exact(width) {
-                        let batch = runtime.verify_consecutive_greedy(chunk, position)?;
-                        predictions.extend_from_slice(&batch.greedy_ids);
-                        hidden_bits.extend(
-                            batch
-                                .final_hidden
-                                .iter()
-                                .flatten()
-                                .map(|value| value.to_bits()),
-                        );
-                        position = runtime.commit_verifier_prefix(batch.ticket, width)?;
-                    }
-                    Ok((predictions, hidden_bits, started.elapsed().as_micros()))
-                };
-
-                // Exercise the transactional invariant used by real speculative
-                // decode, not merely the full-commit throughput path. Use the
-                // requested maximum physical width so a W16 receipt really writes
-                // sixteen cache rows. Zero/full pin the boundary cases; 1, 7 and
-                // 15 span a large tail, the K8-fragment boundary, and a one-row tail.
-                let rejected_tail_width = max_width;
-                let rejected_tail_prefixes =
-                    gemma4_rejected_tail_commit_prefixes(rejected_tail_width)
-                        .expect("validated verifier width has an overwrite-prefix plan");
-                if qualification.token_ids.len() < rejected_tail_width {
-                    return Err(camelid::BackendError::UnsupportedModelArchitecture(
-                        format!(
-                            "Gemma 4 rejected-tail W{rejected_tail_width} gate requires at least {rejected_tail_width} qualified output tokens"
-                        ),
-                    )
-                    .into());
-                }
-                let tail_a = &qualification.token_ids[..rejected_tail_width];
-                let stop_ids = runtime.stop_token_ids();
-                let mut candidate_pool: Vec<u32> = prompt_tokens
-                    .iter()
-                    .chain(&qualification.token_ids)
-                    .copied()
-                    .filter(|token| !stop_ids.contains(token))
-                    .collect();
-                candidate_pool.sort_unstable();
-                candidate_pool.dedup();
-                if candidate_pool.len() < 2 {
-                    return Err(camelid::BackendError::UnsupportedModelArchitecture(
-                        "Gemma 4 rejected-tail gate needs two distinct non-stop candidate tokens"
-                            .into(),
-                    )
-                    .into());
-                }
-                let mut rejected_tail_runs = Vec::with_capacity(rejected_tail_prefixes.len());
-                for committed in rejected_tail_prefixes.iter().copied() {
-                    let overlap = rejected_tail_width - committed;
-                    let mut tail_b = Vec::with_capacity(rejected_tail_width);
-                    for row in 0..rejected_tail_width {
-                        let stale = (row < overlap).then(|| tail_a[committed + row]);
-                        let replacement = candidate_pool
-                            .iter()
-                            .copied()
-                            .find(|token| Some(*token) != stale)
-                            .expect("two-token pool always has a non-stale replacement");
-                        tail_b.push(replacement);
-                    }
-
-                    let experiment_prefill = runtime.prefill_ordered_q4(&prompt)?;
-                    if experiment_prefill.first_greedy_id != tail_a[0] {
-                        return Err(camelid::BackendError::UnsupportedModelArchitecture(format!(
-                            "rejected-tail experiment prefill predicted {}, expected {}",
-                            experiment_prefill.first_greedy_id, tail_a[0],
-                        ))
-                        .into());
-                    }
-                    let start = experiment_prefill.prompt_token_count;
-                    let a_batch = runtime.verify_consecutive_greedy(tail_a, start)?;
-                    let a_ids = a_batch.greedy_ids.clone();
-                    let a_hidden_bits: Vec<u32> = a_batch
-                        .final_hidden
-                        .iter()
-                        .take(committed)
-                        .flatten()
-                        .map(|value| value.to_bits())
-                        .collect();
-                    if committed == 0 {
-                        runtime.rollback_verifier_batch(a_batch.ticket)?;
-                    } else {
-                        runtime.commit_verifier_prefix(a_batch.ticket, committed)?;
-                    }
-                    let b_batch = runtime.verify_consecutive_greedy(&tail_b, start + committed)?;
-                    let b_ids = b_batch.greedy_ids.clone();
-                    let b_hidden_bits: Vec<u32> = b_batch
-                        .final_hidden
-                        .iter()
-                        .flatten()
-                        .map(|value| value.to_bits())
-                        .collect();
-                    runtime.commit_verifier_prefix(b_batch.ticket, rejected_tail_width)?;
-
-                    let reference_prefill = runtime.prefill_ordered_q4(&prompt)?;
-                    if reference_prefill.first_greedy_id != tail_a[0] {
-                        return Err(camelid::BackendError::UnsupportedModelArchitecture(
-                            "rejected-tail reference prefill left the qualified trajectory".into(),
-                        )
-                        .into());
-                    }
-                    let mut reference_ids = Vec::with_capacity(committed + rejected_tail_width);
-                    let mut reference_hidden_bits =
-                        Vec::with_capacity((committed + rejected_tail_width).saturating_mul(3_840));
-                    // The replay cursor advances by one committed position per
-                    // token, so it is state carried across iterations, not a
-                    // loop bound. `Cell` keeps that explicit for clippy.
-                    let reference_position =
-                        std::cell::Cell::new(reference_prefill.prompt_token_count);
-                    for &token in tail_a[..committed].iter().chain(&tail_b) {
-                        let (prediction, hidden) =
-                            runtime.forward_greedy_ordered_q4(token, reference_position.get())?;
-                        reference_ids.push(prediction);
-                        reference_hidden_bits.extend(hidden.iter().map(|value| value.to_bits()));
-                        reference_position.set(reference_position.get() + 1);
-                    }
-
-                    let mut experiment_ids = a_ids[..committed].to_vec();
-                    experiment_ids.extend_from_slice(&b_ids);
-                    let mut experiment_hidden_bits = a_hidden_bits;
-                    experiment_hidden_bits.extend_from_slice(&b_hidden_bits);
-                    let first_id_divergence = experiment_ids
-                        .iter()
-                        .zip(&reference_ids)
-                        .position(|(left, right)| left != right);
-                    let first_hidden_divergence = experiment_hidden_bits
-                        .iter()
-                        .zip(&reference_hidden_bits)
-                        .position(|(left, right)| left != right);
-                    let ids_exact = first_id_divergence.is_none()
-                        && experiment_ids.len() == reference_ids.len();
-                    let hidden_bit_exact = first_hidden_divergence.is_none()
-                        && experiment_hidden_bits.len() == reference_hidden_bits.len();
-                    if !ids_exact || !hidden_bit_exact {
-                        return Err(camelid::BackendError::UnsupportedModelArchitecture(format!(
-                            "Gemma 4 rejected-tail W{rejected_tail_width}/commit-{committed} gate diverged: id={first_id_divergence:?}, hidden_scalar={first_hidden_divergence:?}"
-                        ))
-                        .into());
-                    }
-                    rejected_tail_runs.push(serde_json::json!({
-                        "physical_width": rejected_tail_width,
-                        "committed_prefix": committed,
-                        "rejected_rows_overwritten": overlap,
-                        "overwrite_tokens": tail_b,
-                        "first_id_divergence_vs_fresh_k1": -1,
-                        "first_hidden_scalar_divergence_vs_fresh_k1": -1,
-                        "ids_exact": true,
-                        "hidden_bit_exact": true,
-                        "exact": true
-                    }));
-                }
-
-                // Allocate scratch, compile lazy pipelines, and touch every target
-                // weight before each timed width. Reset makes the warm row invisible.
-                let _ = run_width(1, &teacher_tokens[..1])?;
-                let (reference, reference_hidden_bits, reference_us) =
-                    run_width(1, teacher_tokens)?;
-                if let Some(divergence) = reference
-                    .iter()
-                    .take(timed_rows.saturating_sub(1))
-                    .zip(teacher_tokens.iter().skip(1))
-                    .position(|(prediction, teacher)| prediction != teacher)
-                {
-                    return Err(camelid::BackendError::UnsupportedModelArchitecture(format!(
-                        "ordered K1 teacher trajectory diverged after decode row {divergence}: predicted={} teacher={}",
-                        reference[divergence], teacher_tokens[divergence + 1],
-                    ))
-                    .into());
-                }
-                let reference_rows_per_s = timed_rows as f64 * 1_000_000.0 / reference_us as f64;
-                let mut runs = Vec::with_capacity(widths.len());
-                runs.push(serde_json::json!({
-                    "width": 1,
-                    "batches": timed_rows,
-                    "wall_us": reference_us,
-                    "target_rows_per_s": reference_rows_per_s,
-                    "speedup_vs_k1": 1.0,
-                    "first_id_divergence_vs_k1": -1,
-                    "first_hidden_scalar_divergence_vs_k1": -1,
-                    "ids_exact": true,
-                    "hidden_bit_exact": true,
-                    "exact": true
-                }));
-
-                let mut exact_all = true;
-                for &width in widths.iter().filter(|&&width| width != 1) {
-                    let _ = run_width(width, &teacher_tokens[..width])?;
-                    let (predictions, hidden_bits, wall_us) = run_width(width, teacher_tokens)?;
-                    let first_id_divergence = reference
-                        .iter()
-                        .zip(&predictions)
-                        .position(|(left, right)| left != right);
-                    let ids_exact =
-                        first_id_divergence.is_none() && predictions.len() == reference.len();
-                    let first_hidden_divergence = reference_hidden_bits
-                        .iter()
-                        .zip(&hidden_bits)
-                        .position(|(left, right)| left != right);
-                    let hidden_bit_exact = first_hidden_divergence.is_none()
-                        && hidden_bits.len() == reference_hidden_bits.len();
-                    let exact = ids_exact && hidden_bit_exact;
-                    exact_all &= exact;
-                    let rows_per_s = timed_rows as f64 * 1_000_000.0 / wall_us as f64;
-                    let speedup = reference_us as f64 / wall_us as f64;
-                    eprintln!(
-                        "[gemma4-verify] K={width}: {rows_per_s:.3} target rows/s, {speedup:.3}x K1, ids_exact={ids_exact}, hidden_bit_exact={hidden_bit_exact}"
-                    );
-                    runs.push(serde_json::json!({
-                        "width": width,
-                        "batches": timed_rows / width,
-                        "wall_us": wall_us,
-                        "target_rows_per_s": rows_per_s,
-                        "speedup_vs_k1": speedup,
-                        "first_id_divergence_vs_k1": first_id_divergence.map(|index| index as i64).unwrap_or(-1),
-                        "first_hidden_scalar_divergence_vs_k1": first_hidden_divergence.map(|index| index as i64).unwrap_or(-1),
-                        "ids_exact": ids_exact,
-                        "hidden_bit_exact": hidden_bit_exact,
-                        "exact": exact
-                    }));
-                }
-
-                let receipt = serde_json::json!({
-                    "schema": "camelid.gemma4_ordered_q4_target_sweep.v1",
-                    "model_path": path,
-                    "model_bytes": model_bytes,
-                    "model_sha256": model_sha256,
-                    "camelid_version": VERSION,
-                    "source_commit": option_env!("CAMELID_GIT_COMMIT"),
-                    "prompt": prompt,
-                    "prompt_tokens": prompt_tokens.len(),
-                    "generated_tokens": qualification.token_ids.len(),
-                    "candidate_rows_available": qualification.token_ids.len(),
-                    "timed_rows": timed_rows,
-                    "max_positions": max_positions,
-                    "load_us": load_us,
-                    "environment": {
-                        "CAMELID_GEMMA4_Q4_NATIVE_SIDECAR": std::env::var_os("CAMELID_GEMMA4_Q4_NATIVE_SIDECAR").map(|value| value.to_string_lossy().into_owned()),
-                        "CAMELID_GEMMA4_Q4_NATIVE_REGISTER_FRAGMENT": std::env::var("CAMELID_GEMMA4_Q4_NATIVE_REGISTER_FRAGMENT").ok(),
-                        "CAMELID_GEMMA4_Q4_MMA": std::env::var("CAMELID_GEMMA4_Q4_MMA").ok(),
-                        "CAMELID_GEMMA4_Q4_ROW_OPS": std::env::var("CAMELID_GEMMA4_Q4_ROW_OPS").ok(),
-                        "CAMELID_GEMMA4_Q4_MMA_ROWMAJOR": std::env::var("CAMELID_GEMMA4_Q4_MMA_ROWMAJOR").ok(),
-                        "CAMELID_GEMMA4_Q4_MMA_FRAGMENT": std::env::var("CAMELID_GEMMA4_Q4_MMA_FRAGMENT").ok(),
-                        "CAMELID_GEMMA4_Q4_MMA_REGISTER_FRAGMENT": std::env::var("CAMELID_GEMMA4_Q4_MMA_REGISTER_FRAGMENT").ok(),
-                        "CAMELID_GEMMA4_Q4_MMA_REGISTER_FRAGMENT_K16": std::env::var("CAMELID_GEMMA4_Q4_MMA_REGISTER_FRAGMENT_K16").ok(),
-                        "CAMELID_GEMMA4_Q4_NATIVE_REGISTER_FRAGMENT_K16": std::env::var("CAMELID_GEMMA4_Q4_NATIVE_REGISTER_FRAGMENT_K16").ok(),
-                        "CAMELID_GEMMA4_DENSE_ORDERED_Q4": established_ordered_env,
-                        "CAMELID_GEMMA4_DENSE_METAL_Q6K_HEAD": std::env::var("CAMELID_GEMMA4_DENSE_METAL_Q6K_HEAD").ok(),
-                        "CAMELID_GEMMA4_DENSE_ATTN_ROWS": std::env::var("CAMELID_GEMMA4_DENSE_ATTN_ROWS").ok(),
-                        "CAMELID_GEMMA4_Q4_DIRECT_TG": std::env::var("CAMELID_GEMMA4_Q4_DIRECT_TG").ok(),
-                        "CAMELID_GEMMA4_VERIFY_TRACE": std::env::var("CAMELID_GEMMA4_VERIFY_TRACE").ok(),
-                        "CAMELID_GEMMA4_METAL_HEAD_TIMING": std::env::var("CAMELID_GEMMA4_METAL_HEAD_TIMING").ok(),
-                        "CAMELID_GEMMA4_GPU_TIMING": std::env::var("CAMELID_GEMMA4_GPU_TIMING").ok()
-                    },
-                    "dense_attention_rows_contract": {
-                        "selector": "CAMELID_GEMMA4_DENSE_ATTN_ROWS",
-                        "explicit_request_admission": "all_48_dense_layers_per_target_batch_or_fail_closed",
-                        "default_when_unset": "per_row_split3"
-                    },
-                    "ordered_k1_qualification": {
-                        "exact_vs_established": true,
-                        "prefill_us": qualification.prefill_us,
-                        "decode_us": qualification.decode_us,
-                        "decode_forward_count": qualification.decode_forward_count,
-                        "decode_target_forwards_per_s": qualification_decode_forwards_per_s,
-                        "token_ids": qualification.token_ids
-                    },
-                    "runs": runs,
-                    "rejected_tail_overwrite_gate": {
-                        "physical_width": rejected_tail_width,
-                        "commit_prefixes": rejected_tail_prefixes,
-                        "includes_zero_rollback": true,
-                        "includes_full_commit": true,
-                        "exact_all_commit_prefixes": true,
-                        "runs": rejected_tail_runs
-                    },
-                    "exact_all_widths": exact_all,
-                    "timing_scope": "Warm target-only teacher-forced decode-row verifier wall; full-width batches; prompt replay/assistant excluded"
-                });
-                println!("{}", serde_json::to_string_pretty(&receipt)?);
-                if !exact_all {
-                    return Err(camelid::BackendError::UnsupportedModelArchitecture(
-                        "Gemma 4 K-wide verifier diverged from ordered K1".into(),
-                    )
-                    .into());
-                }
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                let _ = (&path, &prompt, max_tokens, &widths);
-                return Err(camelid::BackendError::UnsupportedModelArchitecture(
-                    "gemma4 ordered verifier requires macOS/Metal".into(),
                 )
                 .into());
             }
@@ -6244,6 +5435,29 @@ async fn main() -> anyhow::Result<()> {
                 threads,
             )?;
         }
+        Command::MaterializeEagle3Corpus {
+            model,
+            target_sha256,
+            jobs,
+            jobs_sha256,
+            output,
+            shard_size,
+            resume,
+            max_shards,
+            threads,
+        } => {
+            run_materialize_eagle3_corpus(
+                model,
+                target_sha256,
+                jobs,
+                jobs_sha256,
+                output,
+                shard_size,
+                resume,
+                max_shards,
+                threads,
+            )?;
+        }
         Command::BenchGenerateVision {
             model,
             mmproj,
@@ -6393,11 +5607,9 @@ async fn main() -> anyhow::Result<()> {
                 allow_net,
                 allow_fs,
                 allow_mcp,
-                trust_mcp_server,
                 shell_sandbox,
                 shell_timeout,
                 models_dir,
-                benchmark_events,
             } => {
                 // The goal may come from stdin so a caller can pipe a long or
                 // generated prompt in without shell quoting.
@@ -6433,13 +5645,11 @@ async fn main() -> anyhow::Result<()> {
                     allow_net,
                     allow_fs,
                     allow_mcp,
-                    trust_mcp_servers: trust_mcp_server,
                     shell_timeout,
                     enable_thinking: false,
                     audit_webhook: None,
                     shell_sandbox,
                     exec_goal: Some(goal),
-                    benchmark_events,
                 })?;
                 std::process::exit(code);
             }
@@ -6479,6 +5689,7 @@ async fn main() -> anyhow::Result<()> {
         Command::BenchEagle3 {
             model,
             eagle3,
+            eagle3_secondary,
             draft_tokens,
             tree_nodes,
             tree_topk,
@@ -6494,6 +5705,7 @@ async fn main() -> anyhow::Result<()> {
             run_bench_eagle3(
                 model,
                 eagle3,
+                eagle3_secondary,
                 draft_tokens,
                 tree_nodes,
                 tree_topk,
@@ -6506,6 +5718,16 @@ async fn main() -> anyhow::Result<()> {
                 max_tokens,
                 threads,
             )?;
+        }
+        Command::ExportEagle3Features {
+            model,
+            eagle3,
+            input,
+            output,
+            limit,
+            threads,
+        } => {
+            run_export_eagle3_features(model, eagle3, input, output, limit, threads)?;
         }
         Command::GhostRun {
             model,
@@ -6644,44 +5866,6 @@ async fn main() -> anyhow::Result<()> {
                 "sealed receipt_id={} -> {}",
                 receipt.receipt_id,
                 out_path.display()
-            );
-        }
-        Command::Quantize {
-            input,
-            output,
-            quant_type,
-        } => {
-            let target = match quant_type.to_lowercase().as_str() {
-                "q8_0" | "q8" => camelid::quantize::TargetQuant::Q8_0,
-                "q4_0" | "q4" => camelid::quantize::TargetQuant::Q4_0,
-                "q4_k_m" | "q4_k" | "q4km" => camelid::quantize::TargetQuant::Q4_K_M,
-                other => anyhow::bail!(
-                    "Unsupported quantization type '{other}'. Supported: q8_0, q4_0, q4_k_m"
-                ),
-            };
-
-            println!(
-                "Quantizing {} -> {} ({:?})...",
-                input.display(),
-                output.display(),
-                target
-            );
-            let receipt = camelid::quantize::quantize_model(&input, &output, target)?;
-            println!("Quantization complete!");
-            println!("  SHA256:            {}", receipt.sha256);
-            println!("  Input bytes:       {}", receipt.input_bytes);
-            println!("  Output bytes:      {}", receipt.output_bytes);
-            println!(
-                "  Compression ratio: {:.2}x",
-                if receipt.compression_ratio > 0.0 {
-                    1.0 / receipt.compression_ratio
-                } else {
-                    1.0
-                }
-            );
-            println!(
-                "  Tensors:           {} quantized / {} total",
-                receipt.quantized_tensors, receipt.tensor_count
             );
         }
     }
@@ -8519,6 +7703,249 @@ fn run_bench_owner_sweep(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn run_materialize_eagle3_corpus(
+    model: PathBuf,
+    expected_target_sha256: String,
+    jobs_path: PathBuf,
+    expected_jobs_sha256: Option<String>,
+    output: PathBuf,
+    shard_size: usize,
+    resume: bool,
+    max_shards: Option<usize>,
+    threads: Option<usize>,
+) -> anyhow::Result<()> {
+    use camelid::eagle3_corpus_materializer::{
+        build_run_manifest, read_jobs, sha256_bytes, sha256_file,
+        validate_llama3_generation_boundary, MaterializationStore, MaterializationSummary,
+        MaterializedSample, TargetSeal,
+    };
+    const PINNED_LLAMA32_3B_Q4KM_SHA256: &str =
+        "6c1a2b41161032677be168d354123594c0e6e67d2b9227c84f296ad037c728ff";
+
+    let valid_sha = |value: &str| {
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    };
+    anyhow::ensure!(
+        valid_sha(&expected_target_sha256),
+        "--target-sha256 must be 64 lowercase hexadecimal characters"
+    );
+    anyhow::ensure!(
+        expected_target_sha256 == PINNED_LLAMA32_3B_Q4KM_SHA256,
+        "materializer admits only the campaign's pinned exact-Q4 target SHA-256 {PINNED_LLAMA32_3B_Q4KM_SHA256}"
+    );
+    if let Some(expected) = expected_jobs_sha256.as_deref() {
+        anyhow::ensure!(
+            valid_sha(expected),
+            "--jobs-sha256 must be 64 lowercase hexadecimal characters"
+        );
+    }
+    anyhow::ensure!(shard_size > 0, "--shard-size must be at least 1");
+    if let Some(limit) = max_shards {
+        anyhow::ensure!(limit > 0, "--max-shards must be at least 1");
+    }
+    configure_rayon_threads(threads)?;
+    apply_serve_nocopy_default();
+    // The materializer is deliberately a one-target path. Disable the optional
+    // prompt n-gram shortcut even though it is lossless, so the provenance has
+    // exactly one causal implementation and no environment-selected drafter.
+    std::env::remove_var("CAMELID_SPEC_NGRAM");
+
+    let jobs_sha256 = sha256_file(&jobs_path)?;
+    if let Some(expected) = expected_jobs_sha256.as_deref() {
+        anyhow::ensure!(
+            jobs_sha256 == expected,
+            "jobs SHA-256 is {jobs_sha256}, expected {expected}"
+        );
+    }
+    let jobs = read_jobs(&jobs_path)?;
+
+    let gguf = read_metadata(&model)?;
+    ensure_arch_has_direct_dense_session(&gguf, DenseLaneWindowedForward::ViaSessionDecode)?;
+    let quantization = camelid::receipt::quantization_label(&gguf);
+    anyhow::ensure!(
+        quantization == "Q4_K_M",
+        "EAGLE corpus materialization requires exact target quantization Q4_K_M, got {quantization}"
+    );
+    let target_sha256 = sha256_file(&model)?;
+    anyhow::ensure!(
+        target_sha256 == expected_target_sha256,
+        "target GGUF SHA-256 is {target_sha256}, expected {expected_target_sha256}"
+    );
+    let config = LlamaModelConfig::from_gguf(&gguf)?;
+    anyhow::ensure!(
+        config.architecture == "llama"
+            && config.embedding_length == 3_072
+            && config.block_count == 28
+            && config.feed_forward_length == 8_192
+            && config.attention_head_count == 24
+            && config.attention_head_count_kv == 8
+            && config.vocab_size == Some(128_256),
+        "materializer requires exact Llama-3.2-3B geometry; got arch={} hidden={} layers={} ffn={} heads={}/{} vocab={:?}",
+        config.architecture,
+        config.embedding_length,
+        config.block_count,
+        config.feed_forward_length,
+        config.attention_head_count,
+        config.attention_head_count_kv,
+        config.vocab_size,
+    );
+    let tokenizer = Tokenizer::from_gguf(&gguf)?;
+    let chat_template = tokenizer
+        .chat_template
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("target tokenizer has no chat template"))?;
+    let target_file = model
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow::anyhow!("target path has no UTF-8 filename"))?
+        .to_string();
+    let current_exe = std::env::current_exe()?;
+    let binary_sha256 = sha256_file(&current_exe)?;
+    let target = TargetSeal {
+        file: target_file,
+        gguf_sha256: target_sha256,
+        quantization,
+        architecture: config.architecture.clone(),
+        tokenizer_metadata_sha256: camelid::receipt::tokenizer_metadata_sha256(&gguf),
+        chat_template_sha256: sha256_bytes(chat_template.as_bytes()),
+        context_length: config.context_length,
+        embedding_length: config.embedding_length as usize,
+        block_count: config.block_count,
+        feed_forward_length: config.feed_forward_length as usize,
+        attention_heads: config.attention_head_count,
+        attention_kv_heads: config.attention_head_count_kv,
+        vocab_size: config.vocab_size.expect("geometry checked"),
+    };
+    let planner_env = camelid::execution_plan::PlannerEnv::capture();
+    let plan_outcome = camelid::execution_plan::plan_for_model(&model, &gguf, threads);
+    let execution_plan = serde_json::to_value(&plan_outcome.plan)?;
+    let run = build_run_manifest(
+        &jobs_path,
+        &jobs,
+        jobs_sha256,
+        target,
+        binary_sha256,
+        execution_plan,
+        shard_size,
+    )?;
+    let mut store = MaterializationStore::open(&output, run, &jobs, resume)?;
+    if store.completed_shards() == store.shard_count() {
+        store.finalize()?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&MaterializationSummary::from_store(&store))?
+        );
+        return Ok(());
+    }
+    let pending = store.pending_shards(max_shards);
+
+    // Match bench-generate's exact target load: plan before loading K-quant
+    // weights, reuse one target weight set, and create a fresh causal session per
+    // job. No model other than this target is loaded in the process.
+    planner_env.apply(&plan_outcome.env_updates);
+    let binding = LlamaTensorBinding::bind(&gguf, &config)?;
+    let store_tensor = TensorStore::open(&model, &gguf);
+    let weights = Arc::new(LlamaLoadedWeights::load(&store_tensor, &binding, None)?);
+    let sampler = LlamaSampler::Greedy;
+
+    let bos_token_id = tokenizer
+        .special
+        .bos
+        .ok_or_else(|| anyhow::anyhow!("target tokenizer has no BOS token"))?;
+    let assistant_marker = "<|start_header_id|>assistant<|end_header_id|>\n\n";
+    let assistant_marker_ids = tokenizer.encode(assistant_marker, false, true)?;
+    let eog_token_ids = tokenizer.special.eog.clone();
+    anyhow::ensure!(
+        !eog_token_ids.is_empty(),
+        "target tokenizer has no EOG tokens"
+    );
+    let mut framing_token_ids = eog_token_ids.clone();
+    for token in &tokenizer.tokens {
+        let chat_marker = token.kind == camelid::tokenizer::TokenKind::UserDefined
+            && token.text.starts_with("<|")
+            && token.text.ends_with("|>");
+        if matches!(
+            token.kind,
+            camelid::tokenizer::TokenKind::Control | camelid::tokenizer::TokenKind::Unused
+        ) || chat_marker
+        {
+            framing_token_ids.insert(token.id);
+        }
+    }
+
+    for shard_index in pending {
+        let samples = {
+            let shard_jobs = store.jobs_for_shard(shard_index);
+            let mut samples = Vec::with_capacity(shard_jobs.len());
+            for job in shard_jobs {
+                let (rendered_prompt, add_special, parse_special) =
+                    camelid::api::render_llama3_training_chat_prompt(
+                        &job.render_messages(),
+                        &tokenizer,
+                    )
+                    .map_err(|error| anyhow::anyhow!("rendering corpus job {}: {error}", job.id))?;
+                let prompt_token_ids =
+                    tokenizer.encode(&rendered_prompt, add_special, parse_special)?;
+                validate_llama3_generation_boundary(
+                    &prompt_token_ids,
+                    bos_token_id,
+                    &assistant_marker_ids,
+                    &eog_token_ids,
+                )
+                .with_context(|| format!("validating chat boundary for job {}", job.id))?;
+                anyhow::ensure!(
+                    prompt_token_ids.len() + job.generation.max_new_tokens
+                        <= config.context_length as usize,
+                    "job {} prompt ({}) + max completion ({}) exceeds target context {}",
+                    job.id,
+                    prompt_token_ids.len(),
+                    job.generation.max_new_tokens,
+                    config.context_length
+                );
+                let generated = generate_run(
+                    &config,
+                    &weights,
+                    &tokenizer,
+                    &prompt_token_ids,
+                    &sampler,
+                    job.generation.max_new_tokens,
+                )?
+                .generated;
+                samples.push(MaterializedSample::from_target_generation(
+                    job,
+                    &rendered_prompt,
+                    add_special,
+                    parse_special,
+                    &prompt_token_ids,
+                    &generated,
+                    &eog_token_ids,
+                    &framing_token_ids,
+                )?);
+            }
+            samples
+        };
+        store.write_shard(shard_index, &samples)?;
+        eprintln!(
+            "[eagle3-materialize] committed shard {}/{} ({} records)",
+            shard_index + 1,
+            store.shard_count(),
+            samples.len()
+        );
+    }
+    if store.completed_shards() == store.shard_count() {
+        store.finalize()?;
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&MaterializationSummary::from_store(&store))?
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_bench_generate(
     model: PathBuf,
     prompt_file: Option<PathBuf>,
@@ -8848,6 +8275,45 @@ fn run_bench_generate_vision(
     Ok(())
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct TargetTopKBenchTelemetry {
+    seed_probes: u64,
+    speculative_rounds: u64,
+    candidate_rows: u64,
+    candidate_ids: u64,
+}
+
+impl TargetTopKBenchTelemetry {
+    fn note_seed_probe(&mut self, candidate_ids: usize) {
+        self.seed_probes += 1;
+        self.candidate_rows += 1;
+        self.candidate_ids += candidate_ids as u64;
+    }
+
+    fn note_speculative(&mut self, rows: usize, candidate_ids: usize) {
+        self.speculative_rounds += 1;
+        self.candidate_rows += rows as u64;
+        self.candidate_ids += candidate_ids as u64;
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn target_topk_bench_telemetry_distinguishes_seed_and_speculative_rounds() {
+    let mut telemetry = TargetTopKBenchTelemetry::default();
+    telemetry.note_seed_probe(8);
+    telemetry.note_speculative(3, 24);
+    assert_eq!(
+        telemetry,
+        TargetTopKBenchTelemetry {
+            seed_probes: 1,
+            speculative_rounds: 1,
+            candidate_rows: 4,
+            candidate_ids: 32,
+        }
+    );
+}
+
 /// One full speculative generation, instrumented for SPEC_RECHECK economics. Mirrors the
 /// server's accept/verify/rollback loop (`api::generate`): a normal greedy first step seeds
 /// the resident engine, then each round drafts ≤γ tokens, verifies them in ONE batched
@@ -8876,6 +8342,7 @@ struct SpeculativeRun {
     normal_steps: u64,
     gpu_verify_rounds: u64,
     cpu_verify_rounds: u64,
+    target_topk: TargetTopKBenchTelemetry,
 }
 
 /// Flatten a [`TokenTree`]'s PRIMARY chain (first-child path from the root):
@@ -8963,6 +8430,7 @@ fn generate_run_speculative(
         normal_steps: 0,
         gpu_verify_rounds: 0,
         cpu_verify_rounds: 0,
+        target_topk: TargetTopKBenchTelemetry::default(),
     };
 
     // Tree-speculation lane (CAMELID_SPEC_TREE): a branching drafter proposes a tree of
@@ -8972,7 +8440,17 @@ fn generate_run_speculative(
     let spec_tree = std::env::var_os("CAMELID_SPEC_TREE")
         .map(|v| v != "0" && !v.is_empty())
         .unwrap_or(false);
-    let mut tree_drafter = camelid::inference::suffix_decoding::SuffixDecodingDrafter::default();
+    // Benchmark-only Phase-1 Token Recycling experiment. This flag is consumed only by this
+    // benchmark generator: serving and the default benchmark continue to use suffix decoding
+    // and the ordinary greedy verifier API. The experimental lane asks Metal for compact target
+    // top-8 ids per verified tree row and feeds them into Token Recycling's sparse adjacency.
+    let bench_token_recycling_topk = std::env::var_os("CAMELID_BENCH_TOKEN_RECYCLING_TOPK")
+        .map(|v| v != "0" && !v.is_empty())
+        .unwrap_or(false);
+    let mut suffix_tree_drafter =
+        camelid::inference::suffix_decoding::SuffixDecodingDrafter::default();
+    let mut recycling_tree_drafter =
+        camelid::inference::token_recycling::TokenRecyclingDrafter::default();
     // ACCEPTANCE-GATED DRAFTING (CAMELID_SPEC_TREE lane only).
     //
     // The suffix drafter only PROPOSES; `verify_tree_gpu` is the exact greedy gate, so any
@@ -9110,12 +8588,78 @@ fn generate_run_speculative(
             };
 
             let draft_started = Instant::now();
-            let tree = tree_drafter.draft_tree(&history, anchor, max_nodes, max_depth);
+            let mut tree = if bench_token_recycling_topk {
+                recycling_tree_drafter.draft_tree(&history, anchor, max_nodes, max_depth)
+            } else {
+                suffix_tree_drafter.draft_tree(&history, anchor, max_nodes, max_depth)
+            };
             run.draft_us += draft_started.elapsed().as_micros();
+
+            // A sparse cold-start TR row cannot produce a child. Probe that anchor without
+            // committing KV/logical position, install its exact latest target row, then redraft
+            // at the SAME base. The committing tree verify below emits the authoritative target
+            // token(s). This avoids both failure modes: plain decode would never expose top-k,
+            // while committing the one-row probe would merely move the missing-row problem to
+            // the newly emitted anchor.
+            if bench_token_recycling_topk && tree.nodes() == 1 && !cpu_verify_pinned {
+                let seed_started = Instant::now();
+                let seed = session.probe_tree_metal_target_top_k(&tree)?;
+                run.verify_us += seed_started.elapsed().as_micros();
+                if let Some((predictions, target_top_k)) = seed {
+                    debug_assert_eq!(predictions.len(), 1);
+                    debug_assert_eq!(target_top_k.len(), 1);
+                    debug_assert_eq!(target_top_k[0][0], predictions[0]);
+                    let candidate_ids =
+                        recycling_tree_drafter.replace_target_candidates(anchor, &target_top_k[0]);
+                    run.gpu_verify_rounds += 1;
+                    run.target_topk.note_seed_probe(candidate_ids);
+                    if std::env::var_os("CAMELID_SPEC_TREE_TRACE").is_some() {
+                        eprintln!(
+                            "[spec-tree-target-topk] kind=seed-probe rows=1 \
+                             candidate_ids={candidate_ids} committed=0"
+                        );
+                    }
+                    let redraft_started = Instant::now();
+                    // Do not relearn the same accepted-stream edge on this second draft call.
+                    tree = recycling_tree_drafter.draft_tree(&[], anchor, max_nodes, max_depth);
+                    run.draft_us += redraft_started.elapsed().as_micros();
+                    debug_assert!(candidate_ids == 0 || tree.nodes() > 1);
+                }
+            }
             if tree.nodes() > 1 {
                 let verify_started = Instant::now();
                 let gpu_emitted = if cpu_verify_pinned {
                     None
+                } else if bench_token_recycling_topk {
+                    session
+                        .verify_tree_metal_with_target_top_k(&tree)?
+                        .map(|verified| {
+                            debug_assert_eq!(verified.target_top_k.len(), tree.nodes());
+                            debug_assert_eq!(verified.predictions.len(), tree.nodes());
+                            let mut candidate_observations = 0usize;
+                            for ((&from, candidates), &prediction) in tree
+                                .tokens
+                                .iter()
+                                .zip(&verified.target_top_k)
+                                .zip(&verified.predictions)
+                            {
+                                debug_assert_eq!(candidates[0], prediction);
+                                candidate_observations += recycling_tree_drafter
+                                    .replace_target_candidates(from, candidates);
+                            }
+                            run.target_topk
+                                .note_speculative(tree.nodes(), candidate_observations);
+                            if std::env::var_os("CAMELID_SPEC_TREE_TRACE").is_some() {
+                                eprintln!(
+                                    "[spec-tree-target-topk] kind=speculative rows={} \
+                                     candidate_ids={} emitted_len={} committed=1",
+                                    tree.nodes(),
+                                    candidate_observations,
+                                    verified.emitted.len()
+                                );
+                            }
+                            verified.emitted
+                        })
                 } else {
                     session.verify_tree_gpu(&tree)?
                 };
@@ -9160,7 +8704,11 @@ fn generate_run_speculative(
                             // primary-chain flatten becomes exact.
                             cpu_verify_pinned = true;
                             session.set_resident_paths_disabled(true);
-                            tree_drafter.branch = 1;
+                            if bench_token_recycling_topk {
+                                recycling_tree_drafter.branch = 1;
+                            } else {
+                                suffix_tree_drafter.branch = 1;
+                            }
                         }
                         let base_position = session.kv_position();
                         let mut batch = Vec::with_capacity(1 + chain.len());
@@ -9232,13 +8780,10 @@ fn generate_run_speculative(
                 // miss, not a drafter miss — so leave the latch untouched.
                 run.verify_us += verify_started.elapsed().as_micros();
             } else {
-                // The drafter found NO recurrence (anchor-only tree). This is TRANSIENT and common
-                // early in a stream (the recurrence hasn't built up yet), so it must NOT crash the
-                // EWMA into the LOW band before the stream's true acceptance is ever observed. Treat
-                // it exactly like the ungated path does: take a cheap plain step and try again next
-                // round. The suffix scan that produced it is O(window) and cheap, and crucially NO
-                // batched verify or KV compaction ran (the expensive part) — so on purely novel
-                // text this costs essentially the same as plain decode. Leave the EWMA untouched.
+                // Suffix found no recurrence, or the experimental TR seed probe was unavailable.
+                // This is not evidence of poor draft acceptance, so leave the latch untouched and
+                // take the lossless plain step below. A successful TR seed always installs at least
+                // one valid candidate and redrafts a nontrivial tree before reaching this branch.
             }
             // No usable tree this round → one plain resident greedy step.
             let step_started = Instant::now();
@@ -9418,6 +8963,10 @@ struct BenchSpeculativeRecord {
     normal_steps: u64,
     gpu_verify_rounds: u64,
     cpu_verify_rounds: u64,
+    target_topk_seed_probes: u64,
+    target_topk_speculative_rounds: u64,
+    target_topk_candidate_rows: u64,
+    target_topk_candidate_ids: u64,
 
     // Lossless gate (intra-Camelid: spec stream vs this run's plain greedy stream).
     first_divergent_generated_token_index: i64,
@@ -9441,6 +8990,7 @@ fn speculative_effective_env() -> BTreeMap<String, Option<String>> {
         "CAMELID_SPEC_GPU",
         "CAMELID_SPEC_DECODE",
         "CAMELID_SPEC_TREE_GATE",
+        "CAMELID_BENCH_TOKEN_RECYCLING_TOPK",
         "CAMELID_SPEC_NGRAM_MIN",
         "CAMELID_METAL_ATTN_SPLITK",
         "CAMELID_METAL_KV_DTYPE",
@@ -9508,6 +9058,16 @@ fn run_bench_speculative(
     threads: Option<usize>,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(max_tokens >= 1, "--max-tokens must be at least 1");
+    let bench_token_recycling_topk = std::env::var_os("CAMELID_BENCH_TOKEN_RECYCLING_TOPK")
+        .map(|v| v != "0" && !v.is_empty())
+        .unwrap_or(false);
+    let tree_requested = std::env::var_os("CAMELID_SPEC_TREE")
+        .map(|v| v != "0" && !v.is_empty())
+        .unwrap_or(false);
+    anyhow::ensure!(
+        !bench_token_recycling_topk || tree_requested,
+        "CAMELID_BENCH_TOKEN_RECYCLING_TOPK=1 requires CAMELID_SPEC_TREE=1"
+    );
     configure_rayon_threads(threads)?;
     camelid::capability::HardwareProfile::detect().log();
 
@@ -9559,7 +9119,9 @@ fn run_bench_speculative(
             // Suffix drafting flattened to a chain: fills the verify window the
             // n-gram drafter leaves mostly empty, without paying the tree
             // verify's per-round cost.
-            "suffix" => Ok(SpeculativeDrafter::Suffix(Box::default())),
+            "suffix" => Ok(SpeculativeDrafter::Suffix(Box::new(
+                camelid::inference::suffix_decoding::SuffixDecodingDrafter::default(),
+            ))),
             "draft" => {
                 let path = draft_model.as_deref().ok_or_else(|| {
                     anyhow::anyhow!("--drafter draft requires --draft-model <gguf>")
@@ -9760,7 +9322,13 @@ fn run_bench_speculative(
         draft_model: draft_model.as_ref().map(|p| p.display().to_string()),
         draft_model_sha256,
         quantization: camelid::receipt::quantization_label(&gguf),
-        drafter: drafter_kind,
+        drafter: if bench_token_recycling_topk {
+            "token-recycling-target-topk".to_string()
+        } else if tree_requested {
+            "suffix-tree".to_string()
+        } else {
+            drafter_kind
+        },
         cpu_draft,
         spec_only,
         draft_tokens: gamma,
@@ -9787,6 +9355,10 @@ fn run_bench_speculative(
         normal_steps: spec.normal_steps,
         gpu_verify_rounds: spec.gpu_verify_rounds,
         cpu_verify_rounds: spec.cpu_verify_rounds,
+        target_topk_seed_probes: spec.target_topk.seed_probes,
+        target_topk_speculative_rounds: spec.target_topk.speculative_rounds,
+        target_topk_candidate_rows: spec.target_topk.candidate_rows,
+        target_topk_candidate_ids: spec.target_topk.candidate_ids,
         first_divergent_generated_token_index: first_divergent,
         lossless: first_divergent < 0,
         plain_token_ids: plain.generated,
@@ -9808,7 +9380,8 @@ fn run_bench_speculative(
     }
     eprintln!(
         "[bench-speculative] {} | {} γ={}{} | accept {:.1}% | tok/round {:.2} | f_draft {:.3} | \
-         draft {:.1} ms/tok | plain {:.2} t/s → spec {:.2} t/s | S_sync {:.2}x | {} | gpu/cpu verify {}/{} | drafted {} rounds {}",
+         draft {:.1} ms/tok | plain {:.2} t/s → spec {:.2} t/s | S_sync {:.2}x | {} | \
+         gpu/cpu verify {}/{} | TR seed/spec {}/{} rows={} ids={} | drafted {} rounds {}",
         record.workload,
         record.drafter,
         record.draft_tokens,
@@ -9816,20 +9389,2493 @@ fn run_bench_speculative(
         record.accept_rate * 100.0,
         record.mean_accepted_tokens_per_round,
         record.f_draft,
-        if record.drafted > 0 { record.draft_ms / record.drafted as f64 } else { 0.0 },
+        if record.drafted > 0 {
+            record.draft_ms / record.drafted as f64
+        } else {
+            0.0
+        },
         record.plain_tokens_per_second,
         record.spec_tokens_per_second,
         record.s_sync,
         if record.lossless {
             "LOSSLESS ✓".to_string()
         } else {
-            format!("DIVERGED @ {}", record.first_divergent_generated_token_index)
+            format!(
+                "DIVERGED @ {}",
+                record.first_divergent_generated_token_index
+            )
         },
         record.gpu_verify_rounds,
         record.cpu_verify_rounds,
+        record.target_topk_seed_probes,
+        record.target_topk_speculative_rounds,
+        record.target_topk_candidate_rows,
+        record.target_topk_candidate_ids,
         record.drafted,
         record.rounds,
     );
+    Ok(())
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Eagle3TokenRecyclingTelemetry {
+    admission_decisions: u64,
+    admission_declines: u64,
+    primary_depth_sum: u64,
+    parent_rows_sum: u64,
+    known_parent_rows_sum: u64,
+    known_parent_share_q16_sum: u64,
+    e9_rounds: u64,
+    e9_offered: u64,
+    e9_accepted_drafts: u64,
+    e9_emitted_tokens: u64,
+    tr_rounds: u64,
+    tr_offered: u64,
+    tr_accepted_drafts: u64,
+    tr_emitted_tokens: u64,
+    cold_seed_anchors: u64,
+    candidate_rows: u64,
+    candidate_ids: u64,
+}
+
+impl Eagle3TokenRecyclingTelemetry {
+    fn note_decision(
+        &mut self,
+        evidence: camelid::inference::token_recycling::TokenRecyclingTreeEvidence,
+    ) {
+        self.admission_decisions += 1;
+        self.admission_declines += u64::from(!evidence.admitted);
+        self.primary_depth_sum += evidence.primary_depth as u64;
+        self.parent_rows_sum += evidence.parent_rows as u64;
+        self.known_parent_rows_sum += evidence.known_parent_rows as u64;
+        self.known_parent_share_q16_sum += evidence.known_parent_share_q16 as u64;
+    }
+
+    fn note_e9(&mut self, offered: usize, emitted: usize, cold_seed: bool) {
+        self.e9_rounds += 1;
+        self.e9_offered += offered as u64;
+        self.e9_accepted_drafts += emitted.saturating_sub(1) as u64;
+        self.e9_emitted_tokens += emitted as u64;
+        self.cold_seed_anchors += u64::from(cold_seed);
+    }
+
+    fn note_tr(&mut self, offered: usize, emitted: usize) {
+        self.tr_rounds += 1;
+        self.tr_offered += offered as u64;
+        self.tr_accepted_drafts += emitted.saturating_sub(1) as u64;
+        self.tr_emitted_tokens += emitted as u64;
+    }
+
+    fn note_candidates(&mut self, rows: usize, ids: usize) {
+        self.candidate_rows += rows as u64;
+        self.candidate_ids += ids as u64;
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Eagle3TargetRowHedgeTelemetry {
+    rounds: u64,
+    insertion_rounds: u64,
+    no_prior_row_rounds: u64,
+    no_promotable_lattice_child_rounds: u64,
+    duplicate_only_rounds: u64,
+    below_promotion_score_rounds: u64,
+    no_replaceable_hedge_rounds: u64,
+    supported_primary_rows: u64,
+    full_path_duplicates: u64,
+    prior_rows_without_materialized_child: u64,
+    target_rows_offered: u64,
+    target_rows_accepted: u64,
+    shared_rows_accepted: u64,
+    evicted_edges_would_accept: u64,
+    counterfactual_emitted_token_delta: i64,
+    neural_hedges_retained_sum: u64,
+    offered_by_depth: [u64; 8],
+    accepted_by_depth: [u64; 8],
+    candidate_rows: u64,
+    candidate_ids: u64,
+}
+
+impl Eagle3TargetRowHedgeTelemetry {
+    fn note_round(
+        &mut self,
+        forest: &camelid::inference::target_row_hedge::TargetRowHedgeForest,
+        acceptance: &camelid::inference::target_row_hedge::TargetRowHedgeAcceptance,
+        ordinary_eagle: &camelid::inference::spec_tree::ScoredTokenTree,
+        predictions: &[u32],
+    ) -> Result<(), String> {
+        use camelid::inference::target_row_hedge::{TargetRowHedgeOutcome, TargetRowHedgeSource};
+
+        if forest.source.len() != forest.tree.nodes()
+            || acceptance.capture_rows.len() != acceptance.emitted_tokens.len()
+            || acceptance.capture_rows.first() != Some(&0)
+            || acceptance
+                .capture_rows
+                .iter()
+                .any(|&row| row >= forest.tree.nodes())
+        {
+            return Err("target-row hedge telemetry received misaligned forest rows".to_string());
+        }
+        let mut next = *self;
+        next.rounds = next.rounds.saturating_add(1);
+        next.supported_primary_rows = next
+            .supported_primary_rows
+            .saturating_add(forest.decision.supported_primary_rows as u64);
+        next.full_path_duplicates = next
+            .full_path_duplicates
+            .saturating_add(forest.decision.full_path_duplicates as u64);
+        next.prior_rows_without_materialized_child = next
+            .prior_rows_without_materialized_child
+            .saturating_add(forest.decision.prior_rows_without_materialized_child as u64);
+        next.neural_hedges_retained_sum = next
+            .neural_hedges_retained_sum
+            .saturating_add(forest.decision.neural_hedges_retained as u64);
+        match forest.decision.outcome {
+            TargetRowHedgeOutcome::Inserted => {
+                next.insertion_rounds = next.insertion_rounds.saturating_add(1);
+                let candidate_row = forest
+                    .source
+                    .iter()
+                    .position(|&source| source == TargetRowHedgeSource::PriorTargetTop1)
+                    .ok_or_else(|| {
+                        "inserted target-row hedge has no candidate provenance".to_string()
+                    })?;
+                let depth = usize::from(forest.tree.depth[candidate_row]);
+                if depth == 0 || depth >= next.offered_by_depth.len() {
+                    return Err(format!(
+                        "target-row hedge candidate depth {depth} is outside 1..=7"
+                    ));
+                }
+                next.target_rows_offered = next.target_rows_offered.saturating_add(1);
+                next.offered_by_depth[depth] = next.offered_by_depth[depth].saturating_add(1);
+                if acceptance.capture_rows.contains(&candidate_row) {
+                    next.target_rows_accepted = next.target_rows_accepted.saturating_add(1);
+                    next.accepted_by_depth[depth] = next.accepted_by_depth[depth].saturating_add(1);
+                }
+            }
+            TargetRowHedgeOutcome::NoPriorTargetRow => {
+                next.no_prior_row_rounds = next.no_prior_row_rounds.saturating_add(1);
+            }
+            TargetRowHedgeOutcome::NoPromotableLatticeChild => {
+                next.no_promotable_lattice_child_rounds =
+                    next.no_promotable_lattice_child_rounds.saturating_add(1);
+            }
+            TargetRowHedgeOutcome::DuplicateOnly => {
+                next.duplicate_only_rounds = next.duplicate_only_rounds.saturating_add(1);
+            }
+            TargetRowHedgeOutcome::BelowPromotionScore => {
+                next.below_promotion_score_rounds =
+                    next.below_promotion_score_rounds.saturating_add(1);
+            }
+            TargetRowHedgeOutcome::NoReplaceableNeuralHedge => {
+                next.no_replaceable_hedge_rounds =
+                    next.no_replaceable_hedge_rounds.saturating_add(1);
+            }
+        }
+        next.shared_rows_accepted = next.shared_rows_accepted.saturating_add(
+            acceptance
+                .capture_rows
+                .iter()
+                .filter(|&&row| {
+                    matches!(
+                        forest.source[row],
+                        TargetRowHedgeSource::EaglePrimaryAndPriorTargetTop1
+                            | TargetRowHedgeSource::EagleNeuralHedgeAndPriorTargetTop1
+                    )
+                })
+                .count() as u64,
+        );
+        let counterfactual =
+            forest.exact_counterfactual(ordinary_eagle, predictions, acceptance)?;
+        if counterfactual.inserted_row_accepted
+            != (forest.decision.outcome == TargetRowHedgeOutcome::Inserted
+                && forest
+                    .source
+                    .iter()
+                    .position(|&source| source == TargetRowHedgeSource::PriorTargetTop1)
+                    .is_some_and(|row| acceptance.capture_rows.contains(&row)))
+        {
+            return Err("target-row counterfactual disagrees with accepted-row telemetry".into());
+        }
+        next.evicted_edges_would_accept = next
+            .evicted_edges_would_accept
+            .saturating_add(counterfactual.evicted_edge_would_accept as u64);
+        next.counterfactual_emitted_token_delta = next
+            .counterfactual_emitted_token_delta
+            .checked_add(i64::from(counterfactual.emitted_token_delta))
+            .ok_or_else(|| "target-row counterfactual delta overflowed i64".to_string())?;
+        *self = next;
+        Ok(())
+    }
+
+    fn note_candidates(&mut self, rows: usize, ids: usize) {
+        self.candidate_rows = self.candidate_rows.saturating_add(rows as u64);
+        self.candidate_ids = self.candidate_ids.saturating_add(ids as u64);
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn eagle3_token_recycling_telemetry_splits_e9_tr_and_cold_seed_rounds() {
+    use camelid::inference::token_recycling::TokenRecyclingTreeEvidence;
+
+    let mut telemetry = Eagle3TokenRecyclingTelemetry::default();
+    telemetry.note_decision(TokenRecyclingTreeEvidence {
+        root_known: false,
+        nodes: 1,
+        max_depth: 0,
+        primary_depth: 0,
+        parent_rows: 0,
+        known_parent_rows: 0,
+        known_parent_share_q16: 0,
+        admitted: false,
+    });
+    telemetry.note_e9(7, 2, true);
+    telemetry.note_candidates(8, 64);
+    telemetry.note_decision(TokenRecyclingTreeEvidence {
+        root_known: true,
+        nodes: 7,
+        max_depth: 2,
+        primary_depth: 2,
+        parent_rows: 3,
+        known_parent_rows: 2,
+        known_parent_share_q16: 43_690,
+        admitted: true,
+    });
+    telemetry.note_tr(6, 3);
+    telemetry.note_candidates(7, 56);
+
+    assert_eq!(telemetry.admission_decisions, 2);
+    assert_eq!(telemetry.admission_declines, 1);
+    assert_eq!(telemetry.e9_rounds, 1);
+    assert_eq!(telemetry.e9_offered, 7);
+    assert_eq!(telemetry.e9_accepted_drafts, 1);
+    assert_eq!(telemetry.e9_emitted_tokens, 2);
+    assert_eq!(telemetry.tr_rounds, 1);
+    assert_eq!(telemetry.tr_offered, 6);
+    assert_eq!(telemetry.tr_accepted_drafts, 2);
+    assert_eq!(telemetry.tr_emitted_tokens, 3);
+    assert_eq!(telemetry.cold_seed_anchors, 1);
+    assert_eq!(telemetry.candidate_rows, 15);
+    assert_eq!(telemetry.candidate_ids, 120);
+}
+
+const EAGLE3_ADAPTIVE_EXPANSION_WINDOW: usize = 4;
+const EAGLE3_ADAPTIVE_SHALLOW_EXPANSIONS: usize = 4;
+const EAGLE3_ADAPTIVE_DEEP_EXPANSIONS: usize = 7;
+const EAGLE3_ADAPTIVE_SHALLOW_TO_DEEP_SUM: u32 = 14;
+const EAGLE3_ADAPTIVE_DEEP_TO_SHALLOW_SUM: u32 = 16;
+const EAGLE3_ADAPTIVE_PROMOTION_WINDOWS: u8 = 2;
+const EAGLE3_ADAPTIVE_DEMOTION_WINDOWS: u8 = 2;
+const EAGLE3_ADAPTIVE_POST_DEMOTION_COOLDOWN: u8 = 2;
+
+const EAGLE3_WIDTH_SELECTOR_NARROW_NODES: usize = 5;
+const EAGLE3_WIDTH_SELECTOR_WIDE_NODES: usize = 6;
+// Mini2 medians from the locked N5/N6 generic screen. Both costs include the shared N6
+// frontier materialization time because the selector runs only after that frontier exists.
+const EAGLE3_WIDTH_SELECTOR_DEFAULT_N5_TOTAL_MS: f64 = 54.233_121_328_3;
+const EAGLE3_WIDTH_SELECTOR_DEFAULT_N6_TOTAL_MS: f64 = 55.375_518_518_6;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Eagle3VerifierWidthSelectorConfig {
+    n5_total_ms: f64,
+    n6_total_ms: f64,
+}
+
+impl Eagle3VerifierWidthSelectorConfig {
+    fn cost_points(self) -> [camelid::eagle3_runtime::Eagle3VerifierBudgetCost; 2] {
+        [
+            camelid::eagle3_runtime::Eagle3VerifierBudgetCost {
+                max_nodes: EAGLE3_WIDTH_SELECTOR_NARROW_NODES,
+                round_cost: self.n5_total_ms,
+            },
+            camelid::eagle3_runtime::Eagle3VerifierBudgetCost {
+                max_nodes: EAGLE3_WIDTH_SELECTOR_WIDE_NODES,
+                round_cost: self.n6_total_ms,
+            },
+        ]
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Eagle3VerifierWidthTelemetry {
+    decisions: u64,
+    n5_rounds: u64,
+    n6_rounds: u64,
+}
+
+impl Eagle3VerifierWidthTelemetry {
+    fn note(&mut self, admitted_node_budget: usize) -> anyhow::Result<()> {
+        match admitted_node_budget {
+            EAGLE3_WIDTH_SELECTOR_NARROW_NODES => self.n5_rounds += 1,
+            EAGLE3_WIDTH_SELECTOR_WIDE_NODES => self.n6_rounds += 1,
+            other => {
+                anyhow::bail!("EAGLE-3 width selector admitted unexpected verifier budget {other}")
+            }
+        }
+        self.decisions += 1;
+        Ok(())
+    }
+}
+
+const EAGLE3_X3_X4_DECISION_AFTER_EXPANSIONS: usize = 3;
+const EAGLE3_X3_X4_MAX_EXPANSIONS: usize = 4;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Eagle3X3X4SelectorConfig {
+    x4_min_next_parent_probability: f64,
+}
+
+impl Eagle3X3X4SelectorConfig {
+    fn use_x4(self, evidence: camelid::eagle3_runtime::Eagle3NextExpansionEvidence) -> bool {
+        // Equality deliberately keeps X4. X3 is admitted only when the already-observed path
+        // probability is strictly below the receipted threshold.
+        f64::from(evidence.next_parent_cumulative_probability)
+            >= self.x4_min_next_parent_probability
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+struct Eagle3X3X4Telemetry {
+    decisions: u64,
+    x3_rounds: u64,
+    x4_rounds: u64,
+    no_fourth_candidate_rounds: u64,
+    next_parent_probability_sum: f64,
+    next_parent_probability_min: Option<f64>,
+    next_parent_probability_max: Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Eagle3TerminalHeadSkipReason {
+    MaxTokens,
+    EndOfGeneration,
+    ContextExhausted,
+}
+
+impl Eagle3TerminalHeadSkipReason {
+    fn label(self) -> &'static str {
+        match self {
+            Self::MaxTokens => "max_tokens",
+            Self::EndOfGeneration => "eog",
+            Self::ContextExhausted => "context_exhausted",
+        }
+    }
+}
+
+/// Decide whether an authoritative head update can be omitted after target verification.
+///
+/// This sees only facts that are already authoritative for the current round: the target's
+/// emitted tokens, the caller's output bound, and the target session's remaining context after
+/// committing the accepted path. An update is skippable only when no later round can consume the
+/// resulting draft state. The empty-emission guard makes the predicate fail closed if a verifier
+/// contract ever changes.
+fn eagle3_terminal_head_skip_reason(
+    enabled: bool,
+    generated_before_round: usize,
+    max_tokens: usize,
+    emitted: &[u32],
+    eog_token_ids: &BTreeSet<u32>,
+    remaining_context_after_verify: usize,
+) -> Option<Eagle3TerminalHeadSkipReason> {
+    if !enabled || emitted.is_empty() {
+        return None;
+    }
+    if generated_before_round.saturating_add(emitted.len()) >= max_tokens {
+        Some(Eagle3TerminalHeadSkipReason::MaxTokens)
+    } else if emitted.iter().any(|token| eog_token_ids.contains(token)) {
+        Some(Eagle3TerminalHeadSkipReason::EndOfGeneration)
+    } else if remaining_context_after_verify == 0 {
+        Some(Eagle3TerminalHeadSkipReason::ContextExhausted)
+    } else {
+        None
+    }
+}
+
+impl Eagle3X3X4Telemetry {
+    fn note_decision(
+        &mut self,
+        evidence: camelid::eagle3_runtime::Eagle3NextExpansionEvidence,
+        use_x4: bool,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            evidence.completed_head_expansions == EAGLE3_X3_X4_DECISION_AFTER_EXPANSIONS,
+            "EAGLE-3 X3/X4 selector received evidence after {} expansions, expected {}",
+            evidence.completed_head_expansions,
+            EAGLE3_X3_X4_DECISION_AFTER_EXPANSIONS,
+        );
+        let probability = f64::from(evidence.next_parent_cumulative_probability);
+        anyhow::ensure!(
+            probability.is_finite() && (0.0..=1.0).contains(&probability),
+            "EAGLE-3 X3/X4 selector received invalid next-parent probability {probability}"
+        );
+        self.decisions += 1;
+        if use_x4 {
+            self.x4_rounds += 1;
+        } else {
+            self.x3_rounds += 1;
+        }
+        self.next_parent_probability_sum += probability;
+        self.next_parent_probability_min = Some(
+            self.next_parent_probability_min
+                .map_or(probability, |current| current.min(probability)),
+        );
+        self.next_parent_probability_max = Some(
+            self.next_parent_probability_max
+                .map_or(probability, |current| current.max(probability)),
+        );
+        Ok(())
+    }
+
+    fn next_parent_probability_mean(self) -> Option<f64> {
+        (self.decisions != 0).then(|| self.next_parent_probability_sum / self.decisions as f64)
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum Eagle3AdaptiveExpansionMode {
+    #[default]
+    Shallow,
+    Deep,
+}
+
+impl Eagle3AdaptiveExpansionMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Shallow => "shallow",
+            Self::Deep => "deep",
+        }
+    }
+
+    fn expansions(self) -> usize {
+        match self {
+            Self::Shallow => EAGLE3_ADAPTIVE_SHALLOW_EXPANSIONS,
+            Self::Deep => EAGLE3_ADAPTIVE_DEEP_EXPANSIONS,
+        }
+    }
+}
+
+const DUAL_EAGLE_RACE_ROUNDS: u8 = 6;
+const DUAL_EAGLE_ROOT_RANKING: usize = 8;
+// 840 is the least common multiple of 1..=8, so reciprocal rank remains exact and
+// deterministic without floating-point comparisons.
+const DUAL_EAGLE_RECIPROCAL_RANK_SCALE: u64 = 840;
+const DUAL_EAGLE_RECIPROCAL_RANK_POINTS: [u64; DUAL_EAGLE_ROOT_RANKING] =
+    [840, 420, 280, 210, 168, 140, 120, 105];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum DualEagleHead {
+    E9,
+    Sw512,
+}
+
+impl DualEagleHead {
+    fn other(self) -> Self {
+        match self {
+            Self::E9 => Self::Sw512,
+            Self::Sw512 => Self::E9,
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Eagle3AdaptiveExpansionTelemetry {
+    shallow_rounds: u64,
+    shallow_accepted_drafts: u64,
+    deep_rounds: u64,
+    deep_accepted_drafts: u64,
+    shallow_to_deep_transitions: u64,
+    deep_to_shallow_transitions: u64,
+    shallow_qualifying_windows: u64,
+    shallow_cooldown_rounds: u64,
+    shallow_cooldown_qualifying_windows: u64,
+    shallow_qualification_resets: u64,
+    deep_rejecting_windows: u64,
+    deep_rejection_resets: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Eagle3AdaptiveExpansionDecision {
+    used_mode: Eagle3AdaptiveExpansionMode,
+    next_mode: Eagle3AdaptiveExpansionMode,
+    accepted_drafts: u32,
+    window_count: usize,
+    window_sum: u32,
+    qualifying_window: bool,
+    qualifying_streak: u8,
+    deep_rejection_streak: u8,
+    cooldown_remaining: u8,
+}
+
+/// Causal controller for the benchmark-only EAGLE expansion experiment.
+///
+/// A round reads [`Self::expansions`] before target verification, then reports only that
+/// completed round's target-authoritative accepted-draft count. Therefore a transition can
+/// affect the next round but never the proposal that produced its own observation.
+/// Promotion and demotion both require two consecutive qualifying rolling windows. A confirmed
+/// demotion also starts two completed shallow cooldown rounds; qualifying cooldown windows never
+/// contribute to the next promotion streak.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Eagle3AdaptiveExpansionController {
+    mode: Eagle3AdaptiveExpansionMode,
+    last_accepted: [u8; EAGLE3_ADAPTIVE_EXPANSION_WINDOW],
+    history_len: usize,
+    history_cursor: usize,
+    shallow_qualifying_streak: u8,
+    deep_rejection_streak: u8,
+    cooldown_remaining: u8,
+    telemetry: Eagle3AdaptiveExpansionTelemetry,
+}
+
+impl Eagle3AdaptiveExpansionController {
+    #[cfg(test)]
+    fn mode(&self) -> Eagle3AdaptiveExpansionMode {
+        self.mode
+    }
+
+    fn expansions(&self) -> usize {
+        self.mode.expansions()
+    }
+
+    fn telemetry(&self) -> Eagle3AdaptiveExpansionTelemetry {
+        self.telemetry
+    }
+
+    fn note_completed_round(&mut self, accepted_drafts: usize) -> Eagle3AdaptiveExpansionDecision {
+        let accepted_drafts = u8::try_from(accepted_drafts)
+            .expect("an eight-node verifier accepts at most seven draft tokens");
+        let used_mode = self.mode;
+        match used_mode {
+            Eagle3AdaptiveExpansionMode::Shallow => {
+                self.telemetry.shallow_rounds += 1;
+                self.telemetry.shallow_accepted_drafts += u64::from(accepted_drafts);
+            }
+            Eagle3AdaptiveExpansionMode::Deep => {
+                self.telemetry.deep_rounds += 1;
+                self.telemetry.deep_accepted_drafts += u64::from(accepted_drafts);
+            }
+        }
+
+        self.last_accepted[self.history_cursor] = accepted_drafts;
+        self.history_cursor = (self.history_cursor + 1) % EAGLE3_ADAPTIVE_EXPANSION_WINDOW;
+        self.history_len = (self.history_len + 1).min(EAGLE3_ADAPTIVE_EXPANSION_WINDOW);
+        let window_sum = self.last_accepted[..self.history_len]
+            .iter()
+            .map(|&value| u32::from(value))
+            .sum();
+
+        let qualifying_window = self.history_len == EAGLE3_ADAPTIVE_EXPANSION_WINDOW
+            && window_sum >= EAGLE3_ADAPTIVE_SHALLOW_TO_DEEP_SUM;
+        if self.history_len == EAGLE3_ADAPTIVE_EXPANSION_WINDOW {
+            match used_mode {
+                Eagle3AdaptiveExpansionMode::Shallow => {
+                    if qualifying_window {
+                        self.telemetry.shallow_qualifying_windows += 1;
+                    }
+                    if self.cooldown_remaining > 0 {
+                        self.telemetry.shallow_cooldown_rounds += 1;
+                        if qualifying_window {
+                            self.telemetry.shallow_cooldown_qualifying_windows += 1;
+                        }
+                        self.cooldown_remaining -= 1;
+                        self.shallow_qualifying_streak = 0;
+                    } else if qualifying_window {
+                        self.shallow_qualifying_streak += 1;
+                        if self.shallow_qualifying_streak >= EAGLE3_ADAPTIVE_PROMOTION_WINDOWS {
+                            self.mode = Eagle3AdaptiveExpansionMode::Deep;
+                            self.shallow_qualifying_streak = 0;
+                            self.deep_rejection_streak = 0;
+                            self.telemetry.shallow_to_deep_transitions += 1;
+                        }
+                    } else {
+                        if self.shallow_qualifying_streak > 0 {
+                            self.telemetry.shallow_qualification_resets += 1;
+                        }
+                        self.shallow_qualifying_streak = 0;
+                    }
+                }
+                Eagle3AdaptiveExpansionMode::Deep => {
+                    if window_sum < EAGLE3_ADAPTIVE_DEEP_TO_SHALLOW_SUM {
+                        self.telemetry.deep_rejecting_windows += 1;
+                        self.deep_rejection_streak += 1;
+                        if self.deep_rejection_streak >= EAGLE3_ADAPTIVE_DEMOTION_WINDOWS {
+                            self.mode = Eagle3AdaptiveExpansionMode::Shallow;
+                            self.shallow_qualifying_streak = 0;
+                            self.deep_rejection_streak = 0;
+                            self.cooldown_remaining = EAGLE3_ADAPTIVE_POST_DEMOTION_COOLDOWN;
+                            self.telemetry.deep_to_shallow_transitions += 1;
+                        }
+                    } else {
+                        if self.deep_rejection_streak > 0 {
+                            self.telemetry.deep_rejection_resets += 1;
+                        }
+                        self.deep_rejection_streak = 0;
+                    }
+                }
+            }
+        }
+
+        Eagle3AdaptiveExpansionDecision {
+            used_mode,
+            next_mode: self.mode,
+            accepted_drafts: u32::from(accepted_drafts),
+            window_count: self.history_len,
+            window_sum,
+            qualifying_window,
+            qualifying_streak: self.shallow_qualifying_streak,
+            deep_rejection_streak: self.deep_rejection_streak,
+            cooldown_remaining: self.cooldown_remaining,
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn eagle3_adaptive_expansions_are_causal_and_start_shallow() {
+    let mut controller = Eagle3AdaptiveExpansionController::default();
+    for round in 0..4 {
+        assert_eq!(controller.expansions(), EAGLE3_ADAPTIVE_SHALLOW_EXPANSIONS);
+        let decision = controller.note_completed_round(4);
+        assert_eq!(decision.used_mode, Eagle3AdaptiveExpansionMode::Shallow);
+        assert_eq!(decision.next_mode, Eagle3AdaptiveExpansionMode::Shallow);
+        assert_eq!(decision.qualifying_streak, u8::from(round == 3));
+    }
+    // One qualifying window is insufficient. The fifth round itself remains shallow; its
+    // second consecutive qualifying result changes only round six.
+    assert_eq!(controller.expansions(), EAGLE3_ADAPTIVE_SHALLOW_EXPANSIONS);
+    let decision = controller.note_completed_round(4);
+    assert_eq!(decision.used_mode, Eagle3AdaptiveExpansionMode::Shallow);
+    assert_eq!(decision.next_mode, Eagle3AdaptiveExpansionMode::Deep);
+    assert_eq!(controller.expansions(), EAGLE3_ADAPTIVE_DEEP_EXPANSIONS);
+    assert_eq!(controller.telemetry().shallow_rounds, 5);
+    assert_eq!(controller.telemetry().shallow_accepted_drafts, 20);
+    assert_eq!(controller.telemetry().shallow_qualifying_windows, 2);
+    assert_eq!(controller.telemetry().shallow_to_deep_transitions, 1);
+}
+
+#[cfg(test)]
+#[test]
+fn eagle3_adaptive_expansions_confirm_deep_rejection_and_cool_down() {
+    let mut controller = Eagle3AdaptiveExpansionController::default();
+    for accepted in [4, 4, 4, 4, 4] {
+        controller.note_completed_round(accepted);
+    }
+    assert_eq!(controller.mode(), Eagle3AdaptiveExpansionMode::Deep);
+
+    // One rejecting deep window is probationary. A recovered next window clears it without
+    // changing the following round's depth.
+    let first_rejection = controller.note_completed_round(3);
+    assert_eq!(first_rejection.used_mode, Eagle3AdaptiveExpansionMode::Deep);
+    assert_eq!(first_rejection.window_count, 4);
+    assert_eq!(first_rejection.window_sum, 15);
+    assert_eq!(first_rejection.deep_rejection_streak, 1);
+    assert_eq!(first_rejection.next_mode, Eagle3AdaptiveExpansionMode::Deep);
+    let recovery = controller.note_completed_round(7);
+    assert_eq!(recovery.window_sum, 18);
+    assert_eq!(recovery.deep_rejection_streak, 0);
+    assert_eq!(recovery.next_mode, Eagle3AdaptiveExpansionMode::Deep);
+    assert_eq!(controller.telemetry().deep_rejection_resets, 1);
+
+    // Two consecutive rejecting deep windows confirm a sustained decline. Both deep rounds
+    // complete before the second result changes only the next round to shallow.
+    let probation = controller.note_completed_round(0);
+    assert_eq!(probation.window_sum, 14);
+    assert_eq!(probation.deep_rejection_streak, 1);
+    assert_eq!(probation.next_mode, Eagle3AdaptiveExpansionMode::Deep);
+    let demotion = controller.note_completed_round(0);
+    assert_eq!(demotion.window_sum, 10);
+    assert_eq!(demotion.deep_rejection_streak, 0);
+    assert_eq!(demotion.next_mode, Eagle3AdaptiveExpansionMode::Shallow);
+    assert_eq!(
+        demotion.cooldown_remaining,
+        EAGLE3_ADAPTIVE_POST_DEMOTION_COOLDOWN
+    );
+    assert_eq!(controller.telemetry().deep_rounds, 4);
+    assert_eq!(controller.telemetry().deep_accepted_drafts, 10);
+    assert_eq!(controller.telemetry().deep_rejecting_windows, 3);
+    assert_eq!(controller.telemetry().deep_to_shallow_transitions, 1);
+
+    // Two fully completed shallow rounds are ineligible even when both windows qualify.
+    for remaining in (0..EAGLE3_ADAPTIVE_POST_DEMOTION_COOLDOWN).rev() {
+        let decision = controller.note_completed_round(7);
+        assert_eq!(decision.used_mode, Eagle3AdaptiveExpansionMode::Shallow);
+        assert_eq!(decision.next_mode, Eagle3AdaptiveExpansionMode::Shallow);
+        assert_eq!(decision.cooldown_remaining, remaining);
+    }
+    assert_eq!(controller.telemetry().shallow_cooldown_rounds, 2);
+    assert_eq!(
+        controller.telemetry().shallow_cooldown_qualifying_windows,
+        2
+    );
+
+    // Once cooldown is complete, two new consecutive qualifying windows are required.
+    let first = controller.note_completed_round(7);
+    assert_eq!(first.next_mode, Eagle3AdaptiveExpansionMode::Shallow);
+    assert_eq!(first.qualifying_streak, 1);
+    let second = controller.note_completed_round(7);
+    assert_eq!(second.next_mode, Eagle3AdaptiveExpansionMode::Deep);
+    assert_eq!(controller.mode(), Eagle3AdaptiveExpansionMode::Deep);
+    assert_eq!(controller.telemetry().shallow_to_deep_transitions, 2);
+}
+
+#[cfg(test)]
+#[test]
+fn eagle3_adaptive_expansions_reject_one_window_prose_bursts() {
+    let mut controller = Eagle3AdaptiveExpansionController::default();
+    for accepted in [3, 3, 4, 4] {
+        controller.note_completed_round(accepted);
+    }
+    assert_eq!(controller.mode(), Eagle3AdaptiveExpansionMode::Shallow);
+    assert_eq!(controller.shallow_qualifying_streak, 1);
+
+    let decision = controller.note_completed_round(0);
+    assert!(!decision.qualifying_window);
+    assert_eq!(decision.qualifying_streak, 0);
+    assert_eq!(decision.next_mode, Eagle3AdaptiveExpansionMode::Shallow);
+    assert_eq!(controller.telemetry().shallow_to_deep_transitions, 0);
+    assert_eq!(controller.telemetry().shallow_qualification_resets, 1);
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize)]
+struct DualEagleScore {
+    top1_hits: u64,
+    top4_hits: u64,
+    reciprocal_rank_840_sum: u64,
+}
+
+impl DualEagleScore {
+    fn note_rank(&mut self, rank: Option<u8>) -> anyhow::Result<()> {
+        if let Some(rank) = rank {
+            anyhow::ensure!(
+                (1..=DUAL_EAGLE_ROOT_RANKING as u8).contains(&rank),
+                "dual-EAGLE root rank {rank} is outside 1..={DUAL_EAGLE_ROOT_RANKING}"
+            );
+            self.top1_hits += u64::from(rank == 1);
+            self.top4_hits += u64::from(rank <= 4);
+            self.reciprocal_rank_840_sum +=
+                DUAL_EAGLE_RECIPROCAL_RANK_POINTS[usize::from(rank - 1)];
+        }
+        Ok(())
+    }
+
+    fn ordering_key(self) -> (u64, u64, u64) {
+        (self.top1_hits, self.top4_hits, self.reciprocal_rank_840_sum)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct DualEagleCheckpointRoundEvidence {
+    root_top8: Vec<u32>,
+    target_rank: Option<u8>,
+    top1_match: bool,
+    top4_inclusion: bool,
+    cumulative_score: DualEagleScore,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct DualEagleRoundReceipt {
+    round: u8,
+    proposal_head: DualEagleHead,
+    target_token: u32,
+    e9: DualEagleCheckpointRoundEvidence,
+    sw512: DualEagleCheckpointRoundEvidence,
+    leader_for_next_round: DualEagleHead,
+}
+
+#[derive(Debug)]
+struct PendingDualEagleRound {
+    round: u8,
+    proposal_head: DualEagleHead,
+    e9_top8: Vec<u32>,
+    sw512_top8: Vec<u32>,
+}
+
+#[derive(Debug, Default)]
+struct DualEagleSelector {
+    completed_rounds: u8,
+    pending: bool,
+    e9_score: DualEagleScore,
+    sw512_score: DualEagleScore,
+    receipts: Vec<DualEagleRoundReceipt>,
+}
+
+impl DualEagleSelector {
+    fn validate_top8(label: &str, candidates: &[u32]) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            candidates.len() == DUAL_EAGLE_ROOT_RANKING,
+            "dual-EAGLE {label} root retained {} candidates, expected {DUAL_EAGLE_ROOT_RANKING}",
+            candidates.len()
+        );
+        for (index, candidate) in candidates.iter().enumerate() {
+            anyhow::ensure!(
+                !candidates[..index].contains(candidate),
+                "dual-EAGLE {label} root contains duplicate target token {candidate}"
+            );
+        }
+        Ok(())
+    }
+
+    fn leader(&self) -> DualEagleHead {
+        // The score is intentionally lexicographic: top-1 hits dominate top-4 inclusion,
+        // which dominates exact reciprocal rank within the retained top eight. Every exact
+        // tie resolves to the original E9 checkpoint.
+        if self.sw512_score.ordering_key() > self.e9_score.ordering_key() {
+            DualEagleHead::Sw512
+        } else {
+            DualEagleHead::E9
+        }
+    }
+
+    fn begin_round(
+        &mut self,
+        e9_top8: Vec<u32>,
+        sw512_top8: Vec<u32>,
+    ) -> anyhow::Result<PendingDualEagleRound> {
+        anyhow::ensure!(
+            self.completed_rounds < DUAL_EAGLE_RACE_ROUNDS,
+            "dual-EAGLE race already completed its {DUAL_EAGLE_RACE_ROUNDS} rounds"
+        );
+        anyhow::ensure!(!self.pending, "dual-EAGLE race already has a pending round");
+        Self::validate_top8("E9", &e9_top8)?;
+        Self::validate_top8("SW512", &sw512_top8)?;
+        let pending = PendingDualEagleRound {
+            round: self.completed_rounds + 1,
+            // This choice uses only evidence completed before this round. The target token
+            // below cannot retroactively select the tree it is about to verify.
+            proposal_head: self.leader(),
+            e9_top8,
+            sw512_top8,
+        };
+        self.pending = true;
+        Ok(pending)
+    }
+
+    fn target_rank(candidates: &[u32], target: u32) -> Option<u8> {
+        candidates
+            .iter()
+            .position(|candidate| *candidate == target)
+            .map(|index| (index + 1) as u8)
+    }
+
+    fn finish_round(
+        &mut self,
+        pending: PendingDualEagleRound,
+        target_token: u32,
+    ) -> anyhow::Result<DualEagleRoundReceipt> {
+        anyhow::ensure!(
+            self.pending,
+            "dual-EAGLE race has no pending round to score"
+        );
+        anyhow::ensure!(
+            pending.round == self.completed_rounds + 1,
+            "dual-EAGLE pending round {} is out of order after {} completed rounds",
+            pending.round,
+            self.completed_rounds
+        );
+        anyhow::ensure!(
+            pending.proposal_head == self.leader(),
+            "dual-EAGLE pending proposal head changed before target evidence"
+        );
+        let e9_rank = Self::target_rank(&pending.e9_top8, target_token);
+        let sw512_rank = Self::target_rank(&pending.sw512_top8, target_token);
+        self.e9_score.note_rank(e9_rank)?;
+        self.sw512_score.note_rank(sw512_rank)?;
+        self.completed_rounds += 1;
+        self.pending = false;
+        let receipt = DualEagleRoundReceipt {
+            round: pending.round,
+            proposal_head: pending.proposal_head,
+            target_token,
+            e9: DualEagleCheckpointRoundEvidence {
+                root_top8: pending.e9_top8,
+                target_rank: e9_rank,
+                top1_match: e9_rank == Some(1),
+                top4_inclusion: e9_rank.is_some_and(|rank| rank <= 4),
+                cumulative_score: self.e9_score,
+            },
+            sw512: DualEagleCheckpointRoundEvidence {
+                root_top8: pending.sw512_top8,
+                target_rank: sw512_rank,
+                top1_match: sw512_rank == Some(1),
+                top4_inclusion: sw512_rank.is_some_and(|rank| rank <= 4),
+                cumulative_score: self.sw512_score,
+            },
+            leader_for_next_round: self.leader(),
+        };
+        self.receipts.push(receipt.clone());
+        Ok(receipt)
+    }
+
+    fn is_complete(&self) -> bool {
+        self.completed_rounds >= DUAL_EAGLE_RACE_ROUNDS
+    }
+
+    fn selected_head(&self) -> Option<DualEagleHead> {
+        self.is_complete().then(|| self.leader())
+    }
+}
+
+#[cfg(test)]
+mod dual_eagle_selector_tests {
+    use super::*;
+
+    fn top8(first: u32) -> Vec<u32> {
+        (first..first + DUAL_EAGLE_ROOT_RANKING as u32).collect()
+    }
+
+    fn finish(
+        selector: &mut DualEagleSelector,
+        e9: Vec<u32>,
+        sw512: Vec<u32>,
+        target: u32,
+    ) -> DualEagleRoundReceipt {
+        let pending = selector.begin_round(e9, sw512).unwrap();
+        selector.finish_round(pending, target).unwrap()
+    }
+
+    #[test]
+    fn target_evidence_changes_only_the_following_round() {
+        let mut selector = DualEagleSelector::default();
+        let first = selector.begin_round(top8(10), top8(20)).unwrap();
+        assert_eq!(first.proposal_head, DualEagleHead::E9);
+        let receipt = selector.finish_round(first, 20).unwrap();
+        assert_eq!(receipt.proposal_head, DualEagleHead::E9);
+        assert_eq!(receipt.leader_for_next_round, DualEagleHead::Sw512);
+
+        let second = selector.begin_round(top8(30), top8(40)).unwrap();
+        assert_eq!(second.proposal_head, DualEagleHead::Sw512);
+    }
+
+    #[test]
+    fn lexicographic_score_orders_top1_then_top4_then_reciprocal_rank() {
+        let mut top1_wins = DualEagleSelector::default();
+        finish(&mut top1_wins, top8(10), top8(20), 10);
+        for target in [21, 21, 21, 21, 21] {
+            finish(&mut top1_wins, top8(30), top8(20), target);
+        }
+        assert_eq!(top1_wins.e9_score.top1_hits, 1);
+        assert_eq!(top1_wins.sw512_score.top1_hits, 0);
+        assert_eq!(top1_wins.selected_head(), Some(DualEagleHead::E9));
+
+        let mut top4_wins = DualEagleSelector::default();
+        for _ in 0..DUAL_EAGLE_RACE_ROUNDS {
+            finish(&mut top4_wins, top8(10), top8(20), 21);
+        }
+        assert_eq!(top4_wins.e9_score.top4_hits, 0);
+        assert_eq!(top4_wins.sw512_score.top4_hits, 6);
+        assert_eq!(top4_wins.selected_head(), Some(DualEagleHead::Sw512));
+
+        let mut reciprocal_rank_wins = DualEagleSelector::default();
+        for _ in 0..DUAL_EAGLE_RACE_ROUNDS {
+            finish(
+                &mut reciprocal_rank_wins,
+                vec![10, 99, 11, 12, 13, 14, 15, 16],
+                vec![20, 21, 99, 22, 23, 24, 25, 26],
+                99,
+            );
+        }
+        assert_eq!(reciprocal_rank_wins.e9_score.top4_hits, 6);
+        assert_eq!(reciprocal_rank_wins.sw512_score.top4_hits, 6);
+        assert!(
+            reciprocal_rank_wins.e9_score.reciprocal_rank_840_sum
+                > reciprocal_rank_wins.sw512_score.reciprocal_rank_840_sum
+        );
+        assert_eq!(
+            reciprocal_rank_wins.selected_head(),
+            Some(DualEagleHead::E9)
+        );
+    }
+
+    #[test]
+    fn exact_ties_default_to_e9_after_six_rounds() {
+        let mut selector = DualEagleSelector::default();
+        for _ in 0..DUAL_EAGLE_RACE_ROUNDS {
+            let receipt = finish(&mut selector, top8(10), top8(10), 12);
+            assert_eq!(receipt.leader_for_next_round, DualEagleHead::E9);
+        }
+        assert!(selector.is_complete());
+        assert_eq!(selector.selected_head(), Some(DualEagleHead::E9));
+        assert!(selector.begin_round(top8(10), top8(20)).is_err());
+    }
+
+    #[test]
+    fn state_machine_rejects_overlap_bad_rank_and_duplicate_roots() {
+        let mut idle = DualEagleSelector::default();
+        let impossible = PendingDualEagleRound {
+            round: 1,
+            proposal_head: DualEagleHead::E9,
+            e9_top8: top8(10),
+            sw512_top8: top8(20),
+        };
+        assert!(idle.finish_round(impossible, 10).is_err());
+
+        let mut selector = DualEagleSelector::default();
+        let pending = selector.begin_round(top8(10), top8(20)).unwrap();
+        assert!(selector.begin_round(top8(30), top8(40)).is_err());
+        selector.finish_round(pending, 999).unwrap();
+        assert_eq!(selector.e9_score, DualEagleScore::default());
+        assert_eq!(selector.sw512_score, DualEagleScore::default());
+
+        let mut duplicate = top8(10);
+        duplicate[7] = duplicate[0];
+        assert!(selector.begin_round(duplicate, top8(20)).is_err());
+        assert!(DualEagleScore::default().note_rank(Some(9)).is_err());
+    }
+
+    #[test]
+    fn reciprocal_rank_integer_scale_is_exact_for_one_through_eight() {
+        for rank in 1..=DUAL_EAGLE_ROOT_RANKING {
+            assert_eq!(
+                DUAL_EAGLE_RECIPROCAL_RANK_POINTS[rank - 1] * rank as u64,
+                DUAL_EAGLE_RECIPROCAL_RANK_SCALE
+            );
+        }
+    }
+
+    #[test]
+    fn benchmark_gate_boolean_is_strict_and_deterministic() {
+        for value in [None, Some(""), Some("0"), Some("false"), Some("OFF")] {
+            assert!(!parse_dual_eagle_selector_env(value).unwrap());
+        }
+        for value in [Some("1"), Some("true"), Some("ON"), Some("enabled")] {
+            assert!(parse_dual_eagle_selector_env(value).unwrap());
+        }
+        assert!(parse_dual_eagle_selector_env(Some("maybe")).is_err());
+    }
+}
+
+const KQUANT_V4_SOA8_ENV: &str = "CAMELID_KQUANT_V4_SOA8";
+
+fn kquant_v4_soa8_prewarm_admitted(value: Option<&str>, prewarm_succeeded: bool) -> bool {
+    let enabled = value.is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+    !enabled || prewarm_succeeded
+}
+
+fn require_kquant_v4_soa8_prewarm(prewarm_succeeded: bool) -> anyhow::Result<()> {
+    let value = std::env::var(KQUANT_V4_SOA8_ENV).ok();
+    anyhow::ensure!(
+        kquant_v4_soa8_prewarm_admitted(value.as_deref(), prewarm_succeeded),
+        "{KQUANT_V4_SOA8_ENV}=1 requires every target FFN/head SOA8 pipeline and sidecar"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod kquant_v4_soa8_prewarm_gate_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_soa8_opt_in_requires_successful_prewarm() {
+        for disabled in [None, Some(""), Some("0"), Some("false"), Some("off")] {
+            assert!(kquant_v4_soa8_prewarm_admitted(disabled, false));
+        }
+        for enabled in [Some("1"), Some("true"), Some("TRUE")] {
+            assert!(!kquant_v4_soa8_prewarm_admitted(enabled, false));
+            assert!(kquant_v4_soa8_prewarm_admitted(enabled, true));
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct Eagle3IndexedHeadShadowLogitMismatchReceipt {
+    token_id: u32,
+    indexed_logit_bits: u32,
+    full_head_logit_bits: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct Eagle3IndexedHeadShadowRowReceipt {
+    verifier_row: usize,
+    candidate_top1_token: Option<u32>,
+    candidate_top1_logit_bits: Option<u32>,
+    authoritative_argmax_token: u32,
+    authoritative_argmax_logit_bits: Option<u32>,
+    top1_matches_authoritative: bool,
+    compared_logits: usize,
+    exact_logit_agreements: usize,
+    all_candidate_logits_exact: bool,
+    first_logit_mismatch: Option<Eagle3IndexedHeadShadowLogitMismatchReceipt>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct Eagle3IndexedHeadShadowReceipt {
+    /// Pinned identity of the library compile option used by the production V4 kernels.
+    metal_fast_math_enabled: bool,
+    /// True only for full-head-confirmed direct emission with exact row-wise fallback.
+    authorizes_token_emission: bool,
+    direct_emission_rows: usize,
+    full_head_fallback_rows: usize,
+    scored: bool,
+    fallback_reason: Option<&'static str>,
+    candidate_union_size: usize,
+    candidate_tile_rows: usize,
+    candidate_weight_bytes: usize,
+    output_weight_format: &'static str,
+    encode_us: u128,
+    commit_wait_us: u128,
+    gpu_busy_us: u128,
+    kernel_window_us: u128,
+    verifier_rows: usize,
+    compared_logits: usize,
+    exact_logit_agreements: usize,
+    all_candidate_logits_exact_rows: usize,
+    candidate_top1_matches: usize,
+    rows: Vec<Eagle3IndexedHeadShadowRowReceipt>,
+}
+
+fn eagle3_indexed_head_shadow_receipt(
+    candidate_union: &[u32],
+    authoritative_argmax_tokens: &[u32],
+    shadow: &camelid::metal::ResidentIndexedHeadShadow,
+    authorizes_token_emission: bool,
+    direct_emission_rows: usize,
+    full_head_fallback_rows: usize,
+) -> anyhow::Result<Eagle3IndexedHeadShadowReceipt> {
+    anyhow::ensure!(
+        shadow.candidate_union == candidate_union,
+        "EAGLE-3 indexed-head shadow scored a different candidate union"
+    );
+    anyhow::ensure!(
+        shadow.scored() == shadow.fallback_reason.is_none(),
+        "EAGLE-3 indexed-head shadow scored/fallback state is inconsistent"
+    );
+    anyhow::ensure!(
+        !shadow.compile_fast_math_enabled,
+        "EAGLE-3 indexed-head shadow requires the shared V4 strict-math library"
+    );
+    if shadow.scored() {
+        anyhow::ensure!(
+            shadow.rows.len() == authoritative_argmax_tokens.len()
+                && shadow.candidate_tile_rows
+                    == candidate_union.len()
+                        * camelid::metal::RESIDENT_INDEXED_HEAD_SHADOW_TILE_ROWS,
+            "EAGLE-3 indexed-head shadow returned malformed row/tile counts"
+        );
+    } else {
+        anyhow::ensure!(
+            shadow.rows.is_empty(),
+            "indexed-head fallback returned rows"
+        );
+    }
+    anyhow::ensure!(
+        (!authorizes_token_emission && direct_emission_rows == 0 && full_head_fallback_rows == 0)
+            || (authorizes_token_emission
+                && shadow.scored()
+                && direct_emission_rows + full_head_fallback_rows
+                    == authoritative_argmax_tokens.len()),
+        "indexed-head direct-emission accounting is inconsistent"
+    );
+    let rows = shadow
+        .rows
+        .iter()
+        .enumerate()
+        .map(|(row, evidence)| {
+            anyhow::ensure!(
+                evidence.verifier_row == row
+                    && evidence.authoritative_argmax_token == authoritative_argmax_tokens[row]
+                    && evidence.compared_logits == candidate_union.len()
+                    && evidence.exact_logit_agreements <= evidence.compared_logits
+                    && evidence.all_candidate_logits_exact
+                        == (evidence.exact_logit_agreements == evidence.compared_logits)
+                    && evidence.all_candidate_logits_exact
+                        == evidence.first_logit_mismatch.is_none()
+                    && evidence.candidate_top1_token.is_some()
+                        == evidence.candidate_top1_logit_bits.is_some()
+                    && evidence.top1_matches_authoritative
+                        == evidence
+                            .candidate_top1_token
+                            .is_some_and(|token| token == evidence.authoritative_argmax_token),
+                "EAGLE-3 indexed-head row {row} is internally inconsistent"
+            );
+            Ok(Eagle3IndexedHeadShadowRowReceipt {
+                verifier_row: row,
+                candidate_top1_token: evidence.candidate_top1_token,
+                candidate_top1_logit_bits: evidence.candidate_top1_logit_bits,
+                authoritative_argmax_token: evidence.authoritative_argmax_token,
+                authoritative_argmax_logit_bits: evidence.authoritative_argmax_logit_bits,
+                top1_matches_authoritative: evidence.top1_matches_authoritative,
+                compared_logits: evidence.compared_logits,
+                exact_logit_agreements: evidence.exact_logit_agreements,
+                all_candidate_logits_exact: evidence.all_candidate_logits_exact,
+                first_logit_mismatch: evidence.first_logit_mismatch.as_ref().map(|mismatch| {
+                    Eagle3IndexedHeadShadowLogitMismatchReceipt {
+                        token_id: mismatch.token_id,
+                        indexed_logit_bits: mismatch.indexed_logit_bits,
+                        full_head_logit_bits: mismatch.full_head_logit_bits,
+                    }
+                }),
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok(Eagle3IndexedHeadShadowReceipt {
+        metal_fast_math_enabled: shadow.compile_fast_math_enabled,
+        authorizes_token_emission,
+        direct_emission_rows,
+        full_head_fallback_rows,
+        scored: shadow.scored(),
+        fallback_reason: shadow.fallback_reason.map(|reason| reason.label()),
+        candidate_union_size: candidate_union.len(),
+        candidate_tile_rows: shadow.candidate_tile_rows,
+        candidate_weight_bytes: shadow.candidate_weight_bytes,
+        output_weight_format: shadow.output_weight_format,
+        encode_us: shadow.encode_us,
+        commit_wait_us: shadow.commit_wait_us,
+        gpu_busy_us: shadow.gpu_busy_us,
+        kernel_window_us: shadow.kernel_window_us,
+        verifier_rows: rows.len(),
+        compared_logits: rows.iter().map(|row| row.compared_logits).sum(),
+        exact_logit_agreements: rows.iter().map(|row| row.exact_logit_agreements).sum(),
+        all_candidate_logits_exact_rows: rows
+            .iter()
+            .filter(|row| row.all_candidate_logits_exact)
+            .count(),
+        candidate_top1_matches: rows
+            .iter()
+            .filter(|row| row.top1_matches_authoritative)
+            .count(),
+        rows,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Eagle3IndexedHeadDirectEmission {
+    predictions: Vec<u32>,
+    direct_emission_rows: usize,
+    full_head_fallback_rows: usize,
+}
+
+fn eagle3_indexed_head_direct_emission_predictions(
+    enabled: bool,
+    authoritative_predictions: &[u32],
+    shadow: Option<&camelid::metal::ResidentIndexedHeadShadow>,
+) -> anyhow::Result<Eagle3IndexedHeadDirectEmission> {
+    if !enabled {
+        return Ok(Eagle3IndexedHeadDirectEmission {
+            predictions: authoritative_predictions.to_vec(),
+            direct_emission_rows: 0,
+            full_head_fallback_rows: 0,
+        });
+    }
+    let shadow = shadow.ok_or_else(|| {
+        anyhow::anyhow!("indexed-head direct emission requires a completed shadow result")
+    })?;
+    anyhow::ensure!(
+        shadow.scored()
+            && !shadow.compile_fast_math_enabled
+            && shadow.rows.len() == authoritative_predictions.len(),
+        "indexed-head direct emission requires strict, scored evidence for every verifier row"
+    );
+    let mut predictions = Vec::with_capacity(authoritative_predictions.len());
+    let mut direct_emission_rows = 0usize;
+    for (row, (&authoritative, evidence)) in authoritative_predictions
+        .iter()
+        .zip(&shadow.rows)
+        .enumerate()
+    {
+        anyhow::ensure!(
+            evidence.verifier_row == row
+                && evidence.authoritative_argmax_token == authoritative
+                && evidence.all_candidate_logits_exact
+                && evidence.exact_logit_agreements == evidence.compared_logits
+                && evidence.first_logit_mismatch.is_none(),
+            "indexed-head direct-emission row {row} lacks exact authoritative evidence"
+        );
+        if evidence.top1_matches_authoritative {
+            let candidate = evidence.candidate_top1_token.ok_or_else(|| {
+                anyhow::anyhow!("indexed-head direct-emission row {row} lost its candidate top-1")
+            })?;
+            anyhow::ensure!(
+                candidate == authoritative,
+                "indexed-head direct-emission row {row} candidate/authority mismatch"
+            );
+            predictions.push(candidate);
+            direct_emission_rows += 1;
+        } else {
+            predictions.push(authoritative);
+        }
+    }
+    anyhow::ensure!(
+        predictions.as_slice() == authoritative_predictions,
+        "full-head-confirmed indexed emission changed the authoritative token sequence"
+    );
+    Ok(Eagle3IndexedHeadDirectEmission {
+        full_head_fallback_rows: predictions.len() - direct_emission_rows,
+        predictions,
+        direct_emission_rows,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct Eagle3TransactionPortfolioEarlyRowReceipt {
+    verifier_row: usize,
+    /// Exact layer-25 indexed logits in `candidate_union` order.
+    candidate_logit_bits: Vec<u32>,
+    /// Selectable candidates in deterministic descending-score/lower-id-tie order.
+    ranked_candidate_tokens: Vec<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct Eagle3TransactionPortfolioCandidateReceipt {
+    path_rows: Vec<usize>,
+    terminal_token: u32,
+    candidate_restricted_log_probability_bits: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct Eagle3TransactionPortfolioPathReceipt {
+    path_rows: Vec<usize>,
+    marginalized_log_probability_bits: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct Eagle3TransactionPortfolioEndpointReceipt {
+    verifier_row: usize,
+    terminal_token: u32,
+    candidate_restricted_log_probability_bits: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+struct Eagle3TransactionPortfolioCoverageReceipt {
+    budget: usize,
+    transaction_covered: bool,
+    path_covered: bool,
+    endpoint_covered: bool,
+    /// Uses the authoritative leaf only after the target-blind portfolio is frozen.
+    terminal_at_authoritative_leaf_covered: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+enum Eagle3TransactionPortfolioRoundReceipt {
+    Scored {
+        round: u64,
+        layer_id: usize,
+        score_policy: &'static str,
+        portfolio_frozen_before_authority_evaluation: bool,
+        tree_tokens: Vec<u32>,
+        tree_parent: Vec<i32>,
+        tree_depth: Vec<u16>,
+        candidate_union: Vec<u32>,
+        early_rows: Vec<Eagle3TransactionPortfolioEarlyRowReceipt>,
+        transaction_candidates_considered: usize,
+        path_candidates_considered: usize,
+        endpoint_candidates_considered: usize,
+        top_transactions: Vec<Eagle3TransactionPortfolioCandidateReceipt>,
+        top_paths: Vec<Eagle3TransactionPortfolioPathReceipt>,
+        top_endpoints: Vec<Eagle3TransactionPortfolioEndpointReceipt>,
+        indexed_head_encode_us: u128,
+        indexed_head_commit_wait_us: u128,
+        indexed_head_gpu_busy_us: u128,
+        indexed_head_kernel_window_us: u128,
+        authoritative_path_rows: Vec<usize>,
+        authoritative_leaf_row: usize,
+        authoritative_terminal_token: u32,
+        transaction_rank: Option<usize>,
+        path_rank: Option<usize>,
+        endpoint_rank: Option<usize>,
+        terminal_rank_at_authoritative_leaf: Option<usize>,
+        coverage: [Eagle3TransactionPortfolioCoverageReceipt; 4],
+    },
+    Fallback {
+        round: u64,
+        reason: String,
+    },
+}
+
+type Eagle3PendingTransactionPortfolio =
+    std::result::Result<camelid::eagle3_runtime::Eagle3EarlyTransactionPortfolio, String>;
+
+fn freeze_eagle3_transaction_portfolio(
+    enabled: bool,
+    tree: &camelid::inference::spec_tree::TokenTree,
+    early_layer25: Option<&camelid::metal::ResidentIndexedHeadEarlySnapshot>,
+) -> anyhow::Result<Option<Eagle3PendingTransactionPortfolio>> {
+    if !enabled {
+        anyhow::ensure!(
+            early_layer25.is_none(),
+            "layer-25 transaction evidence was retained while its gate was disabled"
+        );
+        return Ok(None);
+    }
+    let frozen = early_layer25
+        .ok_or_else(|| "layer-25 early snapshot unavailable".to_string())
+        .and_then(|early| {
+            camelid::eagle3_runtime::Eagle3EarlyTransactionPortfolio::freeze(tree, early)
+                .map_err(|error| error.to_string())
+        });
+    Ok(Some(frozen))
+}
+
+fn record_eagle3_transaction_portfolio_round(
+    enabled: bool,
+    round: u64,
+    frozen: Option<Eagle3PendingTransactionPortfolio>,
+    acceptance: &camelid::eagle3_runtime::Eagle3ForestAcceptance,
+    receipts: &mut Vec<Eagle3TransactionPortfolioRoundReceipt>,
+) -> anyhow::Result<()> {
+    if !enabled {
+        anyhow::ensure!(
+            frozen.is_none(),
+            "transaction portfolio was frozen while its gate was disabled"
+        );
+        return Ok(());
+    }
+    anyhow::ensure!(
+        receipts.last().is_none_or(|previous| match previous {
+            Eagle3TransactionPortfolioRoundReceipt::Scored { round: prior, .. }
+            | Eagle3TransactionPortfolioRoundReceipt::Fallback { round: prior, .. } => {
+                *prior < round
+            }
+        }),
+        "transaction portfolio round ids are not strictly increasing"
+    );
+    let receipt = match frozen.expect("enabled transaction portfolio must carry a freeze result") {
+        Err(reason) => Eagle3TransactionPortfolioRoundReceipt::Fallback { round, reason },
+        Ok(portfolio) => match portfolio.evaluate(acceptance) {
+            Err(error) => Eagle3TransactionPortfolioRoundReceipt::Fallback {
+                round,
+                reason: error.to_string(),
+            },
+            Ok(evaluation) => {
+                let coverage =
+                    evaluation
+                        .coverage
+                        .map(|coverage| Eagle3TransactionPortfolioCoverageReceipt {
+                            budget: coverage.budget,
+                            transaction_covered: coverage.transaction_covered,
+                            path_covered: coverage.path_covered,
+                            endpoint_covered: coverage.endpoint_covered,
+                            terminal_at_authoritative_leaf_covered: coverage
+                                .terminal_at_authoritative_leaf_covered,
+                        });
+                Eagle3TransactionPortfolioRoundReceipt::Scored {
+                    round,
+                    layer_id: portfolio.layer_id,
+                    score_policy: "candidate_restricted_log_softmax_joint_probability",
+                    portfolio_frozen_before_authority_evaluation: true,
+                    tree_tokens: portfolio.tree_tokens,
+                    tree_parent: portfolio.tree_parent,
+                    tree_depth: portfolio.tree_depth,
+                    candidate_union: portfolio.candidate_union,
+                    early_rows: portfolio
+                        .early_rows
+                        .into_iter()
+                        .map(|row| Eagle3TransactionPortfolioEarlyRowReceipt {
+                            verifier_row: row.verifier_row,
+                            candidate_logit_bits: row.candidate_logit_bits,
+                            ranked_candidate_tokens: row.ranked_candidate_tokens,
+                        })
+                        .collect(),
+                    transaction_candidates_considered: portfolio.transaction_candidates_considered,
+                    path_candidates_considered: portfolio.path_candidates_considered,
+                    endpoint_candidates_considered: portfolio.endpoint_candidates_considered,
+                    top_transactions: portfolio
+                        .top_transactions
+                        .into_iter()
+                        .map(|candidate| Eagle3TransactionPortfolioCandidateReceipt {
+                            path_rows: candidate.path_rows,
+                            terminal_token: candidate.terminal_token,
+                            candidate_restricted_log_probability_bits: candidate
+                                .log_probability_bits,
+                        })
+                        .collect(),
+                    top_paths: portfolio
+                        .top_paths
+                        .into_iter()
+                        .map(|candidate| Eagle3TransactionPortfolioPathReceipt {
+                            path_rows: candidate.path_rows,
+                            marginalized_log_probability_bits: candidate.log_probability_bits,
+                        })
+                        .collect(),
+                    top_endpoints: portfolio
+                        .top_endpoints
+                        .into_iter()
+                        .map(|candidate| Eagle3TransactionPortfolioEndpointReceipt {
+                            verifier_row: candidate.verifier_row,
+                            terminal_token: candidate.terminal_token,
+                            candidate_restricted_log_probability_bits: candidate
+                                .log_probability_bits,
+                        })
+                        .collect(),
+                    indexed_head_encode_us: portfolio.indexed_head_encode_us,
+                    indexed_head_commit_wait_us: portfolio.indexed_head_commit_wait_us,
+                    indexed_head_gpu_busy_us: portfolio.indexed_head_gpu_busy_us,
+                    indexed_head_kernel_window_us: portfolio.indexed_head_kernel_window_us,
+                    authoritative_path_rows: evaluation.authoritative_path_rows,
+                    authoritative_leaf_row: evaluation.authoritative_leaf_row,
+                    authoritative_terminal_token: evaluation.authoritative_terminal_token,
+                    transaction_rank: evaluation.transaction_rank,
+                    path_rank: evaluation.path_rank,
+                    endpoint_rank: evaluation.endpoint_rank,
+                    terminal_rank_at_authoritative_leaf: evaluation
+                        .terminal_rank_at_authoritative_leaf,
+                    coverage,
+                }
+            }
+        },
+    };
+    match &receipt {
+        Eagle3TransactionPortfolioRoundReceipt::Scored {
+            transaction_rank,
+            path_rank,
+            endpoint_rank,
+            terminal_rank_at_authoritative_leaf,
+            coverage,
+            ..
+        } => eprintln!(
+            "[eagle3-transaction-portfolio] round={round} outcome=scored transaction_rank={transaction_rank:?} path_rank={path_rank:?} endpoint_rank={endpoint_rank:?} conditional_terminal_rank={terminal_rank_at_authoritative_leaf:?} metric_order=transaction/path/endpoint/conditional-terminal b1={}/{}/{}/{} b2={}/{}/{}/{} b4={}/{}/{}/{} b8={}/{}/{}/{}",
+            u8::from(coverage[0].transaction_covered),
+            u8::from(coverage[0].path_covered),
+            u8::from(coverage[0].endpoint_covered),
+            u8::from(coverage[0].terminal_at_authoritative_leaf_covered),
+            u8::from(coverage[1].transaction_covered),
+            u8::from(coverage[1].path_covered),
+            u8::from(coverage[1].endpoint_covered),
+            u8::from(coverage[1].terminal_at_authoritative_leaf_covered),
+            u8::from(coverage[2].transaction_covered),
+            u8::from(coverage[2].path_covered),
+            u8::from(coverage[2].endpoint_covered),
+            u8::from(coverage[2].terminal_at_authoritative_leaf_covered),
+            u8::from(coverage[3].transaction_covered),
+            u8::from(coverage[3].path_covered),
+            u8::from(coverage[3].endpoint_covered),
+            u8::from(coverage[3].terminal_at_authoritative_leaf_covered),
+        ),
+        Eagle3TransactionPortfolioRoundReceipt::Fallback { reason, .. } => eprintln!(
+            "[eagle3-transaction-portfolio] round={round} outcome=fallback reason={reason:?}"
+        ),
+    }
+    receipts.push(receipt);
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct Eagle3SelectiveEdgePrepEvidenceReceipt {
+    configured_path_budget: usize,
+    measured_path_budget: Option<usize>,
+    predicted_unique_edge_rows: usize,
+    authoritative_edge_rows: usize,
+    prepared_hits: usize,
+    prepared_misses: usize,
+    authoritative_path_fully_covered: bool,
+    theoretical_serial_edge_rows_displaced: usize,
+    actually_reused_edge_rows: usize,
+    portfolio_encode_us: u128,
+    portfolio_commit_wait_us: u128,
+    portfolio_gpu_us: u128,
+    portfolio_kernel_window_us: u128,
+    target_gpu_us: u128,
+    target_tail_gpu_us: u128,
+    target_tail_baseline_us: Option<u128>,
+    target_tail_penalty_us: Option<u128>,
+    e1_gpu_us: u128,
+    total_selective_prep_gpu_us: u128,
+    overlap_us: u128,
+    e1_encode_us: u128,
+    e1_post_target_wait_us: u128,
+    e1_readback_us: u128,
+    oracle_compare_us: u128,
+    target_prefix_interval_us: [u128; 2],
+    target_tail_interval_us: [u128; 2],
+    e1_interval_us: [u128; 2],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+enum Eagle3SelectiveEdgePrepRoundReceipt {
+    Matched {
+        round: u64,
+        compared_f16_values: usize,
+        evidence: Eagle3SelectiveEdgePrepEvidenceReceipt,
+    },
+    Mismatched {
+        round: u64,
+        reason: String,
+        evidence: Eagle3SelectiveEdgePrepEvidenceReceipt,
+    },
+    Fallback {
+        round: u64,
+        reason: String,
+    },
+    SerialOracleSkipped {
+        round: u64,
+        reason: &'static str,
+    },
+}
+
+impl Eagle3SelectiveEdgePrepRoundReceipt {
+    fn round(&self) -> u64 {
+        match self {
+            Self::Matched { round, .. }
+            | Self::Mismatched { round, .. }
+            | Self::Fallback { round, .. }
+            | Self::SerialOracleSkipped { round, .. } => *round,
+        }
+    }
+}
+
+fn eagle3_selective_edge_prep_evidence(
+    configured_path_budget: usize,
+    prepared_edges: usize,
+    authoritative_edges: usize,
+    prepared_hits: usize,
+    prepared_misses: usize,
+    authoritative_path_fully_covered: bool,
+    theoretical_serial_edge_rows_displaced: usize,
+    actually_reused_edge_rows: usize,
+    timing: camelid::metal::Eagle3AuthoritativeE1ShadowTiming,
+) -> Eagle3SelectiveEdgePrepEvidenceReceipt {
+    Eagle3SelectiveEdgePrepEvidenceReceipt {
+        configured_path_budget,
+        measured_path_budget: timing.selective_path_budget,
+        predicted_unique_edge_rows: prepared_edges,
+        authoritative_edge_rows: authoritative_edges,
+        prepared_hits,
+        prepared_misses,
+        authoritative_path_fully_covered,
+        theoretical_serial_edge_rows_displaced,
+        actually_reused_edge_rows,
+        portfolio_encode_us: timing.portfolio_encode_us,
+        portfolio_commit_wait_us: timing.portfolio_commit_wait_us,
+        portfolio_gpu_us: timing.portfolio_gpu_us,
+        portfolio_kernel_window_us: timing.portfolio_kernel_window_us,
+        target_gpu_us: timing.target_gpu_us,
+        target_tail_gpu_us: timing.target_tail_gpu_us,
+        target_tail_baseline_us: timing.target_tail_baseline_us,
+        target_tail_penalty_us: timing.target_tail_penalty_us,
+        e1_gpu_us: timing.e1_gpu_us,
+        total_selective_prep_gpu_us: timing.total_selective_prep_gpu_us,
+        overlap_us: timing.overlap_us,
+        e1_encode_us: timing.e1_encode_us,
+        e1_post_target_wait_us: timing.e1_post_target_wait_us,
+        e1_readback_us: timing.e1_readback_us,
+        oracle_compare_us: timing.oracle_compare_us,
+        target_prefix_interval_us: [timing.target_prefix_start_us, timing.target_prefix_end_us],
+        target_tail_interval_us: [timing.target_tail_start_us, timing.target_tail_end_us],
+        e1_interval_us: [timing.e1_start_us, timing.e1_end_us],
+    }
+}
+
+fn record_eagle3_selective_edge_prep_round(
+    configured_path_budget: usize,
+    round: u64,
+    comparison: Option<camelid::metal::Eagle3AuthoritativeE1ShadowComparison>,
+    receipts: &mut Vec<Eagle3SelectiveEdgePrepRoundReceipt>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        receipts
+            .last()
+            .is_none_or(|previous| previous.round() < round),
+        "selective edge-preparation round ids are not strictly increasing"
+    );
+    use camelid::metal::Eagle3AuthoritativeE1ShadowComparison as Comparison;
+    let receipt = match comparison {
+        Some(Comparison::Matched {
+            prepared_edges,
+            authoritative_edges,
+            prepared_hits,
+            prepared_misses,
+            authoritative_path_fully_covered,
+            theoretical_serial_edge_rows_displaced,
+            actually_reused_edge_rows,
+            compared_f16_values,
+            timing,
+        }) => {
+            let evidence = eagle3_selective_edge_prep_evidence(
+                configured_path_budget,
+                prepared_edges,
+                authoritative_edges,
+                prepared_hits,
+                prepared_misses,
+                authoritative_path_fully_covered,
+                theoretical_serial_edge_rows_displaced,
+                actually_reused_edge_rows,
+                timing,
+            );
+            if evidence.measured_path_budget == Some(configured_path_budget)
+                && evidence.target_tail_baseline_us
+                    == Some(camelid::metal::EAGLE3_SELECTIVE_EDGE_TARGET_TAIL_BASELINE_US)
+            {
+                Eagle3SelectiveEdgePrepRoundReceipt::Matched {
+                    round,
+                    compared_f16_values,
+                    evidence,
+                }
+            } else {
+                Eagle3SelectiveEdgePrepRoundReceipt::Mismatched {
+                    round,
+                    reason: "selective timing identity did not match configured budget/baseline"
+                        .to_string(),
+                    evidence,
+                }
+            }
+        }
+        Some(Comparison::Mismatched {
+            reason,
+            prepared_edges,
+            authoritative_edges,
+            prepared_hits,
+            prepared_misses,
+            authoritative_path_fully_covered,
+            theoretical_serial_edge_rows_displaced,
+            actually_reused_edge_rows,
+            timing,
+        }) => Eagle3SelectiveEdgePrepRoundReceipt::Mismatched {
+            round,
+            reason,
+            evidence: eagle3_selective_edge_prep_evidence(
+                configured_path_budget,
+                prepared_edges,
+                authoritative_edges,
+                prepared_hits,
+                prepared_misses,
+                authoritative_path_fully_covered,
+                theoretical_serial_edge_rows_displaced,
+                actually_reused_edge_rows,
+                timing,
+            ),
+        },
+        Some(Comparison::Fallback(reason)) => Eagle3SelectiveEdgePrepRoundReceipt::Fallback {
+            round,
+            reason: reason.label().to_string(),
+        },
+        None => Eagle3SelectiveEdgePrepRoundReceipt::Fallback {
+            round,
+            reason: "comparison_receipt_unavailable".to_string(),
+        },
+    };
+    receipts.push(receipt);
+    Ok(())
+}
+
+fn record_eagle3_selective_edge_prep_serial_skip(
+    round: u64,
+    receipts: &mut Vec<Eagle3SelectiveEdgePrepRoundReceipt>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        receipts
+            .last()
+            .is_none_or(|previous| previous.round() < round),
+        "selective edge-preparation round ids are not strictly increasing"
+    );
+    receipts.push(Eagle3SelectiveEdgePrepRoundReceipt::SerialOracleSkipped {
+        round,
+        reason: "terminal_head_skip",
+    });
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct Eagle3SelectiveEdgePromotionEvidenceReceipt {
+    proof_receipt_sha256: &'static str,
+    authorization_generation: u64,
+    authorized_stable_position: usize,
+    prepared_edge_rows: Vec<usize>,
+    authoritative_path_rows: Vec<usize>,
+    promoted_edge_rows: Vec<usize>,
+    serial_miss_edge_rows: Vec<usize>,
+    configured_path_budget: usize,
+    predicted_unique_edge_rows: usize,
+    authoritative_edge_rows: usize,
+    promoted_hits: usize,
+    serial_misses: usize,
+    authoritative_path_fully_covered: bool,
+    logical_serial_fc_rows_displaced: usize,
+    saved_serial_kv_rows: usize,
+    serial_fc_logical_columns: usize,
+    serial_fc_physical_columns: usize,
+    terminal_authoritative_rows: usize,
+    device_compacted_eagle_kv_bytes: usize,
+    additional_compaction_command_buffers: usize,
+    compaction_encode_us: u128,
+    compaction_gpu_us: Option<u128>,
+    authoritative_update_gpu_us: u128,
+    e1_kv_host_readback: bool,
+    portfolio_gpu_us: u128,
+    e1_gpu_us: u128,
+    total_selective_prep_gpu_us: u128,
+    overlap_us: u128,
+    target_tail_gpu_us: u128,
+    target_tail_baseline_us: Option<u128>,
+    target_tail_penalty_us: Option<u128>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+enum Eagle3SelectiveEdgePromotionRoundReceipt {
+    Promoted {
+        round: u64,
+        evidence: Eagle3SelectiveEdgePromotionEvidenceReceipt,
+    },
+    Fallback {
+        round: u64,
+        reason: String,
+        serial_authoritative: bool,
+    },
+    TerminalUpdateSkipped {
+        round: u64,
+        reason: &'static str,
+    },
+}
+
+impl Eagle3SelectiveEdgePromotionRoundReceipt {
+    fn round(&self) -> u64 {
+        match self {
+            Self::Promoted { round, .. }
+            | Self::Fallback { round, .. }
+            | Self::TerminalUpdateSkipped { round, .. } => *round,
+        }
+    }
+}
+
+fn record_eagle3_selective_edge_promotion_round(
+    round: u64,
+    outcome: camelid::eagle3_runtime::Eagle3SelectiveEdgePromotionOutcome,
+    receipts: &mut Vec<Eagle3SelectiveEdgePromotionRoundReceipt>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        receipts
+            .last()
+            .is_none_or(|previous| previous.round() < round),
+        "selective edge-promotion round ids are not strictly increasing"
+    );
+    let receipt = match outcome {
+        camelid::eagle3_runtime::Eagle3SelectiveEdgePromotionOutcome::Promoted(receipt) => {
+            let timing = receipt.preparation_timing;
+            Eagle3SelectiveEdgePromotionRoundReceipt::Promoted {
+                round,
+                evidence: Eagle3SelectiveEdgePromotionEvidenceReceipt {
+                    proof_receipt_sha256: receipt.proof_receipt_sha256,
+                    authorization_generation: receipt.authorization_generation,
+                    authorized_stable_position: receipt.authorized_stable_position,
+                    prepared_edge_rows: receipt.prepared_edge_rows,
+                    authoritative_path_rows: receipt.authoritative_path_rows,
+                    promoted_edge_rows: receipt.promoted_edge_rows,
+                    serial_miss_edge_rows: receipt.serial_miss_edge_rows,
+                    configured_path_budget: 4,
+                    predicted_unique_edge_rows: receipt.prepared_edges,
+                    authoritative_edge_rows: receipt.authoritative_edges,
+                    promoted_hits: receipt.promoted_hits,
+                    serial_misses: receipt.serial_misses,
+                    authoritative_path_fully_covered: receipt.authoritative_path_fully_covered,
+                    logical_serial_fc_rows_displaced: receipt.logical_serial_fc_rows_displaced,
+                    saved_serial_kv_rows: receipt.saved_serial_kv_rows,
+                    serial_fc_logical_columns: receipt.serial_fc_logical_columns,
+                    serial_fc_physical_columns: receipt.serial_fc_physical_columns,
+                    terminal_authoritative_rows: receipt.terminal_authoritative_rows,
+                    device_compacted_eagle_kv_bytes: receipt.compacted_bytes,
+                    additional_compaction_command_buffers: receipt
+                        .additional_compaction_command_buffers,
+                    compaction_encode_us: receipt.compaction_encode_us,
+                    compaction_gpu_us: receipt.compaction_gpu_us,
+                    authoritative_update_gpu_us: receipt.authoritative_update_gpu_us,
+                    e1_kv_host_readback: false,
+                    portfolio_gpu_us: timing.portfolio_gpu_us,
+                    e1_gpu_us: timing.e1_gpu_us,
+                    total_selective_prep_gpu_us: timing.total_selective_prep_gpu_us,
+                    overlap_us: timing.overlap_us,
+                    target_tail_gpu_us: timing.target_tail_gpu_us,
+                    target_tail_baseline_us: timing.target_tail_baseline_us,
+                    target_tail_penalty_us: timing.target_tail_penalty_us,
+                },
+            }
+        }
+        camelid::eagle3_runtime::Eagle3SelectiveEdgePromotionOutcome::Fallback { reason } => {
+            Eagle3SelectiveEdgePromotionRoundReceipt::Fallback {
+                round,
+                reason,
+                serial_authoritative: true,
+            }
+        }
+    };
+    receipts.push(receipt);
+    Ok(())
+}
+
+fn record_eagle3_selective_edge_promotion_terminal_skip(
+    round: u64,
+    receipts: &mut Vec<Eagle3SelectiveEdgePromotionRoundReceipt>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        receipts
+            .last()
+            .is_none_or(|previous| previous.round() < round),
+        "selective edge-promotion round ids are not strictly increasing"
+    );
+    receipts.push(
+        Eagle3SelectiveEdgePromotionRoundReceipt::TerminalUpdateSkipped {
+            round,
+            reason: "terminal_head_skip",
+        },
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod eagle3_transaction_portfolio_receipt_tests {
+    use super::*;
+
+    fn root_only_fixture() -> (
+        camelid::inference::spec_tree::TokenTree,
+        camelid::metal::ResidentIndexedHeadEarlySnapshot,
+    ) {
+        (
+            camelid::inference::spec_tree::TokenTree {
+                tokens: vec![1],
+                parent: vec![-1],
+                depth: vec![0],
+            },
+            camelid::metal::ResidentIndexedHeadEarlySnapshot {
+                layer_id: 25,
+                compile_fast_math_enabled: false,
+                candidate_union: vec![2, 3],
+                encode_us: 5,
+                commit_wait_us: 7,
+                gpu_busy_us: 3,
+                kernel_window_us: 4,
+                fallback_reason: None,
+                rows: vec![camelid::metal::ResidentIndexedHeadEarlyRow {
+                    verifier_row: 0,
+                    candidate_logit_bits: vec![2.0f32.to_bits(), 1.0f32.to_bits()],
+                    ranked_candidate_tokens: vec![2, 3],
+                }],
+            },
+        )
+    }
+
+    #[test]
+    fn transaction_portfolio_freezes_then_records_authority_separately() {
+        let (tree, early) = root_only_fixture();
+        let frozen = freeze_eagle3_transaction_portfolio(true, &tree, Some(&early))
+            .unwrap()
+            .expect("enabled diagnostic carries a frozen result");
+        let acceptance = camelid::eagle3_runtime::Eagle3ForestAcceptance {
+            emitted_tokens: vec![2],
+            leaf_row: 0,
+            capture_rows: vec![0],
+            source_nodes: Vec::new(),
+        };
+        let mut receipts = Vec::new();
+        record_eagle3_transaction_portfolio_round(
+            true,
+            1,
+            Some(frozen),
+            &acceptance,
+            &mut receipts,
+        )
+        .unwrap();
+        match &receipts[0] {
+            Eagle3TransactionPortfolioRoundReceipt::Scored {
+                portfolio_frozen_before_authority_evaluation,
+                transaction_rank,
+                path_rank,
+                endpoint_rank,
+                terminal_rank_at_authoritative_leaf,
+                coverage,
+                ..
+            } => {
+                assert!(*portfolio_frozen_before_authority_evaluation);
+                assert_eq!(*transaction_rank, Some(1));
+                assert_eq!(*path_rank, Some(1));
+                assert_eq!(*endpoint_rank, Some(1));
+                assert_eq!(*terminal_rank_at_authoritative_leaf, Some(1));
+                assert!(coverage.iter().all(|entry| {
+                    entry.transaction_covered
+                        && entry.path_covered
+                        && entry.endpoint_covered
+                        && entry.terminal_at_authoritative_leaf_covered
+                }));
+            }
+            receipt => panic!("expected scored transaction receipt, got {receipt:?}"),
+        }
+    }
+
+    #[test]
+    fn transaction_portfolio_gate_off_rejects_retained_early_evidence() {
+        let (tree, early) = root_only_fixture();
+        assert!(freeze_eagle3_transaction_portfolio(false, &tree, Some(&early)).is_err());
+        assert!(freeze_eagle3_transaction_portfolio(false, &tree, None)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn selective_edge_prep_receipt_preserves_coverage_timing_and_zero_reuse() {
+        let timing = camelid::metal::Eagle3AuthoritativeE1ShadowTiming {
+            selective_path_budget: Some(4),
+            portfolio_gpu_us: 10,
+            target_tail_start_us: 100,
+            target_tail_end_us: 5_100,
+            e1_start_us: 200,
+            e1_end_us: 220,
+            target_tail_gpu_us: 5_000,
+            e1_gpu_us: 20,
+            total_selective_prep_gpu_us: 30,
+            target_tail_baseline_us: Some(
+                camelid::metal::EAGLE3_SELECTIVE_EDGE_TARGET_TAIL_BASELINE_US,
+            ),
+            target_tail_penalty_us: Some(78),
+            ..Default::default()
+        };
+        let comparison = camelid::metal::Eagle3AuthoritativeE1ShadowComparison::Matched {
+            prepared_edges: 5,
+            authoritative_edges: 3,
+            prepared_hits: 2,
+            prepared_misses: 1,
+            authoritative_path_fully_covered: false,
+            theoretical_serial_edge_rows_displaced: 2,
+            actually_reused_edge_rows: 0,
+            compared_f16_values: 2
+                * camelid::metal::EAGLE3_KV_HEADS
+                * camelid::metal::EAGLE3_HEAD_DIM
+                * 2,
+            timing,
+        };
+        let mut receipts = Vec::new();
+        record_eagle3_selective_edge_prep_round(4, 1, Some(comparison), &mut receipts).unwrap();
+        match &receipts[0] {
+            Eagle3SelectiveEdgePrepRoundReceipt::Matched { evidence, .. } => {
+                assert_eq!(evidence.predicted_unique_edge_rows, 5);
+                assert_eq!(evidence.prepared_hits, 2);
+                assert_eq!(evidence.prepared_misses, 1);
+                assert_eq!(evidence.target_tail_penalty_us, Some(78));
+                assert_eq!(evidence.total_selective_prep_gpu_us, 30);
+                assert_eq!(evidence.actually_reused_edge_rows, 0);
+            }
+            receipt => panic!("expected matched selective receipt, got {receipt:?}"),
+        }
+        record_eagle3_selective_edge_prep_serial_skip(2, &mut receipts).unwrap();
+        assert_eq!(receipts[1].round(), 2);
+    }
+
+    #[test]
+    fn selective_edge_promotion_receipt_preserves_epoch_route_and_reuse_order() {
+        let receipt = camelid::metal::Eagle3SelectiveEdgePromotionReceipt {
+            proof_receipt_sha256: camelid::metal::EAGLE3_SELECTIVE_EDGE_B4_PROOF_RECEIPT_SHA256,
+            authorization_generation: 17,
+            authorized_stable_position: 600,
+            prepared_edge_rows: vec![1, 3, 4],
+            authoritative_path_rows: vec![0, 1, 4, 6],
+            promoted_edge_rows: vec![1, 4],
+            serial_miss_edge_rows: vec![6],
+            prepared_edges: 3,
+            authoritative_edges: 3,
+            promoted_hits: 2,
+            serial_misses: 1,
+            authoritative_path_fully_covered: false,
+            compacted_bytes: 8_192,
+            additional_compaction_command_buffers: 0,
+            compaction_encode_us: 3,
+            compaction_gpu_us: None,
+            authoritative_update_gpu_us: 100,
+            logical_serial_fc_rows_displaced: 2,
+            saved_serial_kv_rows: 2,
+            serial_fc_logical_columns: 2,
+            serial_fc_physical_columns:
+                camelid::metal::EAGLE3_SELECTIVE_EDGE_PROMOTION_FC_PHYSICAL_COLUMNS,
+            terminal_authoritative_rows: 1,
+            preparation_timing: Default::default(),
+        };
+        let mut receipts = Vec::new();
+        record_eagle3_selective_edge_promotion_round(
+            7,
+            camelid::eagle3_runtime::Eagle3SelectiveEdgePromotionOutcome::Promoted(receipt),
+            &mut receipts,
+        )
+        .unwrap();
+        let Eagle3SelectiveEdgePromotionRoundReceipt::Promoted { round, evidence } = &receipts[0]
+        else {
+            panic!("expected promoted selective-edge receipt")
+        };
+        assert_eq!(*round, 7);
+        assert_eq!(evidence.authorization_generation, 17);
+        assert_eq!(evidence.authorized_stable_position, 600);
+        assert_eq!(evidence.prepared_edge_rows, vec![1, 3, 4]);
+        assert_eq!(evidence.authoritative_path_rows, vec![0, 1, 4, 6]);
+        assert_eq!(evidence.promoted_edge_rows, vec![1, 4]);
+        assert_eq!(evidence.serial_miss_edge_rows, vec![6]);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct Eagle3ArgmaxShadowExpansionReceipt {
+    parent_source_node: usize,
+    candidate_target_tokens: Vec<u32>,
+    lattice_admitted_target_tokens: Vec<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct Eagle3ArgmaxShadowRowReceipt {
+    verifier_row: usize,
+    verifier_token_id: u32,
+    authoritative_argmax_token: u32,
+    candidate_union_hit: bool,
+    miss_token: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct Eagle3ArgmaxShadowRoundReceipt {
+    round: u64,
+    verifier_token_ids: Vec<u32>,
+    expansion_count: usize,
+    candidate_observations: usize,
+    lattice_admitted_observations: usize,
+    draft_candidate_union_size: usize,
+    causal_target_top8_history_rounds_configured: usize,
+    causal_target_top8_history_rounds_available: usize,
+    causal_target_top8_candidate_additions: usize,
+    causal_candidate_recency_rounds_configured: usize,
+    causal_candidate_recency_rounds_available: usize,
+    causal_candidate_recency_additions: usize,
+    candidate_union: Vec<u32>,
+    candidate_union_size: usize,
+    authoritative_argmax_rows: usize,
+    candidate_union_hits: usize,
+    candidate_union_misses: usize,
+    row_evidence: Vec<Eagle3ArgmaxShadowRowReceipt>,
+    expansions: Vec<Eagle3ArgmaxShadowExpansionReceipt>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    indexed_head: Option<Eagle3IndexedHeadShadowReceipt>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Eagle3IndexedHeadCandidateSet {
+    candidate_ids: Vec<u32>,
+    base_candidate_ids: Vec<u32>,
+    draft_candidate_union_size: usize,
+    causal_target_top8_history_rounds_configured: usize,
+    causal_target_top8_history_rounds_available: usize,
+    causal_target_top8_candidate_additions: usize,
+    causal_candidate_recency_rounds_configured: usize,
+    causal_candidate_recency_rounds_available: usize,
+    causal_candidate_recency_additions: usize,
+}
+
+/// Bounded, per-run, causal verifier evidence for indexed-head diagnostics.
+///
+/// A round is published only after its authoritative target verification and acceptance. The
+/// next round may union these exact prior top-8 rows with the target-blind EAGLE candidates, but
+/// neither the verifier tree nor the emitted token path consults this history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Eagle3IndexedHeadTargetTop8History {
+    target_top8_max_rounds: usize,
+    candidate_recency_max_rounds: usize,
+    target_top8_rounds: VecDeque<Vec<[u32; camelid::metal::RESIDENT_VERIFY_TARGET_TOP_K]>>,
+    candidate_rounds: VecDeque<Vec<u32>>,
+}
+
+impl Eagle3IndexedHeadTargetTop8History {
+    fn new(
+        target_top8_max_rounds: usize,
+        candidate_recency_max_rounds: usize,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            target_top8_max_rounds > 0,
+            "indexed-head target-top-8 history must be non-zero"
+        );
+        Ok(Self {
+            target_top8_max_rounds,
+            candidate_recency_max_rounds,
+            target_top8_rounds: VecDeque::with_capacity(target_top8_max_rounds),
+            candidate_rounds: VecDeque::with_capacity(candidate_recency_max_rounds),
+        })
+    }
+
+    fn merge_with_draft(
+        &self,
+        draft_candidates: &[u32],
+    ) -> anyhow::Result<Eagle3IndexedHeadCandidateSet> {
+        anyhow::ensure!(
+            !draft_candidates.is_empty()
+                && draft_candidates.windows(2).all(|pair| pair[0] < pair[1]),
+            "indexed-head draft candidate union must be non-empty, sorted, and unique"
+        );
+        let mut union = draft_candidates.iter().copied().collect::<BTreeSet<_>>();
+        let draft_candidate_union_size = union.len();
+        for round in &self.target_top8_rounds {
+            for row in round {
+                for &token in row {
+                    if token != u32::MAX {
+                        anyhow::ensure!(
+                            (token as usize) < camelid::eagle3::TARGET_VOCAB_SIZE,
+                            "causal target-top-8 history contains out-of-vocabulary token {token}"
+                        );
+                        union.insert(token);
+                    }
+                }
+            }
+        }
+        let base_candidate_ids = union.iter().copied().collect::<Vec<_>>();
+        let causal_target_top8_candidate_additions =
+            base_candidate_ids.len() - draft_candidate_union_size;
+        'history: for prior_candidates in self.candidate_rounds.iter().rev() {
+            for &token in prior_candidates {
+                if union.len() == camelid::metal::RESIDENT_INDEXED_HEAD_SHADOW_MAX_CANDIDATES {
+                    break 'history;
+                }
+                union.insert(token);
+            }
+        }
+        anyhow::ensure!(
+            union.len() <= camelid::metal::RESIDENT_INDEXED_HEAD_SHADOW_MAX_CANDIDATES,
+            "indexed-head draft/history union has {} candidates, above diagnostic cap {}",
+            union.len(),
+            camelid::metal::RESIDENT_INDEXED_HEAD_SHADOW_MAX_CANDIDATES,
+        );
+        let candidate_ids = union.into_iter().collect::<Vec<_>>();
+        Ok(Eagle3IndexedHeadCandidateSet {
+            causal_candidate_recency_additions: candidate_ids.len() - base_candidate_ids.len(),
+            candidate_ids,
+            base_candidate_ids,
+            draft_candidate_union_size,
+            causal_target_top8_history_rounds_configured: self.target_top8_max_rounds,
+            causal_target_top8_history_rounds_available: self.target_top8_rounds.len(),
+            causal_target_top8_candidate_additions,
+            causal_candidate_recency_rounds_configured: self.candidate_recency_max_rounds,
+            causal_candidate_recency_rounds_available: self.candidate_rounds.len(),
+        })
+    }
+
+    fn publish(
+        &mut self,
+        predictions: &[u32],
+        target_top_k: &[[u32; camelid::metal::RESIDENT_VERIFY_TARGET_TOP_K]],
+        base_candidate_ids: &[u32],
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !target_top_k.is_empty() && target_top_k.len() == predictions.len(),
+            "indexed-head target-top-8 publication row count differs from authoritative predictions"
+        );
+        anyhow::ensure!(
+            target_top_k
+                .iter()
+                .zip(predictions)
+                .all(|(row, prediction)| row[0] == *prediction),
+            "indexed-head target-top-8 rank zero differs from authoritative prediction"
+        );
+        anyhow::ensure!(
+            !base_candidate_ids.is_empty()
+                && base_candidate_ids.windows(2).all(|pair| pair[0] < pair[1])
+                && base_candidate_ids.len()
+                    <= camelid::metal::RESIDENT_INDEXED_HEAD_SHADOW_MAX_CANDIDATES,
+            "indexed-head causal base candidate publication is malformed"
+        );
+        if self.target_top8_rounds.len() == self.target_top8_max_rounds {
+            self.target_top8_rounds.pop_front();
+        }
+        self.target_top8_rounds.push_back(target_top_k.to_vec());
+        if self.candidate_recency_max_rounds > 0 {
+            if self.candidate_rounds.len() == self.candidate_recency_max_rounds {
+                self.candidate_rounds.pop_front();
+            }
+            self.candidate_rounds.push_back(base_candidate_ids.to_vec());
+        }
+        Ok(())
+    }
+}
+
+fn eagle3_indexed_head_shadow_candidate_union(
+    enabled: bool,
+    forest: &camelid::eagle3_runtime::Eagle3DraftForest,
+    history: Option<&Eagle3IndexedHeadTargetTop8History>,
+) -> anyhow::Result<Option<Eagle3IndexedHeadCandidateSet>> {
+    if !enabled {
+        return Ok(None);
+    }
+    let shadow = forest.certified_argmax_shadow.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("indexed-head shadow requires retained frontier candidates")
+    })?;
+    let union = shadow.target_token_union();
+    anyhow::ensure!(
+        !union.is_empty()
+            && union
+                .iter()
+                .all(|&token| (token as usize) < camelid::eagle3::TARGET_VOCAB_SIZE)
+            && union.windows(2).all(|pair| pair[0] < pair[1]),
+        "indexed-head candidate union must be non-empty, in-vocabulary, sorted, and unique"
+    );
+    if let Some(history) = history {
+        return history.merge_with_draft(&union).map(Some);
+    }
+    Ok(Some(Eagle3IndexedHeadCandidateSet {
+        draft_candidate_union_size: union.len(),
+        base_candidate_ids: union.clone(),
+        candidate_ids: union,
+        causal_target_top8_history_rounds_configured: 0,
+        causal_target_top8_history_rounds_available: 0,
+        causal_target_top8_candidate_additions: 0,
+        causal_candidate_recency_rounds_configured: 0,
+        causal_candidate_recency_rounds_available: 0,
+        causal_candidate_recency_additions: 0,
+    }))
+}
+
+fn record_eagle3_argmax_shadow_round(
+    enabled: bool,
+    indexed_head_enabled: bool,
+    indexed_head_direct_emission_enabled: bool,
+    round: u64,
+    forest: &camelid::eagle3_runtime::Eagle3DraftForest,
+    verifier_token_ids: &[u32],
+    authoritative_argmax_tokens: &[u32],
+    indexed_head_candidates: Option<&Eagle3IndexedHeadCandidateSet>,
+    indexed_head_shadow: Option<&camelid::metal::ResidentIndexedHeadShadow>,
+    direct_emission: &Eagle3IndexedHeadDirectEmission,
+    receipts: &mut Vec<Eagle3ArgmaxShadowRoundReceipt>,
+) -> anyhow::Result<()> {
+    let Some(shadow) = forest.certified_argmax_shadow.as_ref() else {
+        anyhow::ensure!(!enabled, "argmax shadow gate lost its retained candidates");
+        return Ok(());
+    };
+    anyhow::ensure!(
+        enabled,
+        "frontier retained candidates while shadow gate was disabled"
+    );
+    anyhow::ensure!(
+        verifier_token_ids.len() == authoritative_argmax_tokens.len()
+            && !verifier_token_ids.is_empty(),
+        "argmax shadow verifier/argmax row counts differ"
+    );
+    anyhow::ensure!(
+        receipts
+            .last()
+            .is_none_or(|previous| previous.round < round),
+        "argmax shadow round ids are not strictly increasing"
+    );
+    let draft_candidate_union = shadow.target_token_union();
+    let candidate_union = indexed_head_candidates
+        .map(|candidates| candidates.candidate_ids.clone())
+        .unwrap_or_else(|| draft_candidate_union.clone());
+    let expected_candidates_per_expansion =
+        camelid::metal::eagle3_argmax_shadow_candidate_limit().map_err(anyhow::Error::msg)?;
+    anyhow::ensure!(
+        !draft_candidate_union.is_empty()
+            && draft_candidate_union
+                .windows(2)
+                .all(|pair| pair[0] < pair[1])
+            && !candidate_union.is_empty()
+            && candidate_union.windows(2).all(|pair| pair[0] < pair[1])
+            && shadow.expansions.iter().all(|expansion| {
+                expansion.candidate_target_tokens.len() == expected_candidates_per_expansion
+            }),
+        "argmax shadow candidate union or per-expansion width is incomplete"
+    );
+    let row_evidence = verifier_token_ids
+        .iter()
+        .copied()
+        .zip(authoritative_argmax_tokens.iter().copied())
+        .enumerate()
+        .map(|(row, (verifier_token_id, argmax))| {
+            let hit = candidate_union.binary_search(&argmax).is_ok();
+            Eagle3ArgmaxShadowRowReceipt {
+                verifier_row: row,
+                verifier_token_id,
+                authoritative_argmax_token: argmax,
+                candidate_union_hit: hit,
+                miss_token: (!hit).then_some(argmax),
+            }
+        })
+        .collect::<Vec<_>>();
+    let hits = row_evidence
+        .iter()
+        .filter(|row| row.candidate_union_hit)
+        .count();
+    anyhow::ensure!(
+        indexed_head_enabled == indexed_head_shadow.is_some(),
+        "indexed-head gate/receipt presence diverged"
+    );
+    anyhow::ensure!(
+        direct_emission.predictions.as_slice() == authoritative_argmax_tokens
+            && ((!indexed_head_direct_emission_enabled
+                && direct_emission.direct_emission_rows == 0
+                && direct_emission.full_head_fallback_rows == 0)
+                || (indexed_head_direct_emission_enabled
+                    && direct_emission.direct_emission_rows
+                        + direct_emission.full_head_fallback_rows
+                        == authoritative_argmax_tokens.len())),
+        "indexed-head direct-emission gate/selection diverged"
+    );
+    anyhow::ensure!(
+        indexed_head_enabled == indexed_head_candidates.is_some(),
+        "indexed-head gate/candidate-set presence diverged"
+    );
+    if let Some(candidates) = indexed_head_candidates {
+        anyhow::ensure!(
+            candidates.draft_candidate_union_size == draft_candidate_union.len()
+                && candidates.candidate_ids == candidate_union
+                && candidates.base_candidate_ids.len()
+                    == draft_candidate_union.len()
+                        + candidates.causal_target_top8_candidate_additions
+                && candidates
+                    .base_candidate_ids
+                    .iter()
+                    .all(|token| candidate_union.binary_search(token).is_ok())
+                && candidates.causal_target_top8_candidate_additions
+                    == candidates.base_candidate_ids.len() - draft_candidate_union.len()
+                && candidates.causal_candidate_recency_additions
+                    == candidate_union.len() - candidates.base_candidate_ids.len(),
+            "indexed-head candidate source accounting diverged"
+        );
+    }
+    let indexed_head = indexed_head_shadow
+        .map(|receipt| {
+            eagle3_indexed_head_shadow_receipt(
+                &candidate_union,
+                authoritative_argmax_tokens,
+                receipt,
+                indexed_head_direct_emission_enabled,
+                direct_emission.direct_emission_rows,
+                direct_emission.full_head_fallback_rows,
+            )
+        })
+        .transpose()?;
+    receipts.push(Eagle3ArgmaxShadowRoundReceipt {
+        round,
+        verifier_token_ids: verifier_token_ids.to_vec(),
+        expansion_count: shadow.expansions.len(),
+        candidate_observations: shadow.candidate_observations(),
+        lattice_admitted_observations: shadow.lattice_admitted_observations(),
+        draft_candidate_union_size: draft_candidate_union.len(),
+        causal_target_top8_history_rounds_configured: indexed_head_candidates
+            .map_or(0, |candidates| {
+                candidates.causal_target_top8_history_rounds_configured
+            }),
+        causal_target_top8_history_rounds_available: indexed_head_candidates
+            .map_or(0, |candidates| {
+                candidates.causal_target_top8_history_rounds_available
+            }),
+        causal_target_top8_candidate_additions: indexed_head_candidates.map_or(0, |candidates| {
+            candidates.causal_target_top8_candidate_additions
+        }),
+        causal_candidate_recency_rounds_configured: indexed_head_candidates
+            .map_or(0, |candidates| {
+                candidates.causal_candidate_recency_rounds_configured
+            }),
+        causal_candidate_recency_rounds_available: indexed_head_candidates
+            .map_or(0, |candidates| {
+                candidates.causal_candidate_recency_rounds_available
+            }),
+        causal_candidate_recency_additions: indexed_head_candidates.map_or(0, |candidates| {
+            candidates.causal_candidate_recency_additions
+        }),
+        candidate_union_size: candidate_union.len(),
+        candidate_union,
+        authoritative_argmax_rows: row_evidence.len(),
+        candidate_union_hits: hits,
+        candidate_union_misses: row_evidence.len() - hits,
+        row_evidence,
+        expansions: shadow
+            .expansions
+            .iter()
+            .map(|expansion| Eagle3ArgmaxShadowExpansionReceipt {
+                parent_source_node: expansion.parent_source_node,
+                candidate_target_tokens: expansion.candidate_target_tokens.clone(),
+                lattice_admitted_target_tokens: expansion.lattice_admitted_target_tokens.clone(),
+            })
+            .collect(),
+        indexed_head,
+    });
     Ok(())
 }
 
@@ -9853,6 +11899,15 @@ struct Eagle3BenchRun {
     cpu_verify_rounds: u64,
     resident_normal_steps: u64,
     suffix_rounds: u64,
+    suffix_candidate_rounds: u64,
+    suffix_confidence_declines: u64,
+    suffix_raw_depth_sum: u64,
+    suffix_confident_depth_sum: u64,
+    suffix_root_match_len_sum: u64,
+    suffix_root_support_sum: u64,
+    suffix_root_branch_count_sum: u64,
+    suffix_expected_accepted_q16_sum: u64,
+    suffix_terminal_survival_q16_sum: u64,
     suffix_offered: u64,
     suffix_emitted_tokens: u64,
     suffix_head_catchups: u64,
@@ -9863,31 +11918,205 @@ struct Eagle3BenchRun {
     dynamic_tree_offered: u64,
     dynamic_tree_emitted_tokens: u64,
     materialized_head_forwards: u64,
+    replay_scatter_commits: u64,
+    /// Dynamic rounds the confidence-gated draft early exit ended before the expansion budget.
+    draft_early_exit_rounds: u64,
+    /// Dynamic rounds by recorded head expansions, root included: index `k - 1` counts the
+    /// rounds that recorded exactly `k` expansions.
+    draft_expansions_histogram: Vec<u64>,
     dynamic_tree_max_depth_sum: u64,
+    verifier_widths: Eagle3VerifierWidthTelemetry,
+    x3_x4_expansions: Eagle3X3X4Telemetry,
+    authoritative_fusion: Eagle3AuthoritativeFusionTelemetry,
+    terminal_head_updates_skipped: u64,
+    terminal_head_skip_reason: Option<Eagle3TerminalHeadSkipReason>,
+    adaptive_expansions: Eagle3AdaptiveExpansionTelemetry,
+    token_recycling: Eagle3TokenRecyclingTelemetry,
+    target_row_hedge: Eagle3TargetRowHedgeTelemetry,
+    dual_eagle_rounds: Vec<DualEagleRoundReceipt>,
+    dual_eagle_shadow_update_us: u128,
+    dual_eagle_selected_head: Option<DualEagleHead>,
+    argmax_shadow_rounds: Vec<Eagle3ArgmaxShadowRoundReceipt>,
+    transaction_portfolio_rounds: Vec<Eagle3TransactionPortfolioRoundReceipt>,
+    selective_edge_prep_rounds: Vec<Eagle3SelectiveEdgePrepRoundReceipt>,
+    selective_edge_promotion_rounds: Vec<Eagle3SelectiveEdgePromotionRoundReceipt>,
 }
 
-/// Flatten the first deepest suffix-tree branch, bounded by the verify depth.
-/// Suffix children are inserted in descending frequency order, so choosing the
-/// earliest node at a tied depth preserves the drafter's deterministic ranking.
-fn deepest_suffix_chain(
-    tree: &camelid::inference::spec_tree::TokenTree,
-    max_depth: usize,
-) -> Vec<u32> {
-    let mut leaf = 0usize;
-    for (node, &depth) in tree.depth.iter().enumerate().skip(1) {
-        let depth = depth as usize;
-        if depth <= max_depth && depth > tree.depth[leaf] as usize {
-            leaf = node;
+impl Eagle3BenchRun {
+    /// Account one materialized dynamic frontier: its expansion count and whether the
+    /// confidence-gated early exit ended it. `materialized_head_forwards` stays the lane's own
+    /// per-round sum so its mean remains exact whether or not the exit fired.
+    fn note_dynamic_frontier(
+        &mut self,
+        frontier: &camelid::eagle3_runtime::Eagle3DynamicFrontier,
+        early_exit_theta: Option<f64>,
+        early_exit_trace: bool,
+    ) {
+        let expansions = frontier.head_expansions();
+        if self.draft_expansions_histogram.len() < expansions {
+            self.draft_expansions_histogram.resize(expansions, 0);
+        }
+        if let Some(slot) = expansions
+            .checked_sub(1)
+            .and_then(|index| self.draft_expansions_histogram.get_mut(index))
+        {
+            *slot += 1;
+        }
+        if let Some(exit) = frontier.draft_early_exit() {
+            self.draft_early_exit_rounds += 1;
+            if early_exit_trace {
+                eprintln!(
+                    "[eagle3-draft-early-exit] round={} k={} materialized_head_forwards={} skipped_parent={} depth={} probability={:.9} log-probability={:.9} theta={:.9}",
+                    self.rounds + 1,
+                    exit.completed_head_expansions,
+                    frontier.materialized_head_forwards(),
+                    exit.next_parent,
+                    exit.next_parent_depth,
+                    exit.next_parent_cumulative_probability,
+                    exit.next_parent_cumulative_log_probability,
+                    early_exit_theta.unwrap_or(0.0),
+                );
+            }
         }
     }
-    if leaf == 0 {
-        return Vec::new();
+}
+
+/// Histogram of dynamic rounds by recorded head expansions, padded to `min_expansions`
+/// entries so every budgeted expansion count has a slot even when no round reached it.
+fn eagle3_draft_expansions_histogram(counts: &[u64], min_expansions: usize) -> Vec<u64> {
+    let mut histogram = counts.to_vec();
+    if histogram.len() < min_expansions {
+        histogram.resize(min_expansions, 0);
     }
-    tree.path_to(leaf)
-        .into_iter()
-        .skip(1)
-        .map(|node| tree.tokens[node])
-        .collect()
+    histogram
+}
+
+include!("fp16_coding_probe.rs");
+include!("fp16_copy_probe.rs");
+
+/// Perfect-draft verifier cost on the model's own generated continuation. Every
+/// width sees the same prefix and token count. Prefill, the reference generation,
+/// drafting, and head updates are explicitly outside the measured interval.
+fn run_coding_oracle_verify(
+    config: &LlamaModelConfig,
+    weights: &Arc<LlamaLoadedWeights>,
+    tokenizer: &Tokenizer,
+    prompt: &[u32],
+    reference: &[u32],
+    workload: &str,
+    model_sha256: &str,
+) -> anyhow::Result<()> {
+    let count = reference.len().saturating_sub(1) / 16 * 16;
+    anyhow::ensure!(count >= 16, "oracle needs at least 17 generated tokens");
+    anyhow::ensure!(
+        prompt.len() + count + 1 <= 2048,
+        "oracle stays within the measured width-16 context boundary (2048)"
+    );
+    let binary = std::env::current_exe()?;
+    let binary_sha256 = camelid::receipt::sha256_file_hex(&binary).map_err(anyhow::Error::msg)?;
+    let widths: Vec<usize> = match std::env::var("CAMELID_BENCH_ORACLE_WIDTHS") {
+        Ok(value) => value
+            .split(',')
+            .map(|v| v.trim().parse::<usize>())
+            .collect::<Result<_, _>>()?,
+        Err(std::env::VarError::NotPresent) => vec![1, 2, 4, 8, 16],
+        Err(error) => return Err(error.into()),
+    };
+    anyhow::ensure!(
+        !widths.is_empty() && widths.iter().all(|v| [1, 2, 4, 8, 16].contains(v)),
+        "oracle widths must be selected from 1,2,4,8,16"
+    );
+    anyhow::ensure!(
+        widths
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            == widths.len(),
+        "oracle widths must be unique"
+    );
+    let mut records = Vec::new();
+    // Interleaved ascending/descending repetitions, first pass unreported warmup.
+    for rep in 0..=3 {
+        let order: Vec<usize> = if rep % 2 == 0 {
+            widths.iter().copied().rev().collect()
+        } else {
+            widths.clone()
+        };
+        for width in order {
+            let mut session = LlamaInferenceSession::new(config.clone(), Arc::clone(weights))?;
+            let _ = session.prewarm_resident_weights();
+            session.set_resident_encode_ahead_enabled(false);
+            let first = session
+                .generate_next_token_with_history_diagnostics(
+                    prompt,
+                    LlamaSampler::Greedy,
+                    prompt,
+                    false,
+                    None,
+                )?
+                .next_token_id;
+            anyhow::ensure!(first == reference[0], "oracle prefill anchor diverged");
+            let stream16_before = camelid::metal::metal_kquant_v4_stream16_projection_count();
+            let mut round_ms = Vec::new();
+            for offset in (1..=count).step_by(width) {
+                let started = Instant::now();
+                let predictions = if width == 1 {
+                    vec![
+                        session
+                            .generate_next_token_greedy_resident(reference[offset - 1])?
+                            .ok_or_else(|| anyhow::anyhow!("oracle single row left Metal"))?
+                            .0,
+                    ]
+                } else {
+                    session
+                        .verify_drafts_metal_with_layer_inputs(
+                            reference[offset - 1],
+                            &reference[offset..offset + width - 1],
+                            &[],
+                        )?
+                        .ok_or_else(|| anyhow::anyhow!("oracle width {width} left Metal"))?
+                        .predictions
+                };
+                let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+                anyhow::ensure!(
+                    predictions == reference[offset..offset + width],
+                    "oracle width {width} diverged at offset {offset}"
+                );
+                round_ms.push(elapsed);
+            }
+            if rep > 0 {
+                let total_ms: f64 = round_ms.iter().sum();
+                let stream16_projections =
+                    camelid::metal::metal_kquant_v4_stream16_projection_count()
+                        .saturating_sub(stream16_before);
+                eprintln!("[coding-oracle] rep={rep} width={width} rows={count} rate={:.2} verified rows/s", count as f64 * 1000.0 / total_ms);
+                records.push(serde_json::json!({
+                    "rep": rep, "width": width, "verified_rows": count,
+                    "rounds": round_ms.len(), "total_verify_ms": total_ms,
+                    "mean_round_ms": total_ms / round_ms.len() as f64,
+                    "verified_rows_per_second": count as f64 * 1000.0 / total_ms,
+                    "round_ms": round_ms, "exact_reference_match": true,
+                    "cpu_fallbacks": 0,
+                    "stream16_projections": stream16_projections,
+                }));
+            }
+        }
+    }
+    println!(
+        "{}",
+        serde_json::json!({
+            "schema": "camelid.coding-perfect-draft-cost.v1",
+            "measurement_only": true, "achieved_generation_throughput": false,
+            "scope": "target-only perfect-draft replay; excludes reference generation, prefill, proposal and head maintenance",
+            "commit": benchmark_commit(), "binary_sha256": binary_sha256,
+            "model_sha256": model_sha256, "workload": workload,
+            "prompt_token_ids": prompt, "plain_token_ids": reference,
+            "prompt_tokens": prompt.len(), "verified_rows_per_arm": count,
+            "effective_env": speculative_effective_env(), "records": records,
+            "target_text": tokenizer.decode(reference, false)?,
+        })
+    );
+    Ok(())
 }
 
 fn run_plain_resident_greedy(
@@ -9900,7 +12129,8 @@ fn run_plain_resident_greedy(
     let mut session = LlamaInferenceSession::new(config.clone(), Arc::clone(weights))?;
     // Populate the shared resident weight cache outside the measured decode span. This is a
     // model-load cost, not a per-token cost, and the EAGLE run below reuses the same cache.
-    let _ = session.prewarm_resident_weights();
+    let prewarmed = session.prewarm_resident_weights();
+    require_kquant_v4_soa8_prewarm(prewarmed)?;
     let ttft_started = Instant::now();
     let first = session
         .generate_next_token_with_history_diagnostics(
@@ -9938,7 +12168,7 @@ fn run_plain_resident_greedy(
     })
 }
 
-#[allow(clippy::too_many_arguments)] // one argument per benchmark knob
+#[allow(clippy::too_many_arguments)]
 fn run_eagle3_resident_greedy(
     config: &LlamaModelConfig,
     weights: &Arc<LlamaLoadedWeights>,
@@ -9949,18 +12179,41 @@ fn run_eagle3_resident_greedy(
     tree_nodes: Option<usize>,
     tree_topk: usize,
     tree_expansions: usize,
+    adaptive_expansions: bool,
+    verifier_width_selector: Option<Eagle3VerifierWidthSelectorConfig>,
+    x3_x4_selector: Option<Eagle3X3X4SelectorConfig>,
+    authoritative_cb_fusion: bool,
+    terminal_head_skip: bool,
     suffix_first: bool,
-    checkpoint: camelid::eagle3::Eagle3DraftModel,
+    token_recycling_hybrid: bool,
+    target_row_hedge: bool,
+    target_row_lattice_promotion: bool,
+    target_row_lattice_prior_log_bonus: f32,
+    certified_argmax_shadow: bool,
+    indexed_head_shadow: bool,
+    indexed_head_direct_emission: bool,
+    transaction_portfolio_shadow: bool,
+    selective_edge_prep_budget: Option<usize>,
+    selective_edge_promotion_authorization: Option<
+        camelid::metal::Eagle3SelectiveEdgePromotionAuthorization,
+    >,
+    indexed_head_target_top8_history_rounds: usize,
+    indexed_head_candidate_recency_rounds: usize,
+    mut drafter: camelid::eagle3_runtime::Eagle3Drafter,
+    mut secondary_drafter: Option<camelid::eagle3_runtime::Eagle3Drafter>,
+    head_upload_ms: f64,
 ) -> anyhow::Result<Eagle3BenchRun> {
     use camelid::eagle3::TARGET_LAYER_INPUT_IDS;
     use camelid::eagle3_runtime::{
-        Eagle3AuthoritativeCatchup, Eagle3Drafter, Eagle3DynamicFrontierConfig,
+        Eagle3AuthoritativeCatchup, Eagle3DynamicFrontierConfig, Eagle3ForestAcceptance,
     };
-    use camelid::inference::spec_tree::TreeDrafter;
     use camelid::inference::suffix_decoding::SuffixDecodingDrafter;
+    use camelid::inference::token_recycling::TokenRecyclingDrafter;
 
+    let selective_edge_promotion = selective_edge_promotion_authorization.is_some();
     let mut session = LlamaInferenceSession::new(config.clone(), Arc::clone(weights))?;
-    let _ = session.prewarm_resident_weights();
+    let prewarmed = session.prewarm_resident_weights();
+    require_kquant_v4_soa8_prewarm(prewarmed)?;
     // EAGLE alternates target and head command buffers on Metal's shared serial queue.
     // Do not leave a pre-committed target graph waiting ahead of a head update.
     session.set_resident_encode_ahead_enabled(false);
@@ -9978,14 +12231,6 @@ fn run_eagle3_resident_greedy(
         .ok_or_else(|| anyhow::anyhow!("EAGLE-3 target prompt produced no prediction"))?;
     let ttft_ms = ttft_started.elapsed().as_secs_f64() * 1000.0;
 
-    let head_capacity = prompt_tokens
-        .len()
-        .checked_add(max_tokens)
-        .and_then(|n| n.checked_add(draft_tokens + 1))
-        .ok_or_else(|| anyhow::anyhow!("EAGLE-3 cache capacity overflow"))?;
-    let head_upload_started = Instant::now();
-    let mut drafter = Eagle3Drafter::new(checkpoint, head_capacity)?;
-    let head_upload_ms = head_upload_started.elapsed().as_secs_f64() * 1000.0;
     let mut run = Eagle3BenchRun {
         generated: vec![first],
         ttft_ms,
@@ -9995,7 +12240,19 @@ fn run_eagle3_resident_greedy(
     };
     let seed_started = Instant::now();
     drafter.seed_prompt(weights, prompt_tokens, first, &prompt.layer_inputs)?;
+    if let Some(secondary) = secondary_drafter.as_mut() {
+        secondary.seed_prompt(weights, prompt_tokens, first, &prompt.layer_inputs)?;
+        anyhow::ensure!(
+            secondary.filled() == drafter.filled(),
+            "dual-EAGLE prompt seed watermarks diverged: E9={} SW512={}",
+            drafter.filled(),
+            secondary.filled()
+        );
+    }
     run.head_seed_ms = seed_started.elapsed().as_secs_f64() * 1000.0;
+    // Size the temporary lattice from the caller's requested maximum, not the controller's
+    // current shallow value. A later causal move to seven expansions therefore changes only
+    // the expansion limit for that next round; it never runs against a truncated lattice.
     let tree_lattice_nodes = tree_nodes
         .map(|node_budget| {
             tree_topk
@@ -10006,13 +12263,52 @@ fn run_eagle3_resident_greedy(
         })
         .transpose()?;
     let mut suffix_drafter = suffix_first.then(SuffixDecodingDrafter::default);
+    // Per-run only: benchmark hybrid state is never serialized, prepared, or shared with serving.
+    let mut recycling_drafter = token_recycling_hybrid.then(|| {
+        let mut drafter = TokenRecyclingDrafter::default();
+        drafter.topk = camelid::metal::RESIDENT_VERIFY_TARGET_TOP_K;
+        drafter.branch = 2;
+        drafter
+    });
+    // This cache is independent of the whole-tree EAGLE/TR selector above. Both target-row lanes
+    // always draft their ordinary EAGLE frontier and read this table before verification; current
+    // target rows are installed only after the round is fully verified and accepted.
+    let mut target_row_cache = (target_row_hedge || target_row_lattice_promotion).then(|| {
+        let mut cache = TokenRecyclingDrafter::default();
+        // Both gates deliberately consume only exact prior top-1. The lattice lane adds current
+        // EAGLE corroboration without silently widening target evidence.
+        cache.topk = 1;
+        cache.branch = 1;
+        cache
+    });
+    let mut indexed_head_target_top8_history = (indexed_head_target_top8_history_rounds > 0)
+        .then(|| {
+            Eagle3IndexedHeadTargetTop8History::new(
+                indexed_head_target_top8_history_rounds,
+                indexed_head_candidate_recency_rounds,
+            )
+        })
+        .transpose()?;
     let mut pending_suffix_head = Eagle3AuthoritativeCatchup::default();
+    let mut adaptive_expansion_controller =
+        adaptive_expansions.then(Eagle3AdaptiveExpansionController::default);
+    let mut dual_selector = secondary_drafter
+        .as_ref()
+        .map(|_| DualEagleSelector::default());
     let mut suffix_history = suffix_first.then(|| {
         let mut history = Vec::with_capacity(prompt_tokens.len() + max_tokens);
         history.extend_from_slice(prompt_tokens);
         history.push(first);
         history
     });
+    let adaptive_branching = eagle3_adaptive_branching_enabled();
+    let verifier_width_trace = verifier_width_selector.is_some()
+        && std::env::var_os("CAMELID_BENCH_EAGLE3_WIDTH_SELECTOR_TRACE").is_some();
+    let x3_x4_trace = x3_x4_selector.is_some()
+        && std::env::var_os("CAMELID_BENCH_EAGLE3_X3_X4_SELECTOR_TRACE").is_some();
+    let draft_early_exit_theta = camelid::eagle3_runtime::eagle3_draft_early_exit_theta();
+    let draft_early_exit_trace =
+        draft_early_exit_theta.is_some() && std::env::var_os("CAMELID_SPEC_VERIFY_TRACE").is_some();
 
     let decode_started = Instant::now();
     while run.generated.len() < max_tokens
@@ -10033,6 +12329,12 @@ fn run_eagle3_resident_greedy(
         // A final single token has no successor to draft. Keep it on the resident target;
         // no head update is needed once the requested output length is reached.
         if budget == 0 {
+            anyhow::ensure!(
+                dual_selector
+                    .as_ref()
+                    .is_none_or(DualEagleSelector::is_complete),
+                "dual-EAGLE race ran out of generation/context room before completing {DUAL_EAGLE_RACE_ROUNDS} rounds"
+            );
             let anchor = *run.generated.last().expect("generated is seeded");
             let next = session
                 .generate_next_token_greedy_resident(anchor)?
@@ -10048,22 +12350,238 @@ fn run_eagle3_resident_greedy(
 
         let anchor = *run.generated.last().expect("generated is seeded");
         let target_before = session.kv_position();
+        let mut terminal_head_update_skipped_this_round = false;
+        let round_tree_expansions = adaptive_expansion_controller.as_ref().map_or(
+            tree_expansions,
+            Eagle3AdaptiveExpansionController::expansions,
+        );
         let (emitted, offered, verify_nodes) = if let Some(node_budget) = tree_nodes {
-            let round_node_budget = node_budget.min(context_room);
+            let round_node_budget =
+                cap_verify_nodes_for_position(target_before, node_budget.min(context_room));
             let suffix_drafts = if let (Some(suffix), Some(history)) =
                 (suffix_drafter.as_mut(), suffix_history.as_ref())
             {
                 let draft_started = Instant::now();
                 let suffix_depth = budget.min(round_node_budget.saturating_sub(1));
-                let tree = suffix.draft_tree(history, anchor, round_node_budget, suffix_depth);
-                let drafts = deepest_suffix_chain(&tree, suffix_depth);
+                let proposal =
+                    suffix.draft_confident_chain(history, anchor, round_node_budget, suffix_depth);
+                let evidence = proposal.evidence;
+                if evidence.raw_depth > 0 {
+                    run.suffix_candidate_rounds += 1;
+                    run.suffix_raw_depth_sum += evidence.raw_depth as u64;
+                    run.suffix_confident_depth_sum += evidence.confident_depth as u64;
+                    run.suffix_root_match_len_sum += evidence.root_match_len as u64;
+                    run.suffix_root_support_sum += evidence.root_support as u64;
+                    run.suffix_root_branch_count_sum += evidence.root_branch_count as u64;
+                    run.suffix_expected_accepted_q16_sum += evidence.expected_accepted_q16 as u64;
+                    run.suffix_terminal_survival_q16_sum += evidence.terminal_survival_q16 as u64;
+                    if !evidence.admitted {
+                        run.suffix_confidence_declines += 1;
+                    }
+                }
+                let drafts = proposal.tokens;
                 run.draft_us += draft_started.elapsed().as_micros();
                 drafts
             } else {
                 Vec::new()
             };
 
-            if !suffix_drafts.is_empty() {
+            if dual_selector
+                .as_ref()
+                .is_some_and(|selector| !selector.is_complete())
+            {
+                anyhow::ensure!(
+                    suffix_drafts.is_empty()
+                        && recycling_drafter.is_none()
+                        && target_row_cache.is_none()
+                        && pending_suffix_head.is_empty(),
+                    "dual-EAGLE selector cannot share a round with suffix, Token Recycling, or target-row hedge drafting"
+                );
+                let secondary = secondary_drafter.as_mut().ok_or_else(|| {
+                    anyhow::anyhow!("dual-EAGLE race lost its SW512 shadow head before selection")
+                })?;
+                anyhow::ensure!(
+                    drafter.filled() == session.kv_position()
+                        && secondary.filled() == session.kv_position(),
+                    "dual-EAGLE head watermarks diverged before round: E9={} SW512={} target={}",
+                    drafter.filled(),
+                    secondary.filled(),
+                    session.kv_position()
+                );
+
+                // Both rankings are stable-root observations produced by prior authoritative
+                // updates. Capture them before the ordinary target verify for this round.
+                let e9_top8 = drafter.stable_root_target_top_k(DUAL_EAGLE_ROOT_RANKING)?;
+                let sw512_top8 = secondary.stable_root_target_top_k(DUAL_EAGLE_ROOT_RANKING)?;
+                let pending = dual_selector
+                    .as_mut()
+                    .expect("dual selector exists in race branch")
+                    .begin_round(e9_top8, sw512_top8)?;
+                let proposal_head = pending.proposal_head;
+
+                let draft_started = Instant::now();
+                let frontier = match proposal_head {
+                    DualEagleHead::E9 => drafter.draft_dynamic_frontier(
+                        weights,
+                        anchor,
+                        Eagle3DynamicFrontierConfig {
+                            max_verify_nodes: round_node_budget,
+                            max_lattice_nodes: tree_lattice_nodes.expect("tree budget is present"),
+                            max_depth: budget,
+                            candidates_per_parent: tree_topk,
+                            max_head_expansions: tree_expansions,
+                            adaptive_branching,
+                            certified_argmax_shadow,
+                        },
+                    )?,
+                    DualEagleHead::Sw512 => secondary.draft_dynamic_frontier(
+                        weights,
+                        anchor,
+                        Eagle3DynamicFrontierConfig {
+                            max_verify_nodes: round_node_budget,
+                            max_lattice_nodes: tree_lattice_nodes.expect("tree budget is present"),
+                            max_depth: budget,
+                            candidates_per_parent: tree_topk,
+                            max_head_expansions: tree_expansions,
+                            adaptive_branching,
+                            certified_argmax_shadow,
+                        },
+                    )?,
+                };
+                let materialized_head_forwards = frontier.materialized_head_forwards();
+                run.note_dynamic_frontier(
+                    &frontier,
+                    draft_early_exit_theta,
+                    draft_early_exit_trace,
+                );
+                let replay_scatter_commits = frontier.replay_scatter_commits();
+                let forest = frontier.finish()?;
+                let actual_nodes = forest.scored.tree.nodes();
+                let actual_max_depth = forest.scored.tree.max_depth();
+                anyhow::ensure!(
+                    (2..=round_node_budget).contains(&actual_nodes),
+                    "dual-EAGLE forest produced {actual_nodes} rows for round node budget {round_node_budget}"
+                );
+                run.drafted_token_ids
+                    .extend_from_slice(&forest.scored.tree.tokens[1..]);
+                run.draft_us += draft_started.elapsed().as_micros();
+
+                // Exactly one ordinary target verification supplies both lossless emission and
+                // the live root label used to score the already-captured rankings.
+                let verify_started = Instant::now();
+                let verified = session
+                    .verify_tree_metal_with_layer_inputs(
+                        &forest.scored.tree,
+                        &TARGET_LAYER_INPUT_IDS,
+                    )?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "resident Metal dual-EAGLE verification became unavailable at position {target_before}"
+                        )
+                    })?;
+                run.verify_us += verify_started.elapsed().as_micros();
+                anyhow::ensure!(
+                    verified.predictions.len() == actual_nodes,
+                    "dual-EAGLE target returned {} predictions for {actual_nodes} rows",
+                    verified.predictions.len()
+                );
+                let target_root = *verified.predictions.first().ok_or_else(|| {
+                    anyhow::anyhow!("dual-EAGLE target verify produced no root prediction")
+                })?;
+                let acceptance = forest.accept_target_predictions(&verified.predictions)?;
+                anyhow::ensure!(
+                    acceptance.capture_rows.len() == acceptance.emitted_tokens.len(),
+                    "dual-EAGLE emitted/capture path lengths diverged: {}/{}",
+                    acceptance.emitted_tokens.len(),
+                    acceptance.capture_rows.len()
+                );
+                let receipt = dual_selector
+                    .as_mut()
+                    .expect("dual selector exists in race branch")
+                    .finish_round(pending, target_root)?;
+
+                // Update both private caches from exactly the same target-authoritative rows.
+                // The non-proposal update is separately timed as the temporary race overhead.
+                match proposal_head {
+                    DualEagleHead::E9 => {
+                        let update_started = Instant::now();
+                        drafter.accept_authoritative_forest(
+                            weights,
+                            &verified.layer_inputs,
+                            &acceptance,
+                        )?;
+                        run.head_update_us += update_started.elapsed().as_micros();
+                        let shadow_started = Instant::now();
+                        secondary.accept_authoritative_forest(
+                            weights,
+                            &verified.layer_inputs,
+                            &acceptance,
+                        )?;
+                        run.dual_eagle_shadow_update_us += shadow_started.elapsed().as_micros();
+                    }
+                    DualEagleHead::Sw512 => {
+                        let update_started = Instant::now();
+                        secondary.accept_authoritative_forest(
+                            weights,
+                            &verified.layer_inputs,
+                            &acceptance,
+                        )?;
+                        run.head_update_us += update_started.elapsed().as_micros();
+                        let shadow_started = Instant::now();
+                        drafter.accept_authoritative_forest(
+                            weights,
+                            &verified.layer_inputs,
+                            &acceptance,
+                        )?;
+                        run.dual_eagle_shadow_update_us += shadow_started.elapsed().as_micros();
+                    }
+                }
+                anyhow::ensure!(
+                    drafter.filled() == secondary.filled(),
+                    "dual-EAGLE authoritative updates diverged: E9={} SW512={}",
+                    drafter.filled(),
+                    secondary.filled()
+                );
+
+                if std::env::var_os("CAMELID_SPEC_TREE_TRACE").is_some() {
+                    eprintln!(
+                        "[dual-eagle] round={} proposal={:?} target={} E9-rank={:?} SW512-rank={:?} next={:?}",
+                        receipt.round,
+                        receipt.proposal_head,
+                        receipt.target_token,
+                        receipt.e9.target_rank,
+                        receipt.sw512.target_rank,
+                        receipt.leader_for_next_round,
+                    );
+                }
+                run.dual_eagle_rounds.push(receipt);
+
+                // The sixth round updated both heads before either can be discarded. If SW512
+                // won, move it into the primary slot so the ordinary post-race path is shared.
+                if let Some(selected) = dual_selector
+                    .as_ref()
+                    .and_then(DualEagleSelector::selected_head)
+                {
+                    let mut shadow = secondary_drafter
+                        .take()
+                        .expect("completed dual-EAGLE race retains both synchronized heads");
+                    if selected == DualEagleHead::Sw512 {
+                        std::mem::swap(&mut drafter, &mut shadow);
+                    }
+                    drop(shadow);
+                    run.dual_eagle_selected_head = Some(selected);
+                }
+
+                let emitted_count = acceptance.emitted_tokens.len();
+                let offered = actual_nodes.saturating_sub(1);
+                run.dynamic_tree_rounds += 1;
+                run.dynamic_tree_offered += offered as u64;
+                run.dynamic_tree_emitted_tokens += emitted_count as u64;
+                run.materialized_head_forwards += materialized_head_forwards as u64;
+                run.replay_scatter_commits += replay_scatter_commits as u64;
+                run.dynamic_tree_max_depth_sum += actual_max_depth as u64;
+                (acceptance.emitted_tokens, offered, actual_nodes)
+            } else if !suffix_drafts.is_empty() {
                 run.drafted_token_ids.extend_from_slice(&suffix_drafts);
                 let verify_started = Instant::now();
                 let verified = session
@@ -10098,6 +12616,592 @@ fn run_eagle3_resident_greedy(
                 run.suffix_offered += offered as u64;
                 run.suffix_emitted_tokens += emitted.len() as u64;
                 (emitted, offered, offered + 1)
+            } else if let Some(recycling) = recycling_drafter.as_mut() {
+                anyhow::ensure!(
+                    pending_suffix_head.is_empty(),
+                    "EAGLE/TR hybrid cannot consume deferred suffix rows"
+                );
+                anyhow::ensure!(
+                    drafter.filled() == session.kv_position(),
+                    "EAGLE/TR hybrid head watermark diverged before admission: head={} target={}",
+                    drafter.filled(),
+                    session.kv_position()
+                );
+
+                // Admission is deliberately BEFORE either target verification or EAGLE
+                // materialization. It sees only exact target rows installed by earlier rounds.
+                let proposal_started = Instant::now();
+                let proposal = recycling.draft_known_target_tree(anchor, round_node_budget, budget);
+                run.draft_us += proposal_started.elapsed().as_micros();
+                let evidence = proposal.evidence;
+                run.token_recycling.note_decision(evidence);
+                if std::env::var_os("CAMELID_SPEC_TREE_TRACE").is_some() {
+                    eprintln!(
+                        "[eagle3-tr-hybrid] decision={} root_known={} nodes={} depth={} \
+                         primary_depth={} known_parents={}/{} share_q16={}",
+                        if evidence.admitted { "tr" } else { "e9" },
+                        evidence.root_known,
+                        evidence.nodes,
+                        evidence.max_depth,
+                        evidence.primary_depth,
+                        evidence.known_parent_rows,
+                        evidence.parent_rows,
+                        evidence.known_parent_share_q16,
+                    );
+                }
+
+                if evidence.admitted {
+                    let tree = proposal.tree;
+                    let actual_nodes = tree.nodes();
+                    anyhow::ensure!(
+                        (2..=round_node_budget).contains(&actual_nodes),
+                        "admitted Token Recycling forest produced {actual_nodes} rows for round node budget {round_node_budget}"
+                    );
+                    run.drafted_token_ids.extend_from_slice(&tree.tokens[1..]);
+
+                    let verify_started = Instant::now();
+                    let verified = session
+                        .verify_tree_metal_with_layer_inputs_and_target_top_k(
+                            &tree,
+                            &TARGET_LAYER_INPUT_IDS,
+                        )?
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "resident Metal Token Recycling tree verification became unavailable at position {target_before}"
+                            )
+                        })?;
+                    run.verify_us += verify_started.elapsed().as_micros();
+                    anyhow::ensure!(
+                        verified.predictions.len() == actual_nodes
+                            && verified.target_top_k.len() == actual_nodes,
+                        "Token Recycling target returned predictions/top-k rows {}/{} for {actual_nodes} verifier rows",
+                        verified.predictions.len(),
+                        verified.target_top_k.len(),
+                    );
+                    let (target_emitted, leaf_row) =
+                        tree.accept_longest_path(&verified.predictions);
+                    anyhow::ensure!(
+                        verified.emitted == target_emitted,
+                        "Token Recycling host acceptance diverged from resident target emission"
+                    );
+                    let capture_rows = tree.path_to(leaf_row);
+                    anyhow::ensure!(
+                        capture_rows.len() == target_emitted.len(),
+                        "Token Recycling emitted/capture path lengths diverged: {}/{}",
+                        target_emitted.len(),
+                        capture_rows.len()
+                    );
+                    let acceptance = Eagle3ForestAcceptance {
+                        emitted_tokens: target_emitted,
+                        leaf_row,
+                        source_nodes: capture_rows.clone(),
+                        capture_rows,
+                    };
+                    let update_started = Instant::now();
+                    drafter.accept_authoritative_forest(
+                        weights,
+                        &verified.layer_inputs,
+                        &acceptance,
+                    )?;
+                    run.head_update_us += update_started.elapsed().as_micros();
+
+                    let mut candidate_ids = 0usize;
+                    for ((&from, candidates), &prediction) in tree
+                        .tokens
+                        .iter()
+                        .zip(&verified.target_top_k)
+                        .zip(&verified.predictions)
+                    {
+                        anyhow::ensure!(
+                            candidates[0] == prediction,
+                            "Token Recycling top-1 candidate {} disagrees with greedy prediction {prediction} for verifier token {from}",
+                            candidates[0]
+                        );
+                        candidate_ids += recycling.replace_target_candidates(from, candidates);
+                    }
+                    let emitted_count = acceptance.emitted_tokens.len();
+                    let offered = actual_nodes.saturating_sub(1);
+                    run.token_recycling
+                        .note_candidates(actual_nodes, candidate_ids);
+                    run.token_recycling.note_tr(offered, emitted_count);
+                    if std::env::var_os("CAMELID_SPEC_TREE_TRACE").is_some() {
+                        eprintln!(
+                            "[eagle3-tr-hybrid] lane=tr rows={actual_nodes} candidate_ids={candidate_ids} \
+                             offered={offered} emitted={emitted_count}"
+                        );
+                    }
+                    (acceptance.emitted_tokens, offered, actual_nodes)
+                } else {
+                    // E9 fallback is also the cold seed. Its root row and every other verified
+                    // BFS row overwrite the in-session Token Recycling table after acceptance.
+                    let draft_started = Instant::now();
+                    let frontier = drafter.draft_dynamic_frontier(
+                        weights,
+                        anchor,
+                        Eagle3DynamicFrontierConfig {
+                            max_verify_nodes: round_node_budget,
+                            max_lattice_nodes: tree_lattice_nodes.expect("tree budget is present"),
+                            max_depth: budget,
+                            candidates_per_parent: tree_topk,
+                            max_head_expansions: round_tree_expansions,
+                            adaptive_branching,
+                            certified_argmax_shadow,
+                        },
+                    )?;
+                    let materialized_head_forwards = frontier.materialized_head_forwards();
+                    run.note_dynamic_frontier(
+                        &frontier,
+                        draft_early_exit_theta,
+                        draft_early_exit_trace,
+                    );
+                    let replay_scatter_commits = frontier.replay_scatter_commits();
+                    let forest = frontier.finish()?;
+                    let actual_nodes = forest.scored.tree.nodes();
+                    let actual_max_depth = forest.scored.tree.max_depth();
+                    anyhow::ensure!(
+                        (2..=round_node_budget).contains(&actual_nodes),
+                        "dynamic E9 forest produced {actual_nodes} rows for round node budget {round_node_budget}"
+                    );
+                    run.drafted_token_ids
+                        .extend_from_slice(&forest.scored.tree.tokens[1..]);
+                    run.draft_us += draft_started.elapsed().as_micros();
+
+                    let verify_started = Instant::now();
+                    let verified = session
+                        .verify_tree_metal_with_layer_inputs_and_target_top_k(
+                            &forest.scored.tree,
+                            &TARGET_LAYER_INPUT_IDS,
+                        )?
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "resident Metal E9 fallback verification became unavailable at position {target_before}"
+                            )
+                        })?;
+                    run.verify_us += verify_started.elapsed().as_micros();
+                    anyhow::ensure!(
+                        verified.predictions.len() == actual_nodes
+                            && verified.target_top_k.len() == actual_nodes,
+                        "E9 fallback target returned predictions/top-k rows {}/{} for {actual_nodes} verifier rows",
+                        verified.predictions.len(),
+                        verified.target_top_k.len(),
+                    );
+                    let acceptance = forest.accept_target_predictions(&verified.predictions)?;
+                    anyhow::ensure!(
+                        verified.emitted == acceptance.emitted_tokens,
+                        "E9 fallback host acceptance diverged from resident target emission"
+                    );
+                    anyhow::ensure!(
+                        acceptance.capture_rows.len() == acceptance.emitted_tokens.len(),
+                        "E9 fallback emitted/capture path lengths diverged: {}/{}",
+                        acceptance.emitted_tokens.len(),
+                        acceptance.capture_rows.len()
+                    );
+                    let update_started = Instant::now();
+                    drafter.accept_authoritative_forest(
+                        weights,
+                        &verified.layer_inputs,
+                        &acceptance,
+                    )?;
+                    run.head_update_us += update_started.elapsed().as_micros();
+
+                    let mut candidate_ids = 0usize;
+                    for ((&from, candidates), &prediction) in forest
+                        .scored
+                        .tree
+                        .tokens
+                        .iter()
+                        .zip(&verified.target_top_k)
+                        .zip(&verified.predictions)
+                    {
+                        anyhow::ensure!(
+                            candidates[0] == prediction,
+                            "E9 fallback top-1 candidate {} disagrees with greedy prediction {prediction} for verifier token {from}",
+                            candidates[0]
+                        );
+                        candidate_ids += recycling.replace_target_candidates(from, candidates);
+                    }
+                    let emitted_count = acceptance.emitted_tokens.len();
+                    let offered = actual_nodes.saturating_sub(1);
+                    run.dynamic_tree_rounds += 1;
+                    run.dynamic_tree_offered += offered as u64;
+                    run.dynamic_tree_emitted_tokens += emitted_count as u64;
+                    run.materialized_head_forwards += materialized_head_forwards as u64;
+                    run.replay_scatter_commits += replay_scatter_commits as u64;
+                    run.dynamic_tree_max_depth_sum += actual_max_depth as u64;
+                    run.token_recycling
+                        .note_candidates(actual_nodes, candidate_ids);
+                    run.token_recycling
+                        .note_e9(offered, emitted_count, !evidence.root_known);
+                    if std::env::var_os("CAMELID_SPEC_TREE_TRACE").is_some() {
+                        eprintln!(
+                            "[eagle3-tr-hybrid] lane=e9 cold_seed={} rows={actual_nodes} \
+                             candidate_ids={candidate_ids} offered={offered} emitted={emitted_count}",
+                            !evidence.root_known,
+                        );
+                    }
+                    (acceptance.emitted_tokens, offered, actual_nodes)
+                }
+            } else if let Some(target_rows) = target_row_cache.as_mut() {
+                anyhow::ensure!(
+                    pending_suffix_head.is_empty(),
+                    "EAGLE target-row hedge cannot consume deferred suffix rows"
+                );
+                anyhow::ensure!(
+                    drafter.filled() == session.kv_position(),
+                    "EAGLE target-row hedge watermark diverged before drafting: head={} target={}",
+                    drafter.filled(),
+                    session.kv_position()
+                );
+
+                // Always materialize the ordinary EAGLE frontier first. Fusion may exchange only
+                // one of its non-primary leaf slots; it cannot suppress or shorten the learned
+                // primary spine and cannot enlarge the target verifier batch.
+                let draft_started = Instant::now();
+                let frontier = drafter.draft_dynamic_frontier(
+                    weights,
+                    anchor,
+                    Eagle3DynamicFrontierConfig {
+                        max_verify_nodes: round_node_budget,
+                        max_lattice_nodes: tree_lattice_nodes.expect("tree budget is present"),
+                        max_depth: budget,
+                        candidates_per_parent: tree_topk,
+                        max_head_expansions: round_tree_expansions,
+                        adaptive_branching,
+                        certified_argmax_shadow,
+                    },
+                )?;
+                let materialized_head_forwards = frontier.materialized_head_forwards();
+                run.note_dynamic_frontier(
+                    &frontier,
+                    draft_early_exit_theta,
+                    draft_early_exit_trace,
+                );
+                let replay_scatter_commits = frontier.replay_scatter_commits();
+                let eagle_forest = frontier.finish_borrowed()?;
+                // Retain the target-blind proposal union before releasing the recurrent lattice.
+                // It is diagnostic input only; the fused verifier tree and full head stay fixed.
+                let indexed_head_candidates = eagle3_indexed_head_shadow_candidate_union(
+                    indexed_head_shadow,
+                    &eagle_forest,
+                    indexed_head_target_top8_history.as_ref(),
+                )?;
+                // The closure is read-only and runs before the current verify. The cache mutation
+                // is intentionally below target acceptance, making same-round leakage impossible.
+                let fused = if target_row_lattice_promotion {
+                    camelid::inference::target_row_hedge::TargetRowHedgeForest::fuse_lattice_promoted_with_bonus(
+                        &eagle_forest.scored,
+                        frontier.lattice(),
+                        round_node_budget,
+                        budget,
+                        target_row_lattice_prior_log_bonus,
+                        |token| target_rows.prior_target_top1(token),
+                    )
+                } else {
+                    camelid::inference::target_row_hedge::TargetRowHedgeForest::fuse(
+                        &eagle_forest.scored,
+                        round_node_budget,
+                        budget,
+                        |token| target_rows.prior_target_top1(token),
+                    )
+                }
+                .map_err(anyhow::Error::msg)?;
+                // The current lattice has served its only causal selection purpose. Release its
+                // recurrent branch state before the target verifier allocates/encodes N8.
+                drop(frontier);
+                let actual_nodes = fused.tree.nodes();
+                let actual_max_depth = fused.tree.max_depth();
+                anyhow::ensure!(
+                    (2..=round_node_budget).contains(&actual_nodes),
+                    "target-row fused EAGLE forest produced {actual_nodes} rows for round node budget {round_node_budget}"
+                );
+                run.drafted_token_ids
+                    .extend_from_slice(&fused.tree.tokens[1..]);
+                run.draft_us += draft_started.elapsed().as_micros();
+
+                // Full target-head execution and resident longest-path commit are unchanged.
+                // When causal history is enabled, the same pass also reads compact target top-8
+                // rows for publication after this round's authoritative acceptance.
+                let verify_started = Instant::now();
+                let (predictions, layer_inputs, indexed_head_result, current_target_top_k) =
+                    if let Some(candidates) = indexed_head_candidates.as_ref() {
+                        if indexed_head_target_top8_history.is_some() {
+                            let result = if let Some(path_budget) = selective_edge_prep_budget {
+                                session
+                                    .verify_tree_metal_with_layer_inputs_target_top_k_indexed_head_and_selective_e1_shadow(
+                                        &fused.tree,
+                                        &TARGET_LAYER_INPUT_IDS,
+                                        &candidates.candidate_ids,
+                                        drafter.authoritative_e1_shadow_head_mut(),
+                                        path_budget,
+                                        selective_edge_promotion_authorization,
+                                    )?
+                            } else {
+                                session
+                                    .verify_tree_metal_with_layer_inputs_target_top_k_and_indexed_head_shadow(
+                                        &fused.tree,
+                                        &TARGET_LAYER_INPUT_IDS,
+                                        &candidates.candidate_ids,
+                                    )?
+                            }
+                                .ok_or_else(|| {
+                                    anyhow::anyhow!(
+                                        "resident Metal indexed-head target-top-8 shadow became unavailable at position {target_before}"
+                                    )
+                                })?;
+                            let authoritative = result.authoritative;
+                            (
+                                authoritative.predictions,
+                                authoritative.layer_inputs,
+                                Some(result.shadow),
+                                Some(authoritative.target_top_k),
+                            )
+                        } else {
+                            let result = if let Some(path_budget) = selective_edge_prep_budget {
+                                session
+                                    .verify_tree_metal_with_layer_inputs_indexed_head_and_selective_e1_shadow(
+                                        &fused.tree,
+                                        &TARGET_LAYER_INPUT_IDS,
+                                        &candidates.candidate_ids,
+                                        drafter.authoritative_e1_shadow_head_mut(),
+                                        path_budget,
+                                        selective_edge_promotion_authorization,
+                                    )?
+                            } else {
+                                session
+                                    .verify_tree_metal_with_layer_inputs_and_indexed_head_shadow(
+                                        &fused.tree,
+                                        &TARGET_LAYER_INPUT_IDS,
+                                        &candidates.candidate_ids,
+                                    )?
+                            }
+                                .ok_or_else(|| {
+                                    anyhow::anyhow!(
+                                        "resident Metal indexed-head shadow became unavailable at position {target_before}"
+                                    )
+                                })?;
+                            (
+                                result.authoritative.predictions,
+                                result.authoritative.layer_inputs,
+                                Some(result.shadow),
+                                None,
+                            )
+                        }
+                    } else {
+                        let result = session
+                            .verify_tree_metal_with_layer_inputs(
+                                &fused.tree,
+                                &TARGET_LAYER_INPUT_IDS,
+                            )?
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "resident Metal target-row hedge verification became unavailable at position {target_before}"
+                                )
+                            })?;
+                        (result.predictions, result.layer_inputs, None, None)
+                    };
+                run.verify_us += verify_started.elapsed().as_micros();
+                anyhow::ensure!(
+                    predictions.len() == actual_nodes,
+                    "target-row hedge target returned {} predictions for {actual_nodes} verifier rows",
+                    predictions.len(),
+                );
+                // Freeze through an authority-free type before either the host acceptance walk
+                // or its eventual terminal token is observed by the diagnostic. The target has
+                // already computed its result in this state-inert shadow implementation, but no
+                // current-round truth crosses this API boundary.
+                let frozen_transaction_portfolio = freeze_eagle3_transaction_portfolio(
+                    transaction_portfolio_shadow,
+                    &fused.tree,
+                    indexed_head_result
+                        .as_ref()
+                        .and_then(|shadow| shadow.early_layer25.as_ref()),
+                )?;
+                let direct_emission = eagle3_indexed_head_direct_emission_predictions(
+                    indexed_head_direct_emission,
+                    &predictions,
+                    indexed_head_result.as_ref(),
+                )?;
+                record_eagle3_argmax_shadow_round(
+                    certified_argmax_shadow,
+                    indexed_head_shadow,
+                    indexed_head_direct_emission,
+                    run.rounds + 1,
+                    &eagle_forest,
+                    &fused.tree.tokens,
+                    &predictions,
+                    indexed_head_candidates.as_ref(),
+                    indexed_head_result.as_ref(),
+                    &direct_emission,
+                    &mut run.argmax_shadow_rounds,
+                )?;
+                let fused_acceptance = fused
+                    .accept_target_predictions(&direct_emission.predictions)
+                    .map_err(anyhow::Error::msg)?;
+                // Authoritative EAGLE refresh consumes verifier capture rows, not draft-lattice
+                // token mappings. An inserted target token therefore remains valid even when it
+                // has no EAGLE T2D/source-node entry.
+                let acceptance = Eagle3ForestAcceptance {
+                    emitted_tokens: fused_acceptance.emitted_tokens.clone(),
+                    leaf_row: fused_acceptance.leaf_row,
+                    capture_rows: fused_acceptance.capture_rows.clone(),
+                    source_nodes: Vec::new(),
+                };
+                record_eagle3_transaction_portfolio_round(
+                    transaction_portfolio_shadow,
+                    run.rounds + 1,
+                    frozen_transaction_portfolio,
+                    &acceptance,
+                    &mut run.transaction_portfolio_rounds,
+                )?;
+                let terminal_reason = eagle3_terminal_head_skip_reason(
+                    terminal_head_skip,
+                    run.generated.len(),
+                    max_tokens,
+                    &acceptance.emitted_tokens,
+                    &tokenizer.special.eog,
+                    session.remaining_context(),
+                );
+                if let Some(reason) = terminal_reason {
+                    anyhow::ensure!(
+                        run.terminal_head_updates_skipped == 0
+                            && run.terminal_head_skip_reason.is_none(),
+                        "EAGLE-3 terminal head update was skipped more than once"
+                    );
+                    run.terminal_head_updates_skipped = 1;
+                    run.terminal_head_skip_reason = Some(reason);
+                    terminal_head_update_skipped_this_round = true;
+                    if selective_edge_prep_budget.is_some() {
+                        if selective_edge_promotion {
+                            anyhow::ensure!(
+                                drafter.abandon_selective_edge_promotion_for_terminal_skip(),
+                                "selective promotion terminal skip lost its private artifact"
+                            );
+                            record_eagle3_selective_edge_promotion_terminal_skip(
+                                run.rounds + 1,
+                                &mut run.selective_edge_promotion_rounds,
+                            )?;
+                        } else {
+                            drafter.abandon_authoritative_e1_shadow_for_terminal_skip();
+                            record_eagle3_selective_edge_prep_serial_skip(
+                                run.rounds + 1,
+                                &mut run.selective_edge_prep_rounds,
+                            )?;
+                        }
+                    }
+                } else {
+                    let update_started = Instant::now();
+                    if let Some(path_budget) = selective_edge_prep_budget {
+                        if selective_edge_promotion {
+                            anyhow::ensure!(
+                                path_budget == 4,
+                                "selective promotion escaped its B4 configuration gate"
+                            );
+                            let outcome = drafter
+                                .accept_authoritative_forest_with_selective_edge_promotion(
+                                    weights,
+                                    &layer_inputs,
+                                    &acceptance,
+                                )?;
+                            record_eagle3_selective_edge_promotion_round(
+                                run.rounds + 1,
+                                outcome,
+                                &mut run.selective_edge_promotion_rounds,
+                            )?;
+                        } else {
+                            let comparison = drafter.accept_authoritative_forest_with_e1_receipt(
+                                weights,
+                                &layer_inputs,
+                                &acceptance,
+                            )?;
+                            record_eagle3_selective_edge_prep_round(
+                                path_budget,
+                                run.rounds + 1,
+                                comparison,
+                                &mut run.selective_edge_prep_rounds,
+                            )?;
+                        }
+                    } else {
+                        drafter.accept_authoritative_forest(weights, &layer_inputs, &acceptance)?;
+                    }
+                    run.head_update_us += update_started.elapsed().as_micros();
+                }
+
+                // Causal publication barrier: no row from this verify was visible to `fuse`.
+                // Install every exact greedy target top-1 row only after target acceptance and
+                // head update. A one-element row is the complete evidence needed by this policy.
+                if let Some(history) = indexed_head_target_top8_history.as_mut() {
+                    history.publish(
+                        &direct_emission.predictions,
+                        current_target_top_k.as_deref().ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "indexed-head causal target-top-8 history lost the current verifier rows"
+                            )
+                        })?,
+                        &indexed_head_candidates
+                            .as_ref()
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "indexed-head causal history lost the current base candidate set"
+                                )
+                            })?
+                            .base_candidate_ids,
+                    )?;
+                } else {
+                    anyhow::ensure!(
+                        current_target_top_k.is_none(),
+                        "target-top-8 rows were read without the causal history gate"
+                    );
+                }
+                let mut candidate_ids = 0usize;
+                for (&from, &prediction) in
+                    fused.tree.tokens.iter().zip(&direct_emission.predictions)
+                {
+                    candidate_ids += target_rows
+                        .replace_target_candidates(from, std::slice::from_ref(&prediction));
+                }
+                run.target_row_hedge
+                    .note_candidates(actual_nodes, candidate_ids);
+                run.target_row_hedge
+                    .note_round(
+                        &fused,
+                        &fused_acceptance,
+                        &eagle_forest.scored,
+                        &direct_emission.predictions,
+                    )
+                    .map_err(anyhow::Error::msg)?;
+                if std::env::var_os("CAMELID_SPEC_TREE_TRACE").is_some() {
+                    eprintln!(
+                        "[eagle3-target-row-{}] outcome={:?} supported={} duplicates={} \
+                         no-promotable-lattice-child={} token={:?} parent_depth={:?} lattice-source={:?} \
+                         candidate-score={:?} adjusted-score={:?} comparison={:?}/{:?} \
+                         evicted={:?} neural-retained={} rows={} emitted={}",
+                        if target_row_lattice_promotion { "lattice-promotion" } else { "hedge" },
+                        fused.decision.outcome,
+                        fused.decision.supported_primary_rows,
+                        fused.decision.full_path_duplicates,
+                        fused.decision.prior_rows_without_materialized_child,
+                        fused.decision.candidate_token,
+                        fused.decision.candidate_parent_depth,
+                        fused.decision.candidate_lattice_source_node,
+                        fused.decision.candidate_cumulative_log_probability,
+                        fused.decision.candidate_adjusted_log_score,
+                        fused.decision.comparison_eagle_row,
+                        fused.decision.comparison_cumulative_log_probability,
+                        fused.decision.evicted_eagle_row,
+                        fused.decision.neural_hedges_retained,
+                        actual_nodes,
+                        acceptance.emitted_tokens.len(),
+                    );
+                }
+                let emitted_count = acceptance.emitted_tokens.len();
+                let offered = actual_nodes.saturating_sub(1);
+                run.dynamic_tree_rounds += 1;
+                run.dynamic_tree_offered += offered as u64;
+                run.dynamic_tree_emitted_tokens += emitted_count as u64;
+                run.materialized_head_forwards += materialized_head_forwards as u64;
+                run.replay_scatter_commits += replay_scatter_commits as u64;
+                run.dynamic_tree_max_depth_sum += actual_max_depth as u64;
+                (acceptance.emitted_tokens, offered, actual_nodes)
             } else {
                 if !pending_suffix_head.is_empty() {
                     let update_started = Instant::now();
@@ -10114,19 +13218,106 @@ fn run_eagle3_resident_greedy(
                     session.kv_position()
                 );
                 let draft_started = Instant::now();
-                let frontier = drafter.draft_dynamic_frontier(
-                    weights,
-                    anchor,
-                    Eagle3DynamicFrontierConfig {
-                        max_verify_nodes: round_node_budget,
-                        max_lattice_nodes: tree_lattice_nodes.expect("tree budget is present"),
-                        max_depth: budget,
-                        candidates_per_parent: tree_topk,
-                        max_head_expansions: tree_expansions,
-                    },
-                )?;
+                let frontier_config = Eagle3DynamicFrontierConfig {
+                    max_verify_nodes: round_node_budget,
+                    max_lattice_nodes: tree_lattice_nodes.expect("tree budget is present"),
+                    max_depth: budget,
+                    candidates_per_parent: tree_topk,
+                    max_head_expansions: round_tree_expansions,
+                    adaptive_branching,
+                    certified_argmax_shadow,
+                };
+                let mut x3_x4_decision = None;
+                let mut duplicate_x3_x4_decision = false;
+                let frontier = if let Some(selector) = x3_x4_selector {
+                    drafter.draft_dynamic_frontier_with_expansion_gate(
+                        weights,
+                        anchor,
+                        frontier_config,
+                        |evidence| {
+                            if evidence.completed_head_expansions
+                                != EAGLE3_X3_X4_DECISION_AFTER_EXPANSIONS
+                            {
+                                return true;
+                            }
+                            let use_x4 = selector.use_x4(evidence);
+                            if x3_x4_decision.replace((evidence, use_x4)).is_some() {
+                                duplicate_x3_x4_decision = true;
+                                return false;
+                            }
+                            use_x4
+                        },
+                    )?
+                } else {
+                    drafter.draft_dynamic_frontier(weights, anchor, frontier_config)?
+                };
+                anyhow::ensure!(
+                    !duplicate_x3_x4_decision,
+                    "EAGLE-3 X3/X4 selector was asked to decide twice in one round"
+                );
+                if let Some(selector) = x3_x4_selector {
+                    if let Some((evidence, use_x4)) = x3_x4_decision {
+                        run.x3_x4_expansions.note_decision(evidence, use_x4)?;
+                        if x3_x4_trace {
+                            eprintln!(
+                                "[eagle3-x3-x4-selector] round={} selected=X{} completed={} next-parent={} depth={} probability={:.9} log-probability={:.9} x4-threshold={:.9}",
+                                run.rounds + 1,
+                                if use_x4 { 4 } else { 3 },
+                                evidence.completed_head_expansions,
+                                evidence.next_parent,
+                                evidence.next_parent_depth,
+                                evidence.next_parent_cumulative_probability,
+                                evidence.next_parent_cumulative_log_probability,
+                                selector.x4_min_next_parent_probability,
+                            );
+                        }
+                    } else {
+                        run.x3_x4_expansions.no_fourth_candidate_rounds += 1;
+                        if x3_x4_trace {
+                            eprintln!(
+                                "[eagle3-x3-x4-selector] round={} selected=natural-short completed={} reason=no-fourth-candidate x4-threshold={:.9}",
+                                run.rounds + 1,
+                                frontier.head_expansions(),
+                                selector.x4_min_next_parent_probability,
+                            );
+                        }
+                    }
+                }
                 let materialized_head_forwards = frontier.materialized_head_forwards();
-                let forest = frontier.finish()?;
+                run.note_dynamic_frontier(
+                    &frontier,
+                    draft_early_exit_theta,
+                    draft_early_exit_trace,
+                );
+                let replay_scatter_commits = frontier.replay_scatter_commits();
+                // Benchmark-only admission changes only which connected subset reaches the
+                // verifier. The ordinary target-authoritative acceptance below remains the sole
+                // source of emitted tokens, so choosing N5 cannot change greedy exactness.
+                let forest = if let Some(selector) = verifier_width_selector
+                    .filter(|_| round_node_budget >= EAGLE3_WIDTH_SELECTOR_WIDE_NODES)
+                {
+                    let costs = selector.cost_points();
+                    let selection = frontier.select_for_verifier_costs(&costs)?;
+                    run.verifier_widths.note(selection.admitted_node_budget)?;
+                    if verifier_width_trace {
+                        let n5 = frontier.select_for_verifier_costs(&costs[..1])?;
+                        let n6 = frontier.select_for_verifier_costs(&costs[1..])?;
+                        eprintln!(
+                            "[eagle3-width-selector] round={} selected={} n5_estimated_emitted={:.6} n6_estimated_emitted={:.6} n5_tokens_per_ms={:.9} n6_tokens_per_ms={:.9} n5_total_ms={:.6} n6_total_ms={:.6}",
+                            run.rounds + 1,
+                            selection.admitted_node_budget,
+                            n5.estimated_emitted_tokens,
+                            n6.estimated_emitted_tokens,
+                            n5.estimated_tokens_per_cost,
+                            n6.estimated_tokens_per_cost,
+                            selector.n5_total_ms,
+                            selector.n6_total_ms,
+                        );
+                    }
+                    selection.forest
+                } else {
+                    frontier.finish()?
+                };
                 let actual_nodes = forest.scored.tree.nodes();
                 let actual_max_depth = forest.scored.tree.max_depth();
                 anyhow::ensure!(
@@ -10139,9 +13330,10 @@ fn run_eagle3_resident_greedy(
 
                 let verify_started = Instant::now();
                 let verified = session
-                    .verify_tree_metal_with_layer_inputs(
+                    .verify_tree_metal_with_layer_inputs_and_e1_shadow(
                         &forest.scored.tree,
                         &TARGET_LAYER_INPUT_IDS,
+                        drafter.authoritative_e1_shadow_head_mut(),
                     )?
                     .ok_or_else(|| {
                         anyhow::anyhow!(
@@ -10161,19 +13353,40 @@ fn run_eagle3_resident_greedy(
                     acceptance.emitted_tokens.len(),
                     acceptance.capture_rows.len()
                 );
-                let update_started = Instant::now();
-                drafter.accept_authoritative_forest(
-                    weights,
-                    &verified.layer_inputs,
-                    &acceptance,
-                )?;
-                run.head_update_us += update_started.elapsed().as_micros();
+                let terminal_reason = eagle3_terminal_head_skip_reason(
+                    terminal_head_skip,
+                    run.generated.len(),
+                    max_tokens,
+                    &acceptance.emitted_tokens,
+                    &tokenizer.special.eog,
+                    session.remaining_context(),
+                );
+                if let Some(reason) = terminal_reason {
+                    anyhow::ensure!(
+                        run.terminal_head_updates_skipped == 0
+                            && run.terminal_head_skip_reason.is_none(),
+                        "EAGLE-3 terminal head update was skipped more than once"
+                    );
+                    run.terminal_head_updates_skipped = 1;
+                    run.terminal_head_skip_reason = Some(reason);
+                    terminal_head_update_skipped_this_round = true;
+                    drafter.abandon_authoritative_e1_shadow_for_terminal_skip();
+                } else {
+                    let update_started = Instant::now();
+                    drafter.accept_authoritative_forest(
+                        weights,
+                        &verified.layer_inputs,
+                        &acceptance,
+                    )?;
+                    run.head_update_us += update_started.elapsed().as_micros();
+                }
                 let emitted_count = acceptance.emitted_tokens.len();
                 let offered = actual_nodes.saturating_sub(1);
                 run.dynamic_tree_rounds += 1;
                 run.dynamic_tree_offered += offered as u64;
                 run.dynamic_tree_emitted_tokens += emitted_count as u64;
                 run.materialized_head_forwards += materialized_head_forwards as u64;
+                run.replay_scatter_commits += replay_scatter_commits as u64;
                 run.dynamic_tree_max_depth_sum += actual_max_depth as u64;
                 (acceptance.emitted_tokens, offered, actual_nodes)
             }
@@ -10213,18 +13426,60 @@ fn run_eagle3_resident_greedy(
         );
         run.resident_verify_rounds += 1;
         let effective_head_filled = pending_suffix_head.effective_filled(drafter.filled())?;
-        anyhow::ensure!(
-            effective_head_filled == session.kv_position(),
-            "EAGLE-3/target cache watermarks diverged: materialized_head={} pending_head={} target={}",
-            drafter.filled(),
-            pending_suffix_head.pending_rows(),
-            session.kv_position()
-        );
+        if terminal_head_update_skipped_this_round {
+            anyhow::ensure!(
+                pending_suffix_head.is_empty()
+                    && effective_head_filled.checked_add(emitted.len())
+                        == Some(session.kv_position()),
+                "terminal EAGLE-3 head skip left an unexpected watermark: materialized_head={} pending_head={} emitted={} target={}",
+                drafter.filled(),
+                pending_suffix_head.pending_rows(),
+                emitted.len(),
+                session.kv_position()
+            );
+        } else {
+            anyhow::ensure!(
+                effective_head_filled == session.kv_position(),
+                "EAGLE-3/target cache watermarks diverged: materialized_head={} pending_head={} target={}",
+                drafter.filled(),
+                pending_suffix_head.pending_rows(),
+                session.kv_position()
+            );
+        }
 
         run.rounds += 1;
         run.drafted += offered as u64;
         run.accepted_drafts += emitted.len().saturating_sub(1) as u64;
         run.verify_nodes += verify_nodes as u64;
+        if let Some(controller) = adaptive_expansion_controller.as_mut() {
+            let decision = controller.note_completed_round(emitted.len().saturating_sub(1));
+            if std::env::var_os("CAMELID_BENCH_EAGLE3_ADAPTIVE_EXPANSIONS_TRACE").is_some() {
+                eprintln!(
+                    "[eagle3-adaptive-expansions] round={} used={} expansions={} accepted={} \
+                     window={}/{} sum={} qualifies={} promote_streak={}/{} \
+                     reject_streak={}/{} cooldown={} next={} transition={}",
+                    run.rounds,
+                    decision.used_mode.label(),
+                    decision.used_mode.expansions(),
+                    decision.accepted_drafts,
+                    decision.window_count,
+                    EAGLE3_ADAPTIVE_EXPANSION_WINDOW,
+                    decision.window_sum,
+                    decision.qualifying_window,
+                    decision.qualifying_streak,
+                    EAGLE3_ADAPTIVE_PROMOTION_WINDOWS,
+                    decision.deep_rejection_streak,
+                    EAGLE3_ADAPTIVE_DEMOTION_WINDOWS,
+                    decision.cooldown_remaining,
+                    decision.next_mode.label(),
+                    if decision.used_mode == decision.next_mode {
+                        "none"
+                    } else {
+                        "yes"
+                    },
+                );
+            }
+        }
         let generated_before = run.generated.len();
         for token in emitted {
             if run.generated.len() >= max_tokens {
@@ -10242,6 +13497,31 @@ fn run_eagle3_resident_greedy(
     // Once generation has stopped, no consumer can observe the learned head again. Deliberately
     // drop a final suffix-only streak instead of paying a useless catch-up in the epilogue.
     run.suffix_head_discarded_rows = pending_suffix_head.pending_rows() as u64;
+    if let Some(reason) = run.terminal_head_skip_reason {
+        let stopped_for_recorded_reason = match reason {
+            Eagle3TerminalHeadSkipReason::MaxTokens => run.generated.len() >= max_tokens,
+            Eagle3TerminalHeadSkipReason::EndOfGeneration => run
+                .generated
+                .last()
+                .is_some_and(|token| tokenizer.special.eog.contains(token)),
+            Eagle3TerminalHeadSkipReason::ContextExhausted => session.remaining_context() == 0,
+        };
+        anyhow::ensure!(
+            terminal_head_skip
+                && run.terminal_head_updates_skipped == 1
+                && stopped_for_recorded_reason,
+            "EAGLE-3 terminal head skip did not terminate for its recorded reason {}",
+            reason.label()
+        );
+    } else {
+        anyhow::ensure!(
+            run.terminal_head_updates_skipped == 0,
+            "EAGLE-3 terminal head skip telemetry recorded a count without a reason"
+        );
+    }
+    if let Some(controller) = adaptive_expansion_controller {
+        run.adaptive_expansions = controller.telemetry();
+    }
     run.decode_ms = decode_started.elapsed().as_secs_f64() * 1000.0;
     anyhow::ensure!(
         run.cpu_verify_rounds == 0 && run.resident_verify_rounds == run.rounds,
@@ -10250,6 +13530,469 @@ fn run_eagle3_resident_greedy(
         run.cpu_verify_rounds,
         run.rounds
     );
+    if token_recycling_hybrid {
+        anyhow::ensure!(
+            run.token_recycling.admission_decisions == run.rounds
+                && run.token_recycling.e9_rounds + run.token_recycling.tr_rounds == run.rounds
+                && run.token_recycling.admission_declines == run.token_recycling.e9_rounds,
+            "EAGLE/TR lane telemetry diverged: decisions={} declines={} e9={} tr={} rounds={}",
+            run.token_recycling.admission_decisions,
+            run.token_recycling.admission_declines,
+            run.token_recycling.e9_rounds,
+            run.token_recycling.tr_rounds,
+            run.rounds,
+        );
+        anyhow::ensure!(
+            run.token_recycling.candidate_rows == run.verify_nodes,
+            "EAGLE/TR top-k coverage missed verifier rows: candidates={} verified={}",
+            run.token_recycling.candidate_rows,
+            run.verify_nodes,
+        );
+    }
+    if target_row_hedge || target_row_lattice_promotion {
+        let hedge = run.target_row_hedge;
+        anyhow::ensure!(
+            hedge.rounds == run.rounds
+                && hedge.insertion_rounds
+                    + hedge.no_prior_row_rounds
+                    + hedge.no_promotable_lattice_child_rounds
+                    + hedge.duplicate_only_rounds
+                    + hedge.below_promotion_score_rounds
+                    + hedge.no_replaceable_hedge_rounds
+                    == run.rounds,
+            "target-row decisions missed rounds: decisions={} inserted={} cold={} no-promotable-lattice-child={} duplicate={} below-score={} no-slot={} rounds={}",
+            hedge.rounds,
+            hedge.insertion_rounds,
+            hedge.no_prior_row_rounds,
+            hedge.no_promotable_lattice_child_rounds,
+            hedge.duplicate_only_rounds,
+            hedge.below_promotion_score_rounds,
+            hedge.no_replaceable_hedge_rounds,
+            run.rounds,
+        );
+        anyhow::ensure!(
+            hedge.candidate_rows == run.verify_nodes
+                && hedge.target_rows_offered == hedge.insertion_rounds
+                && hedge.offered_by_depth.iter().sum::<u64>() == hedge.target_rows_offered
+                && hedge.accepted_by_depth.iter().sum::<u64>() == hedge.target_rows_accepted
+                && hedge.target_rows_accepted <= hedge.target_rows_offered
+                && hedge.target_rows_accepted + hedge.evicted_edges_would_accept
+                    <= hedge.insertion_rounds
+                && hedge.counterfactual_emitted_token_delta
+                    == hedge.target_rows_accepted as i64
+                        - hedge.evicted_edges_would_accept as i64,
+            "target-row telemetry diverged: candidate_rows={}/{} offered={}/{} accepted={} evicted-would-accept={} delta={} depth_offered={} depth_accepted={}",
+            hedge.candidate_rows,
+            run.verify_nodes,
+            hedge.target_rows_offered,
+            hedge.insertion_rounds,
+            hedge.target_rows_accepted,
+            hedge.evicted_edges_would_accept,
+            hedge.counterfactual_emitted_token_delta,
+            hedge.offered_by_depth.iter().sum::<u64>(),
+            hedge.accepted_by_depth.iter().sum::<u64>(),
+        );
+    }
+    if certified_argmax_shadow {
+        anyhow::ensure!(
+            run.argmax_shadow_rounds.len() as u64 == run.rounds,
+            "argmax shadow recorded {} of {} fixed-lattice rounds",
+            run.argmax_shadow_rounds.len(),
+            run.rounds,
+        );
+        for receipt in &run.argmax_shadow_rounds {
+            anyhow::ensure!(
+                receipt.authoritative_argmax_rows == receipt.row_evidence.len()
+                    && receipt.candidate_union_hits + receipt.candidate_union_misses
+                        == receipt.authoritative_argmax_rows
+                    && receipt.candidate_union_size == receipt.candidate_union.len()
+                    && receipt.draft_candidate_union_size
+                        + receipt.causal_target_top8_candidate_additions
+                        + receipt.causal_candidate_recency_additions
+                        == receipt.candidate_union_size
+                    && receipt.causal_target_top8_history_rounds_configured
+                        == indexed_head_target_top8_history_rounds
+                    && receipt.causal_target_top8_history_rounds_available
+                        <= receipt.causal_target_top8_history_rounds_configured
+                    && receipt.causal_candidate_recency_rounds_configured
+                        == indexed_head_candidate_recency_rounds
+                    && receipt.causal_candidate_recency_rounds_available
+                        <= receipt.causal_candidate_recency_rounds_configured
+                    && indexed_head_shadow == receipt.indexed_head.is_some()
+                    && receipt.indexed_head.as_ref().is_none_or(|indexed| {
+                        indexed.authorizes_token_emission == indexed_head_direct_emission
+                            && ((!indexed_head_direct_emission
+                                && indexed.direct_emission_rows == 0
+                                && indexed.full_head_fallback_rows == 0)
+                                || indexed.direct_emission_rows + indexed.full_head_fallback_rows
+                                    == indexed.verifier_rows)
+                    }),
+                "argmax shadow round {} has incomplete evidence",
+                receipt.round,
+            );
+        }
+    } else {
+        anyhow::ensure!(
+            run.argmax_shadow_rounds.is_empty(),
+            "argmax shadow emitted receipts while default-off"
+        );
+    }
+    if transaction_portfolio_shadow {
+        anyhow::ensure!(
+            run.transaction_portfolio_rounds.len() as u64 == run.rounds,
+            "transaction portfolio recorded {} of {} fixed-lattice rounds",
+            run.transaction_portfolio_rounds.len(),
+            run.rounds,
+        );
+        for (index, receipt) in run.transaction_portfolio_rounds.iter().enumerate() {
+            let expected_round = index as u64 + 1;
+            match receipt {
+                Eagle3TransactionPortfolioRoundReceipt::Scored {
+                    round,
+                    layer_id,
+                    portfolio_frozen_before_authority_evaluation,
+                    tree_tokens,
+                    tree_parent,
+                    tree_depth,
+                    candidate_union,
+                    early_rows,
+                    transaction_candidates_considered,
+                    path_candidates_considered,
+                    endpoint_candidates_considered,
+                    top_transactions,
+                    top_paths,
+                    top_endpoints,
+                    transaction_rank,
+                    path_rank,
+                    endpoint_rank,
+                    terminal_rank_at_authoritative_leaf,
+                    coverage,
+                    ..
+                } => anyhow::ensure!(
+                    *round == expected_round
+                        && *layer_id
+                            == *camelid::eagle3::TARGET_LAYER_INPUT_IDS
+                                .last()
+                                .expect("capture contract is non-empty")
+                        && *portfolio_frozen_before_authority_evaluation
+                        && tree_tokens.len() == tree_parent.len()
+                        && tree_tokens.len() == tree_depth.len()
+                        && tree_tokens.len() == early_rows.len()
+                        && early_rows.iter().enumerate().all(|(row, evidence)| {
+                            evidence.verifier_row == row
+                                && evidence.candidate_logit_bits.len() == candidate_union.len()
+                        })
+                        && top_transactions.len() == (*transaction_candidates_considered).min(8)
+                        && top_paths.len() == (*path_candidates_considered).min(8)
+                        && top_endpoints.len() == (*endpoint_candidates_considered).min(8)
+                        && transaction_rank
+                            .is_none_or(|rank| rank <= *transaction_candidates_considered)
+                        && path_rank.is_none_or(|rank| rank <= *path_candidates_considered)
+                        && endpoint_rank.is_none_or(|rank| rank <= *endpoint_candidates_considered)
+                        && terminal_rank_at_authoritative_leaf
+                            .is_none_or(|rank| rank <= candidate_union.len())
+                        && coverage
+                            .iter()
+                            .map(|entry| entry.budget)
+                            .eq(camelid::eagle3_runtime::EAGLE3_TRANSACTION_PORTFOLIO_BUDGETS)
+                        && coverage.iter().all(|entry| {
+                            entry.transaction_covered
+                                == transaction_rank.is_some_and(|rank| rank <= entry.budget)
+                                && entry.path_covered
+                                    == path_rank.is_some_and(|rank| rank <= entry.budget)
+                                && entry.endpoint_covered
+                                    == endpoint_rank.is_some_and(|rank| rank <= entry.budget)
+                                && entry.terminal_at_authoritative_leaf_covered
+                                    == terminal_rank_at_authoritative_leaf
+                                        .is_some_and(|rank| rank <= entry.budget)
+                        }),
+                    "transaction portfolio round {expected_round} has incomplete evidence"
+                ),
+                Eagle3TransactionPortfolioRoundReceipt::Fallback { round, .. } => {
+                    anyhow::ensure!(
+                        *round == expected_round,
+                        "transaction portfolio fallback round id diverged"
+                    );
+                }
+            }
+        }
+    } else {
+        anyhow::ensure!(
+            run.transaction_portfolio_rounds.is_empty(),
+            "transaction portfolio emitted receipts while default-off"
+        );
+    }
+    if let Some(path_budget) = selective_edge_prep_budget.filter(|_| !selective_edge_promotion) {
+        anyhow::ensure!(
+            run.selective_edge_prep_rounds.len() as u64 == run.rounds,
+            "selective edge preparation recorded {} of {} fixed-lattice rounds",
+            run.selective_edge_prep_rounds.len(),
+            run.rounds,
+        );
+        for (index, receipt) in run.selective_edge_prep_rounds.iter().enumerate() {
+            let expected_round = index as u64 + 1;
+            anyhow::ensure!(
+                receipt.round() == expected_round,
+                "selective edge-preparation round id diverged at {expected_round}"
+            );
+            let evidence = match receipt {
+                Eagle3SelectiveEdgePrepRoundReceipt::Matched {
+                    compared_f16_values,
+                    evidence,
+                    ..
+                } => {
+                    anyhow::ensure!(
+                        *compared_f16_values
+                            == evidence.prepared_hits
+                                * camelid::metal::EAGLE3_KV_HEADS
+                                * camelid::metal::EAGLE3_HEAD_DIM
+                                * 2,
+                        "selective edge-preparation match compared the wrong K/V width"
+                    );
+                    Some(evidence)
+                }
+                Eagle3SelectiveEdgePrepRoundReceipt::Mismatched { evidence, .. } => Some(evidence),
+                Eagle3SelectiveEdgePrepRoundReceipt::Fallback { .. }
+                | Eagle3SelectiveEdgePrepRoundReceipt::SerialOracleSkipped { .. } => None,
+            };
+            if let Some(evidence) = evidence {
+                anyhow::ensure!(
+                    evidence.configured_path_budget == path_budget
+                        && evidence.measured_path_budget == Some(path_budget)
+                        && evidence.target_tail_baseline_us
+                            == Some(camelid::metal::EAGLE3_SELECTIVE_EDGE_TARGET_TAIL_BASELINE_US)
+                        && evidence.target_tail_penalty_us
+                            == Some(evidence.target_tail_gpu_us.saturating_sub(
+                                camelid::metal::EAGLE3_SELECTIVE_EDGE_TARGET_TAIL_BASELINE_US,
+                            ))
+                        && evidence.prepared_hits + evidence.prepared_misses
+                            == evidence.authoritative_edge_rows
+                        && evidence.prepared_hits <= evidence.predicted_unique_edge_rows
+                        && evidence.authoritative_path_fully_covered
+                            == (evidence.prepared_misses == 0)
+                        && evidence.theoretical_serial_edge_rows_displaced
+                            == evidence.prepared_hits
+                        && evidence.actually_reused_edge_rows == 0
+                        && evidence.total_selective_prep_gpu_us
+                            == evidence.portfolio_gpu_us.saturating_add(evidence.e1_gpu_us)
+                        && evidence.target_tail_gpu_us
+                            == evidence.target_tail_interval_us[1]
+                                .saturating_sub(evidence.target_tail_interval_us[0])
+                        && evidence.e1_gpu_us
+                            == evidence.e1_interval_us[1]
+                                .saturating_sub(evidence.e1_interval_us[0]),
+                    "selective edge-preparation round {expected_round} has inconsistent evidence"
+                );
+            }
+        }
+    } else {
+        anyhow::ensure!(
+            run.selective_edge_prep_rounds.is_empty(),
+            "selective edge-preparation emitted receipts while default-off"
+        );
+    }
+    if selective_edge_promotion {
+        anyhow::ensure!(
+            selective_edge_prep_budget == Some(4)
+                && run.selective_edge_promotion_rounds.len() as u64 == run.rounds,
+            "selective edge promotion recorded {} of {} B4 rounds",
+            run.selective_edge_promotion_rounds.len(),
+            run.rounds,
+        );
+        let mut last_authorization_generation = 0u64;
+        for (index, receipt) in run.selective_edge_promotion_rounds.iter().enumerate() {
+            let expected_round = index as u64 + 1;
+            anyhow::ensure!(
+                receipt.round() == expected_round,
+                "selective edge-promotion round id diverged at {expected_round}"
+            );
+            match receipt {
+                Eagle3SelectiveEdgePromotionRoundReceipt::Promoted { evidence, .. } => {
+                    let promoted_edge_rows = evidence
+                        .authoritative_path_rows
+                        .iter()
+                        .copied()
+                        .skip(1)
+                        .filter(|row| evidence.prepared_edge_rows.binary_search(row).is_ok())
+                        .collect::<Vec<_>>();
+                    let serial_miss_edge_rows = evidence
+                        .authoritative_path_rows
+                        .iter()
+                        .copied()
+                        .skip(1)
+                        .filter(|row| evidence.prepared_edge_rows.binary_search(row).is_err())
+                        .collect::<Vec<_>>();
+                    anyhow::ensure!(
+                        evidence.proof_receipt_sha256
+                            == camelid::metal::EAGLE3_SELECTIVE_EDGE_B4_PROOF_RECEIPT_SHA256
+                            && evidence.authorization_generation
+                                > last_authorization_generation
+                            && evidence.authorized_stable_position > 0
+                            && evidence.prepared_edge_rows.len()
+                                == evidence.predicted_unique_edge_rows
+                            && evidence
+                                .prepared_edge_rows
+                                .windows(2)
+                                .all(|rows| rows[0] < rows[1])
+                            && evidence.prepared_edge_rows.iter().all(|row| {
+                                (1..camelid::metal::EAGLE3_SELECTIVE_EDGE_VERIFIER_ROWS)
+                                    .contains(row)
+                            })
+                            && evidence.authoritative_path_rows.first() == Some(&0)
+                            && evidence.authoritative_path_rows.len()
+                                == evidence.authoritative_edge_rows + 1
+                            && evidence.authoritative_path_rows.iter().all(|row| {
+                                *row < camelid::metal::EAGLE3_SELECTIVE_EDGE_VERIFIER_ROWS
+                            })
+                            && evidence
+                                .authoritative_path_rows
+                                .iter()
+                                .copied()
+                                .collect::<BTreeSet<_>>()
+                                .len()
+                                == evidence.authoritative_path_rows.len()
+                            && promoted_edge_rows == evidence.promoted_edge_rows
+                            && serial_miss_edge_rows == evidence.serial_miss_edge_rows
+                            && evidence.promoted_edge_rows.len() == evidence.promoted_hits
+                            && evidence.serial_miss_edge_rows.len() == evidence.serial_misses
+                            && evidence.configured_path_budget == 4
+                            && (3..camelid::metal::EAGLE3_SELECTIVE_EDGE_VERIFIER_ROWS)
+                                .contains(&evidence.predicted_unique_edge_rows)
+                            && evidence.promoted_hits > 0
+                            && evidence.promoted_hits + evidence.serial_misses
+                                == evidence.authoritative_edge_rows
+                            && evidence.authoritative_path_fully_covered
+                                == (evidence.serial_misses == 0)
+                            && evidence.logical_serial_fc_rows_displaced
+                                == evidence.promoted_hits
+                            && evidence.saved_serial_kv_rows == evidence.promoted_hits
+                            && evidence.serial_fc_logical_columns
+                                == evidence.serial_misses + 1
+                            && evidence.serial_fc_physical_columns
+                                == camelid::metal::EAGLE3_SELECTIVE_EDGE_PROMOTION_FC_PHYSICAL_COLUMNS
+                            && evidence.terminal_authoritative_rows == 1
+                            && evidence.device_compacted_eagle_kv_bytes
+                                == evidence.promoted_hits
+                                    * camelid::metal::EAGLE3_KV_HEADS
+                                    * camelid::metal::EAGLE3_HEAD_DIM
+                                    * 2
+                                    * std::mem::size_of::<u16>()
+                            && evidence.additional_compaction_command_buffers == 0
+                            && evidence.compaction_gpu_us.is_none()
+                            && !evidence.e1_kv_host_readback
+                            && evidence.total_selective_prep_gpu_us
+                                == evidence.portfolio_gpu_us.saturating_add(evidence.e1_gpu_us)
+                            && evidence.target_tail_baseline_us
+                                == Some(
+                                    camelid::metal::EAGLE3_SELECTIVE_EDGE_TARGET_TAIL_BASELINE_US
+                                )
+                            && evidence.target_tail_penalty_us
+                                == Some(evidence.target_tail_gpu_us.saturating_sub(
+                                    camelid::metal::EAGLE3_SELECTIVE_EDGE_TARGET_TAIL_BASELINE_US,
+                                )),
+                        "selective edge-promotion round {expected_round} has inconsistent evidence"
+                    );
+                    last_authorization_generation = evidence.authorization_generation;
+                }
+                Eagle3SelectiveEdgePromotionRoundReceipt::Fallback {
+                    reason,
+                    serial_authoritative,
+                    ..
+                } => anyhow::ensure!(
+                    *serial_authoritative
+                        && matches!(
+                            reason.as_str(),
+                            "selective promotion found no exact prepared authoritative edge"
+                                | "selective promotion preparation fell back: selective_portfolio_unavailable"
+                        ),
+                    "selective edge-promotion fallback {expected_round} was not an allowlisted authoritative decline: {reason:?}"
+                ),
+                Eagle3SelectiveEdgePromotionRoundReceipt::TerminalUpdateSkipped { .. } => {
+                    anyhow::ensure!(
+                        terminal_head_skip,
+                        "selective edge promotion recorded an unconfigured terminal skip"
+                    );
+                }
+            }
+        }
+    } else {
+        anyhow::ensure!(
+            run.selective_edge_promotion_rounds.is_empty(),
+            "selective edge promotion emitted receipts while default-off"
+        );
+    }
+    if adaptive_expansions {
+        anyhow::ensure!(
+            run.adaptive_expansions.shallow_rounds + run.adaptive_expansions.deep_rounds
+                == run.rounds,
+            "adaptive expansion telemetry missed rounds: shallow={} deep={} total={}",
+            run.adaptive_expansions.shallow_rounds,
+            run.adaptive_expansions.deep_rounds,
+            run.rounds,
+        );
+        anyhow::ensure!(
+            run.adaptive_expansions.shallow_accepted_drafts
+                + run.adaptive_expansions.deep_accepted_drafts
+                == run.accepted_drafts,
+            "adaptive expansion telemetry missed accepted drafts: shallow={} deep={} total={}",
+            run.adaptive_expansions.shallow_accepted_drafts,
+            run.adaptive_expansions.deep_accepted_drafts,
+            run.accepted_drafts,
+        );
+    }
+    if let Some(selector) = dual_selector.as_ref() {
+        anyhow::ensure!(
+            selector.is_complete()
+                && selector.receipts.len() == DUAL_EAGLE_RACE_ROUNDS as usize
+                && run.dual_eagle_rounds == selector.receipts
+                && run.dual_eagle_selected_head == selector.selected_head()
+                && secondary_drafter.is_none(),
+            "dual-EAGLE race did not complete and drop exactly one head: completed={} receipts={}/{} selected={:?} shadow_present={}",
+            selector.completed_rounds,
+            run.dual_eagle_rounds.len(),
+            selector.receipts.len(),
+            run.dual_eagle_selected_head,
+            secondary_drafter.is_some(),
+        );
+    }
+    if verifier_width_selector.is_some() {
+        anyhow::ensure!(
+            run.verifier_widths.decisions
+                == run.verifier_widths.n5_rounds + run.verifier_widths.n6_rounds,
+            "EAGLE-3 width-selector telemetry is inconsistent: decisions={} N5={} N6={}",
+            run.verifier_widths.decisions,
+            run.verifier_widths.n5_rounds,
+            run.verifier_widths.n6_rounds,
+        );
+    }
+    if x3_x4_selector.is_some() {
+        anyhow::ensure!(
+            run.x3_x4_expansions.decisions
+                == run.x3_x4_expansions.x3_rounds + run.x3_x4_expansions.x4_rounds,
+            "EAGLE-3 X3/X4 telemetry is inconsistent: decisions={} X3={} X4={}",
+            run.x3_x4_expansions.decisions,
+            run.x3_x4_expansions.x3_rounds,
+            run.x3_x4_expansions.x4_rounds,
+        );
+        anyhow::ensure!(
+            run.x3_x4_expansions.decisions
+                + run.x3_x4_expansions.no_fourth_candidate_rounds
+                == run.dynamic_tree_rounds,
+            "EAGLE-3 X3/X4 telemetry covered {} decisions plus {} natural-short rounds, but ran {} dynamic-tree rounds",
+            run.x3_x4_expansions.decisions,
+            run.x3_x4_expansions.no_fourth_candidate_rounds,
+            run.dynamic_tree_rounds,
+        );
+    }
+
+    // Read the drafter-owned counters only after every authoritative update has completed.
+    // Fusion is deliberately unavailable with dual-EAGLE, so `drafter` is the single head whose
+    // decode-time updates must attest the benchmark lane immediately before the run is returned.
+    run.authoritative_fusion = drafter.authoritative_fusion_telemetry();
+    validate_eagle3_authoritative_cb_fusion_telemetry(
+        authoritative_cb_fusion,
+        run.authoritative_fusion,
+    )?;
 
     Ok(run)
 }
@@ -10281,6 +14024,393 @@ struct BenchEagle3Record {
     tree_node_budget: Option<usize>,
     tree_topk: Option<usize>,
     tree_expansions: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verifier_width_selector: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verifier_width5_total_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verifier_width6_total_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verifier_width_decisions: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verifier_width5_rounds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verifier_width6_rounds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    x3_x4_selector: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    x4_min_next_parent_probability: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    x3_x4_decisions: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    x3_rounds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    x4_rounds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    x3_x4_no_fourth_candidate_rounds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    x3_x4_next_parent_probability_mean: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    x3_x4_next_parent_probability_min: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    x3_x4_next_parent_probability_max: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    authoritative_cb_fusion: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    authoritative_fused_updates: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    authoritative_fused_rows: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    authoritative_update_command_buffers: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    terminal_head_skip: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    terminal_head_updates_skipped: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    terminal_head_skip_reason: Option<&'static str>,
+    adaptive_expansions: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    adaptive_window_rounds: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    adaptive_shallow_expansions: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    adaptive_deep_expansions: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    adaptive_shallow_to_deep_min_accepted_sum: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    adaptive_deep_to_shallow_below_accepted_sum: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    adaptive_promotion_consecutive_windows: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    adaptive_demotion_consecutive_windows: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    adaptive_post_demotion_cooldown_rounds: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    adaptive_shallow_rounds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    adaptive_shallow_accepted_drafts: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    adaptive_deep_rounds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    adaptive_deep_accepted_drafts: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    adaptive_shallow_to_deep_transitions: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    adaptive_deep_to_shallow_transitions: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    adaptive_shallow_qualifying_windows: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    adaptive_shallow_cooldown_rounds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    adaptive_shallow_cooldown_qualifying_windows: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    adaptive_shallow_qualification_resets: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    adaptive_deep_rejecting_windows: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    adaptive_deep_rejection_resets: Option<u64>,
+    token_recycling_hybrid: bool,
+    target_row_hedge: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_hedge_max_nodes: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_hedge_candidate_policy: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_hedge_cache_update_policy: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_hedge_rounds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_hedge_insertion_rounds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_hedge_no_prior_row_rounds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_hedge_duplicate_only_rounds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_hedge_no_replaceable_neural_hedge_rounds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_hedge_supported_primary_rows: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_hedge_full_path_duplicates: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_hedge_rows_offered: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_hedge_rows_accepted: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_hedge_shared_rows_accepted: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_hedge_neural_hedges_retained_sum: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_hedge_offered_by_depth: Option<[u64; 8]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_hedge_accepted_by_depth: Option<[u64; 8]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_hedge_candidate_rows: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_hedge_candidate_ids: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_hedge_evicted_edges_would_accept: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_hedge_counterfactual_emitted_token_delta: Option<i64>,
+    target_row_lattice_promotion: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_lattice_promotion_max_nodes: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_lattice_promotion_candidate_policy: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_lattice_promotion_score_policy: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_lattice_promotion_prior_log_bonus: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_lattice_promotion_cache_update_policy: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_lattice_promotion_rounds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_lattice_promotion_rounds_promoted: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_lattice_promotion_no_prior_row_rounds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_lattice_promotion_no_promotable_child_rounds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_lattice_promotion_duplicate_only_rounds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_lattice_promotion_below_score_rounds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_lattice_promotion_no_replaceable_hedge_rounds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_lattice_promotion_supported_primary_rows: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_lattice_promotion_prior_rows_without_materialized_child: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_lattice_promotion_full_path_duplicates: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_lattice_promotion_rows_offered: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_lattice_promotion_rows_accepted: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_lattice_promotion_shared_rows_accepted: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_lattice_promotion_evicted_edges_would_accept: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_lattice_promotion_counterfactual_emitted_token_delta: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_lattice_promotion_neural_hedges_retained_sum: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_lattice_promotion_offered_by_depth: Option<[u64; 8]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_lattice_promotion_accepted_by_depth: Option<[u64; 8]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_lattice_promotion_candidate_rows: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_lattice_promotion_candidate_ids: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    certified_argmax_shadow: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    certified_argmax_shadow_rounds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    certified_argmax_shadow_candidate_observations: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    certified_argmax_shadow_candidates_per_expansion: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    certified_argmax_shadow_candidate_union_hits: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    certified_argmax_shadow_candidate_union_misses: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    certified_argmax_shadow_round_evidence: Option<Vec<Eagle3ArgmaxShadowRoundReceipt>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    indexed_head_shadow: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    indexed_head_direct_emission: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    indexed_head_direct_emission_full_head_confirmed: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    indexed_head_direct_emission_rows: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    indexed_head_direct_emission_full_head_fallback_rows: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    indexed_head_shadow_causal_target_top8_history_rounds: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    indexed_head_shadow_causal_target_top8_candidate_additions: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    indexed_head_shadow_causal_candidate_recency_rounds: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    indexed_head_shadow_causal_candidate_recency_additions: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    indexed_head_shadow_scored_rounds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    indexed_head_shadow_fallback_rounds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    indexed_head_shadow_exact_logit_agreements: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    indexed_head_shadow_compared_logits: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    indexed_head_shadow_kernel_window_us: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    indexed_head_shadow_compile_fast_math_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transaction_portfolio_shadow: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transaction_portfolio_budgets: Option<[usize; 4]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transaction_portfolio_scored_rounds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transaction_portfolio_fallback_rounds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transaction_portfolio_transaction_hits: Option<[u64; 4]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transaction_portfolio_path_hits: Option<[u64; 4]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transaction_portfolio_endpoint_hits: Option<[u64; 4]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transaction_portfolio_conditional_terminal_hits: Option<[u64; 4]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transaction_portfolio_round_evidence: Option<Vec<Eagle3TransactionPortfolioRoundReceipt>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selective_edge_prep_budget: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selective_edge_prep_target_tail_baseline_us: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selective_edge_prep_matched_rounds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selective_edge_prep_mismatched_rounds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selective_edge_prep_fallback_rounds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selective_edge_prep_serial_oracle_skipped_rounds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selective_edge_prep_round_evidence: Option<Vec<Eagle3SelectiveEdgePrepRoundReceipt>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selective_edge_promotion: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selective_edge_promotion_proof_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selective_edge_promotion_proof_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selective_edge_promotion_proof_source_commit: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selective_edge_promotion_proof_binary_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selective_edge_promotion_proof_matched_rounds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selective_edge_promotion_proof_fallback_rounds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selective_edge_promotion_promoted_rounds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selective_edge_promotion_fallback_rounds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selective_edge_promotion_terminal_skipped_rounds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selective_edge_promotion_prepared_edges: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selective_edge_promotion_authoritative_edges: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selective_edge_promotion_hits: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selective_edge_promotion_serial_misses: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selective_edge_promotion_full_coverage_rounds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selective_edge_promotion_no_hit_fallback_rounds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selective_edge_promotion_portfolio_unavailable_fallback_rounds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selective_edge_promotion_logical_serial_fc_rows_displaced: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selective_edge_promotion_saved_serial_kv_rows: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selective_edge_promotion_serial_fc_logical_columns: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selective_edge_promotion_compacted_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selective_edge_promotion_additional_compaction_command_buffers: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selective_edge_promotion_compaction_encode_us: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selective_edge_promotion_copy_gpu_time_available: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selective_edge_promotion_update_gpu_us: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selective_edge_promotion_round_evidence: Option<Vec<Eagle3SelectiveEdgePromotionRoundReceipt>>,
+    dual_eagle_selector: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dual_eagle_race_rounds: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dual_eagle_root_ranking: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dual_eagle_reciprocal_rank_scale: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dual_eagle_e9_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dual_eagle_e9_config_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dual_eagle_e9_revision: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dual_eagle_sw512: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dual_eagle_sw512_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dual_eagle_sw512_config_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dual_eagle_sw512_revision: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dual_eagle_e9_score: Option<DualEagleScore>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dual_eagle_sw512_score: Option<DualEagleScore>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dual_eagle_round_evidence: Option<Vec<DualEagleRoundReceipt>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dual_eagle_selected_head: Option<DualEagleHead>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dual_eagle_dropped_head: Option<DualEagleHead>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dual_eagle_e9_head_load_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dual_eagle_e9_head_upload_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dual_eagle_sw512_head_load_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dual_eagle_sw512_head_upload_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dual_eagle_shadow_update_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hybrid_admission_decisions: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hybrid_admission_declines: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hybrid_primary_depth_sum: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hybrid_parent_rows_sum: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hybrid_known_parent_rows_sum: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hybrid_known_parent_share_q16_sum: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hybrid_confidence_q16_scale: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hybrid_min_primary_depth: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hybrid_min_known_parent_share_q16: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hybrid_e9_rounds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hybrid_e9_offered: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hybrid_e9_accepted_drafts: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hybrid_e9_emitted_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hybrid_tr_rounds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hybrid_tr_offered: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hybrid_tr_accepted_drafts: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hybrid_tr_emitted_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hybrid_cold_seed_anchors: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hybrid_candidate_rows: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hybrid_candidate_ids: Option<u64>,
     plain_generated_tokens: usize,
     eagle3_generated_tokens: usize,
     head_load_ms: f64,
@@ -10308,6 +14438,32 @@ struct BenchEagle3Record {
     #[serde(skip_serializing_if = "Option::is_none")]
     suffix_rounds: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    suffix_candidate_rounds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suffix_confidence_declines: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suffix_raw_depth_sum: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suffix_confident_depth_sum: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suffix_root_match_len_sum: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suffix_root_support_sum: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suffix_root_branch_count_sum: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suffix_expected_accepted_q16_sum: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suffix_terminal_survival_q16_sum: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suffix_confidence_q16_scale: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suffix_min_prefix_survival_q16: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suffix_min_expected_accepted_q16: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suffix_min_confident_depth: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     suffix_offered: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     suffix_emitted_tokens: Option<u64>,
@@ -10329,6 +14485,25 @@ struct BenchEagle3Record {
     materialized_head_forwards: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     mean_materialized_head_forwards_per_dynamic_round: Option<f64>,
+    /// CAMELID_EAGLE3_DRAFT_EARLY_EXIT threshold armed for this run; absent when the gate is
+    /// off, so an off receipt keeps its established shape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    draft_early_exit_theta: Option<f64>,
+    /// Dynamic rounds the confidence-gated draft early exit ended before the expansion budget.
+    /// Zero with the gate off, so a receipt proves whether the exit fired.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    draft_early_exit_rounds: Option<u64>,
+    /// Dynamic rounds by recorded head expansions, root included: index `k - 1` counts the
+    /// rounds that recorded exactly `k` expansions, for `k` in `1..=tree_expansions`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    draft_expansions_histogram: Option<Vec<u64>>,
+    /// CAMELID_BENCH_EAGLE3_REPLAY_SCATTER armed for this run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    replay_scatter: Option<bool>,
+    /// Path-replay rows restored by a scatter-only commit instead of a head forward. Zero with
+    /// the gate off, so a receipt proves the lane fired.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    replay_scatter_commits: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     mean_dynamic_tree_max_depth: Option<f64>,
     resident_verify_rounds: u64,
@@ -10348,17 +14523,2301 @@ struct BenchEagle3Record {
     peak_memory_bytes: u64,
 }
 
+fn eagle3_adaptive_branching_enabled() -> bool {
+    std::env::var_os("CAMELID_EAGLE3_ADAPTIVE_BRANCHING")
+        .is_some_and(|value| !value.is_empty() && value != "0")
+}
+
+fn eagle3_token_recycling_hybrid_enabled() -> bool {
+    std::env::var_os("CAMELID_BENCH_EAGLE3_TR_HYBRID")
+        .is_some_and(|value| !value.is_empty() && value != "0")
+}
+
+fn parse_eagle3_target_row_hedge_env(value: Option<&str>) -> anyhow::Result<bool> {
+    match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        None | Some("") | Some("0") | Some("false") | Some("off") | Some("no")
+        | Some("disabled") => Ok(false),
+        Some("1") | Some("true") | Some("on") | Some("yes") | Some("enabled") => Ok(true),
+        Some(value) => {
+            anyhow::bail!("CAMELID_BENCH_EAGLE3_TARGET_ROW_HEDGE must be a boolean, got {value:?}")
+        }
+    }
+}
+
+fn eagle3_target_row_hedge_enabled() -> anyhow::Result<bool> {
+    let raw = std::env::var_os("CAMELID_BENCH_EAGLE3_TARGET_ROW_HEDGE");
+    let value = raw
+        .as_ref()
+        .map(|value| {
+            value.to_str().ok_or_else(|| {
+                anyhow::anyhow!("CAMELID_BENCH_EAGLE3_TARGET_ROW_HEDGE is not valid UTF-8")
+            })
+        })
+        .transpose()?;
+    parse_eagle3_target_row_hedge_env(value)
+}
+
+fn parse_eagle3_target_row_lattice_promotion_env(value: Option<&str>) -> anyhow::Result<bool> {
+    match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        None | Some("") | Some("0") | Some("false") | Some("off") | Some("no")
+        | Some("disabled") => Ok(false),
+        Some("1") | Some("true") | Some("on") | Some("yes") | Some("enabled") => Ok(true),
+        Some(value) => anyhow::bail!(
+            "CAMELID_BENCH_EAGLE3_TARGET_ROW_LATTICE_PROMOTION must be a boolean, got {value:?}"
+        ),
+    }
+}
+
+fn eagle3_target_row_lattice_promotion_enabled() -> anyhow::Result<bool> {
+    let raw = std::env::var_os("CAMELID_BENCH_EAGLE3_TARGET_ROW_LATTICE_PROMOTION");
+    let value = raw
+        .as_ref()
+        .map(|value| {
+            value.to_str().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "CAMELID_BENCH_EAGLE3_TARGET_ROW_LATTICE_PROMOTION is not valid UTF-8"
+                )
+            })
+        })
+        .transpose()?;
+    parse_eagle3_target_row_lattice_promotion_env(value)
+}
+
+fn parse_eagle3_argmax_shadow_env(name: &str, value: Option<&str>) -> anyhow::Result<bool> {
+    match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        None | Some("") | Some("0") | Some("false") | Some("off") | Some("no")
+        | Some("disabled") => Ok(false),
+        Some("1") | Some("true") | Some("on") | Some("yes") | Some("enabled") => Ok(true),
+        Some(value) => anyhow::bail!("{name} must be a boolean, got {value:?}"),
+    }
+}
+
+fn eagle3_argmax_shadow_env(name: &str) -> anyhow::Result<bool> {
+    let raw = std::env::var_os(name);
+    let value = raw
+        .as_ref()
+        .map(|value| {
+            value
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("{name} is not valid UTF-8"))
+        })
+        .transpose()?;
+    parse_eagle3_argmax_shadow_env(name, value)
+}
+
+fn parse_eagle3_transaction_portfolio_shadow_env(value: Option<&str>) -> anyhow::Result<bool> {
+    match value {
+        None | Some("") | Some("0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(value) => anyhow::bail!(
+            "{} must be exactly 0 or 1, got {value:?}",
+            camelid::metal::EAGLE3_TRANSACTION_PORTFOLIO_SHADOW_ENV
+        ),
+    }
+}
+
+fn eagle3_transaction_portfolio_shadow_enabled() -> anyhow::Result<bool> {
+    let raw = std::env::var_os(camelid::metal::EAGLE3_TRANSACTION_PORTFOLIO_SHADOW_ENV);
+    let value = raw
+        .as_ref()
+        .map(|value| {
+            value.to_str().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{} is not valid UTF-8",
+                    camelid::metal::EAGLE3_TRANSACTION_PORTFOLIO_SHADOW_ENV
+                )
+            })
+        })
+        .transpose()?;
+    parse_eagle3_transaction_portfolio_shadow_env(value)
+}
+
+fn validate_eagle3_transaction_portfolio_shadow_config(
+    enabled: bool,
+    indexed_head_shadow: bool,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !enabled || indexed_head_shadow,
+        "{}=1 requires CAMELID_BENCH_EAGLE3_INDEXED_HEAD_SHADOW=1",
+        camelid::metal::EAGLE3_TRANSACTION_PORTFOLIO_SHADOW_ENV
+    );
+    Ok(())
+}
+
+fn parse_eagle3_selective_edge_prep_budget_env(
+    value: Option<&str>,
+) -> anyhow::Result<Option<usize>> {
+    match value {
+        None | Some("") | Some("0") => Ok(None),
+        Some("1") => Ok(Some(1)),
+        Some("2") => Ok(Some(2)),
+        Some("4") => Ok(Some(4)),
+        Some("8") => Ok(Some(8)),
+        Some(value) => anyhow::bail!(
+            "{} must be exactly 0, 1, 2, 4, or 8, got {value:?}",
+            camelid::metal::EAGLE3_SELECTIVE_EDGE_PREP_BUDGET_ENV
+        ),
+    }
+}
+
+fn eagle3_selective_edge_prep_budget() -> anyhow::Result<Option<usize>> {
+    let raw = std::env::var_os(camelid::metal::EAGLE3_SELECTIVE_EDGE_PREP_BUDGET_ENV);
+    let value = raw
+        .as_ref()
+        .map(|value| {
+            value.to_str().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{} is not valid UTF-8",
+                    camelid::metal::EAGLE3_SELECTIVE_EDGE_PREP_BUDGET_ENV
+                )
+            })
+        })
+        .transpose()?;
+    parse_eagle3_selective_edge_prep_budget_env(value)
+}
+
+const EAGLE3_SELECTIVE_EDGE_B4_PROOF_COMMIT: &str = "8c66102ff5f9de903575afbcfefcc954b12ffdca";
+const EAGLE3_SELECTIVE_EDGE_B4_PROOF_RECEIPT_SHA256: &str =
+    camelid::metal::EAGLE3_SELECTIVE_EDGE_B4_PROOF_RECEIPT_SHA256;
+const EAGLE3_SELECTIVE_EDGE_B4_PROOF_BINARY_SHA256: &str =
+    "4057e9147bbe3c062137b8b53a4a0ac192748223e67de9c565eace408a8ea8dd";
+const EAGLE3_SELECTIVE_EDGE_B4_PROOF_INPUT_SHA256: &str =
+    "7c7319ab066e8e6f5bb83a813082db1ee117aacd88405a36616b7e54dd0de6a2";
+const EAGLE3_SELECTIVE_EDGE_B4_PROOF_PROMPT_SHA256: &str =
+    "0baf32844e554f35112a32bae75ac8b73e77e074136ea66d085c643f29325ea2";
+const EAGLE3_SELECTIVE_EDGE_B4_PROOF_ROUNDS: u64 = 78;
+const EAGLE3_SELECTIVE_EDGE_B4_PROOF_MATCHED_ROUNDS: u64 = 73;
+const EAGLE3_SELECTIVE_EDGE_B4_PROOF_FALLBACK_ROUNDS: u64 = 5;
+const EAGLE3_SELECTIVE_EDGE_TILED_PREP_ENV: &str = "CAMELID_KQUANT_V4_TILED_PREP_FUSION";
+const EAGLE3_SELECTIVE_EDGE_TILED_PREP_CERTIFICATION_COMMIT: &str =
+    "4124bb6792f5355b1501600773fa51c09b138a1b";
+
+fn validate_eagle3_selective_edge_tiled_prep_overlay(value: Option<&str>) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        value.is_none() || value == Some("1"),
+        "selective B4 promotion admits {EAGLE3_SELECTIVE_EDGE_TILED_PREP_ENV} only as exact `1`, \
+         the bit-identical scheduling overlay certified at \
+         {EAGLE3_SELECTIVE_EDGE_TILED_PREP_CERTIFICATION_COMMIT}"
+    );
+    Ok(())
+}
+
+fn parse_eagle3_selective_edge_promotion_env(value: Option<&str>) -> anyhow::Result<bool> {
+    match value {
+        None | Some("") | Some("0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(value) => anyhow::bail!(
+            "{} must be exactly 0 or 1, got {value:?}",
+            camelid::metal::EAGLE3_SELECTIVE_EDGE_PROMOTION_ENV
+        ),
+    }
+}
+
+fn eagle3_selective_edge_promotion_enabled() -> anyhow::Result<bool> {
+    let raw = std::env::var_os(camelid::metal::EAGLE3_SELECTIVE_EDGE_PROMOTION_ENV);
+    let value = raw
+        .as_ref()
+        .map(|value| {
+            value.to_str().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{} is not valid UTF-8",
+                    camelid::metal::EAGLE3_SELECTIVE_EDGE_PROMOTION_ENV
+                )
+            })
+        })
+        .transpose()?;
+    parse_eagle3_selective_edge_promotion_env(value)
+}
+
+fn eagle3_selective_edge_promotion_receipt_path() -> anyhow::Result<Option<PathBuf>> {
+    std::env::var_os(camelid::metal::EAGLE3_SELECTIVE_EDGE_PROMOTION_RECEIPT_ENV)
+        .map(|path| {
+            anyhow::ensure!(
+                !path.is_empty(),
+                "{} cannot be empty",
+                camelid::metal::EAGLE3_SELECTIVE_EDGE_PROMOTION_RECEIPT_ENV
+            );
+            Ok(PathBuf::from(path))
+        })
+        .transpose()
+}
+
+#[derive(Debug, Deserialize)]
+struct Eagle3SelectiveEdgeB4ProofEvidence {
+    configured_path_budget: usize,
+    measured_path_budget: Option<usize>,
+    predicted_unique_edge_rows: usize,
+    authoritative_edge_rows: usize,
+    prepared_hits: usize,
+    prepared_misses: usize,
+    authoritative_path_fully_covered: bool,
+    theoretical_serial_edge_rows_displaced: usize,
+    actually_reused_edge_rows: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+enum Eagle3SelectiveEdgeB4ProofRound {
+    Matched {
+        round: u64,
+        compared_f16_values: usize,
+        evidence: Eagle3SelectiveEdgeB4ProofEvidence,
+    },
+    Mismatched {
+        round: u64,
+    },
+    Fallback {
+        round: u64,
+        reason: String,
+    },
+    SerialOracleSkipped {
+        round: u64,
+    },
+}
+
+impl Eagle3SelectiveEdgeB4ProofRound {
+    fn round(&self) -> u64 {
+        match self {
+            Self::Matched { round, .. }
+            | Self::Mismatched { round }
+            | Self::Fallback { round, .. }
+            | Self::SerialOracleSkipped { round } => *round,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct Eagle3SelectiveEdgeB4ProofReceipt {
+    commit: String,
+    binary_sha256: String,
+    workload: String,
+    input_sha256: String,
+    prompt_sha256: String,
+    prompt_tokens: usize,
+    model_sha256: String,
+    eagle3_sha256: String,
+    max_tokens: usize,
+    draft_tokens: usize,
+    tree_node_budget: usize,
+    tree_topk: usize,
+    tree_expansions: usize,
+    rounds: u64,
+    first_divergent_generated_token_index: i64,
+    lossless: bool,
+    selective_edge_prep_budget: Option<usize>,
+    selective_edge_prep_matched_rounds: Option<u64>,
+    selective_edge_prep_mismatched_rounds: Option<u64>,
+    selective_edge_prep_fallback_rounds: Option<u64>,
+    selective_edge_prep_serial_oracle_skipped_rounds: Option<u64>,
+    selective_edge_prep_round_evidence: Option<Vec<Eagle3SelectiveEdgeB4ProofRound>>,
+    effective_env: BTreeMap<String, Option<String>>,
+}
+
+#[derive(Debug, Clone)]
+struct Eagle3SelectiveEdgePromotionProof {
+    path: PathBuf,
+    receipt_sha256: String,
+    source_commit: String,
+    binary_sha256: String,
+    matched_rounds: u64,
+    fallback_rounds: u64,
+}
+
+fn validate_eagle3_selective_edge_promotion_config(
+    enabled: bool,
+    receipt_path: Option<&std::path::Path>,
+    selective_budget: Option<usize>,
+    authoritative_cb_fusion: bool,
+    terminal_head_skip: bool,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        enabled == receipt_path.is_some(),
+        "{}=1 and {}=<B4 receipt> must be supplied together",
+        camelid::metal::EAGLE3_SELECTIVE_EDGE_PROMOTION_ENV,
+        camelid::metal::EAGLE3_SELECTIVE_EDGE_PROMOTION_RECEIPT_ENV,
+    );
+    if enabled {
+        anyhow::ensure!(
+            selective_budget == Some(4),
+            "{}=1 requires {}=4; B1/B2 mismatched and B8 is diagnostic-only",
+            camelid::metal::EAGLE3_SELECTIVE_EDGE_PROMOTION_ENV,
+            camelid::metal::EAGLE3_SELECTIVE_EDGE_PREP_BUDGET_ENV,
+        );
+        anyhow::ensure!(
+            authoritative_cb_fusion,
+            "{}=1 requires authoritative command-buffer fusion",
+            camelid::metal::EAGLE3_SELECTIVE_EDGE_PROMOTION_ENV,
+        );
+        anyhow::ensure!(
+            !terminal_head_skip,
+            "{}=1 requires the terminal recurrent cell to remain authoritative",
+            camelid::metal::EAGLE3_SELECTIVE_EDGE_PROMOTION_ENV,
+        );
+    }
+    Ok(())
+}
+
+fn validate_eagle3_selective_edge_b4_proof(
+    path: &std::path::Path,
+    current_model_sha256: &str,
+    current_eagle3_sha256: &str,
+) -> anyhow::Result<Eagle3SelectiveEdgePromotionProof> {
+    // The frozen B4 receipt predates the tiled V4 preparer.  Do not weaken that receipt's
+    // arithmetic descriptor or silently treat arbitrary later gates as proven.  The sole
+    // overlay admitted here is the independently certified, bit-identical scheduling twin;
+    // exact `1` also keeps combined-run receipts unambiguous.
+    let tiled_prep_overlay = std::env::var_os(EAGLE3_SELECTIVE_EDGE_TILED_PREP_ENV);
+    let tiled_prep_overlay = tiled_prep_overlay
+        .as_ref()
+        .map(|value| {
+            value.to_str().ok_or_else(|| {
+                anyhow::anyhow!("{EAGLE3_SELECTIVE_EDGE_TILED_PREP_ENV} is not valid UTF-8")
+            })
+        })
+        .transpose()?;
+    validate_eagle3_selective_edge_tiled_prep_overlay(tiled_prep_overlay)?;
+    let receipt_sha256 = camelid::receipt::sha256_file_hex(path)
+        .with_context(|| format!("hashing selective B4 proof {}", path.display()))?;
+    anyhow::ensure!(
+        receipt_sha256 == EAGLE3_SELECTIVE_EDGE_B4_PROOF_RECEIPT_SHA256,
+        "selective B4 proof SHA-256 is {receipt_sha256}, expected {}",
+        EAGLE3_SELECTIVE_EDGE_B4_PROOF_RECEIPT_SHA256,
+    );
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("reading selective B4 proof {}", path.display()))?;
+    let proof: Eagle3SelectiveEdgeB4ProofReceipt = serde_json::from_str(raw.trim())
+        .with_context(|| format!("parsing selective B4 proof {}", path.display()))?;
+    anyhow::ensure!(
+        proof.commit == EAGLE3_SELECTIVE_EDGE_B4_PROOF_COMMIT
+            && proof.binary_sha256 == EAGLE3_SELECTIVE_EDGE_B4_PROOF_BINARY_SHA256
+            && proof.workload == "pitch-exact"
+            && proof.input_sha256 == EAGLE3_SELECTIVE_EDGE_B4_PROOF_INPUT_SHA256
+            && proof.prompt_sha256 == EAGLE3_SELECTIVE_EDGE_B4_PROOF_PROMPT_SHA256
+            && proof.prompt_tokens == 543
+            && proof.max_tokens == 256
+            && proof.draft_tokens == 15
+            && proof.tree_node_budget == camelid::metal::EAGLE3_SELECTIVE_EDGE_VERIFIER_ROWS
+            && proof.tree_topk == 4
+            && proof.tree_expansions == 5
+            && proof.rounds == EAGLE3_SELECTIVE_EDGE_B4_PROOF_ROUNDS
+            && proof.lossless
+            && proof.first_divergent_generated_token_index == -1
+            && proof.selective_edge_prep_budget == Some(4)
+            && proof.selective_edge_prep_matched_rounds
+                == Some(EAGLE3_SELECTIVE_EDGE_B4_PROOF_MATCHED_ROUNDS)
+            && proof.selective_edge_prep_mismatched_rounds == Some(0)
+            && proof.selective_edge_prep_fallback_rounds
+                == Some(EAGLE3_SELECTIVE_EDGE_B4_PROOF_FALLBACK_ROUNDS)
+            && proof.selective_edge_prep_serial_oracle_skipped_rounds == Some(0),
+        "{} is not the frozen 73-match/0-mismatch/5-fallback B4 proof",
+        path.display(),
+    );
+    anyhow::ensure!(
+        proof.model_sha256 == current_model_sha256 && proof.eagle3_sha256 == current_eagle3_sha256,
+        "selective B4 proof model/head identity does not match this run"
+    );
+
+    // Arithmetic-affecting settings must match the proof exactly. Promotion itself and its
+    // receipt path are intentionally absent from the prior shadow run.
+    const DESCRIPTOR_KEYS: &[&str] = &[
+        "CAMELID_EAGLE3_FULL_AUTHORITATIVE",
+        "CAMELID_EAGLE3_BATCH_AUTHORITATIVE_KV",
+        "CAMELID_EAGLE3_BODY_Q8",
+        "CAMELID_EAGLE3_BODY_Q4",
+        "CAMELID_KQUANT_V2",
+        "CAMELID_KQUANT_V3",
+        "CAMELID_KQUANT_V4",
+        "CAMELID_KQUANT_V4_DIRECT_FRAGMENT",
+        "CAMELID_KQUANT_V4_DIRECT_SIMDGROUP_BARRIER",
+        "CAMELID_KQUANT_V4_REGISTER_EXACT",
+        "CAMELID_KQUANT_V4_REGISTER_EXACT_V2",
+        "CAMELID_KQUANT_V4_FUSED_SEGMENTS",
+        "CAMELID_KQUANT_V4_SOA8",
+        "CAMELID_KQUANT_V4_SHARED_PREP",
+        "CAMELID_KQUANT_V4_STRICT_PREP_FUSION",
+        "CAMELID_KQUANT_MMA",
+        "CAMELID_BENCH_EAGLE3_AUTHORITATIVE_CB_FUSION",
+        "CAMELID_BENCH_EAGLE3_TARGET_ROW_LATTICE_PROMOTION",
+        "CAMELID_BENCH_EAGLE3_INDEXED_HEAD_SHADOW",
+        "CAMELID_BENCH_EAGLE3_INDEXED_HEAD_DIRECT_EMISSION",
+        camelid::metal::EAGLE3_TRANSACTION_PORTFOLIO_SHADOW_ENV,
+        camelid::metal::EAGLE3_SELECTIVE_EDGE_PREP_BUDGET_ENV,
+    ];
+    for key in DESCRIPTOR_KEYS {
+        let proven = proof.effective_env.get(*key).cloned().flatten();
+        let current = std::env::var(key).ok();
+        anyhow::ensure!(
+            proven == current,
+            "selective B4 descriptor {key} changed: proof={proven:?} current={current:?}"
+        );
+    }
+    for unproven_gate in [
+        "CAMELID_EAGLE3_AUTHORITATIVE_KV_BATCH_PROJ",
+        "CAMELID_EAGLE3_FUSED_QKV",
+    ] {
+        anyhow::ensure!(
+            std::env::var_os(unproven_gate).is_none(),
+            "selective B4 promotion does not admit unproven gate {unproven_gate}"
+        );
+    }
+
+    let rounds = proof
+        .selective_edge_prep_round_evidence
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("selective B4 proof has no per-round evidence"))?;
+    anyhow::ensure!(
+        rounds.len() == EAGLE3_SELECTIVE_EDGE_B4_PROOF_ROUNDS as usize
+            && rounds
+                .iter()
+                .enumerate()
+                .all(|(index, round)| round.round() == index as u64 + 1),
+        "selective B4 proof round evidence is incomplete or reordered"
+    );
+    let mut matched = 0u64;
+    let mut fallback = 0u64;
+    let mut prepared_edges = 0usize;
+    let mut authoritative_edges = 0usize;
+    let mut prepared_hits = 0usize;
+    let mut prepared_misses = 0usize;
+    let mut fully_covered = 0u64;
+    for round in rounds {
+        match round {
+            Eagle3SelectiveEdgeB4ProofRound::Matched {
+                compared_f16_values,
+                evidence,
+                ..
+            } => {
+                anyhow::ensure!(
+                    evidence.configured_path_budget == 4
+                        && evidence.measured_path_budget == Some(4)
+                        && (3..camelid::metal::EAGLE3_SELECTIVE_EDGE_VERIFIER_ROWS)
+                            .contains(&evidence.predicted_unique_edge_rows)
+                        && evidence.prepared_hits + evidence.prepared_misses
+                            == evidence.authoritative_edge_rows
+                        && evidence.authoritative_path_fully_covered
+                            == (evidence.prepared_misses == 0)
+                        && evidence.theoretical_serial_edge_rows_displaced
+                            == evidence.prepared_hits
+                        && evidence.actually_reused_edge_rows == 0
+                        && *compared_f16_values
+                            == evidence.prepared_hits
+                                * camelid::metal::EAGLE3_KV_HEADS
+                                * camelid::metal::EAGLE3_HEAD_DIM
+                                * 2,
+                    "selective B4 proof contains an inconsistent matched round"
+                );
+                matched += 1;
+                prepared_edges += evidence.predicted_unique_edge_rows;
+                authoritative_edges += evidence.authoritative_edge_rows;
+                prepared_hits += evidence.prepared_hits;
+                prepared_misses += evidence.prepared_misses;
+                fully_covered += u64::from(evidence.authoritative_path_fully_covered);
+            }
+            Eagle3SelectiveEdgeB4ProofRound::Fallback { reason, .. } => {
+                anyhow::ensure!(
+                    reason == "selective_portfolio_unavailable",
+                    "selective B4 proof contains an unrecognized fallback {reason:?}"
+                );
+                fallback += 1;
+            }
+            Eagle3SelectiveEdgeB4ProofRound::Mismatched { .. }
+            | Eagle3SelectiveEdgeB4ProofRound::SerialOracleSkipped { .. } => {
+                anyhow::bail!("selective B4 proof contains a mismatch or skipped oracle")
+            }
+        }
+    }
+    anyhow::ensure!(
+        matched == EAGLE3_SELECTIVE_EDGE_B4_PROOF_MATCHED_ROUNDS
+            && fallback == EAGLE3_SELECTIVE_EDGE_B4_PROOF_FALLBACK_ROUNDS
+            && prepared_edges == 319
+            && authoritative_edges == 177
+            && prepared_hits == 167
+            && prepared_misses == 10
+            && fully_covered == 65,
+        "selective B4 proof aggregate changed: matched={matched} fallback={fallback} prepared={prepared_edges} authoritative={authoritative_edges} hits={prepared_hits} misses={prepared_misses} full={fully_covered}"
+    );
+    Ok(Eagle3SelectiveEdgePromotionProof {
+        path: path.to_path_buf(),
+        receipt_sha256,
+        source_commit: proof.commit,
+        binary_sha256: proof.binary_sha256,
+        matched_rounds: matched,
+        fallback_rounds: fallback,
+    })
+}
+
+fn validate_eagle3_selective_edge_prep_config(
+    budget: Option<usize>,
+    transaction_portfolio_shadow: bool,
+    indexed_head_shadow: bool,
+    indexed_head_direct_emission: bool,
+    target_row_lattice_promotion: bool,
+    tree_nodes: Option<usize>,
+) -> anyhow::Result<()> {
+    if let Some(budget) = budget {
+        anyhow::ensure!(
+            camelid::eagle3_runtime::EAGLE3_TRANSACTION_PORTFOLIO_BUDGETS.contains(&budget),
+            "selective edge-preparation budget {budget} is not a measured portfolio width"
+        );
+        anyhow::ensure!(
+            transaction_portfolio_shadow && indexed_head_shadow && target_row_lattice_promotion,
+            "{} requires the transaction portfolio, indexed-head shadow, and target-row lattice-promotion gates",
+            camelid::metal::EAGLE3_SELECTIVE_EDGE_PREP_BUDGET_ENV
+        );
+        anyhow::ensure!(
+            !indexed_head_direct_emission,
+            "{} requires the ordinary target full-head predictions to remain authoritative",
+            camelid::metal::EAGLE3_SELECTIVE_EDGE_PREP_BUDGET_ENV
+        );
+        anyhow::ensure!(
+            tree_nodes == Some(camelid::metal::EAGLE3_SELECTIVE_EDGE_VERIFIER_ROWS),
+            "{} requires the frozen N8 verifier tree",
+            camelid::metal::EAGLE3_SELECTIVE_EDGE_PREP_BUDGET_ENV
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod eagle3_transaction_portfolio_shadow_config_tests {
+    use super::*;
+
+    #[test]
+    fn gate_is_strict_default_off_and_requires_indexed_head() {
+        assert!(!parse_eagle3_transaction_portfolio_shadow_env(None).unwrap());
+        assert!(!parse_eagle3_transaction_portfolio_shadow_env(Some("")).unwrap());
+        assert!(!parse_eagle3_transaction_portfolio_shadow_env(Some("0")).unwrap());
+        assert!(parse_eagle3_transaction_portfolio_shadow_env(Some("1")).unwrap());
+        assert!(parse_eagle3_transaction_portfolio_shadow_env(Some("true")).is_err());
+        assert!(parse_eagle3_transaction_portfolio_shadow_env(Some("01")).is_err());
+        assert!(parse_eagle3_transaction_portfolio_shadow_env(Some(" 1")).is_err());
+        assert!(validate_eagle3_transaction_portfolio_shadow_config(false, false).is_ok());
+        assert!(validate_eagle3_transaction_portfolio_shadow_config(true, true).is_ok());
+        assert!(validate_eagle3_transaction_portfolio_shadow_config(true, false).is_err());
+    }
+
+    #[test]
+    fn selective_edge_prep_gate_is_exact_default_off_and_requires_the_frozen_n8_lane() {
+        assert_eq!(
+            parse_eagle3_selective_edge_prep_budget_env(None).unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_eagle3_selective_edge_prep_budget_env(Some("")).unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_eagle3_selective_edge_prep_budget_env(Some("0")).unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_eagle3_selective_edge_prep_budget_env(Some("1")).unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            parse_eagle3_selective_edge_prep_budget_env(Some("2")).unwrap(),
+            Some(2)
+        );
+        assert_eq!(
+            parse_eagle3_selective_edge_prep_budget_env(Some("4")).unwrap(),
+            Some(4)
+        );
+        assert_eq!(
+            parse_eagle3_selective_edge_prep_budget_env(Some("8")).unwrap(),
+            Some(8)
+        );
+        assert!(parse_eagle3_selective_edge_prep_budget_env(Some("true")).is_err());
+        assert!(parse_eagle3_selective_edge_prep_budget_env(Some(" 4")).is_err());
+        assert!(!parse_eagle3_selective_edge_promotion_env(None).unwrap());
+        assert!(!parse_eagle3_selective_edge_promotion_env(Some("")).unwrap());
+        assert!(!parse_eagle3_selective_edge_promotion_env(Some("0")).unwrap());
+        assert!(parse_eagle3_selective_edge_promotion_env(Some("1")).unwrap());
+        assert!(parse_eagle3_selective_edge_promotion_env(Some("true")).is_err());
+        assert!(validate_eagle3_selective_edge_tiled_prep_overlay(None).is_ok());
+        assert!(validate_eagle3_selective_edge_tiled_prep_overlay(Some("1")).is_ok());
+        for value in ["", "0", "true", "TRUE", "01", " 1"] {
+            assert!(
+                validate_eagle3_selective_edge_tiled_prep_overlay(Some(value)).is_err(),
+                "unexpectedly admitted tiled-prep overlay {value:?}"
+            );
+        }
+        let proof = std::path::Path::new("b4-zero-mismatch.json");
+        assert!(
+            validate_eagle3_selective_edge_promotion_config(false, None, None, false, false)
+                .is_ok()
+        );
+        assert!(validate_eagle3_selective_edge_promotion_config(
+            true,
+            Some(proof),
+            Some(4),
+            true,
+            false,
+        )
+        .is_ok());
+        for invalid_budget in [None, Some(1), Some(2), Some(8)] {
+            assert!(validate_eagle3_selective_edge_promotion_config(
+                true,
+                Some(proof),
+                invalid_budget,
+                true,
+                false,
+            )
+            .is_err());
+        }
+        assert!(
+            validate_eagle3_selective_edge_promotion_config(true, None, Some(4), true, false,)
+                .is_err()
+        );
+        assert!(validate_eagle3_selective_edge_promotion_config(
+            true,
+            Some(proof),
+            Some(4),
+            false,
+            false,
+        )
+        .is_err());
+        assert!(validate_eagle3_selective_edge_promotion_config(
+            true,
+            Some(proof),
+            Some(4),
+            true,
+            true,
+        )
+        .is_err());
+        assert!(validate_eagle3_selective_edge_prep_config(
+            Some(4),
+            true,
+            true,
+            false,
+            true,
+            Some(8)
+        )
+        .is_ok());
+        assert!(validate_eagle3_selective_edge_prep_config(
+            Some(4),
+            false,
+            true,
+            false,
+            true,
+            Some(8)
+        )
+        .is_err());
+        assert!(validate_eagle3_selective_edge_prep_config(
+            Some(4),
+            true,
+            true,
+            false,
+            true,
+            Some(7)
+        )
+        .is_err());
+        assert!(validate_eagle3_selective_edge_prep_config(
+            Some(4),
+            true,
+            true,
+            true,
+            true,
+            Some(8)
+        )
+        .is_err());
+
+        // Exercise the surrounding validators as one configuration, so this experiment cannot
+        // accidentally depend on mutually-exclusive campaign lanes.
+        assert!(validate_eagle3_argmax_shadow_config(
+            true,
+            true,
+            false,
+            true,
+            Some(8),
+            8,
+            camelid::metal::EAGLE3_TOP_K_CANDIDATES,
+            0,
+            0,
+        )
+        .is_ok());
+        assert!(validate_eagle3_target_row_lattice_promotion_config(
+            true,
+            false,
+            Some(8),
+            2,
+            2,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        )
+        .is_ok());
+    }
+}
+
+fn parse_eagle3_indexed_head_target_top8_history_rounds_env(
+    value: Option<&str>,
+) -> anyhow::Result<usize> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(0);
+    };
+    let rounds = value.parse::<usize>().map_err(|error| {
+        anyhow::anyhow!(
+            "CAMELID_BENCH_EAGLE3_INDEXED_HEAD_TARGET_TOP8_HISTORY_ROUNDS must be 0, 1, 2, 4, or 8: {error}"
+        )
+    })?;
+    anyhow::ensure!(
+        matches!(rounds, 0 | 1 | 2 | 4 | 8),
+        "CAMELID_BENCH_EAGLE3_INDEXED_HEAD_TARGET_TOP8_HISTORY_ROUNDS must be 0, 1, 2, 4, or 8, got {rounds}"
+    );
+    Ok(rounds)
+}
+
+fn eagle3_indexed_head_target_top8_history_rounds() -> anyhow::Result<usize> {
+    let raw = std::env::var_os("CAMELID_BENCH_EAGLE3_INDEXED_HEAD_TARGET_TOP8_HISTORY_ROUNDS");
+    let value = raw
+        .as_ref()
+        .map(|value| {
+            value.to_str().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "CAMELID_BENCH_EAGLE3_INDEXED_HEAD_TARGET_TOP8_HISTORY_ROUNDS is not valid UTF-8"
+                )
+            })
+        })
+        .transpose()?;
+    parse_eagle3_indexed_head_target_top8_history_rounds_env(value)
+}
+
+fn parse_eagle3_indexed_head_candidate_recency_rounds_env(
+    value: Option<&str>,
+) -> anyhow::Result<usize> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(0);
+    };
+    let rounds = value.parse::<usize>().map_err(|error| {
+        anyhow::anyhow!(
+            "CAMELID_BENCH_EAGLE3_INDEXED_HEAD_CANDIDATE_RECENCY_ROUNDS must be 0, 1, 2, 3, or 4: {error}"
+        )
+    })?;
+    anyhow::ensure!(
+        matches!(rounds, 0 | 1 | 2 | 3 | 4),
+        "CAMELID_BENCH_EAGLE3_INDEXED_HEAD_CANDIDATE_RECENCY_ROUNDS must be 0, 1, 2, 3, or 4, got {rounds}"
+    );
+    Ok(rounds)
+}
+
+fn eagle3_indexed_head_candidate_recency_rounds() -> anyhow::Result<usize> {
+    let raw = std::env::var_os("CAMELID_BENCH_EAGLE3_INDEXED_HEAD_CANDIDATE_RECENCY_ROUNDS");
+    let value = raw
+        .as_ref()
+        .map(|value| {
+            value.to_str().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "CAMELID_BENCH_EAGLE3_INDEXED_HEAD_CANDIDATE_RECENCY_ROUNDS is not valid UTF-8"
+                )
+            })
+        })
+        .transpose()?;
+    parse_eagle3_indexed_head_candidate_recency_rounds_env(value)
+}
+
+fn validate_eagle3_argmax_shadow_config(
+    certified_argmax_shadow: bool,
+    indexed_head_shadow: bool,
+    indexed_head_direct_emission: bool,
+    target_row_lattice_promotion: bool,
+    tree_nodes: Option<usize>,
+    tree_expansions: usize,
+    candidate_limit: usize,
+    target_top8_history_rounds: usize,
+    candidate_recency_rounds: usize,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !indexed_head_shadow || certified_argmax_shadow,
+        "CAMELID_BENCH_EAGLE3_INDEXED_HEAD_SHADOW requires CAMELID_BENCH_EAGLE3_CERTIFIED_ARGMAX_SHADOW=1"
+    );
+    anyhow::ensure!(
+        !indexed_head_direct_emission || indexed_head_shadow,
+        "CAMELID_BENCH_EAGLE3_INDEXED_HEAD_DIRECT_EMISSION requires CAMELID_BENCH_EAGLE3_INDEXED_HEAD_SHADOW=1"
+    );
+    anyhow::ensure!(
+        !certified_argmax_shadow
+            || (target_row_lattice_promotion
+                && tree_nodes
+                    == Some(camelid::inference::target_row_hedge::TARGET_ROW_HEDGE_MAX_NODES)),
+        "EAGLE-3 argmax shadow requires the fixed N8 target-row lattice benchmark"
+    );
+    anyhow::ensure!(
+        certified_argmax_shadow || candidate_limit == camelid::metal::EAGLE3_TOP_K_CANDIDATES,
+        "CAMELID_BENCH_EAGLE3_ARGMAX_SHADOW_CANDIDATES requires CAMELID_BENCH_EAGLE3_CERTIFIED_ARGMAX_SHADOW=1"
+    );
+    anyhow::ensure!(
+        target_top8_history_rounds == 0 || indexed_head_shadow,
+        "CAMELID_BENCH_EAGLE3_INDEXED_HEAD_TARGET_TOP8_HISTORY_ROUNDS requires CAMELID_BENCH_EAGLE3_INDEXED_HEAD_SHADOW=1"
+    );
+    anyhow::ensure!(
+        candidate_recency_rounds == 0
+            || (indexed_head_shadow && target_top8_history_rounds > 0),
+        "CAMELID_BENCH_EAGLE3_INDEXED_HEAD_CANDIDATE_RECENCY_ROUNDS requires indexed-head shadow and non-zero target-top-8 history"
+    );
+    let maximum_history_candidates = target_top8_history_rounds
+        .checked_mul(camelid::inference::target_row_hedge::TARGET_ROW_HEDGE_MAX_NODES)
+        .and_then(|rows| rows.checked_mul(camelid::metal::RESIDENT_VERIFY_TARGET_TOP_K))
+        .ok_or_else(|| anyhow::anyhow!("indexed-head target-top-8 history bound overflow"))?;
+    anyhow::ensure!(
+        !indexed_head_shadow
+            || candidate_limit
+                .checked_mul(tree_expansions)
+                .and_then(|draft_candidates| draft_candidates.checked_add(maximum_history_candidates))
+                .is_some_and(|maximum_union| {
+                    maximum_union
+                        <= camelid::metal::RESIDENT_INDEXED_HEAD_SHADOW_MAX_CANDIDATES
+                }),
+        "indexed-head shadow maximum candidate union (width {candidate_limit} x {tree_expansions} expansions + {target_top8_history_rounds} x {} rows x top-{}) exceeds the diagnostic cap {}",
+        camelid::inference::target_row_hedge::TARGET_ROW_HEDGE_MAX_NODES,
+        camelid::metal::RESIDENT_VERIFY_TARGET_TOP_K,
+        camelid::metal::RESIDENT_INDEXED_HEAD_SHADOW_MAX_CANDIDATES,
+    );
+    Ok(())
+}
+
+fn parse_eagle3_target_row_lattice_prior_log_bonus_env(
+    value: Option<&str>,
+) -> anyhow::Result<Option<f32>> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let bonus = value.parse::<f32>().map_err(|error| {
+        anyhow::anyhow!(
+            "CAMELID_BENCH_EAGLE3_TARGET_ROW_LATTICE_PRIOR_LOG_BONUS must be a number: {error}"
+        )
+    })?;
+    let maximum = camelid::inference::target_row_hedge::TARGET_ROW_LATTICE_MAX_PRIOR_LOG_BONUS;
+    anyhow::ensure!(
+        bonus.is_finite() && (0.0..=maximum).contains(&bonus),
+        "CAMELID_BENCH_EAGLE3_TARGET_ROW_LATTICE_PRIOR_LOG_BONUS must be finite and in 0..={}, got {value:?}",
+        maximum,
+    );
+    Ok(Some(bonus))
+}
+
+fn eagle3_target_row_lattice_prior_log_bonus_override() -> anyhow::Result<Option<f32>> {
+    let raw = std::env::var_os("CAMELID_BENCH_EAGLE3_TARGET_ROW_LATTICE_PRIOR_LOG_BONUS");
+    let value = raw
+        .as_ref()
+        .map(|value| {
+            value.to_str().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "CAMELID_BENCH_EAGLE3_TARGET_ROW_LATTICE_PRIOR_LOG_BONUS is not valid UTF-8"
+                )
+            })
+        })
+        .transpose()?;
+    parse_eagle3_target_row_lattice_prior_log_bonus_env(value)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_eagle3_target_row_hedge_config(
+    enabled: bool,
+    tree_nodes: Option<usize>,
+    draft_tokens: usize,
+    tree_topk: usize,
+    adaptive_branching: bool,
+    adaptive_expansions: bool,
+    suffix_first: bool,
+    token_recycling_hybrid: bool,
+    dual_eagle_selector: bool,
+    verifier_width_selector: bool,
+    x3_x4_selector: bool,
+) -> anyhow::Result<()> {
+    if !enabled {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        tree_nodes == Some(camelid::inference::target_row_hedge::TARGET_ROW_HEDGE_MAX_NODES),
+        "CAMELID_BENCH_EAGLE3_TARGET_ROW_HEDGE requires --tree-nodes {}",
+        camelid::inference::target_row_hedge::TARGET_ROW_HEDGE_MAX_NODES,
+    );
+    anyhow::ensure!(
+        draft_tokens >= 2,
+        "CAMELID_BENCH_EAGLE3_TARGET_ROW_HEDGE requires --draft-tokens >= 2"
+    );
+    anyhow::ensure!(
+        tree_topk >= 2,
+        "CAMELID_BENCH_EAGLE3_TARGET_ROW_HEDGE requires --tree-topk >= 2 so a neural hedge is available"
+    );
+    anyhow::ensure!(
+        !adaptive_branching
+            && !adaptive_expansions
+            && !suffix_first
+            && !token_recycling_hybrid
+            && !dual_eagle_selector
+            && !verifier_width_selector
+            && !x3_x4_selector,
+        "CAMELID_BENCH_EAGLE3_TARGET_ROW_HEDGE requires fixed ordinary N8 EAGLE drafting and cannot combine with adaptive branching/expansions, suffix-first, whole-tree Token Recycling, dual-EAGLE, width selection, or X3/X4 selection"
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_eagle3_target_row_lattice_promotion_config(
+    enabled: bool,
+    target_row_hedge: bool,
+    tree_nodes: Option<usize>,
+    draft_tokens: usize,
+    tree_topk: usize,
+    adaptive_branching: bool,
+    adaptive_expansions: bool,
+    suffix_first: bool,
+    token_recycling_hybrid: bool,
+    dual_eagle_selector: bool,
+    verifier_width_selector: bool,
+    x3_x4_selector: bool,
+) -> anyhow::Result<()> {
+    if !enabled {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        !target_row_hedge,
+        "CAMELID_BENCH_EAGLE3_TARGET_ROW_LATTICE_PROMOTION cannot combine with CAMELID_BENCH_EAGLE3_TARGET_ROW_HEDGE"
+    );
+    anyhow::ensure!(
+        tree_nodes == Some(camelid::inference::target_row_hedge::TARGET_ROW_HEDGE_MAX_NODES),
+        "CAMELID_BENCH_EAGLE3_TARGET_ROW_LATTICE_PROMOTION requires --tree-nodes {}",
+        camelid::inference::target_row_hedge::TARGET_ROW_HEDGE_MAX_NODES,
+    );
+    anyhow::ensure!(
+        draft_tokens >= 2,
+        "CAMELID_BENCH_EAGLE3_TARGET_ROW_LATTICE_PROMOTION requires --draft-tokens >= 2"
+    );
+    anyhow::ensure!(
+        tree_topk >= 2,
+        "CAMELID_BENCH_EAGLE3_TARGET_ROW_LATTICE_PROMOTION requires --tree-topk >= 2 so a neural hedge is available"
+    );
+    anyhow::ensure!(
+        !adaptive_branching
+            && !adaptive_expansions
+            && !suffix_first
+            && !token_recycling_hybrid
+            && !dual_eagle_selector
+            && !verifier_width_selector
+            && !x3_x4_selector,
+        "CAMELID_BENCH_EAGLE3_TARGET_ROW_LATTICE_PROMOTION requires fixed ordinary N8 EAGLE drafting and cannot combine with adaptive branching/expansions, suffix-first, whole-tree Token Recycling, dual-EAGLE, width selection, or X3/X4 selection"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn eagle3_target_row_hedge_gate_is_default_off_and_fixed_n8() {
+    for value in [None, Some(""), Some("0"), Some("false"), Some("OFF")] {
+        assert!(!parse_eagle3_target_row_hedge_env(value).unwrap());
+    }
+    for value in [Some("1"), Some("true"), Some("ON"), Some("enabled")] {
+        assert!(parse_eagle3_target_row_hedge_env(value).unwrap());
+    }
+    assert!(parse_eagle3_target_row_hedge_env(Some("maybe")).is_err());
+    assert!(validate_eagle3_target_row_hedge_config(
+        true,
+        Some(8),
+        15,
+        4,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+    )
+    .is_ok());
+    for invalid in [
+        (
+            Some(7),
+            15,
+            4,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        ),
+        (
+            Some(8),
+            1,
+            4,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        ),
+        (
+            Some(8),
+            15,
+            1,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        ),
+        (
+            Some(8),
+            15,
+            4,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        ),
+        (
+            Some(8),
+            15,
+            4,
+            false,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+        ),
+        (
+            Some(8),
+            15,
+            4,
+            false,
+            false,
+            true,
+            false,
+            false,
+            false,
+            false,
+        ),
+        (
+            Some(8),
+            15,
+            4,
+            false,
+            false,
+            false,
+            true,
+            false,
+            false,
+            false,
+        ),
+        (
+            Some(8),
+            15,
+            4,
+            false,
+            false,
+            false,
+            false,
+            true,
+            false,
+            false,
+        ),
+        (
+            Some(8),
+            15,
+            4,
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            false,
+        ),
+        (
+            Some(8),
+            15,
+            4,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+        ),
+    ] {
+        assert!(validate_eagle3_target_row_hedge_config(
+            true, invalid.0, invalid.1, invalid.2, invalid.3, invalid.4, invalid.5, invalid.6,
+            invalid.7, invalid.8, invalid.9,
+        )
+        .is_err());
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn eagle3_target_row_lattice_promotion_gate_is_default_off_and_exclusive() {
+    for value in [None, Some(""), Some("0"), Some("false"), Some("OFF")] {
+        assert!(!parse_eagle3_target_row_lattice_promotion_env(value).unwrap());
+    }
+    for value in [Some("1"), Some("true"), Some("ON"), Some("enabled")] {
+        assert!(parse_eagle3_target_row_lattice_promotion_env(value).unwrap());
+    }
+    assert!(parse_eagle3_target_row_lattice_promotion_env(Some("maybe")).is_err());
+    for value in [None, Some(""), Some("   ")] {
+        assert_eq!(
+            parse_eagle3_target_row_lattice_prior_log_bonus_env(value).unwrap(),
+            None
+        );
+    }
+    for (value, expected) in [
+        ("0", 0.0),
+        ("0.6931472", std::f32::consts::LN_2),
+        ("16", 16.0),
+    ] {
+        assert_eq!(
+            parse_eagle3_target_row_lattice_prior_log_bonus_env(Some(value)).unwrap(),
+            Some(expected)
+        );
+    }
+    for value in ["-0.1", "16.0001", "NaN", "inf", "not-a-number"] {
+        assert!(parse_eagle3_target_row_lattice_prior_log_bonus_env(Some(value)).is_err());
+    }
+    assert!(validate_eagle3_target_row_lattice_promotion_config(
+        true,
+        false,
+        Some(8),
+        15,
+        4,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+    )
+    .is_ok());
+    assert!(validate_eagle3_target_row_lattice_promotion_config(
+        true,
+        true,
+        Some(8),
+        15,
+        4,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+    )
+    .is_err());
+    assert!(validate_eagle3_target_row_lattice_promotion_config(
+        true,
+        false,
+        Some(8),
+        15,
+        1,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+    )
+    .is_err());
+}
+
+#[cfg(test)]
+#[test]
+fn eagle3_argmax_shadow_gates_are_default_off_and_fail_closed() {
+    for value in [None, Some(""), Some("0"), Some("false"), Some("OFF")] {
+        assert!(!parse_eagle3_argmax_shadow_env("TEST_GATE", value).unwrap());
+    }
+    for value in [Some("1"), Some("true"), Some("ON"), Some("enabled")] {
+        assert!(parse_eagle3_argmax_shadow_env("TEST_GATE", value).unwrap());
+    }
+    assert!(parse_eagle3_argmax_shadow_env("TEST_GATE", Some("maybe")).is_err());
+    assert!(
+        validate_eagle3_argmax_shadow_config(true, true, true, true, Some(8), 4, 128, 8, 2).is_ok()
+    );
+    assert!(
+        validate_eagle3_argmax_shadow_config(false, true, false, true, Some(8), 4, 8, 0, 0)
+            .is_err()
+    );
+    assert!(
+        validate_eagle3_argmax_shadow_config(true, false, false, false, Some(8), 4, 8, 0, 0)
+            .is_err()
+    );
+    assert!(
+        validate_eagle3_argmax_shadow_config(true, false, false, true, Some(7), 4, 8, 0, 0)
+            .is_err()
+    );
+    assert!(
+        validate_eagle3_argmax_shadow_config(false, false, false, false, None, 4, 16, 0, 0)
+            .is_err()
+    );
+    assert!(
+        validate_eagle3_argmax_shadow_config(true, true, false, true, Some(8), 4, 256, 1, 0)
+            .is_err()
+    );
+    assert!(
+        validate_eagle3_argmax_shadow_config(true, false, false, true, Some(8), 4, 8, 1, 0)
+            .is_err()
+    );
+    assert!(
+        validate_eagle3_argmax_shadow_config(true, true, false, true, Some(8), 4, 8, 0, 2).is_err()
+    );
+    assert!(
+        validate_eagle3_argmax_shadow_config(true, false, true, true, Some(8), 4, 8, 0, 0).is_err()
+    );
+    assert!(
+        validate_eagle3_argmax_shadow_config(false, false, false, false, None, 4, 8, 0, 0).is_ok()
+    );
+
+    for value in [None, Some(""), Some("0")] {
+        assert_eq!(
+            parse_eagle3_indexed_head_target_top8_history_rounds_env(value).unwrap(),
+            0
+        );
+    }
+    for rounds in [1, 2, 4, 8] {
+        assert_eq!(
+            parse_eagle3_indexed_head_target_top8_history_rounds_env(Some(&rounds.to_string()))
+                .unwrap(),
+            rounds
+        );
+    }
+    assert!(parse_eagle3_indexed_head_target_top8_history_rounds_env(Some("3")).is_err());
+    assert!(parse_eagle3_indexed_head_target_top8_history_rounds_env(Some("many")).is_err());
+    for rounds in [0, 1, 2, 3, 4] {
+        assert_eq!(
+            parse_eagle3_indexed_head_candidate_recency_rounds_env(Some(&rounds.to_string()))
+                .unwrap(),
+            rounds
+        );
+    }
+    assert!(parse_eagle3_indexed_head_candidate_recency_rounds_env(Some("5")).is_err());
+}
+
+#[cfg(test)]
+#[test]
+fn indexed_head_target_top8_history_is_causal_bounded_and_deterministic() {
+    let mut history = Eagle3IndexedHeadTargetTop8History::new(2, 2).unwrap();
+    let cold = history.merge_with_draft(&[3, 7]).unwrap();
+    assert_eq!(cold.candidate_ids, vec![3, 7]);
+    assert_eq!(cold.causal_target_top8_history_rounds_available, 0);
+    assert_eq!(cold.causal_target_top8_candidate_additions, 0);
+
+    let first = [[10, 11, 12, 13, 14, 15, 16, 17]];
+    assert!(!cold.candidate_ids.contains(&10));
+    history
+        .publish(&[10], &first, &cold.base_candidate_ids)
+        .unwrap();
+    let next = history.merge_with_draft(&[20, 21]).unwrap();
+    assert_eq!(
+        next.candidate_ids,
+        vec![3, 7, 10, 11, 12, 13, 14, 15, 16, 17, 20, 21]
+    );
+    assert_eq!(next.causal_target_top8_history_rounds_available, 1);
+    assert_eq!(next.causal_target_top8_candidate_additions, 8);
+    assert_eq!(next.causal_candidate_recency_additions, 2);
+
+    history
+        .publish(
+            &[20],
+            &[[20, 21, 22, 23, 24, 25, 26, 27]],
+            &next.base_candidate_ids,
+        )
+        .unwrap();
+    let third = history.merge_with_draft(&[30, 31]).unwrap();
+    history
+        .publish(
+            &[30],
+            &[[30, 31, 32, 33, 34, 35, 36, 37]],
+            &third.base_candidate_ids,
+        )
+        .unwrap();
+    let bounded = history.merge_with_draft(&[3, 7]).unwrap();
+    assert!(!bounded.base_candidate_ids.contains(&10));
+    assert!(bounded.candidate_ids.contains(&10));
+    assert!(bounded.candidate_ids.contains(&20));
+    assert!(bounded.candidate_ids.contains(&30));
+    assert_eq!(bounded.causal_target_top8_history_rounds_available, 2);
+    assert_eq!(bounded.causal_candidate_recency_rounds_available, 2);
+    assert!(history
+        .publish(
+            &[99],
+            &[[98, 99, 1, 2, 3, 4, 5, 6]],
+            &bounded.base_candidate_ids,
+        )
+        .is_err());
+}
+
+#[cfg(test)]
+#[test]
+fn indexed_head_receipt_preserves_exact_bits_timing_and_compile_identity() {
+    let shadow = camelid::metal::ResidentIndexedHeadShadow {
+        compile_fast_math_enabled: false,
+        candidate_union: vec![3, 7],
+        candidate_tile_rows: 16,
+        candidate_weight_bytes: 4_096,
+        output_weight_format: "Q6_K",
+        encode_us: 11,
+        commit_wait_us: 22,
+        gpu_busy_us: 19,
+        kernel_window_us: 20,
+        fallback_reason: None,
+        rows: vec![camelid::metal::ResidentIndexedHeadShadowRow {
+            verifier_row: 0,
+            candidate_top1_token: Some(7),
+            candidate_top1_logit_bits: Some(2.0f32.to_bits()),
+            authoritative_argmax_token: 7,
+            authoritative_argmax_logit_bits: Some(2.0f32.to_bits()),
+            top1_matches_authoritative: true,
+            compared_logits: 2,
+            exact_logit_agreements: 2,
+            all_candidate_logits_exact: true,
+            first_logit_mismatch: None,
+        }],
+        early_layer25: None,
+    };
+    let receipt = eagle3_indexed_head_shadow_receipt(&[3, 7], &[7], &shadow, false, 0, 0).unwrap();
+    assert!(!receipt.metal_fast_math_enabled);
+    assert!(!receipt.authorizes_token_emission);
+    assert_eq!(receipt.compared_logits, 2);
+    assert_eq!(receipt.exact_logit_agreements, 2);
+    assert_eq!(receipt.kernel_window_us, 20);
+    assert_eq!(receipt.candidate_top1_matches, 1);
+
+    let direct =
+        eagle3_indexed_head_direct_emission_predictions(true, &[7], Some(&shadow)).unwrap();
+    assert_eq!(direct.predictions, vec![7]);
+    assert_eq!(direct.direct_emission_rows, 1);
+    assert_eq!(direct.full_head_fallback_rows, 0);
+    let direct_receipt =
+        eagle3_indexed_head_shadow_receipt(&[3, 7], &[7], &shadow, true, 1, 0).unwrap();
+    assert!(direct_receipt.authorizes_token_emission);
+
+    let mut miss = shadow.clone();
+    miss.rows[0].authoritative_argmax_token = 9;
+    miss.rows[0].authoritative_argmax_logit_bits = None;
+    miss.rows[0].top1_matches_authoritative = false;
+    let fallback =
+        eagle3_indexed_head_direct_emission_predictions(true, &[9], Some(&miss)).unwrap();
+    assert_eq!(fallback.predictions, vec![9]);
+    assert_eq!(fallback.direct_emission_rows, 0);
+    assert_eq!(fallback.full_head_fallback_rows, 1);
+
+    let mut malformed = shadow;
+    malformed.rows[0].exact_logit_agreements = 1;
+    assert!(eagle3_indexed_head_shadow_receipt(&[3, 7], &[7], &malformed, false, 0, 0).is_err());
+    assert!(eagle3_indexed_head_direct_emission_predictions(true, &[7], Some(&malformed)).is_err());
+}
+
+fn eagle3_adaptive_expansions_enabled() -> bool {
+    std::env::var_os("CAMELID_BENCH_EAGLE3_ADAPTIVE_EXPANSIONS")
+        .is_some_and(|value| !value.is_empty() && value != "0")
+}
+
+fn parse_eagle3_width_selector_env(
+    enabled: Option<&str>,
+    n5_total_ms: Option<&str>,
+    n6_total_ms: Option<&str>,
+) -> anyhow::Result<Option<Eagle3VerifierWidthSelectorConfig>> {
+    let enabled = match enabled
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        None | Some("") | Some("0") | Some("false") | Some("off") | Some("no")
+        | Some("disabled") => false,
+        Some("1") | Some("true") | Some("on") | Some("yes") | Some("enabled") => true,
+        Some(value) => {
+            anyhow::bail!("CAMELID_BENCH_EAGLE3_WIDTH_SELECTOR must be a boolean, got {value:?}")
+        }
+    };
+    if !enabled {
+        return Ok(None);
+    }
+
+    fn total_ms(name: &str, value: Option<&str>, default: f64) -> anyhow::Result<f64> {
+        let value = match value.map(str::trim) {
+            None | Some("") => default,
+            Some(value) => value
+                .parse::<f64>()
+                .map_err(|error| anyhow::anyhow!("{name} must be a number: {error}"))?,
+        };
+        anyhow::ensure!(
+            value.is_finite() && value > 0.0,
+            "{name} must be finite and positive, got {value}"
+        );
+        Ok(value)
+    }
+
+    Ok(Some(Eagle3VerifierWidthSelectorConfig {
+        n5_total_ms: total_ms(
+            "CAMELID_BENCH_EAGLE3_WIDTH5_TOTAL_MS",
+            n5_total_ms,
+            EAGLE3_WIDTH_SELECTOR_DEFAULT_N5_TOTAL_MS,
+        )?,
+        n6_total_ms: total_ms(
+            "CAMELID_BENCH_EAGLE3_WIDTH6_TOTAL_MS",
+            n6_total_ms,
+            EAGLE3_WIDTH_SELECTOR_DEFAULT_N6_TOTAL_MS,
+        )?,
+    }))
+}
+
+fn eagle3_width_selector_config() -> anyhow::Result<Option<Eagle3VerifierWidthSelectorConfig>> {
+    let read_utf8 = |name: &str| -> anyhow::Result<Option<String>> {
+        std::env::var_os(name)
+            .map(|value| {
+                value
+                    .into_string()
+                    .map_err(|_| anyhow::anyhow!("{name} is not valid UTF-8"))
+            })
+            .transpose()
+    };
+    let enabled = read_utf8("CAMELID_BENCH_EAGLE3_WIDTH_SELECTOR")?;
+    let n5_total_ms = read_utf8("CAMELID_BENCH_EAGLE3_WIDTH5_TOTAL_MS")?;
+    let n6_total_ms = read_utf8("CAMELID_BENCH_EAGLE3_WIDTH6_TOTAL_MS")?;
+    parse_eagle3_width_selector_env(
+        enabled.as_deref(),
+        n5_total_ms.as_deref(),
+        n6_total_ms.as_deref(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_eagle3_width_selector_config(
+    config: Option<Eagle3VerifierWidthSelectorConfig>,
+    tree_nodes: Option<usize>,
+    adaptive_expansions: bool,
+    suffix_first: bool,
+    token_recycling_hybrid: bool,
+    dual_eagle_selector: bool,
+) -> anyhow::Result<()> {
+    if config.is_none() {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        tree_nodes == Some(EAGLE3_WIDTH_SELECTOR_WIDE_NODES),
+        "CAMELID_BENCH_EAGLE3_WIDTH_SELECTOR requires --tree-nodes {EAGLE3_WIDTH_SELECTOR_WIDE_NODES}"
+    );
+    anyhow::ensure!(
+        !adaptive_expansions && !suffix_first && !token_recycling_hybrid && !dual_eagle_selector,
+        "CAMELID_BENCH_EAGLE3_WIDTH_SELECTOR cannot be combined with adaptive expansions, suffix-first, Token Recycling, or dual-EAGLE selection"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod eagle3_width_selector_tests {
+    use super::*;
+
+    #[test]
+    fn gate_and_costs_are_strict_with_receipted_defaults() {
+        assert_eq!(
+            parse_eagle3_width_selector_env(None, None, None).unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_eagle3_width_selector_env(Some("off"), Some("bad"), Some("bad")).unwrap(),
+            None
+        );
+        let defaults = parse_eagle3_width_selector_env(Some("ON"), None, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            defaults,
+            Eagle3VerifierWidthSelectorConfig {
+                n5_total_ms: EAGLE3_WIDTH_SELECTOR_DEFAULT_N5_TOTAL_MS,
+                n6_total_ms: EAGLE3_WIDTH_SELECTOR_DEFAULT_N6_TOTAL_MS,
+            }
+        );
+        let custom = parse_eagle3_width_selector_env(Some("1"), Some("54.0"), Some("55.0"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(custom.n5_total_ms, 54.0);
+        assert_eq!(custom.n6_total_ms, 55.0);
+        assert!(parse_eagle3_width_selector_env(Some("maybe"), None, None).is_err());
+        assert!(parse_eagle3_width_selector_env(Some("1"), Some("0"), None).is_err());
+        assert!(parse_eagle3_width_selector_env(Some("1"), None, Some("NaN")).is_err());
+    }
+
+    #[test]
+    fn benchmark_gate_is_isolated_to_plain_n6_dynamic_tree() {
+        let config = Some(Eagle3VerifierWidthSelectorConfig {
+            n5_total_ms: 54.0,
+            n6_total_ms: 55.0,
+        });
+        assert!(
+            validate_eagle3_width_selector_config(config, Some(6), false, false, false, false)
+                .is_ok()
+        );
+        assert!(
+            validate_eagle3_width_selector_config(config, Some(5), false, false, false, false)
+                .is_err()
+        );
+        assert!(
+            validate_eagle3_width_selector_config(config, Some(6), true, false, false, false)
+                .is_err()
+        );
+        assert!(
+            validate_eagle3_width_selector_config(config, Some(6), false, false, false, true)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn telemetry_counts_only_valid_n5_n6_decisions() {
+        let mut telemetry = Eagle3VerifierWidthTelemetry::default();
+        telemetry.note(5).unwrap();
+        telemetry.note(6).unwrap();
+        telemetry.note(5).unwrap();
+        assert_eq!(
+            telemetry,
+            Eagle3VerifierWidthTelemetry {
+                decisions: 3,
+                n5_rounds: 2,
+                n6_rounds: 1,
+            }
+        );
+        let before = telemetry;
+        assert!(telemetry.note(4).is_err());
+        assert_eq!(telemetry, before);
+    }
+}
+
+fn parse_eagle3_x3_x4_selector_env(
+    enabled: Option<&str>,
+    x4_min_next_parent_probability: Option<&str>,
+) -> anyhow::Result<Option<Eagle3X3X4SelectorConfig>> {
+    let enabled = match enabled
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        None | Some("") | Some("0") | Some("false") | Some("off") | Some("no")
+        | Some("disabled") => false,
+        Some("1") | Some("true") | Some("on") | Some("yes") | Some("enabled") => true,
+        Some(value) => {
+            anyhow::bail!("CAMELID_BENCH_EAGLE3_X3_X4_SELECTOR must be a boolean, got {value:?}")
+        }
+    };
+    if !enabled {
+        return Ok(None);
+    }
+
+    let raw_threshold = x4_min_next_parent_probability
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "CAMELID_BENCH_EAGLE3_X3_X4_SELECTOR requires CAMELID_BENCH_EAGLE3_X4_MIN_NEXT_PARENT_PROB"
+            )
+        })?;
+    let threshold = raw_threshold.parse::<f64>().map_err(|error| {
+        anyhow::anyhow!("CAMELID_BENCH_EAGLE3_X4_MIN_NEXT_PARENT_PROB must be a number: {error}")
+    })?;
+    anyhow::ensure!(
+        threshold.is_finite() && (0.0..=1.0).contains(&threshold),
+        "CAMELID_BENCH_EAGLE3_X4_MIN_NEXT_PARENT_PROB must be finite and in 0..=1, got {threshold}"
+    );
+    Ok(Some(Eagle3X3X4SelectorConfig {
+        x4_min_next_parent_probability: threshold,
+    }))
+}
+
+fn eagle3_x3_x4_selector_config() -> anyhow::Result<Option<Eagle3X3X4SelectorConfig>> {
+    let read_utf8 = |name: &str| -> anyhow::Result<Option<String>> {
+        std::env::var_os(name)
+            .map(|value| {
+                value
+                    .into_string()
+                    .map_err(|_| anyhow::anyhow!("{name} is not valid UTF-8"))
+            })
+            .transpose()
+    };
+    let enabled = read_utf8("CAMELID_BENCH_EAGLE3_X3_X4_SELECTOR")?;
+    let threshold = read_utf8("CAMELID_BENCH_EAGLE3_X4_MIN_NEXT_PARENT_PROB")?;
+    parse_eagle3_x3_x4_selector_env(enabled.as_deref(), threshold.as_deref())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_eagle3_x3_x4_selector_config(
+    config: Option<Eagle3X3X4SelectorConfig>,
+    tree_nodes: Option<usize>,
+    tree_topk: usize,
+    tree_expansions: usize,
+    draft_tokens: usize,
+    adaptive_branching: bool,
+    adaptive_expansions: bool,
+    suffix_first: bool,
+    token_recycling_hybrid: bool,
+    dual_eagle_selector: bool,
+) -> anyhow::Result<()> {
+    if config.is_none() {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        tree_nodes == Some(EAGLE3_WIDTH_SELECTOR_WIDE_NODES),
+        "CAMELID_BENCH_EAGLE3_X3_X4_SELECTOR requires --tree-nodes {EAGLE3_WIDTH_SELECTOR_WIDE_NODES}"
+    );
+    anyhow::ensure!(
+        tree_topk == 4,
+        "CAMELID_BENCH_EAGLE3_X3_X4_SELECTOR requires --tree-topk 4"
+    );
+    anyhow::ensure!(
+        tree_expansions == EAGLE3_X3_X4_MAX_EXPANSIONS,
+        "CAMELID_BENCH_EAGLE3_X3_X4_SELECTOR requires --tree-expansions {EAGLE3_X3_X4_MAX_EXPANSIONS}"
+    );
+    anyhow::ensure!(
+        draft_tokens >= 2,
+        "CAMELID_BENCH_EAGLE3_X3_X4_SELECTOR requires --draft-tokens >= 2"
+    );
+    anyhow::ensure!(
+        !adaptive_branching
+            && !adaptive_expansions
+            && !suffix_first
+            && !token_recycling_hybrid
+            && !dual_eagle_selector,
+        "CAMELID_BENCH_EAGLE3_X3_X4_SELECTOR can be combined only with plain N6 dynamic trees and the N5/N6 width selector"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod eagle3_draft_early_exit_receipt_tests {
+    use super::*;
+    use camelid::eagle3::HIDDEN_SIZE;
+    use camelid::eagle3_runtime::{Eagle3DynamicFrontier, Eagle3DynamicFrontierConfig};
+    use camelid::metal::{Eagle3DraftCandidate, Eagle3MetalOutput, EAGLE3_DRAFT_VOCAB};
+
+    fn observation(candidates: &[(u32, f32)]) -> Eagle3MetalOutput {
+        let top_candidates: Vec<Eagle3DraftCandidate> = candidates
+            .iter()
+            .enumerate()
+            .map(
+                |(draft_token, &(target_token, probability))| Eagle3DraftCandidate {
+                    draft_token: draft_token as u32,
+                    target_token,
+                    logit: probability.ln(),
+                },
+            )
+            .collect();
+        Eagle3MetalOutput {
+            draft_token: 0,
+            target_token: top_candidates[0].target_token,
+            top_candidates,
+            evaluated_vocab_rows: EAGLE3_DRAFT_VOCAB,
+            evaluated_vocab_logsumexp: 0.0,
+            raw_hidden: vec![1.0; HIDDEN_SIZE],
+        }
+    }
+
+    fn x5_frontier(theta: Option<f64>) -> Eagle3DynamicFrontier {
+        let config = Eagle3DynamicFrontierConfig {
+            max_verify_nodes: 8,
+            max_lattice_nodes: 21,
+            max_depth: 15,
+            candidates_per_parent: 4,
+            max_head_expansions: 5,
+            adaptive_branching: false,
+            certified_argmax_shadow: false,
+        };
+        let observations = [
+            observation(&[(11, 0.50), (12, 0.30), (13, 0.15), (14, 0.05)]),
+            observation(&[(21, 0.56), (22, 0.30)]),
+            observation(&[(31, 0.80), (32, 0.20)]),
+            observation(&[(41, 0.90), (42, 0.10)]),
+            observation(&[(51, 0.90), (52, 0.10)]),
+        ];
+        let mut frontier = Eagle3DynamicFrontier::new(10, config).unwrap();
+        while let Some(parent) = frontier.next_parent() {
+            if let Some(theta) = theta {
+                if let Some(evidence) = frontier.early_exit_before_next_expansion(theta) {
+                    frontier.record_early_exit(evidence).unwrap();
+                    break;
+                }
+            }
+            frontier
+                .record_expansion(parent, &observations[frontier.head_expansions()])
+                .unwrap();
+        }
+        frontier
+    }
+
+    #[test]
+    fn histogram_is_padded_to_the_expansion_budget() {
+        assert_eq!(
+            eagle3_draft_expansions_histogram(&[], 5),
+            vec![0, 0, 0, 0, 0]
+        );
+        assert_eq!(
+            eagle3_draft_expansions_histogram(&[0, 3], 5),
+            vec![0, 3, 0, 0, 0]
+        );
+        assert_eq!(
+            eagle3_draft_expansions_histogram(&[1, 2, 3, 4, 5, 6, 7], 5),
+            vec![1, 2, 3, 4, 5, 6, 7]
+        );
+    }
+
+    #[test]
+    fn full_budget_rounds_count_in_the_last_bin_and_never_as_early_exits() {
+        let mut run = Eagle3BenchRun::default();
+        let full = x5_frontier(None);
+        assert_eq!(full.head_expansions(), 5);
+        run.note_dynamic_frontier(&full, None, false);
+        run.note_dynamic_frontier(&x5_frontier(Some(0.0)), Some(0.0), false);
+        assert_eq!(run.draft_early_exit_rounds, 0);
+        assert_eq!(run.draft_expansions_histogram, vec![0, 0, 0, 0, 2]);
+        assert_eq!(
+            eagle3_draft_expansions_histogram(&run.draft_expansions_histogram, 5),
+            vec![0, 0, 0, 0, 2]
+        );
+    }
+
+    #[test]
+    fn early_exit_rounds_land_in_their_expansion_bin() {
+        let mut run = Eagle3BenchRun::default();
+        // theta .31 declines the third expansion (12 at joint .30): two recorded expansions.
+        let exited = x5_frontier(Some(0.31));
+        assert_eq!(exited.head_expansions(), 2);
+        assert_eq!(exited.draft_early_exit().unwrap().next_parent, 2);
+        run.note_dynamic_frontier(&exited, Some(0.31), false);
+        run.note_dynamic_frontier(&x5_frontier(None), Some(0.31), false);
+        assert_eq!(run.draft_early_exit_rounds, 1);
+        assert_eq!(run.draft_expansions_histogram, vec![0, 1, 0, 0, 1]);
+    }
+}
+
+#[cfg(test)]
+mod eagle3_x3_x4_selector_tests {
+    use super::*;
+    use camelid::eagle3_runtime::Eagle3NextExpansionEvidence;
+
+    fn evidence(probability: f32) -> Eagle3NextExpansionEvidence {
+        Eagle3NextExpansionEvidence {
+            completed_head_expansions: EAGLE3_X3_X4_DECISION_AFTER_EXPANSIONS,
+            next_parent: 7,
+            next_parent_depth: 3,
+            next_parent_cumulative_log_probability: probability.ln(),
+            next_parent_cumulative_probability: probability,
+        }
+    }
+
+    #[test]
+    fn gate_requires_an_explicit_bounded_threshold() {
+        assert_eq!(parse_eagle3_x3_x4_selector_env(None, None).unwrap(), None);
+        assert_eq!(
+            parse_eagle3_x3_x4_selector_env(Some("off"), Some("bad")).unwrap(),
+            None
+        );
+        assert!(parse_eagle3_x3_x4_selector_env(Some("on"), None).is_err());
+        assert!(parse_eagle3_x3_x4_selector_env(Some("on"), Some("NaN")).is_err());
+        assert!(parse_eagle3_x3_x4_selector_env(Some("on"), Some("-0.1")).is_err());
+        assert!(parse_eagle3_x3_x4_selector_env(Some("on"), Some("1.1")).is_err());
+        assert_eq!(
+            parse_eagle3_x3_x4_selector_env(Some("yes"), Some("0"))
+                .unwrap()
+                .unwrap()
+                .x4_min_next_parent_probability,
+            0.0
+        );
+        assert_eq!(
+            parse_eagle3_x3_x4_selector_env(Some("1"), Some("1"))
+                .unwrap()
+                .unwrap()
+                .x4_min_next_parent_probability,
+            1.0
+        );
+    }
+
+    #[test]
+    fn strict_threshold_keeps_x4_on_equality() {
+        let selector = Eagle3X3X4SelectorConfig {
+            x4_min_next_parent_probability: 0.25,
+        };
+        assert!(selector.use_x4(evidence(0.25)));
+        assert!(!selector.use_x4(evidence(0.249)));
+        assert!(selector.use_x4(evidence(0.251)));
+    }
+
+    #[test]
+    fn benchmark_gate_is_isolated_to_plain_n6_k4_x4() {
+        let config = Some(Eagle3X3X4SelectorConfig {
+            x4_min_next_parent_probability: 0.05,
+        });
+        assert!(validate_eagle3_x3_x4_selector_config(
+            config,
+            Some(6),
+            4,
+            4,
+            15,
+            false,
+            false,
+            false,
+            false,
+            false,
+        )
+        .is_ok());
+        assert!(validate_eagle3_x3_x4_selector_config(
+            config,
+            Some(5),
+            4,
+            4,
+            15,
+            false,
+            false,
+            false,
+            false,
+            false,
+        )
+        .is_err());
+        assert!(validate_eagle3_x3_x4_selector_config(
+            config,
+            Some(6),
+            3,
+            4,
+            15,
+            false,
+            false,
+            false,
+            false,
+            false,
+        )
+        .is_err());
+        assert!(validate_eagle3_x3_x4_selector_config(
+            config,
+            Some(6),
+            4,
+            4,
+            15,
+            true,
+            false,
+            false,
+            false,
+            false,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn telemetry_captures_counts_and_probability_range() {
+        let mut telemetry = Eagle3X3X4Telemetry::default();
+        telemetry.note_decision(evidence(0.20), false).unwrap();
+        telemetry.note_decision(evidence(0.40), true).unwrap();
+        assert_eq!(telemetry.decisions, 2);
+        assert_eq!(telemetry.x3_rounds, 1);
+        assert_eq!(telemetry.x4_rounds, 1);
+        assert!((telemetry.next_parent_probability_min.unwrap() - 0.20).abs() < 1.0e-6);
+        assert!((telemetry.next_parent_probability_max.unwrap() - 0.40).abs() < 1.0e-6);
+        assert!((telemetry.next_parent_probability_mean().unwrap() - 0.30).abs() < 1.0e-6);
+    }
+}
+
+const EAGLE3_AUTHORITATIVE_CB_FUSION_ENV: &str = "CAMELID_BENCH_EAGLE3_AUTHORITATIVE_CB_FUSION";
+
+fn parse_eagle3_authoritative_cb_fusion_env(value: Option<&str>) -> anyhow::Result<bool> {
+    match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        None | Some("") | Some("0") | Some("false") | Some("off") | Some("no")
+        | Some("disabled") => Ok(false),
+        Some("1") | Some("true") | Some("on") | Some("yes") | Some("enabled") => Ok(true),
+        Some(value) => {
+            anyhow::bail!("{EAGLE3_AUTHORITATIVE_CB_FUSION_ENV} must be a boolean, got {value:?}")
+        }
+    }
+}
+
+fn eagle3_authoritative_cb_fusion_enabled() -> anyhow::Result<bool> {
+    let raw = std::env::var_os(EAGLE3_AUTHORITATIVE_CB_FUSION_ENV);
+    let value = raw
+        .as_ref()
+        .map(|value| {
+            value.to_str().ok_or_else(|| {
+                anyhow::anyhow!("{EAGLE3_AUTHORITATIVE_CB_FUSION_ENV} is not valid UTF-8")
+            })
+        })
+        .transpose()?;
+    parse_eagle3_authoritative_cb_fusion_env(value)
+}
+
+fn eagle3_truthy_env_enabled(name: &str) -> anyhow::Result<bool> {
+    let raw = std::env::var_os(name);
+    let value = raw
+        .as_ref()
+        .map(|value| {
+            value
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("{name} is not valid UTF-8"))
+        })
+        .transpose()?;
+    Ok(value.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "on" | "yes" | "enabled"
+        )
+    }))
+}
+
+fn validate_eagle3_authoritative_cb_fusion_config(
+    enabled: bool,
+    batch_authoritative_kv: bool,
+    full_authoritative: bool,
+    dual_eagle_selector: bool,
+) -> anyhow::Result<()> {
+    if !enabled {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        batch_authoritative_kv,
+        "{EAGLE3_AUTHORITATIVE_CB_FUSION_ENV}=1 requires CAMELID_EAGLE3_BATCH_AUTHORITATIVE_KV=1"
+    );
+    anyhow::ensure!(
+        !full_authoritative,
+        "{EAGLE3_AUTHORITATIVE_CB_FUSION_ENV}=1 cannot be combined with CAMELID_EAGLE3_FULL_AUTHORITATIVE=1"
+    );
+    anyhow::ensure!(
+        !dual_eagle_selector,
+        "{EAGLE3_AUTHORITATIVE_CB_FUSION_ENV}=1 cannot be combined with dual-EAGLE selection"
+    );
+    Ok(())
+}
+
+fn validate_eagle3_authoritative_cb_fusion_telemetry(
+    enabled: bool,
+    telemetry: Eagle3AuthoritativeFusionTelemetry,
+) -> anyhow::Result<()> {
+    if !enabled {
+        anyhow::ensure!(
+            telemetry == Eagle3AuthoritativeFusionTelemetry::default(),
+            "EAGLE-3 authoritative command-buffer fusion ran while its benchmark gate was disabled"
+        );
+        return Ok(());
+    }
+    anyhow::ensure!(
+        telemetry.fused_updates > 0,
+        "EAGLE-3 authoritative command-buffer fusion was enabled but recorded no updates"
+    );
+    anyhow::ensure!(
+        telemetry.fused_rows >= telemetry.fused_updates,
+        "EAGLE-3 authoritative command-buffer fusion recorded fewer rows ({}) than updates ({})",
+        telemetry.fused_rows,
+        telemetry.fused_updates,
+    );
+    anyhow::ensure!(
+        telemetry.command_buffers == telemetry.fused_updates,
+        "EAGLE-3 authoritative command-buffer fusion used {} command buffers for {} updates",
+        telemetry.command_buffers,
+        telemetry.fused_updates,
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod eagle3_authoritative_cb_fusion_tests {
+    use super::*;
+
+    #[test]
+    fn benchmark_gate_is_strict_and_default_off() {
+        for value in [None, Some(""), Some("0"), Some("false"), Some("OFF")] {
+            assert!(!parse_eagle3_authoritative_cb_fusion_env(value).unwrap());
+        }
+        for value in [Some("1"), Some("true"), Some("ON"), Some("enabled")] {
+            assert!(parse_eagle3_authoritative_cb_fusion_env(value).unwrap());
+        }
+        assert!(parse_eagle3_authoritative_cb_fusion_env(Some("maybe")).is_err());
+    }
+
+    #[test]
+    fn dependencies_require_batched_kv_and_isolate_dual_and_full_lanes() {
+        assert!(validate_eagle3_authoritative_cb_fusion_config(false, false, true, true).is_ok());
+        assert!(validate_eagle3_authoritative_cb_fusion_config(true, true, false, false).is_ok());
+        assert!(validate_eagle3_authoritative_cb_fusion_config(true, false, false, false).is_err());
+        assert!(validate_eagle3_authoritative_cb_fusion_config(true, true, true, false).is_err());
+        assert!(validate_eagle3_authoritative_cb_fusion_config(true, true, false, true).is_err());
+    }
+
+    #[test]
+    fn telemetry_attests_exactly_one_command_buffer_per_nonempty_update() {
+        let valid = Eagle3AuthoritativeFusionTelemetry {
+            fused_updates: 2,
+            fused_rows: 5,
+            command_buffers: 2,
+        };
+        assert!(validate_eagle3_authoritative_cb_fusion_telemetry(true, valid).is_ok());
+        assert!(validate_eagle3_authoritative_cb_fusion_telemetry(
+            true,
+            Eagle3AuthoritativeFusionTelemetry {
+                fused_updates: 2,
+                fused_rows: 5,
+                command_buffers: 3,
+            },
+        )
+        .is_err());
+        assert!(validate_eagle3_authoritative_cb_fusion_telemetry(
+            false,
+            Eagle3AuthoritativeFusionTelemetry::default(),
+        )
+        .is_ok());
+        assert!(validate_eagle3_authoritative_cb_fusion_telemetry(
+            true,
+            Eagle3AuthoritativeFusionTelemetry::default(),
+        )
+        .is_err());
+        assert!(validate_eagle3_authoritative_cb_fusion_telemetry(
+            true,
+            Eagle3AuthoritativeFusionTelemetry {
+                fused_updates: 2,
+                fused_rows: 1,
+                command_buffers: 2,
+            },
+        )
+        .is_err());
+        assert!(validate_eagle3_authoritative_cb_fusion_telemetry(
+            true,
+            Eagle3AuthoritativeFusionTelemetry {
+                fused_updates: 2,
+                fused_rows: 2,
+                command_buffers: 1,
+            },
+        )
+        .is_err());
+    }
+}
+
+fn parse_eagle3_terminal_head_skip_env(value: Option<&str>) -> anyhow::Result<bool> {
+    match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        None | Some("") | Some("0") | Some("false") | Some("off") | Some("no")
+        | Some("disabled") => Ok(false),
+        Some("1") | Some("true") | Some("on") | Some("yes") | Some("enabled") => Ok(true),
+        Some(value) => anyhow::bail!(
+            "CAMELID_BENCH_EAGLE3_TERMINAL_HEAD_SKIP must be a boolean, got {value:?}"
+        ),
+    }
+}
+
+fn eagle3_terminal_head_skip_enabled() -> anyhow::Result<bool> {
+    let raw = std::env::var_os("CAMELID_BENCH_EAGLE3_TERMINAL_HEAD_SKIP");
+    let value = raw
+        .as_ref()
+        .map(|value| {
+            value.to_str().ok_or_else(|| {
+                anyhow::anyhow!("CAMELID_BENCH_EAGLE3_TERMINAL_HEAD_SKIP is not valid UTF-8")
+            })
+        })
+        .transpose()?;
+    parse_eagle3_terminal_head_skip_env(value)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_eagle3_terminal_head_skip_config(
+    enabled: bool,
+    tree_nodes: Option<usize>,
+    adaptive_branching: bool,
+    adaptive_expansions: bool,
+    suffix_first: bool,
+    token_recycling_hybrid: bool,
+    dual_eagle_selector: bool,
+) -> anyhow::Result<()> {
+    if !enabled {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        tree_nodes.is_some(),
+        "CAMELID_BENCH_EAGLE3_TERMINAL_HEAD_SKIP requires --tree-nodes"
+    );
+    anyhow::ensure!(
+        !adaptive_branching
+            && !adaptive_expansions
+            && !suffix_first
+            && !token_recycling_hybrid
+            && !dual_eagle_selector,
+        "CAMELID_BENCH_EAGLE3_TERMINAL_HEAD_SKIP can be combined only with fixed-expansion plain dynamic trees (including the N5/N6 and X3/X4 selectors)"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod eagle3_terminal_head_skip_tests {
+    use super::*;
+
+    fn eog() -> BTreeSet<u32> {
+        BTreeSet::from([128_009, 128_010])
+    }
+
+    #[test]
+    fn benchmark_gate_is_strict_default_off_and_lane_isolated() {
+        for value in [None, Some(""), Some("0"), Some("false"), Some("OFF")] {
+            assert!(!parse_eagle3_terminal_head_skip_env(value).unwrap());
+        }
+        for value in [Some("1"), Some("true"), Some("ON"), Some("enabled")] {
+            assert!(parse_eagle3_terminal_head_skip_env(value).unwrap());
+        }
+        assert!(parse_eagle3_terminal_head_skip_env(Some("maybe")).is_err());
+
+        assert!(validate_eagle3_terminal_head_skip_config(
+            true,
+            Some(6),
+            false,
+            false,
+            false,
+            false,
+            false,
+        )
+        .is_ok());
+        assert!(validate_eagle3_terminal_head_skip_config(
+            true, None, false, false, false, false, false,
+        )
+        .is_err());
+        assert!(validate_eagle3_terminal_head_skip_config(
+            true,
+            Some(6),
+            false,
+            false,
+            true,
+            false,
+            false,
+        )
+        .is_err());
+        assert!(validate_eagle3_terminal_head_skip_config(
+            false, None, true, true, true, true, true,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn skips_only_for_already_authoritative_terminal_evidence() {
+        let eog = eog();
+        assert_eq!(
+            eagle3_terminal_head_skip_reason(false, 93, 96, &[1, 2, 3], &eog, 10),
+            None
+        );
+        assert_eq!(
+            eagle3_terminal_head_skip_reason(true, 93, 96, &[1, 2, 3], &eog, 10),
+            Some(Eagle3TerminalHeadSkipReason::MaxTokens)
+        );
+        assert_eq!(
+            eagle3_terminal_head_skip_reason(true, 10, 96, &[1, 128_009, 3], &eog, 10),
+            Some(Eagle3TerminalHeadSkipReason::EndOfGeneration)
+        );
+        assert_eq!(
+            eagle3_terminal_head_skip_reason(true, 10, 96, &[1, 2, 3], &eog, 0),
+            Some(Eagle3TerminalHeadSkipReason::ContextExhausted)
+        );
+        assert_eq!(
+            eagle3_terminal_head_skip_reason(true, 10, 96, &[1, 2, 3], &eog, 10),
+            None
+        );
+        assert_eq!(
+            eagle3_terminal_head_skip_reason(true, 96, 96, &[], &eog, 0),
+            None
+        );
+    }
+
+    #[test]
+    fn max_tokens_has_stable_precedence_when_terminal_causes_overlap() {
+        assert_eq!(
+            eagle3_terminal_head_skip_reason(true, 95, 96, &[128_009], &eog(), 0),
+            Some(Eagle3TerminalHeadSkipReason::MaxTokens)
+        );
+    }
+}
+
+fn validate_eagle3_adaptive_expansions_config(
+    enabled: bool,
+    tree_nodes: Option<usize>,
+    tree_expansions: usize,
+    suffix_first: bool,
+    token_recycling_hybrid: bool,
+) -> anyhow::Result<()> {
+    if !enabled {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        tree_nodes == Some(8),
+        "CAMELID_BENCH_EAGLE3_ADAPTIVE_EXPANSIONS requires --tree-nodes 8"
+    );
+    anyhow::ensure!(
+        tree_expansions >= EAGLE3_ADAPTIVE_DEEP_EXPANSIONS,
+        "CAMELID_BENCH_EAGLE3_ADAPTIVE_EXPANSIONS requires --tree-expansions >= {}",
+        EAGLE3_ADAPTIVE_DEEP_EXPANSIONS
+    );
+    anyhow::ensure!(
+        !suffix_first,
+        "CAMELID_BENCH_EAGLE3_ADAPTIVE_EXPANSIONS cannot be combined with --suffix-first"
+    );
+    anyhow::ensure!(
+        !token_recycling_hybrid,
+        "CAMELID_BENCH_EAGLE3_ADAPTIVE_EXPANSIONS cannot be combined with CAMELID_BENCH_EAGLE3_TR_HYBRID"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn eagle3_adaptive_expansion_config_fails_closed() {
+    assert!(validate_eagle3_adaptive_expansions_config(false, None, 1, true, true).is_ok());
+    assert!(validate_eagle3_adaptive_expansions_config(true, Some(8), 7, false, false).is_ok());
+    assert!(validate_eagle3_adaptive_expansions_config(true, None, 7, false, false).is_err());
+    assert!(validate_eagle3_adaptive_expansions_config(true, Some(7), 7, false, false).is_err());
+    assert!(validate_eagle3_adaptive_expansions_config(true, Some(8), 6, false, false).is_err());
+    assert!(validate_eagle3_adaptive_expansions_config(true, Some(8), 7, true, false).is_err());
+    assert!(validate_eagle3_adaptive_expansions_config(true, Some(8), 7, false, true).is_err());
+}
+
+fn parse_dual_eagle_selector_env(value: Option<&str>) -> anyhow::Result<bool> {
+    match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        None | Some("") | Some("0") | Some("false") | Some("off") | Some("no")
+        | Some("disabled") => Ok(false),
+        Some("1") | Some("true") | Some("on") | Some("yes") | Some("enabled") => Ok(true),
+        Some(value) => {
+            anyhow::bail!("CAMELID_BENCH_DUAL_EAGLE_SELECTOR must be a boolean, got {value:?}")
+        }
+    }
+}
+
+fn dual_eagle_selector_enabled() -> anyhow::Result<bool> {
+    let raw = std::env::var_os("CAMELID_BENCH_DUAL_EAGLE_SELECTOR");
+    let value = raw
+        .as_ref()
+        .map(|value| {
+            value.to_str().ok_or_else(|| {
+                anyhow::anyhow!("CAMELID_BENCH_DUAL_EAGLE_SELECTOR is not valid UTF-8")
+            })
+        })
+        .transpose()?;
+    parse_dual_eagle_selector_env(value)
+}
+
 fn eagle3_effective_env() -> BTreeMap<String, Option<String>> {
     const KEYS: &[&str] = &[
         "CAMELID_EAGLE3_FULL_AUTHORITATIVE",
+        "CAMELID_EAGLE3_BATCH_AUTHORITATIVE_KV",
+        "CAMELID_EAGLE3_BODY_Q8",
         "CAMELID_EAGLE3_LM_HEAD_Q8",
+        "CAMELID_EAGLE3_BODY_Q4",
+        "CAMELID_EAGLE3_LM_HEAD_Q4",
         "CAMELID_EAGLE3_LM_HEAD_ROWS",
+        "CAMELID_EAGLE3_ADAPTIVE_BRANCHING",
+        "CAMELID_EAGLE3_ALLOW_DERIVED",
         "CAMELID_METAL_LINEAR",
         "CAMELID_METAL_Q8",
         "CAMELID_METAL_RESIDENT_DECODE",
         "CAMELID_METAL_RESIDENT_PREFILL",
         "CAMELID_METAL_ATTN2",
         "CAMELID_METAL_ATTN_BATCH_K",
+        "CAMELID_METAL_ATTN_SHARED_PREFIX",
         "CAMELID_METAL_KV_DTYPE",
         "CAMELID_METAL_WIRE",
         "CAMELID_METAL_WIRE_NSG8",
@@ -10368,19 +16827,350 @@ fn eagle3_effective_env() -> BTreeMap<String, Option<String>> {
         "CAMELID_KQUANT_V2",
         "CAMELID_KQUANT_V3",
         "CAMELID_KQUANT_V4",
+        "CAMELID_KQUANT_V4_DIRECT_FRAGMENT",
+        "CAMELID_KQUANT_V4_DIRECT_SIMDGROUP_BARRIER",
+        "CAMELID_KQUANT_V4_REGISTER_EXACT",
+        "CAMELID_KQUANT_V4_REGISTER_EXACT_V2",
+        "CAMELID_KQUANT_V4_FUSED_SEGMENTS",
+        "CAMELID_KQUANT_V4_SOA8",
+        "CAMELID_KQUANT_V4_SHARED_PREP",
+        "CAMELID_KQUANT_V4_STRICT_PREP_FUSION",
+        "CAMELID_KQUANT_V4_TILED_PREP_FUSION",
+        "CAMELID_METAL_VERIFY_BATCH_ROPE_SCATTER",
         "CAMELID_KQUANT_V4_TRACE",
         "CAMELID_KQUANT_MMA",
         "CAMELID_SPEC_TREE",
+        "CAMELID_BENCH_EAGLE3_TR_HYBRID",
+        "CAMELID_BENCH_EAGLE3_TARGET_ROW_HEDGE",
+        "CAMELID_BENCH_EAGLE3_TARGET_ROW_LATTICE_PROMOTION",
+        "CAMELID_BENCH_EAGLE3_CERTIFIED_ARGMAX_SHADOW",
+        "CAMELID_BENCH_EAGLE3_INDEXED_HEAD_SHADOW",
+        "CAMELID_BENCH_EAGLE3_INDEXED_HEAD_DIRECT_EMISSION",
+        "CAMELID_BENCH_EAGLE3_ADAPTIVE_EXPANSIONS",
+        "CAMELID_BENCH_EAGLE3_ADAPTIVE_EXPANSIONS_TRACE",
+        "CAMELID_BENCH_DUAL_EAGLE_SELECTOR",
     ];
-    KEYS.iter()
+    let mut values: BTreeMap<String, Option<String>> = KEYS
+        .iter()
         .map(|key| ((*key).to_string(), std::env::var(key).ok()))
-        .collect()
+        .collect();
+    // Preserve the legacy receipt shape byte-for-byte when benchmark-only knobs are absent.
+    // Record explicitly supplied knobs; defaults are captured in dedicated receipt fields.
+    for key in [
+        "CAMELID_KQUANT_V4_STREAM16",
+        "CAMELID_BENCH_FP16_VERIFY",
+        "CAMELID_BENCH_FP16_SG",
+        "CAMELID_BENCH_FP16_ATTN_BATCH",
+        "CAMELID_BENCH_FP16_ATTN_MM",
+        "CAMELID_BENCH_FP16_GATE_UP_FUSED",
+        "CAMELID_BENCH_FP16_PROPOSAL",
+        "CAMELID_BENCH_FP16_COPY_ROWS",
+        "CAMELID_BENCH_FP16_COPY_VARIANTS",
+        "CAMELID_BENCH_ORACLE_VERIFY",
+        "CAMELID_BENCH_ORACLE_WIDTHS",
+        "CAMELID_BENCH_EAGLE3_WIDTH_SELECTOR",
+        "CAMELID_BENCH_EAGLE3_WIDTH_SELECTOR_TRACE",
+        "CAMELID_BENCH_EAGLE3_WIDTH5_TOTAL_MS",
+        "CAMELID_BENCH_EAGLE3_WIDTH6_TOTAL_MS",
+        "CAMELID_BENCH_EAGLE3_X3_X4_SELECTOR",
+        "CAMELID_BENCH_EAGLE3_X3_X4_SELECTOR_TRACE",
+        "CAMELID_BENCH_EAGLE3_X4_MIN_NEXT_PARENT_PROB",
+        "CAMELID_BENCH_EAGLE3_AUTHORITATIVE_CB_FUSION",
+        "CAMELID_BENCH_EAGLE3_TERMINAL_HEAD_SKIP",
+        "CAMELID_BENCH_EAGLE3_PARALLEL_LSE",
+        "CAMELID_BENCH_EAGLE3_VERIFY_LAYER0_EARLY_COMMIT",
+        "CAMELID_BENCH_EAGLE3_TARGET_ROW_LATTICE_PRIOR_LOG_BONUS",
+        "CAMELID_BENCH_EAGLE3_ARGMAX_SHADOW_CANDIDATES",
+        "CAMELID_BENCH_EAGLE3_INDEXED_HEAD_TARGET_TOP8_HISTORY_ROUNDS",
+        "CAMELID_BENCH_EAGLE3_INDEXED_HEAD_CANDIDATE_RECENCY_ROUNDS",
+        camelid::metal::EAGLE3_TRANSACTION_PORTFOLIO_SHADOW_ENV,
+        camelid::metal::EAGLE3_SELECTIVE_EDGE_PREP_BUDGET_ENV,
+        camelid::metal::EAGLE3_SELECTIVE_EDGE_PROMOTION_ENV,
+        camelid::metal::EAGLE3_SELECTIVE_EDGE_PROMOTION_RECEIPT_ENV,
+        "CAMELID_BENCH_EAGLE3_DEVICE_ACCEPT_SHADOW",
+        camelid::eagle3_runtime::EAGLE3_DRAFT_EARLY_EXIT_ENV,
+    ] {
+        if std::env::var_os(key).is_some() {
+            values.insert(key.to_string(), std::env::var(key).ok());
+        }
+    }
+    values
+}
+
+fn eagle3_effective_env_with_derived_provenance(
+    provenance: Option<&camelid::eagle3::Eagle3DerivedProvenance>,
+) -> BTreeMap<String, Option<String>> {
+    let mut values = eagle3_effective_env();
+    if let Some(provenance) = provenance {
+        for (key, value) in [
+            (
+                "CAMELID_EAGLE3_DERIVED_PROVENANCE_SCHEMA",
+                provenance.schema.as_str(),
+            ),
+            (
+                "CAMELID_EAGLE3_DERIVED_RECEIPT_SHA256",
+                provenance.receipt_sha256.as_str(),
+            ),
+            (
+                "CAMELID_EAGLE3_DERIVED_OUTPUT_WEIGHTS_SHA256",
+                provenance.output_weights_sha256.as_str(),
+            ),
+            (
+                "CAMELID_EAGLE3_DERIVED_OUTPUT_CONFIG_SHA256",
+                provenance.output_config_sha256.as_str(),
+            ),
+            (
+                "CAMELID_EAGLE3_DERIVED_OUTPUT_MAPPING_SHA256",
+                provenance.output_mapping_sha256.as_str(),
+            ),
+            (
+                "CAMELID_EAGLE3_DERIVED_SOURCE_WEIGHTS_SHA256",
+                provenance.source_weights_sha256.as_str(),
+            ),
+            (
+                "CAMELID_EAGLE3_DERIVED_SOURCE_CONFIG_SHA256",
+                provenance.source_config_sha256.as_str(),
+            ),
+            (
+                "CAMELID_EAGLE3_DERIVED_SOURCE_MAPPING_SHA256",
+                provenance.source_mapping_sha256.as_str(),
+            ),
+        ] {
+            values.insert(key.to_string(), Some(value.to_string()));
+        }
+        values.insert(
+            "CAMELID_EAGLE3_DERIVED_TENSOR_COUNT".to_string(),
+            Some(provenance.tensor_count.to_string()),
+        );
+    }
+    values
 }
 
 #[allow(clippy::too_many_arguments)]
+fn run_export_eagle3_features(
+    model: PathBuf,
+    eagle3: PathBuf,
+    input: PathBuf,
+    output: PathBuf,
+    limit: Option<usize>,
+    threads: Option<usize>,
+) -> anyhow::Result<()> {
+    use camelid::eagle3::{HIDDEN_SIZE, TARGET_LAYER_INPUT_IDS};
+    use camelid::eagle3_export::{
+        shift_loss_mask, shift_teacher_rows, shifted_corpus_labels, Eagle3FeatureDatasetWriter,
+        Eagle3FeatureInput, Eagle3FeatureSample, AUX_WIDTH,
+    };
+    use camelid::eagle3_runtime::interleave_target_layer_inputs;
+
+    const TEACHER_CHUNK_ROWS: usize = 16;
+    const PINNED_SW512_SHA256: &str =
+        "cf879511aa0e931ac2cfdaf0cc3dfa2e1ec9773c41f3c093a967420222fa84d0";
+
+    configure_rayon_threads(threads)?;
+    let model_sha256 = camelid::receipt::sha256_file_hex(&model)
+        .map_err(|error| anyhow::anyhow!("hashing target model {}: {error}", model.display()))?;
+    let gguf = read_metadata(&model)?;
+    ensure_arch_has_direct_dense_session(&gguf, DenseLaneWindowedForward::CpuDenseOnly)?;
+    let plan_outcome = camelid::execution_plan::plan_for_model(&model, &gguf, threads);
+    camelid::execution_plan::PlannerEnv::capture().apply(&plan_outcome.env_updates);
+    let config = LlamaModelConfig::from_gguf(&gguf)?;
+    anyhow::ensure!(
+        config.architecture == "llama"
+            && config.embedding_length == HIDDEN_SIZE as u32
+            && config.block_count == 28
+            && config.vocab_size == Some(128_256),
+        "EAGLE feature export requires exact Llama-3.2-3B geometry; got arch={} hidden={} layers={} vocab={:?}",
+        config.architecture,
+        config.embedding_length,
+        config.block_count,
+        config.vocab_size
+    );
+    let quantization = camelid::receipt::quantization_label(&gguf);
+    anyhow::ensure!(
+        quantization.starts_with("Q4"),
+        "EAGLE exact-Q4 feature export requires a Q4 target GGUF, got {quantization}"
+    );
+    let eagle3_weights_path = eagle3.join("model.safetensors");
+    let eagle3_checkpoint_sha256 = camelid::receipt::sha256_file_hex(&eagle3_weights_path)
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "hashing EAGLE checkpoint {}: {error}",
+                eagle3_weights_path.display()
+            )
+        })?;
+    anyhow::ensure!(
+        eagle3_checkpoint_sha256 == PINNED_SW512_SHA256,
+        "exact-Q4 training export requires pinned ShareGPT-SW512 EAGLE mapping {}, got {}",
+        PINNED_SW512_SHA256,
+        eagle3_checkpoint_sha256
+    );
+    let eagle3_checkpoint = camelid::eagle3::Eagle3DraftModel::load(&eagle3)?;
+    anyhow::ensure!(
+        eagle3_checkpoint.config.sliding_window == Some(512),
+        "training export requires the pinned SW512 EAGLE checkpoint"
+    );
+    let draft_to_target = eagle3_checkpoint.draft_to_target.clone();
+    drop(eagle3_checkpoint);
+    let binding = LlamaTensorBinding::bind(&gguf, &config)?;
+    let store = TensorStore::open(&model, &gguf);
+    let weights = Arc::new(LlamaLoadedWeights::load(&store, &binding, None)?);
+    let mut writer = Eagle3FeatureDatasetWriter::create(
+        &output,
+        model.display().to_string(),
+        model_sha256,
+        quantization,
+        eagle3_checkpoint_sha256,
+        &draft_to_target,
+    )?;
+
+    let reader =
+        BufReader::new(File::open(&input).map_err(|error| {
+            anyhow::anyhow!("opening feature input {}: {error}", input.display())
+        })?);
+    let mut exported = 0usize;
+    for (line_index, line) in reader.lines().enumerate() {
+        if limit.is_some_and(|limit| exported >= limit) {
+            break;
+        }
+        let line = line.map_err(|error| {
+            anyhow::anyhow!(
+                "reading {} line {}: {error}",
+                input.display(),
+                line_index + 1
+            )
+        })?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let record: Eagle3FeatureInput = serde_json::from_str(&line).map_err(|error| {
+            anyhow::anyhow!(
+                "parsing {} line {} as EAGLE JSONL: {error}",
+                input.display(),
+                line_index + 1
+            )
+        })?;
+        record.validate()?;
+        anyhow::ensure!(
+            record.input_ids.len() <= config.context_length as usize,
+            "EAGLE sample at line {} has {} tokens, exceeding target context {}",
+            line_index + 1,
+            record.input_ids.len(),
+            config.context_length
+        );
+        let id = record
+            .id
+            .clone()
+            .unwrap_or_else(|| format!("line-{:08}", line_index + 1));
+        let rows = record.input_ids.len();
+        let mut session = LlamaInferenceSession::new(config.clone(), Arc::clone(&weights))?;
+        let prewarmed = session.prewarm_resident_weights();
+        require_kquant_v4_soa8_prewarm(prewarmed)?;
+        session.set_resident_encode_ahead_enabled(false);
+        anyhow::ensure!(
+            session.begin_eagle3_training_metal()?,
+            "resident exact-Q4 empty teacher session is unavailable for sample {id}"
+        );
+        let target_vocab = config.vocab_size.expect("exact geometry checked") as usize;
+        let mut aux_layer_inputs = Vec::with_capacity(rows * AUX_WIDTH);
+        let mut hidden_state = Vec::with_capacity(rows * HIDDEN_SIZE);
+        let mut capture_argmax = Vec::with_capacity(rows);
+        let mut capture_draft_logits = Vec::with_capacity(rows * draft_to_target.len());
+        let mut capture_logsumexp = Vec::with_capacity(rows);
+
+        for start in (0..rows).step_by(TEACHER_CHUNK_ROWS) {
+            let end = (start + TEACHER_CHUNK_ROWS).min(rows);
+            let capture = session
+                .forward_eagle3_training_chunk_metal(
+                    &record.input_ids[start..end],
+                    &TARGET_LAYER_INPUT_IDS,
+                )?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "resident exact-Q4 teacher capture declined sample {id} rows {start}..{end}"
+                    )
+                })?;
+            let chunk_aux = interleave_target_layer_inputs(&capture.layer_inputs)?;
+            anyhow::ensure!(
+                capture.predictions.len() == end - start
+                    && chunk_aux.len() == (end - start) * AUX_WIDTH
+                    && capture.output_norm_state.data.len() == (end - start) * HIDDEN_SIZE
+                    && capture.logits.data.len() == (end - start) * target_vocab,
+                "sample {id} teacher capture returned malformed row counts at {start}..{end}"
+            );
+            capture_argmax.extend_from_slice(&capture.predictions);
+            aux_layer_inputs.extend_from_slice(&chunk_aux);
+            hidden_state.extend_from_slice(&capture.output_norm_state.data);
+            for row in capture.logits.data.chunks_exact(target_vocab) {
+                let maximum = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                anyhow::ensure!(
+                    maximum.is_finite() && row.iter().all(|value| value.is_finite()),
+                    "sample {id} contains non-finite exact-Q4 teacher logits"
+                );
+                let exp_sum = row
+                    .iter()
+                    .map(|value| f64::from(*value - maximum).exp())
+                    .sum::<f64>();
+                capture_logsumexp.push((f64::from(maximum) + exp_sum.ln()) as f32);
+                capture_draft_logits.extend(
+                    draft_to_target
+                        .iter()
+                        .map(|&target_id| row[target_id as usize]),
+                );
+            }
+        }
+
+        anyhow::ensure!(
+            capture_argmax.len() == rows
+                && capture_draft_logits.len() == rows * draft_to_target.len()
+                && capture_logsumexp.len() == rows,
+            "sample {id} did not capture every exact-Q4 teacher row"
+        );
+        let shifted_teacher =
+            shift_teacher_rows(&capture_argmax, &capture_draft_logits, &capture_logsumexp)?;
+        let labels = shifted_corpus_labels(&record.input_ids)?;
+        let loss_mask = shift_loss_mask(&record.loss_mask)?;
+        let input_embedding = weights
+            .token_embedding
+            .embedding_lookup(&record.input_ids, "eagle3_export_input_embedding")?
+            .data;
+        let mut next_token_embedding = weights
+            .token_embedding
+            .embedding_lookup(&record.input_ids[1..], "eagle3_export_next_token_embedding")?
+            .data;
+        next_token_embedding.resize(rows * HIDDEN_SIZE, 0.0);
+
+        writer.push(&Eagle3FeatureSample {
+            id,
+            input_ids: record.input_ids,
+            labels,
+            target_argmax: shifted_teacher.target_argmax,
+            loss_mask,
+            aux_layer_inputs,
+            hidden_state,
+            input_embedding,
+            next_token_embedding,
+            teacher_draft_logits: shifted_teacher.teacher_draft_logits,
+            teacher_logsumexp: shifted_teacher.teacher_logsumexp,
+            bootstrap_rows_masked: 0,
+        })?;
+        exported += 1;
+        eprintln!("[eagle3-export] wrote sample {exported} ({rows} rows)");
+    }
+    anyhow::ensure!(exported > 0, "EAGLE feature input contained no records");
+    let manifest = writer.finish()?;
+    eprintln!(
+        "[eagle3-export] complete schema={} samples={} output={}",
+        manifest.schema,
+        manifest.samples.len(),
+        output.display()
+    );
+    Ok(())
+}
+
 fn run_bench_eagle3(
     model: PathBuf,
     eagle3_dir: PathBuf,
+    eagle3_secondary_dir: Option<PathBuf>,
     draft_tokens: usize,
     tree_nodes: Option<usize>,
     tree_topk: usize,
@@ -10395,9 +17185,63 @@ fn run_bench_eagle3(
 ) -> anyhow::Result<()> {
     const PINNED_TARGET_SHA256: &str =
         "6c1a2b41161032677be168d354123594c0e6e67d2b9227c84f296ad037c728ff";
-    const PINNED_EAGLE3_SHA256: &str =
+    const PINNED_EAGLE3_THOUGHTWORKS_SHA256: &str =
         "c0713251464a9b6b5fcf9fb229587bbe59b6fd1521027aef32101d11b9ebbdaf";
-    const PINNED_EAGLE3_REVISION: &str = "02d343789b502a3edfe351bdd4537a44affb98cd";
+    const PINNED_EAGLE3_THOUGHTWORKS_REVISION: &str = "02d343789b502a3edfe351bdd4537a44affb98cd";
+    const PINNED_EAGLE3_SHAREGPT_E8_SHA256: &str =
+        "0694d52a4c7ebf3d4f9bb833cf5f2610f0cc0d30bf62a2376e0b2ee06cbe3662";
+    const PINNED_EAGLE3_SHAREGPT_E8_REVISION: &str = "f3d27a2ec37a7b9807e0ed106f249c727b61d931";
+    const PINNED_EAGLE3_SHAREGPT_E8_CONFIG_SHA256: &str =
+        "1f6f8e7dcf67648757016925e28b09c40461e22b0ffe522b9abc9802ec14eff8";
+    const PINNED_EAGLE3_SHAREGPT_E9_SHA256: &str =
+        "0192ee37dff4b7a86d13011d40e9cf622b331fe76f637d7d1ea24c4b81574304";
+    const PINNED_EAGLE3_SHAREGPT_E9_REVISION: &str = "03ea9aeacd593c07d9f55e0a64e161e69f71a6cd";
+    const PINNED_EAGLE3_SHAREGPT_E9_CONFIG_SHA256: &str =
+        "a5b3a9b3674e3233cdc4f34d201a7c366a2b089ec00a41a9da6b430ca8fd3136";
+    const PINNED_EAGLE3_SHAREGPT_SW512_E9_SHA256: &str =
+        "cf879511aa0e931ac2cfdaf0cc3dfa2e1ec9773c41f3c093a967420222fa84d0";
+    const PINNED_EAGLE3_SHAREGPT_SW512_E9_REVISION: &str =
+        "f5a87b575c502b9c93ce995198a54d683a02a53c";
+    const PINNED_EAGLE3_SHAREGPT_SW512_E9_CONFIG_SHA256: &str =
+        "c7997a68fd0f2324b41ab779c13909115b67cac9a36f758cc5b542cba12c2568";
+    let token_recycling_hybrid = eagle3_token_recycling_hybrid_enabled();
+    let target_row_hedge = eagle3_target_row_hedge_enabled()?;
+    let target_row_lattice_promotion = eagle3_target_row_lattice_promotion_enabled()?;
+    let certified_argmax_shadow =
+        eagle3_argmax_shadow_env("CAMELID_BENCH_EAGLE3_CERTIFIED_ARGMAX_SHADOW")?;
+    let indexed_head_shadow = eagle3_argmax_shadow_env("CAMELID_BENCH_EAGLE3_INDEXED_HEAD_SHADOW")?;
+    let indexed_head_direct_emission =
+        eagle3_argmax_shadow_env("CAMELID_BENCH_EAGLE3_INDEXED_HEAD_DIRECT_EMISSION")?;
+    let transaction_portfolio_shadow = eagle3_transaction_portfolio_shadow_enabled()?;
+    let selective_edge_prep_budget = eagle3_selective_edge_prep_budget()?;
+    let selective_edge_promotion = eagle3_selective_edge_promotion_enabled()?;
+    let selective_edge_promotion_receipt_path = eagle3_selective_edge_promotion_receipt_path()?;
+    let indexed_head_target_top8_history_rounds = eagle3_indexed_head_target_top8_history_rounds()?;
+    let indexed_head_candidate_recency_rounds = eagle3_indexed_head_candidate_recency_rounds()?;
+    let argmax_shadow_candidate_limit =
+        camelid::metal::eagle3_argmax_shadow_candidate_limit().map_err(anyhow::Error::msg)?;
+    let target_row_lattice_prior_log_bonus_override =
+        eagle3_target_row_lattice_prior_log_bonus_override()?;
+    anyhow::ensure!(
+        target_row_lattice_prior_log_bonus_override.is_none() || target_row_lattice_promotion,
+        "CAMELID_BENCH_EAGLE3_TARGET_ROW_LATTICE_PRIOR_LOG_BONUS requires CAMELID_BENCH_EAGLE3_TARGET_ROW_LATTICE_PROMOTION=1"
+    );
+    let target_row_lattice_prior_log_bonus = target_row_lattice_prior_log_bonus_override
+        .unwrap_or(camelid::inference::target_row_hedge::TARGET_ROW_LATTICE_PRIOR_LOG_BONUS);
+    let target_row_lattice_score_policy = if target_row_lattice_prior_log_bonus_override.is_some() {
+        "candidate_cumulative_log_probability_plus_configured_bonus_must_meet_evicted_leaf_score"
+    } else {
+        "candidate_cumulative_log_probability_plus_ln2_must_meet_evicted_leaf_score"
+    };
+    let adaptive_expansions = eagle3_adaptive_expansions_enabled();
+    let dual_eagle_selector = dual_eagle_selector_enabled()?;
+    let verifier_width_selector = eagle3_width_selector_config()?;
+    let x3_x4_selector = eagle3_x3_x4_selector_config()?;
+    let authoritative_cb_fusion = eagle3_authoritative_cb_fusion_enabled()?;
+    let terminal_head_skip = eagle3_terminal_head_skip_enabled()?;
+    let replay_scatter = camelid::eagle3_runtime::eagle3_replay_scatter_enabled();
+    let draft_early_exit_theta = camelid::eagle3_runtime::eagle3_draft_early_exit_theta();
+    let adaptive_branching = eagle3_adaptive_branching_enabled();
     anyhow::ensure!(max_tokens >= 2, "--max-tokens must be at least 2");
     anyhow::ensure!(
         (1..=15).contains(&draft_tokens),
@@ -10415,6 +17259,41 @@ fn run_bench_eagle3(
         "--suffix-first requires --tree-nodes"
     );
     anyhow::ensure!(
+        !token_recycling_hybrid || tree_nodes.is_some_and(|nodes| nodes >= 3),
+        "CAMELID_BENCH_EAGLE3_TR_HYBRID requires --tree-nodes >= 3"
+    );
+    anyhow::ensure!(
+        !token_recycling_hybrid || draft_tokens >= 2,
+        "CAMELID_BENCH_EAGLE3_TR_HYBRID requires --draft-tokens >= 2"
+    );
+    anyhow::ensure!(
+        !token_recycling_hybrid || !suffix_first,
+        "CAMELID_BENCH_EAGLE3_TR_HYBRID cannot be combined with --suffix-first"
+    );
+    anyhow::ensure!(
+        dual_eagle_selector == eagle3_secondary_dir.is_some(),
+        "CAMELID_BENCH_DUAL_EAGLE_SELECTOR and --eagle3-secondary must be supplied together"
+    );
+    anyhow::ensure!(
+        !dual_eagle_selector || tree_nodes.is_some(),
+        "CAMELID_BENCH_DUAL_EAGLE_SELECTOR requires --tree-nodes"
+    );
+    anyhow::ensure!(
+        !dual_eagle_selector || (!suffix_first && !token_recycling_hybrid),
+        "CAMELID_BENCH_DUAL_EAGLE_SELECTOR cannot be combined with suffix-first or Token Recycling"
+    );
+    if dual_eagle_selector {
+        let nodes = tree_nodes.expect("dual selector requires a tree node budget");
+        let minimum_tokens = usize::from(DUAL_EAGLE_RACE_ROUNDS)
+            .checked_mul(nodes)
+            .and_then(|tokens| tokens.checked_add(1))
+            .ok_or_else(|| anyhow::anyhow!("dual-EAGLE race token bound overflow"))?;
+        anyhow::ensure!(
+            max_tokens >= minimum_tokens,
+            "CAMELID_BENCH_DUAL_EAGLE_SELECTOR needs --max-tokens >= {minimum_tokens} so six maximum-width verifier rounds cannot exhaust the request"
+        );
+    }
+    anyhow::ensure!(
         (1..=camelid::metal::EAGLE3_TOP_K_CANDIDATES).contains(&tree_topk),
         "--tree-topk must be in 1..={}",
         camelid::metal::EAGLE3_TOP_K_CANDIDATES
@@ -10424,6 +17303,113 @@ fn run_bench_eagle3(
         "--tree-expansions must be in 1..={} (including the root)",
         camelid::inference::spec_tree::TREE_MAX_NODES
     );
+    validate_eagle3_adaptive_expansions_config(
+        adaptive_expansions,
+        tree_nodes,
+        tree_expansions,
+        suffix_first,
+        token_recycling_hybrid,
+    )?;
+    validate_eagle3_width_selector_config(
+        verifier_width_selector,
+        tree_nodes,
+        adaptive_expansions,
+        suffix_first,
+        token_recycling_hybrid,
+        dual_eagle_selector,
+    )?;
+    validate_eagle3_x3_x4_selector_config(
+        x3_x4_selector,
+        tree_nodes,
+        tree_topk,
+        tree_expansions,
+        draft_tokens,
+        adaptive_branching,
+        adaptive_expansions,
+        suffix_first,
+        token_recycling_hybrid,
+        dual_eagle_selector,
+    )?;
+    validate_eagle3_target_row_hedge_config(
+        target_row_hedge,
+        tree_nodes,
+        draft_tokens,
+        tree_topk,
+        adaptive_branching,
+        adaptive_expansions,
+        suffix_first,
+        token_recycling_hybrid,
+        dual_eagle_selector,
+        verifier_width_selector.is_some(),
+        x3_x4_selector.is_some(),
+    )?;
+    validate_eagle3_target_row_lattice_promotion_config(
+        target_row_lattice_promotion,
+        target_row_hedge,
+        tree_nodes,
+        draft_tokens,
+        tree_topk,
+        adaptive_branching,
+        adaptive_expansions,
+        suffix_first,
+        token_recycling_hybrid,
+        dual_eagle_selector,
+        verifier_width_selector.is_some(),
+        x3_x4_selector.is_some(),
+    )?;
+    validate_eagle3_argmax_shadow_config(
+        certified_argmax_shadow,
+        indexed_head_shadow,
+        indexed_head_direct_emission,
+        target_row_lattice_promotion,
+        tree_nodes,
+        tree_expansions,
+        argmax_shadow_candidate_limit,
+        indexed_head_target_top8_history_rounds,
+        indexed_head_candidate_recency_rounds,
+    )?;
+    validate_eagle3_transaction_portfolio_shadow_config(
+        transaction_portfolio_shadow,
+        indexed_head_shadow,
+    )?;
+    validate_eagle3_selective_edge_prep_config(
+        selective_edge_prep_budget,
+        transaction_portfolio_shadow,
+        indexed_head_shadow,
+        indexed_head_direct_emission,
+        target_row_lattice_promotion,
+        tree_nodes,
+    )?;
+    validate_eagle3_selective_edge_promotion_config(
+        selective_edge_promotion,
+        selective_edge_promotion_receipt_path.as_deref(),
+        selective_edge_prep_budget,
+        authoritative_cb_fusion,
+        terminal_head_skip,
+    )?;
+    validate_eagle3_terminal_head_skip_config(
+        terminal_head_skip,
+        tree_nodes,
+        adaptive_branching,
+        adaptive_expansions,
+        suffix_first,
+        token_recycling_hybrid,
+        dual_eagle_selector,
+    )?;
+    let (batch_authoritative_kv, full_authoritative) = if authoritative_cb_fusion {
+        (
+            eagle3_truthy_env_enabled("CAMELID_EAGLE3_BATCH_AUTHORITATIVE_KV")?,
+            eagle3_truthy_env_enabled("CAMELID_EAGLE3_FULL_AUTHORITATIVE")?,
+        )
+    } else {
+        (false, false)
+    };
+    validate_eagle3_authoritative_cb_fusion_config(
+        authoritative_cb_fusion,
+        batch_authoritative_kv,
+        full_authoritative,
+        dual_eagle_selector,
+    )?;
     configure_rayon_threads(threads)?;
     let input_text = match (&prompt_file, &prompt) {
         (Some(path), _) => std::fs::read_to_string(path)?,
@@ -10444,10 +17430,78 @@ fn run_bench_eagle3(
             eagle3_weights.display()
         )
     })?;
+    let (eagle3_revision, eagle3_derived_provenance) = match eagle3_sha256.as_str() {
+        PINNED_EAGLE3_THOUGHTWORKS_SHA256 => (PINNED_EAGLE3_THOUGHTWORKS_REVISION, None),
+        PINNED_EAGLE3_SHAREGPT_E8_SHA256 => (PINNED_EAGLE3_SHAREGPT_E8_REVISION, None),
+        PINNED_EAGLE3_SHAREGPT_E9_SHA256 => (PINNED_EAGLE3_SHAREGPT_E9_REVISION, None),
+        PINNED_EAGLE3_SHAREGPT_SW512_E9_SHA256 => (PINNED_EAGLE3_SHAREGPT_SW512_E9_REVISION, None),
+        _ => {
+            camelid::eagle3::require_derived_opt_in()?;
+            let provenance =
+                camelid::eagle3::validate_derived_checkpoint(&eagle3_dir, &eagle3_sha256)?;
+            ("derived-mlx-training-receipt-v1", Some(provenance))
+        }
+    };
     anyhow::ensure!(
-        eagle3_sha256 == PINNED_EAGLE3_SHA256,
-        "expected pinned EAGLE-3 SHA-256 {PINNED_EAGLE3_SHA256}, got {eagle3_sha256}"
+        !token_recycling_hybrid || eagle3_sha256 == PINNED_EAGLE3_SHAREGPT_E9_SHA256,
+        "CAMELID_BENCH_EAGLE3_TR_HYBRID requires the pinned ShareGPT-E9 checkpoint"
     );
+    anyhow::ensure!(
+        !dual_eagle_selector || eagle3_sha256 == PINNED_EAGLE3_SHAREGPT_E9_SHA256,
+        "CAMELID_BENCH_DUAL_EAGLE_SELECTOR requires --eagle3 to be the pinned ShareGPT-E9 checkpoint"
+    );
+    let pinned_sharegpt_config = match eagle3_sha256.as_str() {
+        PINNED_EAGLE3_SHAREGPT_E8_SHA256 => {
+            Some(("ShareGPT-E8", PINNED_EAGLE3_SHAREGPT_E8_CONFIG_SHA256))
+        }
+        PINNED_EAGLE3_SHAREGPT_E9_SHA256 => {
+            Some(("ShareGPT-E9", PINNED_EAGLE3_SHAREGPT_E9_CONFIG_SHA256))
+        }
+        PINNED_EAGLE3_SHAREGPT_SW512_E9_SHA256 => Some((
+            "ShareGPT-SW512-E9",
+            PINNED_EAGLE3_SHAREGPT_SW512_E9_CONFIG_SHA256,
+        )),
+        _ => None,
+    };
+    if let Some((label, expected_config_sha256)) = pinned_sharegpt_config {
+        let config_path = eagle3_dir.join("config.json");
+        let config_sha256 = camelid::receipt::sha256_file_hex(&config_path).map_err(|error| {
+            anyhow::anyhow!("hashing EAGLE-3 config {}: {error}", config_path.display())
+        })?;
+        anyhow::ensure!(
+            config_sha256 == expected_config_sha256,
+            "{label} config SHA-256 is {config_sha256}, expected {expected_config_sha256}"
+        );
+    }
+    let (eagle3_secondary_sha256, eagle3_secondary_revision) = if let Some(secondary_dir) =
+        eagle3_secondary_dir.as_ref()
+    {
+        let weights_path = secondary_dir.join("model.safetensors");
+        let sha256 = camelid::receipt::sha256_file_hex(&weights_path).map_err(|error| {
+            anyhow::anyhow!(
+                "hashing secondary EAGLE-3 checkpoint {}: {error}",
+                weights_path.display()
+            )
+        })?;
+        anyhow::ensure!(
+                sha256 == PINNED_EAGLE3_SHAREGPT_SW512_E9_SHA256,
+                "dual-EAGLE secondary SHA-256 is {sha256}, expected pinned ShareGPT-SW512-E9 {PINNED_EAGLE3_SHAREGPT_SW512_E9_SHA256}"
+            );
+        let config_path = secondary_dir.join("config.json");
+        let config_sha256 = camelid::receipt::sha256_file_hex(&config_path).map_err(|error| {
+            anyhow::anyhow!(
+                "hashing secondary EAGLE-3 config {}: {error}",
+                config_path.display()
+            )
+        })?;
+        anyhow::ensure!(
+                config_sha256 == PINNED_EAGLE3_SHAREGPT_SW512_E9_CONFIG_SHA256,
+                "dual-EAGLE secondary config SHA-256 is {config_sha256}, expected {PINNED_EAGLE3_SHAREGPT_SW512_E9_CONFIG_SHA256}"
+            );
+        (Some(sha256), Some(PINNED_EAGLE3_SHAREGPT_SW512_E9_REVISION))
+    } else {
+        (None, None)
+    };
     let current_exe = std::env::current_exe()?;
     let binary_sha256 = camelid::receipt::sha256_file_hex(&current_exe)
         .map_err(|error| anyhow::anyhow!("hashing benchmark binary: {error}"))?;
@@ -10461,6 +17515,23 @@ fn run_bench_eagle3(
         .iter()
         .map(|(key, value)| ((*key).to_string(), value.map(str::to_string)))
         .collect();
+    let selective_edge_promotion_proof = selective_edge_promotion_receipt_path
+        .as_deref()
+        .map(|path| validate_eagle3_selective_edge_b4_proof(path, &model_sha256, &eagle3_sha256))
+        .transpose()?;
+    anyhow::ensure!(
+        selective_edge_promotion == selective_edge_promotion_proof.is_some(),
+        "selective edge-promotion proof validation did not match its gate"
+    );
+    let selective_edge_promotion_authorization = selective_edge_promotion_proof
+        .as_ref()
+        .map(|proof| {
+            camelid::metal::Eagle3SelectiveEdgePromotionAuthorization::from_validated_b4_receipt_sha256(
+                &proof.receipt_sha256,
+            )
+            .map_err(anyhow::Error::msg)
+        })
+        .transpose()?;
     let config = LlamaModelConfig::from_gguf(&gguf)?;
     anyhow::ensure!(
         config.architecture == "llama"
@@ -10506,14 +17577,96 @@ fn run_bench_eagle3(
         prompt_token_ids.len() + max_tokens <= config.context_length as usize,
         "prompt plus generation exceeds target context"
     );
+    if selective_edge_promotion {
+        let current_input_sha256 = camelid::receipt::sha256_hex(input_text.as_bytes());
+        let current_prompt_sha256 = camelid::receipt::sha256_hex(prompt_text.as_bytes());
+        anyhow::ensure!(
+            workload == "pitch-exact"
+                && chat
+                && current_input_sha256 == EAGLE3_SELECTIVE_EDGE_B4_PROOF_INPUT_SHA256
+                && current_prompt_sha256 == EAGLE3_SELECTIVE_EDGE_B4_PROOF_PROMPT_SHA256
+                && prompt_token_ids.len() == 543
+                && max_tokens == 256
+                && draft_tokens == 15
+                && tree_nodes == Some(camelid::metal::EAGLE3_SELECTIVE_EDGE_VERIFIER_ROWS)
+                && tree_topk == 4
+                && tree_expansions == 5,
+            "selective B4 promotion is authorized only for the frozen Pitch workload: workload=pitch-exact chat=true input={} prompt={} prompt_tokens={} max_tokens={} draft_tokens={} tree={:?}/K{}/X{}",
+            current_input_sha256,
+            current_prompt_sha256,
+            prompt_token_ids.len(),
+            max_tokens,
+            draft_tokens,
+            tree_nodes,
+            tree_topk,
+            tree_expansions,
+        );
+    }
 
+    #[cfg(target_os = "macos")]
+    if std::env::var("CAMELID_BENCH_FP16_VERIFY").as_deref() == Ok("1") {
+        return run_fp16_coding_probe(
+            &config,
+            &weights,
+            &tokenizer,
+            &prompt_token_ids,
+            &input_text,
+            &prompt_text,
+            &workload,
+            &model_sha256,
+            max_tokens,
+        );
+    }
     eprintln!("[bench-eagle3] plain resident Metal target lane...");
     let plain =
         run_plain_resident_greedy(&config, &weights, &tokenizer, &prompt_token_ids, max_tokens)?;
-    eprintln!("[bench-eagle3] loading strict EAGLE-3 checkpoint...");
-    let head_load_started = Instant::now();
-    let checkpoint = camelid::eagle3::Eagle3DraftModel::load(&eagle3_dir)?;
-    let head_load_ms = head_load_started.elapsed().as_secs_f64() * 1000.0;
+    // Measurement-only upper bound: replay known target tokens as perfect proposals.
+    // Never report this as generated coding throughput or use it in serving.
+    if std::env::var("CAMELID_BENCH_ORACLE_VERIFY").as_deref() == Ok("1") {
+        return run_coding_oracle_verify(
+            &config,
+            &weights,
+            &tokenizer,
+            &prompt_token_ids,
+            &plain.generated,
+            &workload,
+            &model_sha256,
+        );
+    }
+    let head_capacity = prompt_token_ids
+        .len()
+        .checked_add(max_tokens)
+        .and_then(|positions| positions.checked_add(draft_tokens + 1))
+        .ok_or_else(|| anyhow::anyhow!("EAGLE-3 cache capacity overflow"))?;
+    eprintln!("[bench-eagle3] loading and uploading strict EAGLE-3 checkpoint...");
+    let primary_load_started = Instant::now();
+    let primary_checkpoint = camelid::eagle3::Eagle3DraftModel::load(&eagle3_dir)?;
+    let primary_head_load_ms = primary_load_started.elapsed().as_secs_f64() * 1000.0;
+    let primary_upload_started = Instant::now();
+    let primary_drafter =
+        camelid::eagle3_runtime::Eagle3Drafter::new(&primary_checkpoint, head_capacity)?;
+    let primary_head_upload_ms = primary_upload_started.elapsed().as_secs_f64() * 1000.0;
+    // Eagle3MetalState owns all uploaded buffers; release the ~464 MiB host matrix copy before
+    // loading the second checkpoint so the benchmark does not need both SafeTensor payloads on
+    // the host at once.
+    drop(primary_checkpoint);
+
+    let (secondary_drafter, secondary_head_load_ms, secondary_head_upload_ms) =
+        if let Some(secondary_dir) = eagle3_secondary_dir.as_ref() {
+            eprintln!("[bench-eagle3] loading and uploading pinned SW512 shadow checkpoint...");
+            let load_started = Instant::now();
+            let checkpoint = camelid::eagle3::Eagle3DraftModel::load(secondary_dir)?;
+            let load_ms = load_started.elapsed().as_secs_f64() * 1000.0;
+            let upload_started = Instant::now();
+            let drafter = camelid::eagle3_runtime::Eagle3Drafter::new(&checkpoint, head_capacity)?;
+            let upload_ms = upload_started.elapsed().as_secs_f64() * 1000.0;
+            drop(checkpoint);
+            (Some(drafter), load_ms, upload_ms)
+        } else {
+            (None, 0.0, 0.0)
+        };
+    let head_load_ms = primary_head_load_ms + secondary_head_load_ms;
+    let head_upload_ms = primary_head_upload_ms + secondary_head_upload_ms;
     eprintln!("[bench-eagle3] learned recurrent draft + resident target verify...");
     let eagle = run_eagle3_resident_greedy(
         &config,
@@ -10525,8 +17678,27 @@ fn run_bench_eagle3(
         tree_nodes,
         tree_topk,
         tree_expansions,
+        adaptive_expansions,
+        verifier_width_selector,
+        x3_x4_selector,
+        authoritative_cb_fusion,
+        terminal_head_skip,
         suffix_first,
-        checkpoint,
+        token_recycling_hybrid,
+        target_row_hedge,
+        target_row_lattice_promotion,
+        target_row_lattice_prior_log_bonus,
+        certified_argmax_shadow,
+        indexed_head_shadow,
+        indexed_head_direct_emission,
+        transaction_portfolio_shadow,
+        selective_edge_prep_budget,
+        selective_edge_promotion_authorization,
+        indexed_head_target_top8_history_rounds,
+        indexed_head_candidate_recency_rounds,
+        primary_drafter,
+        secondary_drafter,
+        head_upload_ms,
     )?;
 
     let decode_tps = |run: &Eagle3BenchRun| {
@@ -10569,6 +17741,312 @@ fn run_bench_eagle3(
     } else {
         eagle.dynamic_tree_max_depth_sum as f64 / eagle.dynamic_tree_rounds as f64
     };
+    let dual_final_round = eagle.dual_eagle_rounds.last();
+    anyhow::ensure!(
+        dual_eagle_selector
+            == (dual_final_round.is_some() && eagle.dual_eagle_selected_head.is_some()),
+        "dual-EAGLE receipt completeness does not match its runtime gate"
+    );
+    anyhow::ensure!(
+        (!certified_argmax_shadow && eagle.argmax_shadow_rounds.is_empty())
+            || (certified_argmax_shadow
+                && eagle.argmax_shadow_rounds.len() as u64 == eagle.dynamic_tree_rounds),
+        "argmax shadow receipt count does not match the fixed lattice rounds"
+    );
+    let argmax_candidate_observations = eagle
+        .argmax_shadow_rounds
+        .iter()
+        .map(|round| round.candidate_observations as u64)
+        .sum::<u64>();
+    let argmax_union_hits = eagle
+        .argmax_shadow_rounds
+        .iter()
+        .map(|round| round.candidate_union_hits as u64)
+        .sum::<u64>();
+    let argmax_union_misses = eagle
+        .argmax_shadow_rounds
+        .iter()
+        .map(|round| round.candidate_union_misses as u64)
+        .sum::<u64>();
+    let indexed_receipts = eagle
+        .argmax_shadow_rounds
+        .iter()
+        .filter_map(|round| round.indexed_head.as_ref())
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        (!indexed_head_shadow && indexed_receipts.is_empty())
+            || (indexed_head_shadow && indexed_receipts.len() == eagle.argmax_shadow_rounds.len()),
+        "indexed-head receipt count does not match its gate"
+    );
+    let indexed_scored_rounds = indexed_receipts
+        .iter()
+        .filter(|receipt| receipt.scored)
+        .count() as u64;
+    let indexed_direct_emission_rows = indexed_receipts
+        .iter()
+        .map(|receipt| receipt.direct_emission_rows as u64)
+        .sum::<u64>();
+    let indexed_full_head_fallback_rows = indexed_receipts
+        .iter()
+        .map(|receipt| receipt.full_head_fallback_rows as u64)
+        .sum::<u64>();
+    let indexed_verifier_rows = indexed_receipts
+        .iter()
+        .map(|receipt| receipt.verifier_rows as u64)
+        .sum::<u64>();
+    anyhow::ensure!(
+        (!indexed_head_direct_emission
+            && indexed_direct_emission_rows == 0
+            && indexed_full_head_fallback_rows == 0)
+            || (indexed_head_direct_emission
+                && indexed_direct_emission_rows + indexed_full_head_fallback_rows
+                    == indexed_verifier_rows),
+        "indexed-head direct-emission aggregate accounting diverged"
+    );
+    let indexed_target_top8_candidate_additions = eagle
+        .argmax_shadow_rounds
+        .iter()
+        .map(|round| round.causal_target_top8_candidate_additions as u64)
+        .sum::<u64>();
+    let indexed_candidate_recency_additions = eagle
+        .argmax_shadow_rounds
+        .iter()
+        .map(|round| round.causal_candidate_recency_additions as u64)
+        .sum::<u64>();
+    let indexed_exact_logit_agreements = indexed_receipts
+        .iter()
+        .map(|receipt| receipt.exact_logit_agreements as u64)
+        .sum::<u64>();
+    let indexed_compared_logits = indexed_receipts
+        .iter()
+        .map(|receipt| receipt.compared_logits as u64)
+        .sum::<u64>();
+    let indexed_kernel_window_us = indexed_receipts
+        .iter()
+        .map(|receipt| receipt.kernel_window_us)
+        .sum::<u128>();
+    anyhow::ensure!(
+        (!transaction_portfolio_shadow && eagle.transaction_portfolio_rounds.is_empty())
+            || (transaction_portfolio_shadow
+                && eagle.transaction_portfolio_rounds.len() as u64 == eagle.dynamic_tree_rounds),
+        "transaction portfolio receipt count does not match its gate"
+    );
+    let transaction_portfolio_scored_rounds = eagle
+        .transaction_portfolio_rounds
+        .iter()
+        .filter(|receipt| {
+            matches!(
+                receipt,
+                Eagle3TransactionPortfolioRoundReceipt::Scored { .. }
+            )
+        })
+        .count() as u64;
+    let mut transaction_portfolio_transaction_hits = [0u64; 4];
+    let mut transaction_portfolio_path_hits = [0u64; 4];
+    let mut transaction_portfolio_endpoint_hits = [0u64; 4];
+    let mut transaction_portfolio_conditional_terminal_hits = [0u64; 4];
+    for receipt in &eagle.transaction_portfolio_rounds {
+        if let Eagle3TransactionPortfolioRoundReceipt::Scored { coverage, .. } = receipt {
+            for (slot, covered) in coverage.iter().enumerate() {
+                transaction_portfolio_transaction_hits[slot] +=
+                    u64::from(covered.transaction_covered);
+                transaction_portfolio_path_hits[slot] += u64::from(covered.path_covered);
+                transaction_portfolio_endpoint_hits[slot] += u64::from(covered.endpoint_covered);
+                transaction_portfolio_conditional_terminal_hits[slot] +=
+                    u64::from(covered.terminal_at_authoritative_leaf_covered);
+            }
+        }
+    }
+    if transaction_portfolio_shadow {
+        eprintln!(
+            "[bench-eagle3-transaction-portfolio] budgets={:?} scored={} fallback={} transaction-hits={:?} path-hits={:?} endpoint-hits={:?} conditional-terminal-hits={:?}",
+            camelid::eagle3_runtime::EAGLE3_TRANSACTION_PORTFOLIO_BUDGETS,
+            transaction_portfolio_scored_rounds,
+            eagle.transaction_portfolio_rounds.len() as u64
+                - transaction_portfolio_scored_rounds,
+            transaction_portfolio_transaction_hits,
+            transaction_portfolio_path_hits,
+            transaction_portfolio_endpoint_hits,
+            transaction_portfolio_conditional_terminal_hits,
+        );
+    }
+    let selective_edge_prep_matched_rounds = eagle
+        .selective_edge_prep_rounds
+        .iter()
+        .filter(|receipt| matches!(receipt, Eagle3SelectiveEdgePrepRoundReceipt::Matched { .. }))
+        .count() as u64;
+    let selective_edge_prep_mismatched_rounds = eagle
+        .selective_edge_prep_rounds
+        .iter()
+        .filter(|receipt| {
+            matches!(
+                receipt,
+                Eagle3SelectiveEdgePrepRoundReceipt::Mismatched { .. }
+            )
+        })
+        .count() as u64;
+    let selective_edge_prep_fallback_rounds = eagle
+        .selective_edge_prep_rounds
+        .iter()
+        .filter(|receipt| {
+            matches!(
+                receipt,
+                Eagle3SelectiveEdgePrepRoundReceipt::Fallback { .. }
+            )
+        })
+        .count() as u64;
+    let selective_edge_prep_serial_oracle_skipped_rounds = eagle
+        .selective_edge_prep_rounds
+        .iter()
+        .filter(|receipt| {
+            matches!(
+                receipt,
+                Eagle3SelectiveEdgePrepRoundReceipt::SerialOracleSkipped { .. }
+            )
+        })
+        .count() as u64;
+    if let Some(budget) = selective_edge_prep_budget.filter(|_| !selective_edge_promotion) {
+        eprintln!(
+            "[bench-eagle3-selective-edge-prep] budget={budget} \
+             target-tail-baseline-us={} matched={} mismatched={} fallback={} \
+             serial-oracle-skipped={} terminal-cell=serial-authoritative \
+             prepared-cache-consumption=disabled",
+            camelid::metal::EAGLE3_SELECTIVE_EDGE_TARGET_TAIL_BASELINE_US,
+            selective_edge_prep_matched_rounds,
+            selective_edge_prep_mismatched_rounds,
+            selective_edge_prep_fallback_rounds,
+            selective_edge_prep_serial_oracle_skipped_rounds,
+        );
+    }
+    let mut selective_edge_promotion_promoted_rounds = 0u64;
+    let mut selective_edge_promotion_fallback_rounds = 0u64;
+    let mut selective_edge_promotion_terminal_skipped_rounds = 0u64;
+    let mut selective_edge_promotion_prepared_edges = 0u64;
+    let mut selective_edge_promotion_authoritative_edges = 0u64;
+    let mut selective_edge_promotion_hits = 0u64;
+    let mut selective_edge_promotion_serial_misses = 0u64;
+    let mut selective_edge_promotion_full_coverage_rounds = 0u64;
+    let mut selective_edge_promotion_no_hit_fallback_rounds = 0u64;
+    let mut selective_edge_promotion_portfolio_unavailable_fallback_rounds = 0u64;
+    let mut selective_edge_promotion_logical_serial_fc_rows_displaced = 0u64;
+    let mut selective_edge_promotion_saved_serial_kv_rows = 0u64;
+    let mut selective_edge_promotion_serial_fc_logical_columns = 0u64;
+    let mut selective_edge_promotion_compacted_bytes = 0u64;
+    let mut selective_edge_promotion_additional_compaction_command_buffers = 0u64;
+    let mut selective_edge_promotion_compaction_encode_us = 0u128;
+    let mut selective_edge_promotion_update_gpu_us = 0u128;
+    for receipt in &eagle.selective_edge_promotion_rounds {
+        match receipt {
+            Eagle3SelectiveEdgePromotionRoundReceipt::Promoted { evidence, .. } => {
+                selective_edge_promotion_promoted_rounds += 1;
+                selective_edge_promotion_prepared_edges +=
+                    evidence.predicted_unique_edge_rows as u64;
+                selective_edge_promotion_authoritative_edges +=
+                    evidence.authoritative_edge_rows as u64;
+                selective_edge_promotion_hits += evidence.promoted_hits as u64;
+                selective_edge_promotion_serial_misses += evidence.serial_misses as u64;
+                selective_edge_promotion_full_coverage_rounds +=
+                    u64::from(evidence.authoritative_path_fully_covered);
+                selective_edge_promotion_logical_serial_fc_rows_displaced +=
+                    evidence.logical_serial_fc_rows_displaced as u64;
+                selective_edge_promotion_saved_serial_kv_rows +=
+                    evidence.saved_serial_kv_rows as u64;
+                selective_edge_promotion_serial_fc_logical_columns +=
+                    evidence.serial_fc_logical_columns as u64;
+                selective_edge_promotion_compacted_bytes +=
+                    evidence.device_compacted_eagle_kv_bytes as u64;
+                selective_edge_promotion_additional_compaction_command_buffers +=
+                    evidence.additional_compaction_command_buffers as u64;
+                selective_edge_promotion_compaction_encode_us += evidence.compaction_encode_us;
+                selective_edge_promotion_update_gpu_us += evidence.authoritative_update_gpu_us;
+            }
+            Eagle3SelectiveEdgePromotionRoundReceipt::Fallback { reason, .. } => {
+                selective_edge_promotion_fallback_rounds += 1;
+                match reason.as_str() {
+                    "selective promotion found no exact prepared authoritative edge" => {
+                        selective_edge_promotion_no_hit_fallback_rounds += 1;
+                    }
+                    "selective promotion preparation fell back: selective_portfolio_unavailable" => {
+                        selective_edge_promotion_portfolio_unavailable_fallback_rounds += 1;
+                    }
+                    _ => anyhow::bail!(
+                        "selective promotion recorded unexpected fallback reason {reason:?}"
+                    ),
+                }
+            }
+            Eagle3SelectiveEdgePromotionRoundReceipt::TerminalUpdateSkipped { .. } => {
+                selective_edge_promotion_terminal_skipped_rounds += 1;
+            }
+        }
+    }
+    if selective_edge_promotion {
+        anyhow::ensure!(
+            lossless
+                && first_divergent == -1
+                && eagle.rounds == EAGLE3_SELECTIVE_EDGE_B4_PROOF_ROUNDS
+                && selective_edge_promotion_promoted_rounds == 63
+                && selective_edge_promotion_fallback_rounds == 15
+                && selective_edge_promotion_no_hit_fallback_rounds == 10
+                && selective_edge_promotion_portfolio_unavailable_fallback_rounds == 5
+                && selective_edge_promotion_terminal_skipped_rounds == 0
+                && selective_edge_promotion_prepared_edges == 281
+                && selective_edge_promotion_authoritative_edges == 175
+                && selective_edge_promotion_hits == 167
+                && selective_edge_promotion_serial_misses == 8
+                && selective_edge_promotion_full_coverage_rounds == 57
+                && selective_edge_promotion_logical_serial_fc_rows_displaced == 167
+                && selective_edge_promotion_saved_serial_kv_rows == 167
+                && selective_edge_promotion_serial_fc_logical_columns == 71
+                && selective_edge_promotion_compacted_bytes == 684_032
+                && selective_edge_promotion_additional_compaction_command_buffers == 0,
+            "selective B4 promotion departed from the frozen Pitch transaction: lossless={lossless} first_divergent={first_divergent} rounds={} promoted={} fallback={} no_hit={} portfolio_unavailable={} terminal_skip={} P={} A={} H={} M={} full={} logical_fc_displaced={} kv_saved={} residual_fc_logical_columns={} bytes={} extra_cbs={}",
+            eagle.rounds,
+            selective_edge_promotion_promoted_rounds,
+            selective_edge_promotion_fallback_rounds,
+            selective_edge_promotion_no_hit_fallback_rounds,
+            selective_edge_promotion_portfolio_unavailable_fallback_rounds,
+            selective_edge_promotion_terminal_skipped_rounds,
+            selective_edge_promotion_prepared_edges,
+            selective_edge_promotion_authoritative_edges,
+            selective_edge_promotion_hits,
+            selective_edge_promotion_serial_misses,
+            selective_edge_promotion_full_coverage_rounds,
+            selective_edge_promotion_logical_serial_fc_rows_displaced,
+            selective_edge_promotion_saved_serial_kv_rows,
+            selective_edge_promotion_serial_fc_logical_columns,
+            selective_edge_promotion_compacted_bytes,
+            selective_edge_promotion_additional_compaction_command_buffers,
+        );
+        eprintln!(
+            "[bench-eagle3-selective-promotion] budget=4 promoted_rounds={} fallback_rounds={} \
+             no_hit_fallback_rounds={} portfolio_unavailable_fallback_rounds={} \
+             terminal_skipped_rounds={} prepared_edges={} authoritative_edges={} \
+             promoted_hits={} serial_misses={} full_coverage_rounds={} \
+             logical_serial_fc_rows_displaced={} saved_serial_kv_rows={} \
+             serial_fc_logical_columns={} serial_fc_physical_columns_per_promoted_round={} \
+             device_compacted_eagle_kv_bytes={} additional_compaction_command_buffers={} \
+             compaction_encode_us={} copy_gpu_us=unavailable_fused-cb update_gpu_us={} \
+             terminal-cell=late-authoritative e1-kv-host-readback=false",
+            selective_edge_promotion_promoted_rounds,
+            selective_edge_promotion_fallback_rounds,
+            selective_edge_promotion_no_hit_fallback_rounds,
+            selective_edge_promotion_portfolio_unavailable_fallback_rounds,
+            selective_edge_promotion_terminal_skipped_rounds,
+            selective_edge_promotion_prepared_edges,
+            selective_edge_promotion_authoritative_edges,
+            selective_edge_promotion_hits,
+            selective_edge_promotion_serial_misses,
+            selective_edge_promotion_full_coverage_rounds,
+            selective_edge_promotion_logical_serial_fc_rows_displaced,
+            selective_edge_promotion_saved_serial_kv_rows,
+            selective_edge_promotion_serial_fc_logical_columns,
+            camelid::metal::EAGLE3_SELECTIVE_EDGE_PROMOTION_FC_PHYSICAL_COLUMNS,
+            selective_edge_promotion_compacted_bytes,
+            selective_edge_promotion_additional_compaction_command_buffers,
+            selective_edge_promotion_compaction_encode_us,
+            selective_edge_promotion_update_gpu_us,
+        );
+    }
     let record = BenchEagle3Record {
         runtime: "camelid-eagle3-resident-metal",
         commit: benchmark_commit(),
@@ -10585,13 +18063,29 @@ fn run_bench_eagle3(
         model_sha256,
         tokenizer_metadata_sha256: camelid::receipt::tokenizer_metadata_sha256(&gguf),
         eagle3: eagle3_dir.display().to_string(),
-        eagle3_sha256,
-        eagle3_revision: PINNED_EAGLE3_REVISION,
+        eagle3_sha256: eagle3_sha256.clone(),
+        eagle3_revision,
         quantization: camelid::receipt::quantization_label(&gguf),
         prompt_tokens: prompt_token_ids.len(),
         max_tokens,
         draft_tokens,
-        draft_mode: if suffix_first {
+        draft_mode: if dual_eagle_selector {
+            "dynamic_tree_dual_eagle_selector"
+        } else if token_recycling_hybrid {
+            "dynamic_tree_e9_tr_hybrid"
+        } else if target_row_lattice_promotion {
+            "dynamic_tree_eagle3_target_row_lattice_promotion"
+        } else if target_row_hedge {
+            "dynamic_tree_eagle3_target_row_hedge"
+        } else if adaptive_expansions {
+            "dynamic_tree_adaptive_expansions"
+        } else if x3_x4_selector.is_some() && verifier_width_selector.is_some() {
+            "dynamic_tree_x3_x4_width_selector"
+        } else if x3_x4_selector.is_some() {
+            "dynamic_tree_x3_x4_selector"
+        } else if verifier_width_selector.is_some() {
+            "dynamic_tree_width_selector"
+        } else if suffix_first {
             "suffix_then_dynamic_tree"
         } else if tree_nodes.is_some() {
             "dynamic_tree"
@@ -10601,6 +18095,395 @@ fn run_bench_eagle3(
         tree_node_budget: tree_nodes,
         tree_topk: tree_nodes.map(|_| tree_topk),
         tree_expansions: tree_nodes.map(|_| tree_expansions),
+        verifier_width_selector: verifier_width_selector.map(|_| true),
+        verifier_width5_total_ms: verifier_width_selector.map(|config| config.n5_total_ms),
+        verifier_width6_total_ms: verifier_width_selector.map(|config| config.n6_total_ms),
+        verifier_width_decisions: verifier_width_selector.map(|_| eagle.verifier_widths.decisions),
+        verifier_width5_rounds: verifier_width_selector.map(|_| eagle.verifier_widths.n5_rounds),
+        verifier_width6_rounds: verifier_width_selector.map(|_| eagle.verifier_widths.n6_rounds),
+        x3_x4_selector: x3_x4_selector.map(|_| true),
+        x4_min_next_parent_probability: x3_x4_selector
+            .map(|config| config.x4_min_next_parent_probability),
+        x3_x4_decisions: x3_x4_selector.map(|_| eagle.x3_x4_expansions.decisions),
+        x3_rounds: x3_x4_selector.map(|_| eagle.x3_x4_expansions.x3_rounds),
+        x4_rounds: x3_x4_selector.map(|_| eagle.x3_x4_expansions.x4_rounds),
+        x3_x4_no_fourth_candidate_rounds: x3_x4_selector
+            .map(|_| eagle.x3_x4_expansions.no_fourth_candidate_rounds),
+        x3_x4_next_parent_probability_mean: x3_x4_selector
+            .and_then(|_| eagle.x3_x4_expansions.next_parent_probability_mean()),
+        x3_x4_next_parent_probability_min: x3_x4_selector
+            .and(eagle.x3_x4_expansions.next_parent_probability_min),
+        x3_x4_next_parent_probability_max: x3_x4_selector
+            .and(eagle.x3_x4_expansions.next_parent_probability_max),
+        authoritative_cb_fusion: authoritative_cb_fusion.then_some(true),
+        authoritative_fused_updates: authoritative_cb_fusion
+            .then_some(eagle.authoritative_fusion.fused_updates),
+        authoritative_fused_rows: authoritative_cb_fusion
+            .then_some(eagle.authoritative_fusion.fused_rows),
+        authoritative_update_command_buffers: authoritative_cb_fusion
+            .then_some(eagle.authoritative_fusion.command_buffers),
+        terminal_head_skip: terminal_head_skip.then_some(true),
+        terminal_head_updates_skipped: terminal_head_skip
+            .then_some(eagle.terminal_head_updates_skipped),
+        terminal_head_skip_reason: if terminal_head_skip {
+            eagle
+                .terminal_head_skip_reason
+                .map(Eagle3TerminalHeadSkipReason::label)
+        } else {
+            None
+        },
+        adaptive_expansions,
+        adaptive_window_rounds: adaptive_expansions
+            .then_some(EAGLE3_ADAPTIVE_EXPANSION_WINDOW),
+        adaptive_shallow_expansions: adaptive_expansions
+            .then_some(EAGLE3_ADAPTIVE_SHALLOW_EXPANSIONS),
+        adaptive_deep_expansions: adaptive_expansions
+            .then_some(EAGLE3_ADAPTIVE_DEEP_EXPANSIONS),
+        adaptive_shallow_to_deep_min_accepted_sum: adaptive_expansions
+            .then_some(EAGLE3_ADAPTIVE_SHALLOW_TO_DEEP_SUM),
+        adaptive_deep_to_shallow_below_accepted_sum: adaptive_expansions
+            .then_some(EAGLE3_ADAPTIVE_DEEP_TO_SHALLOW_SUM),
+        adaptive_promotion_consecutive_windows: adaptive_expansions
+            .then_some(EAGLE3_ADAPTIVE_PROMOTION_WINDOWS),
+        adaptive_demotion_consecutive_windows: adaptive_expansions
+            .then_some(EAGLE3_ADAPTIVE_DEMOTION_WINDOWS),
+        adaptive_post_demotion_cooldown_rounds: adaptive_expansions
+            .then_some(EAGLE3_ADAPTIVE_POST_DEMOTION_COOLDOWN),
+        adaptive_shallow_rounds: adaptive_expansions
+            .then_some(eagle.adaptive_expansions.shallow_rounds),
+        adaptive_shallow_accepted_drafts: adaptive_expansions
+            .then_some(eagle.adaptive_expansions.shallow_accepted_drafts),
+        adaptive_deep_rounds: adaptive_expansions
+            .then_some(eagle.adaptive_expansions.deep_rounds),
+        adaptive_deep_accepted_drafts: adaptive_expansions
+            .then_some(eagle.adaptive_expansions.deep_accepted_drafts),
+        adaptive_shallow_to_deep_transitions: adaptive_expansions
+            .then_some(eagle.adaptive_expansions.shallow_to_deep_transitions),
+        adaptive_deep_to_shallow_transitions: adaptive_expansions
+            .then_some(eagle.adaptive_expansions.deep_to_shallow_transitions),
+        adaptive_shallow_qualifying_windows: adaptive_expansions
+            .then_some(eagle.adaptive_expansions.shallow_qualifying_windows),
+        adaptive_shallow_cooldown_rounds: adaptive_expansions
+            .then_some(eagle.adaptive_expansions.shallow_cooldown_rounds),
+        adaptive_shallow_cooldown_qualifying_windows: adaptive_expansions
+            .then_some(eagle.adaptive_expansions.shallow_cooldown_qualifying_windows),
+        adaptive_shallow_qualification_resets: adaptive_expansions
+            .then_some(eagle.adaptive_expansions.shallow_qualification_resets),
+        adaptive_deep_rejecting_windows: adaptive_expansions
+            .then_some(eagle.adaptive_expansions.deep_rejecting_windows),
+        adaptive_deep_rejection_resets: adaptive_expansions
+            .then_some(eagle.adaptive_expansions.deep_rejection_resets),
+        token_recycling_hybrid,
+        target_row_hedge,
+        target_row_hedge_max_nodes: target_row_hedge.then_some(
+            camelid::inference::target_row_hedge::TARGET_ROW_HEDGE_MAX_NODES,
+        ),
+        target_row_hedge_candidate_policy: target_row_hedge
+            .then_some("shallowest_novel_prior_verified_top1_on_eagle_primary_spine"),
+        target_row_hedge_cache_update_policy: target_row_hedge
+            .then_some("post_current_target_verification_and_acceptance"),
+        target_row_hedge_rounds: target_row_hedge.then_some(eagle.target_row_hedge.rounds),
+        target_row_hedge_insertion_rounds: target_row_hedge
+            .then_some(eagle.target_row_hedge.insertion_rounds),
+        target_row_hedge_no_prior_row_rounds: target_row_hedge
+            .then_some(eagle.target_row_hedge.no_prior_row_rounds),
+        target_row_hedge_duplicate_only_rounds: target_row_hedge
+            .then_some(eagle.target_row_hedge.duplicate_only_rounds),
+        target_row_hedge_no_replaceable_neural_hedge_rounds: target_row_hedge
+            .then_some(eagle.target_row_hedge.no_replaceable_hedge_rounds),
+        target_row_hedge_supported_primary_rows: target_row_hedge
+            .then_some(eagle.target_row_hedge.supported_primary_rows),
+        target_row_hedge_full_path_duplicates: target_row_hedge
+            .then_some(eagle.target_row_hedge.full_path_duplicates),
+        target_row_hedge_rows_offered: target_row_hedge
+            .then_some(eagle.target_row_hedge.target_rows_offered),
+        target_row_hedge_rows_accepted: target_row_hedge
+            .then_some(eagle.target_row_hedge.target_rows_accepted),
+        target_row_hedge_shared_rows_accepted: target_row_hedge
+            .then_some(eagle.target_row_hedge.shared_rows_accepted),
+        target_row_hedge_neural_hedges_retained_sum: target_row_hedge
+            .then_some(eagle.target_row_hedge.neural_hedges_retained_sum),
+        target_row_hedge_offered_by_depth: target_row_hedge
+            .then_some(eagle.target_row_hedge.offered_by_depth),
+        target_row_hedge_accepted_by_depth: target_row_hedge
+            .then_some(eagle.target_row_hedge.accepted_by_depth),
+        target_row_hedge_candidate_rows: target_row_hedge
+            .then_some(eagle.target_row_hedge.candidate_rows),
+        target_row_hedge_candidate_ids: target_row_hedge
+            .then_some(eagle.target_row_hedge.candidate_ids),
+        target_row_hedge_evicted_edges_would_accept: target_row_hedge
+            .then_some(eagle.target_row_hedge.evicted_edges_would_accept),
+        target_row_hedge_counterfactual_emitted_token_delta: target_row_hedge
+            .then_some(eagle.target_row_hedge.counterfactual_emitted_token_delta),
+        target_row_lattice_promotion,
+        target_row_lattice_promotion_max_nodes: target_row_lattice_promotion.then_some(
+            camelid::inference::target_row_hedge::TARGET_ROW_HEDGE_MAX_NODES,
+        ),
+        target_row_lattice_promotion_candidate_policy: target_row_lattice_promotion.then_some(
+            "highest_current_eagle_score_pruned_child_under_exact_primary_lattice_source_with_prior_verified_top1",
+        ),
+        target_row_lattice_promotion_score_policy: target_row_lattice_promotion
+            .then_some(target_row_lattice_score_policy),
+        target_row_lattice_promotion_prior_log_bonus: target_row_lattice_promotion.then_some(
+            target_row_lattice_prior_log_bonus,
+        ),
+        target_row_lattice_promotion_cache_update_policy: target_row_lattice_promotion
+            .then_some("post_current_target_verification_and_acceptance"),
+        target_row_lattice_promotion_rounds: target_row_lattice_promotion
+            .then_some(eagle.target_row_hedge.rounds),
+        target_row_lattice_promotion_rounds_promoted: target_row_lattice_promotion
+            .then_some(eagle.target_row_hedge.insertion_rounds),
+        target_row_lattice_promotion_no_prior_row_rounds: target_row_lattice_promotion
+            .then_some(eagle.target_row_hedge.no_prior_row_rounds),
+        target_row_lattice_promotion_no_promotable_child_rounds: target_row_lattice_promotion
+            .then_some(eagle.target_row_hedge.no_promotable_lattice_child_rounds),
+        target_row_lattice_promotion_duplicate_only_rounds: target_row_lattice_promotion
+            .then_some(eagle.target_row_hedge.duplicate_only_rounds),
+        target_row_lattice_promotion_below_score_rounds: target_row_lattice_promotion
+            .then_some(eagle.target_row_hedge.below_promotion_score_rounds),
+        target_row_lattice_promotion_no_replaceable_hedge_rounds: target_row_lattice_promotion
+            .then_some(eagle.target_row_hedge.no_replaceable_hedge_rounds),
+        target_row_lattice_promotion_supported_primary_rows: target_row_lattice_promotion
+            .then_some(eagle.target_row_hedge.supported_primary_rows),
+        target_row_lattice_promotion_prior_rows_without_materialized_child:
+            target_row_lattice_promotion
+                .then_some(eagle.target_row_hedge.prior_rows_without_materialized_child),
+        target_row_lattice_promotion_full_path_duplicates: target_row_lattice_promotion
+            .then_some(eagle.target_row_hedge.full_path_duplicates),
+        target_row_lattice_promotion_rows_offered: target_row_lattice_promotion
+            .then_some(eagle.target_row_hedge.target_rows_offered),
+        target_row_lattice_promotion_rows_accepted: target_row_lattice_promotion
+            .then_some(eagle.target_row_hedge.target_rows_accepted),
+        target_row_lattice_promotion_shared_rows_accepted: target_row_lattice_promotion
+            .then_some(eagle.target_row_hedge.shared_rows_accepted),
+        target_row_lattice_promotion_evicted_edges_would_accept: target_row_lattice_promotion
+            .then_some(eagle.target_row_hedge.evicted_edges_would_accept),
+        target_row_lattice_promotion_counterfactual_emitted_token_delta:
+            target_row_lattice_promotion
+                .then_some(eagle.target_row_hedge.counterfactual_emitted_token_delta),
+        target_row_lattice_promotion_neural_hedges_retained_sum: target_row_lattice_promotion
+            .then_some(eagle.target_row_hedge.neural_hedges_retained_sum),
+        target_row_lattice_promotion_offered_by_depth: target_row_lattice_promotion
+            .then_some(eagle.target_row_hedge.offered_by_depth),
+        target_row_lattice_promotion_accepted_by_depth: target_row_lattice_promotion
+            .then_some(eagle.target_row_hedge.accepted_by_depth),
+        target_row_lattice_promotion_candidate_rows: target_row_lattice_promotion
+            .then_some(eagle.target_row_hedge.candidate_rows),
+        target_row_lattice_promotion_candidate_ids: target_row_lattice_promotion
+            .then_some(eagle.target_row_hedge.candidate_ids),
+        certified_argmax_shadow: certified_argmax_shadow.then_some(true),
+        certified_argmax_shadow_rounds: certified_argmax_shadow
+            .then_some(eagle.argmax_shadow_rounds.len() as u64),
+        certified_argmax_shadow_candidate_observations: certified_argmax_shadow
+            .then_some(argmax_candidate_observations),
+        certified_argmax_shadow_candidates_per_expansion: certified_argmax_shadow
+            .then_some(argmax_shadow_candidate_limit),
+        certified_argmax_shadow_candidate_union_hits: certified_argmax_shadow
+            .then_some(argmax_union_hits),
+        certified_argmax_shadow_candidate_union_misses: certified_argmax_shadow
+            .then_some(argmax_union_misses),
+        certified_argmax_shadow_round_evidence: certified_argmax_shadow
+            .then(|| eagle.argmax_shadow_rounds.clone()),
+        indexed_head_shadow: indexed_head_shadow.then_some(true),
+        indexed_head_direct_emission: indexed_head_direct_emission.then_some(true),
+        indexed_head_direct_emission_full_head_confirmed:
+            indexed_head_direct_emission.then_some(true),
+        indexed_head_direct_emission_rows: indexed_head_direct_emission
+            .then_some(indexed_direct_emission_rows),
+        indexed_head_direct_emission_full_head_fallback_rows: indexed_head_direct_emission
+            .then_some(indexed_full_head_fallback_rows),
+        indexed_head_shadow_causal_target_top8_history_rounds:
+            (indexed_head_target_top8_history_rounds > 0)
+                .then_some(indexed_head_target_top8_history_rounds),
+        indexed_head_shadow_causal_target_top8_candidate_additions:
+            (indexed_head_target_top8_history_rounds > 0)
+                .then_some(indexed_target_top8_candidate_additions),
+        indexed_head_shadow_causal_candidate_recency_rounds:
+            (indexed_head_candidate_recency_rounds > 0)
+                .then_some(indexed_head_candidate_recency_rounds),
+        indexed_head_shadow_causal_candidate_recency_additions:
+            (indexed_head_candidate_recency_rounds > 0)
+                .then_some(indexed_candidate_recency_additions),
+        indexed_head_shadow_scored_rounds: indexed_head_shadow
+            .then_some(indexed_scored_rounds),
+        indexed_head_shadow_fallback_rounds: indexed_head_shadow
+            .then_some(indexed_receipts.len() as u64 - indexed_scored_rounds),
+        indexed_head_shadow_exact_logit_agreements: indexed_head_shadow
+            .then_some(indexed_exact_logit_agreements),
+        indexed_head_shadow_compared_logits: indexed_head_shadow
+            .then_some(indexed_compared_logits),
+        indexed_head_shadow_kernel_window_us: indexed_head_shadow
+            .then_some(indexed_kernel_window_us),
+        indexed_head_shadow_compile_fast_math_enabled: indexed_head_shadow.then_some(false),
+        transaction_portfolio_shadow: transaction_portfolio_shadow.then_some(true),
+        transaction_portfolio_budgets: transaction_portfolio_shadow.then_some(
+            camelid::eagle3_runtime::EAGLE3_TRANSACTION_PORTFOLIO_BUDGETS,
+        ),
+        transaction_portfolio_scored_rounds: transaction_portfolio_shadow
+            .then_some(transaction_portfolio_scored_rounds),
+        transaction_portfolio_fallback_rounds: transaction_portfolio_shadow.then_some(
+            eagle.transaction_portfolio_rounds.len() as u64
+                - transaction_portfolio_scored_rounds,
+        ),
+        transaction_portfolio_transaction_hits: transaction_portfolio_shadow
+            .then_some(transaction_portfolio_transaction_hits),
+        transaction_portfolio_path_hits: transaction_portfolio_shadow
+            .then_some(transaction_portfolio_path_hits),
+        transaction_portfolio_endpoint_hits: transaction_portfolio_shadow
+            .then_some(transaction_portfolio_endpoint_hits),
+        transaction_portfolio_conditional_terminal_hits: transaction_portfolio_shadow
+            .then_some(transaction_portfolio_conditional_terminal_hits),
+        transaction_portfolio_round_evidence: transaction_portfolio_shadow
+            .then(|| eagle.transaction_portfolio_rounds.clone()),
+        selective_edge_prep_budget,
+        selective_edge_prep_target_tail_baseline_us: selective_edge_prep_budget
+            .map(|_| camelid::metal::EAGLE3_SELECTIVE_EDGE_TARGET_TAIL_BASELINE_US),
+        selective_edge_prep_matched_rounds: selective_edge_prep_budget
+            .filter(|_| !selective_edge_promotion)
+            .map(|_| selective_edge_prep_matched_rounds),
+        selective_edge_prep_mismatched_rounds: selective_edge_prep_budget
+            .filter(|_| !selective_edge_promotion)
+            .map(|_| selective_edge_prep_mismatched_rounds),
+        selective_edge_prep_fallback_rounds: selective_edge_prep_budget
+            .filter(|_| !selective_edge_promotion)
+            .map(|_| selective_edge_prep_fallback_rounds),
+        selective_edge_prep_serial_oracle_skipped_rounds: selective_edge_prep_budget
+            .filter(|_| !selective_edge_promotion)
+            .map(|_| selective_edge_prep_serial_oracle_skipped_rounds),
+        selective_edge_prep_round_evidence: selective_edge_prep_budget
+            .filter(|_| !selective_edge_promotion)
+            .map(|_| eagle.selective_edge_prep_rounds.clone()),
+        selective_edge_promotion: selective_edge_promotion.then_some(true),
+        selective_edge_promotion_proof_path: selective_edge_promotion_proof
+            .as_ref()
+            .map(|proof| proof.path.display().to_string()),
+        selective_edge_promotion_proof_sha256: selective_edge_promotion_proof
+            .as_ref()
+            .map(|proof| proof.receipt_sha256.clone()),
+        selective_edge_promotion_proof_source_commit: selective_edge_promotion_proof
+            .as_ref()
+            .map(|proof| proof.source_commit.clone()),
+        selective_edge_promotion_proof_binary_sha256: selective_edge_promotion_proof
+            .as_ref()
+            .map(|proof| proof.binary_sha256.clone()),
+        selective_edge_promotion_proof_matched_rounds: selective_edge_promotion_proof
+            .as_ref()
+            .map(|proof| proof.matched_rounds),
+        selective_edge_promotion_proof_fallback_rounds: selective_edge_promotion_proof
+            .as_ref()
+            .map(|proof| proof.fallback_rounds),
+        selective_edge_promotion_promoted_rounds: selective_edge_promotion
+            .then_some(selective_edge_promotion_promoted_rounds),
+        selective_edge_promotion_fallback_rounds: selective_edge_promotion
+            .then_some(selective_edge_promotion_fallback_rounds),
+        selective_edge_promotion_terminal_skipped_rounds: selective_edge_promotion
+            .then_some(selective_edge_promotion_terminal_skipped_rounds),
+        selective_edge_promotion_prepared_edges: selective_edge_promotion
+            .then_some(selective_edge_promotion_prepared_edges),
+        selective_edge_promotion_authoritative_edges: selective_edge_promotion
+            .then_some(selective_edge_promotion_authoritative_edges),
+        selective_edge_promotion_hits: selective_edge_promotion
+            .then_some(selective_edge_promotion_hits),
+        selective_edge_promotion_serial_misses: selective_edge_promotion
+            .then_some(selective_edge_promotion_serial_misses),
+        selective_edge_promotion_full_coverage_rounds: selective_edge_promotion
+            .then_some(selective_edge_promotion_full_coverage_rounds),
+        selective_edge_promotion_no_hit_fallback_rounds: selective_edge_promotion
+            .then_some(selective_edge_promotion_no_hit_fallback_rounds),
+        selective_edge_promotion_portfolio_unavailable_fallback_rounds:
+            selective_edge_promotion
+                .then_some(selective_edge_promotion_portfolio_unavailable_fallback_rounds),
+        selective_edge_promotion_logical_serial_fc_rows_displaced: selective_edge_promotion
+            .then_some(selective_edge_promotion_logical_serial_fc_rows_displaced),
+        selective_edge_promotion_saved_serial_kv_rows: selective_edge_promotion
+            .then_some(selective_edge_promotion_saved_serial_kv_rows),
+        selective_edge_promotion_serial_fc_logical_columns: selective_edge_promotion
+            .then_some(selective_edge_promotion_serial_fc_logical_columns),
+        selective_edge_promotion_compacted_bytes: selective_edge_promotion
+            .then_some(selective_edge_promotion_compacted_bytes),
+        selective_edge_promotion_additional_compaction_command_buffers:
+            selective_edge_promotion
+                .then_some(selective_edge_promotion_additional_compaction_command_buffers),
+        selective_edge_promotion_compaction_encode_us: selective_edge_promotion
+            .then_some(selective_edge_promotion_compaction_encode_us),
+        selective_edge_promotion_copy_gpu_time_available: selective_edge_promotion
+            .then_some(false),
+        selective_edge_promotion_update_gpu_us: selective_edge_promotion
+            .then_some(selective_edge_promotion_update_gpu_us),
+        selective_edge_promotion_round_evidence: selective_edge_promotion
+            .then(|| eagle.selective_edge_promotion_rounds.clone()),
+        dual_eagle_selector,
+        dual_eagle_race_rounds: dual_eagle_selector.then_some(DUAL_EAGLE_RACE_ROUNDS),
+        dual_eagle_root_ranking: dual_eagle_selector.then_some(DUAL_EAGLE_ROOT_RANKING),
+        dual_eagle_reciprocal_rank_scale: dual_eagle_selector
+            .then_some(DUAL_EAGLE_RECIPROCAL_RANK_SCALE),
+        dual_eagle_e9_sha256: dual_eagle_selector.then(|| eagle3_sha256.clone()),
+        dual_eagle_e9_config_sha256: dual_eagle_selector
+            .then(|| PINNED_EAGLE3_SHAREGPT_E9_CONFIG_SHA256.to_string()),
+        dual_eagle_e9_revision: dual_eagle_selector.then_some(eagle3_revision),
+        dual_eagle_sw512: eagle3_secondary_dir
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        dual_eagle_sw512_sha256: eagle3_secondary_sha256,
+        dual_eagle_sw512_config_sha256: dual_eagle_selector
+            .then(|| PINNED_EAGLE3_SHAREGPT_SW512_E9_CONFIG_SHA256.to_string()),
+        dual_eagle_sw512_revision: eagle3_secondary_revision,
+        dual_eagle_e9_score: dual_final_round.map(|round| round.e9.cumulative_score),
+        dual_eagle_sw512_score: dual_final_round
+            .map(|round| round.sw512.cumulative_score),
+        dual_eagle_round_evidence: dual_eagle_selector
+            .then(|| eagle.dual_eagle_rounds.clone()),
+        dual_eagle_selected_head: eagle.dual_eagle_selected_head,
+        dual_eagle_dropped_head: eagle.dual_eagle_selected_head.map(DualEagleHead::other),
+        dual_eagle_e9_head_load_ms: dual_eagle_selector.then_some(primary_head_load_ms),
+        dual_eagle_e9_head_upload_ms: dual_eagle_selector.then_some(primary_head_upload_ms),
+        dual_eagle_sw512_head_load_ms: dual_eagle_selector
+            .then_some(secondary_head_load_ms),
+        dual_eagle_sw512_head_upload_ms: dual_eagle_selector
+            .then_some(secondary_head_upload_ms),
+        dual_eagle_shadow_update_ms: dual_eagle_selector
+            .then_some(eagle.dual_eagle_shadow_update_us as f64 / 1000.0),
+        hybrid_admission_decisions: token_recycling_hybrid
+            .then_some(eagle.token_recycling.admission_decisions),
+        hybrid_admission_declines: token_recycling_hybrid
+            .then_some(eagle.token_recycling.admission_declines),
+        hybrid_primary_depth_sum: token_recycling_hybrid
+            .then_some(eagle.token_recycling.primary_depth_sum),
+        hybrid_parent_rows_sum: token_recycling_hybrid
+            .then_some(eagle.token_recycling.parent_rows_sum),
+        hybrid_known_parent_rows_sum: token_recycling_hybrid
+            .then_some(eagle.token_recycling.known_parent_rows_sum),
+        hybrid_known_parent_share_q16_sum: token_recycling_hybrid
+            .then_some(eagle.token_recycling.known_parent_share_q16_sum),
+        hybrid_confidence_q16_scale: token_recycling_hybrid.then_some(
+            camelid::inference::token_recycling::TOKEN_RECYCLING_CONFIDENCE_Q16_ONE,
+        ),
+        hybrid_min_primary_depth: token_recycling_hybrid.then_some(
+            camelid::inference::token_recycling::TOKEN_RECYCLING_MIN_PRIMARY_DEPTH,
+        ),
+        hybrid_min_known_parent_share_q16: token_recycling_hybrid.then_some(
+            camelid::inference::token_recycling::TOKEN_RECYCLING_MIN_KNOWN_PARENT_SHARE_Q16,
+        ),
+        hybrid_e9_rounds: token_recycling_hybrid
+            .then_some(eagle.token_recycling.e9_rounds),
+        hybrid_e9_offered: token_recycling_hybrid
+            .then_some(eagle.token_recycling.e9_offered),
+        hybrid_e9_accepted_drafts: token_recycling_hybrid
+            .then_some(eagle.token_recycling.e9_accepted_drafts),
+        hybrid_e9_emitted_tokens: token_recycling_hybrid
+            .then_some(eagle.token_recycling.e9_emitted_tokens),
+        hybrid_tr_rounds: token_recycling_hybrid.then_some(eagle.token_recycling.tr_rounds),
+        hybrid_tr_offered: token_recycling_hybrid.then_some(eagle.token_recycling.tr_offered),
+        hybrid_tr_accepted_drafts: token_recycling_hybrid
+            .then_some(eagle.token_recycling.tr_accepted_drafts),
+        hybrid_tr_emitted_tokens: token_recycling_hybrid
+            .then_some(eagle.token_recycling.tr_emitted_tokens),
+        hybrid_cold_seed_anchors: token_recycling_hybrid
+            .then_some(eagle.token_recycling.cold_seed_anchors),
+        hybrid_candidate_rows: token_recycling_hybrid
+            .then_some(eagle.token_recycling.candidate_rows),
+        hybrid_candidate_ids: token_recycling_hybrid
+            .then_some(eagle.token_recycling.candidate_ids),
         plain_generated_tokens: plain.generated.len(),
         eagle3_generated_tokens: eagle.generated.len(),
         head_load_ms,
@@ -10634,6 +18517,25 @@ fn run_bench_eagle3(
         verify_ms: eagle.verify_us as f64 / 1000.0,
         head_update_ms: eagle.head_update_us as f64 / 1000.0,
         suffix_rounds: suffix_first.then_some(eagle.suffix_rounds),
+        suffix_candidate_rounds: suffix_first.then_some(eagle.suffix_candidate_rounds),
+        suffix_confidence_declines: suffix_first.then_some(eagle.suffix_confidence_declines),
+        suffix_raw_depth_sum: suffix_first.then_some(eagle.suffix_raw_depth_sum),
+        suffix_confident_depth_sum: suffix_first.then_some(eagle.suffix_confident_depth_sum),
+        suffix_root_match_len_sum: suffix_first.then_some(eagle.suffix_root_match_len_sum),
+        suffix_root_support_sum: suffix_first.then_some(eagle.suffix_root_support_sum),
+        suffix_root_branch_count_sum: suffix_first.then_some(eagle.suffix_root_branch_count_sum),
+        suffix_expected_accepted_q16_sum: suffix_first
+            .then_some(eagle.suffix_expected_accepted_q16_sum),
+        suffix_terminal_survival_q16_sum: suffix_first
+            .then_some(eagle.suffix_terminal_survival_q16_sum),
+        suffix_confidence_q16_scale: suffix_first
+            .then_some(camelid::inference::suffix_decoding::SUFFIX_CONFIDENCE_Q16_ONE),
+        suffix_min_prefix_survival_q16: suffix_first
+            .then_some(camelid::inference::suffix_decoding::SUFFIX_MIN_PREFIX_SURVIVAL_Q16),
+        suffix_min_expected_accepted_q16: suffix_first
+            .then_some(camelid::inference::suffix_decoding::SUFFIX_MIN_EXPECTED_ACCEPTED_Q16),
+        suffix_min_confident_depth: suffix_first
+            .then_some(camelid::inference::suffix_decoding::SUFFIX_MIN_CONFIDENT_DEPTH),
         suffix_offered: suffix_first.then_some(eagle.suffix_offered),
         suffix_emitted_tokens: suffix_first.then_some(eagle.suffix_emitted_tokens),
         suffix_head_catchups: suffix_first.then_some(eagle.suffix_head_catchups),
@@ -10646,6 +18548,13 @@ fn run_bench_eagle3(
         materialized_head_forwards: tree_nodes.map(|_| eagle.materialized_head_forwards),
         mean_materialized_head_forwards_per_dynamic_round: tree_nodes
             .map(|_| mean_materialized_head_forwards),
+        draft_early_exit_theta: tree_nodes.and(draft_early_exit_theta),
+        draft_early_exit_rounds: tree_nodes.map(|_| eagle.draft_early_exit_rounds),
+        draft_expansions_histogram: tree_nodes.map(|_| {
+            eagle3_draft_expansions_histogram(&eagle.draft_expansions_histogram, tree_expansions)
+        }),
+        replay_scatter: tree_nodes.map(|_| replay_scatter),
+        replay_scatter_commits: tree_nodes.map(|_| eagle.replay_scatter_commits),
         mean_dynamic_tree_max_depth: tree_nodes.map(|_| mean_dynamic_tree_max_depth),
         resident_verify_rounds: eagle.resident_verify_rounds,
         cpu_verify_rounds: eagle.cpu_verify_rounds,
@@ -10662,7 +18571,9 @@ fn run_bench_eagle3(
         eagle3_drafted_token_ids: eagle.drafted_token_ids,
         metal_device: camelid::metal::detect_metal_device().device_name,
         host_isa: camelid::receipt::host_isa_marker(),
-        effective_env: eagle3_effective_env(),
+        effective_env: eagle3_effective_env_with_derived_provenance(
+            eagle3_derived_provenance.as_ref(),
+        ),
         planner_env_updates,
         execution_plan: plan_outcome.plan,
         peak_memory_bytes: peak_rss_bytes(),
@@ -10680,6 +18591,127 @@ fn run_bench_eagle3(
         record.speedup,
         if record.lossless { "LOSSLESS ✓" } else { "DIVERGED" },
     );
+    if token_recycling_hybrid {
+        eprintln!(
+            "[bench-eagle3-hybrid] E9 rounds={} offered={} accepted={} emitted={} | \
+             TR rounds={} offered={} accepted={} emitted={} | cold seeds={} rows={} ids={}",
+            eagle.token_recycling.e9_rounds,
+            eagle.token_recycling.e9_offered,
+            eagle.token_recycling.e9_accepted_drafts,
+            eagle.token_recycling.e9_emitted_tokens,
+            eagle.token_recycling.tr_rounds,
+            eagle.token_recycling.tr_offered,
+            eagle.token_recycling.tr_accepted_drafts,
+            eagle.token_recycling.tr_emitted_tokens,
+            eagle.token_recycling.cold_seed_anchors,
+            eagle.token_recycling.candidate_rows,
+            eagle.token_recycling.candidate_ids,
+        );
+    }
+    if target_row_hedge || target_row_lattice_promotion {
+        eprintln!(
+            "[bench-eagle3-target-row-{}] rounds={} inserted={} cold={} no-promotable-lattice-child={} \
+             duplicate-only={} below-score={} no-slot={} supported={} missing-lattice={} \
+             deduped={} target offered/accepted={}/{} shared-accepted={} \
+             evicted-would-accept={} counterfactual-delta={} neural-retained-sum={} \
+             cache rows/ids={}/{} depth offered/accepted={:?}/{:?}",
+            if target_row_lattice_promotion { "lattice-promotion" } else { "hedge" },
+            eagle.target_row_hedge.rounds,
+            eagle.target_row_hedge.insertion_rounds,
+            eagle.target_row_hedge.no_prior_row_rounds,
+            eagle.target_row_hedge.no_promotable_lattice_child_rounds,
+            eagle.target_row_hedge.duplicate_only_rounds,
+            eagle.target_row_hedge.below_promotion_score_rounds,
+            eagle.target_row_hedge.no_replaceable_hedge_rounds,
+            eagle.target_row_hedge.supported_primary_rows,
+            eagle.target_row_hedge.prior_rows_without_materialized_child,
+            eagle.target_row_hedge.full_path_duplicates,
+            eagle.target_row_hedge.target_rows_offered,
+            eagle.target_row_hedge.target_rows_accepted,
+            eagle.target_row_hedge.shared_rows_accepted,
+            eagle.target_row_hedge.evicted_edges_would_accept,
+            eagle.target_row_hedge.counterfactual_emitted_token_delta,
+            eagle.target_row_hedge.neural_hedges_retained_sum,
+            eagle.target_row_hedge.candidate_rows,
+            eagle.target_row_hedge.candidate_ids,
+            eagle.target_row_hedge.offered_by_depth,
+            eagle.target_row_hedge.accepted_by_depth,
+        );
+    }
+    if adaptive_expansions {
+        eprintln!(
+            "[bench-eagle3-adaptive-expansions] shallow rounds={} accepted={} | \
+             deep rounds={} accepted={} | transitions shallow->deep={} deep->shallow={} | \
+             shallow_qualifying={} cooldown_rounds={} cooldown_qualifying={} \
+             shallow_resets={} | deep_rejecting={} deep_resets={}",
+            eagle.adaptive_expansions.shallow_rounds,
+            eagle.adaptive_expansions.shallow_accepted_drafts,
+            eagle.adaptive_expansions.deep_rounds,
+            eagle.adaptive_expansions.deep_accepted_drafts,
+            eagle.adaptive_expansions.shallow_to_deep_transitions,
+            eagle.adaptive_expansions.deep_to_shallow_transitions,
+            eagle.adaptive_expansions.shallow_qualifying_windows,
+            eagle.adaptive_expansions.shallow_cooldown_rounds,
+            eagle
+                .adaptive_expansions
+                .shallow_cooldown_qualifying_windows,
+            eagle.adaptive_expansions.shallow_qualification_resets,
+            eagle.adaptive_expansions.deep_rejecting_windows,
+            eagle.adaptive_expansions.deep_rejection_resets,
+        );
+    }
+    if let Some(selector) = verifier_width_selector {
+        eprintln!(
+            "[bench-eagle3-width-selector] decisions={} N5-rounds={} N6-rounds={} costs-ms={:.6}/{:.6}",
+            eagle.verifier_widths.decisions,
+            eagle.verifier_widths.n5_rounds,
+            eagle.verifier_widths.n6_rounds,
+            selector.n5_total_ms,
+            selector.n6_total_ms,
+        );
+    }
+    if let Some(selector) = x3_x4_selector {
+        eprintln!(
+            "[bench-eagle3-x3-x4-selector] decisions={} X3-rounds={} X4-rounds={} natural-short={} x4-threshold={:.9} next-parent-probability mean/min/max={:?}/{:?}/{:?}",
+            eagle.x3_x4_expansions.decisions,
+            eagle.x3_x4_expansions.x3_rounds,
+            eagle.x3_x4_expansions.x4_rounds,
+            eagle.x3_x4_expansions.no_fourth_candidate_rounds,
+            selector.x4_min_next_parent_probability,
+            eagle.x3_x4_expansions.next_parent_probability_mean(),
+            eagle.x3_x4_expansions.next_parent_probability_min,
+            eagle.x3_x4_expansions.next_parent_probability_max,
+        );
+    }
+    if terminal_head_skip {
+        eprintln!(
+            "[bench-eagle3-terminal-head-skip] skipped={} reason={}",
+            eagle.terminal_head_updates_skipped,
+            eagle
+                .terminal_head_skip_reason
+                .map(Eagle3TerminalHeadSkipReason::label)
+                .unwrap_or("none"),
+        );
+    }
+    if authoritative_cb_fusion {
+        eprintln!(
+            "[bench-eagle3-authoritative-cb-fusion] updates={} rows={} command-buffers={}",
+            eagle.authoritative_fusion.fused_updates,
+            eagle.authoritative_fusion.fused_rows,
+            eagle.authoritative_fusion.command_buffers,
+        );
+    }
+    if dual_eagle_selector {
+        eprintln!(
+            "[bench-dual-eagle] selected={:?} dropped={:?} rounds={} E9-score={:?} SW512-score={:?} shadow-update={:.3}ms",
+            record.dual_eagle_selected_head,
+            record.dual_eagle_dropped_head,
+            record.dual_eagle_race_rounds.unwrap_or_default(),
+            record.dual_eagle_e9_score,
+            record.dual_eagle_sw512_score,
+            record.dual_eagle_shadow_update_ms.unwrap_or_default(),
+        );
+    }
     anyhow::ensure!(
         record.lossless,
         "EAGLE-3 output diverged from the resident plain target at generated token {}",
@@ -11804,6 +19836,7 @@ fn apply_runtime_tuning_env(
     apple_accelerate_min_elements: Option<usize>,
     metal_linear: bool,
     metal_q8: bool,
+    kquant_v4_stream16: bool,
 ) {
     if let Some(value) = parallel_linear_min_outputs.filter(|value| *value > 0) {
         std::env::set_var("CAMELID_PARALLEL_LINEAR_MIN_OUTPUTS", value.to_string());
@@ -11816,6 +19849,9 @@ fn apply_runtime_tuning_env(
     }
     if metal_q8 {
         std::env::set_var("CAMELID_METAL_Q8", "1");
+    }
+    if kquant_v4_stream16 {
+        std::env::set_var("CAMELID_KQUANT_V4_STREAM16", "1");
     }
 }
 

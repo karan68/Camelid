@@ -16,8 +16,6 @@ import {
   waitForWorkspaceSessionTerminal,
   WORKSPACE_IDLE_STATE,
   workspaceEndpoint,
-  workspaceFollowUpDisposition,
-  workspaceSessionMatchesRuntime,
 } from '../lib/workspaceAgent'
 import { Button } from '../components/ui/Button'
 import { Modal } from '../components/ui/Modal'
@@ -37,7 +35,6 @@ const PHASE_LABEL = {
   repeated: 'No progress',
   driver_error: 'Model error',
   cancelling: 'Stopping',
-  recovering: 'Recovering',
   cancel_error: 'Stop failed',
   error: 'Error',
 }
@@ -152,7 +149,7 @@ function IconArrowUp({ size = 20 }) {
   )
 }
 
-export function FolderPicker({ apiBase, initialPath, onClose, onPick }) {
+function FolderPicker({ apiBase, initialPath, onClose, onPick }) {
   const [view, setView] = useState(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
@@ -183,10 +180,7 @@ export function FolderPicker({ apiBase, initialPath, onClose, onPick }) {
 
   useEffect(() => {
     load(initialPath || null, true)
-    return () => {
-      requestId.current += 1
-      abortRef.current?.abort()
-    }
+    return () => abortRef.current?.abort()
   }, [load, initialPath])
 
   const atRoots = Boolean(view && view.path === null)
@@ -307,7 +301,7 @@ export default function WorkspaceView({ apiBase, capabilities, selectedModel, ru
   const [state, dispatch] = useReducer(reduceWorkspaceEvent, undefined, initialWorkspaceState)
   const [browseOpen, setBrowseOpen] = useState(false)
   const [activityOpen, setActivityOpen] = useState(false)
-  const [answerCopyState, setAnswerCopyState] = useState('idle')
+  const [answerCopied, setAnswerCopied] = useState(false)
   const [compatibleModels, setCompatibleModels] = useState([])
   const [compatibleModelsLoading, setCompatibleModelsLoading] = useState(true)
   const [compatibleModelsError, setCompatibleModelsError] = useState('')
@@ -317,19 +311,10 @@ export default function WorkspaceView({ apiBase, capabilities, selectedModel, ru
   const workspaceRef = useRef(null)
   const eventSourceRef = useRef(null)
   const sessionRef = useRef(null)
-  const workspacePathRef = useRef(workspacePath)
-  const sessionApiBaseRef = useRef(apiBase)
+  const apiBaseRef = useRef(apiBase)
   const copyTimerRef = useRef(null)
   const intentionalClosuresRef = useRef(new WeakSet())
   const timelineRef = useRef(null)
-  const mountedRef = useRef(false)
-  const operationEpochRef = useRef(0)
-  const pendingControllersRef = useRef(new Set())
-  const startInFlightRef = useRef(false)
-  const pendingStartRef = useRef(null)
-  const stopInFlightRef = useRef(false)
-  const followUpAttemptRef = useRef(null)
-  const recoveringEpochRef = useRef(null)
   const hasLoadedModel = Boolean(runtime?.loaded_now)
 
   const compatibility = useMemo(
@@ -339,13 +324,10 @@ export default function WorkspaceView({ apiBase, capabilities, selectedModel, ru
   const target = compatibility?.target || null
   const toolCapable = Boolean(hasLoadedModel && compatibility?.exact && target?.tool_capable && String(target.status || '').startsWith('supported'))
   const runtimeReady = runtime?.status === 'online' && runtime?.loaded_now && runtime?.generation_ready
-  const running = stopPending || ['starting', 'running', 'cancelling', 'recovering', 'cancel_error'].includes(state.phase)
+  const running = stopPending || ['starting', 'running', 'cancelling', 'cancel_error'].includes(state.phase)
   const stopping = stopPending
-  const sessionIdentityLocked = Boolean(session) || running
-  const sessionBackendReady = !session || String(sessionApiBaseRef.current).replace(/\/$/, '') === String(apiBase).replace(/\/$/, '')
-  const sessionModelReady = sessionBackendReady && workspaceSessionMatchesRuntime(session, runtime, toolCapable)
   const selectedThreadReady = !selectedThreadId || previewedThreadId === selectedThreadId
-  const canStart = Boolean(workspacePath.trim() && goal.trim() && toolCapable && runtimeReady && !running && !session && selectedThreadReady && !threadPreviewLoading && !threadPreviewError && !threadDeleteBusy)
+  const canStart = Boolean(workspacePath.trim() && goal.trim() && toolCapable && runtimeReady && !running && !session && selectedThreadReady && !threadPreviewLoading && !threadPreviewError)
   const conversation = state.turns
   const visibleConversation = conversation.length > MAX_RENDERED_TURNS ? conversation.slice(-MAX_RENDERED_TURNS) : conversation
   const hiddenTurnCount = Math.max(0, Math.max(state.totalTurns || 0, conversation.length) - visibleConversation.length)
@@ -368,74 +350,14 @@ export default function WorkspaceView({ apiBase, capabilities, selectedModel, ru
     return null
   }, [state.events])
 
-  const isCurrentOperation = (epoch) => mountedRef.current && operationEpochRef.current === epoch
-  const trackRequest = () => {
-    const controller = new AbortController()
-    pendingControllersRef.current.add(controller)
-    return controller
-  }
-  const finishRequest = (controller) => pendingControllersRef.current.delete(controller)
-  const abortTrackedRequests = (preserveControllers = []) => {
-    const preserved = new Set(preserveControllers)
-    for (const controller of pendingControllersRef.current) {
-      if (!preserved.has(controller)) {
-        controller.abort()
-        pendingControllersRef.current.delete(controller)
-      }
-    }
-  }
-  const beginOperation = (preserveControllers = []) => {
-    operationEpochRef.current += 1
-    abortTrackedRequests(preserveControllers)
-    recoveringEpochRef.current = null
-    return operationEpochRef.current
-  }
-  const closeEventStream = (source = eventSourceRef.current) => {
-    if (!source) return
-    intentionalClosuresRef.current.add(source)
-    source.close()
-    if (eventSourceRef.current === source) eventSourceRef.current = null
-  }
-  const refreshSavedThreadsFor = async (path, epoch, requestApiBase = apiBase) => {
-    if (!path || !isCurrentOperation(epoch)) return
-    const controller = trackRequest()
-    try {
-      const threads = await getWorkspaceThreads(requestApiBase, path, { signal: controller.signal })
-      if (isCurrentOperation(epoch) && workspacePathRef.current.trim() === path) setSavedThreads(threads)
-    } catch (error) {
-      if (error.name !== 'AbortError' && isCurrentOperation(epoch) && workspacePathRef.current.trim() === path) setSavedThreads([])
-    } finally {
-      finishRequest(controller)
-    }
-  }
-  const restoreDurableThread = async (created, epoch, requestApiBase = apiBase) => {
-    const controller = trackRequest()
-    try {
-      const restored = await getWorkspaceThread(requestApiBase, created.workspace, created.id, { signal: controller.signal })
-      if (!isCurrentOperation(epoch)) return false
-      if (String(restored?.thread?.id || '') !== String(created.id)) {
-        throw new Error('Saved Workspace thread returned a mismatched identity.')
-      }
-      dispatch({ event: 'thread.restored', turns: restored.turns, turnCount: restored.thread.turn_count })
-      setCompaction({
-        compacted_through_turn: restored.thread.compacted_through_turn,
-        archived_turns: 0,
-        compaction_count: restored.thread.compaction_count || 0,
-      })
-      return true
-    } finally {
-      finishRequest(controller)
-    }
-  }
-
   useEffect(() => {
     const controller = new AbortController()
     setCompatibleModelsLoading(true)
     setCompatibleModelsError('')
     getWorkspaceCompatibleModels(apiBase, { signal: controller.signal })
-      .then((models) => { if (!controller.signal.aborted) setCompatibleModels(models) })
+      .then(setCompatibleModels)
       .catch((error) => {
-        if (!controller.signal.aborted && error.name !== 'AbortError') setCompatibleModelsError('Compatible model details are unavailable from this running backend. Open Models to browse local and curated options.')
+        if (error.name !== 'AbortError') setCompatibleModelsError('Compatible model details are unavailable from this running backend. Open Models to browse local and curated options.')
       })
       .finally(() => {
         if (!controller.signal.aborted) setCompatibleModelsLoading(false)
@@ -452,12 +374,8 @@ export default function WorkspaceView({ apiBase, capabilities, selectedModel, ru
     const controller = new AbortController()
     const timer = window.setTimeout(() => {
       getWorkspaceThreads(apiBase, path, { signal: controller.signal })
-        .then((threads) => {
-          if (!controller.signal.aborted && workspacePathRef.current.trim() === path) setSavedThreads(threads)
-        })
-        .catch((error) => {
-          if (!controller.signal.aborted && error.name !== 'AbortError' && workspacePathRef.current.trim() === path) setSavedThreads([])
-        })
+        .then(setSavedThreads)
+        .catch((error) => { if (error.name !== 'AbortError') setSavedThreads([]) })
     }, 250)
     return () => { window.clearTimeout(timer); controller.abort() }
   }, [apiBase, workspacePath])
@@ -489,7 +407,7 @@ export default function WorkspaceView({ apiBase, capabilities, selectedModel, ru
         setPreviewedThreadId(selectedThreadId)
       })
       .catch((error) => {
-        if (!controller.signal.aborted && error.name !== 'AbortError') setThreadPreviewError(error.message || 'Saved conversation could not be loaded.')
+        if (error.name !== 'AbortError') setThreadPreviewError(error.message || 'Saved conversation could not be loaded.')
       })
       .finally(() => {
         if (!controller.signal.aborted) setThreadPreviewLoading(false)
@@ -498,14 +416,13 @@ export default function WorkspaceView({ apiBase, capabilities, selectedModel, ru
   }, [apiBase, workspacePath, selectedThreadId, session])
 
   useEffect(() => {
-    if (workspacePath.trim()) appStorage.setItem('camelid.workspacePath', workspacePath)
-    else appStorage.removeItem('camelid.workspacePath')
+    if (workspacePath) appStorage.setItem('camelid.workspacePath', workspacePath)
   }, [workspacePath])
 
   useEffect(() => {
     sessionRef.current = session
-    workspacePathRef.current = workspacePath
-  }, [session, workspacePath])
+    apiBaseRef.current = apiBase
+  }, [apiBase, session])
 
   useEffect(() => {
     appStorage.setItem('camelid.workspaceSetupPercent', String(setupPercent))
@@ -523,335 +440,149 @@ export default function WorkspaceView({ apiBase, capabilities, selectedModel, ru
   }, [])
 
   useEffect(() => {
-    const live = state.events.at(-1)?.event === 'model.live'
-    const frame = window.requestAnimationFrame(() => {
-      timelineRef.current?.scrollTo({ top: timelineRef.current.scrollHeight, behavior: live ? 'auto' : 'smooth' })
-    })
-    return () => window.cancelAnimationFrame(frame)
-  }, [state.events.length, state.events.at(-1)?.content?.length, state.phase])
+    timelineRef.current?.scrollTo({ top: timelineRef.current.scrollHeight, behavior: 'smooth' })
+  }, [state.events.length, state.phase])
 
   useEffect(() => {
     if (running) setActivityOpen(true)
     else if (state.phase === 'finished' && finalAnswer) setActivityOpen(false)
   }, [running, state.phase, finalAnswer])
 
-  useEffect(() => {
-    mountedRef.current = true
-    return () => {
-      mountedRef.current = false
-      operationEpochRef.current += 1
-      abortTrackedRequests()
-      if (copyTimerRef.current) window.clearTimeout(copyTimerRef.current)
-      const activeSession = sessionRef.current
-      sessionRef.current = null
-      if (activeSession) cancelWorkspaceSession(sessionApiBaseRef.current, activeSession.id).catch(() => {})
-      closeEventStream()
+  useEffect(() => () => {
+    if (copyTimerRef.current) window.clearTimeout(copyTimerRef.current)
+    if (sessionRef.current) {
+      cancelWorkspaceSession(apiBaseRef.current, sessionRef.current.id).catch(() => {})
+    }
+    if (eventSourceRef.current) {
+      intentionalClosuresRef.current.add(eventSourceRef.current)
+      eventSourceRef.current.close()
     }
   }, [])
 
-  const settleBrokenStream = async (created, epoch, message, requestApiBase = apiBase) => {
-    if (!isCurrentOperation(epoch) || recoveringEpochRef.current === epoch) return
-    recoveringEpochRef.current = epoch
-    closeEventStream()
-    dispatch({ event: 'session.recovering', message })
-    const controller = trackRequest()
-    let terminal = null
-    try {
-      const status = await cancelWorkspaceSession(requestApiBase, created.id, { signal: controller.signal })
-      terminal = status === 404
-        ? { state: 'cancelled' }
-        : await waitForWorkspaceSessionTerminal(requestApiBase, created.id, { signal: controller.signal })
-    } catch (error) {
-      if (error.name !== 'AbortError' && isCurrentOperation(epoch)) {
-        dispatch({ event: 'turn.stop_failed', message: `Workspace recovery could not confirm the turn stopped: ${error.message}` })
-      }
-      return
-    } finally {
-      finishRequest(controller)
-    }
-    if (!isCurrentOperation(epoch)) return
-    setSessionRuntime(terminal)
-    try { await restoreDurableThread(created, epoch, requestApiBase) } catch {}
-    await refreshSavedThreadsFor(created.workspace, epoch, requestApiBase)
-    if (isCurrentOperation(epoch)) {
-      recoveringEpochRef.current = null
-      dispatch({ event: 'session.error', message })
-    }
-  }
-
-  const openEventStream = (created, epoch, requestApiBase = apiBase) => {
-    if (!isCurrentOperation(epoch)) return
-    closeEventStream()
-    const url = workspaceEndpoint(requestApiBase, `/${encodeURIComponent(created.id)}/events`)
-    let source
-    try {
-      source = new EventSource(url)
-    } catch {
-      void settleBrokenStream(created, epoch, 'The Workspace event stream could not be opened.', requestApiBase)
-      return
-    }
+  const openEventStream = (created) => {
+    const url = workspaceEndpoint(apiBase, `/${encodeURIComponent(created.id)}/events`)
+    const source = new EventSource(url)
     eventSourceRef.current = source
     source.addEventListener('workspace', (message) => {
-      if (eventSourceRef.current !== source || !isCurrentOperation(epoch)) return
+      if (eventSourceRef.current !== source) return
       try {
         const envelope = JSON.parse(message.data)
         if (envelope.event === 'memory.compacted') setCompaction(envelope)
         dispatch(envelope)
-        if (envelope.event === 'approval.required') {
-          void settleBrokenStream(created, epoch, 'Read-only Workspace received an unexpected approval request.', requestApiBase)
-          return
-        }
         if (['session.finished', 'session.error'].includes(envelope.event)) {
-          closeEventStream(source)
-          const controller = trackRequest()
-          getWorkspaceSession(requestApiBase, created.id, { signal: controller.signal })
-            .then((status) => { if (isCurrentOperation(epoch)) setSessionRuntime(status) })
-            .catch(() => {})
-            .finally(() => finishRequest(controller))
-          void refreshSavedThreadsFor(created.workspace, epoch, requestApiBase)
+          getWorkspaceSession(apiBase, created.id).then(setSessionRuntime).catch(() => {})
+          intentionalClosuresRef.current.add(source)
+          source.close()
+          eventSourceRef.current = null
         }
       } catch {
-        void settleBrokenStream(created, epoch, 'Camelid returned an unreadable Workspace event.', requestApiBase)
+        dispatch({ event: 'session.error', message: 'Camelid returned an unreadable Workspace event.' })
+        intentionalClosuresRef.current.add(source)
+        source.close()
       }
     })
     source.onerror = () => {
       if (intentionalClosuresRef.current.has(source)) return
-      if (eventSourceRef.current !== source || !isCurrentOperation(epoch)) return
-      void settleBrokenStream(created, epoch, 'The Workspace event stream disconnected.', requestApiBase)
+      if (eventSourceRef.current !== source) return
+      dispatch({ event: 'session.error', message: 'The Workspace event stream disconnected.' })
+      source.close()
+      eventSourceRef.current = null
     }
   }
 
   const start = async () => {
-    if (!canStart || startInFlightRef.current || sessionRef.current) return
-    startInFlightRef.current = true
-    const epoch = beginOperation()
-    const requestApiBase = apiBase
-    const requestedGoal = goal.trim()
-    const controller = trackRequest()
-    let settleAttempt
-    const attempt = {
-      controller,
-      requestApiBase,
-      stopRequested: false,
-      result: new Promise((resolve) => { settleAttempt = resolve }),
-    }
-    pendingStartRef.current = attempt
+    if (!canStart) return
     dispatch({ event: 'session.starting' })
     try {
-      const created = await createWorkspaceSession(requestApiBase, {
+      const created = await createWorkspaceSession(apiBase, {
         workspace: workspacePath.trim(),
-        goal: requestedGoal,
+        goal: goal.trim(),
         thread_id: selectedThreadId || undefined,
         max_steps: 12,
         max_tokens: 512,
         temperature: 0,
         allow_writes: false,
-      }, { signal: controller.signal })
-      settleAttempt({ created })
-      if (!isCurrentOperation(epoch)) {
-        if (!attempt.stopRequested && created?.id) cancelWorkspaceSession(requestApiBase, created.id).catch(() => {})
-        return
-      }
-      if (!created?.id || !created?.workspace || !created?.model_id) {
-        if (created?.id) cancelWorkspaceSession(requestApiBase, created.id).catch(() => {})
-        throw new Error('Workspace start returned an incomplete session identity.')
-      }
-      sessionRef.current = created
-      sessionApiBaseRef.current = requestApiBase
-      workspacePathRef.current = created.workspace
-      setWorkspacePath(created.workspace)
+      })
       setSession(created)
-      setSessionRuntime(null)
-      followUpAttemptRef.current = null
-      dispatch({ event: 'turn.user', content: requestedGoal })
-      openEventStream(created, epoch, requestApiBase)
+      dispatch({ event: 'turn.user', content: goal.trim() })
+      openEventStream(created)
     } catch (error) {
-      settleAttempt({ error })
-      if (error.name !== 'AbortError' && isCurrentOperation(epoch)) {
-        dispatch({ event: 'session.error', message: error.message })
-      }
-    } finally {
-      finishRequest(controller)
-      startInFlightRef.current = false
-      if (pendingStartRef.current === attempt) pendingStartRef.current = null
+      dispatch({ event: 'session.error', message: error.message })
     }
   }
 
   const sendFollowUp = async () => {
-    const boundSession = sessionRef.current
     const text = followUp.trim()
-    if (!boundSession || !text || running || compactionBusy || !sessionBackendReady || !workspaceSessionMatchesRuntime(boundSession, runtime, toolCapable)) return
-    let attempt = followUpAttemptRef.current
-    if (!attempt || attempt.text !== text) {
-      attempt = { text, id: window.crypto.randomUUID(), inFlight: false }
-      followUpAttemptRef.current = attempt
-    }
-    if (attempt.inFlight) return
-    attempt.inFlight = true
-    const epoch = beginOperation()
-    const requestApiBase = sessionApiBaseRef.current
-    const controller = trackRequest()
+    if (!session || !text || running) return
     dispatch({ event: 'turn.starting' })
-    const acceptStream = () => {
-      if (!isCurrentOperation(epoch)) return
+    try {
+      await sendWorkspaceMessage(apiBase, session.id, text, window.crypto.randomUUID())
       dispatch({ event: 'turn.user', content: text })
       setFollowUp('')
-      followUpAttemptRef.current = null
-      openEventStream(boundSession, epoch, requestApiBase)
-    }
-    try {
-      const response = await sendWorkspaceMessage(requestApiBase, boundSession.id, text, attempt.id, { signal: controller.signal })
-      if (!isCurrentOperation(epoch)) return
-      const disposition = workspaceFollowUpDisposition(response, boundSession.id)
-      if (disposition === 'stream') {
-        acceptStream()
-      } else if (disposition === 'restore') {
-        await restoreDurableThread(boundSession, epoch, requestApiBase)
-        await refreshSavedThreadsFor(boundSession.workspace, epoch, requestApiBase)
-        if (isCurrentOperation(epoch)) {
-          setFollowUp('')
-          followUpAttemptRef.current = null
-        }
-      } else {
-        setFollowUp('')
-        followUpAttemptRef.current = null
-        await settleBrokenStream(boundSession, epoch, `Workspace returned an unsafe follow-up state (${response.state || 'unknown'}).`, requestApiBase)
-      }
+      openEventStream(session)
     } catch (error) {
-      if (error.name === 'AbortError' || !isCurrentOperation(epoch)) return
-      try {
-        const status = await getWorkspaceSession(requestApiBase, boundSession.id, { signal: controller.signal })
-        if (!isCurrentOperation(epoch)) return
-        if (status.state === 'waiting_for_events') {
-          acceptStream()
-          return
-        }
-        if (['running', 'cancelling'].includes(status.state)) {
-          setFollowUp('')
-          followUpAttemptRef.current = null
-          await settleBrokenStream(boundSession, epoch, 'Workspace could not safely resume the follow-up event stream.', requestApiBase)
-          return
-        }
-      } catch (statusError) {
-        if (statusError.name === 'AbortError' || !isCurrentOperation(epoch)) return
-      }
-      if (isCurrentOperation(epoch)) dispatch({ event: 'session.error', message: error.message })
-    } finally {
-      finishRequest(controller)
-      if (followUpAttemptRef.current === attempt) attempt.inFlight = false
+      dispatch({ event: 'session.error', message: error.message })
     }
   }
 
   const stop = async () => {
-    if (stopInFlightRef.current) return
-    const boundSession = sessionRef.current
-    const pendingStart = !boundSession && startInFlightRef.current ? pendingStartRef.current : null
-    if (!boundSession && !pendingStart && !running) return
-    stopInFlightRef.current = true
-    // The server can publish a session before its create response reaches the
-    // browser. Preserve that request so Stop can learn the published ID and
-    // cancel it instead of abandoning an unclaimed session on the backend.
-    if (pendingStart) pendingStart.stopRequested = true
-    const epoch = beginOperation(pendingStart ? [pendingStart.controller] : [])
-    let sessionToCancel = boundSession
-    let requestApiBase = boundSession ? sessionApiBaseRef.current : pendingStart?.requestApiBase || apiBase
-    followUpAttemptRef.current = null
-    closeEventStream()
+    if (!session || stopping) return
     setStopPending(true)
     dispatch({ event: 'turn.stopping' })
-    let controller = null
     try {
-      if (!sessionToCancel && pendingStart) {
-        const startResult = await pendingStart.result
-        if (!isCurrentOperation(epoch)) return
-        if (!startResult.created?.id) {
-          dispatch({ event: 'session.finished', outcome: 'cancelled' })
-          return
-        }
-        sessionToCancel = startResult.created
-        requestApiBase = pendingStart.requestApiBase
-      }
-      if (!sessionToCancel) {
-        dispatch({ event: 'session.finished', outcome: 'cancelled' })
-        return
-      }
-      controller = trackRequest()
-      const status = await cancelWorkspaceSession(requestApiBase, sessionToCancel.id, { signal: controller.signal })
-      const terminal = status === 404
-        ? { state: 'cancelled' }
-        : await waitForWorkspaceSessionTerminal(requestApiBase, sessionToCancel.id, { signal: controller.signal })
-      if (!isCurrentOperation(epoch)) return
-      setSessionRuntime(terminal)
+      const status = await cancelWorkspaceSession(apiBase, session.id)
+      if (status !== 404) await waitForWorkspaceSessionTerminal(apiBase, session.id)
       dispatch({ event: 'session.finished', outcome: 'cancelled' })
-      await refreshSavedThreadsFor(sessionToCancel.workspace || workspacePathRef.current.trim(), epoch, requestApiBase)
-    } catch (error) {
-      if (error.name !== 'AbortError' && isCurrentOperation(epoch)) {
-        dispatch({ event: 'turn.stop_failed', message: error.message })
+      if (eventSourceRef.current) {
+        intentionalClosuresRef.current.add(eventSourceRef.current)
+        eventSourceRef.current.close()
       }
+      eventSourceRef.current = null
+    } catch (error) {
+      dispatch({ event: 'turn.stop_failed', message: error.message })
     } finally {
-      if (controller) finishRequest(controller)
-      if (isCurrentOperation(epoch)) setStopPending(false)
-      stopInFlightRef.current = false
+      setStopPending(false)
     }
   }
 
   const reset = async () => {
-    const boundSession = sessionRef.current
-    const refreshPath = boundSession?.workspace || workspacePathRef.current.trim()
-    const cancellationApiBase = boundSession ? sessionApiBaseRef.current : apiBase
-    const currentApiBase = apiBase
-    const epoch = beginOperation()
-    closeEventStream()
-    sessionRef.current = null
-    followUpAttemptRef.current = null
+    if (session) {
+      try { await cancelWorkspaceSession(apiBase, session.id) } catch {}
+    }
+    if (eventSourceRef.current) {
+      intentionalClosuresRef.current.add(eventSourceRef.current)
+      eventSourceRef.current.close()
+    }
+    eventSourceRef.current = null
     setSession(null)
     setSessionRuntime(null)
-    setStopPending(false)
     setSelectedThreadId('')
     setPreviewedThreadId('')
     setThreadPreviewError('')
     setFollowUp('')
     setCompaction(null)
     dispatch({ event: 'session.reset' })
-    if (boundSession) {
-      const controller = trackRequest()
-      try { await cancelWorkspaceSession(cancellationApiBase, boundSession.id, { signal: controller.signal }) } catch {}
-      finally { finishRequest(controller) }
-    }
-    await refreshSavedThreadsFor(refreshPath, epoch, currentApiBase)
   }
 
   const deleteSelectedThread = async () => {
     if (!selectedThreadId || threadDeleteBusy) return
-    const selected = savedThreads.find((thread) => thread.id === selectedThreadId)
-    const label = selected?.title || selected?.goal || selectedThreadId
-    if (!window.confirm(`Delete the saved Workspace thread “${label}”? This cannot be undone.`)) return
-    const epoch = operationEpochRef.current
-    const controller = trackRequest()
     setThreadDeleteBusy(true)
     try {
-      await deleteWorkspaceThread(apiBase, workspacePath.trim(), selectedThreadId, { signal: controller.signal })
-      if (isCurrentOperation(epoch)) {
-        setSavedThreads((threads) => threads.filter((thread) => thread.id !== selectedThreadId))
-        setSelectedThreadId('')
-      }
+      await deleteWorkspaceThread(apiBase, workspacePath.trim(), selectedThreadId)
+      setSavedThreads((threads) => threads.filter((thread) => thread.id !== selectedThreadId))
+      setSelectedThreadId('')
     } catch (error) {
-      if (error.name !== 'AbortError' && isCurrentOperation(epoch)) dispatch({ event: 'session.error', message: error.message })
+      dispatch({ event: 'session.error', message: error.message })
     } finally {
-      finishRequest(controller)
-      if (isCurrentOperation(epoch)) setThreadDeleteBusy(false)
+      setThreadDeleteBusy(false)
     }
   }
 
   const updateCompaction = async (undo = false) => {
-    const boundSession = sessionRef.current
-    if (!boundSession || running || compactionBusy) return
-    const epoch = operationEpochRef.current
-    const controller = trackRequest()
+    if (!session || running || compactionBusy) return
     setCompactionBusy(true)
     try {
-      const result = await compactWorkspaceThread(sessionApiBaseRef.current, boundSession.workspace, boundSession.id, undo, { signal: controller.signal })
-      if (!isCurrentOperation(epoch)) return
+      const result = await compactWorkspaceThread(apiBase, workspacePath.trim(), session.id, undo)
       setCompaction(result)
       dispatch({
         event: 'session.notice',
@@ -860,10 +591,9 @@ export default function WorkspaceView({ apiBase, capabilities, selectedModel, ru
           : `Compacted ${result.archived_turns} turns. Raw history remains searchable.`,
       })
     } catch (error) {
-      if (error.name !== 'AbortError' && isCurrentOperation(epoch)) dispatch({ event: 'session.error', message: error.message })
+      dispatch({ event: 'session.error', message: error.message })
     } finally {
-      finishRequest(controller)
-      if (isCurrentOperation(epoch)) setCompactionBusy(false)
+      setCompactionBusy(false)
     }
   }
 
@@ -922,13 +652,12 @@ export default function WorkspaceView({ apiBase, capabilities, selectedModel, ru
   const otherCompatibleModels = compatibleModels.filter((model) => !featuredFilenames.has(model.filename))
 
   const copyAnswer = async () => {
-    const copied = await copyText(finalAnswer)
-    if (!mountedRef.current) return
-    setAnswerCopyState(copied ? 'copied' : 'failed')
+    await copyText(finalAnswer)
+    setAnswerCopied(true)
     if (copyTimerRef.current) window.clearTimeout(copyTimerRef.current)
     copyTimerRef.current = window.setTimeout(() => {
       copyTimerRef.current = null
-      if (mountedRef.current) setAnswerCopyState('idle')
+      setAnswerCopied(false)
     }, 1500)
   }
 
@@ -954,7 +683,7 @@ export default function WorkspaceView({ apiBase, capabilities, selectedModel, ru
     if (terminalError && conversation.length === 0) {
       const meta = TERMINAL_RESULT[state.phase]
       return (
-        <div className="workspace-result__status is-error" role="alert">
+        <div className="workspace-result__status is-error">
           <IconError size={20} />
           <strong>{meta.title}</strong>
           <span>{state.error || meta.detail}</span>
@@ -963,7 +692,7 @@ export default function WorkspaceView({ apiBase, capabilities, selectedModel, ru
     }
     if (running && conversation.length === 0) {
       return (
-        <div className="workspace-result__working" role="status">
+        <div className="workspace-result__working">
           <span className="workspace-result__spinner" aria-hidden="true" />
           <strong>Camelid is working…</strong>
           <span>Reading your files and preparing the answer. Watch each step under “What Camelid did”.</span>
@@ -975,7 +704,7 @@ export default function WorkspaceView({ apiBase, capabilities, selectedModel, ru
       return (
         <div className="workspace-conversation">
           {errorMeta ? (
-            <div className="workspace-result__status is-error" role="alert">
+            <div className="workspace-result__status is-error">
               <IconError size={20} />
               <strong>{errorMeta.title}</strong>
               <span>{state.error || errorMeta.detail}</span>
@@ -988,8 +717,8 @@ export default function WorkspaceView({ apiBase, capabilities, selectedModel, ru
               <div className="workspace-answer__bar">
                 <span className="workspace-answer__label"><IconCheckCircle size={15} /> Answer {index + 1}</span>
                 {turn.assistant && index === visibleConversation.length - 1 && !running ? (
-                  <button type="button" className="workspace-answer__copy" onClick={copyAnswer} aria-live="polite">
-                    {answerCopyState === 'copied' ? 'Copied' : answerCopyState === 'failed' ? 'Copy failed' : 'Copy'}
+                  <button type="button" className="workspace-answer__copy" onClick={copyAnswer}>
+                    {answerCopied ? 'Copied' : 'Copy'}
                   </button>
                 ) : null}
               </div>
@@ -1008,27 +737,14 @@ export default function WorkspaceView({ apiBase, capabilities, selectedModel, ru
               <textarea
                 id="workspace-follow-up"
                 value={followUp}
-                onChange={(event) => {
-                  const value = event.target.value
-                  if (followUpAttemptRef.current?.text !== value.trim()) followUpAttemptRef.current = null
-                  setFollowUp(value)
-                }}
+                onChange={(event) => setFollowUp(event.target.value)}
                 placeholder="Ask about this folder or an earlier finding…"
                 rows={3}
-                disabled={!sessionModelReady || compactionBusy}
-                aria-describedby={!sessionModelReady ? 'workspace-follow-up-model-warning' : undefined}
               />
-              <Button variant="primary" type="submit" disabled={!followUp.trim() || !sessionModelReady || compactionBusy}>
+              <Button variant="primary" type="submit" disabled={!followUp.trim()}>
                 <IconSend size={16} /> Send
               </Button>
             </div>
-            {!sessionModelReady ? (
-              <small id="workspace-follow-up-model-warning" role="status">
-                {sessionBackendReady
-                  ? `Reload the exact Workspace model used by this session (${session.model_id}) before sending a follow-up.`
-                  : 'Return to the Camelid backend that created this session before sending a follow-up.'}
-              </small>
-            ) : null}
           </form> : null}
         </div>
       )
@@ -1044,7 +760,7 @@ export default function WorkspaceView({ apiBase, capabilities, selectedModel, ru
     }
     const meta = TERMINAL_RESULT[state.phase] || { title: 'Session finished', detail: 'Camelid finished without a written answer.' }
     return (
-      <div className="workspace-result__status" role="status">
+      <div className="workspace-result__status">
         <IconBolt size={20} />
         <strong>{meta.title}</strong>
         {meta.detail ? <span>{meta.detail}</span> : null}
@@ -1064,7 +780,7 @@ export default function WorkspaceView({ apiBase, capabilities, selectedModel, ru
             <p className="workspace-kicker">Local file workspace</p>
             <h2 id="workspace-heading">Give Camelid a bounded task</h2>
           </div>
-          <span className={`workspace-status is-${statusClass}`} role="status" aria-live="polite" aria-atomic="true">{statusLabel}</span>
+          <span className={`workspace-status is-${statusClass}`}>{statusLabel}</span>
         </div>
 
         <div className="workspace-model-line">
@@ -1120,13 +836,10 @@ export default function WorkspaceView({ apiBase, capabilities, selectedModel, ru
           <span>Workspace folder</span>
           <div className="workspace-field__control">
             <input
-              value={session?.workspace || workspacePath}
-              onChange={(event) => {
-                workspacePathRef.current = event.target.value
-                setWorkspacePath(event.target.value)
-              }}
+              value={workspacePath}
+              onChange={(event) => setWorkspacePath(event.target.value)}
               placeholder={navigator.platform?.startsWith('Win') ? 'C:\\projects\\example' : '/workspace/example'}
-              disabled={sessionIdentityLocked}
+              disabled={running}
               spellCheck="false"
               aria-label="Workspace folder"
             />
@@ -1135,14 +848,12 @@ export default function WorkspaceView({ apiBase, capabilities, selectedModel, ru
               className="workspace-field__browse"
               icon={<IconSearch size={16} />}
               onClick={() => setBrowseOpen(true)}
-              disabled={sessionIdentityLocked}
+              disabled={running}
             >
               Browse…
             </Button>
           </div>
-          <small>{session
-            ? `This session is locked to ${session.workspace}. Clear activity before choosing another folder.`
-            : 'Camelid canonicalizes this directory and rejects paths that leave it.'}</small>
+          <small>Camelid canonicalizes this directory and rejects paths that leave it.</small>
         </div>
         {savedThreads.length > 0 && !session ? (
           <label className="workspace-field workspace-thread-picker">
@@ -1168,13 +879,7 @@ export default function WorkspaceView({ apiBase, capabilities, selectedModel, ru
             apiBase={apiBase}
             initialPath={workspacePath.trim() || null}
             onClose={() => setBrowseOpen(false)}
-            onPick={(path) => {
-              if (path) {
-                workspacePathRef.current = path
-                setWorkspacePath(path)
-              }
-              setBrowseOpen(false)
-            }}
+            onPick={(path) => { if (path) setWorkspacePath(path); setBrowseOpen(false) }}
           />
         ) : null}
 
@@ -1185,7 +890,7 @@ export default function WorkspaceView({ apiBase, capabilities, selectedModel, ru
             onChange={(event) => setGoal(event.target.value)}
             placeholder="Review this folder, find why the tests fail, and propose the smallest repair."
             rows={4}
-            disabled={sessionIdentityLocked}
+            disabled={running}
           />
         </label>
 
@@ -1195,7 +900,7 @@ export default function WorkspaceView({ apiBase, capabilities, selectedModel, ru
           ) : !session ? (
             <Button variant="primary" onClick={start} disabled={!canStart}><IconPlay size={17} /> {selectedThreadId ? 'Resume & send' : 'Start Workspace'}</Button>
           ) : null}
-          {!running && (session || state.events.length > 0) && <Button variant="ghost" onClick={reset}><IconClose size={17} /> Clear activity</Button>}
+          {!running && state.events.length > 0 && <Button variant="ghost" onClick={reset}><IconClose size={17} /> Clear activity</Button>}
           <span>12 steps · read-only tools run automatically · files are never changed</span>
         </div>
       </section>
@@ -1251,7 +956,7 @@ export default function WorkspaceView({ apiBase, capabilities, selectedModel, ru
               <span>What Camelid did</span>
               <span className="workspace-activity-count">{stepCount} {stepCount === 1 ? 'step' : 'steps'}</span>
             </summary>
-            <div className="workspace-activity__scroll" ref={timelineRef} role="log" aria-live="polite" aria-relevant="additions">
+            <div className="workspace-activity__scroll" ref={timelineRef}>
               <ol className="workspace-timeline">
                 {state.events.map((event, index) => <ActivityRow key={eventKey(event, index)} event={event} />)}
               </ol>

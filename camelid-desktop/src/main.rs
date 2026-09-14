@@ -14,10 +14,8 @@ mod ui_storage;
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{Emitter, Manager, State};
 use tauri_plugin_dialog::DialogExt;
-use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 
 use engine::Engine;
 use ui_storage::UiStorageState;
@@ -272,22 +270,6 @@ fn emit_error(app: &tauri::AppHandle, title: &str, guidance: &str, detail: &str)
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .plugin(
-            tauri_plugin_global_shortcut::Builder::new()
-                .with_handler(|app, _shortcut, event| {
-                    if event.state() == ShortcutState::Pressed {
-                        if let Some(spotlight) = app.get_webview_window("spotlight") {
-                            if spotlight.is_visible().unwrap_or(false) {
-                                let _ = spotlight.hide();
-                            } else {
-                                let _ = spotlight.show();
-                                let _ = spotlight.set_focus();
-                            }
-                        }
-                    }
-                })
-                .build(),
-        )
         .manage(EngineState::default())
         .manage(StartupState::default())
         .manage(UiStorageState::default())
@@ -301,35 +283,6 @@ fn main() {
             ui_storage::replace_ui_storage
         ])
         .setup(|app| {
-            let _ = app
-                .global_shortcut()
-                .register("CommandOrControl+Shift+Space");
-
-            if let Some(icon) = app.default_window_icon() {
-                let _ = TrayIconBuilder::new()
-                    .icon(icon.clone())
-                    .tooltip("Camelid Spotlight")
-                    .on_tray_icon_event(|tray, event| {
-                        if let TrayIconEvent::Click {
-                            button: MouseButton::Left,
-                            button_state: MouseButtonState::Up,
-                            ..
-                        } = event
-                        {
-                            let app = tray.app_handle();
-                            if let Some(spotlight) = app.get_webview_window("spotlight") {
-                                if spotlight.is_visible().unwrap_or(false) {
-                                    let _ = spotlight.hide();
-                                } else {
-                                    let _ = spotlight.show();
-                                    let _ = spotlight.set_focus();
-                                }
-                            }
-                        }
-                    })
-                    .build(app);
-            }
-
             let handle = app.handle().clone();
             // Start the sidecar off the UI thread so the splash paints immediately.
             std::thread::spawn(move || start_engine(handle));
@@ -412,13 +365,6 @@ fn start_engine(app: tauri::AppHandle) {
                         &format!("invalid engine URL {url}: {e}"),
                     ),
                 }
-
-                if let Some(spotlight) = app.get_webview_window("spotlight") {
-                    if let Ok(mut parsed_spotlight) = tauri::Url::parse(&url) {
-                        parsed_spotlight.set_fragment(Some("spotlight"));
-                        let _ = spotlight.navigate(parsed_spotlight);
-                    }
-                }
             } else {
                 emit_error(
                     &app,
@@ -496,65 +442,6 @@ mod tests {
         assert!(
             write_models_directory_preference(root.path(), PathBuf::from("relative/models"))
                 .is_err()
-        );
-    }
-
-    /// Every capability that owns the `main` window must grant start-dragging.
-    ///
-    /// This is a regression guard for a bug that shipped in v0.7.0 and made the
-    /// macOS window impossible to move at all. The window is `titleBarStyle:
-    /// "Overlay"` with `hiddenTitle`, so the OS titlebar is ours to draw and the
-    /// app's own `data-tauri-drag-region` strip is the window's ONLY drag
-    /// handle. That strip fires `startDragging` over IPC — and `core:default`
-    /// does not carry the permission for it: `core:window:default` is a
-    /// read-only set (sizes, positions, `is-*`, monitors, theme, and
-    /// `internal-toggle-maximize`).
-    ///
-    /// The failure is silent and easy to reintroduce, because the ACL denial
-    /// produces no build error and no crash — just a window that will not move,
-    /// while double-click-to-zoom keeps working and makes it look like the
-    /// titlebar is fine. Assert the grant instead of trusting a review to spot
-    /// its absence.
-    ///
-    /// `spotlight-ui` is deliberately excluded: that window is a centred,
-    /// always-on-top overlay that is positioned, never dragged.
-    #[test]
-    fn main_window_capabilities_grant_start_dragging() {
-        const DRAG: &str = "core:window:allow-start-dragging";
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("capabilities");
-        let mut checked = 0;
-
-        for entry in std::fs::read_dir(&dir).expect("capabilities directory") {
-            let path = entry.expect("capability entry").path();
-            if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                continue;
-            }
-            let raw = std::fs::read_to_string(&path).expect("read capability");
-            let value: serde_json::Value = serde_json::from_str(&raw).expect("capability is JSON");
-
-            let owns_main = value["windows"]
-                .as_array()
-                .is_some_and(|w| w.iter().any(|entry| entry == "main"));
-            if !owns_main {
-                continue;
-            }
-
-            let permissions = value["permissions"].as_array().expect("permissions array");
-            assert!(
-                permissions.iter().any(|p| p == DRAG),
-                "{} owns the main window but does not grant {DRAG}; the macOS window \
-                 cannot be moved without it",
-                path.display()
-            );
-            checked += 1;
-        }
-
-        // Both the splash capability and the remote loopback one own `main`. If
-        // this count ever drops, a capability was renamed or removed and the
-        // loop above silently stopped checking anything.
-        assert_eq!(
-            checked, 2,
-            "expected exactly two capabilities owning the main window"
         );
     }
 }

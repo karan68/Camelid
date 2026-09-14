@@ -157,11 +157,6 @@ phase gate.
   highlighting; streaming with stop/abort; regenerate and edit-and-resend
   (single gate-checked send path); per-message telemetry footer (client-measured,
   labeled); conversation export (Markdown/JSON, path-free by whitelist);
-  persisted **Web Auto / Off** control that reads explicit links or searches
-  current-information prompts before generation (including linked-source plus
-  supplemental-search requests), injects query-ranked/path-labelled bounded
-  untrusted evidence without requiring model tool calls, and retains only the
-  sources that reached the model on the reply;
   Generation-controls drawer (system prompt + presets; sampling parameters stay
   guarded until `/api/capabilities` advertises the exact row).
 - **Models** — Evidence Chips on every local GGUF card (unmatched models show a
@@ -189,36 +184,3 @@ phase gate.
 - `Enter` / `Shift+Enter` — send / newline in the composer
 - `Esc` — stop a running generation, close overlays
 - `?` — shortcut map (outside text fields)
-
-## Connected tools (MCP preview)
-
-Connections manages local stdio and remote Streamable HTTP MCP servers. Chat
-selects tools per conversation, requests approval for each call, displays tool
-results, and continues automatically within an eight-round limit. See
-[`docs/MCP.md`](../docs/MCP.md) for setup, credential configuration, boundaries,
-and the HTTP control-plane contract. Workspace remains read-only.
-
-Run `npm run smoke:mcp` and, after `npm run build`, `npm run smoke:mcp-browser`.
-The browser smoke exercises the actual chat request/result wiring using local
-fixtures; it is not model-quality evidence.
-
-## Output previews and file review
-
-Completed code blocks, structured replies, and supported MCP resources have preview
-and download actions. Text outputs can be sent to **Changes** for a full before/after
-review, explicit approval, and durable undo with file-version checks.
-See [Output previews and file review](../docs/OUTPUTS_AND_CHANGES.md).
-
-Validate with `npm run smoke:outputs-changes` and, after building,
-`npm run smoke:outputs-changes-browser`.
-
-## Projects and conversation context
-
-Projects group chats with shared instructions and reference files. The conversation
-context panel controls inheritance, chat-specific instructions/files, and shows
-the exact sources included in the next request. Context is saved locally and
-included in budget estimates and all chat send paths. See
-[Project and conversation context](../docs/PROJECT_CONTEXT.md).
-
-Validate with `npm run smoke:project-context` and, after building,
-`npm run smoke:project-context-browser`.

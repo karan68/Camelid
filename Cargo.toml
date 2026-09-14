@@ -12,15 +12,8 @@ resolver = "2"
 
 [package]
 name = "camelid"
-version = "0.7.3"
+version = "0.6.1"
 edition = "2021"
-# MSRV floor, deliberately BELOW the toolchain in rust-toolchain.toml (1.95.0) —
-# these are different things and should not be "aligned". rust-toolchain.toml
-# says what CI and rustup developers build with; this says the oldest rustc the
-# crate claims to accept, and raising it to match would lock out hosts that
-# build with a distro/Homebrew rustc and no rustup (where the toolchain file is
-# inert). No CI leg builds at 1.89, so this floor is a declared intent rather
-# than a measured one; verifying it would need its own job.
 rust-version = "1.89"
 description = "Camelid: a Rust-native local GGUF inference backend with evidence-gated model compatibility"
 license = "MIT"
@@ -39,18 +32,11 @@ clap = { version = "4.5", features = ["derive", "env"] }
 getrandom = "0.4"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 futures-util = "0.3"
-# MCP client only: stdio and Streamable HTTP, with the existing Rustls provider.
-process-wrap = { version = "10", features = ["tokio1"] }
-rmcp = { version = "=3.3.0", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest-tls-no-provider"] }
-reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
-memmap2 = "0.9"
 llguidance = "=1.7.6"
 toktrie = "=1.7.6"
-pdf-extract = "0.12"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-tempfile = "3"
 minijinja = { version = "2", features = ["json"] }
 rust-embed = { version = "8", features = ["mime-guess"] }
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
@@ -60,7 +46,6 @@ rayon = "1"
 ratatui = "0.29"
 rusqlite = { version = "0.32", features = ["bundled"] }
 rustyline = "14"
-same-file = "1"
 thiserror = "1"
 # Inspection-only Hugging Face tokenizer.json adapter. Pin the upstream JSON
 # contract and use the pure-Rust regex backend: no Oniguruma/C build, C++ esaxx,
@@ -78,13 +63,14 @@ uuid = { version = "1", features = ["v4", "serde"] }
 # Pin it exactly so GPT4O's `\p{L}`/`\p{N}` port cannot drift with a UCD update.
 unicode-general-category = "=1.1.0"
 unicode-normalization = "0.1"
-url = "2"
-zip = { version = "4.6", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 metal = "0.31"
 
 [target.'cfg(windows)'.dependencies]
+# Read-only file mapping for the GGUF wire path. The Unix path uses raw libc
+# mmap; Windows uses memmap2 (CreateFileMapping/MapViewOfFile under the hood).
+memmap2 = "0.9"
 # GetSystemInfo (page size) and GetProcessMemoryInfo (peak working set).
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
@@ -92,7 +78,6 @@ windows-sys = { version = "0.59", features = [
     "Win32_Storage_FileSystem",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
-    "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_ProcessStatus",
     "Win32_System_Power",
     "Win32_System_Registry",
@@ -172,6 +157,7 @@ alloc-gate = []
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+tempfile = "3"
 # Test-only, and all three already resolve to versions the TLS build pulls in:
 # these let the fabric TLS tests mint a throwaway certificate and speak real
 # HTTPS to the proxy, rather than committing a private key or trusting that an

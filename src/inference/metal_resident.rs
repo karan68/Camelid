@@ -9,166 +9,6 @@ use crate::metal;
 
 pub(super) type ResidentDecodeState = metal::ResidentDecodeState;
 
-/// The engine geometry a parked state was built for. Compared on reclaim so a state can
-/// only ever be handed to a session whose dimensions match it exactly — a key collision, or
-/// the same model id reloaded at different dimensions, must rebuild rather than reuse.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(super) struct ResidentMetalGeometry {
-    n_layers: usize,
-    n_heads: usize,
-    n_kv_heads: usize,
-    head_dim: usize,
-    hidden: usize,
-    ffn_dim: usize,
-}
-
-/// A resident Metal engine parked between requests, with the prompt its KV rows hold.
-///
-/// The API builds a fresh `LlamaInferenceSession` per request, so a session-owned engine
-/// dies at the end of every turn and the next turn re-prefills the whole conversation.
-/// CUDA does not have this problem because its engine lives in a process-global cache. This
-/// is the Metal equivalent, kept deliberately smaller: the session still OWNS the engine
-/// while it runs, and only hands it back here on the way out, so the ~30 sites that use
-/// `resident_decode` are untouched.
-struct ResidentMetalParking {
-    /// `LlamaInferenceSession::resident_cache_key` — the API sets it from the model id
-    /// precisely so the same model is recognised across separately-loaded weight Arcs.
-    key: u64,
-    geometry: ResidentMetalGeometry,
-    state: ResidentDecodeState,
-    /// The prompt whose rows `state` holds in `[0, tokens.len())`. `state.filled()` is kept
-    /// equal to this length when parking, so the record and the watermark cannot disagree.
-    tokens: Vec<u32>,
-}
-
-/// The single parking slot. One entry, like the CUDA engine cache: two models alternating
-/// will evict each other rather than both staying resident, which is the same trade that
-/// cache already makes and is what a 16 GiB unified-memory budget wants.
-fn resident_metal_park() -> &'static std::sync::Mutex<Option<ResidentMetalParking>> {
-    static PARK: std::sync::OnceLock<std::sync::Mutex<Option<ResidentMetalParking>>> =
-        std::sync::OnceLock::new();
-    PARK.get_or_init(|| std::sync::Mutex::new(None))
-}
-
-/// Drop whatever is parked. Used when a model is released, and by tests that must not
-/// inherit another test's engine.
-///
-/// macOS-only: its sole caller is the macOS arm of `reset_resident_caches`, and nothing can
-/// park on a target with no resident engine, so on every other target this is dead code
-/// that `-D dead-code` rejects. The park/reclaim pair below stays unconditional because the
-/// `Drop` hook and the prefill both reach them on every target — they simply decline at
-/// runtime.
-#[cfg(target_os = "macos")]
-pub(crate) fn clear_parked_resident_metal() {
-    *resident_metal_park()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner()) = None;
-}
-
-/// Hand a finished engine back for the next request, or drop it.
-///
-/// The two directions of disagreement between the record and the watermark are NOT
-/// symmetric, and treating them alike is what makes parking never fire:
-///
-/// * `filled > tokens.len()` is the ORDINARY case, not an error. Decode advances the
-///   watermark past the prompt, one row per generated token, so by the time a request ends
-///   the engine holds prompt + reply while the record names only the prompt. Those extra
-///   rows are real K/V, they simply have no name here, so the watermark is rewound to the
-///   record and they stop being vouched for. The next turn overwrites them anyway: its
-///   prompt continues from the end of THIS prompt, and the reply is re-prefilled as part of
-///   its suffix. (Recording generated tokens too would extend the reuse across the reply;
-///   that is a follow-up, not a correctness matter.)
-/// * `filled < tokens.len()` IS an error — the record claims rows the engine never wrote,
-///   which is what a failed prefill or a rewind leaves behind. Keep nothing.
-fn park_resident_metal(
-    key: u64,
-    geometry: ResidentMetalGeometry,
-    mut state: ResidentDecodeState,
-    tokens: Vec<u32>,
-) {
-    if tokens.is_empty() || state.filled() < tokens.len() {
-        return;
-    }
-    state.set_filled(tokens.len());
-    *resident_metal_park()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner()) = Some(ResidentMetalParking {
-        key,
-        geometry,
-        state,
-        tokens,
-    });
-}
-
-/// Take the parked engine when it belongs to this model AND was built at these dimensions.
-///
-/// Both halves matter. The key alone does not pin geometry — the same model id reloaded with
-/// a different context or layer range would collide — and handing a session an engine whose
-/// per-layer strides differ from its own would read another shape's rows as if they were
-/// this one's.
-fn reclaim_resident_metal(
-    key: u64,
-    geometry: ResidentMetalGeometry,
-) -> Option<(ResidentDecodeState, Vec<u32>)> {
-    let mut guard = resident_metal_park()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
-    let matches = guard
-        .as_ref()
-        .is_some_and(|p| p.key == key && p.geometry == geometry);
-    if !matches {
-        return None;
-    }
-    guard.take().map(|p| (p.state, p.tokens))
-}
-
-/// Leading run two token sequences share.
-fn common_prefix_len(a: &[u32], b: &[u32]) -> usize {
-    a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
-}
-
-impl ResidentMetalGeometry {
-    fn of(state: &ResidentDecodeState) -> Self {
-        let (n_layers, n_heads, n_kv_heads, head_dim, hidden, ffn_dim) = state.geometry();
-        Self {
-            n_layers,
-            n_heads,
-            n_kv_heads,
-            head_dim,
-            hidden,
-            ffn_dim,
-        }
-    }
-}
-
-impl super::LlamaInferenceSession {
-    /// Hand this session's resident Metal engine to the parking slot on the way out, so the
-    /// next turn of the same conversation can continue from the rows it already holds.
-    ///
-    /// Called from `Drop`, which is the only hook that catches every way a request ends —
-    /// the API builds a fresh session per request and simply lets it fall out of scope.
-    /// Everything that would make the handoff unsafe is refused rather than papered over:
-    /// no model identity, no engine, or a record that disagrees with the watermark.
-    pub(super) fn park_resident_metal_engine(&mut self) {
-        // Never park what can never be continued. Continuation is admitted only on an F32
-        // KV primary (see `metal::resident_kv_primary_is_half`), so on a half primary this
-        // would hold a GPU KV cache alive between requests to no purpose. Refusing here
-        // keeps that configuration byte-for-byte on its previous behaviour.
-        if metal::resident_kv_primary_is_half() {
-            return;
-        }
-        let Some(key) = self.resident_cache_key else {
-            return;
-        };
-        let Some(state) = self.resident_decode.take() else {
-            return;
-        };
-        let tokens = std::mem::take(&mut self.resident_tokens);
-        let geometry = ResidentMetalGeometry::of(&state);
-        park_resident_metal(key, geometry, state, tokens);
-    }
-}
-
 #[derive(Clone, Copy)]
 enum MetalSampleRequest {
     Greedy {
@@ -210,6 +50,201 @@ impl MetalSampleRequest {
 // --all-features) this is genuinely unused; allow it rather than trip clippy `-D dead_code`.
 #[allow(dead_code)]
 pub(super) const MAX_VERIFY_K: usize = 16;
+
+/// Stage-0 target-authoritative commit prototype. This gate only appends the exact integer
+/// acceptance walk to a real EAGLE tree verify and compares its device receipt with the existing
+/// host oracle. It does not authorize emission, compaction, or EAGLE state changes.
+#[cfg(any(target_os = "macos", test))]
+const EAGLE3_DEVICE_ACCEPTANCE_SHADOW_ENV: &str = "CAMELID_BENCH_EAGLE3_DEVICE_ACCEPT_SHADOW";
+
+#[cfg(any(target_os = "macos", test))]
+fn eagle3_device_acceptance_shadow_setting_enables(raw: Option<&str>) -> bool {
+    raw.is_some_and(|value| value.trim() == "1")
+}
+
+#[cfg(target_os = "macos")]
+fn eagle3_device_acceptance_shadow_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        eagle3_device_acceptance_shadow_setting_enables(
+            std::env::var(EAGLE3_DEVICE_ACCEPTANCE_SHADOW_ENV)
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+/// Stage-1 target-authoritative checkpoint. Exact spelling only: malformed campaign env cannot
+/// accidentally split the target queue or allocate E1 scratch.
+#[cfg(any(target_os = "macos", test))]
+const EAGLE3_AUTHORITATIVE_E1_SHADOW_ENV: &str = "CAMELID_BENCH_EAGLE3_AUTHORITATIVE_E1_SHADOW";
+
+#[cfg(any(target_os = "macos", test))]
+fn eagle3_authoritative_e1_shadow_setting_enables(raw: Option<&str>) -> bool {
+    raw.is_some_and(|value| value.trim() == "1")
+}
+
+#[cfg(target_os = "macos")]
+fn eagle3_authoritative_e1_shadow_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        eagle3_authoritative_e1_shadow_setting_enables(
+            std::env::var(EAGLE3_AUTHORITATIVE_E1_SHADOW_ENV)
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Eagle3DeviceAcceptanceShadowCounters {
+    requested: u64,
+    encoded: u64,
+    matched: u64,
+    mismatched: u64,
+    fallback: u64,
+}
+
+#[cfg(target_os = "macos")]
+static EAGLE3_DEVICE_ACCEPTANCE_SHADOW_REQUESTED: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_os = "macos")]
+static EAGLE3_DEVICE_ACCEPTANCE_SHADOW_ENCODED: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_os = "macos")]
+static EAGLE3_DEVICE_ACCEPTANCE_SHADOW_MATCHED: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_os = "macos")]
+static EAGLE3_DEVICE_ACCEPTANCE_SHADOW_MISMATCHED: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_os = "macos")]
+static EAGLE3_DEVICE_ACCEPTANCE_SHADOW_FALLBACK: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(target_os = "macos")]
+fn eagle3_device_acceptance_shadow_counters() -> Eagle3DeviceAcceptanceShadowCounters {
+    let ordering = std::sync::atomic::Ordering::Relaxed;
+    Eagle3DeviceAcceptanceShadowCounters {
+        requested: EAGLE3_DEVICE_ACCEPTANCE_SHADOW_REQUESTED.load(ordering),
+        encoded: EAGLE3_DEVICE_ACCEPTANCE_SHADOW_ENCODED.load(ordering),
+        matched: EAGLE3_DEVICE_ACCEPTANCE_SHADOW_MATCHED.load(ordering),
+        mismatched: EAGLE3_DEVICE_ACCEPTANCE_SHADOW_MISMATCHED.load(ordering),
+        fallback: EAGLE3_DEVICE_ACCEPTANCE_SHADOW_FALLBACK.load(ordering),
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Eagle3DeviceAcceptanceShadowVerdict {
+    Matched,
+    Mismatched(&'static str),
+    Fallback(metal::ResidentTreeAcceptanceShadowFallbackReason),
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn compare_eagle3_device_acceptance_shadow(
+    tree: &spec_tree::TokenTree,
+    target_vocab_size: usize,
+    host_emitted: &[u32],
+    host_leaf: usize,
+    host_path: &[usize],
+    shadow: &metal::ResidentTreeAcceptanceShadow,
+) -> Eagle3DeviceAcceptanceShadowVerdict {
+    let (
+        selected_leaf,
+        emitted_count,
+        terminal_token,
+        safe_terminal_token,
+        terminal_depth,
+        terminal_valid,
+        path_rows,
+        emitted_tokens,
+    ) = match shadow {
+        metal::ResidentTreeAcceptanceShadow::Encoded {
+            selected_leaf,
+            emitted_count,
+            terminal_token,
+            safe_terminal_token,
+            terminal_depth,
+            terminal_valid,
+            path_rows,
+            emitted_tokens,
+        } => (
+            selected_leaf,
+            emitted_count,
+            terminal_token,
+            safe_terminal_token,
+            terminal_depth,
+            terminal_valid,
+            path_rows,
+            emitted_tokens,
+        ),
+        metal::ResidentTreeAcceptanceShadow::Fallback(reason) => {
+            return Eagle3DeviceAcceptanceShadowVerdict::Fallback(*reason);
+        }
+    };
+    let Some(&expected_terminal) = host_emitted.last() else {
+        return Eagle3DeviceAcceptanceShadowVerdict::Mismatched("host_empty");
+    };
+    let Some(&expected_depth) = tree.depth.get(host_leaf) else {
+        return Eagle3DeviceAcceptanceShadowVerdict::Mismatched("host_leaf_out_of_range");
+    };
+    let expected_terminal_valid = (expected_terminal as usize) < target_vocab_size;
+    if *selected_leaf as usize != host_leaf {
+        return Eagle3DeviceAcceptanceShadowVerdict::Mismatched("selected_leaf");
+    }
+    if *emitted_count as usize != host_emitted.len() {
+        return Eagle3DeviceAcceptanceShadowVerdict::Mismatched("emitted_count");
+    }
+    if *terminal_token != expected_terminal {
+        return Eagle3DeviceAcceptanceShadowVerdict::Mismatched("terminal_token");
+    }
+    if *safe_terminal_token
+        != if expected_terminal_valid {
+            expected_terminal
+        } else {
+            0
+        }
+    {
+        return Eagle3DeviceAcceptanceShadowVerdict::Mismatched("safe_terminal_token");
+    }
+    if *terminal_depth != u32::from(expected_depth) {
+        return Eagle3DeviceAcceptanceShadowVerdict::Mismatched("terminal_depth");
+    }
+    if *terminal_valid != expected_terminal_valid {
+        return Eagle3DeviceAcceptanceShadowVerdict::Mismatched("terminal_valid");
+    }
+    if path_rows.len() != host_path.len()
+        || path_rows
+            .iter()
+            .zip(host_path)
+            .any(|(&device, &host)| device as usize != host)
+    {
+        return Eagle3DeviceAcceptanceShadowVerdict::Mismatched("path_rows");
+    }
+    if emitted_tokens != host_emitted {
+        return Eagle3DeviceAcceptanceShadowVerdict::Mismatched("emitted_tokens");
+    }
+    Eagle3DeviceAcceptanceShadowVerdict::Matched
+}
+
+#[cfg(target_os = "macos")]
+fn record_eagle3_device_acceptance_shadow(
+    verdict: Eagle3DeviceAcceptanceShadowVerdict,
+) -> Eagle3DeviceAcceptanceShadowCounters {
+    let ordering = std::sync::atomic::Ordering::Relaxed;
+    EAGLE3_DEVICE_ACCEPTANCE_SHADOW_REQUESTED.fetch_add(1, ordering);
+    match verdict {
+        Eagle3DeviceAcceptanceShadowVerdict::Matched => {
+            EAGLE3_DEVICE_ACCEPTANCE_SHADOW_ENCODED.fetch_add(1, ordering);
+            EAGLE3_DEVICE_ACCEPTANCE_SHADOW_MATCHED.fetch_add(1, ordering);
+        }
+        Eagle3DeviceAcceptanceShadowVerdict::Mismatched(_) => {
+            EAGLE3_DEVICE_ACCEPTANCE_SHADOW_ENCODED.fetch_add(1, ordering);
+            EAGLE3_DEVICE_ACCEPTANCE_SHADOW_MISMATCHED.fetch_add(1, ordering);
+        }
+        Eagle3DeviceAcceptanceShadowVerdict::Fallback(_) => {
+            EAGLE3_DEVICE_ACCEPTANCE_SHADOW_FALLBACK.fetch_add(1, ordering);
+        }
+    }
+    eagle3_device_acceptance_shadow_counters()
+}
 
 /// Whether `prepare_for_prompt_prefix_cache` may vouch for ANY session — the
 /// prompt-prefix-cache host-safety gate. Default ON except on hosts with 8 GiB
@@ -333,57 +368,10 @@ pub(super) fn resident_weight_bytes(tensor: &CpuTensor) -> metal::ResidentWeight
         },
         None => metal::ResidentWeightBytes::Blocks36(q8_0_blocks_as_bytes(
             tensor
-                .q8_0_block_slice()
+                .q8_0_blocks
+                .as_ref()
                 .expect("resident Q8 eligibility requires blocks or wire pages"),
         )),
-    }
-}
-
-/// Resident-lane view of a MoE layer. The always-on shared expert becomes the layer's
-/// "dense" FFN (`gate/up/down_weight_blocks`, width `feed_forward_length`), and the routed
-/// experts + router ride in `moe`. Only `mobilemoe` is admitted: its routing (sigmoid,
-/// selection bias, normalised, scaled, postgate) is what the GPU kernels implement.
-#[cfg(target_os = "macos")]
-pub(super) fn resident_moe_view<'a>(
-    config: &crate::model::LlamaModelConfig,
-    l: &'a super::LlamaLayerWeights,
-) -> Option<metal::ResidentMoeLayerWeights<'a>> {
-    if config.architecture != "mobilemoe" {
-        return None;
-    }
-    let moe = config.moe.as_ref()?;
-    let router = l.moe_router.as_ref()?;
-    l.moe_shared_gate.as_ref()?;
-    Some(metal::ResidentMoeLayerWeights {
-        router: router.data.as_slice(),
-        expert_bias: l.moe_expert_bias.as_ref().map(|t| t.data.as_slice()),
-        gate_exps: resident_weight_bytes(&l.ffn_gate),
-        up_exps: resident_weight_bytes(&l.ffn_up),
-        down_exps: resident_weight_bytes(&l.ffn_down),
-        n_expert: moe.expert_count as usize,
-        n_expert_used: moe.expert_used_count as usize,
-        expert_ff: moe.expert_feed_forward_length? as usize,
-        weights_scale: moe.expert_weights_scale,
-        weights_norm: moe.expert_weights_norm,
-    })
-}
-
-#[cfg(not(target_os = "macos"))]
-pub(super) fn resident_moe_view<'a>(
-    _config: &crate::model::LlamaModelConfig,
-    _l: &'a super::LlamaLayerWeights,
-) -> Option<metal::ResidentMoeLayerWeights<'a>> {
-    None
-}
-
-/// The dense-FFN triple the resident lane should bind for a layer: the shared expert on a
-/// MoE row, the ordinary FFN otherwise.
-pub(super) fn resident_dense_ffn(
-    l: &super::LlamaLayerWeights,
-) -> (&CpuTensor, &CpuTensor, &CpuTensor) {
-    match (&l.moe_shared_gate, &l.moe_shared_up, &l.moe_shared_down) {
-        (Some(g), Some(u), Some(d)) => (g, u, d),
-        _ => (&l.ffn_gate, &l.ffn_up, &l.ffn_down),
     }
 }
 
@@ -427,17 +415,14 @@ impl super::LlamaInferenceSession {
             .is_some())
     }
 
-    /// The arming and shape conditions the batched Metal prefill needs, DELIBERATELY
-    /// excluding the KV-position clause.
-    ///
-    /// Split out because two callers need the same predicate for different reasons.
-    /// `try_metal_resident_prefill_inner` adds `kv_cache.position == 0`, because the
-    /// batched prefill builds a cache from empty. The prompt-prefix cache asks WITHOUT
-    /// that clause, because it needs to know whether this prompt would have taken the
-    /// batched path had it not resumed a cached session — see
-    /// `metal_resident_prefill_would_apply`. Keeping one body means the two can never
-    /// drift into disagreeing about eligibility.
-    fn metal_resident_prefill_shape_admits(&self, n_tokens: usize) -> Result<bool> {
+    /// Shared resident prefill builder. A successful result owns a live resident session at
+    /// `token_ids.len()` and carries requested pre-layer activation snapshots; `None` keeps the
+    /// ordinary lossless fallback contract.
+    fn try_metal_resident_prefill_inner(
+        &mut self,
+        token_ids: &[u32],
+        capture_layer_ids: &[usize],
+    ) -> Result<Option<Vec<Vec<f32>>>> {
         // Two independent arming gates for two different batched prefills:
         //   * CAMELID_METAL_RESIDENT_PREFILL — the existing (non-windowed) `prefill_tokens`,
         //     which fails closed on gemma3 (schedule / sandwich norms / GeGLU) and on
@@ -451,74 +436,13 @@ impl super::LlamaInferenceSession {
         let resident_prefill_armed = std::env::var("CAMELID_METAL_RESIDENT_PREFILL")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
-        Ok((resident_prefill_armed || gemma3_batched)
-            && (2..=16384).contains(&n_tokens)
-            && self.weights.layer_range.is_none()
-            && self.resident_decode_eligible(false)?)
-    }
-
-    /// Would a prompt of `n_tokens` take the batched Metal prefill, if it started from an
-    /// empty cache?
-    ///
-    /// Asked by the prompt-prefix cache before it resumes a PARTIAL hit. A partial hit
-    /// rolls the cached session back to `kv_position = p > 0`, and the position clause in
-    /// `try_metal_resident_prefill_inner` then declines the batched prefill outright, so
-    /// the divergent suffix falls to the CPU dense forward. That is not a smaller win, it
-    /// is a large loss: measured on an M4 / 16 GiB with Llama-3.2-3B-Instruct-Q4_K_M and a
-    /// ~500-token prompt, a cold miss prefills in 1.33 s and a partial hit takes 20.79 s —
-    /// a 15.6x REGRESSION, from the second turn of any conversation carrying a system
-    /// prompt. Q8_0 escapes it only because `kv_roundtrips_through_cpu_exactly` refuses it
-    /// entry to the pool at all, which leaves K-quant models ~18x slower than Q8_0 on
-    /// turn 2 despite being the smaller weights.
-    ///
-    /// So the cache declines the partial resume when this returns true and pays a cold GPU
-    /// prefill instead — faster, and the bit-exact reference path. Exact hits are
-    /// unaffected: they replay a stored logits vector and never prefill at all.
-    ///
-    /// This is a floor, not the ceiling. Threading a base position through
-    /// `prefill_tokens` so the batched prefill can CONTINUE from `p` would beat both arms;
-    /// the scatter and attention uniforms are already there and hardwired to zero
-    /// (`src/metal.rs`, "base position: prefill always starts an empty cache"), and the
-    /// MSL kernels already take `base_position`.
-    pub(crate) fn metal_resident_prefill_would_apply(&self, n_tokens: usize) -> bool {
-        // Eligibility probing must never itself fail a request: an Err here means "cannot
-        // establish that the batched path applies", which is exactly the conservative
-        // answer (keep the existing resume behaviour).
-        self.metal_resident_prefill_shape_admits(n_tokens)
-            .unwrap_or(false)
-    }
-
-    /// Shared resident prefill builder. A successful result owns a live resident session at
-    /// `token_ids.len()` and carries requested pre-layer activation snapshots; `None` keeps the
-    /// ordinary lossless fallback contract.
-    fn try_metal_resident_prefill_inner(
-        &mut self,
-        token_ids: &[u32],
-        capture_layer_ids: &[usize],
-    ) -> Result<Option<Vec<Vec<f32>>>> {
-        let trace = std::env::var_os("CAMELID_RESIDENT_TRACE").is_some();
-        if trace {
-            eprintln!(
-                "[resident-prefill] try_metal_resident_prefill ENTER n={}",
-                token_ids.len()
-            );
-        }
-        // Which of the two batched prefills this call will drive; the arming half of the
-        // same question lives in `metal_resident_prefill_shape_admits`, which documents
-        // both gates.
-        let gemma3_batched = self.gemma3_batched_prefill_armed();
-        // Position first, deliberately. `resident_decode_eligible` inside
-        // `metal_resident_prefill_shape_admits` emits `[resident-eligible]` trace lines,
-        // and the original `||` chain short-circuited at this clause before reaching it.
-        // Testing position first preserves that exactly: a resumed session at position>0
-        // declines here without ever probing eligibility, so CAMELID_RESIDENT_TRACE output
-        // is unchanged. Every other clause is a pure predicate, so their order is free.
-        if self.kv_cache.position != 0
-            || !self.metal_resident_prefill_shape_admits(token_ids.len())?
+        if (!resident_prefill_armed && !gemma3_batched)
+            || token_ids.len() < 2
+            || token_ids.len() > 16384
+            || self.kv_cache.position != 0
+            || self.weights.layer_range.is_some()
+            || !self.resident_decode_eligible(false)?
         {
-            if trace {
-                eprintln!("[resident-prefill] try_metal_resident_prefill declined at site 1");
-            }
             return Ok(None);
         }
         let weights = Arc::clone(&self.weights);
@@ -530,9 +454,6 @@ impl super::LlamaInferenceSession {
         let kv_cap = self.config.context_length as usize;
         let n = token_ids.len();
         if n >= kv_cap {
-            if trace {
-                eprintln!("[resident-prefill] try_metal_resident_prefill declined at site 2");
-            }
             return Ok(None);
         }
         let rms_eps = diagnostic_rms_norm_epsilon(self.config.rms_norm_epsilon)?;
@@ -549,12 +470,7 @@ impl super::LlamaInferenceSession {
             weights.rope_freqs.as_ref(),
         )? {
             Some(t) => t,
-            None => {
-                if trace {
-                    eprintln!("[resident-prefill] try_metal_resident_prefill declined at site 3");
-                }
-                return Ok(None);
-            }
+            None => return Ok(None),
         };
         let (cos_all, sin_all, split_half_pairing) =
             (tables.cos, tables.sin, tables.split_half_pairing);
@@ -607,87 +523,21 @@ impl super::LlamaInferenceSession {
                 .as_ref()
                 .is_some_and(|g| g.rope_neox_pairing);
         let schedule = self.gemma3_resident_schedule(0..n_layers);
-        // Prefix continuation: an engine parked by an earlier turn of this conversation may
-        // already hold the leading rows this prompt needs. Reclaim it only when the model
-        // identity AND the geometry both match, then reuse the run its recorded prompt
-        // shares with this one.
-        //
-        // The claim is bounded three ways, and all three carry weight: by the RECORD (rows
-        // whose tokens we know), by `filled()` (rows the engine still vouches for), and by
-        // `n - 1` so the prefill still ends by writing the last position, which is the state
-        // the decode lane expects. Capture mode opts out — it has no continuation entry
-        // point, and a diagnostic path is not worth a second one.
-        let geometry = ResidentMetalGeometry {
+        let mut session = match metal::ResidentDecodeState::new(
             n_layers,
             n_heads,
-            n_kv_heads: n_kv,
+            n_kv,
             head_dim,
-            hidden: dims.embedding_length,
-            ffn_dim: dims.feed_forward_length,
-        };
-        let reclaimed = self
-            .resident_cache_key
-            .and_then(|key| reclaim_resident_metal(key, geometry))
-            .and_then(|(mut state, parked)| {
-                // Decide the claim BEFORE committing to the engine. A reclaimed engine is
-                // only safe for a CONTINUATION: it carries the previous turn's KV, and a
-                // from-scratch prefill driven through one produced corrupt output where a
-                // fresh (zero-filled) engine was correct. So with nothing to reuse, drop it
-                // and take the ordinary build path.
-                let reuse = if capture_layer_ids.is_empty() && !metal::resident_kv_primary_is_half()
-                {
-                    common_prefix_len(&parked, token_ids)
-                        .min(state.filled())
-                        .min(n.saturating_sub(1))
-                } else {
-                    0
-                };
-                // Reuse has to be worth what it costs. A parked engine was sized for the
-                // prompt that built it, so continuing a much longer one through it forces a
-                // KV growth realloc — and growth reallocates, zero-fills and blits the
-                // whole cache behind a blocking wait. Measured: the server's own 10-token
-                // warm-up parked an engine whose 2 shared positions turn 1 then "reused",
-                // paying that growth to save two rows — 6.8 s against 2.1 s for simply
-                // building at the right size. A fresh engine is allocated for the prompt it
-                // will actually hold, so below this floor that is strictly better.
-                const MIN_REUSE_POSITIONS: usize = 256;
-                if reuse < MIN_REUSE_POSITIONS {
-                    return None;
-                }
-                // Drop the watermark to exactly the reused span BEFORE prefilling the rest,
-                // so a failure below leaves no claim on rows this prefill never wrote.
-                state.set_filled(reuse);
-                Some((state, reuse))
-            });
-        let mut reused = 0usize;
-        let mut session = match reclaimed {
-            Some((state, reuse)) => {
-                reused = reuse;
-                state
-            }
-            None => match metal::ResidentDecodeState::new(
-                n_layers,
-                n_heads,
-                n_kv,
-                head_dim,
-                dims.embedding_length,
-                dims.feed_forward_length,
-                initial_positions,
-                kv_cap,
-                rms_eps,
-                split_half_pairing,
-                schedule,
-            ) {
-                Some(s) => s,
-                None => {
-                    if trace {
-                        eprintln!(
-                            "[resident-prefill] try_metal_resident_prefill declined at site 4"
-                        );
-                    }
-                    return Ok(None);
-                }
-            },
+            dims.embedding_length,
+            dims.feed_forward_length,
+            initial_positions,
+            kv_cap,
+            rms_eps,
+            split_half_pairing,
+            schedule,
+        ) {
+            Some(s) => s,
+            None => return Ok(None),
         };
 
         let session_us = session_started.elapsed().as_micros();
@@ -720,11 +570,9 @@ impl super::LlamaInferenceSession {
                 k_weight_blocks: resident_weight_bytes(&l.attention_k),
                 v_weight_blocks: resident_weight_bytes(&l.attention_v),
                 o_weight_blocks: resident_weight_bytes(&l.attention_output),
-                gate_weight_blocks: resident_weight_bytes(resident_dense_ffn(l).0),
-                up_weight_blocks: resident_weight_bytes(resident_dense_ffn(l).1),
-                down_weight_blocks: resident_weight_bytes(resident_dense_ffn(l).2),
-                moe: resident_moe_view(&self.config, l),
-                qk_l2_norm_after_rope: self.config.architecture == "mobilemoe",
+                gate_weight_blocks: resident_weight_bytes(&l.ffn_gate),
+                up_weight_blocks: resident_weight_bytes(&l.ffn_up),
+                down_weight_blocks: resident_weight_bytes(&l.ffn_down),
             })
             .collect();
 
@@ -732,9 +580,6 @@ impl super::LlamaInferenceSession {
         let gpu_started = Instant::now();
         let layer_inputs = if gemma3_batched {
             if !capture_layer_ids.is_empty() {
-                if trace {
-                    eprintln!("[resident-prefill] try_metal_resident_prefill declined at site 5");
-                }
                 return Ok(None);
             }
             // Tier A: batched weight streaming, bit-identical to `n` token-by-token
@@ -754,74 +599,6 @@ impl super::LlamaInferenceSession {
                     metal::gemma3_batch_prefill_rows(),
                 )
                 .map(|_| Vec::new())
-        } else if reused > 0 {
-            // Continue over the reused rows. The RoPE tables are indexed by batch row, so
-            // they are sliced to `[reused, n)` exactly as the embeddings are.
-            let hidden = dims.embedding_length;
-            let half_rope = cos_all.len() / n;
-            let continued = session
-                .prefill_tokens_from(
-                    &embeddings.data[reused * hidden..],
-                    n - reused,
-                    &layer_views,
-                    &cos_all[reused * half_rope..],
-                    &sin_all[reused * half_rope..],
-                    scale,
-                    reused,
-                )
-                .map(|_| Vec::new());
-            match continued {
-                Some(v) => Some(v),
-                // Continuation is refused off the attention-as-matmul lane. That is a
-                // correctness gate, not a failure: fall back to a cold full prefill of the
-                // whole prompt rather than dropping the request to the CPU. The rewind
-                // below is what makes the retry legitimate — the engine must claim nothing
-                // before a prefill that starts from empty.
-                None => {
-                    if trace {
-                        eprintln!(
-                            "[resident-prefill] continuation declined (reuse={reused}); \
-                             rebuilding for a full prefill"
-                        );
-                    }
-                    reused = 0;
-                    // REBUILD rather than rewind. A reclaimed engine is only safe on the
-                    // path prefix continuation was proven on; driving a from-scratch
-                    // prefill through one produced corrupt output (measured: turns 2+ of a
-                    // 3B-Q4_K_M chat degenerated to "!!!!" where a fresh engine was
-                    // correct, and a fresh engine differs exactly in carrying no prior KV).
-                    // `ResidentDecodeState::new` zero-fills, so a fresh engine restores the
-                    // from-empty precondition every non-continuation prefill assumes.
-                    let schedule = self.gemma3_resident_schedule(0..n_layers);
-                    match metal::ResidentDecodeState::new(
-                        n_layers,
-                        n_heads,
-                        n_kv,
-                        head_dim,
-                        dims.embedding_length,
-                        dims.feed_forward_length,
-                        initial_positions,
-                        kv_cap,
-                        rms_eps,
-                        split_half_pairing,
-                        schedule,
-                    ) {
-                        Some(fresh) => {
-                            session = fresh;
-                            session.prefill_tokens_with_layer_inputs(
-                                &embeddings.data,
-                                n,
-                                &layer_views,
-                                &cos_all,
-                                &sin_all,
-                                scale,
-                                capture_layer_ids,
-                            )
-                        }
-                        None => None,
-                    }
-                }
-            }
         } else {
             session.prefill_tokens_with_layer_inputs(
                 &embeddings.data,
@@ -834,9 +611,6 @@ impl super::LlamaInferenceSession {
             )
         };
         let Some(layer_inputs) = layer_inputs else {
-            if trace {
-                eprintln!("[resident-prefill] try_metal_resident_prefill declined at site 6");
-            }
             return Ok(None);
         };
         // G11, asserted rather than assumed: the resident decode's rebuild predicate is
@@ -844,9 +618,6 @@ impl super::LlamaInferenceSession {
         // lane leaves hollow — which then declines at `history_materialized` and silently
         // drops the whole prompt onto a CPU path that fails closed for windowed archs.
         if session.filled() != n {
-            if trace {
-                eprintln!("[resident-prefill] try_metal_resident_prefill declined at site 7");
-            }
             return Ok(None);
         }
         if time_edges {
@@ -862,19 +633,6 @@ impl super::LlamaInferenceSession {
         // GPU cache now holds positions 0..n; the resident decode continues this sequence.
         self.kv_cache.position = n;
         self.resident_decode = Some(session);
-        // Record the sequence those rows hold, so a later turn of this conversation can
-        // continue from it. Only a prefill that actually wrote them may set this.
-        self.resident_tokens = token_ids.to_vec();
-        if trace && reused > 0 {
-            eprintln!(
-                "[resident-prefill] prefix continuation: reused {reused} of {n} positions, \
-                 prefilled {}",
-                n - reused
-            );
-        }
-        if trace {
-            eprintln!("[resident-prefill] try_metal_resident_prefill OK");
-        }
         Ok(Some(layer_inputs))
     }
 
@@ -949,17 +707,16 @@ impl super::LlamaInferenceSession {
                 k_weight_blocks: resident_weight_bytes(&layer.attention_k),
                 v_weight_blocks: resident_weight_bytes(&layer.attention_v),
                 o_weight_blocks: resident_weight_bytes(&layer.attention_output),
-                gate_weight_blocks: resident_weight_bytes(resident_dense_ffn(layer).0),
-                up_weight_blocks: resident_weight_bytes(resident_dense_ffn(layer).1),
-                down_weight_blocks: resident_weight_bytes(resident_dense_ffn(layer).2),
-                moe: resident_moe_view(&self.config, layer),
-                qk_l2_norm_after_rope: self.config.architecture == "mobilemoe",
+                gate_weight_blocks: resident_weight_bytes(&layer.ffn_gate),
+                up_weight_blocks: resident_weight_bytes(&layer.ffn_up),
+                down_weight_blocks: resident_weight_bytes(&layer.ffn_down),
             })
             .collect();
         let logits_stage = metal::LogitsStage {
             final_norm: &weights.output_norm.data,
             output_weight_blocks: resident_weight_bytes(weights.output_projection()),
             vocab_size: dims.vocab_size,
+            output_is_tied_embedding: false,
         };
         let session = self
             .resident_decode
@@ -986,7 +743,11 @@ impl super::LlamaInferenceSession {
             )));
         }
         let mut layer_inputs = Vec::with_capacity(prefix_inputs.len());
-        for (slot, (mut prefix, last)) in prefix_inputs.drain(..).zip(last_inputs).enumerate() {
+        for (slot, (mut prefix, last)) in prefix_inputs
+            .drain(..)
+            .zip(last_inputs.into_iter())
+            .enumerate()
+        {
             let expected_prefix = prefix_len * dims.embedding_length;
             if prefix.len() != expected_prefix || last.len() != dims.embedding_length {
                 return Err(BackendError::RuntimeShapeMismatch(format!(
@@ -1435,11 +1196,6 @@ impl super::LlamaInferenceSession {
             }
             session.set_filled(position);
             self.resident_decode = Some(session);
-            // These rows were RESEEDED from the CPU KV cache, which stores f16-rounded
-            // values — not bit-identical to what a GPU prefill would have written. A later
-            // turn must not treat them as a known-good prefix, which is the whole reason
-            // prefix continuation never round-trips through the host. Stop vouching.
-            self.resident_tokens.clear();
         }
 
         // gemma3 FFN activation is GeGLU; every other arch on this lane is SiLU.
@@ -1458,11 +1214,9 @@ impl super::LlamaInferenceSession {
                 k_weight_blocks: resident_weight_bytes(&l.attention_k),
                 v_weight_blocks: resident_weight_bytes(&l.attention_v),
                 o_weight_blocks: resident_weight_bytes(&l.attention_output),
-                gate_weight_blocks: resident_weight_bytes(resident_dense_ffn(l).0),
-                up_weight_blocks: resident_weight_bytes(resident_dense_ffn(l).1),
-                down_weight_blocks: resident_weight_bytes(resident_dense_ffn(l).2),
-                moe: resident_moe_view(&self.config, l),
-                qk_l2_norm_after_rope: self.config.architecture == "mobilemoe",
+                gate_weight_blocks: resident_weight_bytes(&l.ffn_gate),
+                up_weight_blocks: resident_weight_bytes(&l.ffn_up),
+                down_weight_blocks: resident_weight_bytes(&l.ffn_down),
             })
             .collect();
 
@@ -1473,6 +1227,7 @@ impl super::LlamaInferenceSession {
                 final_norm: &weights.output_norm.data,
                 output_weight_blocks: resident_weight_bytes(weights.output_projection()),
                 vocab_size: vocab,
+                output_is_tied_embedding: false,
             })
         } else {
             None
@@ -1612,12 +1367,12 @@ impl super::LlamaInferenceSession {
     /// Resolve + upload this session's full resident weight set into the process-global
     /// Metal cache and fault its pages in (`metal::prewarm_resident_weights_cache`).
     ///
-    /// Built for the speculative DRAFT model: its engine otherwise resolves weights
-    /// lazily inside the FIRST `draft()` call, landing the whole convert/upload/page-in
-    /// cost (multi-second for a 1B draft) as a stall in the middle of the user-visible
-    /// decode — which the per-step draft profile then smears into a uniform-looking
-    /// slowdown. Calling this at drafter construction moves that one-time cost to
-    /// configure time, the same place the CUDA lane pays its coexistence reserve.
+    /// Built for speculative engines: a DRAFT model otherwise resolves canonical
+    /// weights lazily inside the first `draft()` call, while an opted-in V4 TARGET
+    /// otherwise builds its verifier SOA8 sidecars lazily inside the first verify.
+    /// Calling this from serialized bootstrap moves either one-time cost ahead of
+    /// user-visible decode timing. Draft sessions deliberately skip target-only
+    /// sidecars, so coexistence does not duplicate unused weights.
     ///
     /// Lossless and idempotent: it only populates the caches the first encode would
     /// populate anyway. Returns false (warming nothing) when the resident Metal lane is
@@ -1628,9 +1383,13 @@ impl super::LlamaInferenceSession {
         {
             return false;
         }
+        let Ok(dims) = DenseLlamaDims::from_config(&self.config) else {
+            return false;
+        };
         let weights = &self.weights;
         // A pipeline-sharded node owns a layer subrange with no logits stage; the
-        // single-node drafter this serves never shards, so skip rather than special-case.
+        // local speculative target/drafter path never shards, so skip rather than
+        // special-case incomplete geometry.
         if weights.layer_range.is_some() {
             return false;
         }
@@ -1650,16 +1409,26 @@ impl super::LlamaInferenceSession {
                 k_weight_blocks: resident_weight_bytes(&l.attention_k),
                 v_weight_blocks: resident_weight_bytes(&l.attention_v),
                 o_weight_blocks: resident_weight_bytes(&l.attention_output),
-                gate_weight_blocks: resident_weight_bytes(resident_dense_ffn(l).0),
-                up_weight_blocks: resident_weight_bytes(resident_dense_ffn(l).1),
-                down_weight_blocks: resident_weight_bytes(resident_dense_ffn(l).2),
-                moe: resident_moe_view(&self.config, l),
-                qk_l2_norm_after_rope: self.config.architecture == "mobilemoe",
+                gate_weight_blocks: resident_weight_bytes(&l.ffn_gate),
+                up_weight_blocks: resident_weight_bytes(&l.ffn_up),
+                down_weight_blocks: resident_weight_bytes(&l.ffn_down),
             })
             .collect();
         let output = resident_weight_bytes(weights.output_projection());
         let embedding = resident_weight_bytes(&weights.token_embedding);
-        metal::prewarm_resident_weights_cache(&layer_views, Some(&output), Some(&embedding))
+        metal::prewarm_resident_weights_cache(
+            &layer_views,
+            Some(&output),
+            Some(&embedding),
+            metal::ResidentWeightGeometry {
+                hidden: dims.embedding_length,
+                q_dim: dims.q_width,
+                kv_dim: dims.kv_width,
+                ffn_dim: dims.feed_forward_length,
+                vocab: dims.vocab_size,
+            },
+            !self.is_drafter,
+        )
     }
 
     /// Non-macOS stub: there is no resident Metal engine to warm.
@@ -1789,17 +1558,16 @@ impl super::LlamaInferenceSession {
                 k_weight_blocks: resident_weight_bytes(&l.attention_k),
                 v_weight_blocks: resident_weight_bytes(&l.attention_v),
                 o_weight_blocks: resident_weight_bytes(&l.attention_output),
-                gate_weight_blocks: resident_weight_bytes(resident_dense_ffn(l).0),
-                up_weight_blocks: resident_weight_bytes(resident_dense_ffn(l).1),
-                down_weight_blocks: resident_weight_bytes(resident_dense_ffn(l).2),
-                moe: resident_moe_view(&self.config, l),
-                qk_l2_norm_after_rope: self.config.architecture == "mobilemoe",
+                gate_weight_blocks: resident_weight_bytes(&l.ffn_gate),
+                up_weight_blocks: resident_weight_bytes(&l.ffn_up),
+                down_weight_blocks: resident_weight_bytes(&l.ffn_down),
             })
             .collect();
         let logits_stage = metal::LogitsStage {
             final_norm: &weights.output_norm.data,
             output_weight_blocks: resident_weight_bytes(weights.output_projection()),
             vocab_size: vocab,
+            output_is_tied_embedding: false,
         };
 
         let session = self
@@ -1855,6 +1623,227 @@ impl super::LlamaInferenceSession {
         }))
     }
 
+    /// Create an empty resident target session for offline teacher forcing. Unlike the normal
+    /// prefill path, this intentionally executes no token and therefore abbreviates no final
+    /// layer: the exporter can capture every corpus row, starting at position zero, through the
+    /// same full verifier graph used for later chunks.
+    #[cfg(target_os = "macos")]
+    pub fn begin_eagle3_training_metal(&mut self) -> Result<bool> {
+        if self.resident_paths_disabled
+            || !resident_decode_metal_enabled()
+            || self.kv_cache.position != 0
+            || self.resident_decode.is_some()
+            || self.weights.layer_range.is_some()
+            || !self.resident_decode_eligible(true)?
+        {
+            return Ok(false);
+        }
+        let weights = Arc::clone(&self.weights);
+        let dims = DenseLlamaDims::from_config(&self.config)?;
+        let head_dim = dims.head_dim;
+        let split_half_pairing = match rope::resident_decode_rope_tables(
+            0,
+            head_dim,
+            &self.config,
+            weights.rope_freqs.as_ref(),
+        )? {
+            Some(tables) => tables.split_half_pairing,
+            None => return Ok(false),
+        };
+        let rms_eps = diagnostic_rms_norm_epsilon(self.config.rms_norm_epsilon)?;
+        let kv_cap = self.config.context_length as usize;
+        metal::set_resident_kquant_lane(weights_use_kquant(&weights));
+        let session = match metal::ResidentDecodeState::new(
+            dims.block_count,
+            self.config.attention_head_count as usize,
+            dims.attention_head_count_kv,
+            head_dim,
+            dims.embedding_length,
+            dims.feed_forward_length,
+            512.min(kv_cap).max(1),
+            kv_cap,
+            rms_eps,
+            split_half_pairing,
+            self.gemma3_resident_schedule(0..dims.block_count),
+        ) {
+            Some(session) => session,
+            None => return Ok(false),
+        };
+        self.resident_decode = Some(session);
+        Ok(true)
+    }
+
+    /// Run one exact resident-Q4 teacher-forcing chunk and capture the target features needed
+    /// by EAGLE-3 training. Unlike speculative verification, every input row is authoritative:
+    /// the resident KV watermark advances by `input_tokens.len()` regardless of whether the
+    /// target's greedy prediction matches the following corpus token.
+    ///
+    /// The caller must first establish an empty resident teacher session with
+    /// [`Self::begin_eagle3_training_metal`].
+    #[cfg(target_os = "macos")]
+    pub fn forward_eagle3_training_chunk_metal(
+        &mut self,
+        input_tokens: &[u32],
+        capture_layer_ids: &[usize],
+    ) -> Result<Option<LlamaEagle3TrainingCapture>> {
+        if input_tokens.is_empty()
+            || self.resident_paths_disabled
+            || !resident_decode_metal_enabled()
+        {
+            return Ok(None);
+        }
+        let position = self.kv_cache.position;
+        let k = input_tokens.len();
+        if k > MAX_VERIFY_K
+            || position + k > self.kv_cache.plan.max_sequence_length
+            || !self.resident_decode_eligible(true)?
+            || self
+                .resident_decode
+                .as_ref()
+                .is_none_or(|session| session.filled() != position)
+        {
+            return Ok(None);
+        }
+
+        let weights = Arc::clone(&self.weights);
+        let dims = DenseLlamaDims::from_config(&self.config)?;
+        if weights.layer_range.is_some() {
+            return Ok(None);
+        }
+        let head_dim = dims.head_dim;
+        let scale = attention_score_scale_value(head_dim, diagnostic_attention_score_scale()?);
+        let mut embeddings = weights
+            .token_embedding
+            .embedding_lookup(input_tokens, "token_embedding_eagle3_training")?;
+        if let Some(g) = self.config.gemma3.as_ref() {
+            for value in &mut embeddings.data {
+                *value *= g.embed_scale;
+            }
+        }
+
+        let mut cos_all = Vec::with_capacity(k * head_dim);
+        let mut sin_all = Vec::with_capacity(k * head_dim);
+        for row in 0..k {
+            match rope::resident_decode_rope_tables(
+                position + row,
+                head_dim,
+                &self.config,
+                weights.rope_freqs.as_ref(),
+            )? {
+                Some(tables) => {
+                    cos_all.extend_from_slice(&tables.cos);
+                    sin_all.extend_from_slice(&tables.sin);
+                }
+                None => return Ok(None),
+            }
+        }
+
+        let ffn_geglu = self.config.gemma3.as_ref().is_some_and(|g| g.ffn_geglu);
+        let layer_views: Vec<metal::ResidentLayerWeights> = weights
+            .layers
+            .iter()
+            .map(|layer| metal::ResidentLayerWeights {
+                attn_norm: &layer.attention_norm.data,
+                ffn_norm: &layer.ffn_norm.data,
+                q_norm: layer
+                    .attention_q_norm
+                    .as_ref()
+                    .map(|tensor| tensor.data.as_slice()),
+                k_norm: layer
+                    .attention_k_norm
+                    .as_ref()
+                    .map(|tensor| tensor.data.as_slice()),
+                post_attn_norm: layer
+                    .post_attention_norm
+                    .as_ref()
+                    .map(|tensor| tensor.data.as_slice()),
+                post_ffw_norm: layer
+                    .post_ffw_norm
+                    .as_ref()
+                    .map(|tensor| tensor.data.as_slice()),
+                ffn_geglu,
+                q_weight_blocks: resident_weight_bytes(&layer.attention_q),
+                k_weight_blocks: resident_weight_bytes(&layer.attention_k),
+                v_weight_blocks: resident_weight_bytes(&layer.attention_v),
+                o_weight_blocks: resident_weight_bytes(&layer.attention_output),
+                gate_weight_blocks: resident_weight_bytes(&layer.ffn_gate),
+                up_weight_blocks: resident_weight_bytes(&layer.ffn_up),
+                down_weight_blocks: resident_weight_bytes(&layer.ffn_down),
+            })
+            .collect();
+        let logits_stage = metal::LogitsStage {
+            final_norm: &weights.output_norm.data,
+            output_weight_blocks: resident_weight_bytes(weights.output_projection()),
+            vocab_size: dims.vocab_size,
+            output_is_tied_embedding: false,
+        };
+
+        let session = self
+            .resident_decode
+            .as_mut()
+            .expect("resident training session present (readiness checked above)");
+        let Some((predictions, raw_layer_inputs, raw_output_norm, raw_logits)) = session
+            .verify_batch_with_training_features(
+                &embeddings.data,
+                &cos_all,
+                &sin_all,
+                &layer_views,
+                &logits_stage,
+                position,
+                k,
+                scale,
+                capture_layer_ids,
+            )
+        else {
+            return Ok(None);
+        };
+        if predictions.len() != k
+            || raw_output_norm.len() != k * dims.embedding_length
+            || raw_logits.len() != k * dims.vocab_size
+        {
+            return Err(BackendError::RuntimeShapeMismatch(format!(
+                "resident EAGLE training capture returned {} predictions, {} norm values, and {} logits; expected {k}, {}, and {}",
+                predictions.len(),
+                raw_output_norm.len(),
+                raw_logits.len(),
+                k * dims.embedding_length,
+                k * dims.vocab_size
+            )));
+        }
+        let layer_inputs = raw_layer_inputs
+            .into_iter()
+            .enumerate()
+            .map(|(slot, values)| {
+                CpuTensor::from_f32(
+                    format!("resident_training_layer_{}_input", capture_layer_ids[slot]),
+                    vec![k, dims.embedding_length],
+                    values,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let output_norm_state = CpuTensor::from_f32(
+            "resident_training_output_norm",
+            vec![k, dims.embedding_length],
+            raw_output_norm,
+        )?;
+        let logits = CpuTensor::from_f32(
+            "resident_training_logits",
+            vec![k, dims.vocab_size],
+            raw_logits,
+        )?;
+
+        let new_position = position + k;
+        session.set_filled(new_position);
+        self.kv_cache.position = new_position;
+        Ok(Some(LlamaEagle3TrainingCapture {
+            predictions,
+            layer_inputs,
+            output_norm_state,
+            logits,
+            timings: LlamaForwardTimings::default(),
+        }))
+    }
+
     /// macOS speculative-verify seam (TREE variant): verify a draft TOKEN TREE against the
     /// resident Metal engine in ONE batched forward (`metal::ResidentDecodeState::verify_batch_tree`,
     /// bit-identical to `verify_batch` on a single-branch tree) and return the accepted longest
@@ -1869,8 +1858,8 @@ impl super::LlamaInferenceSession {
         tree: &spec_tree::TokenTree,
     ) -> Result<Option<Vec<u32>>> {
         Ok(self
-            .verify_tree_metal_inner(tree, &[])?
-            .map(|(emitted, _capture)| emitted))
+            .verify_tree_metal_inner(tree, &[], false, true, None, None, None, None)?
+            .map(|(emitted, _capture, _target_top_k, _indexed_head)| emitted))
     }
 
     /// EAGLE-3 tree target seam: the ordinary target-authoritative tree verify plus snapshots
@@ -1884,8 +1873,252 @@ impl super::LlamaInferenceSession {
         capture_layer_ids: &[usize],
     ) -> Result<Option<LlamaGreedyVerifyCapture>> {
         Ok(self
-            .verify_tree_metal_inner(tree, capture_layer_ids)?
-            .map(|(_emitted, capture)| capture))
+            .verify_tree_metal_inner(tree, capture_layer_ids, false, true, None, None, None, None)?
+            .map(|(_emitted, capture, _target_top_k, _indexed_head)| capture))
+    }
+
+    /// Default-off production-shaped E1 shadow. With the gate absent this delegates directly to
+    /// [`Self::verify_tree_metal_with_layer_inputs`], preserving its allocation and dispatch
+    /// behavior. With the exact gate, the target verifier installs one private E1 receipt in the
+    /// supplied head for comparison after the unchanged serial authoritative update.
+    #[cfg(target_os = "macos")]
+    pub fn verify_tree_metal_with_layer_inputs_and_e1_shadow(
+        &mut self,
+        tree: &spec_tree::TokenTree,
+        capture_layer_ids: &[usize],
+        eagle3_head: &mut metal::Eagle3MetalState,
+    ) -> Result<Option<LlamaGreedyVerifyCapture>> {
+        if !eagle3_authoritative_e1_shadow_enabled() {
+            return self.verify_tree_metal_with_layer_inputs(tree, capture_layer_ids);
+        }
+        Ok(self
+            .verify_tree_metal_inner(
+                tree,
+                capture_layer_ids,
+                false,
+                true,
+                None,
+                Some(eagle3_head),
+                None,
+                None,
+            )?
+            .map(|(_emitted, capture, _target_top_k, _indexed_head)| capture))
+    }
+
+    /// Experimental target-candidate seam for benchmark Token Recycling. This is opt-in and
+    /// leaves [`Self::verify_tree_metal`] on its original resident API and greedy prediction
+    /// buffer. Candidate rows retain BFS tree order so each row can train the adjacency for the
+    /// token that was verified in that row.
+    #[cfg(target_os = "macos")]
+    pub fn verify_tree_metal_with_target_top_k(
+        &mut self,
+        tree: &spec_tree::TokenTree,
+    ) -> Result<Option<LlamaTargetTopKVerify>> {
+        Ok(self
+            .verify_tree_metal_inner(tree, &[], true, true, None, None, None, None)?
+            .map(
+                |(emitted, capture, target_top_k, _indexed_head)| LlamaTargetTopKVerify {
+                    predictions: capture.predictions,
+                    target_top_k,
+                    emitted,
+                    timings: capture.timings,
+                },
+            ))
+    }
+
+    /// Benchmark-only combined EAGLE capture and Token Recycling candidate seam.
+    ///
+    /// The target tree forward and commit rule are identical to
+    /// [`Self::verify_tree_metal_with_layer_inputs`]. The only additional work is the opt-in
+    /// compact top-8 dispatch/readback for each verifier row.
+    #[cfg(target_os = "macos")]
+    pub fn verify_tree_metal_with_layer_inputs_and_target_top_k(
+        &mut self,
+        tree: &spec_tree::TokenTree,
+        capture_layer_ids: &[usize],
+    ) -> Result<Option<LlamaTargetTopKVerifyCapture>> {
+        Ok(self
+            .verify_tree_metal_inner(tree, capture_layer_ids, true, true, None, None, None, None)?
+            .map(
+                |(emitted, capture, target_top_k, _indexed_head)| LlamaTargetTopKVerifyCapture {
+                    predictions: capture.predictions,
+                    target_top_k,
+                    emitted,
+                    layer_inputs: capture.layer_inputs,
+                    timings: capture.timings,
+                },
+            ))
+    }
+
+    /// Default-off EAGLE diagnostic: retain the ordinary capture result and replay only the
+    /// proposal-derived output rows after the authoritative full head has emitted its ids.
+    #[cfg(target_os = "macos")]
+    pub fn verify_tree_metal_with_layer_inputs_and_indexed_head_shadow(
+        &mut self,
+        tree: &spec_tree::TokenTree,
+        capture_layer_ids: &[usize],
+        candidate_ids: &[u32],
+    ) -> Result<Option<LlamaIndexedHeadShadowVerify<LlamaGreedyVerifyCapture>>> {
+        let Some((_emitted, authoritative, _target_top_k, indexed_head)) = self
+            .verify_tree_metal_inner(
+                tree,
+                capture_layer_ids,
+                false,
+                true,
+                Some(candidate_ids),
+                None,
+                None,
+                None,
+            )?
+        else {
+            return Ok(None);
+        };
+        let shadow = indexed_head.ok_or_else(|| {
+            BackendError::RuntimeShapeMismatch(
+                "indexed-head verifier completed without its requested shadow receipt".into(),
+            )
+        })?;
+        Ok(Some(LlamaIndexedHeadShadowVerify {
+            authoritative,
+            shadow,
+        }))
+    }
+
+    /// Default-off selective E1 falsifier. Layer-25 indexed scoring runs on the private EAGLE
+    /// queue while the unchanged target tail is live, freezes the top-B path portfolio, and
+    /// prepares only its unique edge rows. The receipt is installed for comparison after the
+    /// established serial authoritative update; no private row is consumed here.
+    #[cfg(target_os = "macos")]
+    pub fn verify_tree_metal_with_layer_inputs_indexed_head_and_selective_e1_shadow(
+        &mut self,
+        tree: &spec_tree::TokenTree,
+        capture_layer_ids: &[usize],
+        candidate_ids: &[u32],
+        eagle3_head: &mut metal::Eagle3MetalState,
+        path_budget: usize,
+        selective_promotion: Option<metal::Eagle3SelectiveEdgePromotionAuthorization>,
+    ) -> Result<Option<LlamaIndexedHeadShadowVerify<LlamaGreedyVerifyCapture>>> {
+        let Some((_emitted, authoritative, _target_top_k, indexed_head)) = self
+            .verify_tree_metal_inner(
+                tree,
+                capture_layer_ids,
+                false,
+                true,
+                Some(candidate_ids),
+                Some(eagle3_head),
+                Some(path_budget),
+                selective_promotion,
+            )?
+        else {
+            return Ok(None);
+        };
+        let shadow = indexed_head.ok_or_else(|| {
+            BackendError::RuntimeShapeMismatch(
+                "selective E1 verifier completed without its indexed-head receipt".into(),
+            )
+        })?;
+        Ok(Some(LlamaIndexedHeadShadowVerify {
+            authoritative,
+            shadow,
+        }))
+    }
+
+    /// Token-Recycling-capable twin of
+    /// [`Self::verify_tree_metal_with_layer_inputs_and_indexed_head_shadow`].
+    #[cfg(target_os = "macos")]
+    pub fn verify_tree_metal_with_layer_inputs_target_top_k_and_indexed_head_shadow(
+        &mut self,
+        tree: &spec_tree::TokenTree,
+        capture_layer_ids: &[usize],
+        candidate_ids: &[u32],
+    ) -> Result<Option<LlamaIndexedHeadShadowVerify<LlamaTargetTopKVerifyCapture>>> {
+        let Some((emitted, capture, target_top_k, indexed_head)) = self.verify_tree_metal_inner(
+            tree,
+            capture_layer_ids,
+            true,
+            true,
+            Some(candidate_ids),
+            None,
+            None,
+            None,
+        )?
+        else {
+            return Ok(None);
+        };
+        let shadow = indexed_head.ok_or_else(|| {
+            BackendError::RuntimeShapeMismatch(
+                "indexed-head verifier completed without its requested shadow receipt".into(),
+            )
+        })?;
+        Ok(Some(LlamaIndexedHeadShadowVerify {
+            authoritative: LlamaTargetTopKVerifyCapture {
+                predictions: capture.predictions,
+                target_top_k,
+                emitted,
+                layer_inputs: capture.layer_inputs,
+                timings: capture.timings,
+            },
+            shadow,
+        }))
+    }
+
+    /// Token-Recycling-capable twin of the selective E1 falsifier above.
+    #[cfg(target_os = "macos")]
+    pub fn verify_tree_metal_with_layer_inputs_target_top_k_indexed_head_and_selective_e1_shadow(
+        &mut self,
+        tree: &spec_tree::TokenTree,
+        capture_layer_ids: &[usize],
+        candidate_ids: &[u32],
+        eagle3_head: &mut metal::Eagle3MetalState,
+        path_budget: usize,
+        selective_promotion: Option<metal::Eagle3SelectiveEdgePromotionAuthorization>,
+    ) -> Result<Option<LlamaIndexedHeadShadowVerify<LlamaTargetTopKVerifyCapture>>> {
+        let Some((emitted, capture, target_top_k, indexed_head)) = self.verify_tree_metal_inner(
+            tree,
+            capture_layer_ids,
+            true,
+            true,
+            Some(candidate_ids),
+            Some(eagle3_head),
+            Some(path_budget),
+            selective_promotion,
+        )?
+        else {
+            return Ok(None);
+        };
+        let shadow = indexed_head.ok_or_else(|| {
+            BackendError::RuntimeShapeMismatch(
+                "selective E1 verifier completed without its indexed-head receipt".into(),
+            )
+        })?;
+        Ok(Some(LlamaIndexedHeadShadowVerify {
+            authoritative: LlamaTargetTopKVerifyCapture {
+                predictions: capture.predictions,
+                target_top_k,
+                emitted,
+                layer_inputs: capture.layer_inputs,
+                timings: capture.timings,
+            },
+            shadow,
+        }))
+    }
+
+    /// Non-committing target top-k probe used to bootstrap an empty Token Recycling row.
+    ///
+    /// The resident target executes the same exact tree forward, but logical/Metal `filled` and
+    /// host KV position remain at the input base. A subsequent committing verify may therefore
+    /// redraft from the newly installed row and overwrite these provisional slots. This method is
+    /// benchmark-only by reachability; ordinary verification never calls it.
+    #[cfg(target_os = "macos")]
+    pub fn probe_tree_metal_target_top_k(
+        &mut self,
+        tree: &spec_tree::TokenTree,
+    ) -> Result<Option<(Vec<u32>, Vec<[u32; metal::RESIDENT_VERIFY_TARGET_TOP_K]>)>> {
+        Ok(self
+            .verify_tree_metal_inner(tree, &[], true, false, None, None, None, None)?
+            .map(|(_emitted, capture, target_top_k, _indexed_head)| {
+                (capture.predictions, target_top_k)
+            }))
     }
 
     #[cfg(target_os = "macos")]
@@ -1893,7 +2126,20 @@ impl super::LlamaInferenceSession {
         &mut self,
         tree: &spec_tree::TokenTree,
         capture_layer_ids: &[usize],
-    ) -> Result<Option<(Vec<u32>, LlamaGreedyVerifyCapture)>> {
+        read_target_top_k: bool,
+        commit: bool,
+        indexed_head_shadow_candidates: Option<&[u32]>,
+        mut eagle3_e1_shadow_head: Option<&mut metal::Eagle3MetalState>,
+        selective_e1_path_budget: Option<usize>,
+        selective_e1_promotion: Option<metal::Eagle3SelectiveEdgePromotionAuthorization>,
+    ) -> Result<
+        Option<(
+            Vec<u32>,
+            LlamaGreedyVerifyCapture,
+            Vec<[u32; metal::RESIDENT_VERIFY_TARGET_TOP_K]>,
+            Option<metal::ResidentIndexedHeadShadow>,
+        )>,
+    > {
         use spec_tree::TREE_MAX_NODES;
         if self.resident_paths_disabled || !resident_decode_metal_enabled() {
             return Ok(None);
@@ -1983,26 +2229,208 @@ impl super::LlamaInferenceSession {
                 k_weight_blocks: resident_weight_bytes(&l.attention_k),
                 v_weight_blocks: resident_weight_bytes(&l.attention_v),
                 o_weight_blocks: resident_weight_bytes(&l.attention_output),
-                gate_weight_blocks: resident_weight_bytes(resident_dense_ffn(l).0),
-                up_weight_blocks: resident_weight_bytes(resident_dense_ffn(l).1),
-                down_weight_blocks: resident_weight_bytes(resident_dense_ffn(l).2),
-                moe: resident_moe_view(&self.config, l),
-                qk_l2_norm_after_rope: self.config.architecture == "mobilemoe",
+                gate_weight_blocks: resident_weight_bytes(&l.ffn_gate),
+                up_weight_blocks: resident_weight_bytes(&l.ffn_up),
+                down_weight_blocks: resident_weight_bytes(&l.ffn_down),
             })
             .collect();
         let logits_stage = metal::LogitsStage {
             final_norm: &weights.output_norm.data,
             output_weight_blocks: resident_weight_bytes(weights.output_projection()),
             vocab_size: vocab,
+            output_is_tied_embedding: indexed_head_shadow_candidates.is_some()
+                && weights.output_projection_is_tied_embedding(),
         };
 
         let session = self
             .resident_decode
             .as_mut()
             .expect("resident session present (readiness checked above)");
-        // Keep the existing no-capture entry point byte-for-byte on its original Metal API.
-        // Only the new EAGLE seam asks verify_batch_inner to retain layer-input buffers.
-        let (predicted, raw_layer_inputs) = if capture_layer_ids.is_empty() {
+        // Strictly shadow-only: ordinary tree verification never passes a device-acceptance
+        // plan, so its existing wrapper/dispatch/allocation path is unchanged. The first staged
+        // production falsifier is limited to committing EAGLE verifies with the exact three
+        // target capture taps; generic trees, probes, and suffix verification stay on their
+        // established entry points even when the process gate is armed.
+        let acceptance_shadow_requested = commit
+            && capture_layer_ids == crate::eagle3::TARGET_LAYER_INPUT_IDS.as_slice()
+            && eagle3_device_acceptance_shadow_enabled();
+        let eagle3_e1_shadow_requested = commit
+            && capture_layer_ids == crate::eagle3::TARGET_LAYER_INPUT_IDS.as_slice()
+            && eagle3_e1_shadow_head.is_some();
+        // Established entry points remain on their original Metal APIs. Only the explicit
+        // benchmark request reaches the post-authoritative indexed-head replay.
+        let (
+            predicted,
+            raw_layer_inputs,
+            target_top_k,
+            indexed_head_shadow,
+            device_acceptance_shadow,
+            eagle3_e1_shadow,
+        ) = if eagle3_e1_shadow_requested {
+            let acceptance_plan = metal::ResidentTreeAcceptancePlan {
+                tree_tokens: &tree.tokens,
+                tree_parent: &tree.parent,
+                tree_depth: &tree.depth,
+            };
+            let eagle3_head = eagle3_e1_shadow_head
+                .as_deref()
+                .expect("requested E1 shadow has a head");
+            let e1_plan = metal::Eagle3AuthoritativeE1ShadowPlan {
+                head: eagle3_head,
+                tree_tokens: &tree.tokens,
+                tree_parent: &tree.parent,
+                tree_depth: &tree.depth,
+                stable_position: eagle3_head.filled(),
+                selective_path_budget: selective_e1_path_budget,
+                target_tail_baseline_us: selective_e1_path_budget
+                    .map(|_| metal::EAGLE3_SELECTIVE_EDGE_TARGET_TAIL_BASELINE_US),
+                selective_promotion: selective_e1_promotion,
+            };
+            let Some((
+                predicted,
+                raw_layer_inputs,
+                target_top_k,
+                indexed_head_shadow,
+                device_acceptance_shadow,
+                eagle3_e1_shadow,
+            )) = session.verify_batch_tree_with_e1_shadow(
+                &embeddings.data,
+                &cos_all,
+                &sin_all,
+                &layer_views,
+                &logits_stage,
+                &node_kvslot,
+                &ancestor_bits,
+                words,
+                position,
+                n,
+                scale,
+                capture_layer_ids,
+                read_target_top_k,
+                indexed_head_shadow_candidates,
+                acceptance_shadow_requested.then_some(&acceptance_plan),
+                &e1_plan,
+            )
+            else {
+                return Ok(None);
+            };
+            (
+                predicted,
+                raw_layer_inputs,
+                target_top_k,
+                indexed_head_shadow,
+                device_acceptance_shadow,
+                Some(eagle3_e1_shadow),
+            )
+        } else if acceptance_shadow_requested {
+            let acceptance_plan = metal::ResidentTreeAcceptancePlan {
+                tree_tokens: &tree.tokens,
+                tree_parent: &tree.parent,
+                tree_depth: &tree.depth,
+            };
+            let Some((
+                predicted,
+                raw_layer_inputs,
+                target_top_k,
+                indexed_head_shadow,
+                device_acceptance_shadow,
+            )) = session.verify_batch_tree_with_acceptance_shadow(
+                &embeddings.data,
+                &cos_all,
+                &sin_all,
+                &layer_views,
+                &logits_stage,
+                &node_kvslot,
+                &ancestor_bits,
+                words,
+                position,
+                n,
+                scale,
+                capture_layer_ids,
+                read_target_top_k,
+                indexed_head_shadow_candidates,
+                &acceptance_plan,
+            )
+            else {
+                return Ok(None);
+            };
+            (
+                predicted,
+                raw_layer_inputs,
+                target_top_k,
+                indexed_head_shadow,
+                Some(device_acceptance_shadow),
+                None,
+            )
+        } else if let Some(candidate_ids) = indexed_head_shadow_candidates {
+            let Some((predicted, raw_layer_inputs, target_top_k, indexed_head_shadow)) = session
+                .verify_batch_tree_with_indexed_head_shadow(
+                    &embeddings.data,
+                    &cos_all,
+                    &sin_all,
+                    &layer_views,
+                    &logits_stage,
+                    &node_kvslot,
+                    &ancestor_bits,
+                    words,
+                    position,
+                    n,
+                    scale,
+                    capture_layer_ids,
+                    read_target_top_k,
+                    candidate_ids,
+                )
+            else {
+                return Ok(None);
+            };
+            (
+                predicted,
+                raw_layer_inputs,
+                target_top_k,
+                Some(indexed_head_shadow),
+                None,
+                None,
+            )
+        } else if read_target_top_k {
+            if capture_layer_ids.is_empty() {
+                let Some((predicted, target_top_k)) = session.verify_batch_tree_with_target_top_k(
+                    &embeddings.data,
+                    &cos_all,
+                    &sin_all,
+                    &layer_views,
+                    &logits_stage,
+                    &node_kvslot,
+                    &ancestor_bits,
+                    words,
+                    position,
+                    n,
+                    scale,
+                ) else {
+                    return Ok(None);
+                };
+                (predicted, Vec::new(), target_top_k, None, None, None)
+            } else {
+                let Some((predicted, raw_layer_inputs, target_top_k)) = session
+                    .verify_batch_tree_with_layer_inputs_and_target_top_k(
+                        &embeddings.data,
+                        &cos_all,
+                        &sin_all,
+                        &layer_views,
+                        &logits_stage,
+                        &node_kvslot,
+                        &ancestor_bits,
+                        words,
+                        position,
+                        n,
+                        scale,
+                        capture_layer_ids,
+                    )
+                else {
+                    return Ok(None);
+                };
+                (predicted, raw_layer_inputs, target_top_k, None, None, None)
+            }
+        } else if capture_layer_ids.is_empty() {
             let Some(predicted) = session.verify_batch_tree(
                 &embeddings.data,
                 &cos_all,
@@ -2018,7 +2446,7 @@ impl super::LlamaInferenceSession {
             ) else {
                 return Ok(None);
             };
-            (predicted, Vec::new())
+            (predicted, Vec::new(), Vec::new(), None, None, None)
         } else {
             let Some(captured) = session.verify_batch_tree_with_layer_inputs(
                 &embeddings.data,
@@ -2036,20 +2464,110 @@ impl super::LlamaInferenceSession {
             ) else {
                 return Ok(None);
             };
-            captured
+            (captured.0, captured.1, Vec::new(), None, None, None)
         };
 
-        // Host accept: longest greedy-exact path through the tree, then COMPACT the accepted
-        // path's KV into contiguous slots base..base+L-1 so the cache matches a linear decode of
-        // that path (no-op for a single-branch tree). Identical accept rule to the CUDA arm.
+        if let Some(shadow) = eagle3_e1_shadow {
+            eagle3_e1_shadow_head
+                .as_deref_mut()
+                .expect("E1 receipt has an owning head")
+                .install_authoritative_e1_shadow(shadow)
+                .map_err(|error| {
+                    BackendError::RuntimeShapeMismatch(format!(
+                        "EAGLE-3 E1 shadow install failed: {error}"
+                    ))
+                })?;
+        }
+
+        // Host accept: longest greedy-exact path through the tree. A committing call compacts the
+        // accepted path's KV into contiguous slots base..base+L-1 and advances both positions.
+        // The benchmark cold-start probe deliberately leaves the provisional slots uncommitted;
+        // the immediately following full-tree verify starts at the same base and overwrites them.
         let (emitted, leaf) = tree.accept_longest_path(&predicted);
-        let path = tree.path_to(leaf); // includes the anchor (node 0); root first
-        session.compact_tree_kv_path(&path, position).map_err(|e| {
-            BackendError::RuntimeShapeMismatch(format!("tree KV compaction failed: {e}"))
-        })?;
-        let new_position = position + emitted.len();
-        session.set_filled(new_position);
-        self.kv_cache.position = new_position;
+        // Gate-off committing calls already build exactly one host path for compaction. Gate-on
+        // reuses that same allocation as the parity oracle, rather than reconstructing the
+        // selected path a second time. A non-committing call only builds a path if a future
+        // diagnostic explicitly supplies a receipt.
+        let accepted_path =
+            (commit || device_acceptance_shadow.is_some()).then(|| tree.path_to(leaf));
+        if let Some(shadow) = device_acceptance_shadow.as_ref() {
+            let host_path = accepted_path
+                .as_deref()
+                .expect("device acceptance receipt requires a host oracle path");
+            let verdict = compare_eagle3_device_acceptance_shadow(
+                tree, vocab, &emitted, leaf, host_path, shadow,
+            );
+            let counters = record_eagle3_device_acceptance_shadow(verdict);
+            match (verdict, shadow) {
+                (
+                    Eagle3DeviceAcceptanceShadowVerdict::Matched,
+                    metal::ResidentTreeAcceptanceShadow::Encoded {
+                        selected_leaf,
+                        emitted_count,
+                        terminal_token,
+                        terminal_depth,
+                        terminal_valid,
+                        ..
+                    },
+                ) => eprintln!(
+                    "[eagle3-device-accept-shadow] outcome=match route=device-selector-host-commit \
+                     base={position} rows={n} host_leaf={leaf} host_count={} \
+                     device_leaf={selected_leaf} device_count={emitted_count} \
+                     terminal_token={terminal_token} terminal_depth={terminal_depth} \
+                     terminal_valid={terminal_valid} requested_total={} encoded_total={} \
+                     matched_total={} mismatched_total={} fallback_total={}",
+                    emitted.len(),
+                    counters.requested,
+                    counters.encoded,
+                    counters.matched,
+                    counters.mismatched,
+                    counters.fallback,
+                ),
+                (Eagle3DeviceAcceptanceShadowVerdict::Mismatched(field), _) => eprintln!(
+                    "[eagle3-device-accept-shadow] outcome=mismatch route=device-selector-host-commit \
+                     field={field} base={position} rows={n} host_leaf={leaf} host_count={} \
+                     host_path={host_path:?} host_emitted={emitted:?} device={shadow:?} \
+                     requested_total={} encoded_total={} matched_total={} mismatched_total={} \
+                     fallback_total={}",
+                    emitted.len(),
+                    counters.requested,
+                    counters.encoded,
+                    counters.matched,
+                    counters.mismatched,
+                    counters.fallback,
+                ),
+                (Eagle3DeviceAcceptanceShadowVerdict::Fallback(reason), _) => eprintln!(
+                    "[eagle3-device-accept-shadow] outcome=fallback route=host-only \
+                     reason={} base={position} rows={n} host_leaf={leaf} host_count={} \
+                     requested_total={} encoded_total={} matched_total={} mismatched_total={} \
+                     fallback_total={}",
+                    reason.label(),
+                    emitted.len(),
+                    counters.requested,
+                    counters.encoded,
+                    counters.matched,
+                    counters.mismatched,
+                    counters.fallback,
+                ),
+                // A verdict is constructed from this same receipt immediately above; crossed
+                // variants would indicate a local bookkeeping bug, not a model outcome.
+                _ => unreachable!("device acceptance verdict/receipt variant diverged"),
+            }
+        }
+        if commit {
+            let path = accepted_path
+                .as_deref()
+                .expect("committing tree verify requires an accepted path");
+            session.compact_tree_kv_path(path, position).map_err(|e| {
+                BackendError::RuntimeShapeMismatch(format!("tree KV compaction failed: {e}"))
+            })?;
+            let new_position = position + emitted.len();
+            session.set_filled(new_position);
+            self.kv_cache.position = new_position;
+        } else {
+            debug_assert_eq!(session.filled(), position);
+            debug_assert_eq!(self.kv_cache.position, position);
+        }
         if std::env::var_os("CAMELID_SPEC_VERIFY_TRACE").is_some() {
             // Max fan-out = the most children any node has (1 == single-branch / linear).
             let mut child_count = vec![0u32; n];
@@ -2061,7 +2579,9 @@ impl super::LlamaInferenceSession {
             }
             let max_fanout = child_count.iter().copied().max().unwrap_or(0);
             eprintln!(
-                "[metal-tree-verify] base={position} n={n} emitted_len={} max_fanout={max_fanout}",
+                "[metal-tree-verify] mode={} base={position} n={n} emitted_len={} \
+                 max_fanout={max_fanout}",
+                if commit { "commit" } else { "probe" },
                 emitted.len()
             );
         }
@@ -2086,6 +2606,8 @@ impl super::LlamaInferenceSession {
                 layer_inputs,
                 timings: LlamaForwardTimings::default(),
             },
+            target_top_k,
+            indexed_head_shadow,
         )))
     }
 
@@ -2098,6 +2620,39 @@ impl super::LlamaInferenceSession {
         _last_token: u32,
         _drafts: &[u32],
     ) -> Result<Option<Vec<u32>>> {
+        Ok(None)
+    }
+
+    /// Non-macOS build: selective edge preparation is unavailable.
+    #[cfg(not(target_os = "macos"))]
+    #[allow(dead_code)]
+    pub fn verify_tree_metal_with_layer_inputs_indexed_head_and_selective_e1_shadow(
+        &mut self,
+        _tree: &spec_tree::TokenTree,
+        _capture_layer_ids: &[usize],
+        _candidate_ids: &[u32],
+        _eagle3_head: &mut metal::Eagle3MetalState,
+        _path_budget: usize,
+        _selective_promotion: Option<metal::Eagle3SelectiveEdgePromotionAuthorization>,
+    ) -> Result<Option<LlamaIndexedHeadShadowVerify<LlamaGreedyVerifyCapture>>> {
+        Ok(None)
+    }
+
+    /// Non-macOS build: resident teacher-feature capture is unavailable.
+    #[cfg(not(target_os = "macos"))]
+    #[allow(dead_code)]
+    pub fn begin_eagle3_training_metal(&mut self) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Non-macOS build: resident teacher-feature capture is unavailable.
+    #[cfg(not(target_os = "macos"))]
+    #[allow(dead_code)]
+    pub fn forward_eagle3_training_chunk_metal(
+        &mut self,
+        _input_tokens: &[u32],
+        _capture_layer_ids: &[usize],
+    ) -> Result<Option<LlamaEagle3TrainingCapture>> {
         Ok(None)
     }
 
@@ -2134,100 +2689,189 @@ impl super::LlamaInferenceSession {
     ) -> Result<Option<LlamaGreedyVerifyCapture>> {
         Ok(None)
     }
+
+    /// Non-macOS build: target-overlapped Metal E1 is unavailable.
+    #[cfg(not(target_os = "macos"))]
+    #[allow(dead_code)]
+    pub fn verify_tree_metal_with_layer_inputs_and_e1_shadow(
+        &mut self,
+        _tree: &spec_tree::TokenTree,
+        _capture_layer_ids: &[usize],
+        _eagle3_head: &mut metal::Eagle3MetalState,
+    ) -> Result<Option<LlamaGreedyVerifyCapture>> {
+        Ok(None)
+    }
+
+    /// Non-macOS build: resident target top-k verification is unavailable.
+    #[cfg(not(target_os = "macos"))]
+    #[allow(dead_code)]
+    pub fn verify_tree_metal_with_target_top_k(
+        &mut self,
+        _tree: &spec_tree::TokenTree,
+    ) -> Result<Option<LlamaTargetTopKVerify>> {
+        Ok(None)
+    }
+
+    /// Non-macOS build: combined Metal layer capture/target-top-k is unavailable.
+    #[cfg(not(target_os = "macos"))]
+    #[allow(dead_code)]
+    pub fn verify_tree_metal_with_layer_inputs_and_target_top_k(
+        &mut self,
+        _tree: &spec_tree::TokenTree,
+        _capture_layer_ids: &[usize],
+    ) -> Result<Option<LlamaTargetTopKVerifyCapture>> {
+        Ok(None)
+    }
+
+    /// Non-macOS build: indexed Metal output-head diagnostics are unavailable.
+    #[cfg(not(target_os = "macos"))]
+    #[allow(dead_code)]
+    pub fn verify_tree_metal_with_layer_inputs_and_indexed_head_shadow(
+        &mut self,
+        _tree: &spec_tree::TokenTree,
+        _capture_layer_ids: &[usize],
+        _candidate_ids: &[u32],
+    ) -> Result<Option<LlamaIndexedHeadShadowVerify<LlamaGreedyVerifyCapture>>> {
+        Ok(None)
+    }
+
+    /// Non-macOS build: combined target-top-k/indexed-head diagnostics are unavailable.
+    #[cfg(not(target_os = "macos"))]
+    #[allow(dead_code)]
+    pub fn verify_tree_metal_with_layer_inputs_target_top_k_and_indexed_head_shadow(
+        &mut self,
+        _tree: &spec_tree::TokenTree,
+        _capture_layer_ids: &[usize],
+        _candidate_ids: &[u32],
+    ) -> Result<Option<LlamaIndexedHeadShadowVerify<LlamaTargetTopKVerifyCapture>>> {
+        Ok(None)
+    }
+
+    /// Non-macOS build: target-top-k selective edge preparation is unavailable.
+    #[cfg(not(target_os = "macos"))]
+    #[allow(dead_code)]
+    pub fn verify_tree_metal_with_layer_inputs_target_top_k_indexed_head_and_selective_e1_shadow(
+        &mut self,
+        _tree: &spec_tree::TokenTree,
+        _capture_layer_ids: &[usize],
+        _candidate_ids: &[u32],
+        _eagle3_head: &mut metal::Eagle3MetalState,
+        _path_budget: usize,
+        _selective_promotion: Option<metal::Eagle3SelectiveEdgePromotionAuthorization>,
+    ) -> Result<Option<LlamaIndexedHeadShadowVerify<LlamaTargetTopKVerifyCapture>>> {
+        Ok(None)
+    }
+
+    /// Non-macOS build: resident target top-k probing is unavailable.
+    #[cfg(not(target_os = "macos"))]
+    #[allow(dead_code)]
+    pub fn probe_tree_metal_target_top_k(
+        &mut self,
+        _tree: &spec_tree::TokenTree,
+    ) -> Result<Option<(Vec<u32>, Vec<[u32; metal::RESIDENT_VERIFY_TARGET_TOP_K]>)>> {
+        Ok(None)
+    }
 }
 
-#[cfg(all(test, target_os = "macos"))]
-mod parking_tests {
+#[cfg(test)]
+mod eagle3_device_acceptance_shadow_tests {
     use super::*;
 
-    /// A minimal engine. `None` on a host with no Metal device, which skips the test.
-    fn tiny_state(hidden: usize) -> Option<ResidentDecodeState> {
-        metal::ResidentDecodeState::new(1, 1, 1, 32, hidden, 64, 8, 8, 1.0e-5, false, None)
+    #[test]
+    fn eagle3_authoritative_e1_shadow_gate_is_strict_and_default_off() {
+        assert!(!eagle3_authoritative_e1_shadow_setting_enables(None));
+        assert!(!eagle3_authoritative_e1_shadow_setting_enables(Some("")));
+        assert!(!eagle3_authoritative_e1_shadow_setting_enables(Some("0")));
+        assert!(!eagle3_authoritative_e1_shadow_setting_enables(Some(
+            "true"
+        )));
+        assert!(!eagle3_authoritative_e1_shadow_setting_enables(Some("01")));
+        assert!(eagle3_authoritative_e1_shadow_setting_enables(Some("1")));
+        assert!(eagle3_authoritative_e1_shadow_setting_enables(Some(" 1\n")));
     }
 
-    /// The slot has exactly one writer in the test binary: this module. A session parks
-    /// only when `resident_cache_key` is set, and only the API sets it, so no other test
-    /// can leave an engine here or take this one.
     #[test]
-    fn a_parked_engine_is_reclaimed_only_by_an_exact_key_and_geometry_match() {
-        clear_parked_resident_metal();
-        let Some(mut state) = tiny_state(32) else {
-            eprintln!("SKIP: no Metal device");
-            return;
-        };
-        state.set_filled(3);
-        let geometry = ResidentMetalGeometry::of(&state);
-        park_resident_metal(0xD00D, geometry, state, vec![7, 8, 9]);
-
-        assert!(
-            reclaim_resident_metal(0xBEEF, geometry).is_none(),
-            "another model's key must not take this engine"
-        );
-        let mut other = geometry;
-        other.hidden += 128;
-        assert!(
-            reclaim_resident_metal(0xD00D, other).is_none(),
-            "a geometry mismatch must rebuild, never reuse another shape's strides"
-        );
-
-        let (state, tokens) =
-            reclaim_resident_metal(0xD00D, geometry).expect("an exact match reclaims");
-        assert_eq!(tokens, vec![7, 8, 9], "the record must survive parking");
-        assert_eq!(
-            state.filled(),
-            3,
-            "the watermark must survive parking, or the next turn cannot bound its claim"
-        );
-        assert!(
-            reclaim_resident_metal(0xD00D, geometry).is_none(),
-            "reclaiming takes the engine: the slot must not hand the same one out twice"
-        );
+    fn eagle3_device_acceptance_shadow_gate_is_strict_and_default_off() {
+        assert!(!eagle3_device_acceptance_shadow_setting_enables(None));
+        assert!(!eagle3_device_acceptance_shadow_setting_enables(Some("")));
+        assert!(!eagle3_device_acceptance_shadow_setting_enables(Some("0")));
+        assert!(!eagle3_device_acceptance_shadow_setting_enables(Some(
+            "true"
+        )));
+        assert!(!eagle3_device_acceptance_shadow_setting_enables(Some("01")));
+        assert!(eagle3_device_acceptance_shadow_setting_enables(Some("1")));
+        assert!(eagle3_device_acceptance_shadow_setting_enables(Some(
+            " 1\n"
+        )));
     }
 
-    /// Parking is refused when the record and the watermark disagree, because that is
-    /// exactly the state a failed prefill or a rewind leaves behind — rows the record
-    /// claims but the engine does not hold, or rows it holds but cannot name. Reusing
-    /// either as a known prefix is silently wrong output.
     #[test]
-    fn an_engine_whose_record_disagrees_with_its_watermark_is_not_parked() {
-        clear_parked_resident_metal();
-        let Some(mut state) = tiny_state(32) else {
-            eprintln!("SKIP: no Metal device");
-            return;
+    fn eagle3_device_acceptance_shadow_compares_every_commit_field() {
+        let tree = spec_tree::TokenTree {
+            tokens: vec![10, 11, 12, 13, 14, 15, 16, 17],
+            parent: vec![-1, 0, 0, 1, 1, 2, 4, 4],
+            depth: vec![0, 1, 1, 2, 2, 2, 3, 3],
         };
-        state.set_filled(2);
-        let geometry = ResidentMetalGeometry::of(&state);
-        park_resident_metal(0xD00D, geometry, state, vec![7, 8, 9]);
-        assert!(
-            reclaim_resident_metal(0xD00D, geometry).is_none(),
-            "filled=2 against a 3-token record claims rows never written: drop, do not park"
-        );
-
-        // The opposite direction is ordinary, not an error: decode leaves the watermark
-        // past the prompt, and parking rewinds it to the record rather than refusing.
-        clear_parked_resident_metal();
-        let Some(mut state) = tiny_state(32) else {
-            return;
+        let predictions = vec![11, 14, 0, 0, 16, 0, 99, 0];
+        let (emitted, leaf) = tree.accept_longest_path(&predictions);
+        let path = tree.path_to(leaf);
+        let exact = metal::ResidentTreeAcceptanceShadow::Encoded {
+            selected_leaf: leaf as u32,
+            emitted_count: emitted.len() as u32,
+            terminal_token: 99,
+            safe_terminal_token: 99,
+            terminal_depth: 3,
+            terminal_valid: true,
+            path_rows: path.iter().map(|&row| row as u32).collect(),
+            emitted_tokens: emitted.clone(),
         };
-        state.set_filled(6); // prompt of 3, then 3 generated tokens
-        let geometry = ResidentMetalGeometry::of(&state);
-        park_resident_metal(0xD00D, geometry, state, vec![7, 8, 9]);
-        let (state, tokens) = reclaim_resident_metal(0xD00D, geometry)
-            .expect("a decoded-past engine must still park: this is every real request");
-        assert_eq!(tokens, vec![7, 8, 9]);
         assert_eq!(
-            state.filled(),
-            3,
-            "the watermark must be rewound to the record, so the next turn cannot claim              generated rows the record does not name"
+            compare_eagle3_device_acceptance_shadow(
+                &tree,
+                crate::eagle3::TARGET_VOCAB_SIZE,
+                &emitted,
+                leaf,
+                &path,
+                &exact,
+            ),
+            Eagle3DeviceAcceptanceShadowVerdict::Matched
         );
 
-        clear_parked_resident_metal();
-        let Some(state) = tiny_state(32) else { return };
-        let geometry = ResidentMetalGeometry::of(&state);
-        park_resident_metal(0xD00D, geometry, state, Vec::new());
-        assert!(
-            reclaim_resident_metal(0xD00D, geometry).is_none(),
-            "an empty record vouches for nothing and must not park"
+        let mut wrong_path = exact.clone();
+        let metal::ResidentTreeAcceptanceShadow::Encoded { path_rows, .. } = &mut wrong_path else {
+            unreachable!()
+        };
+        path_rows[2] = 5;
+        assert_eq!(
+            compare_eagle3_device_acceptance_shadow(
+                &tree,
+                crate::eagle3::TARGET_VOCAB_SIZE,
+                &emitted,
+                leaf,
+                &path,
+                &wrong_path,
+            ),
+            Eagle3DeviceAcceptanceShadowVerdict::Mismatched("path_rows")
+        );
+
+        let fallback = metal::ResidentTreeAcceptanceShadow::Fallback(
+            metal::ResidentTreeAcceptanceShadowFallbackReason::PipelineUnavailable,
+        );
+        assert_eq!(
+            compare_eagle3_device_acceptance_shadow(
+                &tree,
+                crate::eagle3::TARGET_VOCAB_SIZE,
+                &emitted,
+                leaf,
+                &path,
+                &fallback,
+            ),
+            Eagle3DeviceAcceptanceShadowVerdict::Fallback(
+                metal::ResidentTreeAcceptanceShadowFallbackReason::PipelineUnavailable
+            )
         );
     }
 }
+
+#[cfg(target_os = "macos")]
+include!("metal_fp16_probe.rs");

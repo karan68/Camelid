@@ -1,7 +1,3 @@
-import { normalizeChatContext } from './projectContext.js'
-import { normalizeMessageVariants } from './messageVariants.js'
-import { normalizeConversationOrganization } from './conversationOrganization.js'
-
 export function cleanLegacyDemoCapCopy(value) {
   if (typeof value !== 'string') return value
   const stripped = value
@@ -19,12 +15,7 @@ export function cleanLegacyDemoCapCopy(value) {
 
 export function normalizeStoredMessage(message, { clearStaleStreaming = false } = {}) {
   if (!message || typeof message !== 'object') return message
-  const { demo_token_cap: _demoTokenCap, ...stored } = message
-  /* Keep the sibling list and the mirrored top-level fields in step. A
-     transcript restored from an export, hand-edited, or written by a build
-     that predates variants must never render one alternative's text beside
-     another's token counts. */
-  const rest = normalizeMessageVariants(stored)
+  const { demo_token_cap: _demoTokenCap, ...rest } = message
   const content = cleanLegacyDemoCapCopy(rest.content)
   if (clearStaleStreaming && rest.streaming) {
     return {
@@ -42,9 +33,8 @@ export function normalizeStoredMessage(message, { clearStaleStreaming = false } 
 }
 
 export function normalizeStoredConversations(records, options = {}) {
-  return (Array.isArray(records) ? records : []).map((conversation) => normalizeConversationOrganization({
+  return (Array.isArray(records) ? records : []).map((conversation) => ({
     ...conversation,
-    ...(conversation?.context ? { context: normalizeChatContext(conversation.context) } : {}),
     messages: Array.isArray(conversation?.messages)
       ? conversation.messages.map((message) => normalizeStoredMessage(message, options))
       : [],

@@ -8,11 +8,9 @@
 //! instructions (constraint 6). `run_shell` is cwd-pinned + approval-gated, not a
 //! filesystem jail (Decision C / DECISIONS D9).
 
-use std::io::{Read, Write};
+use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -187,67 +185,21 @@ pub struct ToolCall {
     pub args: Value,
 }
 
-/// An image a tool produced, carried alongside its text.
-///
-/// Base64 rather than `Vec<u8>` on purpose: this rides inside the agent session
-/// file, where a byte vector serializes as a JSON integer array (~7x the size
-/// and unreadable), and the one decoder that would ever consume it wants a
-/// base64 data URL anyway. `mime` is constrained at the producer to the types
-/// that decoder accepts, so a tool cannot manufacture something unrepresentable.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolImage {
-    pub mime: String,
-    pub data_base64: String,
-}
-
 /// The result of running a tool — text the model consumes as data.
-///
-/// `OkWith` is a success that also carries images. It is deliberately a third
-/// variant rather than a field on `Ok`: the two tuple variants stay
-/// byte-identical, so the ~137 construction sites and every `matches!` pattern
-/// in the tree keep compiling.
-///
-/// Test the success/failure axis with [`ToolOutcome::is_err`], never with
-/// `matches!(out, ToolOutcome::Ok(_))` — the latter is false for an
-/// image-bearing success.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ToolOutcome {
     Ok(String),
     Err(String),
-    OkWith {
-        text: String,
-        images: Vec<ToolImage>,
-    },
 }
 
 impl ToolOutcome {
     pub fn text(&self) -> &str {
         match self {
             ToolOutcome::Ok(s) | ToolOutcome::Err(s) => s,
-            ToolOutcome::OkWith { text, .. } => text,
         }
     }
     pub fn is_err(&self) -> bool {
         matches!(self, ToolOutcome::Err(_))
-    }
-
-    /// Images this outcome carries; empty for every text-only outcome, so
-    /// existing callers need no change.
-    pub fn images(&self) -> &[ToolImage] {
-        match self {
-            ToolOutcome::OkWith { images, .. } => images,
-            _ => &[],
-        }
-    }
-
-    /// Rebuild this outcome with new text, keeping any images. Use this instead
-    /// of reconstructing from `text()` + `is_err()`, which silently drops them.
-    pub fn with_text(self, text: String) -> Self {
-        match self {
-            ToolOutcome::Ok(_) => ToolOutcome::Ok(text),
-            ToolOutcome::Err(_) => ToolOutcome::Err(text),
-            ToolOutcome::OkWith { images, .. } => ToolOutcome::OkWith { text, images },
-        }
     }
 
     pub fn clipped(self, max_bytes: usize) -> Self {
@@ -265,12 +217,6 @@ impl ToolOutcome {
         match self {
             Self::Ok(text) => Self::Ok(clip_text(text)),
             Self::Err(text) => Self::Err(clip_text(text)),
-            // Clip the text, pass the images through: the byte budget exists to
-            // bound what the model reads, and an image is not read as text.
-            Self::OkWith { text, images } => Self::OkWith {
-                text: clip_text(text),
-                images,
-            },
         }
     }
 }
@@ -298,9 +244,6 @@ pub struct Sandbox {
     root: PathBuf,
     allow_net: bool,
     shell_timeout: Duration,
-    /// User-facing undo snapshots. Disposable benchmark workspaces disable
-    /// these so adapter-owned state cannot contaminate repository scoring.
-    checkpoints_enabled: bool,
     /// OS-level confinement mode for `run_shell` (Task 1). Defaults to
     /// [`ShellSandbox::Sandboxed`]; production sets it from `--shell-sandbox`.
     shell_mode: ShellSandbox,
@@ -313,11 +256,6 @@ pub struct Sandbox {
 
 const MAX_READ_BYTES: usize = 64 * 1024;
 const MAX_OUTPUT_BYTES: usize = 16 * 1024;
-// Keep draining each child pipe to EOF, but retain only a bounded head/tail.
-// Splitting the overall tool-output allowance between stdout and stderr keeps
-// a chatty compiler or adversarial command from growing the agent process
-// without bound while preserving both the first error and the final summary.
-const MAX_PIPE_CAPTURE_BYTES: usize = MAX_OUTPUT_BYTES / 2;
 const MAX_RANGED_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_LIST_ENTRIES: usize = 4_096;
 const MAX_SEARCH_FILES: usize = 5_000;
@@ -341,20 +279,9 @@ impl Sandbox {
             root,
             allow_net,
             shell_timeout,
-            checkpoints_enabled: true,
             shell_mode: ShellSandbox::default(),
             fs_unrestricted: false,
         })
-    }
-
-    /// Enable or disable user-facing undo snapshots for this sandbox.
-    pub fn with_checkpoints(mut self, enabled: bool) -> Self {
-        self.checkpoints_enabled = enabled;
-        self
-    }
-
-    pub fn checkpoints_enabled(&self) -> bool {
-        self.checkpoints_enabled
     }
 
     /// Set the `run_shell` confinement mode (defaults to sandboxed).
@@ -412,16 +339,7 @@ impl Sandbox {
             }
         };
         let canon = if must_exist {
-            match std::fs::canonicalize(&candidate) {
-                Ok(c) => c,
-                Err(e) => {
-                    let err_msg = format!("cannot access {raw}: {e}");
-                    if let Some(suggestion) = suggest_path_in_sandbox(&self.root, raw) {
-                        return Err(format!("{err_msg}. Did you mean '{suggestion}'?"));
-                    }
-                    return Err(err_msg);
-                }
-            }
+            std::fs::canonicalize(&candidate).map_err(|e| format!("cannot access {raw}: {e}"))?
         } else {
             let parent = candidate
                 .parent()
@@ -444,25 +362,6 @@ impl Sandbox {
         }
     }
 
-    /// Resolve a create/overwrite target while refusing an existing final
-    /// symlink. `resolve(..., false)` intentionally canonicalizes only the
-    /// parent; without this final-component check, an approved write to
-    /// `workspace/link` could follow `link` to a file outside the workspace.
-    pub(crate) fn resolve_output(&self, raw: &str) -> Result<PathBuf, String> {
-        let path = self.resolve(raw, false)?;
-        match std::fs::symlink_metadata(&path) {
-            Ok(metadata) if metadata.file_type().is_symlink() => Err(format!(
-                "output path {raw} is an existing symbolic link; refusing to follow it"
-            )),
-            Ok(metadata) if !metadata.file_type().is_file() => Err(format!(
-                "output path {raw} exists but is not a regular file"
-            )),
-            Ok(_) => Ok(path),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(path),
-            Err(error) => Err(format!("cannot inspect output path {raw}: {error}")),
-        }
-    }
-
     /// Display a resolved path relative to the root for transcripts.
     pub fn rel(&self, path: &Path) -> String {
         path.strip_prefix(&self.root)
@@ -477,112 +376,6 @@ impl Sandbox {
     }
 }
 
-/// Compute Levenshtein edit distance between two strings.
-fn levenshtein_distance(a: &str, b: &str) -> usize {
-    let a_chars: Vec<char> = a.chars().collect();
-    let b_chars: Vec<char> = b.chars().collect();
-    let mut prev: Vec<usize> = (0..=b_chars.len()).collect();
-    let mut curr: Vec<usize> = vec![0; b_chars.len() + 1];
-
-    for (i, &ac) in a_chars.iter().enumerate() {
-        curr[0] = i + 1;
-        for (j, &bc) in b_chars.iter().enumerate() {
-            let cost = if ac == bc { 0 } else { 1 };
-            curr[j + 1] = (prev[j + 1] + 1).min(curr[j] + 1).min(prev[j] + cost);
-        }
-        prev.copy_from_slice(&curr);
-    }
-    prev[b_chars.len()]
-}
-
-/// Find closest matching file in sandbox root if a requested path does not exist.
-fn suggest_path_in_sandbox(root: &Path, raw: &str) -> Option<String> {
-    let raw_norm = raw.replace('\\', "/");
-    let raw_path = Path::new(&raw_norm);
-    let raw_name = raw_path.file_name()?.to_str()?;
-    if raw_name.is_empty() || raw_name.starts_with('.') {
-        return None;
-    }
-    let raw_stem = raw_path.file_stem()?.to_str()?;
-
-    let mut stack = vec![root.to_path_buf()];
-    let mut best_suggestion = None;
-    let mut best_score = 0usize;
-    let mut visited_dirs = 0usize;
-    let mut inspected_files = 0usize;
-
-    'walk: while let Some(dir) = stack.pop() {
-        visited_dirs += 1;
-        if visited_dirs > 64 {
-            break;
-        }
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-
-        for entry in entries.flatten() {
-            let Ok(ft) = entry.file_type() else {
-                continue;
-            };
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-            if name_str.starts_with('.') || name_str == "target" || name_str == "node_modules" {
-                continue;
-            }
-
-            if ft.is_dir() {
-                stack.push(entry.path());
-            } else if ft.is_file() {
-                inspected_files += 1;
-                if inspected_files > 500 {
-                    break 'walk;
-                }
-
-                let entry_path = entry.path();
-                let Ok(rel) = entry_path.strip_prefix(root) else {
-                    continue;
-                };
-                let rel_str = rel.to_string_lossy().replace('\\', "/");
-                let entry_stem = Path::new(&*name_str)
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("");
-
-                let score = if name_str == raw_name {
-                    100
-                } else if name_str.to_ascii_lowercase() == raw_name.to_ascii_lowercase() {
-                    90
-                } else if entry_stem == raw_stem {
-                    80
-                } else if raw_name.len() >= 3 && name_str.len() >= 3 {
-                    let dist = levenshtein_distance(&name_str, raw_name);
-                    if dist <= 2 {
-                        70 - dist * 10
-                    } else {
-                        0
-                    }
-                } else {
-                    0
-                };
-
-                if score > best_score {
-                    best_score = score;
-                    best_suggestion = Some(rel_str);
-                    if score == 100 {
-                        return best_suggestion;
-                    }
-                }
-            }
-        }
-    }
-
-    if best_score >= 50 {
-        best_suggestion
-    } else {
-        None
-    }
-}
-
 // --- tool registry --------------------------------------------------------
 
 /// The tool surface advertised to and accepted from the model for one agent
@@ -591,35 +384,23 @@ fn suggest_path_in_sandbox(root: &Path, raw: &str) -> Option<String> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolProfile {
     Full,
-    BenchmarkShared,
     WorkspaceReadOnly,
 }
 
 impl ToolProfile {
     pub fn allows(self, tool: &str) -> bool {
-        match self {
-            ToolProfile::Full => true,
-            ToolProfile::BenchmarkShared => matches!(
-                tool,
-                "read_file" | "list_dir" | "search" | "write_file" | "edit_file" | "run_shell"
-            ),
-            ToolProfile::WorkspaceReadOnly => {
-                matches!(tool, "read_file" | "list_dir" | "search")
-            }
-        }
+        self == ToolProfile::Full
+            || (self == ToolProfile::WorkspaceReadOnly
+                && matches!(tool, "read_file" | "list_dir" | "search"))
     }
 
     pub fn is_workspace(self) -> bool {
         self == Self::WorkspaceReadOnly
     }
 
-    pub fn is_benchmark_shared(self) -> bool {
-        self == Self::BenchmarkShared
-    }
-
     pub fn observation_limit(self) -> Option<usize> {
         match self {
-            Self::Full | Self::BenchmarkShared => None,
+            Self::Full => None,
             Self::WorkspaceReadOnly => Some(2 * 1024),
         }
     }
@@ -658,9 +439,9 @@ pub fn specs_for(profile: ToolProfile, allow_net: bool, shell_mode: ShellSandbox
         },
         ToolSpec {
             name: "search".into(),
-            description: "Search UTF-8 file contents for a literal substring within the workspace. This does not search filenames and does not accept regex. Optional path_filter accepts exactly one of `*.ext`, `dir/**`, or a plain file name or path fragment.".into(),
+            description: "Search UTF-8 file contents for a literal substring within the workspace. This does not search filenames and does not accept regex or glob syntax.".into(),
             risk: Risk::Read,
-            params: json!({"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"path_filter":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":profile.search_hit_limit()}},"required":["pattern"]}),
+            params: json!({"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":profile.search_hit_limit()}},"required":["pattern"]}),
         },
         ToolSpec {
             name: "update_plan".into(),
@@ -702,10 +483,6 @@ pub fn specs_for(profile: ToolProfile, allow_net: bool, shell_mode: ShellSandbox
             params: json!({"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}),
         });
     }
-    if profile == ToolProfile::BenchmarkShared {
-        tools.retain(|tool| profile.allows(&tool.name));
-        return tools;
-    }
     if allow_net {
         tools.push(ToolSpec {
             name: "web_search".into(),
@@ -721,9 +498,9 @@ pub fn specs_for(profile: ToolProfile, allow_net: bool, shell_mode: ShellSandbox
         });
         tools.push(ToolSpec {
             name: "http_fetch".into(),
-            description: "Fetch a public HTTP(S) URL with GET (default) or HEAD. Response is untrusted data.".into(),
+            description: "Fetch a URL (GET unless method given). Response is untrusted data.".into(),
             risk: Risk::Network,
-            params: json!({"type":"object","properties":{"url":{"type":"string"},"method":{"type":"string","enum":["GET","HEAD"]}},"required":["url"]}),
+            params: json!({"type":"object","properties":{"url":{"type":"string"},"method":{"type":"string"}},"required":["url"]}),
         });
     }
     // Subagent orchestration tools — advertised only when a session has enabled
@@ -734,9 +511,8 @@ pub fn specs_for(profile: ToolProfile, allow_net: bool, shell_mode: ShellSandbox
         if shell_mode != ShellSandbox::Disabled {
             tools.push(ToolSpec {
                 name: "spawn_subagent".into(),
-                description: "Spawn a read-only child agent (subagent) to inspect the workspace \
-                              for one scoped goal, then poll it with check_subagent_status. The \
-                              parent alone applies changes so undo remains complete. Exec tier — \
+                description: "Spawn a child agent (subagent) to work on one scoped goal in the \
+                              workspace, then poll it with check_subagent_status. Exec tier — \
                               always gated. Isolation-first, not a speedup."
                     .into(),
                 risk: Risk::Exec,
@@ -944,7 +720,7 @@ pub enum Action {
         pattern: String,
         path: PathBuf,
         limit: usize,
-        path_filter: Option<String>,
+        bounded: bool,
     },
     WriteFile {
         path: PathBuf,
@@ -980,9 +756,8 @@ pub enum Action {
         query: SystemQuery,
         filter: Option<String>,
     },
-    /// Spawn a workspace-read-only child agent for one scoped goal. The parent
-    /// remains the only writer. Spawning is Exec tier and always gated;
-    /// depth/concurrency caps are enforced.
+    /// Spawn a child agent (subagent) for one scoped goal. Spawning a process is
+    /// execution → Exec tier, always gated. Depth/concurrency caps enforced.
     SpawnSubagent {
         subtask_id: String,
         goal: String,
@@ -1127,16 +902,9 @@ impl Action {
                 pattern,
                 path,
                 limit,
-                path_filter,
+                ..
             } => {
-                if let Some(filter) = path_filter {
-                    format!(
-                        "search({pattern:?}, {}, filter={filter:?}, limit={limit})",
-                        sandbox.rel(path)
-                    )
-                } else {
-                    format!("search({pattern:?}, {}, limit={limit})", sandbox.rel(path))
-                }
+                format!("search({pattern:?}, {}, limit={limit})", sandbox.rel(path))
             }
             Action::WriteFile { path, content, .. } => {
                 format!("write_file({}, {} bytes)", sandbox.rel(path), content.len())
@@ -1236,10 +1004,11 @@ impl Action {
                 timeout.as_secs()
             ),
             // Verbatim goal text (untrusted, never re-parsed) for the approval UI.
-            // Disclose the child's fixed posture: it may inspect and report, but
-            // the parent remains the only writer so checkpoints stay complete.
+            // Disclose the child's posture: it runs unattended and cannot prompt,
+            // so it inherits this session's mode and DENIES anything that would
+            // confirm (it can never run an unattended shell).
             Action::SpawnSubagent { subtask_id, goal } => format!(
-                "spawn_subagent {subtask_id} in {} (read-only child; parent applies all changes):\n  goal: {goal}",
+                "spawn_subagent {subtask_id} in {} (runs unattended; Exec denied in the child):\n  goal: {goal}",
                 sandbox.rel(sandbox.root())
             ),
             // Verbatim text/chord so approval shows exactly what will be synthesized
@@ -1255,29 +1024,7 @@ impl Action {
     }
 
     /// Execute the (already approved) action.
-    // Kept for focused tool tests and optional diagnostic lanes; the production
-    // agent path uses `execute_with_cancel` so process trees observe Ctrl-C.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn execute(&self, sandbox: &Sandbox) -> ToolOutcome {
-        static NEVER_CANCEL: AtomicBool = AtomicBool::new(false);
-        self.execute_with_cancel(sandbox, &NEVER_CANCEL)
-    }
-
-    /// Execute an approved action while observing the owning agent turn's
-    /// cancellation flag. Direct diagnostic/test callers use [`Self::execute`];
-    /// the real agent loop always uses this path so Ctrl-C can tear down a
-    /// running process tree instead of waiting for the shell timeout.
-    pub(crate) fn execute_with_cancel(
-        &self,
-        sandbox: &Sandbox,
-        cancel: &AtomicBool,
-    ) -> ToolOutcome {
-        // Approval may have blocked while another thread delivered Ctrl-C.
-        // Re-check at the mutation/exec boundary so no action begins after the
-        // owning turn has been cancelled, including direct audited callers.
-        if cancel.load(Ordering::Acquire) {
-            return ToolOutcome::Err("action cancelled before execution".into());
-        }
         match self {
             Action::ReadFile {
                 path,
@@ -1293,8 +1040,8 @@ impl Action {
                 pattern,
                 path,
                 limit,
-                path_filter,
-            } => search(pattern, path, *limit, path_filter.as_deref(), sandbox),
+                bounded,
+            } => search(pattern, path, *limit, *bounded, sandbox),
             // Snapshot before every mutation, at the execution site rather than
             // on the model's say-so, so undo is available whether or not the
             // model thought to ask for it. The snapshot only becomes a
@@ -1312,13 +1059,13 @@ impl Action {
                 super::checkpoint::finish(pending, !out.is_err());
                 out
             }
-            Action::RunShell { command } => run_shell(sandbox, command, cancel),
+            Action::RunShell { command } => run_shell(sandbox, command),
             Action::HttpFetch { method, url } => http_fetch(sandbox, method, url),
             Action::RunWindowsCommand {
                 workdir,
                 command,
                 timeout,
-            } => run_windows_command(workdir, command, *timeout, cancel),
+            } => run_windows_command(workdir, command, *timeout),
             Action::InspectSystem { query, filter } => inspect_system(*query, filter.as_deref()),
             Action::SpawnSubagent { subtask_id, goal } => {
                 match subagent::spawn(sandbox.root(), subtask_id, goal) {
@@ -1351,19 +1098,10 @@ impl Action {
             }
             // The server's reply is untrusted data and reaches the model through
             // the same fenced tool-result path as every native tool.
-            Action::McpCall { name, args } => {
-                match super::mcp::call_with_cancel(name, args, cancel) {
-                    Ok((text, images)) if images.is_empty() => ToolOutcome::Ok(clip(&text)),
-                    // The text is clipped as before; the images ride beside it
-                    // so the byte budget for what the model reads does not
-                    // destroy them. Nothing feeds them into a prompt yet.
-                    Ok((text, images)) => ToolOutcome::OkWith {
-                        text: clip(&text),
-                        images,
-                    },
-                    Err(error) => ToolOutcome::Err(error),
-                }
-            }
+            Action::McpCall { name, args } => match super::mcp::call(name, args) {
+                Ok(text) => ToolOutcome::Ok(clip(&text)),
+                Err(error) => ToolOutcome::Err(error),
+            },
         }
     }
 }
@@ -1455,10 +1193,6 @@ pub fn validate_for(
         "search" => {
             let pattern = str_arg("pattern")?;
             let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
-            let path_filter = args
-                .get("path_filter")
-                .and_then(Value::as_str)
-                .map(str::to_string);
             let max_limit = profile.search_hit_limit();
             let limit = args
                 .get("limit")
@@ -1473,13 +1207,13 @@ pub fn validate_for(
                 pattern,
                 path: sandbox.resolve(path, true)?,
                 limit: limit as usize,
-                path_filter,
+                bounded: profile.is_workspace(),
             })
         }
         "write_file" => {
             let path_raw = str_arg("path")?;
             let content = str_arg("content")?;
-            let path = sandbox.resolve_output(&path_raw)?;
+            let path = sandbox.resolve(&path_raw, false)?;
             refuse_agent_state_write(sandbox, &path)?;
             let summary = write_summary(&path, &content);
             Ok(Action::WriteFile {
@@ -1509,9 +1243,6 @@ pub fn validate_for(
                 .and_then(Value::as_str)
                 .unwrap_or("GET")
                 .to_ascii_uppercase();
-            if !matches!(method.as_str(), "GET" | "HEAD") {
-                return Err("http_fetch allows only GET and HEAD".into());
-            }
             Ok(Action::HttpFetch {
                 method,
                 url: str_arg("url")?,
@@ -1740,7 +1471,7 @@ pub fn validate_for(
                     .filter(|s| !s.trim().is_empty())
                     .unwrap_or("screenshot.png");
                 Ok(Action::Screenshot {
-                    path: sandbox.resolve_output(raw)?,
+                    path: sandbox.resolve(raw, false)?,
                 })
             }
         }
@@ -1774,7 +1505,7 @@ pub fn validate_for(
         other if other.starts_with(super::mcp::PREFIX) => {
             if !super::mcp::is_enabled() {
                 return Err(format!(
-                    "`{other}` is an MCP tool but MCP is not enabled (start with --allow-mcp and --trust-mcp-server <NAME>)"
+                    "`{other}` is an MCP tool but MCP is not enabled (start with --allow-mcp)"
                 ));
             }
             if !super::mcp::has_tool(other) {
@@ -1795,238 +1526,25 @@ fn parse_args<T: for<'de> Deserialize<'de>>(args: &Value, name: &str) -> Result<
 
 // --- execution ------------------------------------------------------------
 
-const MAX_SEARCH_FILE_BYTES: u64 = (MAX_READ_BYTES * 8) as u64;
-
-/// Open a regular file without following a final-component symlink on Unix.
-/// The metadata checks reject FIFOs, sockets, devices, and directories before
-/// any read can block on them.  The post-open check also catches ordinary
-/// replacement races; O_NOFOLLOW closes the final-symlink race and O_NONBLOCK
-/// prevents a raced-in FIFO from hanging the caller on Unix.
-fn open_regular_file(
-    path: &Path,
-    max_bytes: u64,
-    operation: &str,
-) -> Result<std::fs::File, String> {
-    let metadata =
-        std::fs::symlink_metadata(path).map_err(|error| format!("{operation} failed: {error}"))?;
-    if metadata.file_type().is_symlink() {
-        return Err(format!("{operation} refused: path is a symbolic link"));
-    }
-    if !metadata.file_type().is_file() {
-        return Err(format!("{operation} refused: path is not a regular file"));
-    }
-    if metadata.len() > max_bytes {
-        return Err(format!(
-            "{operation} refused: file exceeds {max_bytes} bytes"
-        ));
-    }
-
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    }
-    let file = options
-        .open(path)
-        .map_err(|error| format!("{operation} failed: {error}"))?;
-    let opened_metadata = file
-        .metadata()
-        .map_err(|error| format!("{operation} failed: {error}"))?;
-    if !opened_metadata.file_type().is_file() {
-        return Err(format!("{operation} refused: path is not a regular file"));
-    }
-    if opened_metadata.len() > max_bytes {
-        return Err(format!(
-            "{operation} refused: file exceeds {max_bytes} bytes"
-        ));
-    }
-    Ok(file)
-}
-
-pub(crate) fn read_regular_file_bounded(
-    path: &Path,
-    max_file_bytes: u64,
-    read_limit: usize,
-    operation: &str,
-) -> Result<(Vec<u8>, bool), String> {
-    let file = open_regular_file(path, max_file_bytes, operation)?;
-    let capture_limit = read_limit.saturating_add(1);
-    let mut bytes = Vec::with_capacity(capture_limit.min(64 * 1024));
-    file.take(capture_limit as u64)
-        .read_to_end(&mut bytes)
-        .map_err(|error| format!("{operation} failed: {error}"))?;
-    let truncated = bytes.len() > read_limit;
-    if truncated {
-        bytes.truncate(read_limit);
-    }
-    Ok((bytes, truncated))
-}
-
-/// Publish a fully-written same-directory temporary file without replacing an
-/// existing destination. Hard links are the portable fast path. Filesystems
-/// without hard-link support use the host's atomic no-replace rename primitive
-/// (Linux `renameat2`, Apple `renamex_np`, or Windows `MoveFileExW`).
-pub(crate) fn publish_temp_noclobber(temp: &Path, target: &Path) -> Result<(), String> {
-    match std::fs::hard_link(temp, target) {
-        Ok(()) => return Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            return Err(format!(
-                "refusing to replace existing destination {}",
-                target.display()
-            ));
-        }
-        Err(link_error) => {
-            atomic_rename_noclobber(temp, target).map_err(|rename_error| {
-                format!(
-                    "cannot publish {} without replacement (hard link: {link_error}; atomic rename: {rename_error})",
-                    target.display()
-                )
-            })?;
-        }
-    }
-    Ok(())
-}
-
-/// Establish a mandatory guard around a newly spawned child. A containment
-/// failure must never degrade into direct-child-only teardown: the caller's
-/// cleanup runs on both guard creation and assignment failure before the error
-/// crosses the process boundary. Generic inputs keep the failure contract
-/// testable on hosts which do not provide Windows Job Objects.
-#[cfg_attr(not(windows), allow(dead_code))]
-pub(crate) fn establish_child_guard<C, G, E>(
-    child: &mut C,
-    guard_name: &str,
-    create: impl FnOnce() -> Result<G, E>,
-    assign: impl FnOnce(&G, &C) -> Result<(), E>,
-    cleanup: impl FnOnce(&mut C) -> Result<(), String>,
-) -> Result<G, String>
-where
-    E: std::fmt::Display,
-{
-    let guard = match create() {
-        Ok(guard) => guard,
-        Err(error) => {
-            let cleanup_error = cleanup(child).err();
-            let mut message = format!("could not create {guard_name}: {error}");
-            if let Some(cleanup_error) = cleanup_error {
-                message.push_str(&format!("; child cleanup also failed: {cleanup_error}"));
-            }
-            return Err(message);
-        }
-    };
-    if let Err(error) = assign(&guard, child) {
-        let cleanup_error = cleanup(child).err();
-        let mut message = format!("could not assign child to {guard_name}: {error}");
-        if let Some(cleanup_error) = cleanup_error {
-            message.push_str(&format!("; child cleanup also failed: {cleanup_error}"));
-        }
-        return Err(message);
-    }
-    Ok(guard)
-}
-
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn atomic_rename_noclobber(temp: &Path, target: &Path) -> std::io::Result<()> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-
-    let temp = CString::new(temp.as_os_str().as_bytes())
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
-    let target = CString::new(target.as_os_str().as_bytes())
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
-    let result = unsafe {
-        libc::renameat2(
-            libc::AT_FDCWD,
-            temp.as_ptr(),
-            libc::AT_FDCWD,
-            target.as_ptr(),
-            libc::RENAME_NOREPLACE,
-        )
-    };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-#[cfg(any(target_os = "macos", target_os = "ios"))]
-fn atomic_rename_noclobber(temp: &Path, target: &Path) -> std::io::Result<()> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-
-    let temp = CString::new(temp.as_os_str().as_bytes())
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
-    let target = CString::new(target.as_os_str().as_bytes())
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
-    let result = unsafe { libc::renamex_np(temp.as_ptr(), target.as_ptr(), libc::RENAME_EXCL) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-#[cfg(windows)]
-fn atomic_rename_noclobber(temp: &Path, target: &Path) -> std::io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_WRITE_THROUGH};
-
-    let temp = temp
-        .as_os_str()
-        .encode_wide()
-        .chain(Some(0))
-        .collect::<Vec<_>>();
-    let target = target
-        .as_os_str()
-        .encode_wide()
-        .chain(Some(0))
-        .collect::<Vec<_>>();
-    let result = unsafe { MoveFileExW(temp.as_ptr(), target.as_ptr(), MOVEFILE_WRITE_THROUGH) };
-    if result != 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-#[cfg(not(any(
-    target_os = "linux",
-    target_os = "android",
-    target_os = "macos",
-    target_os = "ios",
-    windows
-)))]
-fn atomic_rename_noclobber(_temp: &Path, _target: &Path) -> std::io::Result<()> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "this host has no supported atomic no-replace rename primitive",
-    ))
-}
-
 fn read_file(path: &Path, start_line: Option<usize>, max_lines: Option<usize>) -> ToolOutcome {
     if start_line.is_some() || max_lines.is_some() {
-        let (bytes, grew_past_limit) = match read_regular_file_bounded(
-            path,
-            MAX_RANGED_FILE_BYTES,
-            MAX_RANGED_FILE_BYTES as usize,
-            "ranged read",
-        ) {
-            Ok(result) => result,
-            Err(error) => return ToolOutcome::Err(error),
-        };
-        if grew_past_limit {
+        if std::fs::metadata(path)
+            .map(|metadata| metadata.len() > MAX_RANGED_FILE_BYTES)
+            .unwrap_or(false)
+        {
             return ToolOutcome::Err(format!(
-                "ranged read refused: file exceeded {MAX_RANGED_FILE_BYTES} bytes while reading"
+                "ranged read refused: file exceeds {MAX_RANGED_FILE_BYTES} bytes"
             ));
         }
+        let file = match std::fs::File::open(path) {
+            Ok(file) => file,
+            Err(error) => return ToolOutcome::Err(format!("read failed: {error}")),
+        };
         let start = start_line.unwrap_or(1);
         let limit = max_lines.unwrap_or(200);
         let mut output = String::new();
         let mut returned = 0usize;
-        for (index, line) in String::from_utf8_lossy(&bytes).lines().enumerate() {
+        for (index, line) in std::io::BufReader::new(file).lines().enumerate() {
             let line_number = index + 1;
             if line_number < start {
                 continue;
@@ -2035,6 +1553,10 @@ fn read_file(path: &Path, start_line: Option<usize>, max_lines: Option<usize>) -
                 output.push_str(&format!("...[continue at start_line={line_number}]"));
                 break;
             }
+            let line = match line {
+                Ok(line) => line,
+                Err(error) => return ToolOutcome::Err(format!("read failed: {error}")),
+            };
             let rendered = format!("{line_number}: {line}\n");
             if output.len().saturating_add(rendered.len()) > MAX_READ_BYTES {
                 output.push_str(&format!("...[continue at start_line={line_number}]"));
@@ -2049,15 +1571,25 @@ fn read_file(path: &Path, start_line: Option<usize>, max_lines: Option<usize>) -
             output.trim_end().to_string()
         });
     }
-    match read_regular_file_bounded(path, MAX_RANGED_FILE_BYTES, MAX_READ_BYTES, "read") {
-        Ok((bytes, truncated)) => {
-            let mut text = String::from_utf8_lossy(&bytes).into_owned();
+    if std::fs::metadata(path)
+        .map(|metadata| metadata.len() > MAX_RANGED_FILE_BYTES)
+        .unwrap_or(false)
+    {
+        return ToolOutcome::Err(format!(
+            "read refused: file exceeds {MAX_RANGED_FILE_BYTES} bytes"
+        ));
+    }
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            let truncated = bytes.len() > MAX_READ_BYTES;
+            let slice = &bytes[..bytes.len().min(MAX_READ_BYTES)];
+            let mut text = String::from_utf8_lossy(slice).into_owned();
             if truncated {
                 text.push_str(&format!("\n…[truncated at {MAX_READ_BYTES} bytes]"));
             }
             ToolOutcome::Ok(text)
         }
-        Err(error) => ToolOutcome::Err(error),
+        Err(e) => ToolOutcome::Err(format!("read failed: {e}")),
     }
 }
 
@@ -2118,115 +1650,20 @@ fn list_dir(path: &Path, offset: usize, limit: Option<usize>) -> ToolOutcome {
     })
 }
 
-/// The exact `path_filter` forms `search` understands. Anything else is
-/// refused rather than silently matching nothing, because an empty result set
-/// reads to the model as "the symbol is not there".
-///
-/// Patterns and paths are both normalized to `/` first: `Sandbox::rel` renders
-/// with the platform separator, so an un-normalized `dir/**` would silently miss
-/// every file on Windows.
-fn parse_path_filter(filter: &str) -> Result<PathFilter, String> {
-    let raw = filter.trim();
-    let normalized = raw.replace('\\', "/");
-    let filter = normalized.as_str();
-    if filter.is_empty() || filter == "*" {
-        return Ok(PathFilter::Any);
-    }
-    if let Some(ext) = filter
-        .strip_prefix("*.")
-        .or_else(|| filter.strip_prefix('.'))
-    {
-        if ext.is_empty() || ext.contains(['*', '/']) {
-            return Err(unsupported_path_filter(raw));
-        }
-        return Ok(PathFilter::Extension(format!(".{ext}")));
-    }
-    if let Some(dir) = filter
-        .strip_suffix("/**")
-        .or_else(|| filter.strip_suffix("/*"))
-        .or_else(|| filter.strip_suffix('/'))
-    {
-        if dir.is_empty() || dir.contains('*') {
-            return Err(unsupported_path_filter(raw));
-        }
-        return Ok(PathFilter::Directory(format!("{dir}/")));
-    }
-    if filter.contains('*') {
-        return Err(unsupported_path_filter(raw));
-    }
-    Ok(PathFilter::Name(filter.to_string()))
-}
-
-fn unsupported_path_filter(filter: &str) -> String {
-    format!(
-        "unsupported path_filter {filter:?}: use `*.ext` for an extension, `dir/**` for a \
-         subtree, or a plain file name or path fragment"
-    )
-}
-
-enum PathFilter {
-    Any,
-    /// Suffix including the dot, e.g. `.rs`.
-    Extension(String),
-    /// Directory prefix including the trailing slash, so `src/` cannot match
-    /// `src-generated/`.
-    Directory(String),
-    Name(String),
-}
-
-impl PathFilter {
-    fn matches(&self, rel_path: &str) -> bool {
-        let rel_path = rel_path.replace('\\', "/");
-        match self {
-            PathFilter::Any => true,
-            PathFilter::Extension(suffix) => rel_path.ends_with(suffix.as_str()),
-            PathFilter::Directory(prefix) => rel_path.starts_with(prefix.as_str()),
-            PathFilter::Name(name) => {
-                Path::new(&rel_path)
-                    .file_name()
-                    .and_then(|f| f.to_str())
-                    .is_some_and(|file_name| file_name == name)
-                    || rel_path.contains(name.as_str())
-            }
-        }
-    }
-}
-
 fn search(
     pattern: &str,
     root: &Path,
     limit: usize,
-    path_filter: Option<&str>,
+    bounded: bool,
     sandbox: &Sandbox,
 ) -> ToolOutcome {
     let needle = pattern.to_lowercase();
-    let filter = match path_filter.map(parse_path_filter).transpose() {
-        Ok(filter) => filter,
-        Err(error) => return ToolOutcome::Err(error),
-    };
     let root = match std::fs::canonicalize(root) {
         Ok(root) if sandbox.permits(&root) => root,
         _ => return ToolOutcome::Err("search path is unavailable or outside the workspace".into()),
     };
-    let root_metadata = match std::fs::symlink_metadata(&root) {
-        Ok(metadata) => metadata,
-        Err(error) => return ToolOutcome::Err(format!("search path is unavailable: {error}")),
-    };
-    if root_metadata.file_type().is_file() {
-        if let Some(filter) = &filter {
-            let rel = sandbox.rel(&root);
-            if !filter.matches(&rel) {
-                return ToolOutcome::Err(format!(
-                    "path_filter {:?} excludes the search path {rel}, so this search can never \
-                     match; drop the filter or search a directory that contains it",
-                    path_filter.unwrap_or("")
-                ));
-            }
-        }
+    if root.is_file() {
         return search_file(&needle, &root, limit, sandbox);
-    }
-    if !root_metadata.file_type().is_dir() {
-        return ToolOutcome::Err("search path is not a regular file or directory".into());
     }
     let mut hits = Vec::new();
     let mut stack = vec![root];
@@ -2236,8 +1673,8 @@ fn search(
     let mut truncated = false;
     while let Some(dir) = stack.pop() {
         if hits.len() >= limit
-            || files_scanned >= MAX_SEARCH_FILES
-            || started.elapsed() >= MAX_SEARCH_DURATION
+            || (bounded
+                && (files_scanned >= MAX_SEARCH_FILES || started.elapsed() >= MAX_SEARCH_DURATION))
         {
             truncated = true;
             break;
@@ -2253,8 +1690,9 @@ fn search(
         };
         for entry in read.flatten() {
             if hits.len() >= limit
-                || files_scanned >= MAX_SEARCH_FILES
-                || started.elapsed() >= MAX_SEARCH_DURATION
+                || (bounded
+                    && (files_scanned >= MAX_SEARCH_FILES
+                        || started.elapsed() >= MAX_SEARCH_DURATION))
             {
                 truncated = true;
                 break;
@@ -2274,25 +1712,16 @@ fn search(
                 stack.push(path);
                 continue;
             }
-
-            if let Some(filter) = &filter {
-                if !filter.matches(&sandbox.rel(&path)) {
-                    continue;
-                }
-            }
-
             files_scanned += 1;
-            let Ok((bytes, grew_past_limit)) = read_regular_file_bounded(
-                &path,
-                MAX_SEARCH_FILE_BYTES,
-                MAX_SEARCH_FILE_BYTES as usize,
-                "search read",
-            ) else {
+            if std::fs::metadata(&path)
+                .map(|metadata| metadata.len() > (MAX_READ_BYTES * 8) as u64)
+                .unwrap_or(true)
+            {
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(&path) else {
                 continue;
             };
-            if grew_past_limit {
-                continue;
-            }
             let text = String::from_utf8_lossy(&bytes);
             for (n, line) in text.lines().enumerate() {
                 if line.to_lowercase().contains(&needle) {
@@ -2317,18 +1746,16 @@ fn search(
 }
 
 fn search_file(needle: &str, path: &Path, limit: usize, sandbox: &Sandbox) -> ToolOutcome {
-    let (bytes, grew_past_limit) = match read_regular_file_bounded(
-        path,
-        MAX_SEARCH_FILE_BYTES,
-        MAX_SEARCH_FILE_BYTES as usize,
-        "search read",
-    ) {
-        Ok(result) => result,
-        Err(error) => return ToolOutcome::Err(error),
-    };
-    if grew_past_limit {
-        return ToolOutcome::Err("search file exceeded the size limit while reading".into());
+    if std::fs::metadata(path)
+        .map(|metadata| metadata.len() > (MAX_READ_BYTES * 8) as u64)
+        .unwrap_or(true)
+    {
+        return ToolOutcome::Err("search file is unreadable or exceeds the size limit".into());
     }
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) => return ToolOutcome::Err(format!("search read failed: {error}")),
+    };
     let mut hits = Vec::new();
     let mut truncated = false;
     for (line_index, line) in String::from_utf8_lossy(&bytes).lines().enumerate() {
@@ -2356,202 +1783,8 @@ fn search_file(needle: &str, path: &Path, limit: usize, sandbox: &Sandbox) -> To
     ToolOutcome::Ok(output)
 }
 
-fn regular_output_target(path: &Path) -> Result<Option<std::fs::Metadata>, String> {
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            Err("output path is a symbolic link; refusing to follow it".into())
-        }
-        Ok(metadata) if !metadata.file_type().is_file() => {
-            Err("output path exists but is not a regular file".into())
-        }
-        Ok(metadata) => Ok(Some(metadata)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(format!("cannot inspect output path: {error}")),
-    }
-}
-
-#[cfg(windows)]
-fn ensure_regular_output_target(path: &Path) -> Result<(), String> {
-    regular_output_target(path).map(|_| ())
-}
-
-/// A same-directory temporary output which is removed unless publication has
-/// already consumed it. Keeping cleanup in Drop covers every write, sync,
-/// validation, and publication error without a second error path to maintain.
-struct PendingOutput {
-    path: PathBuf,
-}
-
-impl Drop for PendingOutput {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
-
-fn create_pending_output(path: &Path) -> Result<(std::fs::File, PendingOutput), String> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| "output path has no parent directory".to_string())?;
-    for _ in 0..8 {
-        let temporary = parent.join(format!(
-            ".camelid-write-{}.tmp",
-            uuid::Uuid::new_v4().simple()
-        ));
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            // The unpublished bytes are private even when the user's umask is
-            // permissive. Existing-file permissions are restored below before
-            // the temporary name is promoted.
-            options
-                .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-        }
-        match options.open(&temporary) {
-            Ok(file) => {
-                let pending = PendingOutput { path: temporary };
-                let metadata = file
-                    .metadata()
-                    .map_err(|error| format!("could not inspect temporary output: {error}"))?;
-                if !metadata.file_type().is_file() {
-                    return Err("temporary output is not a regular file".into());
-                }
-                return Ok((file, pending));
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(format!("could not create temporary output: {error}")),
-        }
-    }
-    Err("could not allocate a unique temporary output name".into())
-}
-
-#[cfg(unix)]
-fn same_output_identity(expected: &std::fs::Metadata, current: &std::fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    expected.dev() == current.dev() && expected.ino() == current.ino()
-}
-
-#[cfg(not(unix))]
-fn same_output_identity(_expected: &std::fs::Metadata, _current: &std::fs::Metadata) -> bool {
-    // The publication primitive never follows the final component. Windows
-    // revalidates its type immediately before ReplaceFileW; ReplaceFileW then
-    // either atomically replaces that path or leaves it untouched.
-    true
-}
-
-#[cfg(windows)]
-pub(crate) fn replace_temp_atomically(temporary: &Path, target: &Path) -> std::io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::{ReplaceFileW, REPLACEFILE_WRITE_THROUGH};
-
-    let wide = |path: &Path| {
-        path.as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect::<Vec<_>>()
-    };
-    let temporary = wide(temporary);
-    let target = wide(target);
-    // SAFETY: both path buffers are live and NUL-terminated. A null backup path
-    // asks ReplaceFileW for one atomic replacement without a side file.
-    let result = unsafe {
-        ReplaceFileW(
-            target.as_ptr(),
-            temporary.as_ptr(),
-            std::ptr::null(),
-            REPLACEFILE_WRITE_THROUGH,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
-    };
-    if result == 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
-}
-
-#[cfg(not(windows))]
-pub(crate) fn replace_temp_atomically(temporary: &Path, target: &Path) -> std::io::Result<()> {
-    // The temporary lives beside the destination, so rename is an atomic name
-    // replacement rather than a cross-filesystem copy.
-    std::fs::rename(temporary, target)
-}
-
-fn sync_output_parent(path: &Path) {
-    #[cfg(unix)]
-    {
-        if let Some(parent) = path.parent() {
-            // The content has already committed atomically. Directory sync is a
-            // durability reinforcement; its failure cannot be reported as a
-            // failed write because rolling back at that point would be unsafe.
-            if let Ok(directory) = std::fs::File::open(parent) {
-                let _ = directory.sync_all();
-            }
-        }
-    }
-    #[cfg(not(unix))]
-    let _ = path;
-}
-
-fn write_regular_file_with_hook<F>(
-    path: &Path,
-    content: &[u8],
-    before_publish: F,
-) -> Result<(), String>
-where
-    F: FnOnce() -> Result<(), String>,
-{
-    let original = regular_output_target(path)?;
-    let (mut temporary_file, pending) = create_pending_output(path)?;
-
-    temporary_file
-        .write_all(content)
-        .map_err(|error| format!("could not write temporary output: {error}"))?;
-    if let Some(metadata) = original.as_ref() {
-        temporary_file
-            .set_permissions(metadata.permissions())
-            .map_err(|error| format!("could not preserve output permissions: {error}"))?;
-    }
-    temporary_file
-        .sync_all()
-        .map_err(|error| format!("could not sync temporary output: {error}"))?;
-    drop(temporary_file);
-
-    // Tests inject a failure here to exercise the exact formerly-destructive
-    // boundary: the complete new bytes exist, but the old destination must not
-    // have changed yet.
-    before_publish()?;
-
-    match (original.as_ref(), regular_output_target(path)?) {
-        (None, None) => publish_temp_noclobber(&pending.path, path)
-            .map_err(|error| format!("could not publish new output: {error}"))?,
-        (None, Some(_)) => {
-            return Err("output path appeared while the write was being prepared".into())
-        }
-        (Some(_), None) => {
-            return Err("output path disappeared while the write was being prepared".into())
-        }
-        (Some(expected), Some(current)) => {
-            if !same_output_identity(expected, &current) {
-                return Err("output path changed while the write was being prepared".into());
-            }
-            replace_temp_atomically(&pending.path, path)
-                .map_err(|error| format!("could not atomically replace output: {error}"))?;
-        }
-    }
-    sync_output_parent(path);
-    Ok(())
-}
-
-fn write_regular_file(path: &Path, content: &[u8]) -> Result<(), String> {
-    write_regular_file_with_hook(path, content, || Ok(()))
-}
-
 fn write_file(path: &Path, content: &str) -> ToolOutcome {
-    match write_regular_file(path, content.as_bytes()) {
+    match std::fs::write(path, content) {
         Ok(()) => ToolOutcome::Ok(format!(
             "wrote {} bytes to {}",
             content.len(),
@@ -2561,539 +1794,28 @@ fn write_file(path: &Path, content: &str) -> ToolOutcome {
     }
 }
 
-fn byte_offset_to_line(content: &str, byte_offset: usize) -> usize {
-    content[..byte_offset.min(content.len())]
-        .chars()
-        .filter(|&c| c == '\n')
-        .count()
-        + 1
-}
-
-fn map_lf_range_to_orig(content: &str, start_lf: usize, end_lf: usize) -> (usize, usize) {
-    let mut orig_bytes = 0usize;
-    let mut lf_bytes = 0usize;
-    let mut orig_start = None;
-    let mut orig_end = None;
-
-    let mut chars = content.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if lf_bytes == start_lf && orig_start.is_none() {
-            orig_start = Some(orig_bytes);
-        }
-        if lf_bytes == end_lf && orig_end.is_none() {
-            orig_end = Some(orig_bytes);
-            break;
-        }
-
-        if ch == '\r' && chars.peek() == Some(&'\n') {
-            chars.next();
-            orig_bytes += 2;
-            lf_bytes += 1;
-        } else {
-            orig_bytes += ch.len_utf8();
-            lf_bytes += ch.len_utf8();
-        }
-    }
-
-    let start = orig_start.unwrap_or(0);
-    let end = orig_end.unwrap_or(content.len());
-    (start, end)
-}
-
-/// Re-indent `new_text` by `indent_delta` columns.
-///
-/// Indentation is measured in leading SPACES only. `find_tolerant_line_matches`
-/// only produces a delta for runs that are comparable by width, and a negative
-/// delta reaches here only once `indent_shift_applies` has confirmed every line
-/// can absorb it; the clamp below is a floor, not a fallback.
-fn adjust_indentation(new_text: &str, indent_delta: isize, crlf: bool) -> String {
-    let sep = if crlf { "\r\n" } else { "\n" };
-    let lines: Vec<&str> = new_text.lines().collect();
-    let mut result = Vec::with_capacity(lines.len());
-
-    for line in lines {
-        if line.trim().is_empty() {
-            result.push(String::new());
-        } else if indent_delta > 0 {
-            let padding = " ".repeat(indent_delta as usize);
-            result.push(format!("{padding}{line}"));
-        } else if indent_delta < 0 {
-            let trim_count = (-indent_delta) as usize;
-            let leading_spaces = line.chars().take_while(|c| *c == ' ').count();
-            let to_remove = leading_spaces.min(trim_count);
-            result.push(line[to_remove..].to_string());
-        } else {
-            result.push(line.to_string());
-        }
-    }
-
-    let mut joined = result.join(sep);
-    if new_text.ends_with('\n') {
-        joined.push_str(sep);
-    }
-    joined
-}
-
-/// Whether every line of `new_text` can absorb a negative `indent_delta`.
-///
-/// A line with less leading space than the shift would be clamped at column 0
-/// while its siblings move by the full delta, silently flattening the relative
-/// indentation inside the replacement. A shift that does not fit is evidence the
-/// uniform-delta assumption is wrong, so the match is abandoned instead.
-fn indent_shift_applies(new_text: &str, indent_delta: isize) -> bool {
-    if indent_delta >= 0 {
-        return true;
-    }
-    let trim_count = indent_delta.unsigned_abs();
-    new_text
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .all(|line| line.chars().take_while(|c| *c == ' ').count() >= trim_count)
-}
-
-struct LineMatchCandidate {
-    start_line: usize,
-    end_line: usize,
-    start_byte: usize,
-    end_byte: usize,
-    indent_delta: isize,
-}
-
-fn find_tolerant_line_matches(content: &str, old: &str) -> Vec<LineMatchCandidate> {
-    let file_lines: Vec<&str> = content.lines().collect();
-    let old_lines: Vec<&str> = old.lines().collect();
-    if old_lines.is_empty() || file_lines.len() < old_lines.len() {
-        return Vec::new();
-    }
-
-    let mut line_start_bytes = Vec::with_capacity(file_lines.len() + 1);
-    let mut cursor = 0usize;
-    for line in &file_lines {
-        line_start_bytes.push(cursor);
-        cursor += line.len();
-        if content[cursor..].starts_with("\r\n") {
-            cursor += 2;
-        } else if content[cursor..].starts_with('\n') {
-            cursor += 1;
-        }
-    }
-    line_start_bytes.push(cursor);
-
-    let m = old_lines.len();
-    let mut candidates = Vec::new();
-
-    for i in 0..=(file_lines.len() - m) {
-        let window = &file_lines[i..i + m];
-        let mut uniform_delta: Option<isize> = None;
-        let mut matches = true;
-
-        for (fl, ol) in window.iter().zip(old_lines.iter()) {
-            let fl_trim = fl.trim();
-            let ol_trim = ol.trim();
-
-            if ol_trim.is_empty() {
-                if !fl_trim.is_empty() {
-                    matches = false;
-                    break;
-                }
-                continue;
-            }
-
-            if fl_trim != ol_trim {
-                matches = false;
-                break;
-            }
-
-            let fl_ws = &fl[..fl.len() - fl.trim_start().len()];
-            let ol_ws = &ol[..ol.len() - ol.trim_start().len()];
-            // A tab run measures zero columns, so differing tab counts would
-            // read as a zero delta and overwrite the file's own indentation with
-            // the model's. Only space-only runs are comparable by width;
-            // anything else has to match byte for byte.
-            let comparable = fl_ws == ol_ws
-                || (fl_ws.bytes().all(|b| b == b' ') && ol_ws.bytes().all(|b| b == b' '));
-            if !comparable {
-                matches = false;
-                break;
-            }
-            let delta = fl_ws.len() as isize - ol_ws.len() as isize;
-
-            match uniform_delta {
-                None => uniform_delta = Some(delta),
-                Some(existing) if existing == delta => {}
-                Some(_) => {
-                    matches = false;
-                    break;
-                }
-            }
-        }
-
-        if matches {
-            let start_byte = line_start_bytes[i];
-            let end_byte = if i + m < file_lines.len() {
-                line_start_bytes[i + m]
-            } else {
-                content.len()
-            };
-            candidates.push(LineMatchCandidate {
-                start_line: i + 1,
-                end_line: i + m,
-                start_byte,
-                end_byte,
-                indent_delta: uniform_delta.unwrap_or(0),
-            });
-        }
-    }
-
-    candidates
-}
-
-/// `generate_near_miss_diagnostics` scores every window of the file against
-/// `old`, and `levenshtein_distance` is O(a*b) per line pair. `edit_file` accepts
-/// files up to `MAX_RANGED_FILE_BYTES`, so both costs are bounded: past these
-/// budgets the generic "not found" message is returned instead of scanning on.
-///
-/// The cell budget is a running total spent top-down, so on a large file only
-/// the first windows get fuzzy scoring and "closest match" is biased toward the
-/// top. The free exact/`trim`/`trim_end` tiers still cover the whole file, so
-/// this degrades the ranking, never the correctness of a reported match.
-const MAX_NEAR_MISS_WINDOW_COMPARISONS: usize = 2_000_000;
-const MAX_NEAR_MISS_LEVENSHTEIN_CELLS: usize = 4_000_000;
-
-fn generate_near_miss_diagnostics(content: &str, old: &str) -> String {
-    let file_lines: Vec<&str> = content.lines().collect();
-    let old_lines: Vec<&str> = old.lines().collect();
-
-    if file_lines.is_empty() {
-        return "`old` text not found: file is empty".into();
-    }
-    if old_lines.is_empty() {
-        return "`old` text cannot be empty".into();
-    }
-
-    let m = old_lines.len();
-    if file_lines.len().saturating_mul(m) > MAX_NEAR_MISS_WINDOW_COMPARISONS {
-        return NEAR_MISS_GENERIC.into();
-    }
-    let mut levenshtein_budget = MAX_NEAR_MISS_LEVENSHTEIN_CELLS;
-    let mut best_score = 0.0f32;
-    let mut best_window_idx = 0usize;
-
-    for i in 0..file_lines.len() {
-        let window_len = m.min(file_lines.len() - i);
-        let window = &file_lines[i..i + window_len];
-
-        let mut score = 0.0f32;
-        for (k, fl) in window.iter().enumerate() {
-            let ol = old_lines[k];
-            if fl == &ol {
-                score += 1.0;
-            } else if fl.trim() == ol.trim() {
-                score += 0.85;
-            } else if fl.trim_end() == ol.trim_end() {
-                score += 0.9;
-            } else {
-                let (fl, ol) = (fl.trim(), ol.trim());
-                let cells = fl.len().saturating_mul(ol.len());
-                if cells > levenshtein_budget {
-                    continue;
-                }
-                levenshtein_budget -= cells;
-                let dist = levenshtein_distance(fl, ol);
-                let max_len = fl.len().max(ol.len());
-                if max_len > 0 && dist < max_len {
-                    let sim = 1.0 - (dist as f32 / max_len as f32);
-                    if sim > 0.5 {
-                        score += sim * 0.7;
-                    }
-                }
-            }
-        }
-
-        let normalized_score = score / m as f32;
-        if normalized_score > best_score {
-            best_score = normalized_score;
-            best_window_idx = i;
-        }
-    }
-
-    if best_score >= 0.35 {
-        let start_line = best_window_idx + 1;
-        let end_line = (best_window_idx + m).min(file_lines.len());
-        let window_lines = &file_lines[best_window_idx..end_line];
-
-        let mut snippet = String::new();
-        for (idx, line) in window_lines.iter().enumerate() {
-            snippet.push_str(&format!("  {:4} | {}\n", start_line + idx, line));
-        }
-
-        let hint = if let (Some(fl), Some(ol)) = (window_lines.first(), old_lines.first()) {
-            if fl.trim() == ol.trim() {
-                let fl_indent = fl.chars().take_while(|c| *c == ' ').count();
-                let ol_indent = ol.chars().take_while(|c| *c == ' ').count();
-                format!(
-                    "Hint: Indentation mismatch on line {start_line}. File uses {fl_indent} spaces; `old` had {ol_indent} spaces."
-                )
-            } else {
-                format!(
-                    "Hint: Verify differences near line {start_line}:\n  File has: `{fl}`\n  `old` had: `{ol}`"
-                )
-            }
-        } else {
-            "Hint: Verify line content and indentation with `read_file` before editing.".to_string()
-        };
-
-        format!(
-            "`old` text not found in file (0 exact matches).\n\
-             Closest match found at lines {start_line}-{end_line}:\n\
-             ----------------------------------------\n\
-             {snippet}\
-             ----------------------------------------\n\
-             {hint}"
-        )
-    } else {
-        NEAR_MISS_GENERIC.into()
-    }
-}
-
-const NEAR_MISS_GENERIC: &str = "`old` text not found in file (0 occurrences). Inspect the target section with `read_file` before editing.";
-
 fn edit_file(path: &Path, old: &str, new: &str) -> ToolOutcome {
-    if old.is_empty() {
-        return ToolOutcome::Err("`old` text cannot be empty".into());
-    }
-    if old == new {
-        return ToolOutcome::Err("`new` text is identical to `old` text; no changes made".into());
-    }
-
-    let (bytes, grew_past_limit) = match read_regular_file_bounded(
-        path,
-        MAX_RANGED_FILE_BYTES,
-        MAX_RANGED_FILE_BYTES as usize,
-        "edit read",
-    ) {
-        Ok(result) => result,
-        Err(error) => return ToolOutcome::Err(error),
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) => return ToolOutcome::Err(format!("read failed: {e}")),
     };
-    if grew_past_limit {
+    let count = content.matches(old).count();
+    if count == 0 {
+        return ToolOutcome::Err("`old` text not found in file".into());
+    }
+    if count > 1 {
         return ToolOutcome::Err(format!(
-            "edit read refused: file exceeded {MAX_RANGED_FILE_BYTES} bytes while reading"
+            "`old` text is not unique ({count} occurrences); include more context"
         ));
     }
-    let content = match String::from_utf8(bytes) {
-        Ok(content) => content,
-        Err(error) => return ToolOutcome::Err(format!("edit read failed: {error}")),
-    };
-
-    // 1. Exact match tier
-    let exact_matches: Vec<usize> = content.match_indices(old).map(|(idx, _)| idx).collect();
-    if exact_matches.len() == 1 {
-        let updated = content.replacen(old, new, 1);
-        return match write_regular_file(path, updated.as_bytes()) {
-            Ok(()) => ToolOutcome::Ok(format!("edited {}", path.display())),
-            Err(e) => ToolOutcome::Err(format!("write failed: {e}")),
-        };
-    } else if exact_matches.len() > 1 {
-        let lines: Vec<usize> = exact_matches
-            .iter()
-            .map(|&idx| byte_offset_to_line(&content, idx))
-            .collect();
-        return ToolOutcome::Err(format!(
-            "`old` text is not unique ({} occurrences at lines {}); include more context",
-            lines.len(),
-            lines
-                .iter()
-                .map(|l| l.to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
-    }
-
-    // 2. CRLF vs LF line-ending normalization
-    let file_has_crlf = content.contains("\r\n");
-    let content_lf = content.replace("\r\n", "\n");
-    let old_lf = old.replace("\r\n", "\n");
-    if old_lf != old || file_has_crlf {
-        let norm_matches: Vec<usize> = content_lf
-            .match_indices(&old_lf)
-            .map(|(idx, _)| idx)
-            .collect();
-        if norm_matches.len() == 1 {
-            let (start_orig, end_orig) =
-                map_lf_range_to_orig(&content, norm_matches[0], norm_matches[0] + old_lf.len());
-            let adjusted_new = if file_has_crlf && !new.contains("\r\n") {
-                new.replace('\n', "\r\n")
-            } else {
-                new.to_string()
-            };
-            let updated = format!(
-                "{}{adjusted_new}{}",
-                &content[..start_orig],
-                &content[end_orig..]
-            );
-            return match write_regular_file(path, updated.as_bytes()) {
-                Ok(()) => ToolOutcome::Ok(format!(
-                    "edited {} (matched with normalized line endings)",
-                    path.display()
-                )),
-                Err(e) => ToolOutcome::Err(format!("write failed: {e}")),
-            };
-        } else if norm_matches.len() > 1 {
-            let lines: Vec<usize> = norm_matches
-                .iter()
-                .map(|&idx| byte_offset_to_line(&content_lf, idx))
-                .collect();
-            return ToolOutcome::Err(format!(
-                "`old` text is not unique ({} occurrences at lines {}); include more context",
-                lines.len(),
-                lines
-                    .iter()
-                    .map(|l| l.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
-        }
-    }
-
-    // 3. Tolerant whitespace & uniform indentation matching
-    let tolerant_candidates = find_tolerant_line_matches(&content, old);
-    if tolerant_candidates.len() == 1
-        && indent_shift_applies(new, tolerant_candidates[0].indent_delta)
-    {
-        let candidate = &tolerant_candidates[0];
-        let mut adjusted_new = adjust_indentation(new, candidate.indent_delta, file_has_crlf);
-        let had_trailing_newline =
-            content[candidate.start_byte..candidate.end_byte].ends_with('\n');
-        if had_trailing_newline && !adjusted_new.ends_with('\n') {
-            adjusted_new.push_str(if file_has_crlf { "\r\n" } else { "\n" });
-        }
-        let updated = format!(
-            "{}{adjusted_new}{}",
-            &content[..candidate.start_byte],
-            &content[candidate.end_byte..]
-        );
-        return match write_regular_file(path, updated.as_bytes()) {
-            Ok(()) => ToolOutcome::Ok(format!(
-                "edited {} (matched lines {}-{} after adjusting indentation/whitespace)",
-                path.display(),
-                candidate.start_line,
-                candidate.end_line
-            )),
-            Err(e) => ToolOutcome::Err(format!("write failed: {e}")),
-        };
-    } else if tolerant_candidates.len() > 1 {
-        let lines: Vec<usize> = tolerant_candidates.iter().map(|c| c.start_line).collect();
-        return ToolOutcome::Err(format!(
-            "`old` text matches multiple locations after whitespace normalization (lines {}); include more context",
-            lines.iter().map(|l| l.to_string()).collect::<Vec<_>>().join(", ")
-        ));
-    }
-
-    // 4. Actionable near-miss diagnostics when no match is found
-    ToolOutcome::Err(generate_near_miss_diagnostics(&content, old))
-}
-
-#[derive(Default)]
-struct BoundedPipeCapture {
-    head: Vec<u8>,
-    tail: Vec<u8>,
-    total: usize,
-}
-
-impl BoundedPipeCapture {
-    fn push(&mut self, chunk: &[u8], limit: usize) {
-        self.total = self.total.saturating_add(chunk.len());
-        let head_limit = limit / 2;
-        let tail_limit = limit.saturating_sub(head_limit);
-
-        if self.head.len() < head_limit {
-            let take = (head_limit - self.head.len()).min(chunk.len());
-            self.head.extend_from_slice(&chunk[..take]);
-        }
-
-        if tail_limit == 0 {
-            return;
-        }
-        if chunk.len() >= tail_limit {
-            self.tail.clear();
-            self.tail
-                .extend_from_slice(&chunk[chunk.len() - tail_limit..]);
-            return;
-        }
-        let overflow = self
-            .tail
-            .len()
-            .saturating_add(chunk.len())
-            .saturating_sub(tail_limit);
-        if overflow > 0 {
-            self.tail.drain(..overflow);
-        }
-        self.tail.extend_from_slice(chunk);
-    }
-
-    fn render(self, limit: usize) -> String {
-        let mut bytes = self.head;
-        if self.total <= limit {
-            let suffix_len = self.total.saturating_sub(bytes.len()).min(self.tail.len());
-            bytes.extend_from_slice(&self.tail[self.tail.len() - suffix_len..]);
-        } else {
-            let omitted = self.total.saturating_sub(bytes.len() + self.tail.len());
-            bytes.extend_from_slice(format!("\n…[{omitted} bytes omitted]…\n").as_bytes());
-            bytes.extend_from_slice(&self.tail);
-        }
-        String::from_utf8_lossy(&bytes).trim_end().to_string()
+    let updated = content.replacen(old, new, 1);
+    match std::fs::write(path, &updated) {
+        Ok(()) => ToolOutcome::Ok(format!("edited {}", path.display())),
+        Err(e) => ToolOutcome::Err(format!("write failed: {e}")),
     }
 }
 
-fn drain_pipe_bounded(mut pipe: impl Read, limit: usize, stop: &AtomicBool) -> BoundedPipeCapture {
-    let mut capture = BoundedPipeCapture::default();
-    let mut chunk = [0u8; 8 * 1024];
-    loop {
-        match pipe.read(&mut chunk) {
-            Ok(0) => break,
-            Ok(read) => capture.push(&chunk[..read], limit),
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                if stop.load(Ordering::Acquire) {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            Err(_) => break,
-        }
-    }
-    capture
-}
-
-#[cfg(unix)]
-fn make_pipe_nonblocking(pipe: &impl std::os::fd::AsRawFd) {
-    let fd = std::os::fd::AsRawFd::as_raw_fd(pipe);
-    unsafe {
-        let flags = libc::fcntl(fd, libc::F_GETFL);
-        if flags >= 0 {
-            let _ = libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-        }
-    }
-}
-
-#[cfg(unix)]
-fn kill_unix_process_group(pgid: u32) {
-    // run_shell creates a fresh process group whose id is the direct child's
-    // pid. A negative pid targets that entire group, including grandchildren.
-    unsafe {
-        libc::kill(-(pgid as i32), libc::SIGKILL);
-    }
-}
-
-#[cfg(unix)]
-fn terminate_unix_process_group(child: &mut std::process::Child) {
-    kill_unix_process_group(child.id());
-    // Backstop a failed group setup/kill and always reap the direct child.
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
-fn run_shell(sandbox: &Sandbox, command: &str, cancel: &AtomicBool) -> ToolOutcome {
+fn run_shell(sandbox: &Sandbox, command: &str) -> ToolOutcome {
     // Platform shell with a timeout: `/bin/sh -c <command>` on Unix, `cmd /C
     // <command>` on Windows. The cwd-pin and OS-level confinement are applied by
     // the shell-sandbox layer (Task 1), which fails closed when the configured
@@ -3106,9 +1828,6 @@ fn run_shell(sandbox: &Sandbox, command: &str, cancel: &AtomicBool) -> ToolOutco
     };
     #[cfg(windows)]
     let mut builder = {
-        use std::os::windows::process::CommandExt;
-        use windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
-
         // Absolute interpreter path (W4), matching run_windows_command's
         // system32() discipline. Defense-in-depth only: std's process search
         // already consults System32 *before* the parent PATH and never the
@@ -3127,24 +1846,13 @@ fn run_shell(sandbox: &Sandbox, command: &str, cancel: &AtomicBool) -> ToolOutco
         // `"`, which is an illegal Windows filename character, so a mangled path
         // errors out rather than escaping the cwd pin (verified Phase 0, W4).
         let mut c = Command::new(system32("cmd.exe"));
-        c.arg("/C")
-            .arg(command)
-            // The process must not execute before its mandatory Job Object is
-            // assigned. contain_suspended resumes it after assignment.
-            .creation_flags(CREATE_SUSPENDED);
+        c.arg("/C").arg(command);
         c
     };
     builder
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        // Isolate this invocation before exec so timeout/cancel can signal the
-        // entire descendant tree without touching unrelated Camelid processes.
-        builder.process_group(0);
-    }
     // Apply confinement. A sandboxed mode that can't be enforced here returns an
     // error → refuse to run, never a silent unconfined fallback.
     if let Err(e) =
@@ -3156,19 +1864,23 @@ fn run_shell(sandbox: &Sandbox, command: &str, cancel: &AtomicBool) -> ToolOutco
         Ok(c) => c,
         Err(e) => return ToolOutcome::Err(format!("spawn failed: {e}")),
     };
-    #[cfg(unix)]
-    let child_pgid = child.id();
 
     // Assign the child to a kill-on-close job object (W2) so a timeout tears down
-    // the WHOLE process tree, not just cmd.exe. This boundary is mandatory: if
-    // job creation, assignment, or resume fails, contain_suspended() kills and
-    // reaps the just-spawned child and the tool refuses to run.
+    // the WHOLE process tree, not just cmd.exe. `child.kill()` on Windows reaps
+    // only the direct child; every descendant cmd spawned (rustc, node, a CUDA
+    // process holding VRAM) otherwise survives as an orphan. Descendants spawned
+    // after assignment are captured too. Best-effort — if creation/assignment
+    // fails, the child.kill() backstop still reaps the direct process. Mirrors
+    // run_windows_command; the Unix path is unaffected (/bin/sh's own process
+    // group is already torn down by kill()).
     #[cfg(windows)]
-    let _job = match JobObject::contain_suspended(&mut child) {
-        Ok(job) => job,
-        Err(error) => {
-            return ToolOutcome::Err(format!("process-tree containment failed: {error}"));
+    let _job = {
+        use std::os::windows::io::AsRawHandle;
+        let job = JobObject::new().ok();
+        if let Some(ref j) = job {
+            let _ = j.assign(child.as_raw_handle());
         }
+        job
     };
 
     // Drain stdout/stderr on their own threads (W1). Nothing read these until
@@ -3180,18 +1892,19 @@ fn run_shell(sandbox: &Sandbox, command: &str, cancel: &AtomicBool) -> ToolOutco
     // one command. Both pipes get their own quota, so either one alone can wedge
     // the child; both must be drained. This mirrors run_windows_command, which
     // has had the fix since it was written.
-    let pipe_stop = Arc::new(AtomicBool::new(false));
-    let out_reader = child.stdout.take().map(|pipe| {
-        #[cfg(unix)]
-        make_pipe_nonblocking(&pipe);
-        let stop = Arc::clone(&pipe_stop);
-        std::thread::spawn(move || drain_pipe_bounded(pipe, MAX_PIPE_CAPTURE_BYTES, stop.as_ref()))
+    let out_reader = child.stdout.take().map(|mut p| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut p, &mut buf);
+            buf
+        })
     });
-    let err_reader = child.stderr.take().map(|pipe| {
-        #[cfg(unix)]
-        make_pipe_nonblocking(&pipe);
-        let stop = Arc::clone(&pipe_stop);
-        std::thread::spawn(move || drain_pipe_bounded(pipe, MAX_PIPE_CAPTURE_BYTES, stop.as_ref()))
+    let err_reader = child.stderr.take().map(|mut p| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut p, &mut buf);
+            buf
+        })
     });
 
     let deadline = std::time::Instant::now() + sandbox.shell_timeout;
@@ -3199,20 +1912,16 @@ fn run_shell(sandbox: &Sandbox, command: &str, cancel: &AtomicBool) -> ToolOutco
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => {
-                let cancelled = cancel.load(Ordering::Acquire);
-                if cancelled || std::time::Instant::now() >= deadline {
+                if std::time::Instant::now() >= deadline {
                     // Tear down the whole tree (W2), then the direct-child
-                    // backstop. Terminating the job kills every descendant.
+                    // backstop. Terminating the job kills every descendant;
+                    // child.kill() covers the case where the job never assigned.
                     #[cfg(windows)]
-                    _job.terminate();
-                    #[cfg(unix)]
-                    terminate_unix_process_group(&mut child);
-                    #[cfg(windows)]
-                    {
-                        let _ = child.kill();
-                        let _ = child.wait();
+                    if let Some(ref j) = _job {
+                        j.terminate();
                     }
-                    pipe_stop.store(true, Ordering::Release);
+                    let _ = child.kill();
+                    let _ = child.wait();
                     // Killing the child closes the write ends → the readers hit
                     // EOF. Join them so neither thread outlives this call.
                     if let Some(h) = out_reader {
@@ -3221,62 +1930,29 @@ fn run_shell(sandbox: &Sandbox, command: &str, cancel: &AtomicBool) -> ToolOutco
                     if let Some(h) = err_reader {
                         let _ = h.join();
                     }
-                    return ToolOutcome::Err(if cancelled {
-                        "command cancelled; process tree terminated".to_string()
-                    } else {
-                        format!(
-                            "command timed out after {}s",
-                            sandbox.shell_timeout.as_secs()
-                        )
-                    });
+                    return ToolOutcome::Err(format!(
+                        "command timed out after {}s",
+                        sandbox.shell_timeout.as_secs()
+                    ));
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
-            Err(e) => {
-                #[cfg(windows)]
-                _job.terminate();
-                #[cfg(unix)]
-                terminate_unix_process_group(&mut child);
-                #[cfg(windows)]
-                {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                }
-                pipe_stop.store(true, Ordering::Release);
-                if let Some(h) = out_reader {
-                    let _ = h.join();
-                }
-                if let Some(h) = err_reader {
-                    let _ = h.join();
-                }
-                return ToolOutcome::Err(format!("wait failed: {e}"));
-            }
+            Err(e) => return ToolOutcome::Err(format!("wait failed: {e}")),
         }
     };
 
-    #[cfg(unix)]
-    // The approved invocation owns its complete process group. Even a command
-    // that returns success may have launched background grandchildren; do not
-    // let them survive the tool boundary or keep inherited pipes open.
-    kill_unix_process_group(child_pgid);
-    #[cfg(windows)]
-    // Do not let a successful shell detach descendants that retain the capture
-    // pipes or continue mutating state after the tool returns.
-    _job.terminate();
-    pipe_stop.store(true, Ordering::Release);
-
-    let stdout = out_reader
+    let stdout_bytes = out_reader
         .map(|h| h.join().unwrap_or_default())
-        .unwrap_or_default()
-        .render(MAX_PIPE_CAPTURE_BYTES);
-    let stderr = err_reader
+        .unwrap_or_default();
+    let stderr_bytes = err_reader
         .map(|h| h.join().unwrap_or_default())
-        .unwrap_or_default()
-        .render(MAX_PIPE_CAPTURE_BYTES);
+        .unwrap_or_default();
 
     let mut text = String::new();
     let code = status.code().unwrap_or(-1);
     text.push_str(&format!("exit: {code}\n"));
+    let stdout = clip(&String::from_utf8_lossy(&stdout_bytes));
+    let stderr = clip(&String::from_utf8_lossy(&stderr_bytes));
     if !stdout.is_empty() {
         text.push_str(&format!("stdout:\n{stdout}\n"));
     }
@@ -3475,18 +2151,28 @@ fn web_search(sandbox: &Sandbox, query: &str) -> ToolOutcome {
     let template =
         std::env::var("CAMELID_SEARCH_URL").unwrap_or_else(|_| DEFAULT_SEARCH_URL.to_string());
     let url = template.replace("{query}", &urlencode(query));
-    match crate::api::fetch_public_http("GET", &url) {
-        Ok(response) if (200..300).contains(&response.status) => {
-            let body = String::from_utf8_lossy(&response.body);
+    let output = Command::new("curl")
+        .args([
+            "-sSL",
+            "--max-time",
+            "30",
+            "-A",
+            "camelid-agent",
+            url.as_str(),
+        ])
+        .current_dir(&sandbox.root)
+        .stdin(Stdio::null())
+        .output();
+    match output {
+        Ok(o) if o.status.success() => {
+            let body = String::from_utf8_lossy(&o.stdout);
             ToolOutcome::Ok(clip(&render_hits(&parse_results(&body))))
         }
-        Ok(response) => ToolOutcome::Err(format!(
-            "search failed with HTTP {} from {}: {}",
-            response.status,
-            response.final_url,
-            clip(&String::from_utf8_lossy(&response.body))
+        Ok(o) => ToolOutcome::Err(format!(
+            "search failed: {}",
+            clip(&String::from_utf8_lossy(&o.stderr))
         )),
-        Err(error) => ToolOutcome::Err(format!("search failed: {error}")),
+        Err(e) => ToolOutcome::Err(format!("could not run curl: {e}")),
     }
 }
 
@@ -3494,29 +2180,19 @@ fn http_fetch(sandbox: &Sandbox, method: &str, url: &str) -> ToolOutcome {
     if !sandbox.allow_net {
         return ToolOutcome::Err("network disabled".into());
     }
-    match crate::api::fetch_public_http(method, url) {
-        Ok(response) if (200..300).contains(&response.status) && method == "HEAD" => {
-            ToolOutcome::Ok(format!(
-                "HTTP {}\nURL: {}\nContent-Type: {}",
-                response.status,
-                response.final_url,
-                if response.content_type.is_empty() {
-                    "(not provided)"
-                } else {
-                    &response.content_type
-                }
-            ))
-        }
-        Ok(response) if (200..300).contains(&response.status) => {
-            ToolOutcome::Ok(clip(&String::from_utf8_lossy(&response.body)))
-        }
-        Ok(response) => ToolOutcome::Err(format!(
-            "fetch failed with HTTP {} from {}: {}",
-            response.status,
-            response.final_url,
-            clip(&String::from_utf8_lossy(&response.body))
+    // Reuse curl (already a dependency for `pull`); no auto-injected credentials.
+    let output = Command::new("curl")
+        .args(["-sS", "--max-time", "30", "-X", method, url])
+        .current_dir(&sandbox.root)
+        .stdin(Stdio::null())
+        .output();
+    match output {
+        Ok(o) if o.status.success() => ToolOutcome::Ok(clip(&String::from_utf8_lossy(&o.stdout))),
+        Ok(o) => ToolOutcome::Err(format!(
+            "fetch failed: {}",
+            clip(&String::from_utf8_lossy(&o.stderr))
         )),
-        Err(error) => ToolOutcome::Err(format!("fetch failed: {error}")),
+        Err(e) => ToolOutcome::Err(format!("could not run curl: {e}")),
     }
 }
 
@@ -3525,7 +2201,7 @@ fn http_fetch(sandbox: &Sandbox, method: &str, url: &str) -> ToolOutcome {
 /// workspace is writable by the agent AND is run_windows_command's cwd, and the
 /// Windows process search otherwise consults the current directory).
 #[cfg(windows)]
-pub(crate) fn system32(relative: &str) -> PathBuf {
+fn system32(relative: &str) -> PathBuf {
     let root = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
     Path::new(&root).join("System32").join(relative)
 }
@@ -3577,18 +2253,13 @@ fn base64_ascii(data: &[u8]) -> String {
 /// primary dev host has no pwsh to validate a second branch against (HARDPAN A8:
 /// an untestable branch ships untested, so it doesn't ship).
 #[cfg(windows)]
-fn run_windows_command(
-    workdir: &Path,
-    command: &str,
-    timeout: Duration,
-    cancel: &AtomicBool,
-) -> ToolOutcome {
-    use std::io::Write;
+fn run_windows_command(workdir: &Path, command: &str, timeout: Duration) -> ToolOutcome {
+    use std::io::{Read, Write};
+    use std::os::windows::io::AsRawHandle;
     use std::os::windows::process::CommandExt;
 
     // No console window for the spawned child.
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    use windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
 
     // Absolute path (not bare "powershell.exe") so the model-writable cwd cannot
     // shadow the interpreter.
@@ -3599,7 +2270,7 @@ fn run_windows_command(
         // prevents a blocking prompt from hanging the agent.
         .args(["-NoProfile", "-NonInteractive", "-Command", "-"])
         .current_dir(workdir)
-        .creation_flags(CREATE_NO_WINDOW | CREATE_SUSPENDED)
+        .creation_flags(CREATE_NO_WINDOW)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -3609,26 +2280,31 @@ fn run_windows_command(
         Err(e) => return ToolOutcome::Err(format!("spawn failed: {e}")),
     };
 
-    // Kill-on-close containment is mandatory. On create/assign/resume failure,
-    // contain_suspended() kills and reaps the child before this tool returns.
-    let job = match JobObject::contain_suspended(&mut child) {
-        Ok(job) => job,
-        Err(error) => {
-            return ToolOutcome::Err(format!("process-tree containment failed: {error}"));
-        }
-    };
+    // Kill-on-close job object: descendants PowerShell spawns die with it on a
+    // timeout (or when the job handle drops). Best-effort — if assignment fails,
+    // the child.kill() backstop still reaps the direct PowerShell process (its
+    // descendants may then escape tree-teardown).
+    let job = JobObject::new().ok();
+    if let Some(ref j) = job {
+        let _ = j.assign(child.as_raw_handle());
+    }
 
     // Drain stdout/stderr on their own threads so a command that emits more than a
     // pipe buffer (~64 KiB) before exiting cannot block in WriteFile and then get
     // false-timed-out with its output lost.
-    let pipe_stop = Arc::new(AtomicBool::new(false));
-    let out_reader = child.stdout.take().map(|pipe| {
-        let stop = Arc::clone(&pipe_stop);
-        std::thread::spawn(move || drain_pipe_bounded(pipe, MAX_PIPE_CAPTURE_BYTES, stop.as_ref()))
+    let out_reader = child.stdout.take().map(|mut p| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = p.read_to_end(&mut buf);
+            buf
+        })
     });
-    let err_reader = child.stderr.take().map(|pipe| {
-        let stop = Arc::clone(&pipe_stop);
-        std::thread::spawn(move || drain_pipe_bounded(pipe, MAX_PIPE_CAPTURE_BYTES, stop.as_ref()))
+    let err_reader = child.stderr.take().map(|mut p| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = p.read_to_end(&mut buf);
+            buf
+        })
     });
 
     // Feed the command, then EOF so PowerShell executes it and exits.
@@ -3671,12 +2347,12 @@ fn run_windows_command(
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => {
-                let cancelled = cancel.load(Ordering::Acquire);
-                if cancelled || std::time::Instant::now() >= deadline {
-                    job.terminate();
+                if std::time::Instant::now() >= deadline {
+                    if let Some(ref j) = job {
+                        j.terminate();
+                    }
                     let _ = child.kill();
                     let _ = child.wait();
-                    pipe_stop.store(true, Ordering::Release);
                     // Pipes close on kill → readers EOF; join so no thread leaks.
                     if let Some(h) = out_reader {
                         let _ = h.join();
@@ -3684,48 +2360,29 @@ fn run_windows_command(
                     if let Some(h) = err_reader {
                         let _ = h.join();
                     }
-                    return ToolOutcome::Err(if cancelled {
-                        "command cancelled; process tree terminated".to_string()
-                    } else {
-                        format!("command timed out after {}s", timeout.as_secs())
-                    });
+                    return ToolOutcome::Err(format!(
+                        "command timed out after {}s",
+                        timeout.as_secs()
+                    ));
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
-            Err(e) => {
-                job.terminate();
-                let _ = child.kill();
-                let _ = child.wait();
-                pipe_stop.store(true, Ordering::Release);
-                if let Some(h) = out_reader {
-                    let _ = h.join();
-                }
-                if let Some(h) = err_reader {
-                    let _ = h.join();
-                }
-                return ToolOutcome::Err(format!("wait failed: {e}"));
-            }
+            Err(e) => return ToolOutcome::Err(format!("wait failed: {e}")),
         }
     };
 
-    // A successful PowerShell invocation may have launched background
-    // descendants. End the owned job before joining pipe readers so those
-    // descendants cannot outlive the approved tool call or pin its pipes.
-    job.terminate();
-    pipe_stop.store(true, Ordering::Release);
-
-    let stdout = out_reader
+    let stdout_bytes = out_reader
         .map(|h| h.join().unwrap_or_default())
-        .unwrap_or_default()
-        .render(MAX_PIPE_CAPTURE_BYTES);
-    let stderr = err_reader
+        .unwrap_or_default();
+    let stderr_bytes = err_reader
         .map(|h| h.join().unwrap_or_default())
-        .unwrap_or_default()
-        .render(MAX_PIPE_CAPTURE_BYTES);
+        .unwrap_or_default();
 
     let mut text = String::new();
     let code = status.code().unwrap_or(-1);
     text.push_str(&format!("exit: {code}\n"));
+    let stdout = clip(&String::from_utf8_lossy(&stdout_bytes));
+    let stderr = clip(&String::from_utf8_lossy(&stderr_bytes));
     if !stdout.is_empty() {
         text.push_str(&format!("stdout:\n{stdout}\n"));
     }
@@ -3740,12 +2397,7 @@ fn run_windows_command(
 }
 
 #[cfg(not(windows))]
-fn run_windows_command(
-    _workdir: &Path,
-    _command: &str,
-    _timeout: Duration,
-    _cancel: &AtomicBool,
-) -> ToolOutcome {
+fn run_windows_command(_workdir: &Path, _command: &str, _timeout: Duration) -> ToolOutcome {
     ToolOutcome::Err("run_windows_command is only available on Windows".into())
 }
 
@@ -3929,9 +2581,6 @@ fn uia_click(window: Option<&str>, name: &str) -> ToolOutcome {
 
 #[cfg(windows)]
 fn uia_screenshot(path: &Path) -> ToolOutcome {
-    if let Err(error) = ensure_regular_output_target(path) {
-        return ToolOutcome::Err(format!("screenshot refused: {error}"));
-    }
     match win_uia::screenshot(path) {
         Ok(s) => ToolOutcome::Ok(s),
         Err(e) => ToolOutcome::Err(e),
@@ -3977,26 +2626,14 @@ fn first_line(s: &str) -> String {
 /// the diff's own truncation markers).
 fn write_summary(path: &Path, content: &str) -> String {
     let new_lines = content.lines().count();
-    let existing = read_regular_file_bounded(
-        path,
-        MAX_RANGED_FILE_BYTES,
-        MAX_RANGED_FILE_BYTES as usize,
-        "write preview",
-    )
-    .ok()
-    .and_then(|(bytes, truncated)| (!truncated).then_some(bytes))
-    .and_then(|bytes| String::from_utf8(bytes).ok());
-    match existing {
-        Some(existing) => format!(
+    match std::fs::read_to_string(path) {
+        Ok(existing) => format!(
             "  overwrite: {} lines → {} lines\n{}",
             existing.lines().count(),
             new_lines,
             super::checkpoint::line_diff(&existing, content)
         ),
-        None if path.exists() => format!(
-            "  overwrite: existing file preview unavailable (non-regular, non-UTF-8, or over {MAX_RANGED_FILE_BYTES} bytes) → {new_lines} lines"
-        ),
-        None => {
+        Err(_) => {
             // A create shows its head: enough to see what is being written
             // without scrolling a modal off the screen.
             let head: Vec<&str> = content.lines().take(20).collect();
@@ -4008,78 +2645,6 @@ fn write_summary(path: &Path, content: &str) -> String {
             };
             format!("  create: {new_lines} lines\n{}{tail}", head.join("\n"))
         }
-    }
-}
-
-#[cfg(test)]
-mod outcome_image_tests {
-    use super::*;
-
-    fn with_image(text: &str) -> ToolOutcome {
-        ToolOutcome::OkWith {
-            text: text.to_string(),
-            images: vec![ToolImage {
-                mime: "image/png".to_string(),
-                data_base64: "aGVsbG8=".to_string(),
-            }],
-        }
-    }
-
-    #[test]
-    fn an_image_bearing_success_is_not_an_error() {
-        let out = with_image("done");
-        assert!(!out.is_err(), "OkWith is a success");
-        assert_eq!(out.text(), "done");
-        assert_eq!(out.images().len(), 1);
-    }
-
-    #[test]
-    fn text_only_outcomes_carry_no_images() {
-        assert!(ToolOutcome::Ok("x".into()).images().is_empty());
-        assert!(ToolOutcome::Err("x".into()).images().is_empty());
-    }
-
-    /// The observation byte cap exists to bound what the model READS. An image
-    /// is not read as text, so clipping must not destroy it — this is the path
-    /// every Workspace-profile result takes at 2 KiB.
-    #[test]
-    fn clipping_bounds_the_text_and_keeps_the_images() {
-        let clipped = with_image(&"a".repeat(10_000)).clipped(128);
-        assert!(clipped.text().len() <= 128, "text is bounded");
-        assert_eq!(clipped.images().len(), 1, "the image survives clipping");
-    }
-
-    /// Rebuilding from `text()` + `is_err()` is what silently dropped payloads;
-    /// `with_text` is the replacement and must preserve them.
-    #[test]
-    fn rebuilding_with_new_text_preserves_images_and_the_error_axis() {
-        let rebuilt = with_image("original").with_text("excerpt".into());
-        assert_eq!(rebuilt.text(), "excerpt");
-        assert_eq!(rebuilt.images().len(), 1);
-        assert!(!rebuilt.is_err());
-
-        assert!(ToolOutcome::Err("boom".into())
-            .with_text("clipped".into())
-            .is_err());
-        assert!(!ToolOutcome::Ok("fine".into())
-            .with_text("clipped".into())
-            .is_err());
-    }
-
-    /// Images are persisted to the agent session file, so the encoding has to
-    /// round-trip. Base64 rather than a byte vector keeps that file readable
-    /// and roughly 7x smaller than a JSON integer array would be.
-    #[test]
-    fn an_image_bearing_outcome_round_trips_through_json() {
-        let json = serde_json::to_string(&with_image("done")).unwrap();
-        assert!(
-            json.contains("aGVsbG8="),
-            "base64 stays a string in the session file: {json}"
-        );
-        let back: ToolOutcome = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.images().len(), 1);
-        assert_eq!(back.images()[0].mime, "image/png");
-        assert_eq!(back.text(), "done");
     }
 }
 
@@ -4098,207 +2663,6 @@ mod tests {
         }
     }
 
-    #[cfg(any(
-        target_os = "linux",
-        target_os = "android",
-        target_os = "macos",
-        target_os = "ios",
-        windows
-    ))]
-    #[test]
-    fn atomic_rename_fallback_is_no_clobber() {
-        let dir = tempfile::tempdir().unwrap();
-        let target = dir.path().join("published.json");
-        let first = dir.path().join("first.tmp");
-        std::fs::write(&first, "first").unwrap();
-        atomic_rename_noclobber(&first, &target).unwrap();
-        assert!(!first.exists());
-
-        let second = dir.path().join("second.tmp");
-        std::fs::write(&second, "second").unwrap();
-        assert!(atomic_rename_noclobber(&second, &target).is_err());
-        assert_eq!(std::fs::read_to_string(&target).unwrap(), "first");
-        assert_eq!(std::fs::read_to_string(&second).unwrap(), "second");
-    }
-
-    #[test]
-    fn temp_publication_never_replaces_existing_destination() {
-        let dir = tempfile::tempdir().unwrap();
-        let target = dir.path().join("published.json");
-        std::fs::write(&target, "first").unwrap();
-        let temp = dir.path().join("second.tmp");
-        std::fs::write(&temp, "second").unwrap();
-        assert!(publish_temp_noclobber(&temp, &target).is_err());
-        assert_eq!(std::fs::read_to_string(&target).unwrap(), "first");
-    }
-
-    #[test]
-    fn child_guard_creation_failure_cleans_child_without_assigning() {
-        use std::cell::Cell;
-
-        let mut child = 0usize;
-        let assigned = Cell::new(false);
-        let error = establish_child_guard::<_, (), _>(
-            &mut child,
-            "test guard",
-            || Err("create failed"),
-            |_, _| {
-                assigned.set(true);
-                Ok(())
-            },
-            |child| {
-                *child += 1;
-                Ok(())
-            },
-        )
-        .unwrap_err();
-
-        assert!(error.contains("could not create test guard"), "{error}");
-        assert_eq!(child, 1);
-        assert!(!assigned.get());
-    }
-
-    #[test]
-    fn child_guard_assignment_failure_cleans_child_and_drops_guard() {
-        use std::cell::Cell;
-        use std::rc::Rc;
-
-        #[derive(Debug)]
-        struct Guard(Rc<Cell<usize>>);
-        impl Drop for Guard {
-            fn drop(&mut self) {
-                self.0.set(self.0.get() + 1);
-            }
-        }
-
-        let drops = Rc::new(Cell::new(0));
-        let mut child = 0usize;
-        let error = establish_child_guard(
-            &mut child,
-            "test guard",
-            || Ok::<_, &'static str>(Guard(Rc::clone(&drops))),
-            |_, _| Err("assign failed"),
-            |child| {
-                *child += 1;
-                Ok(())
-            },
-        )
-        .unwrap_err();
-
-        assert!(error.contains("could not assign child"), "{error}");
-        assert_eq!(child, 1);
-        assert_eq!(drops.get(), 1);
-    }
-
-    #[test]
-    fn child_guard_success_retains_guard_and_does_not_clean_child() {
-        let mut child = 0usize;
-        let guard = establish_child_guard(
-            &mut child,
-            "test guard",
-            || Ok::<_, &'static str>("guard"),
-            |_, _| Ok(()),
-            |child| {
-                *child += 1;
-                Ok(())
-            },
-        )
-        .unwrap();
-
-        assert_eq!(guard, "guard");
-        assert_eq!(child, 0);
-    }
-
-    #[test]
-    fn failed_transactional_write_preserves_existing_bytes_and_cleans_temp() {
-        let dir = tempfile::tempdir().unwrap();
-        let target = dir.path().join("existing.txt");
-        std::fs::write(&target, "original bytes").unwrap();
-
-        let error = write_regular_file_with_hook(&target, b"replacement bytes", || {
-            Err("injected failure before atomic publication".into())
-        })
-        .unwrap_err();
-
-        assert!(error.contains("injected failure"), "{error}");
-        assert_eq!(std::fs::read(&target).unwrap(), b"original bytes");
-        let leftovers = std::fs::read_dir(dir.path())
-            .unwrap()
-            .flatten()
-            .filter(|entry| {
-                entry
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with(".camelid-write-")
-            })
-            .collect::<Vec<_>>();
-        assert!(leftovers.is_empty(), "temporary outputs leaked");
-    }
-
-    #[test]
-    fn transactional_write_publishes_complete_replacement() {
-        let dir = tempfile::tempdir().unwrap();
-        let target = dir.path().join("existing.txt");
-        std::fs::write(&target, "old").unwrap();
-
-        write_regular_file(&target, b"complete replacement").unwrap();
-
-        assert_eq!(std::fs::read(&target).unwrap(), b"complete replacement");
-    }
-
-    #[test]
-    fn failed_atomic_replace_does_not_remove_existing_target() {
-        let dir = tempfile::tempdir().unwrap();
-        let target = dir.path().join("existing.txt");
-        let missing_temporary = dir.path().join("missing.tmp");
-        std::fs::write(&target, "original").unwrap();
-
-        assert!(replace_temp_atomically(&missing_temporary, &target).is_err());
-        assert_eq!(std::fs::read_to_string(target).unwrap(), "original");
-    }
-
-    #[test]
-    fn cancelled_action_cannot_begin_an_approved_write() {
-        let dir = tempfile::tempdir().unwrap();
-        let target = dir.path().join("existing.txt");
-        std::fs::write(&target, "original").unwrap();
-        let sb = sandbox(dir.path());
-        let action = Action::WriteFile {
-            path: target.clone(),
-            content: "replacement".into(),
-            summary: String::new(),
-        };
-        let cancelled = AtomicBool::new(true);
-
-        let outcome = action.execute_with_cancel(&sb, &cancelled);
-
-        assert!(outcome.is_err());
-        assert!(outcome.text().contains("cancelled"));
-        assert_eq!(std::fs::read_to_string(target).unwrap(), "original");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn transactional_write_rejects_fifo_without_opening_it() {
-        use std::ffi::CString;
-        use std::os::unix::ffi::OsStrExt;
-        use std::os::unix::fs::FileTypeExt;
-
-        let dir = tempfile::tempdir().unwrap();
-        let target = dir.path().join("output.fifo");
-        let c_path = CString::new(target.as_os_str().as_bytes()).unwrap();
-        // SAFETY: c_path is a live, NUL-terminated path and mkfifo does not
-        // retain the pointer.
-        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
-
-        let error = write_regular_file(&target, b"must not block").unwrap_err();
-        assert!(error.contains("not a regular file"), "{error}");
-        assert!(std::fs::symlink_metadata(&target)
-            .unwrap()
-            .file_type()
-            .is_fifo());
-    }
-
     #[test]
     fn workspace_profile_is_exactly_the_read_only_tool_set() {
         let read_only = specs_for(
@@ -4311,27 +2675,6 @@ mod tests {
         .collect::<Vec<_>>();
         assert_eq!(read_only, vec!["read_file", "list_dir", "search"]);
         assert!(!ToolProfile::WorkspaceReadOnly.allows("write_file"));
-    }
-
-    #[test]
-    fn benchmark_profile_is_exactly_the_shared_task_tool_set() {
-        let shared = specs_for(ToolProfile::BenchmarkShared, true, ShellSandbox::Sandboxed)
-            .into_iter()
-            .map(|tool| tool.name)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            shared,
-            vec![
-                "read_file",
-                "list_dir",
-                "search",
-                "write_file",
-                "edit_file",
-                "run_shell"
-            ]
-        );
-        assert!(!ToolProfile::BenchmarkShared.allows("update_plan"));
-        assert!(!ToolProfile::BenchmarkShared.allows("spawn_subagent"));
     }
 
     #[test]
@@ -4363,28 +2706,6 @@ mod tests {
         let outcome = read_file(&path, None, None);
         assert!(outcome.is_err());
         assert!(outcome.text().contains("exceeds"));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn read_and_search_reject_fifo_without_opening_it() {
-        use std::{ffi::CString, os::unix::ffi::OsStrExt};
-
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("pipe");
-        let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
-        // SAFETY: c_path is a live, NUL-terminated path and mkfifo does not
-        // retain the pointer after returning.
-        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
-
-        let read = read_file(&path, None, None);
-        assert!(read.is_err());
-        assert!(read.text().contains("not a regular file"));
-
-        let sb = sandbox(dir.path());
-        let search = search_file("needle", &path, 1, &sb);
-        assert!(search.is_err());
-        assert!(search.text().contains("not a regular file"));
     }
 
     #[test]
@@ -4516,50 +2837,6 @@ mod tests {
         // absolute outside-root is refused too
         let err2 = validate(&call("read_file", json!({"path":"/etc/passwd"})), &sb).unwrap_err();
         assert!(err2.contains("escapes") || err2.contains("cannot access"));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn output_target_rejects_existing_final_symlink() {
-        use std::os::unix::fs::symlink;
-
-        let root = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        let victim = outside.path().join("victim.txt");
-        std::fs::write(&victim, "unchanged").unwrap();
-        symlink(&victim, root.path().join("output.txt")).unwrap();
-        let sb = sandbox(root.path());
-
-        let error = validate(
-            &call(
-                "write_file",
-                json!({"path":"output.txt","content":"attacker controlled"}),
-            ),
-            &sb,
-        )
-        .unwrap_err();
-        assert!(error.contains("symbolic link"), "{error}");
-        // Screenshot validation uses this same output resolver on Windows.
-        assert!(sb.resolve_output("output.txt").is_err());
-        assert_eq!(std::fs::read_to_string(victim).unwrap(), "unchanged");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn atomic_write_open_rejects_symlink_created_after_validation() {
-        use std::os::unix::fs::symlink;
-
-        let root = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        let victim = outside.path().join("victim.txt");
-        std::fs::write(&victim, "unchanged").unwrap();
-        let sb = sandbox(root.path());
-        let target = sb.resolve_output("new.txt").unwrap();
-        symlink(&victim, &target).unwrap();
-
-        let error = write_regular_file(&target, b"replacement").unwrap_err();
-        assert!(error.contains("symbolic link"), "{error}");
-        assert_eq!(std::fs::read_to_string(victim).unwrap(), "unchanged");
     }
 
     #[test]
@@ -4712,33 +2989,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sb = sandbox(dir.path()); // allow_net = false
         assert!(validate(&call("http_fetch", json!({"url":"http://x"})), &sb).is_err());
-
-        let enabled = Sandbox::new(dir.path(), true, Duration::from_secs(5)).unwrap();
-        assert!(validate(
-            &call(
-                "http_fetch",
-                json!({"url":"https://example.com","method":"GET"})
-            ),
-            &enabled
-        )
-        .is_ok());
-        assert!(validate(
-            &call(
-                "http_fetch",
-                json!({"url":"https://example.com","method":"HEAD"})
-            ),
-            &enabled
-        )
-        .is_ok());
-        assert!(validate(
-            &call(
-                "http_fetch",
-                json!({"url":"https://example.com","method":"POST"})
-            ),
-            &enabled
-        )
-        .unwrap_err()
-        .contains("only GET and HEAD"));
     }
 
     #[test]
@@ -5282,16 +3532,7 @@ mod tests {
         )
         .unwrap()
         .execute(&sb);
-        assert!(
-            out.text().contains("bytes omitted"),
-            "oversized capture must disclose omitted output: {}",
-            out.text()
-        );
-        assert!(
-            out.text().len() <= MAX_OUTPUT_BYTES,
-            "tool output must remain bounded: {} bytes",
-            out.text().len()
-        );
+        assert!(out.text().contains("truncated"), "{}", out.text());
     }
 
     #[cfg(windows)]
@@ -5370,16 +3611,7 @@ mod tests {
             "should complete, not time out: {}",
             out.text()
         );
-        assert!(
-            out.text().contains("bytes omitted"),
-            "oversized capture must disclose omitted output: {}",
-            out.text()
-        );
-        assert!(
-            out.text().len() <= MAX_OUTPUT_BYTES,
-            "tool output must remain bounded: {} bytes",
-            out.text().len()
-        );
+        assert!(out.text().contains("truncated"), "{}", out.text());
     }
 
     #[cfg(windows)]
@@ -5582,19 +3814,6 @@ mod tests {
             "captured output must contain the payload's first line"
         );
         assert!(
-            out.text().contains("004095"),
-            "bounded capture must preserve the payload's final line"
-        );
-        assert!(
-            out.text().contains("bytes omitted"),
-            "oversized capture must disclose omitted output"
-        );
-        assert!(
-            out.text().len() <= MAX_OUTPUT_BYTES,
-            "tool output must remain bounded: {} bytes",
-            out.text().len()
-        );
-        assert!(
             elapsed < Duration::from_secs(15),
             "must not burn the timeout budget (took {elapsed:?})"
         );
@@ -5625,106 +3844,7 @@ mod tests {
             out.text().contains("000000"),
             "stderr payload must be captured"
         );
-        assert!(
-            out.text().contains("004095"),
-            "stderr capture must retain the tail"
-        );
-        assert!(out.text().len() <= MAX_OUTPUT_BYTES);
         assert!(elapsed < Duration::from_secs(15), "took {elapsed:?}");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn run_shell_cancel_tears_down_the_unix_process_group() {
-        use std::sync::Arc;
-
-        let dir = tempfile::tempdir().unwrap();
-        let sb = Sandbox::new(dir.path(), false, Duration::from_secs(30))
-            .unwrap()
-            .with_shell_mode(ShellSandbox::Unrestricted);
-        let action = validate(
-            &call(
-                "run_shell",
-                json!({"command":"echo $$ > shell.pid; sleep 30 & wait"}),
-            ),
-            &sb,
-        )
-        .unwrap();
-        let cancel = Arc::new(AtomicBool::new(false));
-        let setter = Arc::clone(&cancel);
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(250));
-            setter.store(true, Ordering::Release);
-        });
-
-        let started = Instant::now();
-        let outcome = action.execute_with_cancel(&sb, cancel.as_ref());
-        assert!(
-            outcome.text().contains("cancelled"),
-            "expected cancellation, got {outcome:?}"
-        );
-        assert!(started.elapsed() < Duration::from_secs(3));
-
-        let pgid: i32 = std::fs::read_to_string(dir.path().join("shell.pid"))
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            let signal_result = unsafe { libc::kill(-pgid, 0) };
-            let alive = signal_result == 0
-                || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
-            if !alive {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "cancel left process group {pgid} alive"
-            );
-            std::thread::sleep(Duration::from_millis(25));
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn successful_run_shell_reaps_background_descendants() {
-        let dir = tempfile::tempdir().unwrap();
-        let sb = Sandbox::new(dir.path(), false, Duration::from_secs(5))
-            .unwrap()
-            .with_shell_mode(ShellSandbox::Unrestricted);
-        let action = validate(
-            &call(
-                "run_shell",
-                json!({"command":"echo $$ > shell.pid; sleep 30 & exit 0"}),
-            ),
-            &sb,
-        )
-        .unwrap();
-
-        let started = Instant::now();
-        let outcome = action.execute(&sb);
-        assert!(matches!(outcome, ToolOutcome::Ok(_)), "{outcome:?}");
-        assert!(started.elapsed() < Duration::from_secs(2));
-        let pgid: i32 = std::fs::read_to_string(dir.path().join("shell.pid"))
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            let signal_result = unsafe { libc::kill(-pgid, 0) };
-            let alive = signal_result == 0
-                || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
-            if !alive {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "successful tool left process group {pgid} alive"
-            );
-            std::thread::sleep(Duration::from_millis(25));
-        }
     }
 
     /// PIDs of every live PING.EXE whose command line contains `marker`. Querying
@@ -5953,218 +4073,5 @@ mod tests {
         let out = run("cmd /c exit 3; cmd /c exit 0");
         assert!(matches!(out, ToolOutcome::Ok(_)), "got {out:?}");
         assert!(out.text().contains("exit: 0"));
-    }
-
-    #[test]
-    fn edit_file_replaces_exact_match() {
-        let dir = tempfile::tempdir().unwrap();
-        let file_path = dir.path().join("code.txt");
-        std::fs::write(&file_path, "fn calculate() -> i32 {\n    return 42;\n}\n").unwrap();
-
-        let outcome = edit_file(&file_path, "return 42;", "return 100;");
-        assert!(matches!(outcome, ToolOutcome::Ok(_)));
-        let updated = std::fs::read_to_string(&file_path).unwrap();
-        assert_eq!(updated, "fn calculate() -> i32 {\n    return 100;\n}\n");
-    }
-
-    #[test]
-    fn edit_file_tolerates_crlf_vs_lf() {
-        let dir = tempfile::tempdir().unwrap();
-        let file_path = dir.path().join("crlf.txt");
-        std::fs::write(&file_path, "line 1\r\nline 2\r\nline 3\r\n").unwrap();
-
-        // Model sends standard \n in both old and new
-        let outcome = edit_file(&file_path, "line 2\n", "line 2 modified\n");
-        assert!(matches!(outcome, ToolOutcome::Ok(_)));
-        let updated = std::fs::read_to_string(&file_path).unwrap();
-        assert_eq!(updated, "line 1\r\nline 2 modified\r\nline 3\r\n");
-    }
-
-    #[test]
-    fn edit_file_tolerates_uniform_indentation_shift() {
-        let dir = tempfile::tempdir().unwrap();
-        let file_path = dir.path().join("indent.txt");
-        let initial =
-            "function test() {\n        let a = 1;\n        let b = 2;\n        return a + b;\n}\n";
-        std::fs::write(&file_path, initial).unwrap();
-
-        // Model sends 4-space indent instead of 8-space indent in file
-        let old = "    let a = 1;\n    let b = 2;\n    return a + b;";
-        let new = "    let a = 10;\n    let b = 20;\n    return a + b;";
-
-        let outcome = edit_file(&file_path, old, new);
-        assert!(matches!(outcome, ToolOutcome::Ok(_)));
-        let updated = std::fs::read_to_string(&file_path).unwrap();
-        let expected = "function test() {\n        let a = 10;\n        let b = 20;\n        return a + b;\n}\n";
-        assert_eq!(updated, expected);
-    }
-
-    /// A tab run measures zero columns, so a differing tab count used to look
-    /// like a uniform zero delta and write the model's indentation into the
-    /// file. In Python or a Makefile that is a semantic change reported as `Ok`.
-    #[test]
-    fn a_tab_indented_file_is_not_rewritten_by_a_shallower_tab_count() {
-        let dir = tempfile::tempdir().unwrap();
-        let file_path = dir.path().join("indent.py");
-        let initial = "def f():\n\t\tif x:\n\t\t\treturn 1\n";
-        std::fs::write(&file_path, initial).unwrap();
-
-        // One tab shallower than the file at every line.
-        let outcome = edit_file(&file_path, "\tif x:\n\t\treturn 1", "\tif x:\n\t\treturn 2");
-
-        assert!(outcome.is_err(), "{}", outcome.text());
-        assert_eq!(std::fs::read_to_string(&file_path).unwrap(), initial);
-    }
-
-    /// A negative shift is applied per line with a clamp, so a line that cannot
-    /// absorb it lands at column 0 while its siblings move by the full delta.
-    /// A shift that does not fit is evidence the uniform-delta assumption is
-    /// wrong, so the match is abandoned rather than applied.
-    #[test]
-    fn an_indent_shift_that_would_flatten_the_replacement_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
-        let file_path = dir.path().join("flatten.py");
-        let initial = "if x:\n  a = 1\n  b = 2\n";
-        std::fs::write(&file_path, initial).unwrap();
-
-        // delta is -6, but `if y:` carries only 4 leading spaces.
-        let outcome = edit_file(
-            &file_path,
-            "        a = 1\n        b = 2",
-            "        a = 1\n    if y:\n        b = 2",
-        );
-
-        assert!(outcome.is_err(), "{}", outcome.text());
-        assert_eq!(std::fs::read_to_string(&file_path).unwrap(), initial);
-
-        // A negative shift every line can absorb still applies.
-        let fits = dir.path().join("fits.py");
-        std::fs::write(&fits, initial).unwrap();
-        let outcome = edit_file(&fits, "    a = 1\n    b = 2", "    a = 10\n    b = 20");
-        assert!(matches!(outcome, ToolOutcome::Ok(_)), "{}", outcome.text());
-        assert_eq!(
-            std::fs::read_to_string(&fits).unwrap(),
-            "if x:\n  a = 10\n  b = 20\n"
-        );
-    }
-
-    #[test]
-    fn edit_file_reports_ambiguous_line_numbers() {
-        let dir = tempfile::tempdir().unwrap();
-        let file_path = dir.path().join("dup.txt");
-        std::fs::write(&file_path, "header\nitem\nmiddle\nitem\nfooter\n").unwrap();
-
-        let outcome = edit_file(&file_path, "item", "new_item");
-        assert!(outcome.is_err());
-        let err = outcome.text();
-        assert!(err.contains("not unique"));
-        assert!(err.contains("lines 2, 4"));
-    }
-
-    #[test]
-    fn edit_file_provides_actionable_near_miss_diagnostics() {
-        let dir = tempfile::tempdir().unwrap();
-        let file_path = dir.path().join("pricing.cjs");
-        let code = "function calculateDiscount(total, discount) {\n  if (total > 10000) {\n    return total - discount;\n  }\n  return total;\n}\n";
-        std::fs::write(&file_path, code).unwrap();
-
-        // Model sends 4 spaces when file has 2 spaces, and typo in condition
-        let old = "    if (total >= 10000) {\n      return total - discount;\n    }";
-        let outcome = edit_file(&file_path, old, "    return 0;");
-        assert!(outcome.is_err());
-        let err = outcome.text();
-        assert!(err.contains("Closest match found at lines 2-4"));
-        assert!(err.contains("calculateDiscount") || err.contains("if (total > 10000)"));
-    }
-
-    #[test]
-    fn sandbox_resolve_suggests_nearest_file_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let src = dir.path().join("src");
-        std::fs::create_dir_all(&src).unwrap();
-        std::fs::write(src.join("pricing.cjs"), "// code").unwrap();
-
-        let sb = Sandbox::new(dir.path(), false, Duration::from_secs(5)).unwrap();
-
-        // Target in subfolder requested without folder prefix
-        let err = sb.resolve("pricing.cjs", true).unwrap_err();
-        assert!(err.contains("Did you mean 'src/pricing.cjs'?"));
-
-        // Extension typo
-        let err = sb.resolve("src/pricing.js", true).unwrap_err();
-        assert!(err.contains("Did you mean 'src/pricing.cjs'?"));
-    }
-
-    #[test]
-    fn search_respects_path_filter() {
-        let dir = tempfile::tempdir().unwrap();
-        let src = dir.path().join("src");
-        let tests = dir.path().join("tests");
-        std::fs::create_dir_all(&src).unwrap();
-        std::fs::create_dir_all(&tests).unwrap();
-
-        std::fs::write(src.join("lib.rs"), "fn target_symbol() {}\n").unwrap();
-        std::fs::write(tests.join("test.rs"), "fn target_symbol() {}\n").unwrap();
-        std::fs::write(src.join("other.js"), "function target_symbol() {}\n").unwrap();
-
-        let sb = Sandbox::new(dir.path(), false, Duration::from_secs(5)).unwrap();
-
-        // 1. Search filtered by extension *.js
-        let action = validate_for(
-            ToolProfile::Full,
-            &call(
-                "search",
-                json!({"pattern": "target_symbol", "path_filter": "*.js"}),
-            ),
-            &sb,
-        )
-        .unwrap();
-        let outcome = action.execute(&sb);
-        let text = outcome.text();
-        assert!(text.contains("other.js"));
-        assert!(!text.contains("lib.rs"));
-        assert!(!text.contains("test.rs"));
-
-        // 2. Search filtered by directory prefix src/**
-        let action = validate_for(
-            ToolProfile::Full,
-            &call(
-                "search",
-                json!({"pattern": "target_symbol", "path_filter": "src/**"}),
-            ),
-            &sb,
-        )
-        .unwrap();
-        let outcome = action.execute(&sb);
-        let text = outcome.text();
-        assert!(text.contains("src/lib.rs") || text.contains("src\\lib.rs"));
-        assert!(text.contains("src/other.js") || text.contains("src\\other.js"));
-        assert!(!text.contains("tests/test.rs") && !text.contains("tests\\test.rs"));
-    }
-
-    #[test]
-    fn a_directory_path_filter_does_not_match_a_sibling_with_the_same_prefix() {
-        let filter = parse_path_filter("src/**").unwrap();
-        // `Sandbox::rel` renders with the platform separator; both must behave.
-        assert!(filter.matches("src/lib.rs"));
-        assert!(filter.matches("src\\lib.rs"));
-        assert!(filter.matches("src/deep/lib.rs"));
-        assert!(!filter.matches("src-generated/lib.rs"));
-        assert!(!filter.matches("tests/src.rs"));
-    }
-
-    #[test]
-    fn an_unsupported_path_filter_is_refused_rather_than_matching_nothing() {
-        // Silently returning zero hits reads to the model as "the symbol is not
-        // there", which is a worse answer than an error it can correct.
-        for unsupported in ["src/*.rs", "**/*.rs", "src/**/tools.rs", "*.", "/"] {
-            let error = parse_path_filter(unsupported)
-                .err()
-                .unwrap_or_else(|| panic!("{unsupported} should not be accepted"));
-            assert!(error.contains("unsupported path_filter"), "{error}");
-        }
-        for supported in ["*.rs", ".rs", "src/**", "src/", "tools.rs", "*", ""] {
-            assert!(parse_path_filter(supported).is_ok(), "{supported}");
-        }
     }
 }

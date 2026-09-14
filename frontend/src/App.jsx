@@ -15,17 +15,12 @@ import { useBackendLauncher } from './hooks/useBackendLauncher'
 import { useNotice } from './hooks/useNotice'
 import { useTheme } from './hooks/useTheme'
 import { ensureInferenceTelemetryConnected } from './hooks/useInferenceTelemetry'
-import { McpRunPanel } from './components/mcp/ConnectedTools'
-import { OutputReviewContext } from './components/outputs/OutputActions.jsx'
 import ChatWorkspace from './views/ChatWorkspace'
 import { CommandPalette } from './components/CommandPalette'
 import { ShortcutsOverlay } from './components/ShortcutsOverlay'
 
 /* Route-level code splitting (Phase 7): chat is the default surface and stays
    eager; every other view loads on first visit. */
-const ProjectsView = lazy(() => import('./views/ProjectsView'))
-const ChangesView = lazy(() => import('./views/ChangesView'))
-const ConnectionsView = lazy(() => import('./views/ConnectionsView'))
 const AnalyticsView = lazy(() => import('./views/AnalyticsView'))
 const HistoryView = lazy(() => import('./views/HistoryView'))
 const MemoryView = lazy(() => import('./views/MemoryView'))
@@ -39,21 +34,11 @@ const CompatibilityView = lazy(() => import('./views/CompatibilityView'))
 const TelemetryView = lazy(() => import('./views/TelemetryView'))
 const InferenceObservatoryView = lazy(() => import('./views/InferenceObservatoryView'))
 const WorkspaceView = lazy(() => import('./views/WorkspaceView'))
-const ArenaView = lazy(() => import('./views/ArenaView'))
-const SpotlightView = lazy(() => import('./views/SpotlightView'))
 
 const DEMO_UI = import.meta.env?.VITE_CAMELID_DEMO_UI === 'true'
-const HASH_TABS = new Set(['projects', 'changes', 'connections', 'chat', 'workspace', 'arena', 'library', 'downloads', 'api', 'analytics', 'history', 'memory', 'system', 'settings', 'cluster', 'observatory', 'compatibility', 'telemetry'])
+const HASH_TABS = new Set(['chat', 'workspace', 'library', 'downloads', 'api', 'analytics', 'history', 'memory', 'system', 'settings', 'cluster', 'observatory', 'compatibility', 'telemetry'])
 
 function App() {
-  if (typeof window !== 'undefined' && window.location.hash === '#spotlight') {
-    return (
-      <Suspense fallback={<div className="view-loading" role="status">Loading Spotlight…</div>}>
-        <SpotlightView />
-      </Suspense>
-    )
-  }
-
   const { notice, noticeTone, showNotice, clearNotice } = useNotice()
   const { preference, resolved, cyclePreference, setPreference } = useTheme()
 
@@ -70,7 +55,6 @@ function App() {
   const [ledgerFocusRow, setLedgerFocusRow] = useState(null)
   const [paletteOpen, setPaletteOpen] = useState(false)
   const [shortcutsOpen, setShortcutsOpen] = useState(false)
-  const [outputDraft, setOutputDraft] = useState(null)
   const [deleteBusy, setDeleteBusy] = useState(false)
   const [modelsVisited, setModelsVisited] = useState(false)
   const [firstRunCardActive, setFirstRunCardActive] = useState(false)
@@ -90,24 +74,12 @@ function App() {
     dashboard, authRequired, tab, setTab, selectedConversationId, setSelectedConversationId,
     selectedModelId, setSelectedModelId, search, setSearch, memorySearch, setMemorySearch,
     composer, setComposer, newChatTitle, setNewChatTitle, sending, receiptMode, setReceiptMode,
-    inspectMode, setInspectMode, tokenInspections, inspectionSupported,
-    structuredMode, setStructuredMode, structuredSchema, setStructuredSchema,
-    structuredGrammar, setStructuredGrammar, structuredRecords, structuredSupported, structuredReadiness,
-    mcp, mcpSelectedKeys, replaceMcpTools, mcpActivity, mcpApproval, decideMcpApproval,
-    toolsEnabled, setToolsEnabled, toolsText, setToolsText, toolContract, toolCapability, toolsReadiness, toolCallSignatures,
     thinkingMode, setThinkingMode,
-    webResearchEnabled, setWebResearchEnabled, webResearchStatus,
     loadingModelId, registerForm, setRegisterForm,
     conversations, memories, filteredConversations, models, runtime, selectedConversation,
     selectedModel, selectedModelRunnable, selectedModelExperimental, latestAssistantMessage, pendingConversation,
-    createConversation, showNewChatLanding, sendMessage, resendFromMessage, continueFromMessage,
-    regenerateAsVariant, selectMessageVariant, discardMessageVariant, stopGeneration, saveToMemory,
+    createConversation, showNewChatLanding, sendMessage, resendFromMessage, stopGeneration, saveToMemory,
     createMemory, updateMemory, deleteMemory, renameConversation, deleteConversation, deleteAllConversations,
-    conversationTags, archivedConversationCount, conversationTagFilter, toggleConversationTagFilter,
-    clearConversationTagFilter, showArchivedConversations, setShowArchivedConversations,
-    setConversationPinned, setConversationArchived, addConversationTag, removeConversationTag,
-    importConversationsFromText,
-    projects, saveProject, deleteProject, chatContext, updateChatContext, contextSources, globalPrompt, updateGlobalPrompt,
     activateModel, unloadCurrentModel,
     registerModel, loadDashboard, stoppingGeneration,
     apiBase, setApiBase,
@@ -116,12 +88,6 @@ function App() {
   const backend = useBackendLauncher({ showNotice, loadDashboard })
   const authReturnTabRef = useRef(null)
   const apiSurface = runtime?.api_surface || 'full'
-  const queueOutputReview = useCallback(output => {
-    setOutputDraft(output)
-    setTab('changes')
-    setMobileNavOpen(false)
-    if (typeof window !== 'undefined') window.history.replaceState(null, '', '#changes')
-  }, [setTab])
 
   useEffect(() => {
     if (authRequired) {
@@ -266,13 +232,12 @@ function App() {
 
   const selectConversation = (id) => {
     setSelectedConversationId(id)
-    navigateTab('chat')
+    setTab('chat')
     closeMobileNav()
   }
 
-  const startNewChat = (projectId = '') => {
-    showNewChatLanding(typeof projectId === 'string' ? projectId : '')
-    navigateTab('chat')
+  const startNewChat = () => {
+    showNewChatLanding()
     closeMobileNav()
   }
 
@@ -347,7 +312,6 @@ function App() {
   ].filter(Boolean).join(' ')
 
   return (
-    <OutputReviewContext.Provider value={!DEMO_UI && !isLanChatOnly(apiSurface) ? queueOutputReview : null}>
     <div className={shellClasses}>
       {/* macOS desktop only: the window draws no title bar of its own, so the
           traffic lights float over the top-left of our content. This strip is
@@ -369,17 +333,6 @@ function App() {
           onSelectConversation={selectConversation}
           renameConversation={renameConversation}
           requestDeleteConversation={requestDeleteConversation}
-          conversationTags={conversationTags}
-          tagFilter={conversationTagFilter}
-          onToggleTagFilter={toggleConversationTagFilter}
-          onClearTagFilter={clearConversationTagFilter}
-          archivedCount={archivedConversationCount}
-          showArchived={showArchivedConversations}
-          onToggleShowArchived={setShowArchivedConversations}
-          onTogglePin={setConversationPinned}
-          onToggleArchive={setConversationArchived}
-          onAddTag={addConversationTag}
-          onRemoveTag={removeConversationTag}
           runtime={runtime}
           apiSurface={apiSurface}
           themePreference={preference}
@@ -406,8 +359,6 @@ function App() {
           menuButtonRef={hamburgerRef}
           demoMode={DEMO_UI}
         />
-
-        {(tab !== 'chat' || (mcpActivity.conversationId && mcpActivity.conversationId !== selectedConversation?.id)) && mcpActivity.phase !== 'idle' && <div className="camelid-notice-slot"><McpRunPanel activity={mcpActivity} approval={mcpApproval} onDecision={decideMcpApproval} onStop={stopGeneration} /></div>}
 
         {notice && (
           <div className="camelid-notice-slot">
@@ -438,10 +389,6 @@ function App() {
           <Suspense fallback={<div className="view-loading" role="status" aria-label="Loading view">Loading view…</div>}>
           {tab === 'chat' && (
             <ChatWorkspace
-              projects={projects} chatContext={chatContext} updateChatContext={updateChatContext} contextSources={contextSources}
-              globalPrompt={globalPrompt} updateGlobalPrompt={updateGlobalPrompt}
-              mcp={mcp} mcpSelectedKeys={mcpSelectedKeys} replaceMcpTools={replaceMcpTools}
-              mcpActivity={!mcpActivity.conversationId || mcpActivity.conversationId === selectedConversation?.id ? mcpActivity : null} mcpApproval={mcpApproval} decideMcpApproval={decideMcpApproval}
               selectedConversation={selectedConversation}
               selectedModel={selectedModel}
               selectedModelId={selectedModelId}
@@ -458,39 +405,12 @@ function App() {
               saveToMemory={saveToMemory}
               sendMessage={sendMessage}
               resendFromMessage={resendFromMessage}
-              continueFromMessage={continueFromMessage}
-              regenerateAsVariant={regenerateAsVariant}
-              selectMessageVariant={selectMessageVariant}
-              discardMessageVariant={discardMessageVariant}
               stopGeneration={stopGeneration}
               sending={sending}
               receiptMode={receiptMode}
               setReceiptMode={setReceiptMode}
-              inspectMode={inspectMode}
-              setInspectMode={setInspectMode}
-              tokenInspections={tokenInspections}
-              inspectionSupported={inspectionSupported}
-              structuredMode={structuredMode}
-              setStructuredMode={setStructuredMode}
-              structuredSchema={structuredSchema}
-              setStructuredSchema={setStructuredSchema}
-              structuredGrammar={structuredGrammar}
-              setStructuredGrammar={setStructuredGrammar}
-              structuredRecords={structuredRecords}
-              structuredSupported={structuredSupported}
-              structuredReadiness={structuredReadiness}
-              toolsEnabled={toolsEnabled}
-              setToolsEnabled={setToolsEnabled}
-              toolsText={toolsText}
-              setToolsText={setToolsText}
-              toolCapability={toolCapability}
-              toolsReadiness={toolsReadiness}
-              toolCallSignatures={toolCallSignatures}
               thinkingMode={thinkingMode}
               setThinkingMode={setThinkingMode}
-              webResearchEnabled={webResearchEnabled}
-              setWebResearchEnabled={setWebResearchEnabled}
-              webResearchStatus={webResearchStatus}
               stoppingGeneration={stoppingGeneration}
               selectedModelRunnable={selectedModelRunnable}
               selectedModelExperimental={selectedModelExperimental}
@@ -500,10 +420,6 @@ function App() {
               demoMode={DEMO_UI}
             />
           )}
-
-          {tab === 'projects' && <ProjectsView projects={projects} conversations={conversations} onSave={saveProject} onDelete={deleteProject} onNewChat={startNewChat} onOpenConversation={selectConversation} busy={sending} />}
-          {tab === 'changes' && <ChangesView apiBase={apiBase} draft={outputDraft} onConsumeDraft={() => setOutputDraft(null)} />}
-          {tab === 'connections' && <ConnectionsView mcp={mcp} />}
 
           {tab === 'workspace' && (
             <WorkspaceView
@@ -515,16 +431,6 @@ function App() {
             />
           )}
 
-          {tab === 'arena' && (
-            <ArenaView
-              models={models}
-              runtime={runtime}
-              apiBase={apiBase}
-              loadDashboard={loadDashboard}
-              setTab={navigateTab}
-            />
-          )}
-
           {tab === 'analytics' && (
             <AnalyticsView apiBase={apiBase} conversations={conversations} models={models} runtime={runtime} capabilities={dashboard?.capabilities} />
           )}
@@ -532,7 +438,6 @@ function App() {
           {tab === 'history' && (
             <HistoryView
               filteredConversations={filteredConversations}
-              importConversationsFromText={importConversationsFromText}
               setSelectedConversationId={selectConversation}
               setTab={navigateTab}
               deleteConversation={requestDeleteConversation}
@@ -592,7 +497,7 @@ function App() {
             />
           )}
 
-          {tab === 'system' && <SystemView runtime={runtime} selectedModel={selectedModel} capabilities={dashboard?.capabilities} metricsApiBase={apiBase} />}
+          {tab === 'system' && <SystemView runtime={runtime} selectedModel={selectedModel} capabilities={dashboard?.capabilities} />}
 
           {tab === 'settings' && (
             <SettingsView
@@ -644,7 +549,6 @@ function App() {
         onConfirm={handleDeleteConfirm}
       />
     </div>
-    </OutputReviewContext.Provider>
   )
 }
 

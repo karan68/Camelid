@@ -36,10 +36,9 @@ const readPresets = () => {
    parameter; otherwise the row is visibly guarded (I3). Today the contract
    advertises none, so chat stays greedy temperature=0 — exactly the lane the
    parity evidence covers. */
-export function ChatControls({ capabilities, modelId, onClose, globalPrompt, onGlobalPromptChange, busy = false }) {
+export function ChatControls({ capabilities, modelId, onClose }) {
   const apiFeatures = capabilities?.api_features || []
-  const [localSystemPrompt, setSystemPrompt] = useState(readStoredPrompt)
-  const systemPrompt = globalPrompt ?? localSystemPrompt
+  const [systemPrompt, setSystemPrompt] = useState(readStoredPrompt)
   const [presets, setPresets] = useState(readPresets)
   const [presetName, setPresetName] = useState('')
   const [confirmClearPresets, setConfirmClearPresets] = useState(false)
@@ -50,9 +49,7 @@ export function ChatControls({ capabilities, modelId, onClose, globalPrompt, onG
   }, [modelId])
 
   const persistPrompt = (value) => {
-    if (busy) return
     setSystemPrompt(value)
-    onGlobalPromptChange?.(value)
     if (typeof window !== 'undefined') appStorage.setItem(SYSTEM_PROMPT_STORAGE_KEY, value)
   }
   const persistPresets = (next) => {
@@ -82,13 +79,12 @@ export function ChatControls({ capabilities, modelId, onClose, globalPrompt, onG
 
       <div className="chat-controls__group">
         <div className="chat-controls__group-head">
-          <span className="cx-caption chat-controls__label">Global system prompt</span>
+          <span className="cx-caption chat-controls__label">System prompt</span>
           <span className="chat-controls__note">applies to the next send · stored locally</span>
         </div>
         <textarea
           className="chat-controls__prompt"
           rows={3}
-          disabled={busy}
           value={systemPrompt}
           placeholder="Optional system prompt for local chat (leave empty for default behavior)"
           onChange={(event) => persistPrompt(event.target.value)}

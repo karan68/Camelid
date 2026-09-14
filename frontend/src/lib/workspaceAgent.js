@@ -37,13 +37,6 @@ export function reduceWorkspaceEvent(state, envelope) {
   if (event === 'session.starting') return { ...state, phase: 'starting', error: '' }
   if (event === 'turn.starting') return { ...state, phase: 'starting', error: '' }
   if (event === 'turn.stopping') return { ...state, phase: 'cancelling', error: '' }
-  if (event === 'session.recovering') {
-    return {
-      ...state,
-      phase: 'recovering',
-      error: String(envelope.message || 'Workspace is reconciling an interrupted turn.'),
-    }
-  }
   if (event === 'turn.stop_failed') {
     return { ...state, phase: 'cancel_error', error: String(envelope.message || 'Workspace could not confirm that the turn stopped.') }
   }
@@ -92,7 +85,7 @@ export function reduceWorkspaceEvent(state, envelope) {
   }
 
   if (event === 'approval.required') {
-    return { ...state, phase: 'recovering', events, turns, error: 'Read-only Workspace received an unexpected approval request.' }
+    return { ...state, phase: 'error', events, turns, error: 'Read-only Workspace received an unexpected approval request.' }
   }
   if (event === 'tool.result') {
     return { ...state, phase: state.phase === 'cancel_error' ? state.phase : 'running', events, turns }
@@ -149,13 +142,13 @@ export async function getWorkspaceThread(apiBase, workspace, threadId, { signal 
   return response.json()
 }
 
-export async function deleteWorkspaceThread(apiBase, workspace, threadId, { signal } = {}) {
-  const response = await fetch(workspaceThreadsEndpoint(apiBase, workspace, threadId), { method: 'DELETE', signal })
+export async function deleteWorkspaceThread(apiBase, workspace, threadId) {
+  const response = await fetch(workspaceThreadsEndpoint(apiBase, workspace, threadId), { method: 'DELETE' })
   if (!response.ok) throw new Error(await readError(response, `Delete saved Workspace thread failed (${response.status}).`))
 }
 
-export async function compactWorkspaceThread(apiBase, workspace, threadId, undo = false, { signal } = {}) {
-  const response = await fetch(workspaceCompactionEndpoint(apiBase, workspace, threadId), { method: undo ? 'DELETE' : 'POST', signal })
+export async function compactWorkspaceThread(apiBase, workspace, threadId, undo = false) {
+  const response = await fetch(workspaceCompactionEndpoint(apiBase, workspace, threadId), { method: undo ? 'DELETE' : 'POST' })
   if (!response.ok) throw new Error(await readError(response, `Workspace compaction failed (${response.status}).`))
   return response.json()
 }
@@ -204,84 +197,44 @@ export async function browseWorkspaceFolders(apiBase, path = null, { signal } = 
   }
 }
 
-export async function createWorkspaceSession(apiBase, input, { signal } = {}) {
+export async function createWorkspaceSession(apiBase, input) {
   const response = await fetch(workspaceEndpoint(apiBase), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(input),
-    signal,
   })
   if (!response.ok) throw new Error(await readError(response, `Workspace start failed (${response.status}).`))
   return response.json()
 }
 
-export async function sendWorkspaceMessage(apiBase, sessionId, text, clientMessageId, { signal } = {}) {
+export async function sendWorkspaceMessage(apiBase, sessionId, text, clientMessageId) {
   const response = await fetch(workspaceEndpoint(apiBase, `/${encodeURIComponent(sessionId)}/messages`), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ text, client_message_id: clientMessageId }),
-    signal,
   })
   if (!response.ok) throw new Error(await readError(response, `Workspace follow-up failed (${response.status}).`))
   return response.json()
 }
 
-export async function getWorkspaceSession(apiBase, sessionId, { signal } = {}) {
-  const response = await fetch(workspaceEndpoint(apiBase, `/${encodeURIComponent(sessionId)}`), { signal })
+export async function getWorkspaceSession(apiBase, sessionId) {
+  const response = await fetch(workspaceEndpoint(apiBase, `/${encodeURIComponent(sessionId)}`))
   if (!response.ok) throw new Error(await readError(response, `Workspace status failed (${response.status}).`))
   return response.json()
 }
 
-function abortableDelay(delayMs, signal) {
-  if (!signal) return new Promise((resolve) => globalThis.setTimeout(resolve, delayMs))
-  if (signal.aborted) return Promise.reject(signal.reason || new DOMException('The request was aborted.', 'AbortError'))
-  return new Promise((resolve, reject) => {
-    const timer = globalThis.setTimeout(() => {
-      signal.removeEventListener('abort', onAbort)
-      resolve()
-    }, delayMs)
-    const onAbort = () => {
-      globalThis.clearTimeout(timer)
-      reject(signal.reason || new DOMException('The request was aborted.', 'AbortError'))
-    }
-    signal.addEventListener('abort', onAbort, { once: true })
-  })
-}
-
-export async function waitForWorkspaceSessionTerminal(apiBase, sessionId, { timeoutMs = 10000, pollMs = 100, signal } = {}) {
+export async function waitForWorkspaceSessionTerminal(apiBase, sessionId, { timeoutMs = 10000, pollMs = 100 } = {}) {
   const deadline = Date.now() + timeoutMs
   for (;;) {
-    const session = await getWorkspaceSession(apiBase, sessionId, { signal })
+    const session = await getWorkspaceSession(apiBase, sessionId)
     if (!['waiting_for_events', 'running', 'cancelling'].includes(session.state)) return session
     if (Date.now() >= deadline) throw new Error('Workspace is still stopping. Retry Stop before sending another request.')
-    await abortableDelay(pollMs, signal)
+    await new Promise((resolve) => globalThis.setTimeout(resolve, pollMs))
   }
 }
 
-export async function cancelWorkspaceSession(apiBase, sessionId, { signal } = {}) {
-  const response = await fetch(workspaceEndpoint(apiBase, `/${encodeURIComponent(sessionId)}`), { method: 'DELETE', signal })
+export async function cancelWorkspaceSession(apiBase, sessionId) {
+  const response = await fetch(workspaceEndpoint(apiBase, `/${encodeURIComponent(sessionId)}`), { method: 'DELETE' })
   if (!response.ok && response.status !== 404) throw new Error(await readError(response, `Stop failed (${response.status}).`))
   return response.status
-}
-
-export function workspaceFollowUpDisposition(response, expectedSessionId) {
-  if (!response || String(response.session_id || '') !== String(expectedSessionId || '')) {
-    throw new Error('Workspace follow-up returned a mismatched session identity.')
-  }
-  const state = String(response.state || '')
-  if (state === 'waiting_for_events') return 'stream'
-  if (response.duplicate && ['idle', 'cancelled', 'failed', 'error'].includes(state)) return 'restore'
-  return 'recover'
-}
-
-export function workspaceSessionMatchesRuntime(session, runtime, toolCapable) {
-  return Boolean(
-    session
-    && toolCapable
-    && runtime?.status === 'online'
-    && runtime?.loaded_now
-    && runtime?.generation_ready
-    && runtime?.active_model_id
-    && String(runtime.active_model_id) === String(session.model_id),
-  )
 }

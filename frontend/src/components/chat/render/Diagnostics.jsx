@@ -3,7 +3,7 @@ import { formatDurationMs, formatRate } from '../../../lib/formatters'
 import { IconChart } from '../../ui/icons'
 
 /* Developer diagnostics panel — extracted verbatim from ChatWorkspace.
-   Surfaces TTFT, decode rate, generation time, weight-load, and a per-layer
+   Surfaces TTFT, end-to-end output rate, generation time, weight-load, and a per-layer
    attention-vs-FFN latency breakdown from the camelid generation diagnostics. */
 export function DeveloperDiagnosticsBlock({ message }) {
   const [isOpen, setIsOpen] = useState(false)
@@ -44,8 +44,8 @@ export function DeveloperDiagnosticsBlock({ message }) {
               </div>
             )}
             {outputRate && (
-              <div className="summary-card" data-native-rate={message.tokens_out_per_sec ?? undefined}>
-                <span className="card-label">Decode Rate</span>
+              <div className="summary-card">
+                <span className="card-label">End-to-end Output Rate</span>
                 <strong className="card-value">{outputRate}</strong>
               </div>
             )}

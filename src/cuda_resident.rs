@@ -2798,150 +2798,6 @@ extern "C" __global__ void q4_0_gemm_routed_chunked(
     }
 }
 
-// ---- Routed Q4_0 GEMM, quants-first SoA expert slots ------------------------
-// Identical arithmetic to `q4_0_gemm_routed`; the ONLY change is how each weight
-// block's 18 bytes reach the registers. Under CAMELID_GEMMA4_GHOST_ARENA_SOA=1
-// every Q4_0 expert projection is stored in its arena slot pre-split by
-// `q4_0_record_wire_to_soa` into the same quants-first planes the dense lane uses:
-//   [rows*blocks_per_row*16 nibble bytes][rows*blocks_per_row*2 f16 scale bits]
-// so block (row, b) is ONE aligned uint4 load plus a coalesced u16 scale read,
-// instead of sixteen scalar byte loads assembled off an 18-byte stride (the same
-// defect the dense q4_0_gemv_soa repack removed for +12% on this GPU).
-//
-// BIT-IDENTICAL BY CONSTRUCTION: `q4_0_dot32_dp4a_packed` consumes exactly the
-// bytes the wire kernel packed with `q4_pack4_le`, the per-block float term is
-// the same product in the same order, each row is still folded by ONE lane over
-// increasing b, and output stays per-ASSIGNMENT. Only the load instructions
-// change. Pinned by `q4_0_gemm_routed_soa_matches_wire`.
-extern "C" __global__ void q4_0_gemm_routed_soa(
-    const float* __restrict__ input_scales,
-    const signed char* __restrict__ input_quants,
-    const unsigned char* __restrict__ weight_arena,
-    const int* __restrict__ slot_ids,
-    const int* __restrict__ token_offsets,
-    const int* __restrict__ token_ids,
-    unsigned long long weight_stride, int rows, int blocks_per_row,
-    float* __restrict__ output, int expert_count, int tile
-) {
-    int expert = blockIdx.y;
-    if (expert >= expert_count) return;
-    int first = token_offsets[expert];
-    int count = token_offsets[expert + 1] - first;
-    int tile_base = blockIdx.z * tile;
-    if (tile_base >= count) return;
-    int n_tok = count - tile_base;
-    if (n_tok > tile) n_tok = tile;
-
-    const unsigned char* expert_weights = weight_arena + (long)slot_ids[expert] * weight_stride;
-    // Plane bases within THIS expert's slot. The scale plane begins after every
-    // row's nibbles; the slot stride is validated to a 16-byte multiple at load
-    // so the uint4 quant-plane loads stay aligned for every slot id.
-    const uint4* quant_plane = (const uint4*)expert_weights;
-    const unsigned short* scale_plane =
-        (const unsigned short*)(expert_weights + (long)rows * blocks_per_row * 16);
-
-    extern __shared__ float smem40grs[];
-    int warp = threadIdx.x >> 5;
-    int lane = threadIdx.x & 31;
-    int warps_per_block = blockDim.x >> 5;
-    int row = blockIdx.x * warps_per_block + warp;
-    float* myterms = smem40grs + (long)warp * tile * blocks_per_row;
-
-    if (row < rows) {
-        long row_block0 = (long)row * blocks_per_row;
-        for (int b = lane; b < blocks_per_row; b += 32) {
-            long idx = row_block0 + b;
-            float w_scale = f16_bits_to_f32(scale_plane[idx]);
-            uint4 packed = quant_plane[idx];       // one aligned 16-byte load
-            for (int j = 0; j < n_tok; j++) {
-                int t = token_ids[first + tile_base + j];
-                const signed char* y = input_quants
-                    + ((long)t * blocks_per_row + b) * 32;
-                int isum = q4_0_dot32_dp4a_packed(packed, y);
-                myterms[(long)j * blocks_per_row + b] =
-                    (float)isum * w_scale * input_scales[(long)t * blocks_per_row + b];
-            }
-        }
-    }
-    __syncwarp();
-    if (row < rows && lane == 0) {
-        for (int j = 0; j < n_tok; j++) {
-            float acc = 0.0f;
-            for (int b = 0; b < blocks_per_row; b++)
-                acc += myterms[(long)j * blocks_per_row + b];
-            output[(long)(first + tile_base + j) * rows + row] = acc;
-        }
-    }
-}
-
-// SoA twin of q4_0_gemm_routed_chunked: same bounded scratch lifetime and the
-// same per-token strictly-increasing-block fold; only the weight addressing
-// moves to the quants-first planes described on q4_0_gemm_routed_soa.
-extern "C" __global__ void q4_0_gemm_routed_chunked_soa(
-    const float* __restrict__ input_scales,
-    const signed char* __restrict__ input_quants,
-    const unsigned char* __restrict__ weight_arena,
-    const int* __restrict__ slot_ids,
-    const int* __restrict__ token_offsets,
-    const int* __restrict__ token_ids,
-    unsigned long long weight_stride, int rows, int blocks_per_row,
-    float* __restrict__ output, int expert_count, int tile
-) {
-    int expert = blockIdx.y;
-    if (expert >= expert_count) return;
-    int first = token_offsets[expert];
-    int count = token_offsets[expert + 1] - first;
-    int tile_base = blockIdx.z * tile;
-    if (tile_base >= count) return;
-    int n_tok = count - tile_base;
-    if (n_tok > tile) n_tok = tile;
-
-    const unsigned char* expert_weights = weight_arena + (long)slot_ids[expert] * weight_stride;
-    const uint4* quant_plane = (const uint4*)expert_weights;
-    const unsigned short* scale_plane =
-        (const unsigned short*)(expert_weights + (long)rows * blocks_per_row * 16);
-    extern __shared__ float smem40gcs[];
-    int warp = threadIdx.x >> 5;
-    int lane = threadIdx.x & 31;
-    int warps_per_block = blockDim.x >> 5;
-    int row = blockIdx.x * warps_per_block + warp;
-    int chunk_stride = blocks_per_row < G4_ROUTED_GEMM_CHUNK
-        ? blocks_per_row : G4_ROUTED_GEMM_CHUNK;
-    float* myterms = smem40gcs + (long)warp * tile * chunk_stride;
-    float token_acc = 0.0f;
-
-    for (int block0 = 0; block0 < blocks_per_row; block0 += G4_ROUTED_GEMM_CHUNK) {
-        int chunk_blocks = blocks_per_row - block0;
-        if (chunk_blocks > G4_ROUTED_GEMM_CHUNK) chunk_blocks = G4_ROUTED_GEMM_CHUNK;
-        int b = block0 + lane;
-        if (row < rows && lane < chunk_blocks) {
-            long idx = (long)row * blocks_per_row + b;
-            float w_scale = f16_bits_to_f32(scale_plane[idx]);
-            uint4 packed = quant_plane[idx];
-            for (int j = 0; j < n_tok; j++) {
-                int t = token_ids[first + tile_base + j];
-                const signed char* y = input_quants
-                    + ((long)t * blocks_per_row + b) * 32;
-                int isum = q4_0_dot32_dp4a_packed(packed, y);
-                myterms[(long)j * chunk_stride + lane] =
-                    (float)isum * w_scale * input_scales[(long)t * blocks_per_row + b];
-            }
-        }
-        __syncwarp();
-        if (row < rows && lane < n_tok) {
-            const float* token_terms = myterms + (long)lane * chunk_stride;
-            for (int owner = 0; owner < chunk_blocks; owner++)
-                token_acc += token_terms[owner];
-        }
-        // Token owners must finish reading this chunk before block owners reuse
-        // the same bounded scratch for the next 32 weight blocks.
-        __syncwarp();
-    }
-    if (row < rows && lane < n_tok) {
-        output[(long)(first + tile_base + lane) * rows + row] = token_acc;
-    }
-}
-
 // ---- Routed Q4_1 GEMM: the mixed-format half of the same lever -------------
 // The 26B-A4B `.cghost` is MIXED — `down_exps` is Q4_1 in layers 0..=6 and Q4_0 in
 // 7..=29 — so batching only the Q4_0 form would leave a seventh of the stack on the
@@ -3629,43 +3485,6 @@ extern "C" __global__ void q5k_gemv(
 // where a[256] are the rebuilt signed-6-bit weights (recombination order from
 // q6_k_wire_block_dequant). Lane l (0..8) owns its own aux32 lane; lane 0 then
 // replays sums[l] += (d_w * d_act) * aux32[l] per superblock, in order.
-// Draft-chain helper: dequantize ONE row of the 224-byte PADDED Q6_K tied head
-// (the exact layout q6k_gemv reads below — its unit (h, s, l) element map is
-// mirrored here per element) for the token id sitting in a device buffer, and
-// write it scaled by `scale` (the embedding's sqrt(hidden)). This keeps the
-// assistant's argmax -> next-embedding dependency on-device, so a draft round
-// pays one host synchronization instead of one per proposal. Drafter-only
-// numerics: accuracy moves acceptance, never emitted tokens.
-extern "C" __global__ void q6k_row_gather_scale(
-    const unsigned char* __restrict__ head_bytes, // 224-byte PADDED Q6_K blocks
-    const unsigned int* __restrict__ token,       // device token id buffer
-    int slot,                                     // index into `token`
-    float* __restrict__ out, int hidden, float scale
-) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= hidden) return;
-    long row = (long)token[slot];
-    int n_sb = hidden >> 8;
-    int sb = i >> 8;
-    int r = i & 255;
-    const unsigned char* block = head_bytes + (row * n_sb + sb) * 224L;
-    int h = r >> 7;         // 128-element half
-    int rem = r & 127;
-    int q = rem >> 5;       // quadrant: weight offset {+0,+32,+64,+96}
-    int s = (rem >> 4) & 1; // 16-element scale sub-group
-    int l = rem & 15;
-    unsigned char albyte = block[h * 64 + ((q & 1) ? 32 : 0) + s * 16 + l];
-    unsigned char hbyte = block[128 + h * 32 + s * 16 + l];
-    int a;
-    if (q == 0)      a = ((albyte & 0xF) | ((hbyte & 3) << 4)) - 32;
-    else if (q == 1) a = ((albyte & 0xF) | (((hbyte >> 2) & 3) << 4)) - 32;
-    else if (q == 2) a = ((albyte >> 4) | (((hbyte >> 4) & 3) << 4)) - 32;
-    else             a = ((albyte >> 4) | (((hbyte >> 6) & 3) << 4)) - 32;
-    int sc = (int)((signed char)block[192 + 8 * h + s + 2 * q]);
-    float d = f16_bits_to_f32((unsigned short)(block[208] | (block[209] << 8)));
-    out[i] = d * (float)(sc * a) * scale;
-}
-
 extern "C" __global__ void q6k_gemv(
     const float* __restrict__ input_scales,         // n_sb f32 (Q8_K d per superblock)
     const signed char* __restrict__ input_quants,   // n_sb*256 i8 (Q8_K quants)
@@ -5298,77 +5117,6 @@ extern "C" __global__ void q4_0_gemv_routed(
     }
 }
 
-// ---- Routed Q4_0 GEMV, quants-first SoA expert slots ------------------------
-// Identical arithmetic to `q4_0_gemv_routed`; the ONLY change is how each weight
-// block's 18 bytes reach the registers. Under CAMELID_GEMMA4_GHOST_ARENA_SOA=1
-// each Q4_0 projection inside an expert's arena slot is stored pre-split by
-// `q4_0_record_wire_to_soa` as
-//   [rows*blocks_per_row*16 nibble bytes][rows*blocks_per_row*2 f16 scale bits]
-// so a block is ONE aligned uint4 load plus a coalesced u16 scale read.
-// `q4_0_dot32_dp4a_packed` consumes exactly the bytes `q4_0_dot32_dp4a` did with
-// the same nibble split and activation pairing, the per-block float term is
-// unchanged, and lane 0 still folds terms in increasing block order — so the
-// result is bit-identical (the four-step argument on `q4_0_gemv_soa`). Pinned by
-// `q4_0_gemv_routed_soa_matches_wire`.
-extern "C" __global__ void q4_0_gemv_routed_soa(
-    const float* __restrict__ input_scales,
-    const signed char* __restrict__ input_quants,
-    const unsigned char* __restrict__ weight_arena,
-    const int* __restrict__ slot_ids,
-    const int* __restrict__ route_ids,
-    unsigned long long weight_stride, int rows, int blocks_per_row,
-    float* __restrict__ output, int expert_count, int batched_input
-) {
-    int expert = blockIdx.y;
-    if (expert >= expert_count) return;
-    int route = route_ids[expert];
-    int slot = slot_ids[expert];
-    const float* expert_scales = input_scales
-        + (batched_input ? (long)route * blocks_per_row : 0);
-    const signed char* expert_quants = input_quants
-        + (batched_input ? (long)route * blocks_per_row * 32 : 0);
-    const unsigned char* expert_weights = weight_arena + (long)slot * weight_stride;
-    // Plane bases within THIS expert's slot. The slot stride is validated to a
-    // 16-byte multiple at load so the uint4 loads stay aligned for every slot.
-    const uint4* quant_plane = (const uint4*)expert_weights;
-    const unsigned short* scale_plane =
-        (const unsigned short*)(expert_weights + (long)rows * blocks_per_row * 16);
-
-    extern __shared__ unsigned char smem40rs[];
-    signed char* s_iq = (signed char*)smem40rs;
-    float* s_is = (float*)(smem40rs + (long)blocks_per_row * 32);
-    float* terms = (float*)(smem40rs + (long)blocks_per_row * 36);
-    int tid = threadIdx.x;
-    for (int i = tid; i < blocks_per_row * 8; i += blockDim.x)
-        ((int*)s_iq)[i] = ((const int*)expert_quants)[i];
-    for (int i = tid; i < blocks_per_row; i += blockDim.x)
-        s_is[i] = expert_scales[i];
-    __syncthreads();
-
-    int warp = tid >> 5;
-    int lane = tid & 31;
-    int warps_per_block = blockDim.x >> 5;
-    int row = blockIdx.x * warps_per_block + warp;
-    float* myterms = terms + (long)warp * blocks_per_row;
-    if (row < rows) {
-        long row_block0 = (long)row * blocks_per_row;
-        for (int b = lane; b < blocks_per_row; b += 32) {
-            long idx = row_block0 + b;
-            float w_scale = f16_bits_to_f32(scale_plane[idx]);
-            uint4 packed = quant_plane[idx];       // one aligned 16-byte load
-            const signed char* y = s_iq + (long)b * 32;
-            int isum = q4_0_dot32_dp4a_packed(packed, y);
-            myterms[b] = (float)isum * w_scale * s_is[b];
-        }
-    }
-    __syncwarp();
-    if (row < rows && lane == 0) {
-        float acc = 0.0f;
-        for (int b = 0; b < blocks_per_row; b++) acc += myterms[b];
-        output[(long)route * rows + row] = acc;
-    }
-}
-
 // ---- Routed Q4_0 GEMV, R output rows per warp ------------------------------
 // Same arithmetic as `q4_0_gemv_routed`; the only change is WHO does the tail fold.
 //
@@ -6540,42 +6288,22 @@ extern "C" __global__ void attention_batched_q8_0(
         int max_groups = 1024 / head_dim; if (max_groups < 1) max_groups = 1;
         int G = (position_count + head_dim - 1) / head_dim;
         if (G < 1) G = 1; if (G > max_groups) G = max_groups;
-        float* vpart = shared + head_dim; // [max_groups * head_dim]
-        // Grid-stride over all G*head_dim partials, exactly as the f16
-        // `attention_batched` does.
-        //
-        // The two launcher families use opposite conventions. `launch_attention`
-        // (decode) sets blockDim = groups*head_dim and the kernel recovers
-        // G = blockDim.x/head_dim, so deriving gid from tid is self-consistent there.
-        // `launch_attention_batched` instead pins blockDim at 128 and computes G from
-        // position_count, so the kernel MUST stride. This one was written to the decode
-        // convention and launched with the batched one, which breaks in both directions
-        // whenever blockDim.x != G*head_dim:
-        //   head_dim 128, G>=2 (over-subscribed): gid was always 0, so only 1/G of the
-        //     positions were accumulated and the g>=1 slots of `vpart` were summed back
-        //     uninitialised. Correct at G==1 only.
-        //   head_dim 64 (under-subscribed): threads 64..127 got gid==1 even at G==1,
-        //     scanned positions past the live prefix, and wrote vpart[did+1] on top of
-        //     the gid==0 writer for dim did+1 — a race at every context length.
-        //   head_dim 256: gid was always 0 and did never exceeded 127, so output dims
-        //     128..255 were never written at any context length.
-        // Striding to exactly G*head_dim fixes all three.
-        for (int idx = tid; idx < G * head_dim; idx += blockDim.x) {
-            int gid = idx / head_dim, did = idx % head_dim;
-            int b = did / 32;
-            int bi = did % 32;
-            int p_lo = (int)((long)gid * position_count / G);
-            int p_hi = (int)((long)(gid + 1) * position_count / G);
-            float acc = 0.0f;
-            for (int p = p_lo; p < p_hi; p++) {
-                const block_q8_0* vp = vbase + ((long)p * blocks_per_head + b);
-                float d = f16_bits_to_f32(vp->scale);
-                acc += (scores[p] * inv) * (d * (float)vp->qs[bi]);
-            }
-            vpart[(long)did * G + gid] = acc;
+        float* vpart = shared + head_dim;
+        int gid = tid / head_dim;
+        int did = tid % head_dim;
+        int b = did / 32;
+        int bi = did % 32;
+        int p_lo = (int)((long)gid * position_count / G);
+        int p_hi = (int)((long)(gid + 1) * position_count / G);
+        float acc = 0.0f;
+        for (int p = p_lo; p < p_hi; p++) {
+            const block_q8_0* vp = vbase + ((long)p * blocks_per_head + b);
+            float d = f16_bits_to_f32(vp->scale);
+            acc += (scores[p] * inv) * (d * (float)vp->qs[bi]);
         }
+        vpart[(long)did * G + gid] = acc;
         __syncthreads();
-        for (int did = tid; did < head_dim; did += blockDim.x) {
+        if (gid == 0) {
             float sum = 0.0f;
             for (int g = 0; g < G; g++) sum += vpart[(long)did * G + g];
             out[(long)t * q_per_token + (long)head * head_dim + did] = sum;
@@ -8238,7 +7966,6 @@ pub struct CudaResidentKernels {
     pub(crate) q4k_gemv: CudaFunction,
     pub(crate) q5k_gemv: CudaFunction,
     pub(crate) q6k_gemv: CudaFunction,
-    pub(crate) q6k_row_gather_scale: CudaFunction,
     pub(crate) q2k_gemv: CudaFunction,
     pub(crate) q3k_gemv: CudaFunction,
     pub(crate) iq4xs_gemv: CudaFunction,
@@ -8264,17 +7991,10 @@ pub struct CudaResidentKernels {
     pub(crate) q4_0_gemv_routed: CudaFunction,
     /// R-rows-per-warp variant of `q4_0_gemv_routed`; bitwise-identical, opt-in.
     pub(crate) q4_0_gemv_routed_rows: CudaFunction,
-    /// Quants-first SoA twin of `q4_0_gemv_routed` for repacked expert arenas
-    /// (`CAMELID_GEMMA4_GHOST_ARENA_SOA=1`); bitwise-identical.
-    pub(crate) q4_0_gemv_routed_soa: CudaFunction,
     /// Prefill counterpart of `q4_0_gemv_routed`: one expert against its CSR token list.
     pub(crate) q4_0_gemm_routed: CudaFunction,
     /// 32-block low-shared A/B twin; never selected unless the strict opt-in is `1`.
     pub(crate) q4_0_gemm_routed_chunked: CudaFunction,
-    /// Quants-first SoA twin of `q4_0_gemm_routed`; bitwise-identical.
-    pub(crate) q4_0_gemm_routed_soa: CudaFunction,
-    /// Quants-first SoA twin of `q4_0_gemm_routed_chunked`; bitwise-identical.
-    pub(crate) q4_0_gemm_routed_chunked_soa: CudaFunction,
     pub(crate) q4_1_gemm_routed: CudaFunction,
     pub(crate) q4_1_gemm_routed_chunked: CudaFunction,
     pub(crate) q4_1_gemv_routed: CudaFunction,
@@ -8534,7 +8254,6 @@ impl CudaResidentKernels {
             q4k_gemv: f("q4k_gemv")?,
             q5k_gemv: f("q5k_gemv")?,
             q6k_gemv: f("q6k_gemv")?,
-            q6k_row_gather_scale: f("q6k_row_gather_scale")?,
             q2k_gemv: f("q2k_gemv")?,
             iq4xs_gemv: f("iq4xs_gemv")?,
             q3k_gemv: f("q3k_gemv")?,
@@ -8559,11 +8278,8 @@ impl CudaResidentKernels {
             scaled_axpy: f("scaled_axpy")?,
             q4_0_gemv_routed: f("q4_0_gemv_routed")?,
             q4_0_gemv_routed_rows: f("q4_0_gemv_routed_rows")?,
-            q4_0_gemv_routed_soa: f("q4_0_gemv_routed_soa")?,
             q4_0_gemm_routed: f("q4_0_gemm_routed")?,
             q4_0_gemm_routed_chunked: f("q4_0_gemm_routed_chunked")?,
-            q4_0_gemm_routed_soa: f("q4_0_gemm_routed_soa")?,
-            q4_0_gemm_routed_chunked_soa: f("q4_0_gemm_routed_chunked_soa")?,
             q4_1_gemm_routed: f("q4_1_gemm_routed")?,
             q4_1_gemm_routed_chunked: f("q4_1_gemm_routed_chunked")?,
             q4_1_gemv_routed: f("q4_1_gemv_routed")?,
@@ -8636,14 +8352,11 @@ impl CudaResidentKernels {
         })
     }
 
-    /// `soa` selects the quants-first-arena twin of whichever routed Q4_0 GEMM
-    /// the chunked policy picked; every pairing is pinned bitwise-identical.
-    pub(crate) fn gemma4_mtp_q4_0_gemm_routed_kernel(&self, soa: bool) -> (&CudaFunction, bool) {
-        match (self.gemma4_mtp_routed_q4_chunked, soa) {
-            (true, true) => (&self.q4_0_gemm_routed_chunked_soa, true),
-            (true, false) => (&self.q4_0_gemm_routed_chunked, true),
-            (false, true) => (&self.q4_0_gemm_routed_soa, false),
-            (false, false) => (&self.q4_0_gemm_routed, false),
+    pub(crate) fn gemma4_mtp_q4_0_gemm_routed_kernel(&self) -> (&CudaFunction, bool) {
+        if self.gemma4_mtp_routed_q4_chunked {
+            (&self.q4_0_gemm_routed_chunked, true)
+        } else {
+            (&self.q4_0_gemm_routed, false)
         }
     }
 
@@ -8723,63 +8436,16 @@ pub(crate) fn widen_q8(bytes: &[u8]) -> Vec<u8> {
 /// `q4_0_gemv_soa_matches_wire` for the test that pins it. Mirrors the same
 /// contract as `repack_q8_soa`, `swz_q4k_blocks` and `repack_q1_t128`.
 pub(crate) fn q4_0_wire_to_soa(bytes: &[u8]) -> Vec<u8> {
-    let mut out = vec![0u8; bytes.len()];
-    q4_0_wire_to_soa_into(bytes, &mut out);
-    out
-}
-
-/// Non-allocating core of [`q4_0_wire_to_soa`]: split one contiguous Q4_0 wire
-/// region into the quants-first SoA planes, writing into `out` (same length,
-/// disjoint from `wire`). Same pure byte permutation, same bit-exactness
-/// argument; this form exists so per-record staging paths (page-locked tier
-/// slots, the pinned transfer ring) can repack without a per-record `Vec`.
-pub(crate) fn q4_0_wire_to_soa_into(wire: &[u8], out: &mut [u8]) {
     const WIRE: usize = 18;
-    let n = wire.len() / WIRE;
-    debug_assert_eq!(
-        wire.len(),
-        n * WIRE,
-        "Q4_0 wire region must be whole blocks"
-    );
-    debug_assert_eq!(out.len(), wire.len(), "SoA repack must not change size");
+    let n = bytes.len() / WIRE;
+    let mut out = vec![0u8; n * WIRE];
     let (quants, scales) = out.split_at_mut(n * 16);
     for b in 0..n {
-        let blk = &wire[b * WIRE..b * WIRE + WIRE];
+        let blk = &bytes[b * WIRE..b * WIRE + WIRE];
         scales[b * 2..b * 2 + 2].copy_from_slice(&blk[0..2]);
         quants[b * 16..b * 16 + 16].copy_from_slice(&blk[2..WIRE]);
     }
-}
-
-/// Repack every Q4_0 projection region of one routed expert record IN PLACE
-/// into the quants-first SoA layout of [`q4_0_wire_to_soa`], region by region
-/// (`gate_up` first, then `down`, using the record layout's role-aware byte
-/// ranges). A region whose dtype is not Q4_0 (the Q4_1 down variant of some
-/// layers) is left byte-for-byte untouched, so its wire kernels keep reading
-/// exactly what they always read.
-///
-/// Pure byte permutation of each repacked region — every byte lands exactly
-/// once, nothing is synthesized — so the SoA consumers are bit-identical by the
-/// same four-step argument as the dense lane. `scratch` is caller-owned reusable
-/// space (grown to the largest region, ~2.2 MiB on the tracked geometry) so the
-/// staging threads do not allocate per record. Pinned by
-/// `q4_0_record_wire_to_soa_is_a_pure_permutation`.
-pub(crate) fn q4_0_record_wire_to_soa(
-    record: &mut [u8],
-    gate_up: std::ops::Range<usize>,
-    gate_up_is_q4_0: bool,
-    down: std::ops::Range<usize>,
-    down_is_q4_0: bool,
-    scratch: &mut Vec<u8>,
-) {
-    for (range, is_q4_0) in [(gate_up, gate_up_is_q4_0), (down, down_is_q4_0)] {
-        if !is_q4_0 {
-            continue;
-        }
-        let region = &mut record[range];
-        scratch.clear();
-        scratch.extend_from_slice(region);
-        q4_0_wire_to_soa_into(scratch, region);
-    }
+    out
 }
 
 pub(crate) fn repack_q8_soa(bytes: &[u8]) -> Vec<u8> {
@@ -11073,8 +10739,8 @@ fn launch_q4_wire_gemm_routed(
     in_scales: &CudaSlice<f32>,
     in_quants: &CudaSlice<i8>,
     weight_arena: &CudaSlice<u8>,
-    slot_ids: &CudaView<i32>,
-    token_offsets: &CudaView<i32>,
+    slot_ids: &CudaSlice<i32>,
+    token_offsets: &CudaSlice<i32>,
     token_ids: &CudaSlice<i32>,
     weight_stride: usize,
     rows: usize,
@@ -11190,125 +10856,8 @@ pub(crate) fn launch_q4_0_gemm_routed(
         in_scales,
         in_quants,
         weight_arena,
-        &slot_ids.slice(..),
-        &token_offsets.slice(..),
-        token_ids,
-        weight_stride,
-        rows,
-        blocks_per_row,
-        expert_count,
-        max_assignments_per_expert,
-        chunked,
-        out,
-    )
-}
-
-/// Sub-range twin of [`launch_q4_0_gemm_routed`] for a residents-first-ordered
-/// CSR: launches the identical kernel over the contiguous expert range
-/// `[expert_offset, expert_offset + expert_count)`. `token_offsets` values are
-/// absolute assignment indices, so every per-assignment output row lands at
-/// exactly the position the single full-union launch writes; each expert's
-/// per-row fold still happens whole inside one launch, which is what keeps a
-/// two-pass split bit-identical to the one-pass launch.
-#[allow(dead_code, clippy::too_many_arguments)]
-pub(crate) fn launch_q4_0_gemm_routed_range(
-    s: &Arc<CudaStream>,
-    f: &CudaFunction,
-    in_scales: &CudaSlice<f32>,
-    in_quants: &CudaSlice<i8>,
-    weight_arena: &CudaSlice<u8>,
-    slot_ids: &CudaSlice<i32>,
-    token_offsets: &CudaSlice<i32>,
-    token_ids: &CudaSlice<i32>,
-    weight_stride: usize,
-    rows: usize,
-    blocks_per_row: usize,
-    expert_offset: usize,
-    expert_count: usize,
-    max_assignments_per_expert: usize,
-    chunked: bool,
-    out: &mut CudaSlice<f32>,
-) -> Result<(), cudarc::driver::DriverError> {
-    launch_q4_wire_gemm_routed(
-        s,
-        f,
-        in_scales,
-        in_quants,
-        weight_arena,
-        &slot_ids.slice(expert_offset..),
-        &token_offsets.slice(expert_offset..),
-        token_ids,
-        weight_stride,
-        rows,
-        blocks_per_row,
-        expert_count,
-        max_assignments_per_expert,
-        chunked,
-        out,
-    )
-}
-
-/// Launch the draft-chain embedding gather: dequantize one PADDED-Q6_K head row
-/// (selected by the device-resident token id at `token[slot]`) into
-/// `out[0..hidden]`, scaled by the embedding's sqrt(hidden). The row id never
-/// crosses PCIe, which is the point: the assistant's argmax feeds its next
-/// proposal without a host round-trip.
-#[allow(dead_code, clippy::too_many_arguments)]
-pub(crate) fn launch_q6k_row_gather_scale(
-    s: &Arc<CudaStream>,
-    f: &CudaFunction,
-    head_bytes: &CudaSlice<u8>,
-    token: &CudaSlice<u32>,
-    slot: usize,
-    out: &mut CudaSlice<f32>,
-    hidden: usize,
-    scale: f32,
-) -> Result<(), cudarc::driver::DriverError> {
-    use cudarc::driver::{LaunchConfig, PushKernelArg};
-    let cfg = LaunchConfig {
-        grid_dim: ((hidden as u32).div_ceil(256), 1, 1),
-        block_dim: (256, 1, 1),
-        shared_mem_bytes: 0,
-    };
-    let (slot_i, hidden_i) = (slot as i32, hidden as i32);
-    let mut b = s.launch_builder(f);
-    b.arg(head_bytes)
-        .arg(token)
-        .arg(&slot_i)
-        .arg(out)
-        .arg(&hidden_i)
-        .arg(&scale);
-    unsafe { b.launch(cfg) }.map(|_| ())
-}
-
-/// Q4_1 twin of [`launch_q4_0_gemm_routed_range`].
-#[allow(dead_code, clippy::too_many_arguments)]
-pub(crate) fn launch_q4_1_gemm_routed_range(
-    s: &Arc<CudaStream>,
-    f: &CudaFunction,
-    in_scales: &CudaSlice<f32>,
-    in_quants: &CudaSlice<i8>,
-    weight_arena: &CudaSlice<u8>,
-    slot_ids: &CudaSlice<i32>,
-    token_offsets: &CudaSlice<i32>,
-    token_ids: &CudaSlice<i32>,
-    weight_stride: usize,
-    rows: usize,
-    blocks_per_row: usize,
-    expert_offset: usize,
-    expert_count: usize,
-    max_assignments_per_expert: usize,
-    chunked: bool,
-    out: &mut CudaSlice<f32>,
-) -> Result<(), cudarc::driver::DriverError> {
-    launch_q4_wire_gemm_routed(
-        s,
-        f,
-        in_scales,
-        in_quants,
-        weight_arena,
-        &slot_ids.slice(expert_offset..),
-        &token_offsets.slice(expert_offset..),
+        slot_ids,
+        token_offsets,
         token_ids,
         weight_stride,
         rows,
@@ -11344,8 +10893,8 @@ pub(crate) fn launch_q4_1_gemm_routed(
         in_scales,
         in_quants,
         weight_arena,
-        &slot_ids.slice(..),
-        &token_offsets.slice(..),
+        slot_ids,
+        token_offsets,
         token_ids,
         weight_stride,
         rows,
@@ -12720,20 +12269,8 @@ pub(crate) fn launch_attention_splitk(
 }
 
 /// Whether flash prefill attention is enabled.
-/// Opt-in via `CAMELID_FLASH_PREFILL=1`, prefill-only. Default off, which retains
-/// bit-identity with the serial forward pass.
-///
-/// MEASURED 2026-09-10 on an RTX 3060 Laptop (sm_86), and both halves are worth
-/// knowing before enabling it — receipts in
-/// `qa/evidence-bundles/cuda-flash-prefill-ab-20260910/`:
-///   - It is SLOWER here, and worse with context: 1.11x / 1.17x / 1.22x at
-///     1424 / 3025 / 6024 prompt tokens. Developed and reported on sm_89, where the
-///     register-vs-occupancy tradeoff may land differently; no committed evidence
-///     isolates this flag on any device.
-///   - It is NOT token-parity in general. The online-softmax reassociation runs per
-///     LAYER, so its error compounds: greedy output was identical 3/3 at 1429 tokens
-///     but only 1/3 at 6029 tokens, deterministically. Earlier comments here claimed
-///     token-parity without a length bound; that claim did not survive measurement.
+/// Opt-in via `CAMELID_FLASH_PREFILL=1` (prefill-only, token-parity).
+/// Default is off (retaining bit-identity with serial forward pass).
 fn flash_prefill_enabled() -> bool {
     std::env::var("CAMELID_FLASH_PREFILL").is_ok_and(|v| {
         v != "0" && !v.eq_ignore_ascii_case("false") && !v.eq_ignore_ascii_case("off")
@@ -13499,12 +13036,6 @@ pub struct CudaResidentDecode {
     /// Number of KV positions materialized on the GPU (so the driver knows
     /// whether the session needs (re)seeding from the CPU history).
     filled: usize,
-    /// The token sequence whose KV occupies rows `[0, resident_tokens.len())`,
-    /// recorded by prefill so a later prompt sharing a leading run of tokens can
-    /// skip rebuilding rows that already hold exactly those tokens. Empty until
-    /// a prefill records one; truncated by `set_filled` so it can never outlive
-    /// the rows it describes.
-    resident_tokens: Vec<u32>,
     // per-token scratch (reused)
     d_hidden: CudaSlice<f32>,
     d_normed: CudaSlice<f32>,
@@ -13622,31 +13153,6 @@ pub struct CudaResidentDecode {
 // lanes with this constant, and the Metal multi-column verify profits from
 // deeper windows. CUDA-side cost is scratch sizing only (d_verify_scores and
 // friends scale linearly with this constant).
-/// Leading positions of `tokens` whose KV a previous prefill already built.
-///
-/// A KV row is a pure function of the token prefix that produced it, so rows an
-/// engine already holds for an identical prefix ARE the rows a new prompt needs.
-/// Recomputing them would reproduce the same values with the same kernels in the
-/// same order, which is why skipping them is not an approximation and needs no
-/// host mirror.
-///
-/// Bounded by BOTH the recorded sequence and the `filled` watermark: decode
-/// advances `filled` past the recorded prompt (those rows hold generated tokens
-/// this function cannot vouch for), and a rewind lowers it. Claiming a row the
-/// engine cannot account for would skip a prefill of KV that does not hold these
-/// tokens — silently wrong output, not a slow path — so the bound is
-/// deliberately the pessimistic one.
-///
-/// Split out of the engine so the bookkeeping is testable without a GPU.
-fn resident_prefix_len(resident: &[u32], filled: usize, tokens: &[u32]) -> usize {
-    let limit = resident.len().min(filled).min(tokens.len());
-    let mut shared = 0usize;
-    while shared < limit && resident[shared] == tokens[shared] {
-        shared += 1;
-    }
-    shared
-}
-
 pub(crate) const MAX_VERIFY_K: usize = 16;
 const MAX_PRISM_PREFILL_K: usize = 128;
 const DEFAULT_PRISM_BMMA_MIN_TOKENS: usize = 32;
@@ -13792,21 +13298,6 @@ fn prism_cuda_bmma_enabled() -> bool {
     *ENABLED.get_or_init(|| {
         !matches!(
             std::env::var("CAMELID_PRISM_CUDA_NO_BMMA").ok().as_deref(),
-            Some("1") | Some("true") | Some("on") | Some("yes")
-        )
-    })
-}
-
-/// Opt-in for the parity-correct Q4_K/Q6_K batched-prefill tiles (see
-/// `prefers_batched_prefill`). Default OFF: the serial GEMVs stay the shipped
-/// policy for K-quant rows until a device carries a receipt.
-fn kquant_batched_prefill_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        matches!(
-            std::env::var("CAMELID_KQUANT_BATCHED_PREFILL")
-                .ok()
-                .as_deref(),
             Some("1") | Some("true") | Some("on") | Some("yes")
         )
     })
@@ -14177,7 +13668,6 @@ impl CudaResidentDecode {
             cache_v,
             kv_quant,
             filled: 0,
-            resident_tokens: Vec::new(),
             d_hidden: alloc_f(hidden)?,
             d_normed: alloc_f(max_in)?,
             d_q: alloc_f(q_width)?,
@@ -14667,8 +14157,6 @@ impl CudaResidentDecode {
     /// driver only uses `forward_token` (never seed_layer/read_kv_layer). Absolute `li`
     /// indexing is preserved (the Vecs stay length `n_layers`).
     pub fn sparsify_kv(&mut self, keep_full: &[bool]) -> Result<(), String> {
-        // Layers about to lose their cache cannot serve a continued prefix.
-        self.invalidate_resident_tokens();
         let s = self.k.stream.clone();
         for li in 0..self.n_layers {
             if !keep_full.get(li).copied().unwrap_or(false) {
@@ -14700,10 +14188,6 @@ impl CudaResidentDecode {
             }
         }
         self.filled = 0;
-        // The rows this record described have just been invalidated; leaving it
-        // in place would let a later prompt continue from KV that no longer holds
-        // those tokens.
-        self.invalidate_resident_tokens();
         Ok(())
     }
 
@@ -15019,35 +14503,14 @@ impl CudaResidentDecode {
     /// Default policy after same-host Windows/WDDM benchmarking. Q8_0 batching
     /// remains a clear win; the parity-correct Q4_K/Q6_K tiles stay opt-in until
     /// a device shows a sustained gain over the mature serial GEMVs.
-    ///
-    /// `CAMELID_KQUANT_BATCHED_PREFILL=1` is that opt-in: it admits the Q4_K/Q6_K
-    /// tiles so a device can be measured against the serial GEMVs on a real row.
-    /// It only ever widens the set, and only where `supports_batched_prefill`
-    /// already holds — which requires full residency, so an offloaded model keeps
-    /// the serial path that streams its offloaded weights correctly.
-    ///
-    /// MEASURED NULL — qwen35 Ornith-1.0-9B Q4_K_M, RTX 3060 Laptop, fully resident
-    /// (`CAMELID_QWEN35_CUDA_HEADROOM_MB=0`), 2813-token prompt, paired A/B with
-    /// matched thermal start: serial 141.6s / 149.8s vs batched 148.5s / 151.7s =
-    /// 0.95x and 0.99x. Completions were token-for-token identical across all four
-    /// runs, so the tiles are parity-correct — they are simply not faster on this
-    /// row. MECHANISM: 24 of these 32 layers are SSM, and the gated-delta
-    /// recurrence is sequential ACROSS tokens, so a batched chunk can only amortize
-    /// weight reads for the 8 full-attention layers and the FFNs; the SSM majority
-    /// still walks token by token. Expect a null on any SSM-heavy qwen35 row and
-    /// spend the effort elsewhere. Dense K-quant rows are NOT covered by this
-    /// measurement and remain genuinely open.
     pub fn prefers_batched_prefill(&self) -> bool {
-        if !self.supports_batched_prefill() {
-            return false;
-        }
-        let mature_quants_only = self.layers.iter().all(|layer| {
-            layer
-                .quants
-                .iter()
-                .all(|q| matches!(q, ProjQuant::Q8_0 | ProjQuant::Q1_0))
-        });
-        mature_quants_only || kquant_batched_prefill_enabled()
+        self.supports_batched_prefill()
+            && self.layers.iter().all(|layer| {
+                layer
+                    .quants
+                    .iter()
+                    .all(|q| matches!(q, ProjQuant::Q8_0 | ProjQuant::Q1_0))
+            })
     }
 
     /// Whether linear speculative verification can use the batched stack,
@@ -15116,39 +14579,6 @@ impl CudaResidentDecode {
 
     pub fn set_filled(&mut self, filled: usize) {
         self.filled = filled;
-        // Never let the token record outlive the rows it describes. A rewind
-        // (speculative reject, error reset, a fresh prefill starting over)
-        // invalidates everything past the new watermark, and a stale tail would
-        // authorize reusing rows that no longer hold those tokens.
-        if self.resident_tokens.len() > filled {
-            self.resident_tokens.truncate(filled);
-        }
-    }
-
-    /// Record the prompt whose KV now occupies rows `[0, tokens.len())`.
-    ///
-    /// Call this only after a prefill has actually written those rows; the
-    /// record is what later prompts are matched against.
-    pub fn set_resident_tokens(&mut self, tokens: &[u32]) {
-        self.resident_tokens.clear();
-        self.resident_tokens.extend_from_slice(tokens);
-    }
-
-    /// Stop vouching for the KV cache's contents.
-    ///
-    /// Every path that writes KV by any route other than a prefill — a reseed
-    /// from host history, a tree compaction, dropping a layer's cache — must call
-    /// this. A stale record does not cause a slow path, it causes a later prompt
-    /// to skip prefilling rows that no longer hold its tokens, which is silently
-    /// wrong output.
-    fn invalidate_resident_tokens(&mut self) {
-        self.resident_tokens.clear();
-    }
-
-    /// How many leading positions of `tokens` are ALREADY materialized in this
-    /// engine's KV cache and can therefore be skipped by a prefill.
-    pub fn resident_prefix_len(&self, tokens: &[u32]) -> usize {
-        resident_prefix_len(&self.resident_tokens, self.filled, tokens)
     }
 
     /// True when any layer's weights live in host RAM and stream to a GPU scratch buffer
@@ -15196,13 +14626,6 @@ impl CudaResidentDecode {
         if position == 0 {
             return Ok(());
         }
-        // These rows are about to be overwritten from the f16-rounded HOST history.
-        // They will hold the right tokens, but not the bit-identical values a fresh
-        // GPU prefill produces — which is exactly the hazard that keeps the
-        // prompt-prefix cache off this lane. Continuation's guarantee is bit-identity,
-        // so a reseeded span must never be continued from: drop the record and let the
-        // next prompt pay one cold prefill.
-        self.invalidate_resident_tokens();
         let (hd, max_pos, n_kv) = (self.head_dim, self.max_pos, self.n_kv_heads);
         let s = self.k.stream.clone();
         if self.kv_quant == crate::model::KvCacheQuantization::Q8_0 {
@@ -17546,35 +16969,12 @@ impl CudaResidentDecode {
         n: usize,
         scale: f32,
     ) -> Result<(), String> {
-        self.prefill_from(embeddings, cos_all, sin_all, n, scale, 0)
-    }
-
-    /// [`prefill`](Self::prefill), resuming at `start`: positions `[0, start)`
-    /// are left untouched because a previous prefill of the SAME token prefix
-    /// already materialized them (see [`resident_prefix_len`]). `start == 0` is
-    /// the ordinary cold prefill and runs the identical loop.
-    ///
-    /// The caller is responsible for establishing that rows `[0, start)` really
-    /// hold these tokens; passing a `start` the KV cache does not account for
-    /// silently produces wrong output rather than a slow path.
-    pub fn prefill_from(
-        &mut self,
-        embeddings: &[f32],
-        cos_all: &[f32],
-        sin_all: &[f32],
-        n: usize,
-        scale: f32,
-        start: usize,
-    ) -> Result<(), String> {
         let half = self.rope_dim / 2;
         let hidden = self.hidden;
         if embeddings.len() < n * hidden || cos_all.len() < n * half || sin_all.len() < n * half {
             return Err("prefill: input slices too short".into());
         }
-        if start > n {
-            return Err(format!("prefill: start={start} exceeds n={n}"));
-        }
-        for i in start..n {
+        for i in 0..n {
             let emb = &embeddings[i * hidden..(i + 1) * hidden];
             let cos = &cos_all[i * half..(i + 1) * half];
             let sin = &sin_all[i * half..(i + 1) * half];
@@ -17822,10 +17222,8 @@ impl CudaResidentDecode {
     /// projection reproduces its decode GEMV's integer decomposition and ordered fp32 sum,
     /// and the batched norm/RoPE/scatter/attention kernels match their serial counterparts.
     /// When opt-in flash prefill is enabled (`CAMELID_FLASH_PREFILL=1`, prefill only), the fused
-    /// online-softmax attention kernel eliminates intermediate DRAM scratch but is an
-    /// APPROXIMATION whose error grows with context: measured greedy-identical 3/3 at
-    /// 1429 prompt tokens and 1/3 at 6029 (see `flash_prefill_enabled`). It is off by
-    /// default, so this stack is bit-identical to the serial path unless asked otherwise.
+    /// online-softmax attention kernel preserves greedy token-parity while eliminating intermediate
+    /// DRAM scratch.
     /// All K/V of the current chunk are scattered before attention reads them, so a
     /// token attends to every earlier position (prior chunks + earlier tokens in this
     /// chunk) exactly as sequential decoding would.
@@ -19200,10 +18598,6 @@ impl CudaResidentDecode {
     /// slot is never below the destination, so a forward copy never clobbers a source
     /// it still needs. After compaction the caller sets position/filled = base + L.
     pub fn compact_tree_kv_path(&mut self, path: &[usize], base: usize) -> Result<(), String> {
-        // Compaction relocates rows, so position -> token no longer matches the
-        // record. Anything past `base` is a speculative slot the record never
-        // covered, but the move itself is enough to stop vouching for the cache.
-        self.invalidate_resident_tokens();
         let map = |e: cudarc::driver::DriverError| format!("cuda compact: {e}");
         let s = self.k.stream.clone();
         let (n_kv, head_dim, max_pos) = (self.n_kv_heads, self.head_dim, self.max_pos);
@@ -19264,30 +18658,13 @@ impl CudaResidentDecode {
         n: usize,
         scale: f32,
     ) -> Result<(), String> {
-        self.prefill_batched_from(embeddings, cos_all, sin_all, n, scale, 0)
-    }
-
-    /// [`prefill_batched`](Self::prefill_batched), resuming at `start`. The
-    /// chunk loop simply begins at `start` instead of 0; every chunk it does run
-    /// is staged and scattered exactly as on the cold path, so the KV it writes
-    /// is bit-identical to a full prefill's. See [`prefill_from`](Self::prefill_from)
-    /// for the caller's obligation.
-    pub fn prefill_batched_from(
-        &mut self,
-        embeddings: &[f32],
-        cos_all: &[f32],
-        sin_all: &[f32],
-        n: usize,
-        scale: f32,
-        start: usize,
-    ) -> Result<(), String> {
         // The batched layer stack reads each layer's VRAM weight slice directly and has
         // no offload-streaming path (unlike forward_pass), so for an offloaded model
         // (e.g. 8B on a 6 GiB card) it would read placeholder bytes. Fall back to the
         // serial prefill, which streams offloaded weights correctly. Batching is a
         // resident-only fast path.
         if !self.supports_batched_prefill() {
-            return self.prefill_from(embeddings, cos_all, sin_all, n, scale, start);
+            return self.prefill(embeddings, cos_all, sin_all, n, scale);
         }
         let map = |e: cudarc::driver::DriverError| format!("cuda prefill: {e}");
         let hidden = self.hidden;
@@ -19295,15 +18672,11 @@ impl CudaResidentDecode {
         if embeddings.len() < n * hidden || cos_all.len() < n * half || sin_all.len() < n * half {
             return Err("prefill_batched: input slices too short".into());
         }
-        if start > n {
-            return Err(format!("prefill_batched: start={start} exceeds n={n}"));
-        }
         let batch_cap = self.batched_prefill_token_cap();
         self.ensure_prefill_scratch(batch_cap)?;
         let s = self.k.stream.clone();
         let mut sc = self.prefill_scratch.take().expect("allocated above");
-        // Rows [0, start) already hold this prompt's KV from a previous prefill.
-        let mut base = start;
+        let mut base = 0usize;
         while base < n {
             let kk = (n - base).min(batch_cap);
             // Stage this chunk's embeddings + RoPE tables into the shared scratch at

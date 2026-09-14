@@ -1,4 +1,3 @@
-import { EngineMetricsPanel } from '../components/analytics/EngineMetricsPanel'
 import { displayCapabilityCopy, displayCapabilityId, exactRowSupportLanes, findCompatibilityHint, formatCapabilityStatus, isExactCompatibilityHint, isSupportedCapabilityStatus } from '../lib/capabilities'
 import { getChatGateState } from '../lib/chatGate'
 import { describeModelState } from '../lib/modelState'
@@ -23,7 +22,7 @@ function supportLaneTitle(lane) {
   return 'Throughput readiness'
 }
 
-export default function SystemView({ runtime, selectedModel, capabilities, metricsApiBase = '' }) {
+export default function SystemView({ runtime, selectedModel, capabilities }) {
   const runtimePill = runtimeReadinessLabel(runtime)
   const selectedModelName = selectedModel?.name || 'No next-chat model selected'
   const apiBase = runtime?.api_base || 'Local API unavailable'
@@ -219,8 +218,6 @@ export default function SystemView({ runtime, selectedModel, capabilities, metri
           )}
         </div>
       </section>
-
-      <EngineMetricsPanel apiBase={metricsApiBase} runtime={runtime} />
     </section>
   )
 }

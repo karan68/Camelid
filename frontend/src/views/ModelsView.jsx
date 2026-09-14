@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { ModelInspector } from '../components/models/ModelInspector'
 import { TokenizerPlayground } from '../components/models/TokenizerPlayground'
-import { RerankPlayground } from '../components/models/RerankPlayground'
 import { ActiveModelBar } from '../components/models/ActiveModelBar'
 import { CatalogLaneBrowse } from '../components/models/CatalogLaneBrowse'
 import { DownloadsPanel } from '../components/models/DownloadsPanel'
@@ -62,12 +61,6 @@ export default function ModelsView({
   // Typed fail-closed blocker from a pre-load inspect ({ code, message }), shown
   // verbatim instead of attempting a multi-GB load that cannot run.
   const [blocker, setBlocker] = useState(null)
-  // The exact request a blocker refused, so an override re-issues that load rather
-  // than making the user find the row again.
-  const [blockedRequest, setBlockedRequest] = useState(null)
-  // Advisory `warnings` from a load that SUCCEEDED. These are notices, never
-  // blockers: the model is resident and usable while they are on screen.
-  const [loadWarnings, setLoadWarnings] = useState([])
   const [laneError, setLaneError] = useState('')
   const [cancelingDownloads, setCancelingDownloads] = useState(new Set())
   const [canceledCatalogIds, setCanceledCatalogIds] = useState(new Set())
@@ -79,42 +72,6 @@ export default function ModelsView({
   const [deleteNotice, setDeleteNotice] = useState('')
   const [catalogOperations, setCatalogOperations] = useState(new Set())
   const [modelQuery, setModelQuery] = useState('')
-  const [quantizeModalOpen, setQuantizeModalOpen] = useState(false)
-  const [quantizeInputModel, setQuantizeInputModel] = useState('')
-  const [quantizeOutputPath, setQuantizeOutputPath] = useState('')
-  const [quantizeType, setQuantizeType] = useState('q4_k_m')
-  const [quantizeBusy, setQuantizeBusy] = useState(false)
-  const [quantizeResult, setQuantizeResult] = useState(null)
-  const [quantizeError, setQuantizeError] = useState('')
-
-  const handleQuantize = async (e) => {
-    e.preventDefault()
-    if (!quantizeInputModel.trim()) return
-    setQuantizeBusy(true)
-    setQuantizeError('')
-    setQuantizeResult(null)
-    try {
-      const res = await fetch(`${catalogApiBase || apiBase}/api/models/quantize`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          input_path: quantizeInputModel.trim(),
-          output_path: quantizeOutputPath.trim() || undefined,
-          quant_type: quantizeType,
-        }),
-      })
-      const data = await res.json()
-      if (!res.ok) {
-        throw new Error(data?.error?.message || data?.message || `Quantization failed (HTTP ${res.status})`)
-      }
-      setQuantizeResult(data)
-      spine.refreshAll()
-    } catch (err) {
-      setQuantizeError(err.message || 'Quantization failed')
-    } finally {
-      setQuantizeBusy(false)
-    }
-  }
   /* How many curated catalog rows the current term matches, reported up by
      CatalogLaneBrowse so the result line can say whether scrolling is worth it. */
   const [catalogMatchCount, setCatalogMatchCount] = useState(null)
@@ -188,14 +145,12 @@ export default function ModelsView({
   // lib/modelActivation so this page and the first-run card cannot drift; what stays
   // here is the page's own state wiring. The spine's `/api/models/current` refresh
   // answers the identity check, so the confirmation costs no extra request.
-  const loadModelForChat = (filename, { onStage, model = null, force = false } = {}) => {
+  const loadModelForChat = (filename, { onStage, model = null } = {}) => {
     const run = async () => {
       loadInFlightRef.current = filename
       setUsingFilename(filename)
       setLaneError('')
       setBlocker(null)
-      setBlockedRequest(null)
-      setLoadWarnings([])
       try {
         const result = await loadLocalModelForChat({
           apiBase: spine.base,
@@ -203,17 +158,12 @@ export default function ModelsView({
           model: model || spine.local?.models.find((entry) => entry.filename === filename) || null,
           onStage,
           readActiveFilename: async () => modelFilenameFromPath((await spine.refreshCurrent())?.path),
-          force,
         })
         if (!result.ok) {
-          if (result.blocker) {
-            setBlocker(result.blocker)
-            setBlockedRequest({ filename, model })
-          }
+          if (result.blocker) setBlocker(result.blocker)
           setLaneError(result.message)
           return result
         }
-        setLoadWarnings(result.warnings || [])
         await Promise.all([
           spine.refreshLoadedModels(),
           refreshDashboard?.({ silent: true }),
@@ -228,18 +178,6 @@ export default function ModelsView({
     const queued = loadQueueRef.current.then(run, run)
     loadQueueRef.current = queued.catch(() => {})
     return queued
-  }
-
-  // Re-issue the refused load unchanged except for the preflight skip, so whatever
-  // comes back — success, its warnings, or a different refusal — surfaces the same
-  // way the first attempt did.
-  const forceLoadBlockedModel = () => {
-    if (!blockedRequest) return
-    loadModelForChat(blockedRequest.filename, { model: blockedRequest.model, force: true })
-  }
-
-  const dismissLoadWarning = (index) => {
-    setLoadWarnings((current) => current.filter((_, position) => position !== index))
   }
 
   const unloadEmbeddingModel = async (filename) => {
@@ -486,21 +424,6 @@ export default function ModelsView({
           >
             {spine.localLoading ? 'Refreshing…' : 'Refresh'}
           </Button>
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => {
-              setQuantizeResult(null)
-              setQuantizeError('')
-              if (spine.local?.models?.length && !quantizeInputModel) {
-                const first = spine.local.models[0]
-                setQuantizeInputModel(first.path || first.filename)
-              }
-              setQuantizeModalOpen(true)
-            }}
-          >
-            Quantize GGUF
-          </Button>
         </div>
       </header>
 
@@ -550,16 +473,6 @@ export default function ModelsView({
         onUnload={handleUnload}
       />
       <Notice notice={laneError} tone="error" onDismiss={() => setLaneError('')} />
-      {/* The model is loaded and usable; a warning here qualifies that success (a
-          busy host, say) and must not read as the load having been refused. */}
-      {loadWarnings.map((warning, index) => (
-        <Notice
-          key={`${warning?.code || 'load-warning'}-${index}`}
-          notice={warning?.message}
-          tone={warning?.severity === 'info' ? 'info' : 'warning'}
-          onDismiss={() => dismissLoadWarning(index)}
-        />
-      ))}
       <Notice notice={deleteNotice} tone="success" onDismiss={() => setDeleteNotice('')} />
       {deleteBlockedReason ? (
         <p className="lane-delete-guard" id="model-delete-guard">{deleteBlockedReason}</p>
@@ -611,14 +524,7 @@ export default function ModelsView({
         count={laneBuckets ? experimentalRows.length : undefined}
         subtitle="Verification varies by exact row; each model shows what has actually passed."
       >
-        {blocker ? (
-          <UnsupportedBlocker
-            blocker={blocker}
-            className="local-lane-blocker"
-            onForceLoad={blockedRequest ? forceLoadBlockedModel : null}
-            forceBusy={Boolean(usingFilename)}
-          />
-        ) : null}
+        {blocker ? <UnsupportedBlocker blocker={blocker} className="local-lane-blocker" /> : null}
         {!laneBuckets ? (
           <p className="lane-empty">
             {spine.localLoading ? 'Scanning local models…' : runtimeOnline ? 'Local model scan unavailable.' : 'Runtime offline — the local scan resumes when the backend is back.'}
@@ -758,8 +664,6 @@ export default function ModelsView({
           </div>
 
           <TokenizerPlayground apiBase={catalogApiBase || apiBase} />
-
-          <RerankPlayground apiBase={catalogApiBase || apiBase} capabilities={capabilities} />
         </div>
       </details>
 
@@ -778,112 +682,6 @@ export default function ModelsView({
         onCancel={() => { if (!deletingFilename) setPendingDeleteEntry(null) }}
         onConfirm={deleteModelFromDisk}
       />
-
-      {quantizeModalOpen && (
-        <div className="citation-modal-overlay" onClick={() => !quantizeBusy && setQuantizeModalOpen(false)}>
-          <div className="citation-modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 640 }}>
-            <div className="citation-modal__header">
-              <div className="citation-modal__title">
-                <strong>Local GGUF Quantizer Utility</strong>
-              </div>
-              <button
-                type="button"
-                className="cxturn__action cxturn__action--icon"
-                disabled={quantizeBusy}
-                onClick={() => setQuantizeModalOpen(false)}
-              >
-                <IconClose size={16} />
-              </button>
-            </div>
-            <form onSubmit={handleQuantize}>
-              <div className="citation-modal__body" style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
-                <p style={{ margin: 0, color: 'var(--color-text-muted)', fontSize: 13 }}>
-                  Quantize uncompressed FP16/BF16/Q8_0 models directly into high-efficiency Q4_K_M or Q8_0 weights with bit-exact parity validation.
-                </p>
-
-                <label style={{ display: 'flex', flexDirection: 'column', gap: 4, fontSize: 13 }}>
-                  <span>Source GGUF Model Path or Selection:</span>
-                  <input
-                    className="input"
-                    type="text"
-                    required
-                    value={quantizeInputModel}
-                    onChange={(e) => setQuantizeInputModel(e.target.value)}
-                    placeholder="C:\path\to\model.gguf or filename"
-                  />
-                  {spine.local?.models?.length > 0 && (
-                    <select
-                      className="input"
-                      style={{ marginTop: 4 }}
-                      onChange={(e) => {
-                        if (e.target.value) setQuantizeInputModel(e.target.value)
-                      }}
-                      defaultValue=""
-                    >
-                      <option value="">-- Or select from local models --</option>
-                      {spine.local.models.map((m) => (
-                        <option key={m.filename} value={m.path || m.filename}>
-                          {m.filename} ({formatBytes(m.size_bytes)})
-                        </option>
-                      ))}
-                    </select>
-                  )}
-                </label>
-
-                <label style={{ display: 'flex', flexDirection: 'column', gap: 4, fontSize: 13 }}>
-                  <span>Target Quantization:</span>
-                  <select
-                    className="input"
-                    value={quantizeType}
-                    onChange={(e) => setQuantizeType(e.target.value)}
-                  >
-                    <option value="q4_k_m">Q4_K_M (Recommended: 256-elem superblocks, optimal quality/RAM balance)</option>
-                    <option value="q8_0">Q8_0 (32-elem blocks, near FP16 precision)</option>
-                    <option value="q4_0">Q4_0 (Standard legacy 4-bit)</option>
-                  </select>
-                </label>
-
-                <label style={{ display: 'flex', flexDirection: 'column', gap: 4, fontSize: 13 }}>
-                  <span>Output Destination Path (optional):</span>
-                  <input
-                    className="input"
-                    type="text"
-                    value={quantizeOutputPath}
-                    onChange={(e) => setQuantizeOutputPath(e.target.value)}
-                    placeholder="Defaults to <source>-<QUANT>.gguf in the same directory"
-                  />
-                </label>
-
-                {quantizeError && (
-                  <div style={{ color: 'var(--color-error, #f87171)', fontSize: 13 }}>
-                    Error: {quantizeError}
-                  </div>
-                )}
-
-                {quantizeResult && (
-                  <div style={{ background: 'rgba(34, 197, 94, 0.1)', border: '1px solid rgba(34, 197, 94, 0.3)', borderRadius: 8, padding: 12, fontSize: 13 }}>
-                    <strong style={{ color: '#4ade80' }}>Quantization Succeeded!</strong>
-                    <div style={{ marginTop: 6, display: 'flex', flexDirection: 'column', gap: 4 }}>
-                      <div>Saved: <code>{quantizeResult.output_path}</code></div>
-                      <div>Size: {formatBytes(quantizeResult.input_bytes)} → {formatBytes(quantizeResult.output_bytes)} ({((1 - quantizeResult.compression_ratio) * 100).toFixed(1)}% savings)</div>
-                      <div>Tensors Quantized: {quantizeResult.quantized_tensors} / {quantizeResult.tensor_count}</div>
-                      <div>SHA-256: <code style={{ fontSize: 11 }}>{quantizeResult.sha256}</code></div>
-                    </div>
-                  </div>
-                )}
-              </div>
-              <div className="citation-modal__footer" style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
-                <Button variant="outline" size="sm" type="button" disabled={quantizeBusy} onClick={() => setQuantizeModalOpen(false)}>
-                  {quantizeResult ? 'Done' : 'Cancel'}
-                </Button>
-                <Button variant="primary" size="sm" type="submit" loading={quantizeBusy} disabled={quantizeBusy || !quantizeInputModel.trim()}>
-                  {quantizeBusy ? 'Quantizing Model…' : 'Start Quantization'}
-                </Button>
-              </div>
-            </form>
-          </div>
-        </div>
-      )}
     </section>
   )
 }

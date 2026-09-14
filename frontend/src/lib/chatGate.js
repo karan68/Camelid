@@ -35,8 +35,7 @@ function backendMarksSupportedRow(model) {
 }
 
 const GEMMA4_26B_LANE_SCOPED_ROW = 'gemma4_26b_a4b_it_q4_0'
-const GEMMA4_12B_MTP12_LANE_SCOPED_ROW = 'gemma4_12b_it_qat_q4_0_mtp12'
-const GEMMA4_SERVE_LANES = new Set(['ghost_moe', 'local', 'distributed', 'cuda', 'mtp12_metal'])
+const GEMMA4_SERVE_LANES = new Set(['ghost_moe', 'local', 'distributed', 'cuda'])
 const LFM2_26B_LANE_SCOPED_ROW = 'lfm2_5_2_6b_q8_0'
 
 function normalizedGemma4ServeLane(runtime) {
@@ -61,26 +60,6 @@ function isGemma426bLaneScopedRow(model, hint) {
     return normalized === GEMMA4_26B_LANE_SCOPED_ROW
       || (/gemma_?4_26b(?:_|$)/.test(normalized) && normalized.includes('q4_0'))
   })
-}
-
-function isGemma412bMtp12LaneScopedRow(model, hint) {
-  if (hint?.kind === 'compatibility' && hint?.exact === true
-    && hint?.target?.id === GEMMA4_12B_MTP12_LANE_SCOPED_ROW) return true
-  const declaredRows = [
-    model?.catalog_id,
-    model?.compatibility_id,
-  ]
-  if (declaredRows.some((identity) => normalizedIdentity(identity) === GEMMA4_12B_MTP12_LANE_SCOPED_ROW)) {
-    return true
-  }
-  const artifacts = [
-    model?.runtime_model_name,
-    model?.id,
-    model?.model_path,
-    model?.hf_filename,
-  ]
-  return artifacts.some((identity) => normalizedIdentity(String(identity || '').split(/[\\/]/).pop())
-    === 'gemma_4_12b_it_qat_q4_0_gguf')
 }
 
 function normalizedIdentity(value) {
@@ -139,16 +118,14 @@ function supportedCatalogGhostCuda(runtime, runtimeLane) {
     && runtime?.gemma4_ghost_head_gpu_active === true
 }
 
-function runtimeLaneHint(hint, scopedRowId, runtimeLane) {
+function runtimeLaneHint(hint, laneScopedRow, runtimeLane) {
   const reason = runtimeLane === 'ghost_moe'
-    ? 'This model is running in an experimental configuration that has not been verified, so replies are marked unverified.'
-    : 'No verified run configuration was detected for this model; this lane is experimental, so replies are marked unverified.'
-  const target = hint?.target || (scopedRowId
+    ? 'This model is running in a configuration that has not been verified, so replies are marked unverified.'
+    : 'No verified run configuration was detected for this model, so replies are marked unverified.'
+  const target = hint?.target || (laneScopedRow
     ? {
-        id: scopedRowId,
-        family: scopedRowId === GEMMA4_12B_MTP12_LANE_SCOPED_ROW
-          ? 'gemma4_dense_decoder_mtp12'
-          : 'gemma4_a4b_moe_decoder',
+        id: GEMMA4_26B_LANE_SCOPED_ROW,
+        family: 'gemma4_a4b_moe_decoder',
         quantization: 'Q4_0',
       }
     : null)
@@ -175,16 +152,13 @@ export function getChatGateState(capabilities, model, runtime) {
   const runtimeReady = Boolean(!embeddingOnly && isRunnableInCurrentRuntime(model, runtime) && runtimeLoaded && runtimeGenerationReady)
   const discoveredHint = findCompatibilityHint(capabilities, model)
   const runtimeLane = normalizedGemma4ServeLane(runtime)
-  const gemma426bLaneScopedRow = isGemma426bLaneScopedRow(model, discoveredHint)
-  const gemma412bMtp12LaneScopedRow = isGemma412bMtp12LaneScopedRow(model, discoveredHint)
+  const gemmaLaneScopedRow = isGemma426bLaneScopedRow(model, discoveredHint)
   const lfm2LaneScopedRow = isLfm226bLaneScopedRow(model, discoveredHint)
-  const scopedRowId = gemma426bLaneScopedRow
+  const scopedRowId = gemmaLaneScopedRow
     ? GEMMA4_26B_LANE_SCOPED_ROW
-    : gemma412bMtp12LaneScopedRow
-      ? GEMMA4_12B_MTP12_LANE_SCOPED_ROW
-      : lfm2LaneScopedRow
-        ? LFM2_26B_LANE_SCOPED_ROW
-        : null
+    : lfm2LaneScopedRow
+      ? LFM2_26B_LANE_SCOPED_ROW
+      : null
   const scopedTarget = scopedRowId
     ? capabilities?.model_compatibility?.find((row) => row?.id === scopedRowId)
     : null
@@ -192,11 +166,7 @@ export function getChatGateState(capabilities, model, runtime) {
     ? {
         kind: 'compatibility',
         target: scopedTarget,
-        confidence: `exact ${gemma426bLaneScopedRow
-          ? 'Gemma 4 26B'
-          : gemma412bMtp12LaneScopedRow
-            ? 'Gemma 4 12B QAT Q4_0/MTP12'
-            : 'LFM2.5 2.6B'} artifact identity`,
+        confidence: `exact ${gemmaLaneScopedRow ? 'Gemma 4 26B' : 'LFM2.5 2.6B'} artifact identity`,
         exact: true,
       }
     : discoveredHint
@@ -204,15 +174,11 @@ export function getChatGateState(capabilities, model, runtime) {
   // serve or the durable catalog-managed Windows CUDA Ghost pair with every GPU
   // component live. LFM2 is green only for the two receipted runnable lanes,
   // with an execution plan whose host scope and live path are both verified.
-  const gemma426bRuntimeLaneEligible = !gemma426bLaneScopedRow
+  const gemmaRuntimeLaneEligible = !gemmaLaneScopedRow
     || runtimeLane === 'distributed'
     || supportedCatalogGhostCuda(runtime, runtimeLane)
-  const gemma412bMtp12RuntimeLaneEligible = !gemma412bMtp12LaneScopedRow
-    || (runtime?.backend === 'gemma4-runtime' && runtimeLane === 'mtp12_metal')
   const lfm2RuntimeLaneEligible = !lfm2LaneScopedRow || supportedLfm2Runtime(runtime)
-  const runtimeLaneEligible = gemma426bRuntimeLaneEligible
-    && gemma412bMtp12RuntimeLaneEligible
-    && lfm2RuntimeLaneEligible
+  const runtimeLaneEligible = gemmaRuntimeLaneEligible && lfm2RuntimeLaneEligible
   // Once /api/models/local supplies a lane verdict, it owns artifact identity.
   // Falling back to name matching after an explicit experimental verdict would
   // let a same-named, wrong-hash file inherit the supported contract. Runtime
@@ -221,9 +187,7 @@ export function getChatGateState(capabilities, model, runtime) {
   const hasBackendLaneVerdict = Boolean(model?.lane_class)
   const artifactSupported = hasBackendLaneVerdict
     ? backendMarksSupportedRow(model)
-    : !lfm2LaneScopedRow
-      && !gemma412bMtp12LaneScopedRow
-      && isCompatibilitySupportedForModel(capabilities, model)
+    : !lfm2LaneScopedRow && isCompatibilitySupportedForModel(capabilities, model)
   const contractSupported = Boolean(!embeddingOnly && runtimeLaneEligible && artifactSupported)
   const exactRowVerifiedRunnable = Boolean(
     !embeddingOnly
@@ -240,7 +204,7 @@ export function getChatGateState(capabilities, model, runtime) {
   )
   const hint = runtimeLaneEligible
     ? contractHint
-    : runtimeLaneHint(contractHint, scopedRowId, runtimeLane)
+    : runtimeLaneHint(contractHint, gemmaLaneScopedRow, runtimeLane)
   const chatUnlocked = Boolean(runtimeReady && contractSupported)
   const verifiedUnlocked = Boolean(runtimeReady && !contractSupported && exactRowVerifiedRunnable)
   const varianceUnlocked = Boolean(runtimeReady && !contractSupported && exactRowNumericalVariance)

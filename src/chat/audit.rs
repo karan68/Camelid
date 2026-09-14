@@ -76,11 +76,6 @@ pub struct AuditEvent {
     pub args_digest: String,
     pub outcome: Option<AuditOutcome>,
     pub duration_ms: Option<u64>,
-    /// How many images the tool result carried. A count, never the bytes — the
-    /// same posture as `outcome`, since image data from an untrusted tool is
-    /// exactly the kind of payload this trail must record without transmitting.
-    /// `None` on `tool_call`.
-    pub images: Option<usize>,
 }
 
 impl AuditEvent {
@@ -94,7 +89,6 @@ impl AuditEvent {
             args_digest,
             outcome: None,
             duration_ms: None,
-            images: None,
         }
     }
 
@@ -118,7 +112,6 @@ impl AuditEvent {
                 AuditOutcome::Ok
             }),
             duration_ms: Some(duration.as_millis() as u64),
-            images: Some(outcome.images().len()),
         }
     }
 
@@ -136,7 +129,6 @@ impl AuditEvent {
             "args_digest": self.args_digest,
             "outcome": self.outcome.map(AuditOutcome::label),
             "duration_ms": self.duration_ms,
-            "images": self.images,
         })
     }
 }

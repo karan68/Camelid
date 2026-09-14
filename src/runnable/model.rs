@@ -273,6 +273,17 @@ impl Mat {
 }
 
 impl RawMat {
+    #[cfg(not(target_os = "macos"))]
+    fn is_prism_low_bit(&self) -> bool {
+        matches!(
+            self.tt,
+            GgufTensorType::Q1_0
+                | GgufTensorType::Q2_0G64
+                | GgufTensorType::Q2_0G128
+                | GgufTensorType::Pq2_0
+        )
+    }
+
     fn row_bytes(&self) -> usize {
         self.bytes.len() / self.out_features
     }
@@ -1215,9 +1226,9 @@ impl RunnableModel {
                     resident_cuda_artifact_from_sha256, ResidentCudaArtifact,
                 };
 
-                // Hash only the plausible exact Q1 row. This exact digest admits
-                // kernels/layouts validated against one concrete artifact, so a
-                // user-writable persistent cache cannot be its authority.
+                // Hash only the plausible exact Q1 row. API loads normally hit the
+                // receipt hash cache; direct CLI loads still prove identity before
+                // admitting kernels/layouts validated against one concrete artifact.
                 let ffn_dim = q35_layers
                     .first()
                     .map(|layer| layer.ffn_gate.out_features)
@@ -1234,7 +1245,7 @@ impl RunnableModel {
                     && has_q1_projection;
 
                 if candidate {
-                    match crate::receipt::sha256_file_hex(std::path::Path::new(path)) {
+                    match crate::receipt::sha256_file_hex_cached(std::path::Path::new(path)) {
                         Ok(sha256) => resident_cuda_artifact_from_sha256(&sha256),
                         Err(err) => {
                             eprintln!(
@@ -1827,7 +1838,7 @@ impl RunnableModel {
         // surfaces as an error rather than a quietly different lane.
         #[cfg(target_os = "macos")]
         if self.lfm2.is_some() && lfm2_metal_enabled() {
-            return self.generate_lfm2_metal(prompt, max_new, &[], None, &|_| false, &mut |_| {});
+            return self.generate_lfm2_metal(prompt, max_new, &[], None, &mut |_| {});
         }
         let mut cache = self.new_cache();
         let last = self.prefill_generic(prompt, &mut cache, None)?;
@@ -1861,37 +1872,21 @@ impl RunnableModel {
     ) -> Result<Vec<u32>> {
         #[cfg(target_os = "macos")]
         {
-            self.generate_qwen35_vision_metal(
-                prefix,
-                image,
-                suffix,
-                max_new,
-                stop,
-                None,
-                &|_| false,
-                on_token,
-            )
+            self.generate_qwen35_vision_metal(prefix, image, suffix, max_new, stop, None, on_token)
         }
         #[cfg(not(target_os = "macos"))]
         {
             #[cfg(feature = "cuda")]
             {
                 self.generate_qwen35_vision_cuda(
-                    prefix,
-                    image,
-                    suffix,
-                    max_new,
-                    stop,
-                    None,
-                    &|_| false,
-                    on_token,
+                    prefix, image, suffix, max_new, stop, None, on_token,
                 )
             }
             #[cfg(not(feature = "cuda"))]
             {
                 let _ = (prefix, image, suffix, max_new, stop, on_token);
                 Err(BackendError::UnsupportedGguf(
-                    "generating with an attached image requires a Metal or CUDA build; this build can encode the image but has no lane to decode with it".into(),
+                    "Prism image generation requires Metal or CUDA".into(),
                 ))
             }
         }
@@ -1906,21 +1901,13 @@ impl RunnableModel {
         max_new: usize,
         stop: &[u32],
         sampling: &SamplingConfig,
-        should_stop: &dyn Fn(&[u32]) -> bool,
         on_token: &mut dyn FnMut(u32),
     ) -> Result<Vec<u32>> {
         #[cfg(target_os = "macos")]
         {
             let sampling = qwen35_sampling_requires_logits(sampling).then_some(sampling);
             self.generate_qwen35_vision_metal(
-                prefix,
-                image,
-                suffix,
-                max_new,
-                stop,
-                sampling,
-                should_stop,
-                on_token,
+                prefix, image, suffix, max_new, stop, sampling, on_token,
             )
         }
         #[cfg(not(target_os = "macos"))]
@@ -1929,30 +1916,14 @@ impl RunnableModel {
             {
                 let sampling = qwen35_sampling_requires_logits(sampling).then_some(sampling);
                 self.generate_qwen35_vision_cuda(
-                    prefix,
-                    image,
-                    suffix,
-                    max_new,
-                    stop,
-                    sampling,
-                    should_stop,
-                    on_token,
+                    prefix, image, suffix, max_new, stop, sampling, on_token,
                 )
             }
             #[cfg(not(feature = "cuda"))]
             {
-                let _ = (
-                    prefix,
-                    image,
-                    suffix,
-                    max_new,
-                    stop,
-                    sampling,
-                    should_stop,
-                    on_token,
-                );
+                let _ = (prefix, image, suffix, max_new, stop, sampling, on_token);
                 Err(BackendError::UnsupportedGguf(
-                    "generating with an attached image requires a Metal or CUDA build; this build can encode the image but has no lane to decode with it".into(),
+                    "Prism image generation requires Metal or CUDA".into(),
                 ))
             }
         }
@@ -2973,13 +2944,12 @@ impl RunnableModel {
     /// falling back to the CPU runnable lane on any CUDA error. The CPU lane is the
     /// certified oracle, and the default only where neither GPU lane applies.
     fn generate_qwen35(&self, prompt: &[u32], max_new: usize, stop: &[u32]) -> Result<Vec<u32>> {
-        self.generate_qwen35_streaming(prompt, max_new, stop, None, false, &|_| false, &mut |_| {})
+        self.generate_qwen35_streaming(prompt, max_new, stop, None, false, &mut |_| {})
     }
 
     /// Like [`generate_qwen35`](Self::generate_qwen35) but invokes `on_token` for
     /// every emitted token as soon as it is decided — the serve lane's SSE source.
     /// Token order/content identical to the non-streaming path by construction.
-    #[allow(clippy::too_many_arguments)]
     fn generate_qwen35_streaming(
         &self,
         prompt: &[u32],
@@ -2987,7 +2957,6 @@ impl RunnableModel {
         stop: &[u32],
         sampling: Option<&SamplingConfig>,
         stream_tokens_observable: bool,
-        should_stop: &dyn Fn(&[u32]) -> bool,
         on_token: &mut dyn FnMut(u32),
     ) -> Result<Vec<u32>> {
         #[cfg(not(feature = "cuda"))]
@@ -2995,8 +2964,7 @@ impl RunnableModel {
 
         #[cfg(target_os = "macos")]
         if qwen35_metal_enabled() {
-            match self.generate_qwen35_metal(prompt, max_new, stop, sampling, should_stop, on_token)
-            {
+            match self.generate_qwen35_metal(prompt, max_new, stop, sampling, on_token) {
                 Ok(tokens) => return Ok(tokens),
                 Err(err) => {
                     eprintln!("[qwen35] resident Metal lane failed ({err}); using hybrid fallback");
@@ -3005,44 +2973,40 @@ impl RunnableModel {
         }
         #[cfg(feature = "cuda")]
         {
-            // SINGLE SOURCE OF TRUTH with the disclosed execution plan. This lane used
-            // to read `CAMELID_QWEN35_CUDA` itself and default ON only for Prism low-bit
-            // rows on Windows, so a certified Ornith K-quant row (qwen35 Q4_K_M) served
-            // out of the box reported `cuda_resident_kquant_runtime` from
-            // `select_kquant_plan` while decoding here on the CPU — measured 0.42 tok/s
-            // against 6.1 tok/s on the very same row and host. That is the gemma4 Phase 0
-            // defect: the plan and the lane consulted different things. `--gpu off` and
-            // the UI toggle stay authoritative because the policy requires
-            // `gpu_accel_enabled()`; `CAMELID_QWEN35_CUDA=0` still forces the CPU oracle.
-            let cuda_enabled = crate::execution_plan::qwen35_cuda_lane_selectable();
+            let cuda_requested = match std::env::var("CAMELID_QWEN35_CUDA") {
+                Ok(value) => matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "1" | "true" | "on" | "yes"
+                ),
+                // Prism's Windows port is the packed resident CUDA graph. Keep
+                // Ornith's established opt-in policy, while selecting CUDA by
+                // default for Prism rows on Windows; CAMELID_QWEN35_CUDA=0 is
+                // still an explicit CPU fallback/debug override.
+                Err(_) => cfg!(windows) && self.output.is_prism_low_bit(),
+            };
+            // `--gpu off` (and the UI's live toggle) is the AUTHORITATIVE master switch:
+            // it is documented as "Force the CPU reference path; never use the GPU even
+            // if one is present". Nothing in this lane consulted it, so on Windows --
+            // where the default above is ON for every Prism row -- `--gpu off` could not
+            // select the CPU lane at all for the qwen35 Bonsai rows; they kept building
+            // the resident CUDA graph. `CAMELID_QWEN35_CUDA=1` is an opt-IN to this lane,
+            // not an override of the master switch. `gpu_accel_enabled()` lazily seeds
+            // from platform capability, so the default (auto) path is unchanged.
+            let cuda_enabled = cuda_requested && crate::cuda::gpu_accel_enabled();
             if cuda_enabled {
                 return qwen35_cuda_with_cpu_fallback(
                     on_token,
                     stream_tokens_observable,
                     |tracked_on_token| {
-                        self.generate_qwen35_cuda(
-                            prompt,
-                            max_new,
-                            stop,
-                            sampling,
-                            should_stop,
-                            tracked_on_token,
-                        )
+                        self.generate_qwen35_cuda(prompt, max_new, stop, sampling, tracked_on_token)
                     },
                     |fallback_on_token| {
-                        self.generate_qwen35_cpu(
-                            prompt,
-                            max_new,
-                            stop,
-                            sampling,
-                            should_stop,
-                            fallback_on_token,
-                        )
+                        self.generate_qwen35_cpu(prompt, max_new, stop, sampling, fallback_on_token)
                     },
                 );
             }
         }
-        self.generate_qwen35_cpu(prompt, max_new, stop, sampling, should_stop, on_token)
+        self.generate_qwen35_cpu(prompt, max_new, stop, sampling, on_token)
     }
 
     #[cfg(target_os = "macos")]
@@ -3052,7 +3016,6 @@ impl RunnableModel {
         max_new: usize,
         stop: &[u32],
         sampling: Option<&SamplingConfig>,
-        should_stop: &dyn Fn(&[u32]) -> bool,
         on_token: &mut dyn FnMut(u32),
     ) -> Result<Vec<u32>> {
         let max_positions = qwen35_metal_context_capacity();
@@ -3121,13 +3084,6 @@ impl RunnableModel {
             generated.push(next);
             token_history.push(next);
             on_token(next);
-            // A requested stop STRING is decided over the decoded text, so it can only
-            // be judged after the token is retained — matching the dense lane, which
-            // keeps the stop-triggering token in the ids and usage and truncates only
-            // the text. Inert unless the caller asked for stop sequences.
-            if should_stop(&generated) {
-                break;
-            }
             if qwen35_repetition_loop(&generated) {
                 break;
             }
@@ -3274,7 +3230,6 @@ impl RunnableModel {
         max_new: usize,
         stop: &[u32],
         sampling: Option<&SamplingConfig>,
-        should_stop: &dyn Fn(&[u32]) -> bool,
         on_token: &mut dyn FnMut(u32),
     ) -> Result<Vec<u32>> {
         let max_positions = lfm2_metal_context_capacity();
@@ -3378,13 +3333,6 @@ impl RunnableModel {
             out.push(next);
             token_history.push(next);
             on_token(next);
-            // A requested stop STRING is decided over the decoded text, so it can only
-            // be judged after the token is retained — matching the dense lane, which
-            // keeps the stop-triggering token in the ids and usage and truncates only
-            // the text. Inert unless the caller asked for stop sequences.
-            if should_stop(&out) {
-                break;
-            }
             if i + 1 < max_new {
                 let (tok, logits) = step(engine, next, pos, want_logits)?;
                 pos += 1;
@@ -3412,7 +3360,6 @@ impl RunnableModel {
         max_new: usize,
         stop: &[u32],
         sampling: Option<&SamplingConfig>,
-        should_stop: &dyn Fn(&[u32]) -> bool,
         on_token: &mut dyn FnMut(u32),
     ) -> Result<Vec<u32>> {
         let runtime = self
@@ -3544,13 +3491,6 @@ impl RunnableModel {
             generated.push(next);
             token_history.push(next);
             on_token(next);
-            // A requested stop STRING is decided over the decoded text, so it can only
-            // be judged after the token is retained — matching the dense lane, which
-            // keeps the stop-triggering token in the ids and usage and truncates only
-            // the text. Inert unless the caller asked for stop sequences.
-            if should_stop(&generated) {
-                break;
-            }
             if qwen35_repetition_loop(&generated) {
                 break;
             }
@@ -3599,7 +3539,6 @@ impl RunnableModel {
         max_new: usize,
         stop: &[u32],
         sampling: Option<&SamplingConfig>,
-        should_stop: &dyn Fn(&[u32]) -> bool,
         on_token: &mut dyn FnMut(u32),
     ) -> Result<Vec<u32>> {
         let runtime = self
@@ -3775,13 +3714,6 @@ impl RunnableModel {
             generated.push(next);
             token_history.push(next);
             on_token(next);
-            // A requested stop STRING is decided over the decoded text, so it can only
-            // be judged after the token is retained — matching the dense lane, which
-            // keeps the stop-triggering token in the ids and usage and truncates only
-            // the text. Inert unless the caller asked for stop sequences.
-            if should_stop(&generated) {
-                return Ok(generated);
-            }
             if generated.len() >= max_new || qwen35_repetition_loop(&generated) {
                 return Ok(generated);
             }
@@ -3814,13 +3746,6 @@ impl RunnableModel {
                     generated.push(id);
                     token_history.push(id);
                     on_token(id);
-                    // Same placement as the per-token loops: judged after the token is
-                    // retained. Without this the predicate is evaluated only once,
-                    // before the chunk loop, and a stop string is honored for the first
-                    // generated token and then never again on this lane.
-                    if should_stop(&generated) {
-                        break 'device;
-                    }
                     if generated.len() >= max_new || qwen35_repetition_loop(&generated) {
                         break 'device;
                     }
@@ -3839,13 +3764,6 @@ impl RunnableModel {
             generated.push(next);
             token_history.push(next);
             on_token(next);
-            // A requested stop STRING is decided over the decoded text, so it can only
-            // be judged after the token is retained — matching the dense lane, which
-            // keeps the stop-triggering token in the ids and usage and truncates only
-            // the text. Inert unless the caller asked for stop sequences.
-            if should_stop(&generated) {
-                break;
-            }
             if qwen35_repetition_loop(&generated) {
                 break;
             }
@@ -3883,7 +3801,6 @@ impl RunnableModel {
         max_new: usize,
         stop: &[u32],
         sampling: Option<&SamplingConfig>,
-        should_stop: &dyn Fn(&[u32]) -> bool,
         on_token: &mut dyn FnMut(u32),
     ) -> Result<Vec<u32>> {
         // Batched prefill of the whole prompt (weights read once per layer), then
@@ -3906,13 +3823,6 @@ impl RunnableModel {
             out.push(next);
             token_history.push(next);
             on_token(next);
-            // A requested stop STRING is decided over the decoded text, so it can only
-            // be judged after the token is retained — matching the dense lane, which
-            // keeps the stop-triggering token in the ids and usage and truncates only
-            // the text. Inert unless the caller asked for stop sequences.
-            if should_stop(&out) {
-                break;
-            }
             if qwen35_repetition_loop(&out) {
                 break;
             }
@@ -3938,7 +3848,6 @@ impl RunnableModel {
         max_new: usize,
         stop: &[u32],
         sampling: Option<&SamplingConfig>,
-        should_stop: &dyn Fn(&[u32]) -> bool,
         on_token: &mut dyn FnMut(u32),
     ) -> Result<Vec<u32>> {
         // Sparse KV: only the 8 full-attention layers keep a real KV buffer (the 24 SSM
@@ -4095,13 +4004,6 @@ impl RunnableModel {
             out.push(next);
             token_history.push(next);
             on_token(next);
-            // A requested stop STRING is decided over the decoded text, so it can only
-            // be judged after the token is retained — matching the dense lane, which
-            // keeps the stop-triggering token in the ids and usage and truncates only
-            // the text. Inert unless the caller asked for stop sequences.
-            if should_stop(&out) {
-                break;
-            }
             if qwen35_repetition_loop(&out) {
                 break;
             }
@@ -4145,15 +4047,7 @@ impl RunnableModel {
             return Err(BackendError::InvalidTensorData("empty prompt".into()));
         }
         if self.qwen35.is_some() {
-            return self.generate_qwen35_streaming(
-                prompt,
-                max_new,
-                stop,
-                None,
-                false,
-                &|_| false,
-                &mut |_| {},
-            );
+            return self.generate_qwen35_streaming(prompt, max_new, stop, None, false, &mut |_| {});
         }
         self.generate_stopping_streaming(prompt, max_new, stop, &mut |_| {})
     }
@@ -4168,7 +4062,6 @@ impl RunnableModel {
         max_new: usize,
         stop: &[u32],
         sampling: &SamplingConfig,
-        should_stop: &dyn Fn(&[u32]) -> bool,
     ) -> Result<Vec<u32>> {
         if prompt.is_empty() {
             return Err(BackendError::InvalidTensorData("empty prompt".into()));
@@ -4181,7 +4074,6 @@ impl RunnableModel {
                 stop,
                 sampling,
                 false,
-                should_stop,
                 &mut |_| {},
             );
         }
@@ -4191,7 +4083,6 @@ impl RunnableModel {
             stop,
             sampling,
             &|| false,
-            should_stop,
             &mut |_| {},
         )
     }
@@ -4207,14 +4098,7 @@ impl RunnableModel {
         stop: &[u32],
         on_token: &mut dyn FnMut(u32),
     ) -> Result<Vec<u32>> {
-        self.generate_stopping_streaming_cancelled(
-            prompt,
-            max_new,
-            stop,
-            &|| false,
-            &|_| false,
-            on_token,
-        )
+        self.generate_stopping_streaming_cancelled(prompt, max_new, stop, &|| false, on_token)
     }
 
     /// Greedy streaming with cooperative cancellation. The predicate is checked
@@ -4226,7 +4110,6 @@ impl RunnableModel {
         max_new: usize,
         stop: &[u32],
         is_cancelled: &dyn Fn() -> bool,
-        should_stop: &dyn Fn(&[u32]) -> bool,
         on_token: &mut dyn FnMut(u32),
     ) -> Result<Vec<u32>> {
         let greedy = SamplingConfig::default();
@@ -4236,7 +4119,6 @@ impl RunnableModel {
             stop,
             &greedy,
             is_cancelled,
-            should_stop,
             on_token,
         )
     }
@@ -4258,7 +4140,6 @@ impl RunnableModel {
             stop,
             sampling,
             &|| false,
-            &|_| false,
             on_token,
         )
     }
@@ -4266,7 +4147,6 @@ impl RunnableModel {
     /// Sampling-capable runnable generation with cooperative cancellation. Unlike
     /// the previous generic bridge, BitNet now honors non-greedy sampling instead
     /// of silently ignoring the OpenAI request parameters.
-    #[allow(clippy::too_many_arguments)]
     pub fn generate_stopping_streaming_with_sampling_cancelled(
         &self,
         prompt: &[u32],
@@ -4274,7 +4154,6 @@ impl RunnableModel {
         stop: &[u32],
         sampling: &SamplingConfig,
         is_cancelled: &dyn Fn() -> bool,
-        should_stop: &dyn Fn(&[u32]) -> bool,
         on_token: &mut dyn FnMut(u32),
     ) -> Result<Vec<u32>> {
         if prompt.is_empty() {
@@ -4287,27 +4166,12 @@ impl RunnableModel {
         }
         if self.qwen35.is_some() {
             let sampling = qwen35_sampling_requires_logits(sampling).then_some(sampling);
-            return self.generate_qwen35_streaming(
-                prompt,
-                max_new,
-                stop,
-                sampling,
-                true,
-                should_stop,
-                on_token,
-            );
+            return self.generate_qwen35_streaming(prompt, max_new, stop, sampling, true, on_token);
         }
         #[cfg(target_os = "macos")]
         if self.lfm2.is_some() && lfm2_metal_enabled() {
             let sampling = qwen35_sampling_requires_logits(sampling).then_some(sampling);
-            return self.generate_lfm2_metal(
-                prompt,
-                max_new,
-                stop,
-                sampling,
-                should_stop,
-                on_token,
-            );
+            return self.generate_lfm2_metal(prompt, max_new, stop, sampling, on_token);
         }
 
         let mut cache = self.new_cache();
@@ -4336,13 +4200,6 @@ impl RunnableModel {
             out.push(next);
             token_history.push(next);
             on_token(next);
-            // A requested stop STRING is decided over the decoded text, so it can only
-            // be judged after the token is retained — matching the dense lane, which
-            // keeps the stop-triggering token in the ids and usage and truncates only
-            // the text. Inert unless the caller asked for stop sequences.
-            if should_stop(&out) {
-                break;
-            }
             // The generic path serves architectures beyond Qwen 3.5 (including
             // BitNet).  Qwen's defensive repetition heuristic is model-specific
             // and can terminate perfectly valid repeated text from those models.
@@ -6691,14 +6548,14 @@ mod gpu_ssm_layer_tests {
         let prompt: Vec<u32> = vec![3710, 369, 279, 6511, 314, 9338, 30];
         let n = 8usize;
         let cpu = model
-            .generate_qwen35_cpu(&prompt, n, &[], None, &|_| false, &mut |_| {})
+            .generate_qwen35_cpu(&prompt, n, &[], None, &mut |_| {})
             .expect("cpu gen");
         let gpu = model
-            .generate_qwen35_cuda(&prompt, n, &[], None, &|_| false, &mut |_| {})
+            .generate_qwen35_cuda(&prompt, n, &[], None, &mut |_| {})
             .expect("gpu gen");
         // run-twice reuses the cached engine -> validates reset_qwen35_state.
         let gpu2 = model
-            .generate_qwen35_cuda(&prompt, n, &[], None, &|_| false, &mut |_| {})
+            .generate_qwen35_cuda(&prompt, n, &[], None, &mut |_| {})
             .expect("gpu gen 2");
         eprintln!("cpu ={cpu:?}");
         eprintln!("gpu ={gpu:?}");
@@ -6712,7 +6569,7 @@ mod gpu_ssm_layer_tests {
         if let Ok(gguf) = read_metadata(&path) {
             if let Ok(tok) = crate::tokenizer::Tokenizer::from_gguf(&gguf) {
                 let ids16 = model
-                    .generate_qwen35_cuda(&prompt, 16, &[], None, &|_| false, &mut |_| {})
+                    .generate_qwen35_cuda(&prompt, 16, &[], None, &mut |_| {})
                     .expect("gpu 16-tok");
                 let text = tok.decode(&ids16, true).unwrap_or_default();
                 eprintln!("qwen35 GPU 16-tok decode: {text}");
@@ -6740,15 +6597,15 @@ mod gpu_ssm_layer_tests {
         let secs = |gpu: bool, n: usize| -> f64 {
             let t = std::time::Instant::now();
             let r = if gpu {
-                model.generate_qwen35_cuda(&prompt, n, &[], None, &|_| false, &mut |_| {})
+                model.generate_qwen35_cuda(&prompt, n, &[], None, &mut |_| {})
             } else {
-                model.generate_qwen35_cpu(&prompt, n, &[], None, &|_| false, &mut |_| {})
+                model.generate_qwen35_cpu(&prompt, n, &[], None, &mut |_| {})
             };
             r.expect("generate");
             t.elapsed().as_secs_f64()
         };
         // GPU: warm (lazy-build + 5.24 GB upload), then two timed runs.
-        let _ = model.generate_qwen35_cuda(&prompt, 4, &[], None, &|_| false, &mut |_| {});
+        let _ = model.generate_qwen35_cuda(&prompt, 4, &[], None, &mut |_| {});
         let g_lo = secs(true, n_lo);
         let g_hi = secs(true, n_hi);
         let gpu_tokps = (n_hi - n_lo) as f64 / (g_hi - g_lo);
