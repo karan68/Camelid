@@ -111,6 +111,7 @@ impl ServerMetrics {
         self.record_cuda_true_batch(2, shared_projection_launches, duration_micros);
     }
 
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     pub(crate) fn record_cuda_true_batch(
         &self,
         batch_size: usize,
@@ -156,6 +157,7 @@ impl ServerMetrics {
             .fetch_add(saturating_u128_to_u64(duration_micros), Ordering::Relaxed);
     }
 
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     pub(crate) fn record_cuda_true_batch2_preflight_fallback(&self) {
         self.record_cuda_true_batch_preflight_fallback();
         self.inner
@@ -163,12 +165,14 @@ impl ServerMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     pub(crate) fn record_cuda_true_batch_preflight_fallback(&self) {
         self.inner
             .cuda_true_batch_preflight_fallbacks
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     pub(crate) fn record_cuda_batched_prefill(
         &self,
         batch_size: usize,
