@@ -9,6 +9,9 @@ import { apiSurfaceAllowsTab, isLanChatOnly } from '../lib/apiSurface.js'
 
 const VIEW_LABELS = [
   ['chat', 'Chat'],
+  ['projects', 'Projects'],
+  ['changes', 'Changes'],
+  ['connections', 'Connections'],
   ['workspace', 'Workspace'],
   ['arena', 'Model Arena'],
   ['library', 'Models'],

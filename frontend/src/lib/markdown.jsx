@@ -3,21 +3,15 @@ import { Fragment, createContext, memo, useContext, useEffect, useLayoutEffect, 
 import { copyText } from './clipboard.js'
 import { displayMathOnlyLine, splitMathSegments } from './mathSegments.js'
 import { MathSpan } from '../components/chat/render/MathSpan.jsx'
+import { OutputActions } from '../components/outputs/OutputActions.jsx'
 import { MermaidDiagram } from '../components/chat/render/MermaidDiagram.jsx'
 
 /* Assistant markdown + fenced-code rendering.
    Extracted verbatim from the original ChatWorkspace so the parsing/rendering
    behavior (and the markup the CI smokes assert on) is preserved exactly. */
 
-export const normalizeCodeLanguage = (value) => {
-  const language = String(value || '').trim().replace(/[^a-zA-Z0-9_+#.-].*$/, '')
-  if (!language) return 'Code'
-  if (language.toLowerCase() === 'js') return 'JavaScript'
-  if (language.toLowerCase() === 'ts') return 'TypeScript'
-  if (language.toLowerCase() === 'html') return 'HTML'
-  if (language.toLowerCase() === 'css') return 'CSS'
-  return language.toUpperCase()
-}
+export { normalizeCodeLanguage } from './codeFences.js'
+import { codeFences } from './codeFences.js'
 
 /* Returns whether the text actually reached the clipboard. `navigator.clipboard`
    is undefined outside secure contexts — which includes reaching a Camelid served
@@ -419,19 +413,9 @@ const renderHighlightedCode = (code, language, keyPrefix) => {
   return nodes
 }
 
-const splitFenceInfo = (value) => {
-  const trimmed = String(value || '').trim()
-  if (!trimmed) return { language: 'Code', firstCodeLine: '' }
-  const [, rawLanguage = '', firstCodeLine = ''] = trimmed.match(/^([a-zA-Z0-9_+#.-]+)?\s*([\s\S]*)$/) || []
-  return {
-    language: normalizeCodeLanguage(rawLanguage),
-    firstCodeLine: firstCodeLine.trimStart(),
-  }
-}
-
 export const CODE_CARD_STREAMING_LABEL = 'Still generating — code block incomplete'
 
-export function CodeBlockCard({ language, code, keyPrefix, stillGenerating }) {
+export function CodeBlockCard({ language, code, sourceCode = code, keyPrefix, stillGenerating }) {
   const preRef = useRef(null)
   const autoFollowCodeRef = useRef(true)
   const [copied, setCopied] = useState(false)
@@ -477,6 +461,7 @@ export function CodeBlockCard({ language, code, keyPrefix, stillGenerating }) {
       <figcaption>
         <span className="message-code-card-title">{language}</span>
         {stillGenerating && <span className="message-code-card-status" aria-live="polite" data-live-status="active">{CODE_CARD_STREAMING_LABEL}</span>}
+        <OutputActions code={sourceCode} language={language} disabled={stillGenerating} />
         <button type="button" onClick={handleCopy} aria-label={`Copy ${language} code`}>{copied ? 'Copied' : 'Copy'}</button>
       </figcaption>
       {/* Highlighting deferred while the fence is open (Phase 8B): plain text
@@ -497,6 +482,7 @@ const pushCodeBlock = (blocks, language, code, keyPrefix, { incomplete = false, 
       key={`code-${blocks.length}`}
       language={language}
       code={trimmedCode}
+      sourceCode={code}
       keyPrefix={keyPrefix}
       stillGenerating={stillGenerating}
     />
@@ -541,23 +527,10 @@ function splitStableBoundary(content) {
 function renderFencedContent(normalized, streaming) {
   const blocks = []
   let cursor = 0
-  let fenceStart = normalized.indexOf('```', cursor)
-  while (fenceStart !== -1) {
-    const before = normalized.slice(cursor, fenceStart)
-    blocks.push(...renderMarkdownText(before, `md-${blocks.length}`))
-    const infoStart = fenceStart + 3
-    const nextLine = normalized.indexOf('\n', infoStart)
-    const infoEnd = nextLine === -1 ? normalized.length : nextLine
-    const { language, firstCodeLine } = splitFenceInfo(normalized.slice(infoStart, infoEnd))
-    const codeStart = nextLine === -1 ? infoEnd : nextLine + 1
-    const fenceEnd = normalized.indexOf('```', codeStart)
-    const incompleteFence = fenceEnd === -1
-    const codeEnd = fenceEnd === -1 ? normalized.length : fenceEnd
-    const codeBody = normalized.slice(codeStart, codeEnd)
-    const code = firstCodeLine ? `${firstCodeLine}${codeBody ? `\n${codeBody}` : ''}` : codeBody
-    pushCodeBlock(blocks, language, code, `code-${blocks.length}`, { incomplete: incompleteFence, streaming })
-    cursor = fenceEnd === -1 ? normalized.length : fenceEnd + 3
-    fenceStart = normalized.indexOf('```', cursor)
+  for (const fence of codeFences(normalized)) {
+    blocks.push(...renderMarkdownText(normalized.slice(cursor, fence.start), `md-${blocks.length}`))
+    pushCodeBlock(blocks, fence.language, fence.code, `code-${blocks.length}`, { incomplete: fence.incomplete, streaming })
+    cursor = fence.end
   }
   blocks.push(...renderMarkdownText(normalized.slice(cursor), `md-${blocks.length}`))
   return blocks

@@ -317,7 +317,7 @@ function UserTurn({ message, messageContent, onEditResend }) {
   )
 }
 
-export const MessageTurn = memo(function MessageTurn({ message, generationElapsedSeconds, priorUserPrompt, onReusePrompt, onRegenerate, onEditResend, onContinue, onSelectVariant, onDiscardVariant, regenerateReplacesThread = false, tokenInspection = null, structuredRecord = null, toolCallRepeat = null }) {
+export const MessageTurn = memo(function MessageTurn({ hideManagedToolCalls = false, message, generationElapsedSeconds, priorUserPrompt, onReusePrompt, onRegenerate, onEditResend, onContinue, onSelectVariant, onDiscardVariant, regenerateReplacesThread = false, tokenInspection = null, structuredRecord = null, toolCallRepeat = null }) {
   const [copied, setCopied] = useState(false)
   const copiedResetRef = useRef(null)
   const messageContent = cleanLegacyDemoCapCopy(message.content)
@@ -328,7 +328,7 @@ export const MessageTurn = memo(function MessageTurn({ message, generationElapse
   const liveStatusLabel = streamingStatusLabel(streamingPhase, generationElapsedSeconds, isOpenStreamingCode)
   const showStreamingStatus = assistantStreaming && !messageContent
   const showLiveGenerationBadge = assistantStreaming && Boolean(messageContent)
-  const noVisibleResponse = message.role === 'assistant' && !assistantStreaming && !String(messageContent || '').trim()
+  const noVisibleResponse = message.role === 'assistant' && !message.tool_calls?.length && !assistantStreaming && !String(messageContent || '').trim()
   const hiddenTokenLimit = noVisibleResponse
     && message.finish_reason === 'length'
     && Number(message.usage?.completion_tokens || 0) > 0
@@ -492,8 +492,8 @@ export const MessageTurn = memo(function MessageTurn({ message, generationElapse
             absence={tokenInspection.absence}
           />
         )}
-        {message.role === 'assistant' && !assistantStreaming && message.tool_calls && (
-          <ToolCallsCard toolCalls={message.tool_calls} repeated={toolCallRepeat} replyContent={messageContent} />
+        {message.role === 'assistant' && !assistantStreaming && !hideManagedToolCalls && message.tool_calls && (
+          <ToolCallsCard managed={message.mcp_managed} toolCalls={message.tool_calls} repeated={toolCallRepeat} replyContent={messageContent} />
         )}
         <DeveloperDiagnosticsBlock message={message} />
       </div>

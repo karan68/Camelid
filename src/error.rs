@@ -52,6 +52,11 @@ pub enum BackendError {
         budget_bytes: u64,
     },
 
+    /// A resident batch row asked for a position past the engine's capacity. Raised by a
+    /// bounds check before any KV page is written, so the caller may retry the row.
+    #[error("resident position {position} exceeds the engine capacity of {capacity}")]
+    ResidentPositionOutOfRange { position: usize, capacity: usize },
+
     #[error("invalid model metadata: {0}")]
     InvalidModelMetadata(String),
 

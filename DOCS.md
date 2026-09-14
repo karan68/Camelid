@@ -16,6 +16,9 @@ Read these first:
 
 - [`README.md`](README.md) — product overview, quick start, and starter models
 - [`docs/MODELS.md`](docs/MODELS.md) — full download catalog, model setup, and validation details
+- [`docs/MCP.md`](docs/MCP.md) — connected tool servers, approvals, and automatic chat continuation (preview)
+- [Project and conversation context](docs/PROJECT_CONTEXT.md) — shared instructions, reference files, and per-chat inheritance.
+- [Output previews and file review](docs/OUTPUTS_AND_CHANGES.md) — downloads, approved local file changes, and undo.
 - [`docs/REMOTE_CHAT.md`](docs/REMOTE_CHAT.md) — browser chat over a private LAN or Tailscale
 - [`COMPATIBILITY.md`](COMPATIBILITY.md) — authoritative support ledger and at-a-glance release contract
 - [`STATUS.md`](./docs/reference/STATUS.md) — current milestone/evidence snapshot and exact blockers
@@ -32,6 +35,7 @@ Read these first:
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — contribution and validation guidance
 - [`docs/CONTRIBUTOR_QUICKSTART.md`](docs/CONTRIBUTOR_QUICKSTART.md) — shortest safe local contributor path
 - [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md) — current toolchain, env-var, and path guidance
+- [`docs/CUDA_CONTINUOUS_BATCHING.md`](docs/CUDA_CONTINUOUS_BATCHING.md) — explicit-opt-in CUDA sequence batching, two-model residency, observability, and rollback
 - [`docs/VALIDATION_MATRIX.md`](docs/VALIDATION_MATRIX.md) — expected checks by change class
 - [`SECURITY.md`](SECURITY.md) — security reporting guidance
 - [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) — acknowledgements and license notices

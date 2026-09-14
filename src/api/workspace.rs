@@ -1604,15 +1604,24 @@ pub(super) async fn session_status(
         .lock()
         .map(|state| state.as_str())
         .unwrap_or("error");
+    let resident_cuda = state
+        .loaded_models
+        .read()
+        .await
+        .get(&session.model_id)
+        .and_then(|model| {
+            crate::inference::resident_cuda_status(super::model_resident_cache_key(
+                &model.id,
+                &model.lane.gguf_sha256,
+            ))
+        });
     Json(WorkspaceSessionStatusResponse {
         id: session.id.clone(),
         workspace: simplify_path(&session.workspace),
         model_id: session.model_id.clone(),
         state: status,
         context_budget_tokens: session.context_budget_tokens,
-        resident_cuda: crate::inference::resident_cuda_status(super::model_resident_cache_key(
-            &session.model_id,
-        )),
+        resident_cuda,
         allow_writes: session.allow_writes,
         semantic_retrieval: session.semantic_retriever.is_some(),
         embedding_model_id: session
@@ -1936,7 +1945,7 @@ fn workspace_request_allowed(headers: &HeaderMap, cli_token: Option<&str>) -> bo
     matches!((cli_token, provided), (Some(expected), Some(provided)) if crate::workspace_auth::token_matches(expected, provided))
 }
 
-fn local_management_request_allowed(headers: &HeaderMap) -> bool {
+pub(super) fn local_management_request_allowed(headers: &HeaderMap) -> bool {
     let authority = headers
         .get("host")
         .and_then(|value| value.to_str().ok())

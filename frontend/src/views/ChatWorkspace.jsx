@@ -1,3 +1,12 @@
+import { ToolActivityCard } from '../components/mcp/ToolActivityCard'
+import { toolActivityGroups } from '../lib/toolActivity.js'
+import { ComposerMenu } from '../components/chat/ComposerMenu'
+import { ConversationContext } from '../components/context/ContextEditors'
+import { contextSourceMessages, chatHistoryForRequest } from '../lib/projectContext.js'
+import { ConversationFiles } from '../components/outputs/ConversationFiles'
+import { conversationFiles } from '../lib/conversationFiles.js'
+import { OutputPanelContext, OutputMessageContext, ToolOutputGallery } from '../components/outputs/OutputActions.jsx'
+import { ConnectedTools, McpRunPanel } from '../components/mcp/ConnectedTools'
 import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { getChatGateState } from '../lib/chatGate'
 import { getRuntimeRequestModelId } from '../lib/modelState'
@@ -28,7 +37,7 @@ import {
   setCompactionOverride,
 } from '../lib/conversationCompaction.js'
 import { PREPARING_STREAMING_LABEL, StreamingLoader } from '../components/chat/render/StreamingIndicator'
-import { classifyWebResearchNeed } from '../lib/webResearch.js'
+import { classifyWebResearchNeed, estimateWebResearchChatTokens } from '../lib/webResearch.js'
 import {
   ATTACHED_DOCUMENTS_STORAGE_KEY,
   normalizeAttachedDocuments,
@@ -133,6 +142,11 @@ async function prepareVisionAttachment(file) {
   const image = await loadBrowserImage(file)
   let blob = file
   let type = file.type
+  // Track the dimensions alongside the bytes: the resize branch below replaces
+  // the blob, and reporting the source dimensions for the resized bytes would
+  // describe an image that was never sent.
+  let width = image.naturalWidth
+  let height = image.naturalHeight
   if (file.size > MAX_VISION_UPLOAD_BYTES || Math.max(image.naturalWidth, image.naturalHeight) > MAX_VISION_EDGE) {
     const scale = Math.min(1, MAX_VISION_EDGE / Math.max(image.naturalWidth, image.naturalHeight))
     const canvas = document.createElement('canvas')
@@ -146,6 +160,10 @@ async function prepareVisionAttachment(file) {
     if (blob?.size > MAX_VISION_UPLOAD_BYTES) blob = await canvasBlob(canvas, 0.72)
     if (!blob) throw new Error('Could not prepare the selected image.')
     type = 'image/jpeg'
+    // Both canvasBlob calls encode this same canvas, so these describe the
+    // bytes actually sent under the 0.9 and the 0.72 retry path alike.
+    width = canvas.width
+    height = canvas.height
   }
   if (blob.size > MAX_VISION_UPLOAD_BYTES) {
     throw new Error('The prepared image is still too large. Choose an image under 3 MB.')
@@ -154,13 +172,15 @@ async function prepareVisionAttachment(file) {
     name: file.name,
     type,
     size: blob.size,
-    width: image.naturalWidth,
-    height: image.naturalHeight,
+    width,
+    height,
     data_url: await readAsDataUrl(blob),
   }
 }
 
 export default function ChatWorkspace({
+  projects = [], chatContext = {}, updateChatContext = null, contextSources = [], globalPrompt, updateGlobalPrompt,
+  mcp = null, mcpSelectedKeys = [], replaceMcpTools = null, mcpActivity = null, mcpApproval = null, decideMcpApproval = null,
   selectedConversation,
   selectedModel,
   selectedModelId,
@@ -229,6 +249,17 @@ export default function ChatWorkspace({
   const nonSupportedChatReady = !supportedChatReady && (selectedModelExperimental || verifiedChatReady || varianceChatReady || unverifiedChatReady)
   const visionReady = canChat && Boolean(runtime?.vision_ready)
   const [generationElapsedSeconds, setGenerationElapsedSeconds] = useState(0)
+  const [filesOpen, setFilesOpen] = useState(false)
+  const [selectedFileId, setSelectedFileId] = useState(null)
+  const files = useMemo(() => conversationFiles(selectedConversation?.messages), [selectedConversation?.messages])
+  useEffect(() => { setFilesOpen(false); setSelectedFileId(null) }, [selectedConversation?.id])
+  const openOutput = (output, messageId) => {
+    const found = files.find(file => file.messageId === messageId && file.mime === output.mime && file.name === output.name && file.text === output.text)
+    if (!found) return false
+    setSelectedFileId(found.id)
+    setFilesOpen(true)
+    return true
+  }
   const [showControls, setShowControls] = useState(false)
   const [showAllMessages, setShowAllMessages] = useState(false)
   const [userScrolledAway, setUserScrolledAway] = useState(false)
@@ -265,10 +296,12 @@ export default function ChatWorkspace({
   const hasStreamingAssistant = rawVisibleMessages.some((m) => m.role === 'assistant' && m.streaming)
   const hasStreamingAssistantContent = rawVisibleMessages.some((m) => m.role === 'assistant' && m.streaming && String(m.content || '').trim())
   const requestActive = Boolean(sending)
+  const connectedToolsAvailable = Boolean(mcp && !demoMode && runtime?.api_surface !== 'lan_chat_only')
   // Sending is process-global (only one local-model request may run), while
   // loaders, stop controls, and auto-follow belong only to the conversation
   // that owns the pending/streaming turn.
   const generationActive = Boolean(pendingConversation || hasStreamingAssistant)
+  const followActive = generationActive || Boolean(mcpActivity && mcpActivity.phase !== 'idle')
   const visibleMessages = useMemo(() => {
     if (!generationActive) return rawVisibleMessages
     return rawVisibleMessages.filter((message, index, messages) => {
@@ -514,7 +547,7 @@ export default function ChatWorkspace({
   }, [])
 
   useEffect(() => {
-    if (!generationActive) return undefined
+    if (!followActive) return undefined
     autoFollowGenerationRef.current = true
     setUserScrolledAway(false)
     /* Auto-follow is released by the user's GESTURE, not by how far they got.
@@ -550,15 +583,15 @@ export default function ChatWorkspace({
       el?.removeEventListener('touchmove', releaseOnUpwardIntent)
       el?.removeEventListener('keydown', releaseOnUpwardIntent)
     }
-  }, [generationActive, selectedConversation?.id])
+  }, [followActive, selectedConversation?.id])
 
   useLayoutEffect(() => {
-    if (!generationActive || !autoFollowGenerationRef.current) return undefined
+    if (!followActive || !autoFollowGenerationRef.current) return undefined
     const frame = window.requestAnimationFrame(() => {
       chatBottomRef.current?.scrollIntoView({ block: 'end', behavior: 'auto' })
     })
     return () => window.cancelAnimationFrame(frame)
-  }, [generationActive, streamingScrollSignature])
+  }, [followActive, streamingScrollSignature, mcpActivity?.phase, mcpApproval?.id])
 
   useLayoutEffect(() => {
     const resize = () => resizeComposerInput(composerRef.current)
@@ -748,12 +781,12 @@ export default function ChatWorkspace({
      clamps to the context's remaining room, so an overshoot is a non-blocking
      notice — only a prompt that fills the whole context is a hard error. Prompt
      size is a client estimate, labeled as such. */
-  const estimatedPromptTokens = useMemo(() => {
-    const history = visibleMessages.map((m) => String(m.content || '')).join(' ')
-    const text = `${history} ${composer}`
-    const pieces = text.match(/[\p{L}\p{N}_]+|[^\s\p{L}\p{N}_]/gu) || []
-    return Math.max(1, Math.round(Math.max(pieces.length, text.length / 4)))
-  }, [visibleMessages, composer])
+  const previewMessages = [...contextSourceMessages(contextSources), ...chatHistoryForRequest([
+    ...visibleMessages.filter(message => !message.streaming),
+    ...(composer.trim() ? [{ id: 'context-preview-draft', role: 'user', content: composer.trim(), ...(composerImage ? { image: composerImage } : {}) }] : []),
+  ])]
+  const estimatePrompt = messages => estimateWebResearchChatTokens(messages, { visionTokenAllowance: runtime?.vision_token_allowance })
+  const untrimmedPromptTokens = estimatePrompt(previewMessages)
   const configuredMaxTokens = getConfiguredMaxTokens(selectedModelId)
   const effectiveMaxTokens = applyGemma4GhostChatTokenCap(
     configuredMaxTokens,
@@ -761,6 +794,39 @@ export default function ChatWorkspace({
   )
   const ghostBudgetCapped = effectiveMaxTokens < configuredMaxTokens
   const activeContextLength = runtime?.active_context_length || modelContextLength(selectedModel)
+  /* The meter reads the same three numbers the budget check does, so the chip
+     and the notice under the composer can never disagree. The verified bound is
+     drawn as a marker rather than a limit: past it the row is still served, it
+     simply has no committed evidence pack. */
+  const verifiedBound = verifiedContextBound(capabilities, selectedModel)
+  const executionLane = runtime?.execution_plan?.selected_backend || ''
+
+  /* Compaction preview. The panel must describe what the NEXT send will do, so
+     it runs the same pure trim the send path runs, over the same preference
+     store -- there is no second copy of the rule to drift. */
+  const conversationId = selectedConversation?.id || ''
+  const [autoCompact, setAutoCompactState] = useState(() => getAutoCompactEnabled())
+  const [compactionOverride, setCompactionOverrideState] = useState(null)
+  useEffect(() => {
+    setCompactionOverrideState(getCompactionOverride(conversationId))
+  }, [conversationId])
+
+  const contextBudget = composeContextBudget({
+    contextLength: activeContextLength,
+    promptTokens: untrimmedPromptTokens,
+    reservedTokens: effectiveMaxTokens,
+    verifiedBound,
+    warnAtPercent: AUTO_COMPACT_THRESHOLD_PERCENT,
+  })
+  const compactionPreview = applySendCompaction(previewMessages, {
+    enabled: compactionOverride === 'off' ? false : autoCompact,
+    forced: compactionOverride === 'force',
+    filledPercent: contextBudget?.filledPercent ?? 0,
+  })
+  const estimatedPromptTokens = estimatePrompt(compactionPreview.messages)
+  const systemTokens = estimatePrompt(compactionPreview.messages.filter(message => message.role === 'system'))
+  const elidedTokenEstimate = Math.max(0, untrimmedPromptTokens - estimatedPromptTokens)
+
   const rawSendBudget = validateSendBudget({
     promptTokens: estimatedPromptTokens,
     maxTokens: effectiveMaxTokens,
@@ -782,44 +848,6 @@ export default function ChatWorkspace({
   const sendBudget = segmentedVideoComposerBypass && rawSendBudget.level === 'error'
     ? { ...rawSendBudget, level: 'ok', message: null }
     : rawSendBudget
-
-  /* The meter reads the same three numbers the budget check does, so the chip
-     and the notice under the composer can never disagree. The verified bound is
-     drawn as a marker rather than a limit: past it the row is still served, it
-     simply has no committed evidence pack. */
-  const verifiedBound = verifiedContextBound(capabilities, selectedModel)
-  const executionLane = runtime?.execution_plan?.selected_backend || ''
-
-  /* Compaction preview. The panel must describe what the NEXT send will do, so
-     it runs the same pure trim the send path runs, over the same preference
-     store -- there is no second copy of the rule to drift. */
-  const conversationId = selectedConversation?.id || ''
-  const [autoCompact, setAutoCompactState] = useState(() => getAutoCompactEnabled())
-  const [compactionOverride, setCompactionOverrideState] = useState(null)
-  useEffect(() => {
-    setCompactionOverrideState(getCompactionOverride(conversationId))
-  }, [conversationId])
-
-  const contextBudget = composeContextBudget({
-    contextLength: activeContextLength,
-    promptTokens: estimatedPromptTokens,
-    reservedTokens: effectiveMaxTokens,
-    verifiedBound,
-    warnAtPercent: AUTO_COMPACT_THRESHOLD_PERCENT,
-  })
-  const compactionPreview = applySendCompaction(visibleMessages, {
-    enabled: compactionOverride === 'off' ? false : autoCompact,
-    forced: compactionOverride === 'force',
-    filledPercent: contextBudget?.filledPercent ?? 0,
-  })
-  const elidedTokenEstimate = compactionPreview.compacted    ? visibleMessages
-      .filter((message) => !compactionPreview.messages.includes(message))
-      .reduce((sum, message) => {
-        const text = String(message?.content || '')
-        const pieces = text.match(/[\p{L}\p{N}_]+|[^\s\p{L}\p{N}_]/gu) || []
-        return sum + Math.round(Math.max(pieces.length, text.length / 4))
-      }, 0)
-    : 0
 
   const handleToggleAutoCompact = (next) => {
     setAutoCompactEnabled(next)
@@ -850,60 +878,23 @@ export default function ChatWorkspace({
     'Camelid runs the loaded model locally. Verify important output.',
   ].filter(Boolean).join(' ')
 
+  const renderConversationContext = compact => (updateChatContext && <ConversationContext compact={compact} key={selectedConversation?.id || 'draft'} context={chatContext} projects={projects} sources={contextSources} globalPrompt={globalPrompt || ''} onSave={updateChatContext} onManageProjects={() => setTab('projects')} busy={sending} />)
+
+  const toolActivity = useMemo(() => toolActivityGroups(visibleMessages), [visibleMessages])
+  const hasInlineActivity = Boolean(mcpActivity?.messageId && toolActivity.groups.has(mcpActivity.messageId))
+
   const renderComposer = () => (
     <div className={`cxcomposer is-${readinessState}`}>
+      {renderConversationContext(false)}
       {showControls && (
         <ChatControls
           capabilities={capabilities}
+          globalPrompt={globalPrompt} onGlobalPromptChange={updateGlobalPrompt} busy={sending}
           modelId={getRuntimeRequestModelId(selectedModel, runtime, selectedModelId)}
           onClose={() => setShowControls(false)}
         />
       )}
-      {structuredSupported && structuredMode !== 'off' && setStructuredMode && (
-        <div className="structout-editor">
-          <div className="structout-editor__modes" role="group" aria-label="Constraint form">
-            {[
-              ['json_schema', 'JSON schema'],
-              ['json_object', 'Any JSON'],
-              ['grammar', 'Grammar'],
-            ].map(([value, label]) => (
-              <button
-                key={value}
-                type="button"
-                className={`structout-editor__mode ${structuredMode === value ? 'is-on' : ''}`}
-                aria-pressed={structuredMode === value}
-                onClick={() => setStructuredMode(value)}
-              >
-                {label}
-              </button>
-            ))}
-          </div>
-          {structuredMode === 'json_schema' && (
-            <textarea
-              className="structout-editor__field"
-              aria-label="JSON schema"
-              spellCheck={false}
-              value={structuredSchema}
-              onChange={(event) => setStructuredSchema?.(event.target.value)}
-            />
-          )}
-          {structuredMode === 'grammar' && (
-            <textarea
-              className="structout-editor__field"
-              aria-label="Grammar"
-              spellCheck={false}
-              value={structuredGrammar}
-              onChange={(event) => setStructuredGrammar?.(event.target.value)}
-            />
-          )}
-          <p className={`structout-editor__status ${structuredReadiness.ready ? '' : 'is-invalid'}`}>
-            {structuredReadiness.ready
-              ? 'The next reply is constrained to this. Turn on Tokens as well to see whether the constraint actually diverted the decode.'
-              : structuredReadiness.reason}
-          </p>
-        </div>
-      )}
-      {toolCapability.capable && toolsEnabled && setToolsText && (
+      {!connectedToolsAvailable && toolCapability.capable && toolsEnabled && setToolsText && !mcpSelectedKeys.length && (
         <div className="tooldef">
           <textarea
             className="tooldef__field"
@@ -982,6 +973,15 @@ export default function ChatWorkspace({
           placeholder={composerPlaceholder}
           disabled={composerDisabled}
         />
+        <div className="cxcomposer__option-chips" aria-label="Active message options">
+          {[
+            [thinkingMode && !selectedBitNetChatModel, 'Thinking', () => setThinkingMode?.(false)],
+            [webResearchEnabled, 'Web auto', () => setWebResearchEnabled?.(false)],
+            [receiptMode, 'Receipt', () => setReceiptMode?.(false)],
+            [structuredSupported && structuredMode !== 'off', structuredMode === 'grammar' ? 'Grammar' : 'JSON output', () => setStructuredMode?.('off')],
+            [inspectionSupported && inspectMode, 'Token probabilities', () => setInspectMode?.(false)],
+          ].filter(([active]) => active).map(([, label, remove]) => <button key={label} type="button" disabled={requestActive} aria-label={'Remove ' + label} onClick={remove}>{label}<IconClose size={11} /></button>)}
+        </div>
         <div className="cxcomposer__toolbar">
           <div className="cxcomposer__tools">
             {models.length ? (
@@ -1025,6 +1025,13 @@ export default function ChatWorkspace({
             ) : (
               <button type="button" className="cxcomposer__tool" onClick={() => setTab('library')}>Add a model</button>
             )}
+            {connectedToolsAvailable && <ConnectedTools key={'mcp-' + (selectedConversation?.id || 'draft')} connections={mcp.connections} selectedKeys={mcpSelectedKeys}
+              onSelectionChange={replaceMcpTools} onManage={() => setTab('connections')} disabled={requestActive} capability={toolCapability}
+              connectionBusy={mcp.busy} error={mcp.error} onRetry={() => mcp.refresh()}
+              onConnect={id => mcp.mutate('/connections/' + id + '/connect', { method: 'POST' })}
+              manualEnabled={toolsEnabled} onManualEnabledChange={setToolsEnabled} manualText={toolsText} onManualTextChange={setToolsText}
+              manualReadiness={toolsReadiness} structuredMode={structuredMode} />}
+            {renderConversationContext(true)}
             {visionReady && (
               <>
                 <input
@@ -1035,16 +1042,6 @@ export default function ChatWorkspace({
                   onChange={handleVisionFile}
                   tabIndex={-1}
                 />
-                <button
-                  type="button"
-                  className={`cxcomposer__tool cxcomposer__tool--collapsible ${composerImage ? 'is-on' : ''}`}
-                  onClick={() => imageInputRef.current?.click()}
-                  disabled={requestActive}
-                  aria-label="Attach image"
-                  title="Attach one PNG or JPEG for the loaded Prism vision model"
-                >
-                  <IconImage size={16} /> <span className="cxcomposer__tool-label">{composerImage ? 'Image ready' : 'Image'}</span>
-                </button>
               </>
             )}
             <input
@@ -1059,19 +1056,61 @@ export default function ChatWorkspace({
               }}
               tabIndex={-1}
             />
+            <ComposerMenu label="Attach" description={visionReady ? "Attach one PNG or JPEG for the loaded Prism vision model, or add documents for retrieval" : "Attach documents for local retrieval"} icon={<IconFile size={16} />} disabled={requestActive}>
+              {close => <div className="composer-menu__attachments">
             <button
               type="button"
               className={`cxcomposer__tool cxcomposer__tool--collapsible ${attachedDocuments.length > 0 ? 'is-on' : ''}`}
-              onClick={() => docInputRef.current?.click()}
+              onClick={() => { close(); docInputRef.current?.click() }}
               disabled={requestActive || documentIngesting}
               aria-label="Attach documents for RAG"
               title="Drag & drop or attach .pdf, .docx, .md, .txt, .csv documents for local RAG"
             >
               <IconFile size={16} />{' '}
               <span className="cxcomposer__tool-label">
-                {documentIngesting ? 'Indexing…' : attachedDocuments.length > 0 ? `Docs (${attachedDocuments.length})` : 'Docs'}
+                {documentIngesting ? 'Indexing…' : attachedDocuments.length > 0 ? `Docs (${attachedDocuments.length})` : 'Documents'}
               </span>
             </button>
+                {visionReady && <>                <button
+                  type="button"
+                  className={`cxcomposer__tool cxcomposer__tool--collapsible ${composerImage ? 'is-on' : ''}`}
+                  onClick={() => { close(); imageInputRef.current?.click() }}
+                  disabled={requestActive}
+                  aria-label="Attach image"
+                  title="Attach one PNG or JPEG for the loaded Prism vision model"
+                >
+                  <IconImage size={16} /> <span className="cxcomposer__tool-label">{composerImage ? 'Image ready' : 'Image'}</span>
+                </button>
+</>}
+                <p>Documents: PDF, Word, Markdown, text, CSV or JSON. Images are available with a vision model.</p>
+              </div>}
+            </ComposerMenu>
+            {/* Guarded on BOTH halves of the gate: the engine must advertise the
+                protocol and the LOADED MODEL must carry a tool receipt. The second
+                half is STRICTER than the engine — POST /v1/chat/completions gates
+                on the chat template and never reads tool_capable — so the copy
+                says Camelid declines, not that the engine refuses. */}
+            {!connectedToolsAvailable && !demoMode && setToolsEnabled && (
+              <button
+                type="button"
+                className={`cxcomposer__tool cxcomposer__tool--collapsible ${toolsEnabled && toolCapability.capable ? 'is-on' : ''}`}
+                title={toolCapability.capable
+                  ? 'Offer tools to the model on the next turn'
+                  : toolCapability.reason || 'This model is not tool-capable.'}
+                aria-label={toolCapability.capable ? 'Tools' : 'Tools — unavailable for this model'}
+                aria-pressed={toolCapability.capable ? toolsEnabled : undefined}
+                disabled={!toolCapability.capable}
+                onClick={() => setToolsEnabled(!toolsEnabled)}
+              >
+                <IconBolt size={16} />
+                <span className="cxcomposer__tool-label">
+                  {!toolCapability.capable ? 'Tools unavailable' : toolsEnabled ? 'Tools on' : 'Tools'}
+                </span>
+              </button>
+            )}
+            {!demoMode && <ComposerMenu label="Options" icon={<IconBolt size={16} />}>
+              {close => <>
+                <div className="composer-menu__choices">
             {!demoMode && setWebResearchEnabled && (
               <button
                 type="button"
@@ -1097,6 +1136,7 @@ export default function ChatWorkspace({
                 title="Attach a verification receipt to the next reply"
                 aria-label="Verification receipt"
                 aria-pressed={receiptMode}
+                disabled={requestActive}
                 onClick={() => setReceiptMode(!receiptMode)}
               >
                 <IconReceipt size={16} /> <span className="cxcomposer__tool-label">{receiptMode ? 'Receipt on' : 'Receipt'}</span>
@@ -1116,7 +1156,7 @@ export default function ChatWorkspace({
                   : 'This engine does not advertise constrained decoding.'}
                 aria-label={structuredSupported ? 'Structured output' : 'Structured output — unavailable on this engine'}
                 aria-pressed={structuredSupported ? structuredMode !== 'off' : undefined}
-                disabled={!structuredSupported}
+                disabled={requestActive || !structuredSupported}
                 onClick={() => setStructuredMode(structuredMode === 'off' ? 'json_schema' : 'off')}
               >
                 <IconFile size={16} />
@@ -1143,35 +1183,12 @@ export default function ChatWorkspace({
                   : 'This engine does not advertise per-token probability reporting, so the next reply cannot record it.'}
                 aria-label={inspectionSupported ? 'Tokens — record per-token probabilities' : 'Tokens — unavailable on this engine'}
                 aria-pressed={inspectionSupported ? inspectMode : undefined}
-                disabled={!inspectionSupported}
+                disabled={requestActive || !inspectionSupported}
                 onClick={() => setInspectMode(!inspectMode)}
               >
                 <IconChart size={16} />
                 <span className="cxcomposer__tool-label">
                   {inspectionSupported ? (inspectMode ? 'Tokens on' : 'Tokens') : 'Tokens unavailable'}
-                </span>
-              </button>
-            )}
-            {/* Guarded on BOTH halves of the gate: the engine must advertise the
-                protocol and the LOADED MODEL must carry a tool receipt. The second
-                half is STRICTER than the engine — POST /v1/chat/completions gates
-                on the chat template and never reads tool_capable — so the copy
-                says Camelid declines, not that the engine refuses. */}
-            {!demoMode && setToolsEnabled && (
-              <button
-                type="button"
-                className={`cxcomposer__tool cxcomposer__tool--collapsible ${toolsEnabled && toolCapability.capable ? 'is-on' : ''}`}
-                title={toolCapability.capable
-                  ? 'Offer tools to the model on the next turn'
-                  : toolCapability.reason || 'This model is not tool-capable.'}
-                aria-label={toolCapability.capable ? 'Tools' : 'Tools — unavailable for this model'}
-                aria-pressed={toolCapability.capable ? toolsEnabled : undefined}
-                disabled={!toolCapability.capable}
-                onClick={() => setToolsEnabled(!toolsEnabled)}
-              >
-                <IconBolt size={16} />
-                <span className="cxcomposer__tool-label">
-                  {!toolCapability.capable ? 'Tools unavailable' : toolsEnabled ? 'Tools on' : 'Tools'}
                 </span>
               </button>
             )}
@@ -1182,6 +1199,7 @@ export default function ChatWorkspace({
                 title="Show the model's reasoning before the final answer (experimental)"
                 aria-label="Thinking mode"
                 aria-pressed={thinkingMode}
+                disabled={requestActive}
                 onClick={() => setThinkingMode(!thinkingMode)}
               >
                 <IconThinking size={16} /> <span className="cxcomposer__tool-label">{thinkingMode ? 'Thinking on (experimental)' : 'Thinking'}</span>
@@ -1205,12 +1223,62 @@ export default function ChatWorkspace({
                 className={`cxcomposer__tool cxcomposer__tool--collapsible ${showControls ? 'is-on' : ''}`}
                 aria-expanded={showControls}
                 aria-label="Generation controls"
-                onClick={() => setShowControls((value) => !value)}
+                onClick={() => { close(); setShowControls((value) => !value) }}
                 title="System prompt and generation settings"
               >
                 <IconBolt size={16} /> <span className="cxcomposer__tool-label">Controls</span>
               </button>
             )}
+                  <button type="button" className="cxcomposer__tool composer-menu__files" onClick={() => { close(); setFilesOpen(true) }}><IconFile size={16} />Conversation files ({files.length})</button>
+                </div>
+                <fieldset className="composer-menu__format" disabled={requestActive}>
+      {structuredSupported && structuredMode !== 'off' && setStructuredMode && (
+        <div className="structout-editor">
+          <div className="structout-editor__modes" role="group" aria-label="Constraint form">
+            {[
+              ['json_schema', 'JSON schema'],
+              ['json_object', 'Any JSON'],
+              ['grammar', 'Grammar'],
+            ].map(([value, label]) => (
+              <button
+                key={value}
+                type="button"
+                className={`structout-editor__mode ${structuredMode === value ? 'is-on' : ''}`}
+                aria-pressed={structuredMode === value}
+                onClick={() => setStructuredMode(value)}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          {structuredMode === 'json_schema' && (
+            <textarea
+              className="structout-editor__field"
+              aria-label="JSON schema"
+              spellCheck={false}
+              value={structuredSchema}
+              onChange={(event) => setStructuredSchema?.(event.target.value)}
+            />
+          )}
+          {structuredMode === 'grammar' && (
+            <textarea
+              className="structout-editor__field"
+              aria-label="Grammar"
+              spellCheck={false}
+              value={structuredGrammar}
+              onChange={(event) => setStructuredGrammar?.(event.target.value)}
+            />
+          )}
+          <p className={`structout-editor__status ${structuredReadiness.ready ? '' : 'is-invalid'}`}>
+            {structuredReadiness.ready
+              ? 'The next reply is constrained to this. Turn on Tokens as well to see whether the constraint actually diverted the decode.'
+              : structuredReadiness.reason}
+          </p>
+        </div>
+      )}
+                </fieldset>
+              </>}
+            </ComposerMenu>}
           </div>
           <div className="cxcomposer__actions">
             {generationActive && (
@@ -1253,16 +1321,24 @@ export default function ChatWorkspace({
           <StatusDot tone={statusTone} pulse={supportedChatReady || verifiedChatReady || varianceChatReady} />
           <span className="cxcomposer__status-text">{statusLine}</span>
         </span>
+        {statusDetail && (
+          <Tooltip content={statusDetail} placement="top">
+            <button type="button" className="cxcomposer__status-info" aria-label="Chat status details">
+              <IconInfo size={14} />
+            </button>
+          </Tooltip>
+        )}
         <ContextMeter
           contextLength={activeContextLength}
           promptTokens={estimatedPromptTokens}
+          systemTokens={systemTokens}
           reservedTokens={effectiveMaxTokens}
           verifiedBound={verifiedBound}
           executionLane={executionLane}
           autoCompact={autoCompact}
           onToggleAutoCompact={handleToggleAutoCompact}
           onCompactNow={compactionPreview.compacted ? null : handleCompactNow}
-          canCompact={compactForSend(visibleMessages) !== null}
+          canCompact={compactForSend(previewMessages) !== null}
           compaction={compactionPreview.compacted
             ? {
               active: true,
@@ -1272,19 +1348,16 @@ export default function ChatWorkspace({
             : null}
           onSendEverything={compactionPreview.compacted ? handleSendEverything : null}
         />
-        {statusDetail && (
-          <Tooltip content={statusDetail} placement="top">
-            <button type="button" className="cxcomposer__status-info" aria-label="Chat status details">
-              <IconInfo size={14} />
-            </button>
-          </Tooltip>
-        )}
+
       </div>
     </div>
   )
 
   return (
+    <OutputPanelContext.Provider value={openOutput}>
+    <div className={'chat-workspace-layout' + (filesOpen ? ' has-files' : '')}>
     <section className={`cxchat is-${readinessState} ${userScrolledAway ? 'is-user-scrolled' : ''} ${isFreshThread ? 'cxchat--empty' : ''}`} data-view="chat">
+      <div className="cxchat__utility"><button type="button" aria-label="Conversation files" aria-expanded={filesOpen} onClick={() => setFilesOpen(!filesOpen)}><IconFile size={15} />Files{files.length > 0 && <span>{files.length}</span>}</button></div>
       <div className="cxchat__scroll">
         <div className="cxchat__column">
           {verifiedChatReady && (
@@ -1373,6 +1446,8 @@ export default function ChatWorkspace({
                 const dayKey = dayKeyOf(message.created_at)
                 const priorDayKey = priorMessage ? dayKeyOf(priorMessage.created_at) : null
                 const showDaySeparator = Boolean(dayKey && priorDayKey && dayKey !== priorDayKey)
+                if (message.role === 'tool' && toolActivity.pairedResults.has(message.id)) return null
+                if (message.role === 'tool') return <OutputMessageContext.Provider key={message.id} value={message.id}><details className="mcp-result" key={message.id}><summary>{message.mcp?.connection ? `${message.mcp.connection} · ` : ''}{message.mcp?.tool || 'Tool result'} · {message.mcp?.status || 'received'}{message.mcp?.is_error ? ' · error' : ''}</summary><ToolOutputGallery content={message.content} /><pre>{message.content}</pre></details></OutputMessageContext.Provider>
                 return (
                   <Fragment key={message.id}>
                     {showDaySeparator && (
@@ -1380,8 +1455,9 @@ export default function ChatWorkspace({
                         <span>{formatDayLabel(message.created_at)}</span>
                       </div>
                     )}
-                    <MessageTurn
+                    {(!message.mcp_managed || !message.tool_calls?.length || Boolean(message.content?.trim())) && <OutputMessageContext.Provider value={message.id}><MessageTurn
                       message={message}
+                      hideManagedToolCalls={Boolean(toolActivity.groups.has(message.id))}
                       generationElapsedSeconds={generationElapsedSeconds}
                       priorUserPrompt={priorUserPrompt}
                       onReusePrompt={setComposer}
@@ -1401,11 +1477,16 @@ export default function ChatWorkspace({
                             normalizeToolCalls(message.tool_calls) || [],
                           )
                         : null}
-                    />
+                    /></OutputMessageContext.Provider>}
+                    {toolActivity.groups.get(message.id)?.map(({ call, result }, callIndex) => <ToolActivityCard key={callIndex} call={call} result={result}
+                      live={mcpActivity?.calls?.[JSON.stringify([message.id, call.id])]}
+                      queued={mcpActivity?.messageId === message.id && mcpActivity.phase !== 'idle'}
+                      approval={mcpApproval} onDecision={decideMcpApproval} onStop={stopGeneration} />)}
+
                   </Fragment>
                 )
               })}
-              {generationActive && (
+              {followActive && (
                 <button
                   type="button"
                   className="cxchat__jump-latest"
@@ -1426,8 +1507,9 @@ export default function ChatWorkspace({
                   </article>
                 </>
               )}
+              <McpRunPanel activity={hasInlineActivity ? null : mcpActivity} approval={mcpApproval} onDecision={decideMcpApproval} onStop={stopGeneration} />
               {/* Follow-up prompts sit under the latest reply — they act on it. */}
-              {visibleMessages.length > 0 && !generationActive && canChat && (
+              {visibleMessages.length > 0 && !requestActive && canChat && (
                 <div className="cxchat__followups" aria-label="Follow-up prompts">
                   {FOLLOW_UP_PROMPTS.map((prompt) => (
                     <button key={prompt} type="button" className="cxchat__followup" onClick={() => handleSuggestion(prompt)}>{prompt}</button>
@@ -1474,5 +1556,8 @@ export default function ChatWorkspace({
         </div>
       )}
     </section>
+    {filesOpen && <ConversationFiles key={selectedConversation?.id || 'draft'} files={files} selectedId={selectedFileId} onSelect={setSelectedFileId} onClose={() => setFilesOpen(false)} conversationId={selectedConversation?.id || 'draft'} />}
+    </div>
+    </OutputPanelContext.Provider>
   )
 }
