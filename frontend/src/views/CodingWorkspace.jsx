@@ -13,7 +13,7 @@ import { ConversationContext } from '../components/context/ContextEditors.jsx'
 import { Button } from '../components/ui/Button.jsx'
 import { ConfirmDialog } from '../components/ui/ConfirmDialog.jsx'
 import { CamelidMark } from '../components/ui/CamelidMark.jsx'
-import { IconApi, IconBolt, IconCheck, IconChevronRight, IconCpu, IconFile, IconFolder, IconHistory, IconPlus, IconReceipt, IconSearch, IconSend, IconShield, IconSidebar, IconStop, IconTrash } from '../components/ui/icons.jsx'
+import { IconApi, IconCheck, IconChevronRight, IconCpu, IconFile, IconFolder, IconHistory, IconPlus, IconReceipt, IconSearch, IconSend, IconShield, IconSidebar, IconStop, IconTrash } from '../components/ui/icons.jsx'
 
 const labels = { running: 'Working', queued: 'Queued', working: 'Working', waiting_approval: 'Needs approval', waiting_helpers: 'Waiting for helpers', paused: 'Paused', stopping: 'Stopping', completed: 'Turn finished', done: 'Done', failed: 'Failed', cancelled: 'Stopped', interrupted: 'Interrupted' }
 const label = value => labels[value] || value || 'Ready'
@@ -29,6 +29,9 @@ export default function CodingWorkspace({ apiBase, runtime, selectedModel, capab
   const [goal, setGoal] = useState('')
   const [allowCommands, setAllowCommands] = useState(false)
   const [inputMode, setInputMode] = useState('steer')
+  const [optionsOpen, setOptionsOpen] = useState(false)
+  const optionsRef = useRef(null)
+  const optionsButton = useRef(null)
   const [projectSettings, setProjectSettings] = useState({ verification_command: '', preview_entry: 'index.html', workflow: '', max_run_seconds: 1800, browser_check: false })
   const [folderOpen, setFolderOpen] = useState(false)
   const [sideOpen, setSideOpen] = useState(true)
@@ -81,10 +84,21 @@ export default function CodingWorkspace({ apiBase, runtime, selectedModel, capab
   useEffect(() => {
     if (sideOpen && (reviewId || commandOpen || snippetsOpen) && window.matchMedia('(max-width: 700px)').matches) sidebar.current?.scrollIntoView({ block: 'start' })
   }, [sideOpen, reviewId, commandOpen, snippetsOpen])
+  useEffect(() => { setOptionsOpen(false); setInputMode('steer') }, [selectedId])
+  useEffect(() => {
+    if (!optionsOpen) return
+    const outside = event => { if (!optionsRef.current?.contains(event.target)) setOptionsOpen(false) }
+    const escape = event => {
+      if (event.key === 'Escape') { setOptionsOpen(false); optionsButton.current?.focus() }
+    }
+    document.addEventListener('pointerdown', outside)
+    document.addEventListener('keydown', escape)
+    return () => { document.removeEventListener('pointerdown', outside); document.removeEventListener('keydown', escape) }
+  }, [optionsOpen])
   const submit = async () => {
     if (!canSend) return
     const options = { workspace: workspace.trim(), model_id: runtime.active_model_id, project_id: chatContext?.project_id || '', ...codingContext(contextSources), allow_commands: allowCommands, project: { ...projectSettings, engine_id: coding.executionEngine?.id || '' }, ...(selectedId ? { mode: running ? inputMode : 'follow_up' } : {}) }
-    try { await coding.send(goal.trim(), options); setGoal(''); userAway.current = false; appStorage.setItem('camelid.codingWorkspace', workspace.trim()) } catch { /* hook presents the error */ }
+    try { await coding.send(goal.trim(), options); setGoal(''); setInputMode('steer'); setOptionsOpen(false); userAway.current = false; appStorage.setItem('camelid.codingWorkspace', workspace.trim()) } catch { /* hook presents the error */ }
   }
   const decide = async approved => { try { await coding.decide(approved); setReviewId(null); setCommandOpen(false) } catch { /* hook presents the error */ } }
   const undo = async () => {
@@ -143,22 +157,40 @@ export default function CodingWorkspace({ apiBase, runtime, selectedModel, capab
             {snapshot?.approval && <section className="coding-approval coding-approval-summary" aria-label="Pending agent approval"><div className="coding-row"><IconShield size={18} /><strong>Your review is needed</strong></div><p>{pendingReview ? `Lead wants to ${pendingReview.before == null ? 'create' : 'update'} ${relativeName(pendingReview.path)}.` : 'Lead wants to run a command in your project.'}</p><Button variant="primary" size="sm" onClick={openApproval}>{pendingReview ? 'Review file change' : 'Review command'}<IconChevronRight size={14} /></Button></section>}
             {running && <div className="coding-runline" role="status"><span className="coding-dot" /><span>{snapshot.phase === 'paused' ? 'Paused before the next action. The current request may finish.' : snapshot.phase === 'stopping' ? 'Stopping…' : describeCodingAction(snapshot.agents.lead?.action, snapshot.agents.lead?.status)}</span><div className="coding-actions"><Button size="sm" variant="ghost" disabled={busy || snapshot.phase === 'stopping'} onClick={() => ignore(coding.control(snapshot.phase === 'paused' ? 'resume' : 'pause'))}>{snapshot.phase === 'paused' ? 'Resume' : 'Pause'}</Button><Button size="sm" variant="ghost" icon={<IconStop size={14} />} disabled={busy || snapshot.phase === 'stopping'} onClick={() => ignore(coding.control('stop'))}>Stop</Button></div></div>}
             {snapshot && !running && <div className="coding-runline"><span>{label(snapshot.phase)} · conversation saved</span><Button size="sm" variant="ghost" icon={<IconTrash size={14} />} disabled={busy} onClick={() => setConfirmRemove(true)}>Remove session</Button></div>}
+          {(snapshot?.incoming || []).filter(m => m.mode === 'steer' || m.status === 'accepted').slice(-6).map(m => <p className="coding-incoming" key={m.id}>{m.mode === 'steer' ? (m.status === 'consumed' ? 'Message received' : 'Message sent') : 'Queued'}: {describeCodingMessage(m.text).description}{!running && m.mode === 'queue' && <Button size="sm" variant="ghost" onClick={() => ignore(coding.send(m.text, { message_id: m.id }))}>Continue queued task</Button>}</p>)}
             <div ref={bottom} />
           </div></div>
         </div>
         <div className="coding-composer-area cxchat__column">
           {!snapshot && <div className="coding-setup">
             <div className="coding-folder-field"><label htmlFor="coding-folder">Project folder</label><div className="coding-row"><input id="coding-folder" value={workspace} onChange={e => setWorkspace(e.target.value)} placeholder="Choose a local folder" disabled={busy} /><Button size="sm" variant="outline" icon={<IconFolder size={15} />} disabled={busy} onClick={() => setFolderOpen(true)}>Browse</Button></div></div>
-            <label className="coding-command-choice"><input type="checkbox" checked={allowCommands} onChange={e => setAllowCommands(e.target.checked)} disabled={busy} /><span>Allow command requests<small>Every command asks first and runs with your account permissions. Command changes are not covered by Undo.</small></span></label>
+
           </div>}
-          {!snapshot ? <ConversationContext compact={false} context={chatContext} projects={projects} sources={contextSources} globalPrompt={globalPrompt || ''} onSave={updateChatContext} onManageProjects={() => setTab('projects')} busy={busy} /> : <div className="coding-context"><IconFolder size={15} /><strong>{project?.name || relativeName(snapshot.config.workspace)}</strong><span>{snapshot.config.workspace}</span></div>}
-          {snapshot && <label className="coding-command-choice coding-file-approval-choice"><input type="checkbox" checked={Boolean(snapshot.auto_approve_files)} onChange={e => ignore(coding.setAutoApproveFiles(e.target.checked))} disabled={busy || connection !== 'connected' || snapshot.phase === 'stopping'} /><span>Auto-approve file changes<small>Applies pending and future file edits in this session. Reviews and Undo stay available. Commands still ask. Resets when the engine restarts.</small></span></label>}
+          {!snapshot && <ConversationContext compact={false} context={chatContext} projects={projects} sources={contextSources} globalPrompt={globalPrompt || ''} onSave={updateChatContext} onManageProjects={() => setTab('projects')} busy={busy} />}
           {!ready && <p className="coding-readiness" role="status">{capability.reason || 'Code needs an exact tool-capable model artifact with a certified digest.'} <button type="button" onClick={() => setTab('library')}>Open Models</button></p>}
-          {running && <div className="coding-input-mode"><label>Send as <select aria-label="Coding message mode" value={inputMode} onChange={e => setInputMode(e.target.value)}><option value="steer">Add to current task</option><option value="queue">Queue follow-up</option></select></label><small>{inputMode === 'steer' ? 'Applied before the next action. Pending proposals are reconsidered.' : 'Starts after this task finishes successfully.'}</small></div>}
-          {(snapshot?.incoming || []).filter(m => m.mode === 'steer' || m.status === 'accepted').slice(-6).map(m => <p className="coding-incoming" key={m.id}>{m.mode === 'steer' ? (m.status === 'consumed' ? 'Correction received by Lead' : 'Correction accepted') : 'Queued'}: {describeCodingMessage(m.text).description}{!running && m.mode === 'queue' && <Button size="sm" variant="ghost" onClick={() => ignore(coding.send(m.text, { message_id: m.id }))}>Continue queued task</Button>}</p>)}
           <form className="coding-composer cxcomposer" onSubmit={e => { e.preventDefault(); submit() }}>
-            <div className="cxcomposer__box"><textarea className="cxcomposer__input" aria-label="Message coding agents" value={goal} maxLength={16000} onChange={e => setGoal(e.target.value)} placeholder={running ? (inputMode === 'steer' ? 'Add a correction to the current task…' : 'Queue the next task…') : snapshot ? 'Give Lead a follow-up…' : 'What should Camelid build or fix?'} disabled={busy || snapshot?.phase === 'stopping'} onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); submit() } }} rows={2} />
-            <div className="coding-composer-tools cxcomposer__toolbar"><span><span className="coding-dot" />{snapshot?.config.model_id || selectedModel?.name || 'No model'}</span><details><summary><IconBolt size={14} />Project tools</summary><p>Read files · search · plan · reviewed edits · read-only helpers{(snapshot?.config.allow_commands ?? allowCommands) ? ' · approved commands' : ''}</p></details><span><IconShield size={14} />{snapshot?.auto_approve_files ? 'Auto-approve files' : 'Review changes'}</span><Button type="submit" size="sm" variant="primary" icon={<IconSend size={17} />} aria-label={running ? (inputMode === 'steer' ? 'Add to current task' : 'Queue follow-up') : snapshot ? 'Send coding follow-up' : 'Start coding'} disabled={!canSend} /></div>
+            <div className="cxcomposer__box">
+            {snapshot && <div className="coding-composer-project"><IconFolder size={14} /><span>{project?.name || relativeName(snapshot.config.workspace)}</span></div>}
+            <textarea className="cxcomposer__input" aria-label="Message coding agents" value={goal} maxLength={16000} onChange={e => setGoal(e.target.value)} placeholder={running && inputMode === 'queue' ? 'What should Camelid do next?' : 'Message Camelid…'} disabled={busy || snapshot?.phase === 'stopping'} onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); submit() } }} rows={2} />
+            <div className="coding-composer-tools cxcomposer__toolbar">
+              <span className="coding-composer-model" title={snapshot?.config.model_id || selectedModel?.name || 'No model'}><span className="coding-dot" />{snapshot?.config.model_id || selectedModel?.name || 'No model'}</span>
+              <div className="coding-composer-options" ref={optionsRef}>
+                <button ref={optionsButton} type="button" className="coding-options-trigger" aria-label="Coding options" aria-expanded={optionsOpen} aria-controls="coding-options" onClick={() => setOptionsOpen(v => !v)}><IconShield size={14} /><span>{snapshot?.auto_approve_files ? 'Auto-approve edits' : 'Review edits'}</span></button>
+                <div id="coding-options" className="coding-options-popover" hidden={!optionsOpen}>
+                  <strong>Project permissions</strong>
+                  {snapshot ? <>
+                    <p className="coding-options-path"><IconFolder size={14} />{snapshot.config.workspace}</p>
+                    <label className="coding-command-choice coding-file-approval-choice"><input type="checkbox" checked={Boolean(snapshot.auto_approve_files)} onChange={e => ignore(coding.setAutoApproveFiles(e.target.checked))} disabled={busy || connection !== 'connected' || snapshot.phase === 'stopping'} /><span>Auto-approve file changes<small>Apply pending and future edits in this session. You can review and undo them.</small></span></label>
+                    <p>Commands still ask for approval. Auto-approval turns off when the engine restarts.</p>
+                  </> : <label className="coding-command-choice"><input type="checkbox" checked={allowCommands} onChange={e => setAllowCommands(e.target.checked)} disabled={busy} /><span>Allow command requests<small>Every command asks first and runs with your account permissions. Command changes are not covered by Undo.</small></span></label>}
+                  <p>Agents can read, search, and edit project files.</p>
+                </div>
+              </div>
+              <div className="coding-send-controls">
+                {running && <select className="coding-send-mode" aria-label="Coding message mode" value={inputMode} onChange={e => setInputMode(e.target.value)}><option value="steer">Send now</option><option value="queue">Send after task</option></select>}
+                <Button type="submit" size="sm" variant="primary" icon={<IconSend size={17} />} aria-label={running ? (inputMode === 'steer' ? 'Add to current task' : 'Queue follow-up') : snapshot ? 'Send coding follow-up' : 'Start coding'} disabled={!canSend} />
+              </div>
+            </div>
             </div>
           </form>
         </div>

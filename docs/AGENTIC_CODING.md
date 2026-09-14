@@ -13,7 +13,7 @@ This UI preview uses deterministic test activity, not a model-validation receipt
 3. If the task needs tests or build commands, enable **Allow command requests** before starting. This setting is fixed for the session. Each command still requires its own decision.
 4. Describe the task. Read/search/plan tools run automatically. File edits pause for an exact diff approval; command requests pause for the command, working folder, and execution notice.
 
-After starting a session, **Auto-approve file changes** above the composer lets you apply pending and future file edits automatically. It starts off. You can change it while working or before a follow-up; it applies only to this session's project. Browser reloads retain the server's choice, while an engine restart resets it. File reviews, conflict checks, and Undo remain available. Commands still require their own approval. Turning it off restores review prompts for file changes that have not already been approved. This option is unavailable when `CAMELID_PRODUCTION` is set.
+After starting a session, **Review edits** in the composer opens project permissions, where **Auto-approve file changes** lets you apply pending and future file edits automatically. It starts off. You can change it while working or before a follow-up; it applies only to this session's project. Browser reloads retain the server's choice, while an engine restart resets it. File reviews, conflict checks, and Undo remain available. Commands still require their own approval. Turning it off restores review prompts for file changes that have not already been approved. This option is unavailable when `CAMELID_PRODUCTION` is set.
 
 File tools stay within the selected folder. File reviews reject path traversal, symbolic links, `.git`, and `.camelid` destinations. An approved command runs with the current user's account permissions and the project as its working directory; it is **not confined to that folder by an OS sandbox**. Commands are opt-in, approved individually, limited to 120 seconds, and cancellable. Their side effects are not covered by file Undo.
 
@@ -69,7 +69,7 @@ Configure a build/test command under **Project** (for example a project's existi
 
 ## Correct or queue work
 
-The running composer offers **Add to current task** and **Queue follow-up**. Corrections are accepted with a run-bound idempotent message ID, then consumed at a model/tool boundary. The UI distinguishes acceptance from delivery. Unlaunched proposals and pending approvals based on the older task revision are invalidated. A tool already admitted to execution may finish; its result is recorded before the correction is consumed.
+The running composer defaults to **Send now**, which adds the message to the active task. Choose **Send after task** to queue one follow-up; sending it returns the composer to **Send now**. Delivery updates appear in the conversation, and the full project path and permissions are available from the edit-permissions control. Corrections are accepted with a run-bound idempotent message ID, then consumed at a model/tool boundary. The UI distinguishes acceptance from delivery. Unlaunched proposals and pending approvals based on the older task revision are invalidated. A tool already admitted to execution may finish; its result is recorded before the correction is consumed.
 
 Queued follow-ups start after a normally finished turn while the session retains engine ownership. Stop, failure, and restart leave queued messages visible for explicit continuation. They do not resume automatically after restart. The session retains at most 32 correction/queue entries and 24 KiB of their text.
 
@@ -134,3 +134,13 @@ On macOS / Apple M4, the relevant Rust suites passed 137 tests: 32 coding lifecy
 The new real Qwen3 4B Q4_K_M reliability fixture **failed its coding task**. The correction was consumed, a read-only helper completed and its findings were delivered, and the queued follow-up started once. However, the lead produced malformed edit calls and applied no file change. All three individually approved `python3 -m unittest -v` attempts recorded the two real failing assertions. No passing verification was recorded; the later live workflow-save and checkpoint assertions were not reached. Those operations remain covered by deterministic tests. This is an orchestration improvement, not a new claim that the model can reliably complete coding tasks.
 
 The live run also exposed unfinished “we will” / “let’s” prose that the earlier promise heuristic missed. The final guard recognizes that wording and has a deterministic regression; the real model fixture was not rerun after that guard change.
+
+### Composer interaction QA (2026-09-14)
+
+The composer uses the normal “Message Camelid…” prompt, a short project label, and a compact permissions control. The persistent permission explanation and separate “Send as” row have been removed. Auto-approval remains explicit and off by default; moving its control does not grant permissions.
+
+The frontend production build and complete deterministic Chromium coding smoke passed on the validation host. Checks cover opening permissions, Escape with focus restoration, outside-click dismissal, persisted approval state, active messages, one-message queue selection, file/command approval, undo, reconnect, and project preview. Desktop and mobile layouts were checked in both themes at widths 1440, 1024, 768, 390, and 320 pixels; the running composer and open permissions panel were separately checked at 1440, 390, and 320 pixels. These are UI fixture results, not model-performance or generated-code-quality claims.
+
+![Compact coding composer, desktop fixture](assets/camelid-coding-composer.png)
+
+![Compact coding composer, mobile fixture](assets/camelid-coding-composer-mobile.png)
