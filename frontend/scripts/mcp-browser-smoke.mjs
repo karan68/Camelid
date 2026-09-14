@@ -394,6 +394,7 @@ try {
   await clickText('button', 'Add server')
   await page.waitForSelector('.mcp-form')
   await page.type('.mcp-form input', 'Design docs')
+  assert.equal(await page.$eval('.mcp-form input', input => input.value), 'Design docs', 'opening the modal must not steal focus while typing')
   await page.select('.mcp-form select', 'http')
   await page.type('.mcp-form input[type="url"]', 'https://docs.example/mcp')
   await click('.mcp-form__advanced summary')

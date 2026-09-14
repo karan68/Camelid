@@ -101,6 +101,8 @@ The snapshot's `auto_approve_files` flag reports the current server-owned choice
 
 ## Validation
 
+The frontend CI job runs `npm run smoke:coding`, `npm run smoke:coding-browser`, and `npm run smoke:retro-transitions` against the production build. The transition check starts its own preview server. The macOS Rust job explicitly runs the otherwise ignored `chromium_load_check_distinguishes_valid_and_broken_javascript` regression; a missing browser or missing report fails that gate. Live-model fixtures remain separate from these deterministic checks.
+
 Run `cargo test --lib coding::tests -- --test-threads=1` for coding lifecycle, exact approval, real command execution/denial, journal conflict, pause/stop, helper scope/cancellation, idempotency, storage failure, restoration, and API boundary checks. These use scripted model responses and temporary files; they do not establish model quality.
 
 Run `npm --prefix frontend run build`, `npm --prefix frontend run smoke:coding`, and `npm --prefix frontend run smoke:coding-browser`. The browser smoke uses deterministic HTTP fixtures with real UI interactions, including agent selection, file/command review, navigation, reload, follow-up, Undo, and responsive dark/light layouts. Its screenshots are written to `target/coding-browser`.
@@ -144,3 +146,11 @@ The frontend production build and complete deterministic Chromium coding smoke p
 ![Compact coding composer, desktop fixture](assets/camelid-coding-composer.png)
 
 ![Compact coding composer, mobile fixture](assets/camelid-coding-composer-mobile.png)
+
+### Regression gate repairs (2026-09-14)
+
+The engine-metrics SSR smoke's original cold dependency scan reproduced the CI crash on Linux with Node 22.23.2: all 23 assertions passed before exit 139. Disabling browser dependency discovery and file watching for this one-shot SSR check passed five consecutive runs. The parser now accepts Windows CRLF source files, and the Code browser fixture uses the platform path separator when serving built assets. The production frontend build and Code state, Code browser, and transition checks passed on Windows.
+
+The full CI run also exposed a dialog focus race in the connected-tools fixture. Deferred dialog focus could steal focus from an input after typing began, leaving the required connection name empty. The dialog now preserves focus already inside it. The browser regression checks the typed value before saving, and the complete connected-tools browser check passed with the repair.
+
+The reliability live fixture selects `python` on Windows and `python3` on Unix. Before contacting the engine it requires both original counter defects to fail the unchanged unit tests. It records that baseline and the independent post-edit test output, so an unavailable interpreter cannot be confused with a model failure.

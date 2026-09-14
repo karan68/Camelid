@@ -23,7 +23,14 @@ if __name__ == '__main__': unittest.main()
 `
 writeFileSync(join(workspace, 'task_counter.py'), original)
 writeFileSync(join(workspace, 'test_task_counter.py'), tests)
-const command = 'python3 -m unittest -v'
+const python = process.platform === 'win32' ? 'python' : 'python3'
+const command = `${python} -m unittest -v`
+const runTests = () => spawnSync(python, ['-m', 'unittest', '-v'], { cwd: workspace, encoding: 'utf8', timeout: 15000 })
+const baseline = runTests()
+assert.ifError(baseline.error)
+assert.equal(baseline.status, 1, 'The original counter must fail the real unit tests')
+assert.match(baseline.stderr, /FAILED \(failures=2\)/, 'Both counter defects must be detected before any model edit')
+writeFileSync(join(out, 'baseline.txt'), baseline.stdout + baseline.stderr)
 const messageId = () => randomUUID().replaceAll('-', '')
 const route = '/api/agent/coding/sessions'
 async function request(path, method = 'GET', body, expected = 200) {
@@ -75,7 +82,9 @@ try {
   assert.ok(session.helper_results.some(r => r.parent_run_id === firstRun && r.outcome === 'done' && r.delivered), 'Helper findings must be delivered')
   assert.ok(session.checks.some(c => c.status === 'passed' && c.run_id === firstRun && c.command === command), 'Exact approved checks must pass')
   assert.equal(readFileSync(join(workspace, 'test_task_counter.py'), 'utf8'), tests, 'Tests must stay unchanged')
-  const independent = spawnSync('python3', ['-m', 'unittest', '-v'], { cwd: workspace, encoding: 'utf8', timeout: 15000 })
+  const independent = runTests()
+  assert.ifError(independent.error)
+  writeFileSync(join(out, 'independent-tests.txt'), independent.stdout + independent.stderr)
   assert.equal(independent.status, 0, independent.stderr)
   await request(`${route}/${sessionId}/project`, 'POST', { action: 'save_workflow', name: 'counter-check', notes: 'Run the existing counter unit tests after edits; preserve count_open(tasks).' })
   const checkpoint = session.checkpoints.find(c => c.run_id === firstRun)

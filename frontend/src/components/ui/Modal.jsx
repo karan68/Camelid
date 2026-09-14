@@ -48,7 +48,12 @@ export function Modal({ open, onClose, title, children, footer = null, labelledB
     const { body } = document
     const prevOverflow = body.style.overflow
     body.style.overflow = 'hidden'
-    const frame = window.requestAnimationFrame(() => panelRef.current?.focus())
+    const frame = window.requestAnimationFrame(() => {
+      const panel = panelRef.current
+      // A user may already have clicked a field before this frame runs. Keep
+      // that focus so opening the dialog cannot swallow their first keystrokes.
+      if (panel && !panel.contains(document.activeElement)) panel.focus()
+    })
     return () => {
       window.removeEventListener('keydown', onKey)
       body.style.overflow = prevOverflow
