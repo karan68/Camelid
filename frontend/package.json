@@ -4,6 +4,8 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
+    "smoke:coding": "node scripts/coding-session-smoke.mjs",
+    "smoke:coding-browser": "node scripts/coding-browser-smoke.mjs",
     "dev": "vite --host 127.0.0.1 --port 4175",
     "build": "vite build",
     "smoke:chat-polish": "node scripts/chat-polish-smoke.mjs",
@@ -32,6 +34,7 @@
     "smoke:structured-output": "node scripts/structured-output-smoke.mjs",
     "smoke:token-inspector": "node scripts/token-inspector-smoke.mjs",
     "smoke:ui": "node scripts/ui-regression-smoke.mjs",
+    "smoke:retro-transitions": "node scripts/retro-transition-smoke.mjs",
     "smoke:ghost-moe-execution": "node scripts/ghost-moe-execution-plan-smoke.mjs",
     "smoke:gemma4-mtp12-gate": "node scripts/gemma4-mtp12-chat-gate-smoke.mjs",
     "smoke:gemma4-mtp12-target-render": "node scripts/gemma4-mtp12-target-render-smoke.mjs",

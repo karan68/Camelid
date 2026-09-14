@@ -97,8 +97,11 @@ For [image chat](docs/MODELS.md#multimodal-image-chat) and [embeddings and reran
 | **Browser chat** | `camelid serve --model <gguf>` | Everyday local chat |
 | **Terminal UI** | `camelid chat` | Shell and SSH workflows |
 | **HTTP API** | Start `camelid serve` | Chat, image input, embeddings, and reranking |
+| **Code in Chat** | Choose **Code** in the local web UI | Reviewed edits, approved commands, and a live agent sidebar |
 | **Agent mode** | `camelid chat --agent --model <gguf>` | Approval-gated tools in a repository |
 | **Workspace** (preview) | Open **Workspace** in the web UI | Read-only analysis of a local folder |
+
+The [Code guide](docs/AGENTIC_CODING.md) covers project folders, approvals, helper agents, saved runs, and Undo. Code requires an exact certified tool-capable artifact and a loopback engine connection.
 
 Agent mode confines file tools to a workspace root and keeps network access off unless enabled. Workspace is read-only and resumable. Both require a model marked `tool_capable` in the compatibility ledger. Review the [agent documentation](DOCS.md) and every requested action before enabling additional tools or network access.
 

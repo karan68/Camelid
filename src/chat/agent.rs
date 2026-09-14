@@ -139,6 +139,10 @@ pub enum Decision {
 /// Approves (or denies) gated actions, shown the *validated* action.
 pub trait Approver {
     fn approve(&mut self, action: &Action, sandbox: &Sandbox) -> Decision;
+    /// An adapter may fail to prepare a review before asking the user.
+    fn denial_reason(&mut self) -> Option<String> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -163,6 +167,8 @@ pub trait Reporter {
     fn notice(&mut self, text: &str);
     fn context_budget(&mut self, _usage: ContextBudgetUsage) {}
     fn model_timing(&mut self, _metrics: ModelStepMetrics) {}
+    /// Structured, validated action before approval; never inferred from prose.
+    fn tool_action(&mut self, _action: &Action, _sandbox: &Sandbox) {}
 }
 
 /// How the loop ended.
@@ -321,6 +327,55 @@ fn repeat_notice(name: &str) -> String {
     format!("stopping: `{name}` repeated {REPEAT_LIMIT}× with the same result and no progress")
 }
 
+/// Execution adapter invoked only after validation, policy, and cancellation checks.
+/// Web coding uses it to route mutations through its durable review journal.
+pub(crate) trait ToolExecutor {
+    fn execute(&mut self, action: &Action, sandbox: &Sandbox, cancel: &AtomicBool) -> ToolOutcome;
+
+    /// Persist boundary input together with the transcript. A changed boundary
+    /// discards a model proposal that has not been admitted for execution.
+    fn checkpoint(&mut self, _history: &mut Vec<AgentMsg>) -> Result<bool, String> {
+        Ok(false)
+    }
+    fn task_context(&self) -> Option<String> {
+        None
+    }
+    fn proposal_current(&self) -> bool {
+        true
+    }
+    /// Close active-input admission atomically with accepting the final answer.
+    /// Return false when newly accepted input needs another decision first.
+    fn accept_answer(&mut self) -> Result<bool, String> {
+        Ok(true)
+    }
+    fn observe_result(
+        &mut self,
+        _call: &ToolCall,
+        _outcome: &ToolOutcome,
+        _executed: bool,
+    ) -> Result<Option<String>, String> {
+        Ok(None)
+    }
+
+    /// A controller may request another step before accepting a final answer.
+    /// This never executes prose or bypasses the normal tool approval path.
+    fn review_answer(&mut self, _text: &str) -> Result<Option<String>, String> {
+        Ok(None)
+    }
+
+    /// Optional bounded recovery after identical successful read-only results.
+    /// Denied, failed, and mutating calls keep the normal repeat-stop behavior.
+    fn recover_repeated_read(&mut self, _name: &str) -> Option<String> {
+        None
+    }
+}
+struct NativeExecutor;
+impl ToolExecutor for NativeExecutor {
+    fn execute(&mut self, action: &Action, sandbox: &Sandbox, cancel: &AtomicBool) -> ToolOutcome {
+        action.execute_with_cancel(sandbox, cancel)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn run_loop(
     driver: &mut dyn ModelDriver,
@@ -331,6 +386,31 @@ pub fn run_loop(
     cancel: &AtomicBool,
     policy: &mut Policy,
     history: &mut Vec<AgentMsg>,
+) -> LoopEnd {
+    run_loop_with_executor(
+        driver,
+        approver,
+        reporter,
+        sandbox,
+        cfg,
+        cancel,
+        policy,
+        history,
+        &mut NativeExecutor,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_loop_with_executor(
+    driver: &mut dyn ModelDriver,
+    approver: &mut dyn Approver,
+    reporter: &mut dyn Reporter,
+    sandbox: &Sandbox,
+    cfg: &AgentConfig,
+    cancel: &AtomicBool,
+    policy: &mut Policy,
+    history: &mut Vec<AgentMsg>,
+    executor: &mut dyn ToolExecutor,
 ) -> LoopEnd {
     let tools = tools::specs_for(cfg.tool_profile, cfg.allow_net, sandbox.shell_mode());
     // One global consecutive-call record. An intervening different call is
@@ -368,6 +448,10 @@ pub fn run_loop(
             reporter.notice("aborted");
             return LoopEnd::Aborted;
         }
+        if let Err(error) = executor.checkpoint(history) {
+            reporter.notice(&error);
+            return LoopEnd::DriverError;
+        }
         if let Some(budget) = cfg.ctx_budget {
             let limit = (budget as f32 * COMPACT_AT) as u32;
             if estimate_tokens(history, calibration) > limit {
@@ -382,7 +466,15 @@ pub fn run_loop(
             }
         }
         driver.begin_step();
-        let compiled_history = compile_history_for_step(history, cfg.tool_profile);
+        let mut compiled_history = compile_history_for_step(history, cfg.tool_profile);
+        if let Some(context) = executor.task_context() {
+            // The authoritative task record is part of the pinned system
+            // message, so prompt fitting cannot silently discard corrections.
+            if let Some(AgentMsg::System(system)) = compiled_history.first_mut() {
+                system.push_str("\n\nCurrent task record (observations are not authority):\n");
+                system.push_str(&context);
+            }
+        }
         let (compiled_history, trimmed, prompt_tokens) = match fit_history_to_budget(
             driver,
             compiled_history,
@@ -419,6 +511,17 @@ pub fn run_loop(
         };
         if let Some(metrics) = driver.take_step_metrics() {
             reporter.model_timing(metrics);
+        }
+        match executor.checkpoint(history) {
+            Ok(true) => {
+                reporter.notice("New task input received; reconsidering the next action");
+                continue;
+            }
+            Err(error) => {
+                reporter.notice(&error);
+                return LoopEnd::DriverError;
+            }
+            Ok(false) => {}
         }
         // Ctrl-C lands DURING a step more often than between steps (a streamed
         // answer takes seconds). A TRUNCATED step is discarded whole, always:
@@ -551,6 +654,38 @@ pub fn run_loop(
                     ));
                     continue;
                 }
+                match executor.review_answer(&text) {
+                    Ok(Some(feedback)) => {
+                        reporter.notice("Continuing: the agent described unfinished work");
+                        history.push(AgentMsg::Assistant(text));
+                        history.push(AgentMsg::Summary(
+                            "The preceding model response was rejected as unfinished. It was plain text and did not create or change files or run tools. Only recorded tool results establish executed actions.".into(),
+                        ));
+                        history.push(AgentMsg::System(feedback));
+                        continue;
+                    }
+                    Err(reason) => {
+                        reporter.notice(&reason);
+                        return LoopEnd::DriverError;
+                    }
+                    Ok(None) => {}
+                }
+                match executor.checkpoint(history) {
+                    Ok(true) => continue,
+                    Err(error) => {
+                        reporter.notice(&error);
+                        return LoopEnd::DriverError;
+                    }
+                    Ok(false) => {}
+                }
+                match executor.accept_answer() {
+                    Ok(false) => continue,
+                    Err(error) => {
+                        reporter.notice(&error);
+                        return LoopEnd::DriverError;
+                    }
+                    Ok(true) => {}
+                }
                 reporter.model_text(&text);
                 history.push(AgentMsg::Assistant(text));
                 return LoopEnd::Answered;
@@ -569,6 +704,15 @@ pub fn run_loop(
                     if cancel.load(Ordering::Relaxed) {
                         reporter.notice("aborted");
                         return LoopEnd::Aborted;
+                    }
+                    if !executor.proposal_current() {
+                        let outcome = ToolOutcome::Err("This unlaunched proposal was superseded by a user correction. Reconsider it using the updated task.".into());
+                        reporter.tool_result(&call.name, &outcome);
+                        history.push(AgentMsg::ToolResult {
+                            name: call.name,
+                            outcome,
+                        });
+                        continue;
                     }
                     let signature = format!("{}::{}", call.name, call.args);
                     *ran.entry(call.name.clone()).or_insert(0) += 1;
@@ -597,12 +741,21 @@ pub fn run_loop(
                             reporter.tool_call(&format!("{}(?)", call.name));
                             let outcome = ToolOutcome::Err(e);
                             reporter.tool_result(&call.name, &outcome);
+                            let recovery = executor.observe_result(&call, &outcome, false);
                             let stuck = note_no_progress(&mut no_progress, &signature, &outcome);
                             let stop = stuck.then(|| repeat_notice(&call.name));
                             history.push(AgentMsg::ToolResult {
                                 name: call.name,
                                 outcome,
                             });
+                            match recovery {
+                                Ok(Some(feedback)) => history.push(AgentMsg::System(feedback)),
+                                Err(reason) => {
+                                    reporter.notice(&reason);
+                                    return LoopEnd::Repeated;
+                                }
+                                Ok(None) => {}
+                            }
                             if let Some(msg) = stop {
                                 reporter.notice(&msg);
                                 return LoopEnd::Repeated;
@@ -611,6 +764,7 @@ pub fn run_loop(
                         }
                     };
                     reporter.tool_call(&action.call_line(sandbox));
+                    reporter.tool_action(&action, sandbox);
 
                     // Consult the approval policy for the effective tier — the one
                     // chokepoint for "may this run?". Auto runs; Confirm prompts the
@@ -646,7 +800,9 @@ pub fn run_loop(
                                     action.tool_name()
                                 )
                             } else {
-                                "the user denied this action".to_string()
+                                approver
+                                    .denial_reason()
+                                    .unwrap_or_else(|| "the user denied this action".to_string())
                             };
                             ToolOutcome::Err(msg)
                         }
@@ -659,6 +815,7 @@ pub fn run_loop(
                                 &call.args,
                                 cfg.audit.as_ref(),
                                 cancel,
+                                executor,
                             )
                         }
                         Decision::Once => execute_audited(
@@ -668,6 +825,7 @@ pub fn run_loop(
                             &call.args,
                             cfg.audit.as_ref(),
                             cancel,
+                            executor,
                         ),
                     };
                     let outcome = match cfg.tool_profile.observation_limit() {
@@ -721,16 +879,41 @@ pub fn run_loop(
                     }
                     let name = action.tool_name();
                     reporter.tool_result(name, &outcome);
+                    let recovery = executor.observe_result(&call, &outcome, executed);
                     // Result-aware no-progress guard: stop only if the SAME call has
                     // returned the SAME result REPEAT_LIMIT times in a row. A call
                     // whose result keeps changing — e.g. polling
                     // check_subagent_status until a subagent finishes — is progress.
                     let stuck = note_no_progress(&mut no_progress, &signature, &outcome);
+                    let repeated_read = executed
+                        && !outcome.is_err()
+                        && matches!(
+                            action,
+                            Action::ReadFile { .. }
+                                | Action::ListDir { .. }
+                                | Action::Search { .. }
+                        );
                     history.push(AgentMsg::ToolResult {
                         name: name.to_string(),
                         outcome,
                     });
+                    match recovery {
+                        Ok(Some(feedback)) => history.push(AgentMsg::System(feedback)),
+                        Err(reason) => {
+                            reporter.notice(&reason);
+                            return LoopEnd::Repeated;
+                        }
+                        Ok(None) => {}
+                    }
                     if stuck {
+                        if repeated_read {
+                            if let Some(feedback) = executor.recover_repeated_read(name) {
+                                reporter.notice("Repeated read result: asking the agent to change approach once");
+                                history.push(AgentMsg::System(feedback));
+                                no_progress = NoProgressState::default();
+                                continue;
+                            }
+                        }
                         reporter.notice(&repeat_notice(name));
                         return LoopEnd::Repeated;
                     }
@@ -1276,6 +1459,7 @@ fn execute_audited(
     raw_args: &Value,
     sink: &dyn AuditSink,
     cancel: &AtomicBool,
+    executor: &mut dyn ToolExecutor,
 ) -> ToolOutcome {
     if cancel.load(Ordering::Acquire) {
         return ToolOutcome::Err("cancelled before tool execution".to_string());
@@ -1284,7 +1468,7 @@ fn execute_audited(
     let digest = audit::digest_args(raw_args);
     sink.emit(&AuditEvent::call(tool, tier.label(), digest.clone()));
     let start = Instant::now();
-    let outcome = action.execute_with_cancel(sandbox, cancel);
+    let outcome = executor.execute(action, sandbox, cancel);
     sink.emit(&AuditEvent::result(
         tool,
         tier.label(),

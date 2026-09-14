@@ -6,6 +6,8 @@ This index helps readers navigate the public Markdown set.
 
 ## Fast reader paths
 
+- [Code in Chat](docs/AGENTIC_CODING.md): local coding sessions, live agent assignments, approvals, and Undo.
+
 - **Product/reviewer path:** start with `README.md`, then `COMPATIBILITY.md`, then the milestone snapshot in `docs/reference/STATUS.md`, then `docs/benchmarks/BENCHMARKS.md`.
 - **Evidence auditor path:** start with `docs/benchmarks/PARITY.md`, then `qa/evidence-bundles/README.md`, then follow the row-specific manifests linked from `docs/reference/STATUS.md`.
 - **Contributor path:** start with `docs/CONTRIBUTOR_QUICKSTART.md`, then use `docs/VALIDATION_MATRIX.md` to choose the smallest safe check lane.

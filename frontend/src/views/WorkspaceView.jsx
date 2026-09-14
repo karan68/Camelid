@@ -152,12 +152,18 @@ function IconArrowUp({ size = 20 }) {
   )
 }
 
-export function FolderPicker({ apiBase, initialPath, onClose, onPick }) {
+export function FolderPicker({ apiBase, initialPath, onClose, onPick, onCreate = null }) {
   const [view, setView] = useState(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const requestId = useRef(0)
   const abortRef = useRef(null)
+  const [newFolder, setNewFolder] = useState(false)
+  const [folderName, setFolderName] = useState('')
+  const [creating, setCreating] = useState(false)
+  const [creationError, setCreationError] = useState('')
+  const creationPending = useRef(false)
+  const closePicker = useCallback(() => { if (!creationPending.current) onClose() }, [onClose])
 
   const load = useCallback((path, fallbackToRoots = false) => {
     abortRef.current?.abort()
@@ -166,6 +172,9 @@ export function FolderPicker({ apiBase, initialPath, onClose, onPick }) {
     const id = ++requestId.current
     setLoading(true)
     setError('')
+    setNewFolder(false)
+    setFolderName('')
+    setCreationError('')
     browseWorkspaceFolders(apiBase, path, { signal: controller.signal })
       .then((data) => {
         if (id !== requestId.current) return
@@ -190,42 +199,64 @@ export function FolderPicker({ apiBase, initialPath, onClose, onPick }) {
   }, [load, initialPath])
 
   const atRoots = Boolean(view && view.path === null)
+  const folderReady = Boolean(view?.path && !loading && !error)
   const canGoUp = Boolean(view && (view.parent !== null || (view.hasRoots && view.path !== null)))
   const goUp = () => {
     if (!view) return
     if (view.parent !== null) load(view.parent)
     else if (view.hasRoots) load(null)
   }
+  const createFolder = async event => {
+    event.preventDefault()
+    if (!onCreate || !folderReady || !folderName.trim() || creationPending.current) return
+    creationPending.current = true
+    setCreating(true)
+    setCreationError('')
+    try {
+      const result = await onCreate(view.path, folderName.trim())
+      if (!result?.path) throw new Error('The engine did not return the new folder. Refresh the folder list before trying again.')
+      onPick(result.path)
+    } catch (err) { setCreationError(err.message || 'Could not create the folder.') }
+    finally { creationPending.current = false; setCreating(false) }
+  }
 
   return (
     <Modal
       open
-      onClose={onClose}
-      title="Choose workspace folder"
+      onClose={closePicker}
+      title={onCreate ? 'Choose project folder' : 'Choose workspace folder'}
       labelledById="workspace-folder-title"
       size="md"
       footer={
         <div className="folder-picker__actions">
-          <Button variant="ghost" onClick={onClose}>Cancel</Button>
-          <Button variant="primary" onClick={() => onPick(view?.path)} disabled={!view || view.path === null}>Use this folder</Button>
+          <Button variant="ghost" onClick={closePicker} disabled={creating}>Cancel</Button>
+          <Button variant="primary" onClick={() => onPick(view?.path)} disabled={!folderReady || creating || newFolder}>Use this folder</Button>
         </div>
       }
     >
       <div className="folder-picker">
         <div className="folder-picker__bar">
-          <button type="button" className="folder-picker__up" onClick={goUp} disabled={!canGoUp}>
+          <button type="button" className="folder-picker__up" onClick={goUp} disabled={!canGoUp || loading || creating}>
             <IconArrowUp size={16} /> Up
           </button>
-          <code className="folder-picker__path">{atRoots ? 'This PC' : (view?.path || '…')}</code>
+          <code className="folder-picker__path" title={view?.path || ''}>{atRoots ? 'This PC' : (view?.path || '…')}</code>
         </div>
-        {error ? <p className="folder-picker__error">{error}</p> : null}
+        {onCreate && !newFolder && <div><Button variant="outline" size="sm" onClick={() => setNewFolder(true)} disabled={!folderReady || creating}>New folder</Button></div>}
+        {newFolder && <form className="folder-picker__create" onSubmit={createFolder} aria-busy={creating}>
+          <label htmlFor="project-folder-name">New folder name</label>
+          <input id="project-folder-name" autoFocus value={folderName} maxLength={255} placeholder="My project" disabled={creating} aria-invalid={Boolean(creationError)} aria-describedby="project-folder-help" onChange={event => { setFolderName(event.target.value); setCreationError('') }} />
+          <p id="project-folder-help" className="folder-picker__note">Create a folder inside the location shown above and use it for this project.</p>
+          {creationError && <p className="folder-picker__error" role="alert">{creationError}</p>}
+          <div className="folder-picker__create-actions"><Button variant="primary" type="submit" size="sm" disabled={!folderReady || !folderName.trim() || creating}>{creating ? 'Creating…' : 'Create & use'}</Button><Button variant="ghost" size="sm" disabled={creating} onClick={() => { setNewFolder(false); setFolderName(''); setCreationError('') }}>Back to folders</Button></div>
+        </form>}
+        {error ? <p className="folder-picker__error" role="alert">{error}</p> : null}
         <ul className="folder-picker__list">
           {loading ? (
             <li className="folder-picker__empty">Loading…</li>
           ) : view && view.entries.length ? (
             view.entries.map((entry) => (
               <li key={entry.path}>
-                <button type="button" className="folder-picker__entry" onClick={() => load(entry.path)}>
+                <button type="button" className="folder-picker__entry" disabled={creating} onClick={() => load(entry.path)}>
                   <IconFolder size={16} /> <span>{entry.name}</span>
                 </button>
               </li>

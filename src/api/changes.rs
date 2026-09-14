@@ -465,6 +465,81 @@ pub(super) async fn remove(
     .await
 }
 
+impl crate::chat::coding::ChangeJournal for ChangeManager {
+    fn undo_group(&self, workspace: &FsPath, ids: &[String]) -> Result<Vec<Value>> {
+        let _guard = self.lock.lock().map_err(|_| "Review store unavailable.")?;
+        if ids.is_empty() || ids.len() > MAX_REVIEWS {
+            return Err("Choose a nonempty checkpoint within the review limit.".into());
+        }
+        let mut virtual_files = std::collections::BTreeMap::new();
+        let mut changes = vec![];
+        let mut seen = std::collections::BTreeSet::new();
+        for id in ids.iter().rev() {
+            if !seen.insert(id) {
+                return Err("Duplicate change in checkpoint.".into());
+            }
+            let review = self.load(id)?;
+            if review.workspace != workspace {
+                return Err("Checkpoint belongs to a different project.".into());
+            }
+            if review.status == "undone" {
+                continue;
+            }
+            if review.status != "applied" {
+                return Err(
+                    "A checkpoint change is no longer applied. Review it individually.".into(),
+                );
+            }
+            let path = destination(workspace, &review.path)?;
+            let current = virtual_files
+                .entry(review.path.clone())
+                .or_insert(read_text(&path, MAX_BYTES)?);
+            if current != &Some(review.after.clone()) {
+                return Err(format!(
+                    "{} changed after this task. No checkpoint files were overwritten.",
+                    review.path
+                ));
+            }
+            *current = review.before.clone();
+            changes.push(review);
+        }
+        // Preflight all files before the first mutation; each durable Undo also
+        // rechecks immediately before writing. Interrupted groups can be retried.
+        let mut result = vec![];
+        for change in changes {
+            result.push(view(&self.undo(&change.id).map_err(|e| format!("Checkpoint restore stopped after {} changes: {e}. Completed Undo records remain durable; refresh before retrying.", result.len()))?, true));
+        }
+        Ok(result)
+    }
+    fn prepare(
+        &self,
+        workspace: &FsPath,
+        path: &str,
+        content: String,
+        source: String,
+    ) -> Result<Value> {
+        let _guard = self.lock.lock().map_err(|_| "Review store unavailable.")?;
+        self.propose(Proposal {
+            workspace: workspace.to_path_buf(),
+            path: path.into(),
+            content,
+            source,
+        })
+        .map(|review| view(&review, true))
+    }
+    fn decide(&self, id: &str, approved: bool) -> Result<Value> {
+        let _guard = self.lock.lock().map_err(|_| "Review store unavailable.")?;
+        // An explicit decision in the Changes page may win the race with the
+        // coding approval. Report that observed result without applying twice.
+        let existing = self.load(id)?;
+        if (approved && existing.status == "applied") || (!approved && existing.status != "pending")
+        {
+            return Ok(view(&existing, true));
+        }
+        ChangeManager::decide(self, id, approved).map(|review| view(&review, true))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -621,5 +696,42 @@ mod tests {
                 StatusCode::FORBIDDEN
             );
         }
+    }
+    #[test]
+    fn grouped_undo_preflights_manual_edits_and_restores_multiple_versions() {
+        use crate::chat::coding::ChangeJournal;
+        let (_dir, manager, root) = fixture();
+        fs::write(root.join("one.txt"), "original").unwrap();
+        let one = manager
+            .propose(proposal(&root, "one.txt", "first edit"))
+            .unwrap();
+        manager.decide(&one.id, true).unwrap();
+        let two = manager
+            .propose(proposal(&root, "one.txt", "second edit"))
+            .unwrap();
+        manager.decide(&two.id, true).unwrap();
+        let three = manager
+            .propose(proposal(&root, "two.txt", "new file"))
+            .unwrap();
+        manager.decide(&three.id, true).unwrap();
+        let ids = vec![one.id, two.id, three.id];
+        fs::write(root.join("one.txt"), "manual edit").unwrap();
+        assert!(manager.undo_group(&root, &ids).is_err());
+        assert_eq!(
+            fs::read_to_string(root.join("two.txt")).unwrap(),
+            "new file",
+            "all files must be preflighted before any restore"
+        );
+        fs::write(root.join("one.txt"), "second edit").unwrap();
+        assert_eq!(manager.undo_group(&root, &ids).unwrap().len(), 3);
+        assert_eq!(
+            fs::read_to_string(root.join("one.txt")).unwrap(),
+            "original"
+        );
+        assert!(!root.join("two.txt").exists());
+        assert!(
+            manager.undo_group(&root, &ids).unwrap().is_empty(),
+            "retry must not replay already completed Undo"
+        );
     }
 }

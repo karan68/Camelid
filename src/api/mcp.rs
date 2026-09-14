@@ -1258,7 +1258,6 @@ mod tests {
         }
         assert!(!dir.path().join("connections.json").exists());
     }
-    #[cfg(unix)]
     #[tokio::test]
     async fn mcp_stdio_discovers_and_calls_a_local_process() {
         let dir = tempfile::tempdir().unwrap();
@@ -1275,22 +1274,36 @@ for line in sys.stdin:
 "#).unwrap();
         let mut c = config("");
         c.transport = "stdio".into();
-        c.command = "/usr/bin/python3".into();
-        c.args = vec![script.to_string_lossy().into_owned()];
+        // Use CI's configured interpreter rather than macOS's system launcher.
+        c.command = if cfg!(windows) { "python" } else { "python3" }.into();
+        // The fixture needs only the standard library; skip host/user site hooks.
+        c.args = vec![
+            "-I".into(),
+            "-S".into(),
+            script.to_string_lossy().into_owned(),
+        ];
         c.validate().unwrap();
-        let (client, tools) = tokio::time::timeout(Duration::from_secs(10), open(&c))
+        // This tests the stdio protocol, not startup latency. Shared CI runners
+        // can delay spawning Python while the parallel inference suite is busy.
+        let (client, tools) = tokio::time::timeout(Duration::from_secs(60), open(&c))
             .await
-            .unwrap()
-            .unwrap();
+            .expect("MCP stdio fixture startup/discovery exceeded 60 seconds")
+            .expect("MCP stdio fixture failed to initialize and discover tools");
         assert_eq!(tools[0].name, "echo");
-        let result = client
-            .call_tool(CallToolRequestParams::new("echo").with_arguments(Default::default()))
-            .await
-            .unwrap();
+        let result = tokio::time::timeout(
+            CALL_TIMEOUT,
+            client.call_tool(CallToolRequestParams::new("echo").with_arguments(Default::default())),
+        )
+        .await
+        .expect("local MCP tool call exceeded the command deadline")
+        .expect("MCP stdio fixture echo call failed");
         assert_eq!(
             serde_json::to_value(result).unwrap()["content"][0]["text"],
             "local tool result"
         );
-        client.cancel().await.unwrap();
+        client
+            .cancel()
+            .await
+            .expect("MCP stdio fixture shutdown failed");
     }
 }

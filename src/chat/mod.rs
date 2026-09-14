@@ -26,6 +26,8 @@ mod banner;
 mod checkpoint;
 pub(crate) mod client;
 mod clipboard;
+pub(crate) mod coding;
+pub(crate) mod coding_project;
 mod inline;
 mod markdown;
 mod mcp;

@@ -203,11 +203,15 @@ const page = await browser.newPage()
 await page.setViewport({ width: 1280, height: 900, deviceScaleFactor: 1 })
 page.on('pageerror', (error) => pageErrors.push(String(error)))
 await page.setRequestInterception(true)
-page.on('request', (request) => {
+page.on('request', async (request) => {
   const url = request.url()
   if (url.startsWith('data:') || url.startsWith('blob:')) return request.continue()
   try {
-    if (new URL(url).origin === origin) return request.continue()
+    if (new URL(url).origin === origin) {
+      // Exercise asynchronous font discovery even on a warm, fast test host.
+      if (/KaTeX_.*\.woff2$/.test(url)) await new Promise(resolve => setTimeout(resolve, 250))
+      return request.continue()
+    }
   } catch {
     // fall through and abort
   }
@@ -253,6 +257,11 @@ try {
   /* ---- 1. KaTeX actually typesets -------------------------------------- */
   await sendPrompt(MATH_PROMPT)
   await page.waitForSelector('.cx-math .katex', { timeout: 30000 })
+  // Typesetting inserts the DOM before the browser finishes loading its fonts.
+  // Wait for a real KaTeX font, then keep the local-asset assertion below.
+  await page.waitForFunction(() => [...document.fonts].some(font =>
+    font.family.includes('KaTeX') && font.status === 'loaded'
+  ), { timeout: 30000 })
   const mathState = await page.evaluate(() => {
     const spans = [...document.querySelectorAll('.cx-math')]
     return {
