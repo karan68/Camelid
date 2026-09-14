@@ -2012,15 +2012,48 @@ mod tests {
             journal,
         ))
     }
+    fn wait_for_snapshot(
+        run: &Run,
+        description: &str,
+        ready: impl Fn(&Snapshot) -> bool,
+    ) -> Snapshot {
+        // Subscribe before inspecting the state so publication cannot race the
+        // wait. Shared CI can spend seconds persisting earlier scripted steps.
+        let mut updates = run.subscribe();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(async {
+                tokio::time::timeout(Duration::from_secs(30), async {
+                    loop {
+                        let snapshot = run.snapshot();
+                        if ready(&snapshot) {
+                            return snapshot;
+                        }
+                        updates.changed().await.expect("coding state stream closed");
+                    }
+                })
+                .await
+                .unwrap_or_else(|_| {
+                    let snapshot = run.snapshot();
+                    // Release an approval/helper worker before failing the test.
+                    run.cancel.store(true, Ordering::Release);
+                    run.wake.notify_all();
+                    panic!(
+                        "{description} did not arrive: phase={:?}, error={}",
+                        snapshot.phase, snapshot.error
+                    );
+                })
+            })
+    }
     fn pending(run: &Run) -> String {
-        let deadline = Instant::now() + Duration::from_secs(3);
-        loop {
-            if let Some(a) = run.snapshot().approval {
-                return a["id"].as_str().unwrap().into();
-            }
-            assert!(Instant::now() < deadline, "approval did not arrive");
-            thread::sleep(Duration::from_millis(5));
-        }
+        wait_for_snapshot(run, "approval", |s| s.approval.is_some())
+            .approval
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .into()
     }
     fn write_action(sb: &Sandbox, content: &str) -> Action {
         tools::validate_for(
@@ -2815,12 +2848,8 @@ mod tests {
             agent_view("helper-one", Some("lead"), "Read project"),
         );
         let waiting = run.clone();
-        let worker = thread::spawn(move || waiting.wait_helpers(5));
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while run.snapshot().phase != Phase::WaitingHelpers {
-            assert!(Instant::now() < deadline);
-            thread::sleep(Duration::from_millis(5));
-        }
+        let worker = thread::spawn(move || waiting.wait_helpers(60));
+        wait_for_snapshot(&run, "helper wait", |s| s.phase == Phase::WaitingHelpers);
         run.update("helper-one", "agent.finished", Value::Null, true, |s| {
             s.agents.get_mut("helper-one").unwrap().status = "done".into();
             s.helper_results.push(HelperResult {
@@ -2870,11 +2899,7 @@ mod tests {
             .unwrap();
         let waiting = run.clone();
         let worker = thread::spawn(move || waiting.wait_helpers(120));
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while run.snapshot().phase != Phase::WaitingHelpers {
-            assert!(Instant::now() < deadline);
-            thread::sleep(Duration::from_millis(5));
-        }
+        wait_for_snapshot(&run, "helper wait", |s| s.phase == Phase::WaitingHelpers);
         run.control("stop").unwrap();
         assert!(worker.join().unwrap().is_err());
         let restored = Manager::new(run.store.parent().unwrap().into())
@@ -3080,12 +3105,8 @@ mod tests {
         assert_ne!(run.snapshot().run_id, original);
         // The fixture deliberately has no model server. Its queued run must
         // settle without replaying or granting any action, not remain phantom-active.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while run.snapshot().phase.active() {
-            assert!(Instant::now() < deadline);
-            thread::sleep(Duration::from_millis(10));
-        }
-        assert_eq!(run.snapshot().phase, Phase::Failed);
+        let settled = wait_for_snapshot(&run, "queued run completion", |s| !s.phase.active());
+        assert_eq!(settled.phase, Phase::Failed);
         assert!(run
             .start("Queued read-only task".into(), message, None)
             .is_ok());
