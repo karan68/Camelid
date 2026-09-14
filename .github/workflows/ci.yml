@@ -245,6 +245,13 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets ${{ matrix.features }} -- -D warnings
 
+      # The stdio MCP regression launches a real Python server on every OS.
+      # Use a configured interpreter rather than macOS's system launcher.
+      - name: Setup Python for process verification
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+
       # CAMELID_REQUIRE_METAL_TESTS=1 makes the macOS Metal lane fail-closed: the
       # device-gated skips (56 in src/metal.rs, plus the draft-rollback regression guard
       # in src/inference/tests.rs) become hard failures instead of silent passes. Enabled

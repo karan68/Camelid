@@ -1258,7 +1258,6 @@ mod tests {
         }
         assert!(!dir.path().join("connections.json").exists());
     }
-    #[cfg(unix)]
     #[tokio::test]
     async fn mcp_stdio_discovers_and_calls_a_local_process() {
         let dir = tempfile::tempdir().unwrap();
@@ -1275,7 +1274,8 @@ for line in sys.stdin:
 "#).unwrap();
         let mut c = config("");
         c.transport = "stdio".into();
-        c.command = "/usr/bin/python3".into();
+        // Use CI's configured interpreter rather than macOS's system launcher.
+        c.command = if cfg!(windows) { "python" } else { "python3" }.into();
         // The fixture needs only the standard library; skip host/user site hooks.
         c.args = vec![
             "-I".into(),
@@ -1290,10 +1290,13 @@ for line in sys.stdin:
             .expect("MCP stdio fixture startup/discovery exceeded 60 seconds")
             .expect("MCP stdio fixture failed to initialize and discover tools");
         assert_eq!(tools[0].name, "echo");
-        let result = client
-            .call_tool(CallToolRequestParams::new("echo").with_arguments(Default::default()))
-            .await
-            .expect("MCP stdio fixture echo call failed");
+        let result = tokio::time::timeout(
+            CALL_TIMEOUT,
+            client.call_tool(CallToolRequestParams::new("echo").with_arguments(Default::default())),
+        )
+        .await
+        .expect("local MCP tool call exceeded the command deadline")
+        .expect("MCP stdio fixture echo call failed");
         assert_eq!(
             serde_json::to_value(result).unwrap()["content"][0]["text"],
             "local tool result"
