@@ -1637,11 +1637,15 @@ mod tests {
 
         assert_eq!(labels(&fabric.observe()), vec!["a"]);
 
-        std::fs::write(&path, "b=127.0.0.1:1\n").expect("rewrite");
+        // Different LENGTH, not just different content: `FileStamp` is length plus
+        // mtime, so a same-length rewrite inside one mtime tick is invisible by design
+        // (see the fixtures in `watch.rs`). Keeping the lengths equal made this test
+        // race the clock rather than exercise the generation bump.
+        std::fs::write(&path, "bb=127.0.0.1:1\n").expect("rewrite");
 
         assert_eq!(
             labels(&fabric.observe()),
-            vec!["b"],
+            vec!["bb"],
             "an observation of the node set as it was must not survive the set changing"
         );
     }
