@@ -98,10 +98,15 @@ const LAZY_Q8_LINEAR_ENV: &str = "CAMELID_LAZY_Q8_0_LINEAR";
 const METADATA_CHAT_TEMPLATE_ENV: &str = "CAMELID_METADATA_CHAT_TEMPLATE";
 const GENERATION_TIMEOUT_ENV: &str = "CAMELID_GENERATION_TIMEOUT_MS";
 const STREAM_TIMING_DIAGNOSTICS_ENV: &str = "CAMELID_STREAM_TIMING_DIAGNOSTICS";
+// Read only by the CUDA prefill lane; a Metal build never looks at them.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 const CUDA_COOPERATIVE_PREFILL_ENV: &str = "CAMELID_CUDA_COOPERATIVE_PREFILL";
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 const CUDA_COOPERATIVE_PREFILL_CHUNK_TOKENS_ENV: &str =
     "CAMELID_CUDA_COOPERATIVE_PREFILL_CHUNK_TOKENS";
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 const DEFAULT_CUDA_COOPERATIVE_PREFILL_CHUNK_TOKENS: usize = 256;
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 const CUDA_BATCHED_PREFILL_ENV: &str = "CAMELID_CUDA_BATCHED_PREFILL";
 
 #[cfg(feature = "cuda")]

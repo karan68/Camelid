@@ -102,6 +102,7 @@ impl ServerMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     pub(crate) fn record_cuda_true_batch2(
         &self,
         shared_projection_launches: usize,

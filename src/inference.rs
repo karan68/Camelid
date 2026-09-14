@@ -2845,7 +2845,10 @@ impl LlamaInferenceSession {
         ))
     }
 
+    /// Mirror of the CUDA method so callers compile everywhere; nothing calls it
+    /// on a build that has no CUDA lane to group.
     #[cfg(not(feature = "cuda"))]
+    #[allow(dead_code)]
     pub(crate) fn cuda_true_batch_identity(&self) -> Option<(u64, u64, usize)> {
         None
     }

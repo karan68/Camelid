@@ -50,6 +50,8 @@ type ScalarCooperativeJob = Box<dyn FnMut(CooperativeStepContext) -> StepOutcome
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CooperativeBatchKey(u64, usize, CooperativeBatchPhase);
 
+// Only the CUDA lane builds batch keys, so neither variant is constructed on Metal.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CooperativeBatchPhase {
     Decode,
@@ -57,10 +59,12 @@ enum CooperativeBatchPhase {
 }
 
 impl CooperativeBatchKey {
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     pub(crate) fn new(group: u64, instance: usize) -> Self {
         Self(group, instance, CooperativeBatchPhase::Decode)
     }
 
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     pub(crate) fn prefill(group: u64, instance: usize) -> Self {
         Self(group, instance, CooperativeBatchPhase::Prefill)
     }
@@ -92,6 +96,8 @@ pub(crate) trait BatchableCooperativeJob: Any + Send {
         self.step_pair(others[0], context).map(Vec::from)
     }
 
+    /// Only the CUDA pairing path downcasts a job back to its concrete type.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     fn as_any_mut(&mut self) -> &mut dyn Any;
 
     fn completed_units(&self) -> Option<u64> {
