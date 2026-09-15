@@ -814,3 +814,22 @@ for (const fixture of [
 }
 
 console.log('first-run activation smoke: all checks passed')
+
+// A failed readiness check must retain the engine's actionable reason.
+{
+  const filename = 'Meta-Llama-3.1-8B-Instruct-Q8_0.gguf'
+  const reason = 'Estimated weight storage exceeds the configured budget.'
+  const result = await loadLocalModelForChat({
+    filename,
+    readActiveFilename: async () => filename,
+    fetchImpl: async (url) => {
+      if (url.endsWith('/v1/health')) return response({ body: {
+        loaded_now: true, generation_ready: false, active_model_id: filename,
+        generation_readiness_reason: reason,
+      } })
+      return response({ body: { architecture: 'llama', generation_capable: true } })
+    },
+  })
+  assert.equal(result.ok, false)
+  assert.equal(result.message, reason)
+}

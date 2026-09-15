@@ -194,7 +194,7 @@ try {
     selectedModelId: selectedModel.id,
     setSelectedModelId: noop,
     models: [selectedModel],
-    runtime: { ...readyRuntime, generation_ready: false },
+    runtime: { ...readyRuntime, generation_ready: false, generation_readiness_reason: 'Weight storage exceeds the configured budget.' },
     capabilities,
     pendingConversation: null,
     composer: 'Keep this draft editable',
@@ -205,7 +205,7 @@ try {
     selectedModelRunnable: false,
     setTab: noop,
   }))
-  assert.match(loadedButNotRunnableMarkup, /loaded, but this build cannot run it for Chat/, 'a completed fail-closed load must not look like an endless warmup')
+  assert.match(loadedButNotRunnableMarkup, /Weight storage exceeds the configured budget\./, 'a blocked load must explain the runtime blocker')
   assert.match(loadedButNotRunnableMarkup, /· Not runnable/, 'the model picker must distinguish a blocked loaded row from an active load')
   assert.match(loadedButNotRunnableMarkup, /Choose a runnable model; this loaded model is blocked/, 'the composer must give an actionable next step for a permanently blocked load')
   assert.doesNotMatch(loadedButNotRunnableMarkup, /warming up|· Loading|finishes getting ready/, 'generation_ready=false after a completed load must not masquerade as transient progress')

@@ -488,6 +488,10 @@ jobs:
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: npm run smoke:model-lanes
 
+      - name: Frontend model-loading status smoke
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: node scripts/model-loading-status-smoke.mjs
+
       - name: Frontend catalog activation smoke
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: npm run smoke:catalog-activation
