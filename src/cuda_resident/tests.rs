@@ -1818,6 +1818,25 @@ fn prism_cuda_fast_policy_is_per_construction_not_process_cached() {
 }
 
 #[test]
+fn prism_cuda_fast_defaults_to_strict_for_exact_windows_bonsai27b() {
+    use super::ResidentCudaArtifact::{Generic, PrismBonsai27bQ1};
+    let policy = super::prism_cuda_fast_for_artifact_policy;
+    assert!(!policy(None, PrismBonsai27bQ1, true));
+    assert!(policy(None, Generic, true));
+    assert!(policy(None, PrismBonsai27bQ1, false));
+    for strict in ["0", "false", "off", "no"] {
+        assert!(policy(Some(strict), PrismBonsai27bQ1, true));
+    }
+    for strict in ["", "invalid"] {
+        assert!(!policy(Some(strict), PrismBonsai27bQ1, true));
+    }
+    for strict in ["1", "true", "on", "yes"] {
+        assert!(!policy(Some(strict), PrismBonsai27bQ1, true));
+        assert!(!policy(Some(strict), Generic, true));
+    }
+}
+
+#[test]
 fn prism_cuda_popc_policy_is_exact_artifact_sm86_and_escape_safe() {
     let prism = super::ResidentCudaArtifact::PrismBonsai27bQ1;
     let generic = super::ResidentCudaArtifact::Generic;

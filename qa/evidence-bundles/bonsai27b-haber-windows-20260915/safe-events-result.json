@@ -1,0 +1,52 @@
+{
+  "id": "chatcmpl-runnable",
+  "object": "chat.completion",
+  "created": 1789486945,
+  "model": "Bonsai-27B",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": " is: in Haber Haber Haber Haber Haber"
+      },
+      "finish_reason": "length"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 15,
+    "completion_tokens": 8,
+    "total_tokens": 23
+  },
+  "camelid": {
+    "generated_token_ids": [
+      369,
+      25,
+      303,
+      214867,
+      214867,
+      214867,
+      214867,
+      214867
+    ],
+    "lane": "runnable",
+    "architecture": "qwen35",
+    "prompt_token_ids": [
+      248045,
+      846,
+      198,
+      6503,
+      488,
+      1970,
+      248046,
+      198,
+      248045,
+      74455,
+      198,
+      248068,
+      271,
+      248069,
+      271
+    ]
+  }
+}

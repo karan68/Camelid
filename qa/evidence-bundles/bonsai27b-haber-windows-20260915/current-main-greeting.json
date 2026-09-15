@@ -1,0 +1,76 @@
+{
+  "id": "chatcmpl-runnable",
+  "object": "chat.completion",
+  "created": 1789489678,
+  "model": "Bonsai-27B",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "Yes, I can code! I can help you write, debug, and explain code in many popular languages like Python, JavaScript, Java, C++, and more"
+      },
+      "finish_reason": "length"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 15,
+    "completion_tokens": 32,
+    "total_tokens": 47
+  },
+  "camelid": {
+    "generated_token_ids": [
+      9175,
+      11,
+      353,
+      628,
+      1970,
+      0,
+      353,
+      628,
+      1438,
+      488,
+      3165,
+      11,
+      7156,
+      11,
+      321,
+      10033,
+      1970,
+      303,
+      1599,
+      5243,
+      15005,
+      1040,
+      12654,
+      11,
+      12544,
+      11,
+      7693,
+      11,
+      351,
+      21733,
+      321,
+      777
+    ],
+    "lane": "runnable",
+    "architecture": "qwen35",
+    "prompt_token_ids": [
+      248045,
+      846,
+      198,
+      6503,
+      488,
+      1970,
+      248046,
+      198,
+      248045,
+      74455,
+      198,
+      248068,
+      271,
+      248069,
+      271
+    ]
+  }
+}
