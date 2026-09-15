@@ -10,6 +10,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod engine;
+mod lifecycle;
 mod ui_storage;
 
 use std::path::{Path, PathBuf};
@@ -26,7 +27,7 @@ const MODELS_DIRECTORY_PREFERENCE_FILE: &str = "models-directory.json";
 
 /// Managed state holding the running sidecar so it can be torn down on exit.
 #[derive(Default)]
-struct EngineState(Mutex<Option<Engine>>);
+struct EngineState(lifecycle::OwnedSidecar<Engine>);
 
 /// A durable startup snapshot which the splash can replay after its JavaScript loads.
 #[derive(Clone, serde::Serialize)]
@@ -335,6 +336,19 @@ fn main() {
             std::thread::spawn(move || start_engine(handle));
             Ok(())
         })
+        .on_window_event(|window, event| {
+            if window.label() == "main"
+                && matches!(event, tauri::WindowEvent::CloseRequested { .. })
+            {
+                // Quit before WebView teardown. Closing the main window must not
+                // leave the desktop or its GPU-owning sidecar in the background.
+                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                    api.prevent_close();
+                }
+                exit_engine(window.app_handle());
+                window.app_handle().exit(0);
+            }
+        })
         .build(tauri::generate_context!())
         .expect("error while building camelid-desktop")
         .run(|app_handle, event| {
@@ -342,7 +356,7 @@ fn main() {
                 event,
                 tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
             ) {
-                shutdown_engine(app_handle);
+                exit_engine(app_handle);
             }
         });
 }
@@ -387,10 +401,11 @@ fn start_engine(app: tauri::AppHandle) {
     match engine::spawn(&engine_path, models_dir.as_deref()) {
         Ok(eng) => {
             let url = eng.base_url();
-            if let Some(state) = app.try_state::<EngineState>() {
-                if let Ok(mut guard) = state.inner().0.lock() {
-                    *guard = Some(eng);
-                }
+            let Some(state) = app.try_state::<EngineState>() else {
+                return; // Dropping eng stops the unpublished sidecar.
+            };
+            if !state.0.install(eng) {
+                return; // Shutdown won the race with the startup worker.
             }
             emit_status(&app, "Engine ready. Loading\u{2026}");
             if let Some(window) = app.get_webview_window("main") {
@@ -435,11 +450,13 @@ fn start_engine(app: tauri::AppHandle) {
 /// Kill the sidecar cleanly on shutdown. Idempotent: `take()` ensures one shutdown.
 fn shutdown_engine(app_handle: &tauri::AppHandle) {
     if let Some(state) = app_handle.try_state::<EngineState>() {
-        if let Ok(mut guard) = state.0.lock() {
-            if let Some(mut eng) = guard.take() {
-                eng.shutdown();
-            }
-        }
+        state.0.stop(false);
+    }
+}
+
+fn exit_engine(app_handle: &tauri::AppHandle) {
+    if let Some(state) = app_handle.try_state::<EngineState>() {
+        state.0.stop(true);
     }
 }
 

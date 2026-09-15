@@ -633,10 +633,12 @@ pub fn plan_for_model_with_platform_and_env(
         }
         reasons.push(
             "Prism packed low-bit Windows CUDA lane selected; Q1_0/Q2_0 wire blocks remain \
-             packed and execute in the Qwen/Qwen3.5 resident CUDA graph. Q1_0 Qwen3.5 prompts \
-             use up to 128-token tensor-core prefill with Bonsai-specific D128 recurrent \
+             packed and execute in the Qwen/Qwen3.5 resident CUDA graph. The fast Q1_0 path \
+             can use up to 128-token tensor-core prefill with Bonsai-specific D128 recurrent \
              kernels; greedy text and image decode keep token lookup and RoPE selection \
-             on-device. CAMELID_PRISM_CUDA_STRICT=1 retains the exact arithmetic lane. \
+             on-device. Exact Bonsai-27B Q1 defaults to strict arithmetic after a repeated-token \
+             regression in fast Q1; CAMELID_PRISM_CUDA_STRICT=1 also selects strict arithmetic \
+             for other Prism rows. \
              Oversized rows stream a capacity-planned suffix from pinned host RAM"
                 .into(),
         );
@@ -644,7 +646,7 @@ pub fn plan_for_model_with_platform_and_env(
             "cuda_resident_prism_low_bit_runtime",
             "cuda_resident_prism_packed_wire",
             "prism_low_bit_cuda_resident_prefill",
-            "prism_q1_tensor_core_cuda_prefill",
+            "prism_low_bit_cuda_prefill",
             "prism_low_bit_cuda_resident_decode",
             "scalar_prism_block_decode_fallback",
         )

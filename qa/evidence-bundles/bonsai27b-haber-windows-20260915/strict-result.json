@@ -1,0 +1,77 @@
+{
+  "id": "chatcmpl-runnable",
+  "object": "chat.completion",
+  "created": 1789487022,
+  "model": "Bonsai-27B",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "```python\ndef add(a, b):\n    return a + b\n```"
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 31,
+    "completion_tokens": 17,
+    "total_tokens": 48
+  },
+  "camelid": {
+    "generated_token_ids": [
+      71093,
+      12305,
+      198,
+      727,
+      884,
+      2784,
+      11,
+      292,
+      1590,
+      198,
+      262,
+      460,
+      264,
+      478,
+      292,
+      198,
+      71093
+    ],
+    "lane": "runnable",
+    "architecture": "qwen35",
+    "prompt_token_ids": [
+      248045,
+      846,
+      198,
+      7734,
+      264,
+      12654,
+      709,
+      884,
+      2784,
+      11,
+      292,
+      8,
+      421,
+      4523,
+      836,
+      2542,
+      13,
+      20052,
+      1132,
+      279,
+      1970,
+      13,
+      248046,
+      198,
+      248045,
+      74455,
+      198,
+      248068,
+      271,
+      248069,
+      271
+    ]
+  }
+}

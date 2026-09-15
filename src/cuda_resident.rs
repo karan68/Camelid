@@ -14948,7 +14948,7 @@ pub(crate) const MAX_VERIFY_K: usize = 16;
 const MAX_PRISM_PREFILL_K: usize = 128;
 const DEFAULT_PRISM_BMMA_MIN_TOKENS: usize = 32;
 
-/// Fast Q1 CUDA is the production default. It matches the established
+/// Fast Q1 CUDA is the generic default. It matches the established
 /// Q1-by-Q8 contraction used by optimized CUDA runtimes and is deterministic,
 /// but activation quantization means it is not bit-identical to Camelid's
 /// original f32 reduction. Set `CAMELID_PRISM_CUDA_STRICT=1` for the exact lane.
@@ -14958,6 +14958,26 @@ fn prism_cuda_fast_policy(strict: Option<&str>) -> bool {
 
 fn prism_cuda_fast_from_env() -> bool {
     prism_cuda_fast_policy(std::env::var("CAMELID_PRISM_CUDA_STRICT").ok().as_deref())
+}
+
+/// The shipped fast Q1 path collapses into repeated tokens on the exact Windows
+/// Bonsai-27B artifact. Keep this row on f32 contractions until that path regains
+/// end-to-end parity. An explicit STRICT=0 remains a diagnostic opt-in; other
+/// artifacts and platforms retain their existing policy.
+fn prism_cuda_fast_for_artifact_policy(
+    strict: Option<&str>,
+    artifact: ResidentCudaArtifact,
+    windows: bool,
+) -> bool {
+    if windows && artifact == ResidentCudaArtifact::PrismBonsai27bQ1 {
+        return strict.is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            )
+        });
+    }
+    prism_cuda_fast_policy(strict)
 }
 
 /// Artifact identity for CUDA paths whose kernels/layouts are validated against
@@ -15447,7 +15467,16 @@ impl CudaResidentDecode {
         }
         let q_width = n_heads * head_dim;
         let kv_width = n_kv_heads * head_dim;
-        let fast_q1 = prism_cuda_fast_from_env();
+        let fast_q1 = prism_cuda_fast_for_artifact_policy(
+            std::env::var("CAMELID_PRISM_CUDA_STRICT").ok().as_deref(),
+            artifact,
+            cfg!(target_os = "windows"),
+        );
+        if artifact == ResidentCudaArtifact::PrismBonsai27bQ1
+            && std::env::var_os("CAMELID_RESIDENT_TRACE").is_some()
+        {
+            eprintln!("[prism-cuda] Bonsai-27B Q1 fast_q1={fast_q1}");
+        }
         let q1_policy = prism_q1_model_policy_for_geometry(
             fast_q1, artifact, n_layers, hidden, ffn_dim, q_width, kv_width,
         );

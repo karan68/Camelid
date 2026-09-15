@@ -4026,7 +4026,9 @@ impl RunnableModel {
                     }
                     out.push(id);
                     on_token(id);
-                    if out.len() >= max_new {
+                    // Match the host-fed and multimodal Qwen3.5 loops: a
+                    // device chunk must not bypass the short-cycle guard.
+                    if out.len() >= max_new || qwen35_repetition_loop(&out) {
                         break 'outer;
                     }
                 }
@@ -5339,6 +5341,8 @@ mod qwen35_imrope_tests {
 
     #[test]
     fn short_exact_repetition_cycles_stop_but_normal_lists_do_not() {
+        assert!(!qwen35_repetition_loop(&[7, 7, 7]));
+        assert!(qwen35_repetition_loop(&[7, 7, 7, 7]));
         assert!(qwen35_repetition_loop(&[7, 8, 7, 8, 7, 8, 7, 8]));
         assert!(qwen35_repetition_loop(&[
             1, 2, 3, 1, 2, 3, 1, 2, 3, 1, 2, 3
