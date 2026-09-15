@@ -2840,7 +2840,10 @@ fn router_with_state_and_policy(state: AppState, policy: server::ServerPolicy) -
             post(coding::decide),
         )
         .route("/api/agent/coding/sessions/:id/events", get(coding::events))
-        .route("/api/agent/coding/sessions/:id/preview-server", get(coding::preview_server_status).post(coding::preview_server_action))
+        .route(
+            "/api/agent/coding/sessions/:id/preview-server",
+            get(coding::preview_server_status).post(coding::preview_server_action),
+        )
         .route(
             "/api/agent/coding/sessions/:id/project",
             post(coding::project_action),
