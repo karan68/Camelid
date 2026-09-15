@@ -69,3 +69,24 @@ Both `prism_cuda_fast` policy unit tests and
 optimized Windows test binary. The installed engine's SHA256 was verified
 against the tested build; after desktop restart, Bonsai reported loaded and
 generation-ready.
+
+## Integration onto v0.7.4 main
+
+The fixes were rebased onto main `641af7ff` and rebuilt at `85337b80`.
+The resulting optimized Windows engine, SHA256
+`c402515ceda26df3f1fdd66373d7f02f77bffa93767c562b2a70f5f21956f76a`,
+passed the same four requests: greeting, correct Python function with natural
+stop, deterministic repeated greeting, and matching streamed function.
+No arithmetic, graph, or device-input overrides were set; the trace again
+recorded `fast_q1=false`. The `current-main-*` responses in the same bundle
+preserve this rerun separately from the initial build. These are bounded
+functional checks, not broad parity or performance qualification.
+
+All 19 desktop tests passed after integration, as did `npm ci`, `npm run build`,
+and formatting. The native close probe passed after readiness and without
+waiting for readiness. Its main-window selection was updated to exclude the
+newer hidden Spotlight window. The three lifecycle tests separately cover
+shutdown racing a late startup and retry.
+
+The subsequent v0.7.5 version bump changes package metadata only; release
+packaging and the cross-platform standard gates are checked by CI.

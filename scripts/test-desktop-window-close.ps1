@@ -29,7 +29,9 @@ public static class CamelidCloseProbe {
             GetWindowThreadProcessId(hwnd, out owner);
             var title = new System.Text.StringBuilder(512);
             GetWindowText(hwnd, title, title.Capacity);
-            if (owner == processId && title.ToString().Contains("Camelid")) {
+            // The hidden Spotlight window also has Camelid in its title.
+            // Send WM_CLOSE only to the main window under test.
+            if (owner == processId && (title.ToString() == "Camelid Desktop" || title.ToString() == "Camelid")) {
                 found = hwnd;
                 return false;
             }
