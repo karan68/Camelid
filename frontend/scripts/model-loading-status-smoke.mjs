@@ -24,5 +24,12 @@ try {
   }))
   assert.ok(blockedHtml.includes('Weight storage exceeds the configured budget.'))
   assert.ok(!blockedHtml.includes('this build cannot run it for Chat'))
+  assert.ok(!blockedHtml.includes('not runnable for Chat in this build'))
+  const unknownBlockerHtml = renderToStaticMarkup(createElement(ChatWorkspace, {
+    ...chatProps, models: [model], selectedModel: model, selectedModelId: model.id,
+    runtime: { status: 'online', loaded_now: true, active_model_id: model.id, generation_ready: false },
+  }))
+  assert.ok(unknownBlockerHtml.includes('Chat is unavailable. Check Models for details.'))
+  assert.ok(!unknownBlockerHtml.includes('waiting for runtime readiness'))
   console.log('Model loading status smoke: Models progress, Chat progress, and actual blocker rendered')
 } finally { await server.close() }

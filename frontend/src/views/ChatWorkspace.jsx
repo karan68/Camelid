@@ -390,7 +390,7 @@ export default function ChatWorkspace({
       : selectedModelIssue
         ? selectedModelIssue
         : selectedRuntimeLoadedButNotReady
-          ? runtime?.generation_readiness_reason || `${selectedModelName} is loaded; waiting for runtime readiness.`
+          ? runtime?.generation_readiness_reason || `${selectedModelName} is loaded, but Chat is unavailable. Check Models for details.`
         : supportBlocked
           ? `${selectedModelName} isn't verified for chat yet.`
           : selectedRuntimeMatchesLoadedModel
@@ -421,7 +421,7 @@ export default function ChatWorkspace({
           ? 'This model is loaded for embeddings and reranking. Choose a generation model to chat.'
           : 'This model creates embeddings for search and reranking. Load it from Models, or choose a generation model to chat.'
         : selectedRuntimeLoadedButNotReady
-          ? 'This model is loaded but not runnable for Chat in this build. Choose another model to continue.'
+          ? runtime?.generation_readiness_reason || 'This model is loaded, but Chat is unavailable. Check Models for details.'
         : supportBlocked
           /* When the blocker is a near miss — wrong file, or the right model at an
              unverified quantization — naming it is far more actionable than "pick a
