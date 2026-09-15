@@ -223,7 +223,7 @@ export async function loadLocalModelForChat({
       return {
         ok: false,
         stage: LOADING,
-        message: `Camelid loaded ${filename}, but it is not generation-ready yet.`,
+        message: health.generation_readiness_reason || `Camelid loaded ${filename}, but it is not generation-ready yet.`,
         code: '',
         blocker: null,
       }

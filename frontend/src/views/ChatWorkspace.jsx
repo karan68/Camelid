@@ -366,7 +366,10 @@ export default function ChatWorkspace({
      (send gate, reply cap, local-inference note) folds into the tooltip below. */
   const webResearchPlan = useMemo(() => classifyWebResearchNeed(composer), [composer])
   const webResearchWillUsePublicWeb = webResearchEnabled && webResearchPlan.needed && canChat
-  const statusLine = visibleWebResearchStatus?.phase === 'researching'
+  const loadProgress = runtime?.model_load_progress?.[0]
+  const statusLine = loadProgress
+    ? `Checking ${loadProgress.filename}: ${Math.floor(100 * loadProgress.bytes_read / Math.max(1, loadProgress.total_bytes))}% read.`
+    : visibleWebResearchStatus?.phase === 'researching'
     ? 'Reading relevant web sources before Camelid answers…'
     : webResearchWillUsePublicWeb
       ? 'Web Auto will send linked URLs or a search query to the public web.'
@@ -387,7 +390,7 @@ export default function ChatWorkspace({
       : selectedModelIssue
         ? selectedModelIssue
         : selectedRuntimeLoadedButNotReady
-          ? `${selectedModelName} is loaded, but this build cannot run it for Chat.`
+          ? runtime?.generation_readiness_reason || `${selectedModelName} is loaded; waiting for runtime readiness.`
         : supportBlocked
           ? `${selectedModelName} isn't verified for chat yet.`
           : selectedRuntimeMatchesLoadedModel

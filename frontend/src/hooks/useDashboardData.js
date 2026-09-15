@@ -267,10 +267,6 @@ function tokensPerSecond(tokens, elapsedMs) {
   return tokenCount / (duration / 1000)
 }
 
-function isLoadedModelGenerationReady(model) {
-  return Boolean(model?.llama_config && model?.llama_tensors && model?.tokenizer?.status === 'available')
-}
-
 function fallbackModelName(id, modelPath) {
   if (id) return id
   const fileName = modelPath?.split('/').filter(Boolean).pop() || ''
@@ -636,6 +632,8 @@ function makeDashboard({ health, models, currentModel, capabilities, conversatio
       loaded_now: Boolean(health?.loaded_now ?? health?.active_model_id),
       active_model_id: health?.active_model_id || null,
       generation_ready: Boolean(health?.generation_ready),
+      generation_readiness_reason: health?.generation_readiness_reason || null,
+      model_load_progress: health?.model_load_progress || [],
       active_context_length: Number(health?.active_context_length) || null,
       max_prompt_tokens: Number(health?.max_prompt_tokens) || null,
       max_generation_tokens: Number(health?.max_generation_tokens) || null,
@@ -837,6 +835,17 @@ export function useDashboardData({ showNotice, clearNotice }) {
       const health = await fetchJson(`${normalizedApiBase}/v1/health`).then((result) => {
         recordHealthPoll({ ok: true, latencyMs: performance.now() - healthStartedAt })
         observedHealth = result
+        setDashboard((current) => current ? {
+          ...current,
+          runtime: {
+            ...current.runtime,
+            loaded_now: Boolean(result.loaded_now),
+            active_model_id: result.active_model_id || null,
+            generation_ready: Boolean(result.generation_ready),
+            generation_readiness_reason: result.generation_readiness_reason || null,
+            model_load_progress: result.model_load_progress || [],
+          },
+        } : current)
         return result
       }, (error) => {
         recordHealthPoll({ ok: false, latencyMs: performance.now() - healthStartedAt })
@@ -2703,7 +2712,8 @@ export function useDashboardData({ showNotice, clearNotice }) {
       })
       const loadedId = loaded?.id || id
       const loadedPath = getModelPath(loaded) || model.model_path
-      const ready = isLoadedModelGenerationReady(loaded)
+      const loadedHealth = await fetchJson(`${normalizedApiBase}/v1/health`)
+      const ready = Boolean(loadedHealth?.generation_ready && loadedHealth?.active_model_id === loadedId)
       const fileType = getLoadedModelFileType(loaded)
       const quantLabel = getLoadedModelQuantLabel(loaded) || (fileType !== null && fileType !== undefined ? `file_type ${fileType}` : model.quant)
       const loadedRecord = {
@@ -2726,8 +2736,8 @@ export function useDashboardData({ showNotice, clearNotice }) {
         ready
           ? supportedByContract
             ? 'Model loaded and verified — you can start chatting.'
-            : 'Model loaded and running, but this build isn’t verified, so chat stays locked. The Compatibility page lists the verified builds.'
-          : 'Model loaded, but it isn’t ready to generate yet. Give it a moment, or check the Models page for details.',
+            : 'Model loaded and ready for chat. Replies are not verified for this model.'
+          : loadedHealth?.generation_readiness_reason || 'Model loaded; waiting for runtime readiness.',
         ready && supportedByContract ? 'success' : 'info',
       )
     } catch (error) {
@@ -2827,7 +2837,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
           ? 'Embedding model loaded as a sidecar. The current Chat model was left active.'
           : supportedByContract
             ? 'Model saved, loaded, and verified — you can start chatting.'
-            : 'Model saved and running, but this build isn’t verified, so chat stays locked. The Compatibility page lists the verified builds.',
+            : 'Model saved and ready for chat. Replies are not verified for this model.',
         embeddingOnly || supportedByContract ? 'success' : 'info',
       )
     } catch (error) {

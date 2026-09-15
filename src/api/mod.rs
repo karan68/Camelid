@@ -92,9 +92,9 @@ use crate::{
     BackendError,
 };
 
-const DEFAULT_CPU_WEIGHT_MATERIALIZATION_LIMIT_BYTES: u64 = 6 * 1024 * 1024 * 1024;
 const CPU_WEIGHT_MATERIALIZATION_LIMIT_ENV: &str = "CAMELID_MAX_CPU_WEIGHT_MATERIALIZATION_BYTES";
 const RETAIN_Q8_BLOCKS_ENV: &str = "CAMELID_RETAIN_Q8_0_BLOCKS";
+#[cfg(test)]
 const LAZY_Q8_LINEAR_ENV: &str = "CAMELID_LAZY_Q8_0_LINEAR";
 const METADATA_CHAT_TEMPLATE_ENV: &str = "CAMELID_METADATA_CHAT_TEMPLATE";
 const GENERATION_TIMEOUT_ENV: &str = "CAMELID_GENERATION_TIMEOUT_MS";
@@ -661,6 +661,9 @@ pub struct HealthResponse {
     pub build: String,
     pub loaded_now: bool,
     pub generation_ready: bool,
+    /// Actual blocker or warm-up state for the active model.
+    pub generation_readiness_reason: Option<String>,
+    pub model_load_progress: Vec<receipt::load_hash::HashProgress>,
     /// Effective context window of the active loaded runtime, not a catalog or
     /// training-context guess. WebUI prompt budgeting uses this value.
     pub active_context_length: Option<u32>,
@@ -3705,6 +3708,20 @@ async fn health_registry_snapshot(state: &AppState) -> HealthResponse {
         build: crate::receipt::camelid_version(),
         loaded_now,
         generation_ready,
+        generation_readiness_reason: if generation_ready {
+            None
+        } else if !state
+            .generation_warm
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            Some(
+                "The model is warming up. Chat will become available when initialization finishes."
+                    .into(),
+            )
+        } else {
+            model.and_then(|model| loaded_model_readiness(model).err())
+        },
+        model_load_progress: receipt::load_hash::progress(),
         active_context_length,
         max_prompt_tokens,
         max_generation_tokens,
@@ -3833,6 +3850,8 @@ fn busy_health_response(state: &AppState) -> HealthResponse {
         build: crate::receipt::camelid_version(),
         loaded_now: false,
         generation_ready: false,
+        generation_readiness_reason: None,
+        model_load_progress: receipt::load_hash::progress(),
         active_context_length: None,
         max_prompt_tokens: state.server_limits.max_prompt_tokens,
         max_generation_tokens: state.server_limits.max_generation_tokens,
@@ -5554,19 +5573,28 @@ fn health_generation_ready(loaded: bool, warm: bool) -> bool {
 }
 
 fn loaded_model_generation_ready(model: &LoadedModel) -> bool {
-    let Some(binding) = model.llama_tensors.as_ref() else {
-        return false;
-    };
+    loaded_model_readiness(model).is_ok()
+}
+
+fn loaded_model_readiness(model: &LoadedModel) -> Result<(), String> {
+    let binding = model.llama_tensors.as_ref().ok_or_else(|| {
+        "This model has no runnable tensor binding in the current engine.".to_string()
+    })?;
+    if model.llama_config.is_none() {
+        return Err("Camelid could not build this model's runtime configuration.".into());
+    }
+    if !matches!(model.tokenizer, TokenizerLoadState::Available(_)) {
+        return Err("This model's tokenizer is unavailable.".into());
+    }
     let (layer_range, load_embedding, load_output) = api_weight_load_ownership();
-    model.llama_config.is_some()
-        && matches!(model.tokenizer, TokenizerLoadState::Available(_))
-        && guard_cpu_weight_materialization_budget_with_ownership(
-            binding,
-            layer_range.as_ref(),
-            load_embedding,
-            load_output,
-        )
-        .is_ok()
+    guard_cpu_weight_materialization_budget_with_ownership(
+        binding,
+        layer_range.as_ref(),
+        load_embedding,
+        load_output,
+    )
+    .map(|_| ())
+    .map_err(|err| err.to_string())
 }
 
 /// Runtime GPU state for the UI toggle. `available` covers either a usable CUDA
@@ -16552,16 +16580,14 @@ fn build_loaded_model(
     let tokenizer_result = Tokenizer::from_gguf(&gguf);
     let tokenizer = tokenizer_state_from_result(tokenizer_result.as_ref());
     let tokenizer_runtime = tokenizer_result.ok().map(Arc::new);
-    // Hash the exact GGUF bytes once at load time so receipts and capability
-    // gates can name the lane without re-hashing per request. This must bypass
-    // the persistent performance cache: loaded-model identity authorizes exact
-    // tool-capable rows, and a writable cache entry is not cryptographic proof
-    // of the bytes that were loaded. Repeat loads in this process still take
-    // the idempotent fast path above and reuse this already-proven identity.
-    let gguf_sha256 = receipt::sha256_file_hex(&path).map_err(|err| match err {
-        receipt::ReceiptError::Io { path, source } => BackendError::Io { path, source },
-        other => BackendError::InvalidModelMetadata(other.to_string()),
-    })?;
+    // Only reuse digests computed in this process against unchanged filesystem
+    // identity. Never trust the writable persistent performance cache to authorize
+    // exact model capabilities. Cold reads publish byte progress to health.
+    let gguf_sha256 =
+        receipt::load_hash::sha256_file_hex_for_load(&path).map_err(|err| match err {
+            receipt::ReceiptError::Io { path, source } => BackendError::Io { path, source },
+            other => BackendError::InvalidModelMetadata(other.to_string()),
+        })?;
     let tokenizer_kind = tokenizer_runtime
         .as_ref()
         .map(|tokenizer| tokenizer.model.as_summary_model());
@@ -17379,7 +17405,14 @@ async fn load_weights_lru(
         )
     })?;
 
-    let limit_bytes = cpu_weight_materialization_limit_bytes().unwrap_or(u64::MAX);
+    let limit_bytes = cpu_weight_materialization_limit_bytes().map_err(|err| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "weight_budget_unavailable",
+            err.to_string(),
+            Some("model"),
+        )
+    })?;
 
     loop {
         let loaded = state.loaded_models.read().await;
@@ -17437,27 +17470,35 @@ async fn load_weights_lru(
         }
     }
 
-    let store = TensorStore::open(&model.path, &model.gguf);
-    // Only the coordinator reaches the API loader; a worker runs `run_worker_loop` instead.
-    // Its ownership is role-derived, not positional -- see `distributed::PipelineRole`.
-    let loaded = match layer_range {
-        Some(layer_range) => {
-            tracing::info!(
-                "API loader running in distributed coordinator mode; loading layers {}..{}",
-                layer_range.start,
-                layer_range.end
-            );
-            LlamaLoadedWeights::load_distributed(
+    // Weight materialization performs blocking multi-GB file reads. Running it
+    // on the async request executor stalls health and UI polling on slow disks.
+    let path = model.path.clone();
+    let gguf = model.gguf.clone();
+    let binding = binding.clone();
+    let loaded = tokio::task::spawn_blocking(move || {
+        let store = TensorStore::open(&path, &gguf);
+        match layer_range {
+            Some(layer_range) => LlamaLoadedWeights::load_distributed(
                 &store,
-                binding,
+                &binding,
                 layer_range.start,
                 layer_range.end,
                 load_embedding,
                 load_output,
-            )
+            ),
+            None => LlamaLoadedWeights::load(&store, &binding, None),
         }
-        None => LlamaLoadedWeights::load(&store, binding, None),
-    };
+    })
+    .await
+    .map_err(|err| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "weight_load_task_failed",
+            format!("Weight loading task failed: {err}"),
+            Some("model"),
+        )
+    })?;
+
     let weights = Arc::new(loaded.map_err(|err| {
         api_error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -19611,19 +19652,40 @@ async fn validate_generation_request(
     })
 }
 
+// This is a capacity ceiling, not a free-memory snapshot: checking the entire
+// retained model against *remaining* free RAM after loading would count it twice
+// and make health flip to unavailable after successful generation. The existing
+// fit preflight and KV/scratch allocation guards check live available memory.
 fn cpu_weight_materialization_limit_bytes() -> std::result::Result<u64, BackendError> {
-    match env::var(CPU_WEIGHT_MATERIALIZATION_LIMIT_ENV) {
-        Ok(value) if value.trim().is_empty() => Ok(DEFAULT_CPU_WEIGHT_MATERIALIZATION_LIMIT_BYTES),
-        Ok(value) => value.trim().parse::<u64>().map_err(|err| {
+    let configured = env::var(CPU_WEIGHT_MATERIALIZATION_LIMIT_ENV)
+        .map(Some)
+        .or_else(|err| {
+            if matches!(err, env::VarError::NotPresent) {
+                Ok(None)
+            } else {
+                Err(BackendError::InvalidModelMetadata(format!(
+                    "invalid {CPU_WEIGHT_MATERIALIZATION_LIMIT_ENV}: {err}"
+                )))
+            }
+        })?;
+    let (total, _) = crate::capability::host_ram_total_available_bytes();
+    resolve_weight_capacity(configured.as_deref(), total)
+}
+
+fn resolve_weight_capacity(configured: Option<&str>, total: u64) -> crate::Result<u64> {
+    if let Some(value) = configured.map(str::trim).filter(|value| !value.is_empty()) {
+        return value.parse::<u64>().map_err(|err| {
             BackendError::InvalidModelMetadata(format!(
                 "invalid {CPU_WEIGHT_MATERIALIZATION_LIMIT_ENV} {value:?}: {err}"
             ))
-        }),
-        Err(env::VarError::NotPresent) => Ok(DEFAULT_CPU_WEIGHT_MATERIALIZATION_LIMIT_BYTES),
-        Err(err) => Err(BackendError::InvalidModelMetadata(format!(
-            "invalid {CPU_WEIGHT_MATERIALIZATION_LIMIT_ENV}: {err}"
-        ))),
+        });
     }
+    if total == 0 {
+        return Err(BackendError::InvalidModelMetadata(format!(
+            "Cannot determine host RAM capacity; set {CPU_WEIGHT_MATERIALIZATION_LIMIT_ENV} to an explicit byte budget for this host."
+        )));
+    }
+    Ok(total)
 }
 
 fn cpu_weight_materialization_retains_q8_blocks() -> bool {
@@ -20450,7 +20512,7 @@ fn guard_cpu_weight_materialization_budget_with_ownership(
     let limit_bytes = cpu_weight_materialization_limit_bytes()?;
     if estimated_bytes > limit_bytes {
         return Err(BackendError::UnsupportedTensorType(format!(
-            "estimated CPU weight materialization/retention is {estimated_bytes} bytes, above safety limit {limit_bytes} bytes; dense Q8_0 linears retain expanded in-memory blocks by default and other CPU tensors may decode eagerly. Lower model size/quant target, set {LAZY_Q8_LINEAR_ENV}=1 only if deliberately accepting the slower file-backed Q8 path, or raise {CPU_WEIGHT_MATERIALIZATION_LIMIT_ENV} deliberately for a controlled run"
+            "estimated CPU weight materialization/retention is {estimated_bytes} bytes, above the host RAM capacity or configured weight budget of {limit_bytes} bytes. Use a smaller model or quantization, or review {CPU_WEIGHT_MATERIALIZATION_LIMIT_ENV} if an explicit budget is configured."
         )));
     }
     Ok(estimated_bytes)
@@ -32865,6 +32927,18 @@ mod tests {
             0
         );
         std::env::remove_var(LAZY_Q8_LINEAR_ENV);
+    }
+
+    #[test]
+    fn weight_capacity_tracks_host_ram_and_explicit_configuration() {
+        for total in [3_000_000_000, 17_179_869_184, 68_719_476_736] {
+            assert_eq!(resolve_weight_capacity(None, total).unwrap(), total);
+            assert_eq!(resolve_weight_capacity(Some("  "), total).unwrap(), total);
+        }
+        assert_eq!(resolve_weight_capacity(Some("1234"), 0).unwrap(), 1234);
+        assert_eq!(resolve_weight_capacity(Some("0"), 100).unwrap(), 0);
+        assert!(resolve_weight_capacity(None, 0).is_err());
+        assert!(resolve_weight_capacity(Some("invalid"), 100).is_err());
     }
 
     #[test]
