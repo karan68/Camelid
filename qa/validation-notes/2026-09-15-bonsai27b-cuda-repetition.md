@@ -47,7 +47,7 @@ than claiming tensor-core prefill regardless of the selected arithmetic.
 
 ## Patched engine validation
 
-The local optimized Windows build, SHA256
+The initial optimized Windows build (source base `04938343`, plus this fix), SHA256
 `c178b65a43f583f78cabea8a8c46e26b023e9227cda2b06176e30d41a0935ecf`,
 passed these checks with no arithmetic, graph, or device-input overrides:
 
