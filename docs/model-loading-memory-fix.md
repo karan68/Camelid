@@ -36,7 +36,7 @@ request executor. Large USB reads therefore leave the HTTP listener and health
 polling schedulable. The model picker also waits for the engine's readiness
 response; metadata alone is not treated as evidence that generation can run.
 
-## Installed-build check on the affected M4 Mac
+## Targeted M4 regression check
 
 Both `Llama-3.2-3B-Instruct-Q4_K_M.gguf` and
 `Meta-Llama-3.1-8B-Instruct-Q8_0.gguf` returned “Hello!” twice with the default
@@ -51,7 +51,8 @@ using the trusted process-local hash. These reload numbers do not include
 rematerializing weights after an unload. The second chat on each resident model
 reported a weight-cache hit and 0 ms weight loading.
 
-The patched app is installed in `/Applications/Camelid Desktop.app`; quit and
-reopen it to use the new engine. Installation keeps a timestamped backup under
-`~/Library/Application Support/Camelid Backups/`. Raw checks and the installed
-binary digest are in `qa/model-loading-memory-fix/results.json` and `install.json`.
+The sanitized measurements and tested engine digest are in
+`qa/model-loading-memory-fix/results.json`. These short greeting checks validate
+this loading regression; they do not expand the documented model support or
+parity guarantees. Measurements were collected on the v0.7.4-based fix before
+rebasing onto the subsequent main-branch changes.
