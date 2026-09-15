@@ -101,6 +101,8 @@ export function useCodingSession(apiBase, activeModelId, loadedNow) {
   })
   const projectAction = body => mutate(async () => accept(await codingRequest(apiBase, '/' + encodeURIComponent(selectedId) + '/project', { method: 'POST', body })))
   const loadPreview = signal => codingRequest(apiBase, '/' + encodeURIComponent(selectedId) + '/preview', { signal })
+  const previewServerStatus = signal => codingRequest(apiBase, '/' + encodeURIComponent(selectedId) + '/preview-server', { signal })
+  const managePreview = (action, entry = '') => codingRequest(apiBase, '/' + encodeURIComponent(selectedId) + '/preview-server', { method: 'POST', body: { action, entry } })
   const remove = () => mutate(async () => {
     await codingRequest(apiBase, '/' + encodeURIComponent(selectedId), { method: 'DELETE' })
     select(''); await refresh()
@@ -109,5 +111,5 @@ export function useCodingSession(apiBase, activeModelId, loadedNow) {
     await refresh()
     if (selectedId) { accept(await codingRequest(apiBase, '/' + encodeURIComponent(selectedId))); setConnection('connected') }
   })
-  return { snapshot, sessions, toolCapableModel, executionEngine, projectAction, loadPreview, selectedId, select, send, control, setAutoApproveFiles, decide, remove, retry, busy, error, connection, decidingId }
+  return { snapshot, sessions, toolCapableModel, executionEngine, projectAction, loadPreview, previewServerStatus, managePreview, selectedId, select, send, control, setAutoApproveFiles, decide, remove, retry, busy, error, connection, decidingId }
 }

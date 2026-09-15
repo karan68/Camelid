@@ -28,6 +28,7 @@ pub(crate) mod client;
 mod clipboard;
 pub(crate) mod coding;
 pub(crate) mod coding_project;
+pub(crate) mod preview_server;
 mod inline;
 mod markdown;
 mod mcp;

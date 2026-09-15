@@ -2840,6 +2840,7 @@ fn router_with_state_and_policy(state: AppState, policy: server::ServerPolicy) -
             post(coding::decide),
         )
         .route("/api/agent/coding/sessions/:id/events", get(coding::events))
+        .route("/api/agent/coding/sessions/:id/preview-server", get(coding::preview_server_status).post(coding::preview_server_action))
         .route(
             "/api/agent/coding/sessions/:id/project",
             post(coding::project_action),
@@ -23015,6 +23016,7 @@ fn generate_token_ids(
         history.push(step.next_token_id);
         // Commit exactly the token LLGuidance allowed. No lossy token
         // decode/re-encode round trip is involved.
+        prepared.engine_progress.record_progress(generated.len());
         if let Some(state) = grammar.as_mut() {
             if state.commit_token(step.next_token_id).map_err(|err| {
                 Box::new(api_error(
