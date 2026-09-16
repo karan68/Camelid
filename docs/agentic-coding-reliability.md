@@ -33,3 +33,33 @@ Users can save a project workflow after a current passing check. The named workf
 The connected-engine runner is not a general execution-backend interface, fleet manager, or OS sandbox. Broader unattended execution requires an isolated backend with explicit filesystem, network, environment, and cancellation capabilities. Exact command approval and execution isolation remain separate responsibilities.
 
 Richer browser interactions, independent helper budgets, and broader model scheduling remain future work. Validate lifecycle invariants with deterministic fixtures and report exact-artifact live-model failures separately. A tool-capability gate does not certify coding quality.
+
+## Managed static previews
+
+Code tasks can use `start_preview`, `open_preview`, and `stop_preview`, including
+when shell commands are disabled. `open_preview` starts or reuses a local static
+HTTP server and opens Google Chrome on the engine's computer. These agent actions
+use the existing per-action approval dialog; automatic file approval does not
+approve them. The Preview panel also has direct Start, Open in Chrome, and Stop
+controls.
+
+Set the project's Preview entry (for example `tiny-board/index.html`), or pass
+`entry` to the tool. With no entry configured, Camelid uses `index.html` at the
+workspace root or the unique immediate subfolder containing it. Ambiguous sites
+require an explicit entry. The containing folder is the site's document root.
+
+The server binds only to `127.0.0.1` on an available port. It serves HTML, CSS,
+JavaScript, JSON, images, fonts, and other supported static assets with their MIME
+types, including absolute asset paths within that site. Hidden paths, traversal,
+paths escaping the site, and assets over 16 MB are refused. Changed files are read
+on reload; there is no build step or hot-reload injection. Framework development
+servers and application backends are outside this static-preview feature.
+
+The preview survives agent completion and command timeouts. Repeated starts reuse
+its URL. Stop closes the listener without closing Chrome tabs; engine shutdown or
+deleting the task also closes it. A restart never replays a browser launch or
+pretends a saved URL is still live. Opening Chrome is not recorded as a passing
+browser test. The API supports `GET` and `POST` at
+`/api/agent/coding/sessions/:id/preview-server`. POST accepts `action` (`start`,
+`open`, or `stop`) and an optional `entry` such as `tiny-board/index.html`;
+management remains same-origin and loopback-only.

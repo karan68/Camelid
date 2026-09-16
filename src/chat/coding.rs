@@ -170,6 +170,7 @@ pub(crate) struct Run {
     children: Mutex<Vec<thread::JoinHandle<()>>>,
     model_lock: Mutex<()>,
     prepared_check: Mutex<Option<project::PreparedCheck>>,
+    preview_server: Mutex<Option<super::preview_server::PreviewServer>>,
 }
 #[derive(Clone)]
 pub(crate) struct Manager {
@@ -457,6 +458,7 @@ impl Run {
             children: Mutex::default(),
             model_lock: Mutex::new(()),
             prepared_check: Mutex::new(None),
+            preview_server: Mutex::new(None),
         }
     }
     pub fn snapshot(&self) -> Snapshot {
@@ -465,6 +467,80 @@ impl Run {
             .unwrap_or_else(|p| p.into_inner())
             .snapshot
             .clone()
+    }
+
+    pub fn preview_status(&self) -> super::preview_server::Status {
+        self.preview_server
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .map(|s| s.status())
+            .unwrap_or_default()
+    }
+
+    pub fn manage_preview(
+        &self,
+        action: &str,
+        entry: &str,
+    ) -> Result<super::preview_server::Status, String> {
+        if !matches!(action, "start" | "open" | "stop") {
+            return Err("Unknown preview action.".into());
+        }
+        let config = self.snapshot().config;
+        let mut server = self
+            .preview_server
+            .lock()
+            .map_err(|_| "Preview server unavailable.")?;
+        if action == "stop" {
+            *server = None;
+            return Ok(Default::default());
+        }
+        let requested = if entry.is_empty() {
+            &config.project.preview_entry
+        } else {
+            entry
+        };
+        let entry = if requested.is_empty() {
+            if config.workspace.join("index.html").is_file() {
+                "index.html".into()
+            } else {
+                let mut candidates = Vec::new();
+                for child in fs::read_dir(&config.workspace)
+                    .map_err(|e| e.to_string())?
+                    .take(128)
+                    .flatten()
+                {
+                    let name = child.file_name().to_string_lossy().into_owned();
+                    if !name.starts_with('.')
+                        && !matches!(name.as_str(), "target" | "node_modules")
+                        && child.path().join("index.html").is_file()
+                    {
+                        candidates.push(format!("{name}/index.html"));
+                    }
+                }
+                if candidates.len() != 1 {
+                    return Err("Set Preview entry to the site's HTML file (for example tiny-board/index.html).".into());
+                }
+                candidates.remove(0)
+            }
+        } else {
+            requested.replace('\\', "/")
+        };
+        if !server
+            .as_ref()
+            .is_some_and(|s| s.matches(&config.workspace, &entry))
+        {
+            // Validate and bind the replacement before stopping a working preview.
+            let replacement =
+                super::preview_server::PreviewServer::start(&config.workspace, &entry)?;
+            *server = Some(replacement);
+        }
+        let server = server.as_mut().unwrap();
+        if action == "open" {
+            server.open_chrome()
+        } else {
+            Ok(server.status())
+        }
     }
     fn phase(&self) -> Phase {
         self.saved
@@ -869,6 +945,10 @@ impl Run {
         );
         driver.set_context_budget(Some(config.context_tokens));
         driver.set_native_tool_history(true);
+        // Dense Qwen3 supports the server's token-level JSON schema decoder.
+        // Other tool-capable lanes retain their established native protocol.
+        let family = self.snapshot().config.family.to_ascii_lowercase();
+        driver.set_constrained_actions(family.contains("qwen3") && !family.contains("qwen35"));
         driver.set_stream_control(self.cancel.clone(), agent::AGENT_MODEL_STEP_TIMEOUT);
         let run = self.clone();
         let key = agent_id.to_string();
@@ -1320,7 +1400,14 @@ impl Reporter for CodingReporter {
             "agent.notice",
             json!({"content":clipped(text,4000)}),
             true,
-            |_| {},
+            |s| {
+                if self.agent_id == "lead"
+                    && (text.starts_with("model error:")
+                        || text.starts_with("context budget error:"))
+                {
+                    s.error = clipped(text, 4000);
+                }
+            },
         );
     }
     fn model_timing(&mut self, metrics: ModelStepMetrics) {
@@ -1863,6 +1950,12 @@ impl ToolExecutor for CodingController {
             Action::Coding {
                 operation: CodingOperation::VerifyProject,
             } => self.run.verify(sandbox, cancel),
+            Action::Coding { operation: CodingOperation::Preview { action, entry } } => {
+                self.run.manage_preview(action, entry).map(|status| {
+                    self.run.update("lead", "preview.updated", json!(status), true, |_| {});
+                    json!({"preview": status, "note": "The server stays running until Stop preview or engine shutdown. Opening Chrome is not a browser test."}).to_string()
+                })
+            },
             Action::WriteFile { .. } | Action::EditFile { .. } => {
                 let key = self
                     .prepared
@@ -2011,6 +2104,88 @@ mod tests {
             file,
             journal,
         ))
+    }
+
+    #[test]
+    fn managed_preview_survives_completion_without_command_permission() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("tiny-board")).unwrap();
+        fs::write(dir.path().join("tiny-board/index.html"), "<h1>Ready</h1>").unwrap();
+        let run = test_run(dir.path(), Arc::new(Journal::default()));
+        assert!(!run.snapshot().config.allow_commands);
+        let first = run.manage_preview("start", "").unwrap();
+        assert!(first.running);
+        assert_eq!(first.entry.as_deref(), Some("tiny-board/index.html"));
+        assert_eq!(
+            first.url,
+            run.manage_preview("start", "tiny-board/index.html")
+                .unwrap()
+                .url
+        );
+        assert!(run.manage_preview("start", "missing.html").is_err());
+        assert_eq!(first.url, run.preview_status().url);
+        run.finish(LoopEnd::Answered, None);
+        assert!(run.preview_status().running);
+        let saved = run.saved.lock().unwrap().clone();
+        let restored = Run::new(
+            saved,
+            dir.path().join("restored.json"),
+            Arc::new(Journal::default()),
+        );
+        assert!(
+            !restored.preview_status().running,
+            "restart must not invent or replay a server"
+        );
+        assert!(!run.manage_preview("stop", "").unwrap().running);
+        assert!(!run.manage_preview("stop", "").unwrap().running);
+        assert!(run.manage_preview("start", "../index.html").is_err());
+        let specs = tools::specs_for(ToolProfile::Coding, false, ShellSandbox::Disabled);
+        for name in ["start_preview", "open_preview", "stop_preview"] {
+            assert!(specs
+                .iter()
+                .any(|s| s.name == name && s.risk == tools::Risk::Exec));
+            assert!(!ToolProfile::WorkspaceReadOnly.allows(name));
+        }
+    }
+
+    #[test]
+    fn managed_preview_tool_requires_approval_and_dispatches_without_shell() {
+        for approved in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            fs::write(dir.path().join("index.html"), "<h1>Preview</h1>").unwrap();
+            let run = test_run(dir.path(), Arc::new(Journal::default()));
+            run.set_auto_approve_files(&run.snapshot().run_id, true)
+                .unwrap();
+            let sb = Sandbox::new(dir.path(), false, Duration::from_secs(1))
+                .unwrap()
+                .with_shell_mode(ShellSandbox::Disabled);
+            let action = Action::Coding {
+                operation: CodingOperation::Preview {
+                    action: "start".into(),
+                    entry: "index.html".into(),
+                },
+            };
+            let mut c = controller(run.clone());
+            let worker = thread::spawn(move || {
+                let decision = c.approve(&action, &sb);
+                if decision == Decision::Once {
+                    assert!(!c.execute(&action, &sb, &AtomicBool::new(false)).is_err());
+                }
+                decision
+            });
+            let approval = pending(&run);
+            assert!(!run.preview_status().running);
+            run.decide(&approval, approved).unwrap();
+            assert_eq!(
+                worker.join().unwrap(),
+                if approved {
+                    Decision::Once
+                } else {
+                    Decision::No
+                }
+            );
+            assert_eq!(run.preview_status().running, approved);
+        }
     }
     fn wait_for_snapshot(
         run: &Run,

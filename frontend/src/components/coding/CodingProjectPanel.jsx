@@ -15,11 +15,38 @@ export function CodingProjectPanel({ panel, coding, settings, setSettings, runni
   const [preview, setPreview] = useState(null)
   const [previewError, setPreviewError] = useState('')
   const [loading, setLoading] = useState(false)
+  const [server, setServer] = useState(null)
+  const [serverBusy, setServerBusy] = useState(false)
+  const [serverError, setServerError] = useState('')
+  const selectedSession = useRef(snapshot?.id)
+  selectedSession.current = snapshot?.id
   const [restore, setRestore] = useState(null)
   const frame = useRef(null)
   const projectKey = JSON.stringify(snapshot?.config.project || settings)
   useEffect(() => { setDraft(JSON.parse(projectKey)) }, [projectKey])
   useEffect(() => { setPreview(null); setPreviewError(''); setSaved('') }, [snapshot?.id])
+  useEffect(() => { setServer(null); setServerError(''); setServerBusy(false) }, [snapshot?.id])
+  useEffect(() => {
+    if (panel !== 'preview' || !snapshot?.id || !coding.previewServerStatus) return
+    const controller = new AbortController()
+    coding.previewServerStatus(controller.signal).then(status => { if (!controller.signal.aborted) setServer(status) }).catch(error => {
+      if (!controller.signal.aborted) setServerError(error.message)
+    })
+    return () => controller.abort()
+  }, [panel, snapshot?.id, snapshot?.seq])
+  const manageServer = async action => {
+    const session = snapshot?.id
+    setServerBusy(true); setServerError('')
+    try {
+      const status = await coding.managePreview(action, draft.preview_entry || '')
+      if (selectedSession.current === session) setServer(status)
+    } catch (error) {
+      if (selectedSession.current === session) {
+        setServerError(error.message)
+        coding.previewServerStatus().then(status => { if (selectedSession.current === session) setServer(status) }).catch(() => {})
+      }
+    } finally { if (selectedSession.current === session) setServerBusy(false) }
+  }
   const storageKey = `camelid.preview.${snapshot?.config.project?.engine_id || 'engine'}.${snapshot?.config.workspace || ''}`
   useEffect(() => {
     const receive = event => {
@@ -46,6 +73,15 @@ export function CodingProjectPanel({ panel, coding, settings, setSettings, runni
     finally { setLoading(false) }
   }
   if (panel === 'preview') return <section className="coding-project-panel" aria-label="Project preview">
+    <h3>Test in Chrome</h3>
+    <p>Start a local server for your HTML, CSS and JavaScript. It stays available after the task finishes, until you stop it or close Camelid.</p>
+    <div className="coding-row">
+      <Button size="sm" disabled={!snapshot || serverBusy} onClick={() => manageServer('start')}>{server?.running ? 'Preview running' : 'Start preview server'}</Button>
+      <Button size="sm" disabled={!snapshot || serverBusy} onClick={() => manageServer('open')}>Open in Chrome</Button>
+      <Button size="sm" disabled={!server?.running || serverBusy} onClick={() => manageServer('stop')}>Stop preview server</Button>
+    </div>
+    {server?.running && <p><a href={server.url} target="_blank" rel="noopener noreferrer">{server.url}</a><br /><span className="coding-muted">Reload Chrome after file changes. Opening the site does not record a passing test.</span></p>}
+    {serverError && <p role="alert">{serverError}</p>}
     <h3>Project preview</h3><p>Open the static HTML page with its local CSS and JavaScript. Preview storage is saved separately for this project.</p>
     <Button size="sm" disabled={!snapshot || loading || running} onClick={loadPreview}>{loading ? 'Loading…' : preview ? 'Refresh preview' : 'Open preview'}</Button>
     {running && <p>Wait for the current edits to settle before opening a preview.</p>}

@@ -657,7 +657,11 @@ pub(crate) fn run_loop_with_executor(
                 match executor.review_answer(&text) {
                     Ok(Some(feedback)) => {
                         reporter.notice("Continuing: the agent described unfinished work");
-                        history.push(AgentMsg::Assistant(text));
+                        // A rejected/truncated tool-call response can contain
+                        // thousands of tokens of code that never executed.
+                        // Keep a bounded diagnostic, not that entire payload,
+                        // so the corrective step still fits the context budget.
+                        history.push(AgentMsg::Assistant(rejected_answer_excerpt(&text)));
                         history.push(AgentMsg::Summary(
                             "The preceding model response was rejected as unfinished. It was plain text and did not create or change files or run tools. Only recorded tool results establish executed actions.".into(),
                         ));
@@ -1351,12 +1355,20 @@ fn context_budget_usage(
     }
 }
 
+fn rejected_answer_excerpt(text: &str) -> String {
+    if text.trim_start().starts_with("<tool_call>") {
+        "[Malformed or incomplete tool call omitted; no tool was executed.]".into()
+    } else {
+        first_line(text, 512)
+    }
+}
+
 fn fit_history_to_budget(
     driver: &mut dyn ModelDriver,
     mut history: Vec<AgentMsg>,
     tools: &[ToolSpec],
     max_tokens: u32,
-    _profile: tools::ToolProfile,
+    profile: tools::ToolProfile,
 ) -> Result<(Vec<AgentMsg>, bool, Option<u32>), String> {
     let Some(budget) = driver.context_budget_tokens() else {
         return Ok((history, false, None));
@@ -1377,6 +1389,12 @@ fn fit_history_to_budget(
             Ok(Some(_)) if shrink_largest_tool_observation(&mut history) => {
                 trimmed = true;
             }
+            Ok(Some(_))
+                if profile == tools::ToolProfile::Coding
+                    && summarize_oldest_tool_exchange(&mut history) =>
+            {
+                trimmed = true;
+            }
             Ok(Some(prompt_tokens)) => {
                 return Err(format!(
                     "required prompt ({prompt_tokens} tokens) plus generation allowance \
@@ -1386,6 +1404,68 @@ fn fit_history_to_budget(
             Err(error) => return Err(error),
         }
     }
+}
+
+/// File-write arguments can fill the prompt even after result text is clipped.
+/// Fold a completed exchange as a unit, preserving all user instructions and
+/// the most recent tool exchange. Never retain file contents as instructions.
+fn summarize_oldest_tool_exchange(history: &mut Vec<AgentMsg>) -> bool {
+    let Some(last) = history
+        .iter()
+        .rposition(|m| matches!(m, AgentMsg::ToolCalls(_)))
+    else {
+        return false;
+    };
+    for index in 0..last {
+        let AgentMsg::ToolCalls(calls) = &history[index] else {
+            continue;
+        };
+        if calls.is_empty() || index + calls.len() >= history.len() {
+            continue;
+        }
+        let results = &history[index + 1..index + 1 + calls.len()];
+        if !calls.iter().zip(results).all(|(call, result)| matches!(result, AgentMsg::ToolResult {name, ..} if name == &call.name)) {
+            continue;
+        }
+        let mut summary =
+            String::from("Earlier completed tools (record only; re-read files if needed):\n");
+        for (call, result) in calls.iter().zip(results) {
+            let AgentMsg::ToolResult { outcome, .. } = result else {
+                unreachable!()
+            };
+            let path = call.args.get("path").and_then(Value::as_str).unwrap_or("");
+            summary.push_str(&format!(
+                "{} {}: {}\n",
+                call.name,
+                first_line(path, 160),
+                if outcome.is_err() {
+                    "failed"
+                } else {
+                    "succeeded"
+                }
+            ));
+        }
+        let end = index + 1 + calls.len();
+        // A tiny exchange may cost less than its summary. Skip it rather than
+        // repeatedly making an already constrained prompt larger.
+        let before = history[index..end]
+            .iter()
+            .map(|m| match m {
+                AgentMsg::ToolCalls(calls) => calls
+                    .iter()
+                    .map(|c| c.name.len() + c.args.to_string().len())
+                    .sum::<usize>(),
+                AgentMsg::ToolResult { name, outcome } => name.len() + outcome.text().len(),
+                _ => 0,
+            })
+            .sum::<usize>();
+        if summary.len() >= before {
+            continue;
+        }
+        history.splice(index..end, [AgentMsg::Summary(summary)]);
+        return true;
+    }
+    false
 }
 
 fn remove_oldest_optional_context(history: &mut Vec<AgentMsg>) -> bool {
@@ -2083,6 +2163,7 @@ pub type DeltaSink = Box<dyn FnMut(&str) + Send>;
 /// sent so the server renders them through the model's own chat template; the
 /// model's output is parsed here into tool calls (family-specific, Phase 1).
 pub struct LiveDriver {
+    constrained_actions: bool,
     client: Client,
     model_id: String,
     /// Exact bytes authorized when this agent session started. Included on
@@ -2122,6 +2203,7 @@ impl LiveDriver {
     pub fn new(session: &Session, max_tokens: u32, temperature: f32) -> Self {
         let model_id = session.active_id.clone().unwrap_or_default();
         Self {
+            constrained_actions: false,
             client: session.client(),
             model_id,
             expected_gguf_sha256: session.active_gguf_sha256().unwrap_or_default().to_string(),
@@ -2152,6 +2234,7 @@ impl LiveDriver {
         temperature: f32,
     ) -> Self {
         Self {
+            constrained_actions: false,
             client,
             model_id,
             expected_gguf_sha256,
@@ -2198,6 +2281,10 @@ impl LiveDriver {
     pub fn set_native_tool_history(&mut self, enabled: bool) {
         self.native_tool_history = enabled;
     }
+
+    pub fn set_constrained_actions(&mut self, enabled: bool) {
+        self.constrained_actions = enabled;
+    }
 }
 
 impl ModelDriver for LiveDriver {
@@ -2217,6 +2304,9 @@ impl ModelDriver for LiveDriver {
         self.last_step_metrics = None;
         self.last_prompt_tokens = None;
         let tool_defs = tools_to_json(tools);
+        if self.constrained_actions {
+            return self.step_constrained(history, &tool_defs);
+        }
         // TUI lane: stream the model's output live. Tool calls come off the
         // stream's structured `tool_calls` deltas, with text parsing as the
         // fallback — the same two-source rule the blocking path below uses.
@@ -2310,19 +2400,41 @@ impl ModelDriver for LiveDriver {
 }
 
 impl LiveDriver {
+    fn step_constrained(
+        &mut self,
+        history: &[AgentMsg],
+        tools: &[Value],
+    ) -> Result<ModelStep, String> {
+        let started = Instant::now();
+        let timeout = self
+            .remaining_step_timeout()?
+            .unwrap_or(AGENT_MODEL_STEP_TIMEOUT);
+        let cancel = self.stream_cancel.as_deref().unwrap_or(&CANCEL);
+        let request = self.request(history, tools, self.fold_system_role, false);
+        let turn = self
+            .client
+            .chat_turn_with_control(&request, cancel, timeout)
+            .map_err(|e| e.to_string())?;
+        self.last_prompt_tokens = turn.prompt_tokens;
+        self.last_step_metrics = Some(ModelStepMetrics {
+            total_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+            ttft_ms: None,
+            output_tokens: turn.completion_tokens,
+        });
+        self.last_step_truncated = turn.finish_reason.as_deref() == Some("length");
+        if self.last_step_truncated {
+            return Err("The model exhausted its reply budget before completing a constrained action. No tool was executed. Use smaller file edits or a larger reply budget.".into());
+        }
+        parse_constrained_action(&turn.content, tools)
+    }
+
     fn preflight_prompt_tokens(
         &self,
         history: &[AgentMsg],
         tool_defs: &[Value],
         fold_system: bool,
     ) -> Result<u32, String> {
-        let mut request = self.request(history, tool_defs, fold_system, false);
-        if let Some(object) = request.as_object_mut() {
-            // Count the rendering even when it exceeds the fitter budget. The
-            // client accepts only the server's typed prompt-limit count; every
-            // other preflight error still fails the step.
-            object.remove("camelid_context_budget_tokens");
-        }
+        let request = self.preflight_request(history, tool_defs, fold_system);
         let timeout = self.remaining_step_timeout()?;
         let count = match (self.stream_cancel.as_deref(), timeout) {
             (Some(cancel), Some(timeout)) => self
@@ -2334,6 +2446,25 @@ impl LiveDriver {
             _ => self.client.generation_preflight(&request),
         };
         count.map_err(|error| error.to_string())
+    }
+
+    fn preflight_request(
+        &self,
+        history: &[AgentMsg],
+        tool_defs: &[Value],
+        fold_system: bool,
+    ) -> Value {
+        let mut request = self.request(history, tool_defs, fold_system, false);
+        if let Some(object) = request.as_object_mut() {
+            // Count the rendering even when it exceeds the fitter budget. The
+            // client accepts only the server's typed prompt-limit count; every
+            // other preflight error still fails the step.
+            object.remove("camelid_context_budget_tokens");
+            // Output constraints do not change the rendered prompt, and the
+            // count-only endpoint does not accept decoding constraints.
+            object.remove("response_format");
+        }
+        request
     }
 
     fn remaining_step_timeout(&self) -> Result<Option<Duration>, String> {
@@ -2369,6 +2500,41 @@ impl LiveDriver {
             "max_tokens": self.max_tokens,
             "temperature": self.temperature,
         });
+        if self.constrained_actions {
+            request.as_object_mut().unwrap().remove("tools");
+            request["stream"] = json!(false);
+            request["camelid_enable_thinking"] = json!(false);
+            request["response_format"] = json!({"type":"json_schema","json_schema":{
+                "name":"coding_action","strict":true,"schema":coding_action_schema(tool_defs)
+            }});
+            let instruction = format!(
+                "Output exactly one JSON object: {{\"name\":\"tool_name\",\"arguments\":{{...}}}}. No XML tags, markdown, or prose outside JSON. To finish, use {{\"name\":\"final_answer\",\"arguments\":{{\"text\":\"your report\"}}}}. Tool arguments must follow their schemas. Keep file writes compact enough for the reply budget; use small edit_file changes to extend existing files. A plan is not evidence of execution. Available tool schemas: {}", serde_json::to_string(tool_defs).unwrap()
+            );
+            let mut structured_history = history
+                .iter()
+                .map(|message| match message {
+                    AgentMsg::ToolCalls(calls) => AgentMsg::Assistant(
+                        calls
+                            .iter()
+                            .map(|call| json!({"name":call.name,"arguments":call.args}).to_string())
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    ),
+                    _ => message.clone(),
+                })
+                .collect::<Vec<_>>();
+            if let Some(AgentMsg::System(system)) = structured_history.first_mut() {
+                system.push('\n');
+                system.push_str(&instruction);
+            } else {
+                structured_history.insert(0, AgentMsg::System(instruction));
+            }
+            // Use ordinary tool-result roles; XML tool-call examples conflict
+            // with the constrained JSON action protocol.
+            let messages =
+                history_to_messages(&structured_history, fold_system, &self.family, false);
+            request["messages"] = json!(messages);
+        }
         if stream {
             // The terminal usage chunk (validated server surface, oracle-matched)
             // is the streaming lane's only source of real prompt-token counts —
@@ -2772,6 +2938,48 @@ fn tools_to_json(tools: &[ToolSpec]) -> Vec<Value> {
             })
         })
         .collect()
+}
+
+fn coding_action_schema(tools: &[Value]) -> Value {
+    let mut choices = tools.iter().map(|tool| json!({
+        "type":"object",
+        "properties":{"name":{"const":tool["function"]["name"]},"arguments":tool["function"]["parameters"]},
+        "required":["name","arguments"],"additionalProperties":false
+    })).collect::<Vec<_>>();
+    choices.push(json!({"type":"object","properties":{
+        "name":{"const":"final_answer"},"arguments":{"type":"object","properties":{"text":{"type":"string"}},"required":["text"],"additionalProperties":false}
+    },"required":["name","arguments"],"additionalProperties":false}));
+    json!({"anyOf":choices})
+}
+
+fn parse_constrained_action(content: &str, tools: &[Value]) -> Result<ModelStep, String> {
+    let value: Value = serde_json::from_str(content)
+        .map_err(|e| format!("Invalid constrained action JSON: {e}. No tool was executed."))?;
+    let name = value["name"]
+        .as_str()
+        .ok_or("Constrained action is missing its name. No tool was executed.")?;
+    let args = value
+        .get("arguments")
+        .filter(|a| a.is_object())
+        .ok_or("Constrained action arguments must be an object. No tool was executed.")?;
+    if name == "final_answer" {
+        return args["text"]
+            .as_str()
+            .map(|s| ModelStep::Text(s.into()))
+            .ok_or("Final answer must contain text.".into());
+    }
+    if !tools
+        .iter()
+        .any(|tool| tool["function"]["name"].as_str() == Some(name))
+    {
+        return Err(format!(
+            "Constrained action named unavailable tool {name}. No tool was executed."
+        ));
+    }
+    Ok(ModelStep::Calls(vec![ToolCall {
+        name: name.into(),
+        args: args.clone(),
+    }]))
 }
 
 // --- inline (line-mode) reporter + approver ------------------------------
@@ -3899,6 +4107,223 @@ mod tests {
             AgentMsg::ToolResult { outcome, .. }
                 if outcome.text().contains("truncated for Workspace")
         )));
+    }
+
+    #[test]
+    fn constrained_action_schema_and_parser_preserve_content_and_reject_invalid_calls() {
+        let specs = tools::specs_for(tools::ToolProfile::Coding, false, ShellSandbox::Disabled);
+        let defs = tools_to_json(&specs);
+        crate::grammar::ConstraintSpec::from_schema(&coding_action_schema(&defs)).unwrap();
+        let content = "const title = '<b>Hello</b>';\nconst path = 'C:\\temp';\n";
+        let encoded =
+            json!({"name":"write_file","arguments":{"path":"tiny-board/app.js","content":content}})
+                .to_string();
+        let ModelStep::Calls(calls) = parse_constrained_action(&encoded, &defs).unwrap() else {
+            panic!("expected tool call")
+        };
+        assert_eq!(calls[0].args["content"], content);
+        assert!(parse_constrained_action(
+            r#"{"name":"write_file","arguments":{"content":"bad\ escape"}}"#,
+            &defs
+        )
+        .is_err());
+        assert!(
+            parse_constrained_action(r#"{"name":"delete_everything","arguments":{}}"#, &defs)
+                .is_err()
+        );
+        assert!(
+            parse_constrained_action(r#"{"name":"write_file","arguments":"wrong"}"#, &defs)
+                .is_err()
+        );
+        assert!(
+            matches!(parse_constrained_action(r#"{"name":"final_answer","arguments":{"text":"Checked files"}}"#, &defs).unwrap(), ModelStep::Text(s) if s == "Checked files")
+        );
+    }
+
+    #[test]
+    fn constrained_action_request_uses_schema_and_keeps_artifact_binding() {
+        let mut driver = LiveDriver::with(
+            Client::new("127.0.0.1:1".parse().unwrap()),
+            "model".into(),
+            "a".repeat(64),
+            "qwen3".into(),
+            2048,
+            0.0,
+        );
+        driver.set_constrained_actions(true);
+        driver.set_native_tool_history(true);
+        let history = vec![
+            AgentMsg::System("User rules".into()),
+            AgentMsg::User("Build it".into()),
+            AgentMsg::ToolCalls(vec![tc("list_dir", json!({"path":"."}))]),
+            AgentMsg::ToolResult {
+                name: "list_dir".into(),
+                outcome: ToolOutcome::Ok("empty".into()),
+            },
+        ];
+        let defs = tools_to_json(&tools::specs_for(
+            tools::ToolProfile::Coding,
+            false,
+            ShellSandbox::Disabled,
+        ));
+        let request = driver.request(&history, &defs, false, false);
+        assert_eq!(request["response_format"]["type"], "json_schema");
+        assert_eq!(request["camelid_expected_gguf_sha256"], "a".repeat(64));
+        assert_eq!(request["stream"], false);
+        assert!(request.get("tools").is_none());
+        let preflight = driver.preflight_request(&history, &defs, false);
+        assert!(preflight.get("response_format").is_none());
+        assert_eq!(preflight["messages"], request["messages"]);
+        assert_eq!(preflight["camelid_expected_gguf_sha256"], "a".repeat(64));
+        let messages = request["messages"].as_array().unwrap();
+        assert!(messages[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("User rules"));
+        let prior: Value = serde_json::from_str(messages[2]["content"].as_str().unwrap()).unwrap();
+        assert_eq!(prior["name"], "list_dir");
+        assert_eq!(messages[3]["role"], "tool");
+    }
+
+    #[test]
+    #[ignore = "requires a running local Qwen3 engine and explicit probe workspace"]
+    fn constrained_action_live_write_probe() {
+        let address = std::env::var("CAMELID_TEST_AGENT_ADDR")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let root = std::path::PathBuf::from(std::env::var("CAMELID_TEST_AGENT_WORKSPACE").unwrap());
+        let sb = Sandbox::new(&root, false, Duration::from_secs(10)).unwrap();
+        let defs = tools_to_json(&tools::specs_for(
+            tools::ToolProfile::Coding,
+            false,
+            ShellSandbox::Disabled,
+        ));
+        let mut driver = LiveDriver::with(
+            Client::new(address),
+            "Qwen3-4B-Q4_K_M.gguf".into(),
+            "7485fe6f11af29433bc51cab58009521f205840f5b4ae3a32fa7f92e8534fdf5".into(),
+            "qwen3".into(),
+            512,
+            0.0,
+        );
+        driver.set_constrained_actions(true);
+        driver.set_stream_control(
+            std::sync::Arc::new(AtomicBool::new(false)),
+            Duration::from_secs(120),
+        );
+        driver.begin_step();
+        let history=vec![AgentMsg::System("You are a coding agent. The workspace is empty. Do exactly the requested write_file now.".into()), AgentMsg::User("Create probe/nested/app.js containing a short JavaScript function that puts a title into an element with textContent and saves an empty array to localStorage under tiny-board-v1 in try/catch. Make just this one write_file call. Do not plan, delegate, or answer in prose.".into())];
+        let ModelStep::Calls(calls) = driver.step_constrained(&history, &defs).unwrap() else {
+            panic!("expected write_file")
+        };
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "write_file");
+        let action = tools::validate_for(tools::ToolProfile::Coding, &calls[0], &sb).unwrap();
+        assert!(!action.execute(&sb).is_err());
+        let text = std::fs::read_to_string(root.join("probe/nested/app.js")).unwrap();
+        assert!(text.contains("textContent"));
+        assert!(text.contains("localStorage"));
+        println!("Live constrained write succeeded: {}", root.display());
+    }
+
+    #[test]
+    fn rejected_tool_call_does_not_fill_recovery_context() {
+        let text = format!(
+            "<tool_call>\n{{\"name\":\"write_file\",\"arguments\":{{\"content\":\"{}",
+            "unfinished code".repeat(2000)
+        );
+        let excerpt = rejected_answer_excerpt(&text);
+        assert!(excerpt.len() < 100);
+        assert!(excerpt.contains("no tool was executed"));
+        assert!(!excerpt.contains("unfinished code"));
+        assert!(rejected_answer_excerpt(&"promise ".repeat(2000)).len() < 600);
+    }
+
+    #[test]
+    fn coding_budget_folds_old_writes_preserving_goals_and_latest_exchange() {
+        struct Driver;
+        impl ModelDriver for Driver {
+            fn step(&mut self, _: &[AgentMsg], _: &[ToolSpec]) -> Result<ModelStep, String> {
+                unreachable!()
+            }
+            fn context_budget_tokens(&self) -> Option<u32> {
+                Some(1000)
+            }
+            fn prompt_tokens(
+                &mut self,
+                history: &[AgentMsg],
+                _: &[ToolSpec],
+            ) -> Result<Option<u32>, String> {
+                Ok(Some(
+                    history
+                        .iter()
+                        .map(|m| match m {
+                            AgentMsg::ToolCalls(calls) => calls
+                                .iter()
+                                .map(|c| c.args.to_string().len())
+                                .sum::<usize>(),
+                            AgentMsg::ToolResult { outcome, .. } => outcome.text().len(),
+                            AgentMsg::System(s)
+                            | AgentMsg::User(s)
+                            | AgentMsg::Assistant(s)
+                            | AgentMsg::Memory(s)
+                            | AgentMsg::Summary(s) => s.len(),
+                        })
+                        .sum::<usize>() as u32,
+                ))
+            }
+        }
+        let history = vec![
+            AgentMsg::System("Rules and authoritative task record".into()),
+            AgentMsg::User("Build Tiny Board and preserve every requirement".into()),
+            AgentMsg::ToolCalls(vec![tc(
+                "write_file",
+                json!({"path":"tiny-board/index.html","content":"private file content".repeat(120)}),
+            )]),
+            AgentMsg::ToolResult {
+                name: "write_file".into(),
+                outcome: ToolOutcome::Ok("wrote index.html".into()),
+            },
+            AgentMsg::ToolCalls(vec![tc(
+                "write_file",
+                json!({"path":"tiny-board/style.css","content":"body {}"}),
+            )]),
+            AgentMsg::ToolResult {
+                name: "write_file".into(),
+                outcome: ToolOutcome::Err("specific latest error".into()),
+            },
+        ];
+        let (fitted, trimmed, tokens) = fit_history_to_budget(
+            &mut Driver,
+            history.clone(),
+            &[],
+            128,
+            tools::ToolProfile::Coding,
+        )
+        .unwrap();
+        assert!(trimmed);
+        assert!(tokens.unwrap() + 128 <= 1000);
+        assert!(
+            matches!(&fitted[0], AgentMsg::System(s) if s == "Rules and authoritative task record")
+        );
+        assert!(
+            matches!(&fitted[1], AgentMsg::User(s) if s == "Build Tiny Board and preserve every requirement")
+        );
+        assert!(fitted.iter().any(|m| matches!(m, AgentMsg::Summary(s) if s.contains("index.html: succeeded") && !s.contains("private file content"))));
+        assert!(
+            matches!(fitted.last(), Some(AgentMsg::ToolResult {outcome, ..}) if outcome.text() == "specific latest error")
+        );
+        assert_eq!(
+            fitted
+                .iter()
+                .filter(|m| matches!(m, AgentMsg::ToolCalls(_)))
+                .count(),
+            1
+        );
+        let mut incomplete = history;
+        incomplete.remove(3);
+        assert!(!summarize_oldest_tool_exchange(&mut incomplete));
     }
 
     #[test]

@@ -101,7 +101,8 @@ fn destination(root: &FsPath, relative: &str) -> Result<PathBuf> {
             return Err("Symbolic links cannot be reviewed or changed here.".into());
         }
     }
-    sb.resolve_output(relative).map_err(|_| "The destination must be a regular file inside the workspace, with an existing parent folder.".into())
+    sb.resolve_output(relative)
+        .map_err(|_| "The destination must be a regular file inside the workspace.".into())
 }
 fn read_text(path: &FsPath, limit: usize) -> Result<Option<String>> {
     let meta = match fs::symlink_metadata(path) {
@@ -144,6 +145,7 @@ fn publish(review: &Review, expected: &Option<String>, replacement: &Option<Stri
     let path = destination(&review.workspace, &review.path)?;
     same_version(&path, expected)?;
     if let Some(content) = replacement {
+        sandbox(&review.workspace)?.create_output_parent(&path)?;
         let mut temp =
             tempfile::NamedTempFile::new_in(path.parent().ok_or("Missing parent folder.")?)
                 .map_err(|_| "Could not prepare the replacement file.")?;
@@ -562,6 +564,118 @@ mod tests {
             source: "Test output".into(),
         }
     }
+    #[test]
+    #[ignore = "requires a local Qwen3 engine, explicit goal file, and disposable workspace"]
+    fn constrained_coding_live_three_file_task() {
+        use crate::chat::coding::{Config, Manager, Phase};
+        let root = PathBuf::from(std::env::var("CAMELID_TEST_AGENT_WORKSPACE").unwrap());
+        let workspace = root.join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        let journal = ChangeManager {
+            directory: Arc::new(root.join("reviews")),
+            lock: Arc::new(Mutex::new(())),
+        };
+        let manager = Manager::new(root.join("sessions"));
+        let goal = fs::read_to_string(std::env::var("CAMELID_TEST_AGENT_GOAL").unwrap()).unwrap();
+        let config = Config {
+            addr: std::env::var("CAMELID_TEST_AGENT_ADDR")
+                .unwrap()
+                .parse()
+                .unwrap(),
+            workspace: fs::canonicalize(&workspace).unwrap(),
+            model_id: "Qwen3-4B-Q4_K_M.gguf".into(),
+            model_sha256: "7485fe6f11af29433bc51cab58009521f205840f5b4ae3a32fa7f92e8534fdf5".into(),
+            family: "qwen3".into(),
+            context_tokens: 8192,
+            max_tokens: 2048,
+            max_steps: 24,
+            allow_commands: false,
+            project_id: String::new(),
+            instructions: String::new(),
+            references: String::new(),
+            project: Default::default(),
+        };
+        let run = manager
+            .create(
+                config,
+                goal,
+                uuid::Uuid::new_v4().simple().to_string(),
+                Arc::new(journal),
+            )
+            .unwrap();
+        run.set_auto_approve_files(&run.snapshot().run_id, true)
+            .unwrap();
+        let started = std::time::Instant::now();
+        let mut seq = 0;
+        loop {
+            let snapshot = run.snapshot();
+            for event in snapshot.events.iter().filter(|e| e.seq > seq) {
+                if matches!(
+                    event.kind.as_str(),
+                    "tool.call" | "model.timing" | "agent.notice" | "run.finished"
+                ) {
+                    println!(
+                        "{} {} {}",
+                        started.elapsed().as_secs(),
+                        event.kind,
+                        event.detail
+                    );
+                }
+            }
+            seq = snapshot.seq;
+            if !snapshot.phase.active() {
+                assert_eq!(snapshot.phase, Phase::Completed, "{}", snapshot.error);
+                break;
+            }
+            if started.elapsed() > Duration::from_secs(1200) {
+                run.control("stop").unwrap();
+                panic!("Live coding task exceeded its 20-minute test deadline");
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        for name in ["index.html", "style.css", "app.js"] {
+            assert!(
+                workspace.join("tiny-board").join(name).is_file(),
+                "Missing {name}"
+            );
+        }
+        println!(
+            "Live three-file task completed in {}s: {}",
+            started.elapsed().as_secs(),
+            workspace.display()
+        );
+    }
+
+    #[test]
+    fn nested_creation_requires_approval_and_supports_undo() {
+        let (_dir, m, w) = fixture();
+        let relative = "tiny-board/assets/index.html";
+        let rejected = m.propose(proposal(&w, relative, "denied")).unwrap();
+        assert!(!w.join("tiny-board").exists());
+        m.decide(&rejected.id, false).unwrap();
+        assert!(!w.join("tiny-board").exists());
+        let review = m.propose(proposal(&w, relative, "hello")).unwrap();
+        assert!(!w.join("tiny-board").exists());
+        m.decide(&review.id, true).unwrap();
+        assert_eq!(fs::read_to_string(w.join(relative)).unwrap(), "hello");
+        m.undo(&review.id).unwrap();
+        assert!(!w.join(relative).exists());
+    }
+
+    #[test]
+    fn nested_creation_rechecks_parent_before_apply() {
+        let (_dir, m, w) = fixture();
+        let review = m
+            .propose(proposal(&w, "tiny-board/index.html", "hello"))
+            .unwrap();
+        fs::write(w.join("tiny-board"), "user file").unwrap();
+        assert!(m.decide(&review.id, true).is_err());
+        assert_eq!(
+            fs::read_to_string(w.join("tiny-board")).unwrap(),
+            "user file"
+        );
+    }
+
     #[test]
     fn approval_replay_and_durable_undo() {
         let (_dir, m, w) = fixture();

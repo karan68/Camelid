@@ -639,6 +639,25 @@ impl Client {
         Ok(parse_chat_turn(&body))
     }
 
+    pub fn chat_turn_with_control(
+        &self,
+        request: &Value,
+        cancel: &AtomicBool,
+        timeout: Duration,
+    ) -> anyhow::Result<ChatTurn> {
+        let (status, body) = self.request_with_control(
+            "POST",
+            "/v1/chat/completions",
+            Some(request),
+            cancel,
+            timeout,
+        )?;
+        if status != 200 {
+            anyhow::bail!(envelope_message(&body).unwrap_or_else(|| format!("HTTP {status}")));
+        }
+        Ok(parse_chat_turn(&body))
+    }
+
     pub fn generation_preflight(&self, request: &Value) -> anyhow::Result<u32> {
         let (status, body) = self.request(
             "POST",
@@ -679,6 +698,7 @@ impl Client {
 /// One assistant turn from `/v1/chat/completions`.
 pub struct ChatTurn {
     pub content: String,
+    pub finish_reason: Option<String>,
     /// Structured tool calls (OpenAI shape); `content` is empty when this is set.
     pub tool_calls: Vec<ToolCallOut>,
     pub prompt_tokens: Option<u32>,
@@ -730,6 +750,10 @@ fn parse_chat_turn(body: &Value) -> ChatTurn {
         .map(|n| n as u32);
     ChatTurn {
         content,
+        finish_reason: body
+            .pointer("/choices/0/finish_reason")
+            .and_then(Value::as_str)
+            .map(str::to_string),
         tool_calls,
         prompt_tokens,
         completion_tokens,
@@ -1433,6 +1457,20 @@ mod tests {
         assert_eq!(turn.tool_calls[0].name, "read_file");
         assert!(turn.tool_calls[0].arguments.contains("notes.txt"));
         assert_eq!(turn.completion_tokens, Some(7));
+    }
+
+    #[test]
+    fn constrained_chat_preserves_finish_reason_and_honors_cancellation() {
+        let turn = parse_chat_turn(
+            &json!({"choices":[{"message":{"content":"{}"},"finish_reason":"length"}]}),
+        );
+        assert_eq!(turn.finish_reason.as_deref(), Some("length"));
+        let client = Client::new("127.0.0.1:1".parse().unwrap());
+        let error = client
+            .chat_turn_with_control(&json!({}), &AtomicBool::new(true), Duration::from_secs(1))
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("cancelled"));
     }
 
     #[test]
