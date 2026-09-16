@@ -14944,6 +14944,31 @@ fn resident_prefix_len(resident: &[u32], filled: usize, tokens: &[u32]) -> usize
     shared
 }
 
+/// Extend the record by the token a decode step just wrote KV for at `position`.
+///
+/// A prefill records its whole prompt in one call; decode then writes one row per
+/// step. Without this the record freezes at the prompt while `filled` runs past
+/// it, so the next turn re-prefills every token the model itself generated -- the
+/// repeated prefill F3 exists to remove.
+///
+/// The two guards are what keep the record honest, and neither is optional:
+///
+/// * `record.len() == position` -- the record must already account for exactly
+///   `[0, position)`. Appending across a gap (a step that could not name its
+///   token, an intervening reseed, a rewind) would put this token at an index
+///   whose row holds something else, and `resident_prefix_len` would then skip
+///   prefilling a row that does not hold the prompt's token. Silently wrong
+///   output, not a slow path. Declining leaves the record short, which only
+///   costs a re-prefill.
+/// * `position < filled` -- the row must actually be written. Callers record
+///   after the forward, so this is belt-and-braces against a future caller that
+///   records before one.
+fn record_resident_token(record: &mut Vec<u32>, filled: usize, position: usize, token: u32) {
+    if record.len() == position && position < filled {
+        record.push(token);
+    }
+}
+
 pub(crate) const MAX_VERIFY_K: usize = 16;
 const MAX_PRISM_PREFILL_K: usize = 128;
 const DEFAULT_PRISM_BMMA_MIN_TOKENS: usize = 32;
@@ -16558,6 +16583,18 @@ impl CudaResidentDecode {
     pub fn set_resident_tokens(&mut self, tokens: &[u32]) {
         self.resident_tokens.clear();
         self.resident_tokens.extend_from_slice(tokens);
+    }
+
+    /// Extend the record by the token whose KV row a decode step just wrote at
+    /// `position`. See [`record_resident_token`] for the rules; split out of the
+    /// engine so the bookkeeping is testable without a GPU.
+    pub fn record_resident_token(&mut self, position: usize, token: u32) {
+        record_resident_token(&mut self.resident_tokens, self.filled, position, token);
+    }
+
+    /// How many leading positions the token record currently accounts for.
+    pub fn resident_token_len(&self) -> usize {
+        self.resident_tokens.len()
     }
 
     /// Stop vouching for the KV cache's contents.

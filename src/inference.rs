@@ -2519,6 +2519,11 @@ pub(crate) enum CudaResidentPrefillChunkOutcome {
         end_position: usize,
         elapsed_micros: u128,
         finalized: bool,
+        /// Leading positions this chunk skipped because the engine already held
+        /// their KV. `0` means a full prefill; the F3 gates assert on it so a
+        /// silent regression to re-prefilling shows up as a failure, not a
+        /// slower run nothing measures.
+        reused_positions: usize,
     },
 }
 
@@ -4068,6 +4073,7 @@ impl LlamaInferenceSession {
             end_position,
             elapsed_micros: started.elapsed().as_micros(),
             finalized,
+            reused_positions: reuse,
         })
     }
 
@@ -4355,7 +4361,7 @@ impl LlamaInferenceSession {
             .weights
             .token_embedding
             .embedding_lookup(&[token_id], "token_embedding")?;
-        match self.try_resident_decode_forward(&embedding, true, Some(token_id))? {
+        match self.try_resident_decode_forward(&embedding, true, Some(token_id), Some(token_id))? {
             Some(ResidentForward::Sampled(id)) => {
                 self.kv_cache.position += 1;
                 Ok(Some((id, started.elapsed().as_micros())))
@@ -4419,7 +4425,13 @@ impl LlamaInferenceSession {
         } else {
             let seed =
                 base ^ 0x9E37_79B9_7F4A_7C15u64.wrapping_mul(self.kv_cache.position as u64 + 1);
-            self.try_resident_decode_forward_cuda(&embedding, true, None, Some((inv_temp, seed)))?
+            self.try_resident_decode_forward_cuda(
+                &embedding,
+                true,
+                None,
+                Some((inv_temp, seed)),
+                Some(token_id),
+            )?
         };
         match forward {
             Some(ResidentForward::Sampled(id)) => {
@@ -4729,6 +4741,7 @@ impl LlamaInferenceSession {
         embedding: &CpuTensor,
         compute_logits: bool,
         gpu_sample_token: Option<u32>,
+        input_token: Option<u32>,
     ) -> Result<Option<ResidentForward>> {
         if std::env::var_os("CAMELID_RESIDENT_TRACE").is_some() {
             use std::sync::Once;
@@ -4747,6 +4760,7 @@ impl LlamaInferenceSession {
                 compute_logits,
                 gpu_sample_token,
                 None,
+                input_token,
             );
         }
         self.try_resident_decode_forward_metal(embedding, compute_logits, gpu_sample_token)
@@ -4763,6 +4777,7 @@ impl LlamaInferenceSession {
         compute_logits: bool,
         gpu_sample_token: Option<u32>,
         sample: Option<(f32, u64)>,
+        input_token: Option<u32>,
     ) -> Result<Option<ResidentForward>> {
         if !self.resident_decode_eligible(compute_logits)? {
             return Ok(None);
@@ -5263,6 +5278,14 @@ impl LlamaInferenceSession {
             }
         };
         slot.engine.set_filled(position + 1);
+        // The row this step just wrote holds `input_token`, so the engine can
+        // now vouch for it to the next turn's prefix match. Unconditional: the
+        // record is only ever CONSULTED behind the prefix-continuation gate, so
+        // keeping it accurate here costs one push and leaves that kill switch
+        // the single place the reuse is turned off.
+        if let Some(token) = input_token {
+            slot.engine.record_resident_token(position, token);
+        }
         Ok(Some(forward))
     }
 
@@ -5274,6 +5297,7 @@ impl LlamaInferenceSession {
         compute_logits: bool,
         gpu_sample_token: Option<u32>,
         sample: Option<(f32, u64)>,
+        input_token: Option<u32>,
     ) -> Result<Option<ResidentForward>> {
         Ok(None)
     }
@@ -5438,7 +5462,7 @@ impl LlamaInferenceSession {
         // prefill and ineligible configs take the CPU chunk path below.
         if seq_len == 1 {
             if let Some(ResidentForward::Hidden(out)) =
-                self.try_resident_decode_forward(hidden, false, None)?
+                self.try_resident_decode_forward(hidden, false, None, None)?
             {
                 self.kv_cache.position += 1;
                 return Ok(out);
@@ -6226,7 +6250,7 @@ impl LlamaInferenceSession {
             // would swallow the distributed worker dispatch inside the layer loop below.
             None
         } else {
-            self.try_resident_decode_forward(&hidden, compute_logits, None)?
+            self.try_resident_decode_forward(&hidden, compute_logits, None, Some(token_id))?
         };
         // When the resident path also produced logits on the GPU, carry them here and skip the
         // CPU final norm + output projection below.
