@@ -18736,12 +18736,36 @@ fn f3_user_turn(seed: &[u32], len: usize) -> Vec<u32> {
 /// prefill and ~3.0 s of that extra attention; only the second term is F3's to
 /// remove, and it cannot be removed by caching.
 ///
-/// Measured for the record, because it inverts the obvious fix: enabling the
-/// batched K-quant prefill lane (`CAMELID_KQUANT_BATCHED_PREFILL=1`) lowers
-/// turn 1 to 4083 ms but raises turn 10 to 12276 ms (3.01x) -- its attention
-/// term grows about 3x faster per turn. The serial default is the better lane
-/// for multi-turn chat, which is the opposite of what a turn-1 benchmark would
-/// conclude.
+/// MEASURED, so nobody re-runs it: every alternative prefill lane is WORSE with
+/// context than the shipped serial default. Release, L4 (sm_89), same row and
+/// conversation, turn-1 -> turn-10 TTFT:
+///
+/// | prefill lane                          | turn 1  | turn 10  | per turn |
+/// |---------------------------------------|---------|----------|----------|
+/// | serial (default)                      | 4758 ms |  7573 ms |  ~310 ms |
+/// | serial + CAMELID_FLASH_PREFILL=1      | 4767 ms |  7603 ms |  ~310 ms |
+/// | CAMELID_KQUANT_BATCHED_PREFILL=1      | 4083 ms | 12276 ms |  ~910 ms |
+/// | ...that plus flash, KQUANT_BATCH=4    | 4949 ms | 20132 ms | ~1690 ms |
+///
+/// Two things worth keeping. `CAMELID_FLASH_PREFILL` is INERT on this row:
+/// `launch_attention_flash_prefill` is reachable only from
+/// `run_batched_layer_stack`, and a K-quant row takes the serial lane, so the
+/// flag changes nothing until batched prefill is also on -- at which point it is
+/// slower still. (`flash_prefill_enabled` asks for sm_89 evidence because none
+/// was committed; this is it, and it does not favour the flag.)
+///
+/// And the shortfall is NOT reachable by flipping these. The batched K-quant
+/// GEMM stages token rows in shared memory, so `batched_layer_token_cap` clamps
+/// the tile to 2 tokens (4 here at most): weight reads amortize 2-4x, nowhere
+/// near enough to matter. Serial prefill therefore runs at roughly DECODE speed,
+/// ~14 ms/token, which is the ~4.6 s constant. Closing this needs a K-quant
+/// prefill GEMM with real tiles, not a flag.
+///
+/// Note also what that would do to THIS gate: shrinking the constant while the
+/// attention term stands makes the RATIO worse even though every user-visible
+/// number improves. The ratio is a proxy; the spec's other F3 gate (agent TTFT
+/// p95 under 4 s) is the one that tracks what a user feels, and at 7.6 s it is
+/// also unmet for the same reason.
 #[cfg(feature = "cuda")]
 #[test]
 #[ignore = "requires CAMELID_3B_GGUF and a CUDA device"]
