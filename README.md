@@ -4,7 +4,7 @@
 
 **Local AI, powered by Rust.**
 
-Run supported GGUF models on your own hardware through a desktop app, browser chat, terminal, or OpenAI-compatible API.
+Chat, work with files, and code with supported GGUF models on your own hardware. Use the desktop app, a desktop or mobile browser, the terminal, or an OpenAI-compatible API.
 
 [![CI][ci-badge]][ci-workflow]
 [![Latest release][release-badge]][latest-release]
@@ -12,13 +12,13 @@ Run supported GGUF models on your own hardware through a desktop app, browser ch
 [![Rust](https://img.shields.io/badge/built_with-Rust-dea584.svg)](https://www.rust-lang.org/)
 [![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20macOS%20%7C%20Linux-64748b.svg)](#platform-support)
 
-[Download][latest-release] · [Quick start](#quick-start) · [Models](#supported-models) · [Documentation](DOCS.md) · [Contributing](CONTRIBUTING.md)
+[Download][latest-release] · [Quick start](#quick-start) · [Features](#features) · [Screenshots](#screenshots) · [Models](#supported-models) · [Documentation](DOCS.md)
 
 </div>
 
-![Camelid WebUI chat surface](docs/assets/camelid-readme-chat-surface-dark.png)
+![Camelid desktop chat with a pinned conversation, Markdown table, project context, and model selector](docs/assets/readme/desktop-chat.png)
 
-<div align="center"><sub>Camelid's local web UI—a dark, collapsed-rail chat surface served directly from the engine binary.</sub></div>
+<div align="center"><sub>The current Camelid UI with illustrative demo conversations. Screenshots show interface features, not model-quality or performance results.</sub></div>
 
 ## Why Camelid?
 
@@ -26,6 +26,20 @@ Run supported GGUF models on your own hardware through a desktop app, browser ch
 - **One Rust engine.** The engine and web UI ship as a single binary, with no Python, Node.js, or Docker required at runtime.
 - **Hardware acceleration.** Use Metal on Apple Silicon, CUDA on supported NVIDIA paths, or CPU fallback on Windows, macOS, and Linux.
 - **Tested compatibility.** Supported model files and quantizations are validated against a pinned llama.cpp reference, with explicit limits for each tested configuration.
+
+## Features
+
+| Feature | What you can do |
+|---|---|
+| **Everyday chat** | Stream replies with Markdown, code highlighting, math, and diagrams. Edit and resend, regenerate replies, continue unfinished answers, and pin, tag, archive, or export conversations. |
+| **Projects and context** | Group chats with shared instructions and reference files. Choose what each conversation inherits and inspect the sources included in the next request. [Guide](docs/PROJECT_CONTEXT.md) · [Screenshot](docs/assets/readme/desktop-projects.png) |
+| **Files and previews** | Browse generated files beside the conversation, switch between Preview and Source, and download outputs. On the local engine, review a proposed file change before applying it, with conflict checks and Undo. [Guide](docs/OUTPUTS_AND_CHANGES.md) |
+| **Code in Chat** | Work in a local project with a live plan, read-only helper agents, file reviews, individually approved commands, checks, and project previews, including a managed local preview server for Chrome. Pause, steer, queue a follow-up, or return to a saved session. [Guide](docs/AGENTIC_CODING.md) |
+| **Web and connected tools** | Use **Web Auto** for web research with reply sources. Connect local or remote MCP servers, choose tools per conversation, and approve each tool call. MCP is a preview feature. [MCP guide](docs/MCP.md) |
+| **Mobile browser chat** | Chat from your phone with a compact model selector, project context, and file previews. Inference stays on your computer; browser history and context stay separate on each device. [Remote setup](docs/REMOTE_CHAT.md) |
+| **Models and developer tools** | Browse the model catalog, inspect local GGUF metadata, check compatibility evidence, explore API examples, and inspect request telemetry. Model and tool availability follow the active engine's capabilities. |
+
+Local chat works offline once model files are downloaded. Web research and remote MCP services need network access; Code requires an exact certified tool-capable model and a local engine connection.
 
 ## Quick start
 
@@ -67,6 +81,49 @@ Run `camelid pull` without an argument to list the curated model catalog.
 > [!NOTE]
 > To chat from another device, see the [remote browser chat guide](docs/REMOTE_CHAT.md). Non-loopback listeners require authentication and either TLS or an explicit cleartext acknowledgement.
 
+## Screenshots
+
+### Desktop
+
+Preview and download generated files without leaving the conversation. Code adds project activity, helper assignments, and explicit file reviews.
+
+<table>
+  <tr>
+    <th>Conversation files</th>
+    <th>Code and agent activity</th>
+  </tr>
+  <tr>
+    <td><a href="docs/assets/readme/desktop-files.png"><img src="docs/assets/readme/desktop-files.png" alt="Desktop chat with a generated Markdown checklist and its rendered file preview" width="720"></a></td>
+    <td><a href="docs/assets/readme/desktop-code.png"><img src="docs/assets/readme/desktop-code.png" alt="Code session waiting for a file review, with a work plan and lead and helper activity" width="720"></a></td>
+  </tr>
+</table>
+
+<details>
+<summary>Projects: shared instructions and reference files</summary>
+
+![Camelid Projects page showing three projects with instructions, reference files, and related chats](docs/assets/readme/desktop-projects.png)
+
+</details>
+
+### Mobile
+
+The responsive browser UI keeps chat, project context, and downloadable file previews close at hand. These captures show the restricted remote-chat surface; local coding and engine administration are not exposed there.
+
+<table>
+  <tr>
+    <th>Chat</th>
+    <th>File preview</th>
+    <th>Conversation context</th>
+  </tr>
+  <tr>
+    <td><a href="docs/assets/readme/mobile-chat.png"><img src="docs/assets/readme/mobile-chat.png" alt="Mobile chat with a compact composer, model selector, and context meter" width="260"></a></td>
+    <td><a href="docs/assets/readme/mobile-files.png"><img src="docs/assets/readme/mobile-files.png" alt="Mobile Files sheet with a Markdown preview, filename field, and download button" width="260"></a></td>
+    <td><a href="docs/assets/readme/mobile-context.png"><img src="docs/assets/readme/mobile-context.png" alt="Mobile conversation context with project instructions, reference selection, and chat-specific instructions" width="260"></a></td>
+  </tr>
+</table>
+
+Use a trusted private LAN or private Tailscale HTTPS access with authentication. See [remote browser chat](docs/REMOTE_CHAT.md) for setup. Screenshots were captured from the current frontend with isolated demo data; [capture details and reproduction commands](docs/assets/readme/README.md) are included.
+
 ## Supported models
 
 Start with one of these five options. Support applies to exact model files, quantizations, and tested execution paths; see the [compatibility ledger](COMPATIBILITY.md) for each model's limits.
@@ -89,19 +146,23 @@ Llama 3.2 3B and LFM2.5 have support limited to the documented exact-file smoke 
 
 For [image chat](docs/MODELS.md#multimodal-image-chat) and [embeddings and reranking](docs/MODELS.md#embeddings-and-reranking), see the model guide for supported files and setup.
 
+For [voice input](docs/voice-input.md), use the microphone beside Send. A one-time
+154 MB English speech-model download enables local Rust transcription into an editable prompt.
+
 ## Ways to use Camelid
 
 | Interface | Start it with | Best for |
 |---|---|---|
 | **Desktop app** | Install from [Quick start](#quick-start) | Native app with bundled engine |
 | **Browser chat** | `camelid serve --model <gguf>` | Everyday local chat |
+| **Phone or tablet** | Open the authenticated [remote chat URL](docs/REMOTE_CHAT.md) | Browser chat with inference on your computer |
 | **Terminal UI** | `camelid chat` | Shell and SSH workflows |
 | **HTTP API** | Start `camelid serve` | Chat, image input, embeddings, and reranking |
 | **Code in Chat** | Choose **Code** in the local web UI | Reviewed edits, approved commands, and a live agent sidebar |
 | **Agent mode** | `camelid chat --agent --model <gguf>` | Approval-gated tools in a repository |
 | **Workspace** (preview) | Open **Workspace** in the web UI | Read-only analysis of a local folder |
 
-The [Code guide](docs/AGENTIC_CODING.md) covers project folders, approvals, helper agents, saved runs, and Undo. Code requires an exact certified tool-capable artifact and a loopback engine connection.
+The [Code guide](docs/AGENTIC_CODING.md) covers project folders, approvals, helper agents, checks, previews, saved workflows, follow-ups, and Undo. Code requires an exact certified tool-capable artifact and a loopback engine connection.
 
 Agent mode confines file tools to a workspace root and keeps network access off unless enabled. Workspace is read-only and resumable. Both require a model marked `tool_capable` in the compatibility ledger. Review the [agent documentation](DOCS.md) and every requested action before enabling additional tools or network access.
 
@@ -148,6 +209,10 @@ See the [contributor quick start](docs/CONTRIBUTOR_QUICKSTART.md) for prerequisi
 - [Documentation index](DOCS.md)
 - [Model catalog and validation](docs/MODELS.md)
 - [Remote browser chat](docs/REMOTE_CHAT.md)
+- [Projects and conversation context](docs/PROJECT_CONTEXT.md)
+- [Output previews and file review](docs/OUTPUTS_AND_CHANGES.md)
+- [Code in Chat](docs/AGENTIC_CODING.md)
+- [Connected tools (MCP preview)](docs/MCP.md)
 - [Configuration reference](docs/CONFIGURATION.md)
 - [CUDA continuous batching and model residency](docs/CUDA_CONTINUOUS_BATCHING.md)
 - [Architecture](docs/architecture/ARCHITECTURE.md)

@@ -405,8 +405,8 @@ impl Sandbox {
     }
 
     /// Resolve a user/model-supplied path against the root and confirm it stays
-    /// inside. `must_exist=false` resolves the parent (for write targets that
-    /// don't exist yet). This is the path-escape backstop (constraint 5).
+    /// inside. `must_exist=false` resolves the nearest existing parent without
+    /// creating missing directories. This is the path-escape backstop (constraint 5).
     pub fn resolve(&self, raw: &str, must_exist: bool) -> Result<PathBuf, String> {
         if raw.trim().is_empty() {
             return Err("empty path".into());
@@ -437,7 +437,7 @@ impl Sandbox {
             let file = candidate
                 .file_name()
                 .ok_or_else(|| format!("invalid path {raw}"))?;
-            let parent_canon = std::fs::canonicalize(parent)
+            let parent_canon = resolve_missing_directory(parent)
                 .map_err(|e| format!("cannot access parent of {raw}: {e}"))?;
             parent_canon.join(file)
         };
@@ -471,6 +471,51 @@ impl Sandbox {
         }
     }
 
+    /// Called only after write approval. Revalidate the resolved destination,
+    /// then create missing parents one at a time, rejecting redirected paths.
+    pub(crate) fn create_output_parent(&self, path: &Path) -> Result<(), String> {
+        let raw = path.to_str().ok_or("Output path is not UTF-8")?;
+        if self.resolve_output(raw)? != path {
+            return Err("Output destination changed after validation".into());
+        }
+        let parent = path.parent().ok_or("Missing output parent")?;
+        let mut missing = Vec::new();
+        let mut ancestor = parent;
+        loop {
+            match std::fs::symlink_metadata(ancestor) {
+                Ok(_) => break,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    missing.push(ancestor.to_path_buf());
+                    ancestor = ancestor.parent().ok_or("Missing output ancestor")?;
+                }
+                Err(e) => return Err(format!("Cannot inspect output parent: {e}")),
+            }
+        }
+        for directory in missing.iter().rev() {
+            let parent = directory.parent().ok_or("Missing output ancestor")?;
+            let canonical = std::fs::canonicalize(parent).map_err(|e| e.to_string())?;
+            if canonical != parent || !self.permits(&canonical) {
+                return Err("Output parent changed after validation".into());
+            }
+            match std::fs::create_dir(directory) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(format!("Cannot create output parent: {e}")),
+            }
+            let metadata = std::fs::symlink_metadata(directory).map_err(|e| e.to_string())?;
+            if !metadata.is_dir()
+                || metadata.file_type().is_symlink()
+                || std::fs::canonicalize(directory).map_err(|e| e.to_string())? != *directory
+            {
+                return Err("Output parent is not an unchanged regular directory".into());
+            }
+        }
+        if self.resolve_output(raw)? != path {
+            return Err("Output destination changed during directory creation".into());
+        }
+        Ok(())
+    }
+
     /// Display a resolved path relative to the root for transcripts.
     pub fn rel(&self, path: &Path) -> String {
         path.strip_prefix(&self.root)
@@ -482,6 +527,25 @@ impl Sandbox {
                 }
             })
             .unwrap_or_else(|_| path.display().to_string())
+    }
+}
+
+fn resolve_missing_directory(path: &Path) -> Result<PathBuf, String> {
+    match std::fs::canonicalize(path) {
+        Ok(canonical) if canonical.is_dir() => Ok(canonical),
+        Ok(_) => Err("parent is not a directory".into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // A dangling link is an existing entry, not a directory to create.
+            if std::fs::symlink_metadata(path).is_ok() {
+                return Err("parent is an inaccessible existing entry".into());
+            }
+            let Some(std::path::Component::Normal(name)) = path.components().next_back() else {
+                return Err("missing parent must not contain parent traversal".into());
+            };
+            let parent = path.parent().ok_or("missing parent has no ancestor")?;
+            Ok(resolve_missing_directory(parent)?.join(name))
+        }
+        Err(error) => Err(error.to_string()),
     }
 }
 
@@ -623,6 +687,9 @@ impl ToolProfile {
                     | "wait_for_helpers"
                     | "verify_project"
                     | "read_workflow"
+                    | "start_preview"
+                    | "open_preview"
+                    | "stop_preview"
             ),
             ToolProfile::BenchmarkShared => matches!(
                 tool,
@@ -705,7 +772,7 @@ pub fn specs_for(profile: ToolProfile, allow_net: bool, shell_mode: ShellSandbox
         },
         ToolSpec {
             name: "write_file".into(),
-            description: "Create or overwrite a file within the workspace.".into(),
+            description: "Create or overwrite a file within the workspace. Missing parent folders are created automatically after approval.".into(),
             risk: Risk::Write,
             params: json!({"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}),
         },
@@ -759,6 +826,16 @@ pub fn specs_for(profile: ToolProfile, allow_net: bool, shell_mode: ShellSandbox
                 description: "Run the project's configured verification command after exact user approval. Records output and the checked file versions. A failed check needs a fix or an honest blocker; opening a page is not an interaction test.".into(),
                 risk: Risk::Exec,
                 params: json!({"type":"object","properties":{}}),
+            });
+        }
+        for (name, description) in [
+            ("start_preview", "Start a managed loopback HTTP server for this static website. Serves HTML, CSS, JavaScript and assets; survives tool completion. No shell or Python needed, available when commands are disabled. Optional entry is a workspace-relative HTML file, e.g. tiny-board/index.html. Returns the live URL."),
+            ("open_preview", "Start or reuse the managed static website preview and open its live URL in Google Chrome on the engine's computer. Use this when asked to start the site for Chrome. Optional entry is a workspace-relative HTML file. No shell needed. Opening is not a passing browser test."),
+            ("stop_preview", "Stop this task's managed preview server and release its port. Does not close the user's Chrome tabs."),
+        ] {
+            tools.push(ToolSpec { name: name.into(), description: description.into(), risk: Risk::Exec,
+                params: if name == "stop_preview" { json!({"type":"object","properties":{}}) }
+                    else { json!({"type":"object","properties":{"entry":{"type":"string"}}}) },
             });
         }
         tools.retain(|tool| profile.allows(&tool.name));
@@ -1121,6 +1198,7 @@ pub enum CodingOperation {
     WaitForHelpers { timeout_seconds: u64 },
     VerifyProject,
     ReadWorkflow { name: String },
+    Preview { action: String, entry: String },
 }
 impl CodingOperation {
     pub fn name(&self) -> &'static str {
@@ -1128,6 +1206,11 @@ impl CodingOperation {
             Self::WaitForHelpers { .. } => "wait_for_helpers",
             Self::VerifyProject => "verify_project",
             Self::ReadWorkflow { .. } => "read_workflow",
+            Self::Preview { action, .. } => match action.as_str() {
+                "start" => "start_preview",
+                "open" => "open_preview",
+                _ => "stop_preview",
+            },
         }
     }
 }
@@ -1137,6 +1220,9 @@ impl Action {
         match self {
             Action::Coding {
                 operation: CodingOperation::VerifyProject,
+            } => Risk::Exec,
+            Action::Coding {
+                operation: CodingOperation::Preview { .. },
             } => Risk::Exec,
             Action::Coding { .. } => Risk::Read,
             Action::ReadFile { .. } | Action::ListDir { .. } | Action::Search { .. } => Risk::Read,
@@ -1189,6 +1275,21 @@ impl Action {
     /// One-line summary of the *call* for the transcript (resolved, not prose).
     pub fn call_line(&self, sandbox: &Sandbox) -> String {
         match self {
+            Action::Coding {
+                operation: CodingOperation::Preview { action, entry },
+            } => format!(
+                "{action} preview ({}); managed local server{}",
+                if entry.is_empty() {
+                    "project HTML entry"
+                } else {
+                    entry
+                },
+                if action == "open" {
+                    " and Google Chrome"
+                } else {
+                    ""
+                }
+            ),
             Action::Coding { operation } => operation.name().to_string(),
             Action::ReadFile {
                 path,
@@ -1391,6 +1492,9 @@ impl Action {
             // checkpoint if the mutation succeeds — a failed call must not
             // hand /undo a phantom entry.
             Action::WriteFile { path, content, .. } => {
+                if let Err(error) = sandbox.create_output_parent(path) {
+                    return ToolOutcome::Err(error);
+                }
                 let pending = super::checkpoint::prepare(sandbox, path, "write_file");
                 let out = write_file(path, content);
                 super::checkpoint::finish(pending, !out.is_err());
@@ -1516,7 +1620,8 @@ pub fn validate_for(
             .ok_or_else(|| format!("{} requires a string `{key}`", call.name))
     };
     match call.name.as_str() {
-        "wait_for_helpers" | "verify_project" | "read_workflow" => {
+        "wait_for_helpers" | "verify_project" | "read_workflow" | "start_preview"
+        | "open_preview" | "stop_preview" => {
             if profile != ToolProfile::Coding {
                 return Err("This tool is only available in Code.".into());
             }
@@ -1537,6 +1642,21 @@ pub fn validate_for(
                         return Err("Verification commands are disabled.".into());
                     }
                     CodingOperation::VerifyProject
+                }
+                "start_preview" | "open_preview" | "stop_preview" => {
+                    let entry = args
+                        .get("entry")
+                        .map(|v| v.as_str().ok_or("entry must be a string"))
+                        .transpose()?
+                        .unwrap_or("")
+                        .replace('\\', "/");
+                    if !entry.is_empty() {
+                        super::coding_project::relative_path(&entry)?;
+                    }
+                    CodingOperation::Preview {
+                        action: call.name.trim_end_matches("_preview").into(),
+                        entry,
+                    }
                 }
                 _ => CodingOperation::ReadWorkflow {
                     name: str_arg("name")?,
@@ -4740,6 +4860,104 @@ mod tests {
         let outcome = action.execute(&free);
         assert!(!outcome.is_err(), "{}", outcome.text());
         assert!(outcome.text().contains("outside needle"));
+    }
+
+    #[test]
+    fn nested_write_creates_parents_only_at_execution() {
+        let _cp = super::super::checkpoint::tests::cp_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let sb = sandbox(dir.path());
+        let action = validate(
+            &call(
+                "write_file",
+                json!({"path":"tiny-board/assets/index.html","content":"hello"}),
+            ),
+            &sb,
+        )
+        .unwrap();
+        assert!(!dir.path().join("tiny-board").exists());
+        assert!(action
+            .execute_with_cancel(&sb, &AtomicBool::new(true))
+            .is_err());
+        assert!(!dir.path().join("tiny-board").exists());
+        let outcome = action.execute(&sb);
+        assert!(!outcome.is_err(), "{}", outcome.text());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("tiny-board/assets/index.html")).unwrap(),
+            "hello"
+        );
+    }
+
+    #[test]
+    fn nested_write_rejects_escape_and_non_directory_parents() {
+        let dir = tempfile::tempdir().unwrap();
+        let sb = sandbox(dir.path());
+        for path in [
+            "../outside-new/file.txt",
+            "missing/../../outside.txt",
+            ".camelid/new/file.txt",
+        ] {
+            assert!(
+                validate(
+                    &call("write_file", json!({"path":path,"content":"bad"})),
+                    &sb
+                )
+                .is_err(),
+                "{path}"
+            );
+        }
+        std::fs::write(dir.path().join("file"), "unchanged").unwrap();
+        assert!(sb.resolve_output("file/child/new.txt").is_err());
+        assert!(!dir.path().join("missing").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nested_write_rejects_parent_redirected_after_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let sb = sandbox(dir.path());
+        let action = validate(
+            &call(
+                "write_file",
+                json!({"path":"new/nested/file.txt","content":"bad"}),
+            ),
+            &sb,
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("new")).unwrap();
+        assert!(action.execute(&sb).is_err());
+        assert!(!outside.path().join("nested").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn nested_write_rejects_windows_junction_after_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let sb = sandbox(dir.path());
+        let action = validate(
+            &call(
+                "write_file",
+                json!({"path":"new/nested/file.txt","content":"bad"}),
+            ),
+            &sb,
+        )
+        .unwrap();
+        let output = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(dir.path().join("new"))
+            .arg(outside.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(action.execute(&sb).is_err());
+        assert!(sb.resolve_output("new/nested/file.txt").is_err());
+        assert!(!outside.path().join("nested").exists());
     }
 
     #[test]

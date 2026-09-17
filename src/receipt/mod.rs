@@ -22,6 +22,7 @@ pub mod agent;
 pub mod audit;
 pub mod distributed;
 pub mod gguf_hash_cache;
+pub mod load_hash;
 pub mod verify;
 
 pub use gguf_hash_cache::sha256_file_hex_cached;

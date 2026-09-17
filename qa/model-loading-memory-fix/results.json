@@ -1,0 +1,77 @@
+[
+  {
+    "engine_sha256": "d66160432fcd363e37596ace0a1c198e258478067c5bc56e20f9a90e7e4839f2"
+  },
+  {
+    "operation": "/api/models/load",
+    "health_polls": 108,
+    "max_health_seconds": 0.001866499995230697
+  },
+  {
+    "operation": "/v1/chat/completions",
+    "health_polls": 3,
+    "max_health_seconds": 0.0026629170024534687
+  },
+  {
+    "filename": "Llama-3.2-3B-Instruct-Q4_K_M.gguf",
+    "attempt": 1,
+    "load_seconds": 54.56939595899894,
+    "reply": "Hello!",
+    "generation_ready_after_chat": true,
+    "weight_load_ms": 223
+  },
+  {
+    "operation": "/v1/chat/completions",
+    "health_polls": 1,
+    "max_health_seconds": 0.0010639579995768145
+  },
+  {
+    "filename": "Llama-3.2-3B-Instruct-Q4_K_M.gguf",
+    "attempt": 2,
+    "load_seconds": 54.56939595899894,
+    "reply": "Hello!",
+    "generation_ready_after_chat": true,
+    "weight_load_ms": 0
+  },
+  {
+    "filename": "Llama-3.2-3B-Instruct-Q4_K_M.gguf",
+    "repeat_load_seconds": 0.7062564170046244,
+    "cold_load_seconds": 54.56939595899894
+  },
+  {
+    "operation": "/api/models/load",
+    "health_polls": 444,
+    "max_health_seconds": 0.003614790999563411
+  },
+  {
+    "operation": "/v1/chat/completions",
+    "health_polls": 421,
+    "max_health_seconds": 0.005021499993745238
+  },
+  {
+    "filename": "Meta-Llama-3.1-8B-Instruct-Q8_0.gguf",
+    "attempt": 1,
+    "load_seconds": 224.26691712500178,
+    "reply": "Hello!",
+    "generation_ready_after_chat": true,
+    "weight_load_ms": 209138
+  },
+  {
+    "operation": "/v1/chat/completions",
+    "health_polls": 2,
+    "max_health_seconds": 0.0024409999896306545
+  },
+  {
+    "filename": "Meta-Llama-3.1-8B-Instruct-Q8_0.gguf",
+    "attempt": 2,
+    "load_seconds": 224.26691712500178,
+    "reply": "Hello!",
+    "generation_ready_after_chat": true,
+    "weight_load_ms": 0
+  },
+  {
+    "filename": "Meta-Llama-3.1-8B-Instruct-Q8_0.gguf",
+    "repeat_load_seconds": 0.735954749994562,
+    "cold_load_seconds": 224.26691712500178
+  }
+]

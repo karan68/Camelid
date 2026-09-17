@@ -22,6 +22,7 @@ import { EvidenceChip } from '../components/ui/EvidenceChip'
 import { IconSend, IconStop, IconMemory, IconReceipt, IconThinking, IconBolt, IconChart, IconChat, IconChevronDown, IconEdit, IconImage, IconInfo, IconClose, IconSearch, IconFile } from '../components/ui/icons'
 import { Tooltip } from '../components/ui/Tooltip'
 import { MessageTurn } from '../components/chat/MessageTurn'
+import { VoiceInput } from '../components/chat/VoiceInput'
 import { ChatControls } from '../components/chat/ChatControls'
 import { ContextMeter } from '../components/chat/ContextMeter'
 import { composeContextBudget } from '../lib/contextBudget.js'
@@ -182,6 +183,7 @@ export default function ChatWorkspace({
   projects = [], chatContext = {}, updateChatContext = null, contextSources = [], globalPrompt, updateGlobalPrompt,
   mcp = null, mcpSelectedKeys = [], replaceMcpTools = null, mcpActivity = null, mcpApproval = null, decideMcpApproval = null,
   selectedConversation,
+  apiBase,
   selectedModel,
   selectedModelId,
   setSelectedModelId,
@@ -261,6 +263,7 @@ export default function ChatWorkspace({
     return true
   }
   const [showControls, setShowControls] = useState(false)
+  const [voiceBusy, setVoiceBusy] = useState(false)
   const [showAllMessages, setShowAllMessages] = useState(false)
   const [userScrolledAway, setUserScrolledAway] = useState(false)
   const [composerImage, setComposerImage] = useState(null)
@@ -366,7 +369,10 @@ export default function ChatWorkspace({
      (send gate, reply cap, local-inference note) folds into the tooltip below. */
   const webResearchPlan = useMemo(() => classifyWebResearchNeed(composer), [composer])
   const webResearchWillUsePublicWeb = webResearchEnabled && webResearchPlan.needed && canChat
-  const statusLine = visibleWebResearchStatus?.phase === 'researching'
+  const loadProgress = runtime?.model_load_progress?.[0]
+  const statusLine = loadProgress
+    ? `Checking ${loadProgress.filename}: ${Math.floor(100 * loadProgress.bytes_read / Math.max(1, loadProgress.total_bytes))}% read.`
+    : visibleWebResearchStatus?.phase === 'researching'
     ? 'Reading relevant web sources before Camelid answers…'
     : webResearchWillUsePublicWeb
       ? 'Web Auto will send linked URLs or a search query to the public web.'
@@ -387,7 +393,7 @@ export default function ChatWorkspace({
       : selectedModelIssue
         ? selectedModelIssue
         : selectedRuntimeLoadedButNotReady
-          ? `${selectedModelName} is loaded, but this build cannot run it for Chat.`
+          ? runtime?.generation_readiness_reason || `${selectedModelName} is loaded, but Chat is unavailable. Check Models for details.`
         : supportBlocked
           ? `${selectedModelName} isn't verified for chat yet.`
           : selectedRuntimeMatchesLoadedModel
@@ -418,7 +424,7 @@ export default function ChatWorkspace({
           ? 'This model is loaded for embeddings and reranking. Choose a generation model to chat.'
           : 'This model creates embeddings for search and reranking. Load it from Models, or choose a generation model to chat.'
         : selectedRuntimeLoadedButNotReady
-          ? 'This model is loaded but not runnable for Chat in this build. Choose another model to continue.'
+          ? runtime?.generation_readiness_reason || 'This model is loaded, but Chat is unavailable. Check Models for details.'
         : supportBlocked
           /* When the blocker is a near miss — wrong file, or the right model at an
              unverified quantization — naming it is far more actionable than "pick a
@@ -442,7 +448,7 @@ export default function ChatWorkspace({
       ? 'warn'
     : supportedChatReady || verifiedChatReady ? 'ready' : varianceChatReady || unverifiedChatReady ? 'warn' : apiUnavailable ? 'offline' : selectedEmbeddingReady ? 'ready' : selectedEmbeddingOnly ? 'neutral' : supportBlocked ? 'warn' : runtime?.loaded_now ? 'warn' : 'neutral'
 
-  const canSubmit = Boolean(composer.trim()) && canChat && !requestActive
+  const canSubmit = Boolean(composer.trim()) && canChat && !requestActive && !voiceBusy
   const sendDisabledReason = requestActive
     ? 'Wait for the current reply to finish before sending again.'
     : canChat
@@ -671,6 +677,7 @@ export default function ChatWorkspace({
   }
 
   const handleSendMessage = async () => {
+    if (voiceBusy) return
     const image = composerImage
     setComposerImage(null)
     setImageError('')
@@ -1281,6 +1288,16 @@ export default function ChatWorkspace({
             </ComposerMenu>}
           </div>
           <div className="cxcomposer__actions">
+            {!demoMode && <VoiceInput
+              key={`${selectedConversation?.id || "new"}:${apiBase || ""}`}
+              apiBase={apiBase}
+              disabled={requestActive || apiUnavailable}
+              onBusyChange={setVoiceBusy}
+              onTranscript={(text) => {
+                setComposer((draft) => draft ? `${draft}${/\s$/.test(draft) ? "" : " "}${text}` : text)
+                composerRef.current?.focus()
+              }}
+            />}
             {generationActive && (
               <button type="button" className="cxcomposer__stop" aria-label={composerStopAriaLabel} onClick={stopGeneration} disabled={stoppingGeneration}>
                 <IconStop size={16} /> {composerStopLabel}

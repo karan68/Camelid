@@ -513,6 +513,64 @@ pub(super) async fn preview(
     }
 }
 
+pub(super) async fn preview_server_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(error) = authorize(&state, &headers) {
+        return *error;
+    }
+    let run = match run(&state, &id) {
+        Ok(run) => run,
+        Err(error) => return *error,
+    };
+    match tokio::task::spawn_blocking(move || run.preview_status()).await {
+        Ok(status) => Json(status).into_response(),
+        Err(error) => failure(error),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct PreviewRequest {
+    action: PreviewAction,
+    #[serde(default)]
+    entry: String,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PreviewAction {
+    Start,
+    Open,
+    Stop,
+}
+
+pub(super) async fn preview_server_action(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(request): Json<PreviewRequest>,
+) -> Response {
+    if let Err(error) = authorize(&state, &headers) {
+        return *error;
+    }
+    let run = match run(&state, &id) {
+        Ok(run) => run,
+        Err(error) => return *error,
+    };
+    let action = match request.action {
+        PreviewAction::Start => "start",
+        PreviewAction::Open => "open",
+        PreviewAction::Stop => "stop",
+    };
+    match tokio::task::spawn_blocking(move || run.manage_preview(action, &request.entry)).await {
+        Ok(Ok(status)) => Json(status).into_response(),
+        Ok(Err(error)) => failure(error),
+        Err(error) => failure(error),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -522,6 +580,36 @@ mod tests {
         headers.insert("host", "127.0.0.1:8181".parse().unwrap());
         headers.insert("origin", "http://127.0.0.1:8181".parse().unwrap());
         headers
+    }
+    #[tokio::test]
+    async fn managed_preview_api_rejects_foreign_origin_before_session_lookup() {
+        let state = AppState::default();
+        let mut headers = local_headers();
+        headers.insert("origin", "https://unrelated.example".parse().unwrap());
+        assert_eq!(
+            preview_server_status(
+                State(state.clone()),
+                headers.clone(),
+                Path("missing".into())
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            preview_server_action(
+                State(state),
+                headers,
+                Path("missing".into()),
+                Json(PreviewRequest {
+                    action: PreviewAction::Start,
+                    entry: "index.html".into()
+                })
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN
+        );
     }
     #[tokio::test]
     async fn active_input_and_reconnect_preserve_identity_authority_and_evidence() {

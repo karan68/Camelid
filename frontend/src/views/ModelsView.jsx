@@ -537,6 +537,11 @@ export default function ModelsView({
       )}
 
       {/* Zone 1 — active model bar */}
+      {runtime?.model_load_progress?.map((progress) => (
+        <Notice key={progress.filename} tone="info" notice={
+          `Checking ${progress.filename}: ${formatBytes(progress.bytes_read)} of ${formatBytes(progress.total_bytes)} read. The first load checks the complete model file.`
+        } />
+      ))}
       <ActiveModelBar
         runtime={runtime}
         activeFilename={spine.activeFilename}

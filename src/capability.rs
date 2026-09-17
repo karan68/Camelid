@@ -184,7 +184,6 @@ fn detect_simd() -> SimdCaps {
 /// capability report uses; `(0, 0)` means "unknown" and callers must not size a
 /// buffer from it. The Ghost-MoE CUDA host expert tier reads this to bound the
 /// arena it is allowed to claim.
-#[cfg(feature = "cuda")]
 pub(crate) fn host_ram_total_available_bytes() -> (u64, u64) {
     host_ram_bytes()
 }
