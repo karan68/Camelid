@@ -184,7 +184,7 @@ const statusSheets = ['../src/styles/ui.css', '../src/styles/shell.css', '../src
   .map((path) => [path, read(path)])
 
 /* ---- README product surface ---- */
-assert.match(readmeSource, /docs\/assets\/camelid-readme-chat-surface-dark\.png/, 'README should use the approved dark collapsed-rail chat screenshot')
+assert.match(readmeSource, /docs\/assets\/readme\/desktop-chat\.png/, 'README should use the approved Camelid desktop chat screenshot')
 assert.doesNotMatch(readmeSource, /assets\/camelid-banner\.png/, 'README should not lead with the disliked first banner image')
 assert.doesNotMatch(readmeSource, /docs\/assets\/ui-screenshot-v2\.png/, 'README must not regress to the retired light screenshot')
 
