@@ -1,0 +1,8 @@
+[resident-cuda] prefix continuation: reused 178 of 693 positions, prefilled 515
+[resident-cuda] GPU prefill chunk 0..693 of 693 in 7361 ms
+[resident-cuda] prefix continuation: reused 21 of 22 positions, prefilled 1
+[resident-cuda] GPU prefill chunk 0..22 of 22 in 14 ms
+[resident-cuda] prefix continuation: reused 74 of 97 positions, prefilled 23
+[resident-cuda] GPU prefill chunk 0..97 of 97 in 302 ms
+[resident-cuda] prefix continuation: reused 263 of 286 positions, prefilled 23
+[resident-cuda] GPU prefill chunk 0..286 of 286 in 310 ms
