@@ -18911,3 +18911,179 @@ fn f3_turn_ten_prefills_only_the_new_question() {
         turn_one.as_secs_f64() * 1e3
     );
 }
+// ---------------------------------------------------------------------------
+// F3 on the PAGED lane. F1's concurrency puts KV in per-sequence page tables,
+// where the engine-wide token record does not apply, so reuse there is a fork of
+// the retained page table. Same two questions as the single-sequence gates: does
+// it happen, and does it change anything.
+//
+// Every conversation here stays under `SPLITK_THRESHOLD` (512) positions --
+// above it the paged decode declines to the CPU, which is an F1 limit these
+// gates are not trying to measure.
+// ---------------------------------------------------------------------------
+
+/// Turn the paged lane on for one test. Restores both variables afterwards so a
+/// later test in the same process is not silently reconfigured.
+#[cfg(feature = "cuda")]
+struct PagedLaneGuard {
+    paged: Option<std::ffi::OsString>,
+    slots: Option<std::ffi::OsString>,
+}
+
+#[cfg(feature = "cuda")]
+impl PagedLaneGuard {
+    fn enable(slots: &str) -> Self {
+        let guard = Self {
+            paged: std::env::var_os("CAMELID_CUDA_PAGED_KV"),
+            slots: std::env::var_os("CAMELID_CUDA_SEQUENCE_SLOTS"),
+        };
+        std::env::set_var("CAMELID_CUDA_PAGED_KV", "1");
+        std::env::set_var("CAMELID_CUDA_SEQUENCE_SLOTS", slots);
+        guard
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Drop for PagedLaneGuard {
+    fn drop(&mut self) {
+        match self.paged.take() {
+            Some(value) => std::env::set_var("CAMELID_CUDA_PAGED_KV", value),
+            None => std::env::remove_var("CAMELID_CUDA_PAGED_KV"),
+        }
+        match self.slots.take() {
+            Some(value) => std::env::set_var("CAMELID_CUDA_SEQUENCE_SLOTS", value),
+            None => std::env::remove_var("CAMELID_CUDA_SEQUENCE_SLOTS"),
+        }
+    }
+}
+
+/// Run one turn on the paged lane: prefill all but the last prompt token, then
+/// decode. Returns (positions reused, generated tokens).
+#[cfg(feature = "cuda")]
+fn f3_paged_turn(
+    model: &ReviewRegressionModel,
+    cache_key: u64,
+    prompt: &[u32],
+    generate: usize,
+) -> (usize, Vec<u32>) {
+    let prefill_len = prompt.len() - 1;
+    let mut session = review_regression_session(model, cache_key);
+    let outcome = session
+        .try_resident_prefill_cuda_chunk(&prompt[..prefill_len], 0, prefill_len)
+        .expect("paged prefill");
+    let reused = match outcome {
+        CudaResidentPrefillChunkOutcome::Advanced {
+            reused_positions,
+            finalized: true,
+            ..
+        } => reused_positions,
+        other => panic!("paged prefill did not finish on the GPU: {other:?}"),
+    };
+    assert_eq!(session.kv_position(), prefill_len);
+    let generated = f3_decode_greedy(&mut session, prompt[prefill_len], generate);
+    drop(session);
+    (reused, generated)
+}
+
+/// The paged exact-parity gate: forking a retained page table must answer
+/// exactly as a cold prefill that built every row itself.
+///
+/// This is a sharper question than on the single-sequence lane. A fork SHARES
+/// pages, and the first write into a shared page copies it
+/// (`PendingPageKind::CopyOnWrite`), so a wrong page copy, a stale refcount or
+/// an off-by-one truncate all show up here as a changed token rather than as a
+/// crash.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "requires CAMELID_3B_GGUF and a CUDA device"]
+fn f3_paged_reuse_answers_identically_to_a_cold_prefill() {
+    let _env_guard = crate::test_support::env_lock();
+    let Some(model) = review_regression_model() else {
+        eprintln!("SKIP F3 paged parity gate: set CAMELID_3B_GGUF");
+        return;
+    };
+    let _paged = PagedLaneGuard::enable("1");
+    if !resident_prefill_is_available(&model, 0xF3A0_0FF0) {
+        return;
+    }
+    std::env::remove_var("CAMELID_CUDA_PREFIX_CONTINUATION");
+
+    const TURN_TOKENS: usize = 100;
+    const REPLY_TOKENS: usize = 6;
+    let warm_key = 0xF3A0_0001_u64;
+
+    let turn1 = f3_user_turn(&model.prompts[0], TURN_TOKENS);
+    let (turn1_reused, reply) = f3_paged_turn(&model, warm_key, &turn1, REPLY_TOKENS);
+
+    let mut turn2 = turn1.clone();
+    turn2.extend_from_slice(&reply);
+    turn2.extend(f3_user_turn(&model.prompts[1], TURN_TOKENS));
+    assert!(
+        turn2.len() < crate::cuda_resident::SPLITK_THRESHOLD,
+        "paged gates must stay inside the paged decode's position limit"
+    );
+
+    // WARM: the retained page table from turn 1 is still referenced.
+    let (warm_reused, warm_reply) = f3_paged_turn(&model, warm_key, &turn2, REPLY_TOKENS);
+    // COLD: a different cache key rebuilds the engine and its page pool.
+    let (cold_reused, cold_reply) = f3_paged_turn(&model, 0xF3A0_0002, &turn2, REPLY_TOKENS);
+
+    assert_eq!(turn1_reused, 0, "the first turn has nothing to fork");
+    assert_eq!(cold_reused, 0, "a rebuilt engine holds no pages to fork");
+    assert_eq!(
+        warm_reused,
+        turn1.len() + reply.len() - 1,
+        "turn 2 must fork turn 1's whole history -- prompt AND generated rows"
+    );
+    assert_eq!(
+        warm_reply, cold_reply,
+        "F3 paged parity gate: forking the retained pages changed the answer"
+    );
+}
+
+/// The retained prefix must outlive the session that built it. Sessions release
+/// their sequence on drop, and before F3 that freed every page the conversation
+/// held, so the next turn had nothing to fork however well it matched.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "requires CAMELID_3B_GGUF and a CUDA device"]
+fn f3_paged_prefix_survives_the_session_that_built_it() {
+    let _env_guard = crate::test_support::env_lock();
+    let Some(model) = review_regression_model() else {
+        eprintln!("SKIP F3 paged retention gate: set CAMELID_3B_GGUF");
+        return;
+    };
+    let _paged = PagedLaneGuard::enable("1");
+    if !resident_prefill_is_available(&model, 0xF3A0_0FF1) {
+        return;
+    }
+    std::env::remove_var("CAMELID_CUDA_PREFIX_CONTINUATION");
+
+    const TURN_TOKENS: usize = 100;
+    const REPLY_TOKENS: usize = 6;
+    let key = 0xF3A0_0003_u64;
+
+    let turn1 = f3_user_turn(&model.prompts[0], TURN_TOKENS);
+    let (_, reply) = f3_paged_turn(&model, key, &turn1, REPLY_TOKENS);
+
+    let mut turn2 = turn1.clone();
+    turn2.extend_from_slice(&reply);
+    turn2.extend(f3_user_turn(&model.prompts[1], TURN_TOKENS));
+    let (reused, _) = f3_paged_turn(&model, key, &turn2, REPLY_TOKENS);
+
+    assert!(
+        reused > turn1.len(),
+        "turn 2 forked {reused} positions but turn 1's prompt alone was {} -- the \
+         generated rows are not being retained across the session boundary",
+        turn1.len()
+    );
+    assert_eq!(reused, turn1.len() + reply.len() - 1);
+
+    // A prompt that shares nothing must fork nothing, even with a prefix retained.
+    let unrelated = f3_user_turn(&model.prompts[1], TURN_TOKENS);
+    let (unrelated_reused, _) = f3_paged_turn(&model, key, &unrelated, 1);
+    assert_eq!(
+        unrelated_reused, 0,
+        "a prompt sharing no leading token must not fork the retained prefix"
+    );
+}

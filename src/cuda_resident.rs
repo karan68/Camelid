@@ -14935,7 +14935,7 @@ const MAX_INDEPENDENT_BATCH_ROWS: usize = 8;
 /// deliberately the pessimistic one.
 ///
 /// Split out of the engine so the bookkeeping is testable without a GPU.
-fn resident_prefix_len(resident: &[u32], filled: usize, tokens: &[u32]) -> usize {
+pub(crate) fn resident_prefix_len(resident: &[u32], filled: usize, tokens: &[u32]) -> usize {
     let limit = resident.len().min(filled).min(tokens.len());
     let mut shared = 0usize;
     while shared < limit && resident[shared] == tokens[shared] {
