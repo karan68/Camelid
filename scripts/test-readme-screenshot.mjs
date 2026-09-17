@@ -7,14 +7,18 @@ import { join } from 'node:path'
 
 const repoRoot = new URL('..', import.meta.url)
 const readme = readFileSync(new URL('../README.md', import.meta.url), 'utf8')
-const expectedAsset = 'docs/assets/camelid-readme-chat-surface-dark.png'
+// The hero screenshot the README actually ships. Refreshed with the README
+// itself (docs/assets/readme/, captured from the frontend at v0.7.7); this guard
+// pins the bytes so the surface cannot change without an explicit update here.
+const expectedAsset = 'docs/assets/readme/desktop-chat.png'
 const retiredLightAsset = 'docs/assets/ui-screenshot-v2.png'
-const expectedSha256 = '2576d003da76fa5a4e32462f9922555daec2cd1b5a88ccb392e125931baba418'
+const expectedSha256 = 'e064e5e7eda8711cddbf54a538ce48e7cf32bb7eab78db4701e5ce440cec6b8d'
+const expectedAlt = 'Camelid desktop chat with a pinned conversation, Markdown table, project context, and model selector'
 
 assert.match(
   readme,
-  new RegExp(`!\\[Camelid WebUI chat surface\\]\\(${expectedAsset.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\)`),
-  'README must use the approved dark collapsed-rail Camelid chat screenshot',
+  new RegExp(`!\\[${expectedAlt.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\]\\(${expectedAsset.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\)`),
+  'README must use the approved Camelid desktop chat screenshot',
 )
 assert.doesNotMatch(
   readme,
@@ -23,8 +27,8 @@ assert.doesNotMatch(
 )
 assert.match(
   readme,
-  /dark, collapsed-rail chat surface/i,
-  'README caption must preserve the intended dark collapsed-rail screenshot contract',
+  /Screenshots show interface features, not model-quality or performance results/i,
+  'README caption must keep saying the screenshots are interface-only, not results',
 )
 
 const assetBytes = readFileSync(join(fileURLToPath(repoRoot), expectedAsset))
