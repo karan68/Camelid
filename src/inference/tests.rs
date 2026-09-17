@@ -3881,11 +3881,14 @@ fn phase5_resident_prefill_chunks_match_whole_and_release_every_boundary() {
                     CudaResidentPrefillChunkOutcome::Unsupported => unreachable!(),
                 },
                 finalized: base == prefix.len(),
-                // A continuation chunk reuses exactly the positions the chunks
-                // before it wrote; the prefix-continuation match is whole-prompt
-                // only, so it never adds to this.
-                reused_positions: base - chunk.len(),
             }
+        );
+        // A continuation chunk reuses exactly the positions the chunks before it
+        // wrote; the prefix-continuation match is whole-prompt only, so it never
+        // adds to this.
+        assert_eq!(
+            crate::inference::last_resident_prefill_reused(),
+            base - chunk.len(),
         );
         assert_eq!(
             chunked.kv_position(),
@@ -18603,10 +18606,8 @@ fn f3_reusing_generated_kv_answers_identically_to_a_cold_prefill() {
             .expect("warm turn-2 prefill");
         let reused = match outcome {
             CudaResidentPrefillChunkOutcome::Advanced {
-                reused_positions,
-                finalized: true,
-                ..
-            } => reused_positions,
+                finalized: true, ..
+            } => crate::inference::last_resident_prefill_reused(),
             other => panic!("warm turn 2 did not finish on the GPU: {other:?}"),
         };
         (
@@ -18624,10 +18625,8 @@ fn f3_reusing_generated_kv_answers_identically_to_a_cold_prefill() {
             .expect("cold turn-2 prefill");
         let reused = match outcome {
             CudaResidentPrefillChunkOutcome::Advanced {
-                reused_positions,
-                finalized: true,
-                ..
-            } => reused_positions,
+                finalized: true, ..
+            } => crate::inference::last_resident_prefill_reused(),
             other => panic!("cold turn 2 did not finish on the GPU: {other:?}"),
         };
         (
@@ -18688,9 +18687,9 @@ fn f3_generated_rows_extend_the_reusable_prefix_past_the_prompt() {
         .try_resident_prefill_cuda_chunk(&history[..prefill_len], 0, prefill_len)
         .expect("turn-2 prefill");
     let reused = match outcome {
-        CudaResidentPrefillChunkOutcome::Advanced {
-            reused_positions, ..
-        } => reused_positions,
+        CudaResidentPrefillChunkOutcome::Advanced { .. } => {
+            crate::inference::last_resident_prefill_reused()
+        }
         other => panic!("turn 2 did not run on the GPU: {other:?}"),
     };
     assert_eq!(turn2.kv_position(), prefill_len);
@@ -18825,10 +18824,8 @@ fn f3_turn_ten_prefills_only_the_new_question() {
             .unwrap_or_else(|error| panic!("turn {turn} prefill failed: {error}"));
         let reused = match outcome {
             CudaResidentPrefillChunkOutcome::Advanced {
-                reused_positions,
-                finalized: true,
-                ..
-            } => reused_positions,
+                finalized: true, ..
+            } => crate::inference::last_resident_prefill_reused(),
             other => panic!("turn {turn} did not finish on the GPU: {other:?}"),
         };
         let first = f3_decode_greedy(&mut session, last, 1)[0];
@@ -18859,9 +18856,9 @@ fn f3_turn_ten_prefills_only_the_new_question() {
         )
         .expect("control prefill");
     let control_reused = match control_outcome {
-        CudaResidentPrefillChunkOutcome::Advanced {
-            reused_positions, ..
-        } => reused_positions,
+        CudaResidentPrefillChunkOutcome::Advanced { .. } => {
+            crate::inference::last_resident_prefill_reused()
+        }
         other => panic!("control turn 10 did not run on the GPU: {other:?}"),
     };
     let _ = f3_decode_greedy(&mut control, control_last, 1);
@@ -19011,10 +19008,8 @@ fn f3_paged_turn(
         .expect("paged prefill");
     let reused = match outcome {
         CudaResidentPrefillChunkOutcome::Advanced {
-            reused_positions,
-            finalized: true,
-            ..
-        } => reused_positions,
+            finalized: true, ..
+        } => crate::inference::last_resident_prefill_reused(),
         other => panic!("paged prefill did not finish on the GPU: {other:?}"),
     };
     assert_eq!(session.kv_position(), prefill_len);

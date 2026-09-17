@@ -24700,7 +24700,6 @@ impl CooperativeStreamDecodeJob {
                 end_position,
                 elapsed_micros,
                 finalized,
-                ..
             } => {
                 if !state.started {
                     telemetry::emit(telemetry::Event::PrefillStarted {
@@ -25201,7 +25200,6 @@ impl CooperativeStreamDecodeJob {
                 end_position: 1,
                 elapsed_micros,
                 finalized: false,
-                ..
             } = outcome
             else {
                 let response = api_error(

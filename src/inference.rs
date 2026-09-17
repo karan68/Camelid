@@ -2519,12 +2519,28 @@ pub(crate) enum CudaResidentPrefillChunkOutcome {
         end_position: usize,
         elapsed_micros: u128,
         finalized: bool,
-        /// Leading positions this chunk skipped because the engine already held
-        /// their KV. `0` means a full prefill; the F3 gates assert on it so a
-        /// silent regression to re-prefilling shows up as a failure, not a
-        /// slower run nothing measures.
-        reused_positions: usize,
     },
+}
+
+/// Leading positions the most recent resident CUDA prefill skipped because the
+/// engine already held their KV.
+///
+/// Test observability, deliberately NOT a field on the outcome above: adding one
+/// would force the exhaustive matches in `src/api/mod.rs` to change, and that
+/// file's git blob sha is pinned as the SmolLM3 renderer grounding. Nothing in
+/// production reads this, so a counter keeps the reuse measurable without
+/// dragging unrelated model-qualification evidence into a KV-cache change.
+///
+/// Reads are only meaningful immediately after the caller's own prefill, which
+/// is how `last_resident_prefill_reused` is used (single-threaded gates).
+#[cfg(feature = "cuda")]
+static LAST_RESIDENT_PREFILL_REUSED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// See [`LAST_RESIDENT_PREFILL_REUSED`].
+#[cfg(all(test, feature = "cuda"))]
+pub(crate) fn last_resident_prefill_reused() -> usize {
+    LAST_RESIDENT_PREFILL_REUSED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Keep a capacity refusal typed. Every other paged-batch failure stays an opaque
@@ -4095,11 +4111,11 @@ impl LlamaInferenceSession {
                 started.elapsed().as_millis()
             );
         }
+        LAST_RESIDENT_PREFILL_REUSED.store(reuse, std::sync::atomic::Ordering::Relaxed);
         Ok(CudaResidentPrefillChunkOutcome::Advanced {
             end_position,
             elapsed_micros: started.elapsed().as_micros(),
             finalized,
-            reused_positions: reuse,
         })
     }
 
