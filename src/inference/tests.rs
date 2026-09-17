@@ -18926,14 +18926,28 @@ fn f3_turn_ten_prefills_only_the_new_question() {
     // regression that matters -- reuse silently narrowing and the conversation
     // creeping back into the prefill -- without asserting a target this lane
     // does not meet.
+    //
+    // RELEASE ONLY, because 1.59x and 2.20x were both measured there. An
+    // unoptimized build spends much longer in the per-token prefill and lands at
+    // 2.94x on the same hardware -- with `prefilled` above IDENTICAL, so nothing
+    // the cache does has changed. Asserting a release-calibrated ratio on a debug
+    // build is a flake, not a gate, so the bound is stated only where it was
+    // measured. The assertions above this one are deterministic and hold on both.
     let ratio = turn_ten.as_secs_f64() / turn_one.as_secs_f64();
-    assert!(
-        ratio <= 2.20,
-        "turn-10 TTFT is {ratio:.2}x turn-1 ({:.1} ms vs {:.1} ms); measured 1.59x \
-         on an L4, so this is a regression in how much turn 10 re-prefills",
-        turn_ten.as_secs_f64() * 1e3,
-        turn_one.as_secs_f64() * 1e3
-    );
+    if cfg!(debug_assertions) {
+        eprintln!(
+            "[f3-ttft] debug build: turn-10/turn-1 is {ratio:.2}x, not asserted \
+             (the 2.20x ceiling is release-calibrated)"
+        );
+    } else {
+        assert!(
+            ratio <= 2.20,
+            "turn-10 TTFT is {ratio:.2}x turn-1 ({:.1} ms vs {:.1} ms); measured 1.59x \
+             on an L4, so this is a regression in how much turn 10 re-prefills",
+            turn_ten.as_secs_f64() * 1e3,
+            turn_one.as_secs_f64() * 1e3
+        );
+    }
 }
 // ---------------------------------------------------------------------------
 // F3 on the PAGED lane. F1's concurrency puts KV in per-sequence page tables,
