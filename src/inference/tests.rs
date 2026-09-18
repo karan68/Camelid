@@ -3883,6 +3883,13 @@ fn phase5_resident_prefill_chunks_match_whole_and_release_every_boundary() {
                 finalized: base == prefix.len(),
             }
         );
+        // A continuation chunk reuses exactly the positions the chunks before it
+        // wrote; the prefix-continuation match is whole-prompt only, so it never
+        // adds to this.
+        assert_eq!(
+            crate::inference::last_resident_prefill_reused(),
+            base - chunk.len(),
+        );
         assert_eq!(
             chunked.kv_position(),
             if base == prefix.len() { base } else { 0 },
@@ -18509,4 +18516,607 @@ fn resident_prefill_repeats_with_prefix_continuation_disabled() {
 
     assert!(advanced, "the repeat request must still prefill on the GPU");
     assert_eq!(position, prompt.len());
+}
+// ---------------------------------------------------------------------------
+// F3 -- session KV cache on CUDA. A chat turn must not re-prefill the turns
+// before it. These gates prove the reuse HAPPENS (a slow lane is invisible to
+// every other test) and that it changes NOTHING (an over-claimed row answers
+// from the wrong KV, which no timing test would catch).
+// ---------------------------------------------------------------------------
+
+/// Decode `count` tokens greedily through the resident lane, starting from
+/// `first`. Fails loudly rather than skipping if the lane declines: this helper
+/// only runs inside gates that already probed the engine builds, so a decline
+/// here is a regression, not an environment limit.
+#[cfg(feature = "cuda")]
+fn f3_decode_greedy(session: &mut LlamaInferenceSession, first: u32, count: usize) -> Vec<u32> {
+    let mut generated = Vec::with_capacity(count);
+    let mut next = first;
+    for step in 0..count {
+        let (token, _) = session
+            .generate_next_token_greedy_resident(next)
+            .unwrap_or_else(|error| panic!("resident greedy decode failed at step {step}: {error}"))
+            .unwrap_or_else(|| panic!("resident greedy decode declined at step {step}"));
+        generated.push(token);
+        next = token;
+    }
+    generated
+}
+
+/// The F3 exact-parity gate.
+///
+/// Turn 2 of a chat carries turn 1's prompt AND the model's own reply. The
+/// engine holds device KV for both, so turn 2 should prefill only the new
+/// question -- but the KV rows for the reply were written by the DECODE kernels,
+/// while a cold prefill writes them with the PREFILL kernels. If those two
+/// disagree by even one ulp, reusing them is not an optimization, it is a
+/// different model answering.
+///
+/// So this runs turn 2 twice against the same prompt -- once on the warm engine
+/// (reusing turn 1) and once on a rebuilt one (reusing nothing) -- and requires
+/// the two replies to be token-identical. Greedy decode makes any divergence in
+/// the reused K/V observable as a flipped token at the first near-tie.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "requires CAMELID_3B_GGUF and a CUDA device"]
+fn f3_reusing_generated_kv_answers_identically_to_a_cold_prefill() {
+    let _env_guard = crate::test_support::env_lock();
+    let Some(model) = review_regression_model() else {
+        eprintln!("SKIP F3 parity gate: set CAMELID_3B_GGUF");
+        return;
+    };
+    if !resident_prefill_is_available(&model, 0xF300_0FF0) {
+        return;
+    }
+    std::env::remove_var("CAMELID_CUDA_PREFIX_CONTINUATION");
+
+    const REPLY_TOKENS: usize = 8;
+    const TURN2_TOKENS: usize = 8;
+    let warm_key = 0xF300_0001_u64;
+
+    // Turn 1. The session contract prefills all but the last prompt token and
+    // decodes through it, so the record ends contiguous over prompt + reply.
+    let turn1_prompt = model.prompts[0].clone();
+    let (reply, turn1_last) = {
+        let mut turn1 = review_regression_session(&model, warm_key);
+        let split = turn1_prompt.len() - 1;
+        assert!(
+            turn1
+                .try_resident_prefill_cuda(&turn1_prompt[..split])
+                .unwrap(),
+            "turn 1 must prefill on the GPU or this gate proves nothing"
+        );
+        let last = turn1_prompt[split];
+        (f3_decode_greedy(&mut turn1, last, REPLY_TOKENS), last)
+    };
+    let _ = turn1_last;
+
+    // Turn 2: the whole history plus a question that shares no leading token.
+    let mut turn2_prompt = turn1_prompt.clone();
+    turn2_prompt.extend_from_slice(&reply);
+    turn2_prompt.extend_from_slice(&model.prompts[1]);
+    let prefill_len = turn2_prompt.len() - 1;
+    let turn2_last = *turn2_prompt.last().expect("turn 2 prompt is non-empty");
+
+    // WARM arm: same cache key, so the engine still holds turn 1.
+    let (warm_reused, warm_reply) = {
+        let mut warm = review_regression_session(&model, warm_key);
+        let outcome = warm
+            .try_resident_prefill_cuda_chunk(&turn2_prompt[..prefill_len], 0, prefill_len)
+            .expect("warm turn-2 prefill");
+        let reused = match outcome {
+            CudaResidentPrefillChunkOutcome::Advanced {
+                finalized: true, ..
+            } => crate::inference::last_resident_prefill_reused(),
+            other => panic!("warm turn 2 did not finish on the GPU: {other:?}"),
+        };
+        (
+            reused,
+            f3_decode_greedy(&mut warm, turn2_last, TURN2_TOKENS),
+        )
+    };
+
+    // COLD arm: a different cache key rebuilds the engine, so there is nothing
+    // to reuse and the whole prompt is prefilled from scratch.
+    let (cold_reused, cold_reply) = {
+        let mut cold = review_regression_session(&model, 0xF300_0002);
+        let outcome = cold
+            .try_resident_prefill_cuda_chunk(&turn2_prompt[..prefill_len], 0, prefill_len)
+            .expect("cold turn-2 prefill");
+        let reused = match outcome {
+            CudaResidentPrefillChunkOutcome::Advanced {
+                finalized: true, ..
+            } => crate::inference::last_resident_prefill_reused(),
+            other => panic!("cold turn 2 did not finish on the GPU: {other:?}"),
+        };
+        (
+            reused,
+            f3_decode_greedy(&mut cold, turn2_last, TURN2_TOKENS),
+        )
+    };
+
+    assert_eq!(cold_reused, 0, "a rebuilt engine holds nothing to reuse");
+    // One short of the full history: the last generated token was never fed back
+    // in, so no row holds it and the record cannot vouch for it.
+    assert_eq!(
+        warm_reused,
+        turn1_prompt.len() + reply.len() - 1,
+        "turn 2 must reuse turn 1's prompt AND the tokens the model generated"
+    );
+    assert_eq!(
+        warm_reply, cold_reply,
+        "F3 exact-parity gate: reusing turn 1's device KV changed the answer"
+    );
+}
+
+/// The reuse must be CAUSED by the decode-side record, not by the prompt match
+/// alone. Without `record_resident_token` the record stops at the turn-1 prompt,
+/// so this asserts the difference: with the record extended, turn 2 reuses past
+/// the prompt into the generated rows.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "requires CAMELID_3B_GGUF and a CUDA device"]
+fn f3_generated_rows_extend_the_reusable_prefix_past_the_prompt() {
+    let _env_guard = crate::test_support::env_lock();
+    let Some(model) = review_regression_model() else {
+        eprintln!("SKIP F3 record-growth gate: set CAMELID_3B_GGUF");
+        return;
+    };
+    if !resident_prefill_is_available(&model, 0xF300_0FF1) {
+        return;
+    }
+    std::env::remove_var("CAMELID_CUDA_PREFIX_CONTINUATION");
+
+    const REPLY_TOKENS: usize = 6;
+    let key = 0xF300_0003_u64;
+    let prompt = model.prompts[0].clone();
+    let split = prompt.len() - 1;
+
+    let mut turn1 = review_regression_session(&model, key);
+    assert!(turn1.try_resident_prefill_cuda(&prompt[..split]).unwrap());
+    let reply = f3_decode_greedy(&mut turn1, prompt[split], REPLY_TOKENS);
+    drop(turn1);
+
+    let mut history = prompt.clone();
+    history.extend_from_slice(&reply);
+    history.extend_from_slice(&model.prompts[1]);
+    let prefill_len = history.len() - 1;
+
+    let mut turn2 = review_regression_session(&model, key);
+    let outcome = turn2
+        .try_resident_prefill_cuda_chunk(&history[..prefill_len], 0, prefill_len)
+        .expect("turn-2 prefill");
+    let reused = match outcome {
+        CudaResidentPrefillChunkOutcome::Advanced { .. } => {
+            crate::inference::last_resident_prefill_reused()
+        }
+        other => panic!("turn 2 did not run on the GPU: {other:?}"),
+    };
+    assert_eq!(turn2.kv_position(), prefill_len);
+    drop(turn2);
+
+    assert!(
+        reused > prompt.len(),
+        "turn 2 reused {reused} positions but turn 1's prompt was {} -- the decoded \
+         rows are not being recorded, so every turn re-prefills the model's own reply",
+        prompt.len()
+    );
+    assert_eq!(reused, prompt.len() + reply.len() - 1);
+}
+
+/// Build one conversational turn of `len` tokens by cycling a real encoded
+/// prompt. The token VALUES only have to be valid ids -- this gate measures
+/// prefill work, not answer quality -- and cycling keeps the turn long enough
+/// for the wall-clock difference to be about prefill rather than fixed overhead.
+#[cfg(feature = "cuda")]
+fn f3_user_turn(seed: &[u32], len: usize) -> Vec<u32> {
+    seed.iter().copied().cycle().take(len).collect()
+}
+
+/// Turn 10 of a chat must pay for its OWN question and nothing else.
+///
+/// The deterministic half of this gate is `prefilled`: every turn must prefill
+/// one user turn's worth of tokens, never the conversation behind it. That
+/// assertion is hardware-independent and is the real regression guard -- a
+/// silent revert to re-prefilling fails it on any machine.
+///
+/// The timing half is bounded rather than exact, because wall clock is a
+/// property of the host. The control arm (`CAMELID_CUDA_PREFIX_CONTINUATION=0`,
+/// same prompt, reuse off) is what makes the numbers mean something: if
+/// re-prefilling is not dramatically slower, the gate is measuring nothing.
+///
+/// WHAT THIS DOES NOT REACH. The product spec asks for turn-10 TTFT within 20%
+/// of turn-1. Measured on an L4 (release, Llama-3.2-3B Q4_K_M, 3.4k-token
+/// conversation) it is 1.59x -- 4758 ms -> 7573 ms, against 85980 ms with the
+/// reuse off. The shortfall is not the cache. Keeping the history on the device
+/// removes the re-prefill, but turn 10's new tokens still attend over 3.4k
+/// positions where turn 1's attended over 170. Fitting the ten turns to
+/// `ttft = c + a * new_tokens * context` splits it as c ~= 4.6 s of per-token
+/// prefill and ~3.0 s of that extra attention; only the second term is F3's to
+/// remove, and it cannot be removed by caching.
+///
+/// MEASURED, so nobody re-runs it: every alternative prefill lane is WORSE with
+/// context than the shipped serial default. Release, L4 (sm_89), same row and
+/// conversation, turn-1 -> turn-10 TTFT:
+///
+/// | prefill lane                          | turn 1  | turn 10  | per turn |
+/// |---------------------------------------|---------|----------|----------|
+/// | serial (default)                      | 4758 ms |  7573 ms |  ~310 ms |
+/// | serial + CAMELID_FLASH_PREFILL=1      | 4767 ms |  7603 ms |  ~310 ms |
+/// | CAMELID_KQUANT_BATCHED_PREFILL=1      | 4083 ms | 12276 ms |  ~910 ms |
+/// | ...that plus flash, KQUANT_BATCH=4    | 4949 ms | 20132 ms | ~1690 ms |
+///
+/// Two things worth keeping. `CAMELID_FLASH_PREFILL` is INERT on this row:
+/// `launch_attention_flash_prefill` is reachable only from
+/// `run_batched_layer_stack`, and a K-quant row takes the serial lane, so the
+/// flag changes nothing until batched prefill is also on -- at which point it is
+/// slower still. (`flash_prefill_enabled` asks for sm_89 evidence because none
+/// was committed; this is it, and it does not favour the flag.)
+///
+/// And the shortfall is NOT reachable by flipping these. The batched K-quant
+/// GEMM stages token rows in shared memory, so `batched_layer_token_cap` clamps
+/// the tile to 2 tokens (4 here at most): weight reads amortize 2-4x, nowhere
+/// near enough to matter. Serial prefill therefore runs at roughly DECODE speed,
+/// ~14 ms/token, which is the ~4.6 s constant. Closing this needs a K-quant
+/// prefill GEMM with real tiles, not a flag.
+///
+/// Note also what that would do to THIS gate: shrinking the constant while the
+/// attention term stands makes the RATIO worse even though every user-visible
+/// number improves. The ratio is a proxy; the spec's other F3 gate (agent TTFT
+/// p95 under 4 s) is the one that tracks what a user feels, and at 7.6 s it is
+/// also unmet for the same reason.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "requires CAMELID_3B_GGUF and a CUDA device"]
+fn f3_turn_ten_prefills_only_the_new_question() {
+    let _env_guard = crate::test_support::env_lock();
+    let Some(model) = review_regression_model() else {
+        eprintln!("SKIP F3 TTFT gate: set CAMELID_3B_GGUF");
+        return;
+    };
+    if !resident_prefill_is_available(&model, 0xF300_0FF2) {
+        return;
+    }
+    std::env::remove_var("CAMELID_CUDA_PREFIX_CONTINUATION");
+    // Bound the device KV allocation to a realistic chat context. Unset, the cap
+    // is the model's full trained context (131072 for Llama 3.2), which would
+    // reserve many GB of VRAM up front and push this host into layer offload --
+    // measuring PCIe streaming instead of prefill.
+    std::env::set_var("CAMELID_CUDA_RESIDENT_MAX_CONTEXT", "8192");
+
+    const TURNS: usize = 10;
+    const REPLY_TOKENS: usize = 8;
+    const USER_TURN_TOKENS: usize = 340;
+    let key = 0xF300_0004_u64;
+
+    let mut history = f3_user_turn(&model.prompts[0], USER_TURN_TOKENS);
+    let mut ttft = Vec::with_capacity(TURNS);
+    let mut prefilled = Vec::with_capacity(TURNS);
+    let mut turn_ten_prompt = Vec::new();
+
+    // Build the engine BEFORE the measured turns. Construction (VRAM probe,
+    // weight upload, NVRTC compile) costs tens of seconds and lands on whichever
+    // turn runs first, which would inflate the turn-1 baseline enough for the
+    // comparison below to pass without measuring anything. The warm-up uses the
+    // OTHER prompt, so it shares no leading token with turn 1: the engine ends
+    // up built but holding nothing turn 1 can reuse.
+    {
+        let warm_prompt = f3_user_turn(&model.prompts[1], USER_TURN_TOKENS);
+        let warm_len = warm_prompt.len() - 1;
+        let mut warmup = review_regression_session(&model, key);
+        warmup
+            .try_resident_prefill_cuda_chunk(&warm_prompt[..warm_len], 0, warm_len)
+            .expect("warm-up prefill must build the engine");
+    }
+
+    for turn in 0..TURNS {
+        let prefill_len = history.len() - 1;
+        let last = history[prefill_len];
+        if turn == TURNS - 1 {
+            turn_ten_prompt = history.clone();
+        }
+        let mut session = review_regression_session(&model, key);
+
+        // TTFT as the user experiences it: prefill plus the first decoded token.
+        let started = std::time::Instant::now();
+        let outcome = session
+            .try_resident_prefill_cuda_chunk(&history[..prefill_len], 0, prefill_len)
+            .unwrap_or_else(|error| panic!("turn {turn} prefill failed: {error}"));
+        let reused = match outcome {
+            CudaResidentPrefillChunkOutcome::Advanced {
+                finalized: true, ..
+            } => crate::inference::last_resident_prefill_reused(),
+            other => panic!("turn {turn} did not finish on the GPU: {other:?}"),
+        };
+        let first = f3_decode_greedy(&mut session, last, 1)[0];
+        ttft.push(started.elapsed());
+        prefilled.push(prefill_len - reused);
+
+        let mut reply = vec![first];
+        reply.extend(f3_decode_greedy(&mut session, first, REPLY_TOKENS - 1));
+        drop(session);
+
+        history.extend_from_slice(&reply);
+        if turn + 1 < TURNS {
+            history.extend(f3_user_turn(&model.prompts[1], USER_TURN_TOKENS));
+        }
+    }
+
+    // Control: the same turn-10 prompt with the reuse switched off.
+    std::env::set_var("CAMELID_CUDA_PREFIX_CONTINUATION", "0");
+    let control_prefill_len = turn_ten_prompt.len() - 1;
+    let control_last = turn_ten_prompt[control_prefill_len];
+    let mut control = review_regression_session(&model, 0xF300_0005);
+    let control_started = std::time::Instant::now();
+    let control_outcome = control
+        .try_resident_prefill_cuda_chunk(
+            &turn_ten_prompt[..control_prefill_len],
+            0,
+            control_prefill_len,
+        )
+        .expect("control prefill");
+    let control_reused = match control_outcome {
+        CudaResidentPrefillChunkOutcome::Advanced { .. } => {
+            crate::inference::last_resident_prefill_reused()
+        }
+        other => panic!("control turn 10 did not run on the GPU: {other:?}"),
+    };
+    let _ = f3_decode_greedy(&mut control, control_last, 1);
+    let control_ttft = control_started.elapsed();
+    drop(control);
+    std::env::remove_var("CAMELID_CUDA_PREFIX_CONTINUATION");
+    std::env::remove_var("CAMELID_CUDA_RESIDENT_MAX_CONTEXT");
+
+    for (turn, (ttft, prefilled)) in ttft.iter().zip(prefilled.iter()).enumerate() {
+        eprintln!(
+            "[f3-ttft] turn {:>2}: ttft {:>7.1} ms, prefilled {prefilled} tokens",
+            turn + 1,
+            ttft.as_secs_f64() * 1e3,
+        );
+    }
+    eprintln!(
+        "[f3-ttft] control (continuation off): ttft {:.1} ms, prefilled {} tokens",
+        control_ttft.as_secs_f64() * 1e3,
+        control_prefill_len - control_reused,
+    );
+
+    let turn_one = ttft[0];
+    let turn_ten = ttft[TURNS - 1];
+
+    assert!(
+        turn_ten_prompt.len() > 3_000,
+        "the conversation must actually be long enough to matter, got {} tokens",
+        turn_ten_prompt.len()
+    );
+    assert_eq!(
+        prefilled[0],
+        control_prefill_len.min(USER_TURN_TOKENS - 1),
+        "turn 1 has nothing to reuse and must prefill its whole prompt"
+    );
+    assert_eq!(
+        control_reused, 0,
+        "the control arm must reuse nothing, or it is not a control"
+    );
+    // The mechanism, stated deterministically: turn 10 prefills its own question
+    // plus the reply it is answering, never the nine turns before it.
+    assert!(
+        prefilled[TURNS - 1] <= USER_TURN_TOKENS + REPLY_TOKENS,
+        "turn 10 prefilled {} tokens; it should only prefill the new question \
+         (<= {}), not re-prefill the conversation",
+        prefilled[TURNS - 1],
+        USER_TURN_TOKENS + REPLY_TOKENS
+    );
+    // The reuse win, which is what the cache is actually for. Measured 11.4x on
+    // an L4; the bound is deliberately far below that so a slower or busier host
+    // does not turn a working cache into a red build.
+    assert!(
+        control_ttft.as_secs_f64() > turn_ten.as_secs_f64() * 5.0,
+        "re-prefilling the whole conversation took {:.1} ms vs {:.1} ms reused -- \
+         too close for this gate to be evidence of anything",
+        control_ttft.as_secs_f64() * 1e3,
+        turn_ten.as_secs_f64() * 1e3
+    );
+    // TTFT growth ceiling. The spec's target is 1.20x and this is NOT it: the
+    // measured 1.59x is recorded in the doc comment above along with why the
+    // remaining growth is attention rather than re-prefill. 2.20x is set above
+    // the measured value with room for host variance, so it catches the
+    // regression that matters -- reuse silently narrowing and the conversation
+    // creeping back into the prefill -- without asserting a target this lane
+    // does not meet.
+    //
+    // RELEASE ONLY, because 1.59x and 2.20x were both measured there. An
+    // unoptimized build spends much longer in the per-token prefill and lands at
+    // 2.94x on the same hardware -- with `prefilled` above IDENTICAL, so nothing
+    // the cache does has changed. Asserting a release-calibrated ratio on a debug
+    // build is a flake, not a gate, so the bound is stated only where it was
+    // measured. The assertions above this one are deterministic and hold on both.
+    let ratio = turn_ten.as_secs_f64() / turn_one.as_secs_f64();
+    if cfg!(debug_assertions) {
+        eprintln!(
+            "[f3-ttft] debug build: turn-10/turn-1 is {ratio:.2}x, not asserted \
+             (the 2.20x ceiling is release-calibrated)"
+        );
+    } else {
+        assert!(
+            ratio <= 2.20,
+            "turn-10 TTFT is {ratio:.2}x turn-1 ({:.1} ms vs {:.1} ms); measured 1.59x \
+             on an L4, so this is a regression in how much turn 10 re-prefills",
+            turn_ten.as_secs_f64() * 1e3,
+            turn_one.as_secs_f64() * 1e3
+        );
+    }
+}
+// ---------------------------------------------------------------------------
+// F3 on the PAGED lane. F1's concurrency puts KV in per-sequence page tables,
+// where the engine-wide token record does not apply, so reuse there is a fork of
+// the retained page table. Same two questions as the single-sequence gates: does
+// it happen, and does it change anything.
+//
+// Every conversation here stays under `SPLITK_THRESHOLD` (512) positions --
+// above it the paged decode declines to the CPU, which is an F1 limit these
+// gates are not trying to measure.
+// ---------------------------------------------------------------------------
+
+/// Turn the paged lane on for one test. Restores both variables afterwards so a
+/// later test in the same process is not silently reconfigured.
+#[cfg(feature = "cuda")]
+struct PagedLaneGuard {
+    paged: Option<std::ffi::OsString>,
+    slots: Option<std::ffi::OsString>,
+}
+
+#[cfg(feature = "cuda")]
+impl PagedLaneGuard {
+    fn enable(slots: &str) -> Self {
+        let guard = Self {
+            paged: std::env::var_os("CAMELID_CUDA_PAGED_KV"),
+            slots: std::env::var_os("CAMELID_CUDA_SEQUENCE_SLOTS"),
+        };
+        std::env::set_var("CAMELID_CUDA_PAGED_KV", "1");
+        std::env::set_var("CAMELID_CUDA_SEQUENCE_SLOTS", slots);
+        guard
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Drop for PagedLaneGuard {
+    fn drop(&mut self) {
+        match self.paged.take() {
+            Some(value) => std::env::set_var("CAMELID_CUDA_PAGED_KV", value),
+            None => std::env::remove_var("CAMELID_CUDA_PAGED_KV"),
+        }
+        match self.slots.take() {
+            Some(value) => std::env::set_var("CAMELID_CUDA_SEQUENCE_SLOTS", value),
+            None => std::env::remove_var("CAMELID_CUDA_SEQUENCE_SLOTS"),
+        }
+    }
+}
+
+/// Run one turn on the paged lane: prefill all but the last prompt token, then
+/// decode. Returns (positions reused, generated tokens).
+#[cfg(feature = "cuda")]
+fn f3_paged_turn(
+    model: &ReviewRegressionModel,
+    cache_key: u64,
+    prompt: &[u32],
+    generate: usize,
+) -> (usize, Vec<u32>) {
+    let prefill_len = prompt.len() - 1;
+    let mut session = review_regression_session(model, cache_key);
+    let outcome = session
+        .try_resident_prefill_cuda_chunk(&prompt[..prefill_len], 0, prefill_len)
+        .expect("paged prefill");
+    let reused = match outcome {
+        CudaResidentPrefillChunkOutcome::Advanced {
+            finalized: true, ..
+        } => crate::inference::last_resident_prefill_reused(),
+        other => panic!("paged prefill did not finish on the GPU: {other:?}"),
+    };
+    assert_eq!(session.kv_position(), prefill_len);
+    let generated = f3_decode_greedy(&mut session, prompt[prefill_len], generate);
+    drop(session);
+    (reused, generated)
+}
+
+/// The paged exact-parity gate: forking a retained page table must answer
+/// exactly as a cold prefill that built every row itself.
+///
+/// This is a sharper question than on the single-sequence lane. A fork SHARES
+/// pages, and the first write into a shared page copies it
+/// (`PendingPageKind::CopyOnWrite`), so a wrong page copy, a stale refcount or
+/// an off-by-one truncate all show up here as a changed token rather than as a
+/// crash.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "requires CAMELID_3B_GGUF and a CUDA device"]
+fn f3_paged_reuse_answers_identically_to_a_cold_prefill() {
+    let _env_guard = crate::test_support::env_lock();
+    let Some(model) = review_regression_model() else {
+        eprintln!("SKIP F3 paged parity gate: set CAMELID_3B_GGUF");
+        return;
+    };
+    let _paged = PagedLaneGuard::enable("1");
+    if !resident_prefill_is_available(&model, 0xF3A0_0FF0) {
+        return;
+    }
+    std::env::remove_var("CAMELID_CUDA_PREFIX_CONTINUATION");
+
+    const TURN_TOKENS: usize = 100;
+    const REPLY_TOKENS: usize = 6;
+    let warm_key = 0xF3A0_0001_u64;
+
+    let turn1 = f3_user_turn(&model.prompts[0], TURN_TOKENS);
+    let (turn1_reused, reply) = f3_paged_turn(&model, warm_key, &turn1, REPLY_TOKENS);
+
+    let mut turn2 = turn1.clone();
+    turn2.extend_from_slice(&reply);
+    turn2.extend(f3_user_turn(&model.prompts[1], TURN_TOKENS));
+    assert!(
+        turn2.len() < crate::cuda_resident::SPLITK_THRESHOLD,
+        "paged gates must stay inside the paged decode's position limit"
+    );
+
+    // WARM: the retained page table from turn 1 is still referenced.
+    let (warm_reused, warm_reply) = f3_paged_turn(&model, warm_key, &turn2, REPLY_TOKENS);
+    // COLD: a different cache key rebuilds the engine and its page pool.
+    let (cold_reused, cold_reply) = f3_paged_turn(&model, 0xF3A0_0002, &turn2, REPLY_TOKENS);
+
+    assert_eq!(turn1_reused, 0, "the first turn has nothing to fork");
+    assert_eq!(cold_reused, 0, "a rebuilt engine holds no pages to fork");
+    assert_eq!(
+        warm_reused,
+        turn1.len() + reply.len() - 1,
+        "turn 2 must fork turn 1's whole history -- prompt AND generated rows"
+    );
+    assert_eq!(
+        warm_reply, cold_reply,
+        "F3 paged parity gate: forking the retained pages changed the answer"
+    );
+}
+
+/// The retained prefix must outlive the session that built it. Sessions release
+/// their sequence on drop, and before F3 that freed every page the conversation
+/// held, so the next turn had nothing to fork however well it matched.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "requires CAMELID_3B_GGUF and a CUDA device"]
+fn f3_paged_prefix_survives_the_session_that_built_it() {
+    let _env_guard = crate::test_support::env_lock();
+    let Some(model) = review_regression_model() else {
+        eprintln!("SKIP F3 paged retention gate: set CAMELID_3B_GGUF");
+        return;
+    };
+    let _paged = PagedLaneGuard::enable("1");
+    if !resident_prefill_is_available(&model, 0xF3A0_0FF1) {
+        return;
+    }
+    std::env::remove_var("CAMELID_CUDA_PREFIX_CONTINUATION");
+
+    const TURN_TOKENS: usize = 100;
+    const REPLY_TOKENS: usize = 6;
+    let key = 0xF3A0_0003_u64;
+
+    let turn1 = f3_user_turn(&model.prompts[0], TURN_TOKENS);
+    let (_, reply) = f3_paged_turn(&model, key, &turn1, REPLY_TOKENS);
+
+    let mut turn2 = turn1.clone();
+    turn2.extend_from_slice(&reply);
+    turn2.extend(f3_user_turn(&model.prompts[1], TURN_TOKENS));
+    let (reused, _) = f3_paged_turn(&model, key, &turn2, REPLY_TOKENS);
+
+    assert!(
+        reused > turn1.len(),
+        "turn 2 forked {reused} positions but turn 1's prompt alone was {} -- the \
+         generated rows are not being retained across the session boundary",
+        turn1.len()
+    );
+    assert_eq!(reused, turn1.len() + reply.len() - 1);
+
+    // A prompt that shares nothing must fork nothing, even with a prefix retained.
+    let unrelated = f3_user_turn(&model.prompts[1], TURN_TOKENS);
+    let (unrelated_reused, _) = f3_paged_turn(&model, key, &unrelated, 1);
+    assert_eq!(
+        unrelated_reused, 0,
+        "a prompt sharing no leading token must not fork the retained prefix"
+    );
 }

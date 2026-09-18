@@ -3206,10 +3206,63 @@ fn resident_prefix_len_is_bounded_by_the_record_and_the_watermark() {
     assert_eq!(prefix(&[1, 2, 3, 4], 2, &[1, 2, 3, 4]), 2);
     assert_eq!(prefix(&[1, 2, 3, 4], 0, &[1, 2, 3, 4]), 0);
 
-    // Bounded ABOVE by the record: decode advances `filled` past the recorded
-    // prompt, but those extra rows hold generated tokens the record cannot vouch
-    // for, so they are never claimed.
+    // Bounded ABOVE by the record: a watermark that ran ahead of the record
+    // covers rows the record cannot vouch for, so they are never claimed. This is
+    // the bound `record_resident_token` exists to raise honestly, one row at a
+    // time, rather than by trusting `filled`.
     assert_eq!(prefix(&[1, 2, 3], 999, &[1, 2, 3, 4, 5]), 3);
+}
+
+/// F3. Decode must be able to extend the record, or every turn after the first
+/// re-prefills the model's own reply -- but only in a way that can never claim a
+/// row it has not accounted for, because an over-claim answers from the wrong KV
+/// instead of failing. GPU-free, so it runs in ordinary CI.
+#[test]
+fn record_resident_token_extends_only_a_contiguous_accounted_record() {
+    use super::record_resident_token as record;
+    use super::resident_prefix_len as prefix;
+
+    // The steady case: a prefill recorded [0, 3), decode writes rows 3 and 4.
+    let mut r = vec![1u32, 2, 3];
+    record(&mut r, 4, 3, 40);
+    record(&mut r, 5, 4, 50);
+    assert_eq!(r, vec![1, 2, 3, 40, 50]);
+    // ...and the next turn now reuses the generated rows, not just the prompt.
+    assert_eq!(prefix(&r, 5, &[1, 2, 3, 40, 50, 60]), 5);
+
+    // A gap: the record accounts for 5 rows, the step is writing row 7. Rows 5
+    // and 6 were written by something that could not name its token, so 7 must
+    // not be recorded AT INDEX 5 -- that index is row 5, which holds a different
+    // token.
+    let mut gapped = vec![1u32, 2, 3, 40, 50];
+    record(&mut gapped, 8, 7, 70);
+    assert_eq!(
+        gapped,
+        vec![1, 2, 3, 40, 50],
+        "a gap must leave the record short"
+    );
+
+    // A stale record longer than the position: a rewind already truncated
+    // through `set_filled`, so anything still longer means the caller is out of
+    // step. Refuse rather than rewriting history in place.
+    let mut stale = vec![1u32, 2, 3, 40, 50];
+    record(&mut stale, 6, 2, 99);
+    assert_eq!(stale, vec![1, 2, 3, 40, 50]);
+
+    // The row must be written before it is vouched for.
+    let mut unwritten = vec![1u32, 2, 3];
+    record(&mut unwritten, 3, 3, 40);
+    assert_eq!(
+        unwritten,
+        vec![1, 2, 3],
+        "position == filled means no row yet"
+    );
+
+    // Recording never lets the claim outrun the watermark: `filled` still bounds
+    // the prefix even when the record is complete.
+    let mut rewound = vec![1u32, 2, 3];
+    record(&mut rewound, 4, 3, 40);
+    assert_eq!(prefix(&rewound, 2, &[1, 2, 3, 40]), 2);
 }
 
 #[test]

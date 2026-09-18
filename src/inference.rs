@@ -2522,6 +2522,27 @@ pub(crate) enum CudaResidentPrefillChunkOutcome {
     },
 }
 
+/// Leading positions the most recent resident CUDA prefill skipped because the
+/// engine already held their KV.
+///
+/// Test observability, deliberately NOT a field on the outcome above: adding one
+/// would force the exhaustive matches in `src/api/mod.rs` to change, and that
+/// file's git blob sha is pinned as the SmolLM3 renderer grounding. Nothing in
+/// production reads this, so a counter keeps the reuse measurable without
+/// dragging unrelated model-qualification evidence into a KV-cache change.
+///
+/// Reads are only meaningful immediately after the caller's own prefill, which
+/// is how `last_resident_prefill_reused` is used (single-threaded gates).
+#[cfg(feature = "cuda")]
+static LAST_RESIDENT_PREFILL_REUSED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// See [`LAST_RESIDENT_PREFILL_REUSED`].
+#[cfg(all(test, feature = "cuda"))]
+pub(crate) fn last_resident_prefill_reused() -> usize {
+    LAST_RESIDENT_PREFILL_REUSED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Keep a capacity refusal typed. Every other paged-batch failure stays an opaque
 /// shape mismatch, because only this one is known to have written nothing.
 #[cfg(feature = "cuda")]
@@ -3903,20 +3924,43 @@ impl LlamaInferenceSession {
             );
         }
         let slot = guard.as_mut().expect("resident CUDA engine built above");
-        let reuse = if !paged_kv_enabled
-            && kv_slot_count == 1
-            && base_position == 0
-            && end_position == total_prefill_tokens
-            && !std::env::var_os("CAMELID_CUDA_PREFIX_CONTINUATION")
-                .map(|value| {
-                    let value = value.to_string_lossy();
-                    let value = value.trim();
-                    value == "0"
-                        || value.eq_ignore_ascii_case("false")
-                        || value.eq_ignore_ascii_case("off")
-                })
-                .unwrap_or(false)
-        {
+        let whole_prompt = base_position == 0 && end_position == total_prefill_tokens;
+        let continuation_disabled = std::env::var_os("CAMELID_CUDA_PREFIX_CONTINUATION")
+            .map(|value| {
+                let value = value.to_string_lossy();
+                let value = value.trim();
+                value == "0"
+                    || value.eq_ignore_ascii_case("false")
+                    || value.eq_ignore_ascii_case("off")
+            })
+            .unwrap_or(false);
+        // The prefix reuse is single-sequence only. With F1's concurrency on
+        // (paged KV, or more than one KV slot) every turn re-prefills the whole
+        // conversation again, which on a 3.4k-token chat is ~10x the
+        // time-to-first-token. That is a large regression to discover by
+        // stopwatch, so say it once rather than letting the lane go quiet.
+        // Two-sequence KV WITHOUT paging is the one lane with no reuse: it has a
+        // second KV bank rather than page tables, so there is nothing to fork and
+        // nothing per-sequence to match against. Every turn there re-prefills its
+        // whole history, which on a 3.4k-token chat is ~10x the time-to-first-
+        // token -- too large to leave for a stopwatch to find.
+        if whole_prompt && !continuation_disabled && !paged_kv_enabled && kv_slot_count > 1 {
+            static CONCURRENT_REUSE_UNAVAILABLE: std::sync::Once = std::sync::Once::new();
+            CONCURRENT_REUSE_UNAVAILABLE.call_once(|| {
+                eprintln!(
+                    "[resident-cuda] WARNING: two-sequence CUDA KV is active \
+                     (kv_slots={kv_slot_count}) without paged KV, so session KV prefix \
+                     reuse is OFF and every turn re-prefills its whole history. Set \
+                     CAMELID_CUDA_PAGED_KV=1 to keep reuse with concurrency, or unset \
+                     CAMELID_CUDA_TWO_SEQUENCE_KV / CAMELID_CUDA_SEQUENCE_SLOTS."
+                );
+            });
+        }
+        let reuse = if !whole_prompt || continuation_disabled {
+            base_position
+        } else if paged_kv_enabled {
+            slot.adopt_paged_prefix(self.cuda_sequence_id, token_ids, n.saturating_sub(1))?
+        } else if kv_slot_count == 1 {
             slot.engine
                 .resident_prefix_len(token_ids)
                 .min(n.saturating_sub(1))
@@ -4004,6 +4048,9 @@ impl LlamaInferenceSession {
         }
         slot.engine.set_filled(end_position);
         let finalized = end_position == total_prefill_tokens;
+        if paged_kv_enabled && finalized && base_position == 0 {
+            slot.set_paged_tokens(self.cuda_sequence_id, token_ids);
+        }
         if !paged_kv_enabled && finalized && base_position == 0 {
             slot.engine.set_resident_tokens(token_ids);
             if trace && reuse > 0 {
@@ -4064,6 +4111,7 @@ impl LlamaInferenceSession {
                 started.elapsed().as_millis()
             );
         }
+        LAST_RESIDENT_PREFILL_REUSED.store(reuse, std::sync::atomic::Ordering::Relaxed);
         Ok(CudaResidentPrefillChunkOutcome::Advanced {
             end_position,
             elapsed_micros: started.elapsed().as_micros(),
@@ -4355,7 +4403,7 @@ impl LlamaInferenceSession {
             .weights
             .token_embedding
             .embedding_lookup(&[token_id], "token_embedding")?;
-        match self.try_resident_decode_forward(&embedding, true, Some(token_id))? {
+        match self.try_resident_decode_forward(&embedding, true, Some(token_id), Some(token_id))? {
             Some(ResidentForward::Sampled(id)) => {
                 self.kv_cache.position += 1;
                 Ok(Some((id, started.elapsed().as_micros())))
@@ -4419,7 +4467,13 @@ impl LlamaInferenceSession {
         } else {
             let seed =
                 base ^ 0x9E37_79B9_7F4A_7C15u64.wrapping_mul(self.kv_cache.position as u64 + 1);
-            self.try_resident_decode_forward_cuda(&embedding, true, None, Some((inv_temp, seed)))?
+            self.try_resident_decode_forward_cuda(
+                &embedding,
+                true,
+                None,
+                Some((inv_temp, seed)),
+                Some(token_id),
+            )?
         };
         match forward {
             Some(ResidentForward::Sampled(id)) => {
@@ -4729,6 +4783,7 @@ impl LlamaInferenceSession {
         embedding: &CpuTensor,
         compute_logits: bool,
         gpu_sample_token: Option<u32>,
+        input_token: Option<u32>,
     ) -> Result<Option<ResidentForward>> {
         if std::env::var_os("CAMELID_RESIDENT_TRACE").is_some() {
             use std::sync::Once;
@@ -4747,6 +4802,7 @@ impl LlamaInferenceSession {
                 compute_logits,
                 gpu_sample_token,
                 None,
+                input_token,
             );
         }
         self.try_resident_decode_forward_metal(embedding, compute_logits, gpu_sample_token)
@@ -4763,6 +4819,7 @@ impl LlamaInferenceSession {
         compute_logits: bool,
         gpu_sample_token: Option<u32>,
         sample: Option<(f32, u64)>,
+        input_token: Option<u32>,
     ) -> Result<Option<ResidentForward>> {
         if !self.resident_decode_eligible(compute_logits)? {
             return Ok(None);
@@ -5076,6 +5133,9 @@ impl LlamaInferenceSession {
             };
             let slot = guard.as_mut().expect("resident CUDA paged engine retained");
             slot.engine.set_filled(position + 1);
+            if let Some(token) = input_token {
+                slot.record_paged_token(self.cuda_sequence_id, position, token);
+            }
             return Ok(Some(forward));
         }
 
@@ -5263,6 +5323,14 @@ impl LlamaInferenceSession {
             }
         };
         slot.engine.set_filled(position + 1);
+        // The row this step just wrote holds `input_token`, so the engine can
+        // now vouch for it to the next turn's prefix match. Unconditional: the
+        // record is only ever CONSULTED behind the prefix-continuation gate, so
+        // keeping it accurate here costs one push and leaves that kill switch
+        // the single place the reuse is turned off.
+        if let Some(token) = input_token {
+            slot.engine.record_resident_token(position, token);
+        }
         Ok(Some(forward))
     }
 
@@ -5274,6 +5342,7 @@ impl LlamaInferenceSession {
         compute_logits: bool,
         gpu_sample_token: Option<u32>,
         sample: Option<(f32, u64)>,
+        input_token: Option<u32>,
     ) -> Result<Option<ResidentForward>> {
         Ok(None)
     }
@@ -5438,7 +5507,7 @@ impl LlamaInferenceSession {
         // prefill and ineligible configs take the CPU chunk path below.
         if seq_len == 1 {
             if let Some(ResidentForward::Hidden(out)) =
-                self.try_resident_decode_forward(hidden, false, None)?
+                self.try_resident_decode_forward(hidden, false, None, None)?
             {
                 self.kv_cache.position += 1;
                 return Ok(out);
@@ -6226,7 +6295,7 @@ impl LlamaInferenceSession {
             // would swallow the distributed worker dispatch inside the layer loop below.
             None
         } else {
-            self.try_resident_decode_forward(&hidden, compute_logits, None)?
+            self.try_resident_decode_forward(&hidden, compute_logits, None, Some(token_id))?
         };
         // When the resident path also produced logits on the GPU, carry them here and skip the
         // CPU final norm + output projection below.
@@ -14675,6 +14744,22 @@ struct ResidentCudaSlot {
 struct ResidentCudaPagedKv {
     pool: cuda_paged_kv::CudaKvPagePool,
     tables: HashMap<cuda_sequence::CudaSequenceId, cuda_paged_kv::CudaKvPageTable>,
+    /// What the rows of each LIVE sequence's page table hold. The non-paged lane
+    /// keeps one record on the engine; paged KV runs many sequences against one
+    /// engine, so the record has to follow the sequence instead.
+    tokens: HashMap<cuda_sequence::CudaSequenceId, Vec<u32>>,
+    /// The finished conversation whose pages are kept alive by REFCOUNT so the
+    /// next turn can fork them instead of re-prefilling. One entry: F3's scope is
+    /// one exact active session, not a general prefix cache.
+    cached: Option<ResidentCudaPagedPrefix>,
+}
+
+/// A retained conversation: a page table whose pages are still referenced, plus
+/// the tokens those pages hold.
+#[cfg(feature = "cuda")]
+struct ResidentCudaPagedPrefix {
+    table: cuda_paged_kv::CudaKvPageTable,
+    tokens: Vec<u32>,
 }
 
 #[cfg(feature = "cuda")]
@@ -14684,6 +14769,8 @@ impl ResidentCudaPagedKv {
             pool: cuda_paged_kv::CudaKvPagePool::new(layout, capacity_pages)
                 .map_err(|error| BackendError::RuntimeShapeMismatch(error.to_string()))?,
             tables: HashMap::new(),
+            tokens: HashMap::new(),
+            cached: None,
         })
     }
 
@@ -14761,11 +14848,147 @@ impl ResidentCudaSlot {
             })
     }
 
-    fn prepare_paged_append(
+    /// Free a page table: pages it EXCLUSIVELY owns go back to the driver, then
+    /// every handle drops its pool reference. A page a fork still holds only
+    /// loses a reference, which is what lets a retained prefix outlive the
+    /// sequence that built it.
+    fn release_paged_table(&mut self, mut table: cuda_paged_kv::CudaKvPageTable) -> Result<()> {
+        let paged = self.paged_kv.as_mut().ok_or_else(|| {
+            BackendError::RuntimeShapeMismatch("resident CUDA paged KV is not enabled".to_string())
+        })?;
+        let exclusive_pages = table
+            .pages()
+            .iter()
+            .copied()
+            .filter_map(|page| match paged.pool.references(page) {
+                Ok(1) => Some(Ok(page)),
+                Ok(_) => None,
+                Err(error) => Some(Err(error)),
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|error| BackendError::RuntimeShapeMismatch(error.to_string()))?;
+        for page in &exclusive_pages {
+            self.engine
+                .release_paged_kv_page(*page)
+                .map_err(BackendError::RuntimeShapeMismatch)?;
+        }
+        let paged = self
+            .paged_kv
+            .as_mut()
+            .expect("paged KV was validated above");
+        table
+            .release_all(&mut paged.pool)
+            .map_err(|error| BackendError::RuntimeShapeMismatch(error.to_string()))
+    }
+
+    /// Give the retained prefix's pages back. Returns whether there was one.
+    fn evict_paged_prefix(&mut self) -> Result<bool> {
+        let Some(prefix) = self.paged_kv.as_mut().and_then(|paged| paged.cached.take()) else {
+            return Ok(false);
+        };
+        if std::env::var_os("CAMELID_RESIDENT_TRACE").is_some() {
+            eprintln!(
+                "[resident-cuda-paged] evicted the retained {}-token prefix to free pages",
+                prefix.tokens.len()
+            );
+        }
+        self.release_paged_table(prefix.table)?;
+        Ok(true)
+    }
+
+    /// Seed `sequence_id` from the retained prefix and report how many leading
+    /// positions it now holds.
+    ///
+    /// The fork RETAINS the shared pages instead of copying them, and the first
+    /// write into a still-shared page copies only that one page
+    /// (`PendingPageKind::CopyOnWrite`), so reusing a whole conversation costs
+    /// one page copy at most -- never a re-prefill.
+    fn adopt_paged_prefix(
+        &mut self,
+        sequence_id: cuda_sequence::CudaSequenceId,
+        token_ids: &[u32],
+        max_reuse: usize,
+    ) -> Result<usize> {
+        let Some(paged) = self.paged_kv.as_mut() else {
+            return Ok(0);
+        };
+        let Some(cached) = paged.cached.as_ref() else {
+            return Ok(0);
+        };
+        let reuse = crate::cuda_resident::resident_prefix_len(
+            &cached.tokens,
+            cached.table.len(),
+            token_ids,
+        )
+        .min(max_reuse);
+        if reuse == 0 {
+            return Ok(0);
+        }
+        // Only ever seed a freshly acquired (empty) table: adopting over one that
+        // already holds rows would drop its pages without releasing them.
+        if paged
+            .tables
+            .get(&sequence_id)
+            .is_none_or(|table| table.len() != 0)
+        {
+            return Ok(0);
+        }
+        // Refcount saturation is a capacity limit, not a fault -- prefill the
+        // whole prompt instead of failing the request.
+        let Ok(mut child) = cached.table.fork(&mut paged.pool, sequence_id.get()) else {
+            return Ok(0);
+        };
+        if let Err(error) = child.truncate(&mut paged.pool, reuse) {
+            let _ = child.release_all(&mut paged.pool);
+            return Err(BackendError::RuntimeShapeMismatch(error.to_string()));
+        }
+        paged.tables.insert(sequence_id, child);
+        paged
+            .tokens
+            .insert(sequence_id, token_ids[..reuse].to_vec());
+        Ok(reuse)
+    }
+
+    /// Record the prompt a paged prefill just wrote.
+    fn set_paged_tokens(&mut self, sequence_id: cuda_sequence::CudaSequenceId, tokens: &[u32]) {
+        if let Some(paged) = self.paged_kv.as_mut() {
+            paged.tokens.insert(sequence_id, tokens.to_vec());
+        }
+    }
+
+    /// Per-sequence twin of `CudaResidentDecode::record_resident_token`, with the
+    /// same contiguity rule: extend only a record that already accounts for
+    /// exactly `[0, position)` over rows the table actually holds.
+    fn record_paged_token(
+        &mut self,
+        sequence_id: cuda_sequence::CudaSequenceId,
+        position: usize,
+        token: u32,
+    ) {
+        let Some(paged) = self.paged_kv.as_mut() else {
+            return;
+        };
+        let held = paged
+            .tables
+            .get(&sequence_id)
+            .map_or(0, cuda_paged_kv::CudaKvPageTable::len);
+        if let Some(record) = paged.tokens.get_mut(&sequence_id) {
+            if record.len() == position && position < held {
+                record.push(token);
+            }
+        }
+    }
+
+    /// Plan the pool-side append. Split out so a failure can be retried after
+    /// dropping the retained prefix.
+    fn plan_paged_append(
         &mut self,
         sequence_id: cuda_sequence::CudaSequenceId,
         count: usize,
-    ) -> Result<ResidentCudaPendingAppend> {
+    ) -> Result<(
+        cuda_paged_kv::PendingCudaKvBatchAppend,
+        Vec<cuda_paged_kv::CudaKvPageHandle>,
+    )> {
         let paged = self.paged_kv.as_mut().ok_or_else(|| {
             BackendError::RuntimeShapeMismatch("resident CUDA paged KV is not enabled".to_string())
         })?;
@@ -14780,6 +15003,30 @@ impl ResidentCudaSlot {
         let planned_pages = table
             .planned_pages_after_batch(&pending)
             .map_err(|error| BackendError::RuntimeShapeMismatch(error.to_string()))?;
+        Ok((pending, planned_pages))
+    }
+
+    fn prepare_paged_append(
+        &mut self,
+        sequence_id: cuda_sequence::CudaSequenceId,
+        count: usize,
+    ) -> Result<ResidentCudaPendingAppend> {
+        // The retained prefix is a CACHE holding real pages. When the pool cannot
+        // serve a live sequence, give those pages back and retry -- never fail a
+        // request in order to keep a speed-up.
+        let (pending, planned_pages) = match self.plan_paged_append(sequence_id, count) {
+            Ok(planned) => planned,
+            Err(error) => {
+                if self.evict_paged_prefix()? {
+                    self.plan_paged_append(sequence_id, count)?
+                } else {
+                    return Err(error);
+                }
+            }
+        };
+        let paged = self.paged_kv.as_mut().ok_or_else(|| {
+            BackendError::RuntimeShapeMismatch("resident CUDA paged KV is not enabled".to_string())
+        })?;
         let allocated_pages = pending.allocated_pages().collect::<Vec<_>>();
         let mut allocated_device_pages = Vec::with_capacity(allocated_pages.len());
         for page in &allocated_pages {
@@ -15064,40 +15311,35 @@ impl ResidentCudaSlot {
             .map_err(|error| BackendError::RuntimeShapeMismatch(error.to_string()))
     }
 
+    /// End a sequence. Instead of freeing its pages outright, RETAIN them as the
+    /// prefix the next turn forks from -- that retention is the whole of F3 on
+    /// this lane.
     fn release_paged_sequence(&mut self, sequence_id: cuda_sequence::CudaSequenceId) -> Result<()> {
         let paged = self.paged_kv.as_mut().ok_or_else(|| {
             BackendError::RuntimeShapeMismatch("resident CUDA paged KV is not enabled".to_string())
         })?;
-        let table = paged.tables.get(&sequence_id).ok_or_else(|| {
+        let table = paged.tables.remove(&sequence_id).ok_or_else(|| {
             BackendError::RuntimeShapeMismatch(
                 "resident CUDA paged KV sequence table is missing".to_string(),
             )
         })?;
-        let exclusive_pages = table
-            .pages()
-            .iter()
-            .copied()
-            .filter_map(|page| match paged.pool.references(page) {
-                Ok(1) => Some(Ok(page)),
-                Ok(_) => None,
-                Err(error) => Some(Err(error)),
-            })
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|error| BackendError::RuntimeShapeMismatch(error.to_string()))?;
-        for page in &exclusive_pages {
-            self.engine
-                .release_paged_kv_page(*page)
-                .map_err(BackendError::RuntimeShapeMismatch)?;
+        let tokens = paged.tokens.remove(&sequence_id).unwrap_or_default();
+        // Retain only while the record accounts for EXACTLY the rows the table
+        // holds. A short record would let a later fork reuse rows it cannot name,
+        // which is wrong output rather than a slow path.
+        if tokens.is_empty() || tokens.len() != table.len() {
+            return self.release_paged_table(table);
         }
-        let table = paged
-            .tables
-            .get_mut(&sequence_id)
-            .expect("paged sequence table was validated above");
-        table
-            .release_all(&mut paged.pool)
-            .map_err(|error| BackendError::RuntimeShapeMismatch(error.to_string()))?;
-        paged.tables.remove(&sequence_id);
-        Ok(())
+        let previous = self
+            .paged_kv
+            .as_mut()
+            .expect("paged KV was validated above")
+            .cached
+            .replace(ResidentCudaPagedPrefix { table, tokens });
+        match previous {
+            Some(previous) => self.release_paged_table(previous.table),
+            None => Ok(()),
+        }
     }
 }
 

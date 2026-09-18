@@ -1,0 +1,5 @@
+READY: "generation_ready":true
+turn 1: prompt_tokens=23 wall=1.088218267s
+turn 2: prompt_tokens=98 wall=1.626590933s
+turn 3: prompt_tokens=199 wall=1.630592685s
+turn 4: prompt_tokens=298 wall=1.615458230s
