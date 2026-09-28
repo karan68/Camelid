@@ -125,6 +125,62 @@ The index is session-local and never written into the project. Any encoder
 failure produces a notice and falls back to the existing lexical and agent-tool
 retrieval path.
 
+## Knowledge Library integration
+
+Document search (`POST /api/documents/search`) ranks by meaning as well as by
+keyword when the exact encoder above is in the models directory. Nothing needs
+to be registered: the library loads its own copy of
+`nomic-embed-text-v1.5.Q8_0.gguf` on first use, only after the file matches the
+pinned size and SHA-256, and keeps it independent of whichever chat model is
+loaded or switched. A missing file is looked for again on every use, so a later
+download is picked up; a file that fails verification is not used.
+
+**Indexing.** After each upload the new chunks are embedded in the
+background, newest first, 16 per encoder call, with the `search_document:`
+prefix. Keyword search works immediately and does not wait for it. Vectors live
+in the library database (`document_chunk_vectors`), one row per chunk, together
+with the hash of the chunk text that was embedded, the encoder's SHA-256 and the
+dimension count:
+
+- a vector is only scored while its chunk still carries that hash, and is
+  dropped with its chunk when the document is deleted or re-ingested;
+- a chunk whose stored text no longer matches its recorded hash is skipped
+  rather than embedded, and becomes pending again if the text is restored;
+- chunks ingested before verifiable citations have no hash, are not embedded,
+  and stay keyword-only until the document is attached again.
+
+The indexer also starts when a search or `GET /api/documents/index-status`
+finds pending chunks, so an existing library is indexed on first use. That
+endpoint reports whether the encoder is available (with a reason code when it
+is not), whether indexing is running, and each document's indexable, indexed
+and skipped chunk counts.
+
+**Ranking.** `mode` selects the rankers:
+
+| `mode` | Behaviour |
+| --- | --- |
+| `auto` (default) | `hybrid` when the encoder is available, `keyword` otherwise |
+| `keyword` | BM25 over the FTS5 index only |
+| `semantic` | cosine similarity only |
+| `hybrid` | both, fused by reciprocal rank |
+
+`semantic` and `hybrid` return `409` with the reason code instead of silently
+degrading. In `hybrid`, BM25 and cosine each contribute their best 50 chunks
+in scope; each list adds `1 / (60 + rank)` for every chunk it holds, and ties
+break on the better single-list rank, then chunk id. Citation checks run on
+the fused list before it is cut to `top_k`, so a withheld chunk is replaced by
+the next verified one. The response's `retrieval` object reports what
+actually ranked the results, the encoder's availability and the scope's index
+coverage, and every result's `retrieval` field says whether keyword, meaning
+or both found it. A scope with nothing indexed yet reports `keyword`.
+
+There is no separate rerank stage: `/v1/rerank` is the same bi-encoder cosine
+over the same encoder, so it would rescore candidates with the function the
+semantic ranker already used.
+
+Set `CAMELID_DOCUMENT_SEMANTIC=0` (or `false`, `off`, `no`) to keep document
+search keyword-only; the encoder is then never loaded.
+
 ## Evidence gate
 
 The ignored real-artifact test requires the SHA-pinned GGUF at
@@ -147,6 +203,7 @@ metadata/tokenizer-only process baseline was 9.2 MiB. These are host-specific
 measurements, not a portable SLA.
 
 No support is implied for another filename, hash, Nomic version, encoder
-architecture, quantization, classifier head, GPU backend, or persistent vector
-database. The experimental BitNet rows above likewise remain outside the
+architecture, quantization, classifier head, GPU backend, or an external vector
+database; the Knowledge Library's vector table above is the only persistent
+store. The experimental BitNet rows above likewise remain outside the
 supported envelope until their own reference-vector receipts are committed.

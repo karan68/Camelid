@@ -75,6 +75,14 @@ const FOLLOW_UP_PROMPTS = [
 
 const MAX_VISION_UPLOAD_BYTES = 3 * 1024 * 1024
 const MAX_VISION_EDGE = 1600
+const INDEX_STATUS_POLL_MS = 1500
+
+const RETRIEVAL_NOTES = {
+  hybrid: 'Found by keyword and by meaning',
+  semantic: 'Found by meaning',
+  keyword: 'Found by keyword',
+  attached: 'Included because nothing else matched',
+}
 
 /* Day separators: a calendar-day key plus a short label ("Today", "Yesterday",
    "Tue, Aug 4") rendered between turns whenever the day changes. */
@@ -270,6 +278,7 @@ export default function ChatWorkspace({
   const [composerImage, setComposerImage] = useState(null)
   const [imageError, setImageError] = useState('')
   const [attachedDocuments, setAttachedDocumentsState] = useState(readAttachedDocuments)
+  const [indexStatus, setIndexStatus] = useState(null)
   const [documentIngesting, setDocumentIngesting] = useState(false)
   const [documentError, setDocumentError] = useState('')
   const [activeCitation, setActiveCitation] = useState(null)
@@ -556,6 +565,42 @@ export default function ChatWorkspace({
     // from successful ingest/remove actions in this component.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
+
+  // Semantic indexing runs in the background after an upload. Poll only while
+  // an attached document is still being indexed; keyword search needs none of it.
+  const attachedIdsKey = attachedDocuments.map((doc) => doc.doc_id).join('\n')
+  useEffect(() => {
+    if (!attachedIdsKey) {
+      setIndexStatus(null)
+      return undefined
+    }
+    const ids = attachedIdsKey.split('\n')
+    let cancelled = false
+    let timer = null
+    const poll = async () => {
+      try {
+        const res = await fetch('/api/documents/index-status')
+        const status = res.ok ? await res.json() : null
+        if (cancelled || !status?.semantic) return
+        const byId = Object.fromEntries((status.documents || []).map((doc) => [doc.id, doc]))
+        setIndexStatus({ semantic: status.semantic, byId })
+        const pending = ids.some((id) => {
+          const doc = byId[id]
+          return doc && doc.indexed_chunks + doc.skipped_chunks < doc.indexable_chunks
+        })
+        if (status.semantic.available && status.semantic.indexing && pending) {
+          timer = window.setTimeout(poll, INDEX_STATUS_POLL_MS)
+        }
+      } catch {
+        // Status is informational; search keeps working without it.
+      }
+    }
+    poll()
+    return () => {
+      cancelled = true
+      if (timer) window.clearTimeout(timer)
+    }
+  }, [attachedIdsKey])
 
   useEffect(() => {
     if (!followActive) return undefined
@@ -1005,28 +1050,46 @@ export default function ChatWorkspace({
       >
         {(attachedDocuments.length > 0 || documentIngesting) && (
           <div className="cxcomposer__docs">
-            {attachedDocuments.map((doc) => (
-              <div key={doc.doc_id} className="cxcomposer__doc-pill">
-                <button
-                  type="button"
-                  className="cxcomposer__doc-remove"
-                  aria-label={`Remove ${doc.filename}`}
-                  title="Remove attachment"
-                  onClick={() => {
-                    setAttachedDocuments((prev) => prev.filter((d) => d.doc_id !== doc.doc_id))
-                    composerRef.current?.focus()
-                  }}
-                >
-                  <IconClose size={14} />
-                </button>
-                <button type="button" className="cxcomposer__doc-open" title={`Open ${doc.filename}`} onClick={() => openDocument(doc)}>
-                  <IconFile size={14} />
-                  <span className="cxcomposer__doc-name">{doc.filename}</span>
-                  <span className="cxcomposer__doc-chunks">{doc.chunk_count} chunks</span>
-                </button>
-              </div>
-            ))}
+            {attachedDocuments.map((doc) => {
+              const coverage = indexStatus?.semantic?.available ? indexStatus.byId[doc.doc_id] : null
+              const indexing = coverage && coverage.indexed_chunks + coverage.skipped_chunks < coverage.indexable_chunks
+              return (
+                <div key={doc.doc_id} className="cxcomposer__doc-pill">
+                  <button
+                    type="button"
+                    className="cxcomposer__doc-remove"
+                    aria-label={`Remove ${doc.filename}`}
+                    title="Remove attachment"
+                    onClick={() => {
+                      setAttachedDocuments((prev) => prev.filter((d) => d.doc_id !== doc.doc_id))
+                      composerRef.current?.focus()
+                    }}
+                  >
+                    <IconClose size={14} />
+                  </button>
+                  <button type="button" className="cxcomposer__doc-open" title={`Open ${doc.filename}`} onClick={() => openDocument(doc)}>
+                    <IconFile size={14} />
+                    <span className="cxcomposer__doc-name">{doc.filename}</span>
+                    {indexing ? (
+                      <span className="cxcomposer__doc-chunks cxcomposer__doc-chunks--indexing" title="Indexing for search by meaning. Keyword search works meanwhile.">
+                        indexing {coverage.indexed_chunks}/{coverage.indexable_chunks}
+                      </span>
+                    ) : (
+                      <span className="cxcomposer__doc-chunks">{doc.chunk_count} chunks</span>
+                    )}
+                  </button>
+                </div>
+              )
+            })}
             {documentIngesting && <span className="cxcomposer__doc-status">Indexing document…</span>}
+            {attachedDocuments.length > 0 && ['encoder_not_installed', 'encoder_mismatch', 'encoder_load_failed'].includes(indexStatus?.semantic?.reason) && (
+              <p className="cxcomposer__semantic-note" role="status">
+                Keyword search only. {indexStatus.semantic.message}
+                {indexStatus.semantic.reason === 'encoder_not_installed' && (
+                  <button type="button" onClick={() => setTab('library')}>Open Models</button>
+                )}
+              </p>
+            )}
           </div>
         )}
         {composerImage && (
@@ -1661,6 +1724,9 @@ export default function ChatWorkspace({
               </div>
             )}
             <div className="citation-modal__footer">
+              {RETRIEVAL_NOTES[activeCitation.retrieval] && (
+                <span className="citation-modal__found">{RETRIEVAL_NOTES[activeCitation.retrieval]}</span>
+              )}
               <button type="button" className="button" onClick={() => setActiveCitation(null)}>
                 Close
               </button>
