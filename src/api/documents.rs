@@ -262,9 +262,10 @@ pub struct SemanticSummary {
     pub available: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<&'static str>,
-    /// Index coverage of the searched scope, so a partly indexed library shows.
+    /// Index coverage of the searched scope, so a partly indexed library
+    /// shows. Present only when the search ranked by meaning.
     #[serde(flatten)]
-    pub coverage: Coverage,
+    pub coverage: Option<Coverage>,
 }
 
 #[derive(Debug, Serialize)]
@@ -757,9 +758,31 @@ pub(crate) fn run_search(
                     .collect(),
             )
         };
-    let mut results = retain_verifiable(conn, fetch_results(conn, &ranked)?)?;
-    results.truncate(plan.top_k);
+    let results = first_verified(conn, fetch_results(conn, &ranked)?, plan.top_k)?;
     Ok((results, mode))
+}
+
+/// The first `top_k` candidates, in rank order, that pass the citation check.
+/// Candidates are checked a window at a time, so a search that needs no
+/// replacements checks `top_k` of them rather than the whole candidate pool.
+fn first_verified(
+    conn: &Connection,
+    candidates: Vec<DocumentSearchResult>,
+    top_k: usize,
+) -> Result<Vec<DocumentSearchResult>, rusqlite::Error> {
+    let mut verified = Vec::with_capacity(top_k);
+    let mut candidates = candidates.into_iter();
+    while verified.len() < top_k {
+        let window = candidates
+            .by_ref()
+            .take(top_k - verified.len())
+            .collect::<Vec<_>>();
+        if window.is_empty() {
+            break;
+        }
+        verified.extend(retain_verifiable(conn, window)?);
+    }
+    Ok(verified)
 }
 
 fn internal_error(code: &'static str) -> impl Fn(rusqlite::Error) -> Response {
@@ -787,7 +810,7 @@ pub async fn search_documents(
                 semantic: SemanticSummary {
                     available: false,
                     reason: None,
-                    coverage: Coverage::default(),
+                    coverage: None,
                 },
             },
         }));
@@ -861,11 +884,22 @@ pub async fn search_documents(
                 }
             }
         }
-        let coverage = document_vectors::coverage(&conn, payload.doc_ids.as_deref())
-            .map_err(internal_error("index_coverage_error"))?;
+        // Counting coverage scans every chunk in scope, so a search that did not
+        // rank by meaning skips it.
+        let coverage = if query_vector.is_some() {
+            Some(
+                document_vectors::coverage(&conn, payload.doc_ids.as_deref())
+                    .map_err(internal_error("index_coverage_error"))?,
+            )
+        } else {
+            None
+        };
         (results, ranked_by, coverage)
     };
-    if query_vector.is_some() && coverage.pending() > 0 {
+    if coverage
+        .as_ref()
+        .is_some_and(|coverage| coverage.pending() > 0)
+    {
         document_vectors::schedule_indexing(state.models_dir.clone(), false);
     }
 
@@ -1256,5 +1290,44 @@ mod tests {
         assert!(results
             .iter()
             .all(|result| !result.excerpt.contains("90 days")));
+    }
+
+    #[test]
+    fn verification_keeps_rank_order_and_backfills_across_windows() {
+        let conn = library();
+        let corrupted = seed_passages(&conn, "corrupted", &POLICY);
+        let healthy = seed_passages(&conn, "healthy", &POLICY);
+        conn.execute(
+            "UPDATE documents SET source_text = REPLACE(source_text, '60 days', '90 days') WHERE id = 'corrupted'",
+            [],
+        )
+        .unwrap();
+        // Two withheld candidates lead, so the first window keeps nothing.
+        let order = [
+            corrupted[0],
+            corrupted[1],
+            healthy[2],
+            corrupted[2],
+            healthy[0],
+            healthy[1],
+        ];
+        let ranked = order
+            .iter()
+            .map(|id| (*id, 0.0_f32, "keyword"))
+            .collect::<Vec<_>>();
+        let pick = |top_k| {
+            first_verified(&conn, fetch_results(&conn, &ranked).unwrap(), top_k)
+                .unwrap()
+                .iter()
+                .map(|result| (result.doc_id.clone(), result.chunk_index))
+                .collect::<Vec<_>>()
+        };
+        let healthy_at = |index: usize| ("healthy".to_string(), index);
+        assert_eq!(pick(2), vec![healthy_at(2), healthy_at(0)]);
+        assert_eq!(
+            pick(10),
+            vec![healthy_at(2), healthy_at(0), healthy_at(1)],
+            "a pool that runs out returns what verified, in rank order"
+        );
     }
 }

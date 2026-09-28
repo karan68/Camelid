@@ -149,8 +149,9 @@ dimension count:
 - chunks ingested before verifiable citations have no hash, are not embedded,
   and stay keyword-only until the document is attached again.
 
-The indexer also starts when a search or `GET /api/documents/index-status`
-finds pending chunks, so an existing library is indexed on first use. That
+The indexer also starts when a search that ranks by meaning, or
+`GET /api/documents/index-status`, finds pending chunks, so an existing
+library is indexed on first use. That
 endpoint reports whether the encoder is available (with a reason code when it
 is not), whether indexing is running, and each document's indexable, indexed
 and skipped chunk counts.
@@ -168,11 +169,12 @@ and skipped chunk counts.
 degrading. In `hybrid`, BM25 and cosine each contribute their best 50 chunks
 in scope; each list adds `1 / (60 + rank)` for every chunk it holds, and ties
 break on the better single-list rank, then chunk id. Citation checks run on
-the fused list before it is cut to `top_k`, so a withheld chunk is replaced by
-the next verified one. The response's `retrieval` object reports what
-actually ranked the results, the encoder's availability and the scope's index
-coverage, and every result's `retrieval` field says whether keyword, meaning
-or both found it. A scope with nothing indexed yet reports `keyword`.
+the ranked list in order until `top_k` results pass, so a withheld chunk is
+replaced by the next verified one. The response's `retrieval` object reports
+what actually ranked the results and the encoder's availability, plus the
+scope's index coverage when meaning took part, and every result's `retrieval`
+field says whether keyword, meaning or both found it. A scope with nothing
+indexed yet reports `keyword`.
 
 There is no separate rerank stage: `/v1/rerank` is the same bi-encoder cosine
 over the same encoder, so it would rescore candidates with the function the
