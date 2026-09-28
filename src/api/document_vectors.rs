@@ -644,14 +644,18 @@ pub async fn index_status(
                 None,
             )
         })?;
-        coverage_by_document(&conn).map_err(|e| {
-            api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "index_status_query_error",
-                e.to_string(),
-                None,
-            )
-        })?
+        // A skipped chunk whose text was restored must count as pending here,
+        // or nothing would ever start the indexer for it.
+        clear_recovered_skips(&conn)
+            .and_then(|()| coverage_by_document(&conn))
+            .map_err(|e| {
+                api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "index_status_query_error",
+                    e.to_string(),
+                    None,
+                )
+            })?
     };
     if encoder.is_ok() && documents.iter().any(|(_, coverage)| coverage.pending() > 0) {
         schedule_indexing(state.models_dir.clone(), false);
