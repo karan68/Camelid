@@ -137,7 +137,9 @@ download is picked up; a file that fails verification is not used.
 
 **Indexing.** After each upload the new chunks are embedded in the
 background, newest first, 16 per encoder call, with the `search_document:`
-prefix. Keyword search works immediately and does not wait for it. Vectors live
+prefix; an upload that arrives while a large file is being embedded goes next
+rather than waiting for the rest of that file. Keyword search works
+immediately and does not wait for any of it. Vectors live
 in the library database (`document_chunk_vectors`), one row per chunk, together
 with the hash of the chunk text that was embedded, the encoder's SHA-256 and the
 dimension count:

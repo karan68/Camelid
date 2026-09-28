@@ -389,6 +389,22 @@ fn pending_batch(
     rows.collect()
 }
 
+/// Whether any chunk above `id` is waiting for a vector: an upload that
+/// arrived after the current indexing pass started.
+fn pending_above(conn: &Connection, id: i64) -> Result<bool, rusqlite::Error> {
+    conn.query_row(
+        "SELECT EXISTS (
+             SELECT 1
+             FROM document_chunks AS c
+             LEFT JOIN document_chunk_vectors AS v
+               ON v.chunk_id = c.id AND v.encoder_sha256 = ?1 AND v.chunk_sha256 = c.chunk_sha256
+             WHERE v.chunk_id IS NULL AND c.chunk_sha256 IS NOT NULL AND c.id > ?2
+         )",
+        params![ENCODER_SHA256, id],
+        |row| row.get(0),
+    )
+}
+
 /// Writes one vector (or a skip record when `vector` is `None`), but only if
 /// the chunk still exists with the hash that was embedded: a document
 /// re-ingested mid-batch gets new chunk ids and must not inherit these rows.
@@ -458,7 +474,9 @@ fn locked<T>(
     work(conn).map_err(|error| error.to_string())
 }
 
-/// Embeds every pending chunk, newest first, and returns how many were stored.
+/// Embeds pending chunks, newest first, and returns how many were stored. A
+/// pass stops early when a newer upload arrives, so the scheduler starts over
+/// from the newest chunk and a small upload does not wait behind a large one.
 fn index_pending(encoder: &Encoder) -> Result<usize, String> {
     let conn = {
         let _lock = db_lock()
@@ -468,6 +486,7 @@ fn index_pending(encoder: &Encoder) -> Result<usize, String> {
     };
     locked(&conn, clear_recovered_skips)?;
     let mut before_id = i64::MAX;
+    let mut pass_top = None;
     let mut stored = 0;
     loop {
         let batch = locked(&conn, |conn| pending_batch(conn, before_id, INDEX_BATCH))?;
@@ -475,6 +494,7 @@ fn index_pending(encoder: &Encoder) -> Result<usize, String> {
             break;
         };
         before_id = last.id;
+        let top = *pass_top.get_or_insert(batch[0].id);
         let (intact, tampered): (Vec<_>, Vec<_>) = batch
             .into_iter()
             .partition(|chunk| sha256_hex(chunk.content.as_bytes()) == chunk.chunk_sha256);
@@ -510,6 +530,9 @@ fn index_pending(encoder: &Encoder) -> Result<usize, String> {
             Ok(())
         })?;
         stored += intact.len();
+        if locked(&conn, |conn| pending_above(conn, top))? {
+            break;
+        }
     }
     Ok(stored)
 }
@@ -976,6 +999,30 @@ pub(crate) mod tests {
             .unwrap()
             .iter()
             .all(|chunk| chunk.id != ids[0]));
+    }
+
+    #[test]
+    fn an_upload_after_a_pass_started_is_seen_as_newer() {
+        let conn = memory();
+        let large = seed(&conn, "large", TEXT);
+        let top = *large.last().unwrap();
+        assert!(
+            !pending_above(&conn, top).unwrap(),
+            "nothing newer than the pass's first chunk yet"
+        );
+        let small = seed(
+            &conn,
+            "small",
+            "A short note that arrives while the large file is indexing.",
+        );
+        assert!(pending_above(&conn, top).unwrap());
+        for id in &small {
+            put_vector(&conn, *id, &[1.0]);
+        }
+        assert!(
+            !pending_above(&conn, top).unwrap(),
+            "an indexed upload no longer interrupts the pass"
+        );
     }
 
     #[test]
