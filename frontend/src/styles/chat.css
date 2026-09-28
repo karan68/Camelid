@@ -1272,8 +1272,8 @@
 .cxcomposer__doc-pill {
   display: inline-flex;
   align-items: center;
-  gap: var(--space-2);
-  padding: 4px 10px;
+  gap: 4px;
+  padding: 2px 10px 2px 2px;
   background: var(--color-surface-raised, rgba(255, 255, 255, 0.06));
   border: 1px solid var(--color-border-soft);
   border-radius: var(--radius-pill, 9999px);
@@ -1291,16 +1291,23 @@
   color: var(--color-text-faint);
   font-size: 10px;
 }
+/* Left of the name, like an editor tab, so it stays put whatever the filename length. */
 .cxcomposer__doc-remove {
+  flex: none;
+  display: inline-grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
   background: transparent;
   border: none;
-  color: var(--color-text-muted);
+  border-radius: var(--radius-pill, 9999px);
+  color: var(--color-text-faint);
   cursor: pointer;
-  display: inline-flex;
-  align-items: center;
-  padding: 0;
+  transition: background var(--dur-fast) ease, color var(--dur-fast) ease;
 }
-.cxcomposer__doc-remove:hover { color: var(--color-error, #f87171); }
+.cxcomposer__doc-remove:hover { background: var(--color-border-strong); color: var(--color-text); }
+.cxcomposer__doc-remove:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 1px; }
 .cxcomposer__doc-status { font-size: var(--text-xs); color: var(--color-accent); align-self: center; }
 .citation-pill {
   display: inline-flex;
@@ -1541,3 +1548,208 @@
   .cxchat__utility, .cxcomposer__option-chips { display: none; }
   .composer-menu__choices .composer-menu__files { display: flex; }
 }
+
+
+/* F2a: verification states for the citation viewer. */
+.citation-modal__badge {
+  font-size: var(--text-xs);
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--color-border, #334155);
+  color: var(--color-text-subtle, #cbd5e1);
+  white-space: nowrap;
+}
+
+.citation-modal__badge--verified {
+  color: #4ade80;
+  border-color: rgba(74, 222, 128, 0.4);
+  background: rgba(74, 222, 128, 0.12);
+}
+
+.citation-modal__badge--refused {
+  color: #f87171;
+  border-color: rgba(248, 113, 113, 0.4);
+  background: rgba(248, 113, 113, 0.12);
+}
+
+.citation-modal__body {
+  overflow-wrap: anywhere;
+}
+
+.citation-modal__body--pending {
+  opacity: 0.7;
+  font-style: italic;
+}
+
+.citation-modal__context {
+  opacity: 0.55;
+}
+
+.citation-modal__span {
+  background: rgba(250, 204, 21, 0.28);
+  color: var(--color-text, #f8fafc);
+  border-radius: 3px;
+  padding: 1px 2px;
+  font-weight: 600;
+}
+
+.citation-modal__refusal {
+  margin: var(--space-3);
+  padding: var(--space-4);
+  border-radius: 8px;
+  border: 1px solid rgba(248, 113, 113, 0.35);
+  background: rgba(248, 113, 113, 0.08);
+}
+
+.citation-modal__refusal-title {
+  margin: 0 0 var(--space-2);
+  font-weight: 600;
+  color: #f87171;
+}
+
+.citation-modal__refusal-message {
+  margin: 0 0 var(--space-2);
+  font-size: var(--text-sm);
+  line-height: 1.6;
+  color: var(--color-text-subtle, #cbd5e1);
+}
+
+.citation-modal__refusal-code {
+  margin: 0;
+  font-family: var(--font-mono, monospace);
+  font-size: var(--text-xs);
+  opacity: 0.7;
+}
+
+/* Attached documents open in a viewer; generated files stay pinned above the composer. */
+.cxcomposer__doc-open {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+  padding: 0;
+  background: transparent;
+  border: none;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+.cxcomposer__doc-open:hover .cxcomposer__doc-name { text-decoration: underline; }
+
+.cxturn__user-docs {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: var(--space-2);
+  max-width: 100%;
+  margin: 0 0 var(--space-2);
+  padding: 0;
+  list-style: none;
+}
+.cxturn__user-doc {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 280px;
+  padding: 4px 10px;
+  background: var(--color-chip);
+  border: 1px solid var(--color-border-soft);
+  border-radius: var(--radius-pill);
+  color: var(--color-text);
+  font: inherit;
+  font-size: var(--text-xs);
+  cursor: pointer;
+}
+.cxturn__user-doc:hover:not(:disabled) { border-color: var(--color-accent); }
+.cxturn__user-doc:disabled { cursor: default; }
+.cxturn__user-doc-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 500;
+}
+.cxturn__user-doc-meta { flex: none; color: var(--color-text-faint); font-size: 10px; }
+
+.cx-modal.document-viewer {
+  display: flex;
+  flex-direction: column;
+  width: min(960px, calc(100vw - 32px));
+  max-width: 960px;
+  max-height: calc(100dvh - 32px);
+  overflow: hidden;
+}
+.document-viewer .cx-modal__title { min-width: 0; overflow-wrap: anywhere; }
+.document-viewer .cx-modal__body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  min-height: 0;
+}
+.document-viewer__meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+  font-size: var(--text-xs);
+  color: var(--color-text-faint);
+}
+.document-viewer__text {
+  flex: 1;
+  min-height: 0;
+  margin: 0;
+  padding: var(--space-4);
+  overflow: auto;
+  background: var(--color-code-bg);
+  border: 1px solid var(--color-border-soft);
+  border-radius: var(--radius-md);
+  color: var(--color-text);
+  font-family: inherit;
+  font-size: var(--text-sm);
+  line-height: 1.65;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.document-viewer__pending { opacity: 0.7; font-style: italic; }
+.document-viewer .citation-modal__refusal { margin: 0; }
+
+.files-tray {
+  margin: 0 0 var(--space-2);
+  overflow: hidden;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border-soft);
+  border-radius: var(--radius-lg);
+}
+.files-tray__head,
+.files-tray__file {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  width: 100%;
+  background: transparent;
+  border: none;
+  color: var(--color-text);
+  font: inherit;
+  font-size: var(--text-sm);
+  text-align: left;
+  cursor: pointer;
+}
+.files-tray__head { padding: 8px 12px; }
+.files-tray__head svg { transition: transform var(--dur-fast) ease; }
+.files-tray__head svg.is-collapsed { transform: rotate(-90deg); }
+.files-tray__list {
+  max-height: 132px;
+  margin: 0;
+  padding: 0 6px 6px;
+  overflow-y: auto;
+  list-style: none;
+}
+.files-tray__file { padding: 6px 8px; border-radius: var(--radius-sm); }
+.files-tray__file:hover { background: var(--color-surface-hover); }
+.files-tray__name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.files-tray__file small { flex: none; color: var(--color-text-faint); font-size: var(--text-xs); }

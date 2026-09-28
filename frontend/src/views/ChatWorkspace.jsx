@@ -3,11 +3,11 @@ import { toolActivityGroups } from '../lib/toolActivity.js'
 import { ComposerMenu } from '../components/chat/ComposerMenu'
 import { ConversationContext } from '../components/context/ContextEditors'
 import { contextSourceMessages, chatHistoryForRequest } from '../lib/projectContext.js'
-import { ConversationFiles } from '../components/outputs/ConversationFiles'
+import { ConversationFiles, ConversationFilesTray } from '../components/outputs/ConversationFiles'
 import { conversationFiles } from '../lib/conversationFiles.js'
 import { OutputPanelContext, OutputMessageContext, ToolOutputGallery } from '../components/outputs/OutputActions.jsx'
 import { ConnectedTools, McpRunPanel } from '../components/mcp/ConnectedTools'
-import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { getChatGateState } from '../lib/chatGate'
 import { getRuntimeRequestModelId } from '../lib/modelState'
 import { detectRepeatedCall, normalizeToolCalls } from '../lib/toolCalling'
@@ -22,6 +22,7 @@ import { EvidenceChip } from '../components/ui/EvidenceChip'
 import { IconSend, IconStop, IconMemory, IconReceipt, IconThinking, IconBolt, IconChart, IconChat, IconChevronDown, IconEdit, IconImage, IconInfo, IconClose, IconSearch, IconFile } from '../components/ui/icons'
 import { Tooltip } from '../components/ui/Tooltip'
 import { MessageTurn } from '../components/chat/MessageTurn'
+import { DocumentViewer } from '../components/chat/DocumentViewer'
 import { VoiceInput } from '../components/chat/VoiceInput'
 import { ChatControls } from '../components/chat/ChatControls'
 import { ContextMeter } from '../components/chat/ContextMeter'
@@ -272,6 +273,10 @@ export default function ChatWorkspace({
   const [documentIngesting, setDocumentIngesting] = useState(false)
   const [documentError, setDocumentError] = useState('')
   const [activeCitation, setActiveCitation] = useState(null)
+  const [citationView, setCitationView] = useState(null)
+  const [viewerDocument, setViewerDocument] = useState(null)
+  const openDocument = useCallback((doc) => setViewerDocument(doc), [])
+  const closeDocumentViewer = useCallback(() => setViewerDocument(null), [])
   const chatBottomRef = useRef(null)
   const composerRef = useRef(null)
   const imageInputRef = useRef(null)
@@ -634,6 +639,69 @@ export default function ChatWorkspace({
     return () => window.removeEventListener('camelid-citation-click', handleCitationClick)
   }, [])
 
+  // A citation is shown only after the server re-derives it from the stored
+  // source and every hash still matches. Failures are refused, never rendered.
+  useEffect(() => {
+    if (!activeCitation) {
+      setCitationView(null)
+      return undefined
+    }
+
+    const docId = activeCitation.doc_id
+    const chunkIndex = activeCitation.chunk_index
+    if (!docId || chunkIndex === null || chunkIndex === undefined) {
+      setCitationView({
+        status: 'refused',
+        code: 'citation_unverifiable',
+        message: 'This citation carries no source binding, so it cannot be verified.',
+      })
+      return undefined
+    }
+
+    let cancelled = false
+    setCitationView({ status: 'verifying' })
+
+    const verify = async () => {
+      try {
+        const res = await fetch('/api/documents/citation/resolve', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            doc_id: docId,
+            chunk_index: chunkIndex,
+            chunk_sha256: activeCitation.chunk_sha256 || null,
+            doc_sha256: activeCitation.doc_sha256 || null,
+          }),
+        })
+        const payload = await res.json().catch(() => null)
+        if (cancelled) return
+        if (res.ok && payload) {
+          setCitationView({ status: 'verified', data: payload })
+        } else {
+          setCitationView({
+            status: 'refused',
+            code: payload?.error?.code || 'citation_refused',
+            message:
+              payload?.error?.message ||
+              'This citation could not be verified against its source.',
+          })
+        }
+      } catch {
+        if (cancelled) return
+        setCitationView({
+          status: 'refused',
+          code: 'citation_unreachable',
+          message: 'The source could not be reached to verify this citation.',
+        })
+      }
+    }
+
+    verify()
+    return () => {
+      cancelled = true
+    }
+  }, [activeCitation])
+
   const handleDocumentFiles = async (files) => {
     if (!files || !files.length) return
     setDocumentError('')
@@ -717,6 +785,10 @@ export default function ChatWorkspace({
       overrideImage: image,
       requestContent: contentToSend !== composer ? contentToSend : null,
       citations: requestCitations,
+      documents: attachedDocuments.map((doc) => ({
+        ...doc,
+        passages: requestCitations.filter((citation) => citation.doc_id === doc.doc_id).length,
+      })),
     })
   }
 
@@ -935,16 +1007,22 @@ export default function ChatWorkspace({
           <div className="cxcomposer__docs">
             {attachedDocuments.map((doc) => (
               <div key={doc.doc_id} className="cxcomposer__doc-pill">
-                <IconFile size={14} />
-                <span className="cxcomposer__doc-name" title={doc.filename}>{doc.filename}</span>
-                <span className="cxcomposer__doc-chunks">{doc.chunk_count} chunks</span>
                 <button
                   type="button"
                   className="cxcomposer__doc-remove"
-                  title="Remove document"
-                  onClick={() => setAttachedDocuments((prev) => prev.filter((d) => d.doc_id !== doc.doc_id))}
+                  aria-label={`Remove ${doc.filename}`}
+                  title="Remove attachment"
+                  onClick={() => {
+                    setAttachedDocuments((prev) => prev.filter((d) => d.doc_id !== doc.doc_id))
+                    composerRef.current?.focus()
+                  }}
                 >
-                  <IconClose size={12} />
+                  <IconClose size={14} />
+                </button>
+                <button type="button" className="cxcomposer__doc-open" title={`Open ${doc.filename}`} onClick={() => openDocument(doc)}>
+                  <IconFile size={14} />
+                  <span className="cxcomposer__doc-name">{doc.filename}</span>
+                  <span className="cxcomposer__doc-chunks">{doc.chunk_count} chunks</span>
                 </button>
               </div>
             ))}
@@ -1485,6 +1563,7 @@ export default function ChatWorkspace({
                       onSelectVariant={selectMessageVariant ? (index) => selectMessageVariant(message.id, index) : null}
                       onDiscardVariant={discardMessageVariant && !requestActive ? () => discardMessageVariant(message.id) : null}
                       onEditResend={canResend && message.role === 'user' ? (messageId, content) => resendFromMessage(messageId, content) : null}
+                      onOpenDocument={openDocument}
                       onContinue={canContinue ? () => continueFromMessage(message.id) : null}
                       tokenInspection={tokenInspections?.[message.id] || null}
                       structuredRecord={structuredRecords?.[message.id] || null}
@@ -1541,6 +1620,7 @@ export default function ChatWorkspace({
 
       <div className="cxchat__dock">
         <div className="cxchat__column">
+          {files.length > 0 && <ConversationFilesTray files={files} onOpen={(id) => { setSelectedFileId(id); setFilesOpen(true) }} />}
           {renderComposer()}
         </div>
       </div>
@@ -1553,17 +1633,33 @@ export default function ChatWorkspace({
                 <IconFile size={16} />
                 <span>{activeCitation.filename || 'Source Document'}</span>
               </div>
-              {activeCitation.retrieval === 'attached' ? (
-                <span className="citation-modal__score">Attached context</span>
-              ) : activeCitation.score != null && (
-                <span className="citation-modal__score">
-                  Relevance: {(activeCitation.score * 100).toFixed(0)}%
+              {citationView?.status === 'verified' ? (
+                <span className="citation-modal__badge citation-modal__badge--verified">
+                  Verified &middot; bytes {citationView.data.byte_start}&ndash;{citationView.data.byte_end}
                 </span>
+              ) : citationView?.status === 'refused' ? (
+                <span className="citation-modal__badge citation-modal__badge--refused">Refused</span>
+              ) : (
+                <span className="citation-modal__badge">Verifying&hellip;</span>
               )}
             </div>
-            <div className="citation-modal__body">
-              <p>{activeCitation.excerpt}</p>
-            </div>
+            {citationView?.status === 'verified' ? (
+              <div className="citation-modal__body">
+                <span className="citation-modal__context">{citationView.data.before}</span>
+                <mark className="citation-modal__span">{citationView.data.span}</mark>
+                <span className="citation-modal__context">{citationView.data.after}</span>
+              </div>
+            ) : citationView?.status === 'refused' ? (
+              <div className="citation-modal__refusal">
+                <p className="citation-modal__refusal-title">Citation refused</p>
+                <p className="citation-modal__refusal-message">{citationView.message}</p>
+                <p className="citation-modal__refusal-code">{citationView.code}</p>
+              </div>
+            ) : (
+              <div className="citation-modal__body citation-modal__body--pending">
+                Verifying this passage against its source&hellip;
+              </div>
+            )}
             <div className="citation-modal__footer">
               <button type="button" className="button" onClick={() => setActiveCitation(null)}>
                 Close
@@ -1572,6 +1668,7 @@ export default function ChatWorkspace({
           </div>
         </div>
       )}
+      {viewerDocument && <DocumentViewer key={viewerDocument.doc_id} document={viewerDocument} onClose={closeDocumentViewer} />}
     </section>
     {filesOpen && <ConversationFiles key={selectedConversation?.id || 'draft'} files={files} selectedId={selectedFileId} onSelect={setSelectedFileId} onClose={() => setFilesOpen(false)} conversationId={selectedConversation?.id || 'draft'} />}
     </div>
