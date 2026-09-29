@@ -33,6 +33,7 @@ mod coding;
 #[allow(dead_code)]
 mod continuous_batch;
 mod contract;
+pub(crate) mod document_collections;
 pub(crate) mod document_vectors;
 pub(crate) mod documents;
 mod engine;
@@ -2943,6 +2944,24 @@ fn router_with_state_and_policy(state: AppState, policy: server::ServerPolicy) -
             get(document_vectors::index_status),
         )
         .route("/api/documents", get(documents::list_documents))
+        .route(
+            "/api/collections",
+            get(document_collections::list_collections)
+                .post(document_collections::create_collection),
+        )
+        .route(
+            "/api/collections/:id",
+            axum::routing::patch(document_collections::rename_collection)
+                .delete(document_collections::delete_collection),
+        )
+        .route(
+            "/api/collections/:id/documents",
+            post(document_collections::add_collection_documents),
+        )
+        .route(
+            "/api/collections/:id/documents/:doc_id",
+            axum::routing::delete(document_collections::remove_collection_document),
+        )
         .route("/api/models/local", get(local_models))
         .route("/api/models/local/delete", post(delete_local_model))
         .route("/api/models/quantize", post(quantize_model_endpoint))
