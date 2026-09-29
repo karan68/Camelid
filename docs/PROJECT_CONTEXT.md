@@ -36,6 +36,34 @@ Context is composed in the shared send path, including regenerate, edit/resend,
 and continue. An MCP run freezes its context for all approval and continuation
 rounds. Context edits are disabled while a response or tool run is active.
 
+## Knowledge collections
+
+A knowledge collection is a named set of documents from the Knowledge Library.
+Open **Attach → Collections** in the composer to create, rename, or delete a
+collection, add library documents to it or remove them, or upload files straight
+into it. A document can belong to any number of collections. Removing it from a
+collection, or deleting the collection, leaves the document in the library;
+deleting the document removes it from every collection.
+
+A project searches the collections chosen in its editor, and its chats search
+them too unless the chat turns one off: clear it under **Conversation context**,
+or remove its chip in the composer. A chat can also search collections of its
+own, from the same panel or with **Search this collection in this chat** in the
+library. A chat or project searches at most 16 collections.
+
+When a message is sent, the chat reads the collections again and runs one
+document search over its attached documents and the members of every searched
+collection together, so a message searches each document once however many
+collections hold it. The results reach the model the same way as attached
+documents' results, as quoted source excerpts with verifiable citations. The
+composer shows a chip for each searched collection with its size, or its
+indexing progress while its documents are embedded; the sent message names each
+collection and how many of the passages used came from its documents.
+
+A deleted collection shows as **Collection unavailable** and is not searched;
+remove its chip to clear it. If the collections cannot be read, the message is
+sent without them and says so.
+
 ## Files, storage, and scope
 
 - Reference files are static UTF-8 copies: text, Markdown, code, CSV, or JSON.
@@ -55,9 +83,14 @@ rounds. Context edits are disabled while a response or tool run is active.
 - Updating a project affects future messages in its linked chats. Removing a
   project displays **Project unavailable** in those chats and omits its context.
   No conversation is deleted and no replacement project is chosen automatically.
-- Context is sent to the selected chat endpoint. The feature works on the LAN
-  chat surface because its project management is entirely local to the UI.
-  It adds no engine filesystem, tool-execution, indexing, or synchronization API.
+- Context is sent to the selected chat endpoint. Instructions and reference
+  files work on the LAN chat surface because they are entirely local to the UI
+  and add no engine filesystem, tool-execution, indexing, or synchronization API.
+- Knowledge collections live in the engine's library database, next to the
+  documents they group; chats and projects store only collection ids. They are
+  part of the library API, which the LAN chat surface does not serve, so that
+  surface neither offers nor searches them and never requests them. A chat's
+  saved collections apply again on the full surface.
 - Conversation exports retain their existing transcript-only field whitelist.
   Project and conversation context are excluded, and imports do not activate
   context from an imported file. Clearing UI storage removes saved context.
@@ -65,8 +98,11 @@ rounds. Context edits are disabled while a response or tool run is active.
 ## Validation
 
 Run `npm run smoke:project-context` and, after `npm run build`,
-`npm run smoke:project-context-browser` from `frontend`. The browser suite uses
+`npm run smoke:project-context-browser` and
+`npm run smoke:knowledge-collections-browser` from `frontend`. The browser suites use
 local deterministic API fixtures to verify actual request payloads, inheritance,
 file selection, persistence, project isolation, MCP continuation, the context
-budget gate, project deletion, and desktop/mobile layouts. These checks verify
+budget gate, project deletion, and desktop/mobile layouts, and that collections
+are managed, searched per chat and per project, left out once deleted, and absent
+from the LAN chat surface. These checks verify
 UI behavior and request composition; they are not model-quality evidence.

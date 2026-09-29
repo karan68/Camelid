@@ -2,7 +2,10 @@ import { ToolActivityCard } from '../components/mcp/ToolActivityCard'
 import { toolActivityGroups } from '../lib/toolActivity.js'
 import { ComposerMenu } from '../components/chat/ComposerMenu'
 import { ConversationContext } from '../components/context/ContextEditors'
-import { contextSourceMessages, chatHistoryForRequest } from '../lib/projectContext.js'
+import { contextCollectionRefs, contextSourceMessages, chatHistoryForRequest, withCollection, withoutCollection } from '../lib/projectContext.js'
+import { DOCUMENT_ACCEPT, documentsCoverage, ingestLibraryFile } from '../lib/knowledgeCollections.js'
+import { useKnowledgeCollections } from '../hooks/useKnowledgeCollections.js'
+import { KnowledgeLibrary } from '../components/knowledge/KnowledgeLibrary'
 import { ConversationFiles, ConversationFilesTray } from '../components/outputs/ConversationFiles'
 import { conversationFiles } from '../lib/conversationFiles.js'
 import { OutputPanelContext, OutputMessageContext, ToolOutputGallery } from '../components/outputs/OutputActions.jsx'
@@ -19,7 +22,7 @@ import { CamelidMark } from '../components/ui/CamelidMark'
 import { Avatar } from '../components/ui/Avatar'
 import { StatusDot } from '../components/ui/StatusDot'
 import { EvidenceChip } from '../components/ui/EvidenceChip'
-import { IconSend, IconStop, IconMemory, IconReceipt, IconThinking, IconBolt, IconChart, IconChat, IconChevronDown, IconEdit, IconImage, IconInfo, IconClose, IconSearch, IconFile } from '../components/ui/icons'
+import { IconSend, IconStop, IconMemory, IconReceipt, IconThinking, IconBolt, IconChart, IconChat, IconChevronDown, IconEdit, IconImage, IconInfo, IconClose, IconSearch, IconFile, IconCollection } from '../components/ui/icons'
 import { Tooltip } from '../components/ui/Tooltip'
 import { MessageTurn } from '../components/chat/MessageTurn'
 import { DocumentViewer } from '../components/chat/DocumentViewer'
@@ -107,17 +110,6 @@ const readAsDataUrl = (blob) => new Promise((resolve, reject) => {
   const reader = new FileReader()
   reader.onload = () => resolve(String(reader.result || ''))
   reader.onerror = () => reject(reader.error || new Error('Could not read the image.'))
-  reader.readAsDataURL(blob)
-})
-
-const readAsBase64 = (blob) => new Promise((resolve, reject) => {
-  const reader = new FileReader()
-  reader.onload = () => {
-    const res = String(reader.result || '')
-    const comma = res.indexOf(',')
-    resolve(comma !== -1 ? res.slice(comma + 1) : res)
-  }
-  reader.onerror = () => reject(reader.error || new Error('Could not read the document.'))
   reader.readAsDataURL(blob)
 })
 
@@ -285,6 +277,22 @@ export default function ChatWorkspace({
   const [citationView, setCitationView] = useState(null)
   const [viewerDocument, setViewerDocument] = useState(null)
   const openDocument = useCallback((doc) => setViewerDocument(doc), [])
+  // Collections are a full-API feature; wait for health to say which surface this is.
+  const knowledgeEnabled = !demoMode && Boolean(runtime) && runtime.api_surface !== 'lan_chat_only'
+  const knowledge = useKnowledgeCollections(knowledgeEnabled)
+  const [library, setLibrary] = useState(null)
+  const [collectionError, setCollectionError] = useState('')
+  const collectionRefs = knowledgeEnabled ? contextCollectionRefs(chatContext, projects) : []
+  const collectionsById = new Map((knowledge.collections || []).map((collection) => [collection.id, collection]))
+  const searchedCollectionIds = new Set(collectionRefs.map((ref) => ref.id))
+  const openLibrary = (collectionId = null) => {
+    knowledge.refresh()
+    setLibrary({ collectionId })
+  }
+  // Throws while a reply is generating; callers show the message.
+  const setCollectionSearched = (collectionId, searched) => updateChatContext(searched
+    ? withCollection(chatContext, projects, collectionId)
+    : withoutCollection(chatContext, projects, collectionId))
   const closeDocumentViewer = useCallback(() => setViewerDocument(null), [])
   const chatBottomRef = useRef(null)
   const composerRef = useRef(null)
@@ -568,13 +576,16 @@ export default function ChatWorkspace({
 
   // Semantic indexing runs in the background after an upload. Poll only while
   // an attached document is still being indexed; keyword search needs none of it.
-  const attachedIdsKey = attachedDocuments.map((doc) => doc.doc_id).join('\n')
+  const watchedDocIdsKey = [...new Set([
+    ...attachedDocuments.map((doc) => doc.doc_id),
+    ...collectionRefs.flatMap((ref) => collectionsById.get(ref.id)?.doc_ids || []),
+  ])].join('\n')
   useEffect(() => {
-    if (!attachedIdsKey) {
+    if (!watchedDocIdsKey) {
       setIndexStatus(null)
       return undefined
     }
-    const ids = attachedIdsKey.split('\n')
+    const ids = watchedDocIdsKey.split('\n')
     let cancelled = false
     let timer = null
     const poll = async () => {
@@ -600,7 +611,7 @@ export default function ChatWorkspace({
       cancelled = true
       if (timer) window.clearTimeout(timer)
     }
-  }, [attachedIdsKey])
+  }, [watchedDocIdsKey])
 
   useEffect(() => {
     if (!followActive) return undefined
@@ -753,30 +764,7 @@ export default function ChatWorkspace({
     setDocumentIngesting(true)
     for (const file of Array.from(files)) {
       try {
-        const lowerName = file.name.toLowerCase()
-        const isBinary = lowerName.endsWith('.pdf') || lowerName.endsWith('.docx')
-        let content = ''
-        let is_base64 = false
-        if (isBinary) {
-          content = await readAsBase64(file)
-          is_base64 = true
-        } else {
-          content = await file.text()
-        }
-        const res = await fetch('/api/documents/ingest', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            filename: file.name,
-            content,
-            is_base64,
-          }),
-        })
-        if (!res.ok) {
-          const failure = await res.json().catch(() => null)
-          throw new Error(failure?.error?.message || failure?.message || `Could not index ${file.name}.`)
-        }
-        const doc = await res.json()
+        const doc = await ingestLibraryFile(file)
         setAttachedDocuments((prev) => [
           ...prev.filter((item) => item.doc_id !== doc.doc_id && item.filename !== doc.filename),
           doc,
@@ -797,17 +785,34 @@ export default function ChatWorkspace({
 
     let contentToSend = composer
     let requestCitations = []
-    if (attachedDocuments.length > 0) {
+    setCollectionError('')
+    // Re-read collections so a collection deleted elsewhere is skipped, not a failed search.
+    let searchedCollections = []
+    if (collectionRefs.length > 0) {
+      const current = await knowledge.refresh()
+      if (current) {
+        const live = new Map(current.map((collection) => [collection.id, collection]))
+        searchedCollections = collectionRefs.map((ref) => live.get(ref.id)).filter(Boolean)
+      } else {
+        setCollectionError('Collections could not be read, so this message was sent without them.')
+      }
+    }
+    if (attachedDocuments.length > 0 || searchedCollections.length > 0) {
       try {
         const res = await fetch('/api/documents/search', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             query: composer,
-            doc_ids: attachedDocuments.map((d) => d.doc_id),
+            ...(attachedDocuments.length > 0 ? { doc_ids: attachedDocuments.map((d) => d.doc_id) } : {}),
+            ...(searchedCollections.length > 0 ? { collection_ids: searchedCollections.map((c) => c.id) } : {}),
             top_k: 4,
           }),
         })
+        if (!res.ok && searchedCollections.length > 0) {
+          const failure = await res.json().catch(() => null)
+          setCollectionError(failure?.error?.message || 'Document search failed, so this message was sent without document context.')
+        }
         if (res.ok) {
           const data = await res.json()
           if (data.results && data.results.length > 0) {
@@ -833,6 +838,11 @@ export default function ChatWorkspace({
       documents: attachedDocuments.map((doc) => ({
         ...doc,
         passages: requestCitations.filter((citation) => citation.doc_id === doc.doc_id).length,
+      })),
+      collections: searchedCollections.map((collection) => ({
+        id: collection.id,
+        name: collection.name,
+        passages: requestCitations.filter((citation) => collection.doc_ids.includes(citation.doc_id)).length,
       })),
     })
   }
@@ -1002,7 +1012,8 @@ export default function ChatWorkspace({
     'Camelid runs the loaded model locally. Verify important output.',
   ].filter(Boolean).join(' ')
 
-  const renderConversationContext = compact => (updateChatContext && <ConversationContext compact={compact} key={selectedConversation?.id || 'draft'} context={chatContext} projects={projects} sources={contextSources} globalPrompt={globalPrompt || ''} onSave={updateChatContext} onManageProjects={() => setTab('projects')} busy={sending} />)
+  const renderConversationContext = compact => (updateChatContext && <ConversationContext compact={compact} key={selectedConversation?.id || 'draft'} context={chatContext} projects={projects} sources={contextSources} globalPrompt={globalPrompt || ''} onSave={updateChatContext} onManageProjects={() => setTab('projects')} busy={sending}
+    collections={knowledgeEnabled && !knowledge.error ? knowledge.collections : undefined} />)
 
   const toolActivity = useMemo(() => toolActivityGroups(visibleMessages), [visibleMessages])
   const hasInlineActivity = Boolean(mcpActivity?.messageId && toolActivity.groups.has(mcpActivity.messageId))
@@ -1048,8 +1059,40 @@ export default function ChatWorkspace({
           }
         }}
       >
-        {(attachedDocuments.length > 0 || documentIngesting) && (
+        {(attachedDocuments.length > 0 || documentIngesting || collectionRefs.length > 0) && (
           <div className="cxcomposer__docs">
+            {knowledge.collections !== null && collectionRefs.map((ref) => {
+              const collection = collectionsById.get(ref.id)
+              const label = collection?.name || 'Collection unavailable'
+              const coverage = collection && indexStatus?.semantic?.available ? documentsCoverage(collection.doc_ids, indexStatus.byId) : null
+              return (
+                <div key={ref.id} className={`cxcomposer__doc-pill cxcomposer__doc-pill--collection${collection ? '' : ' is-unavailable'}`}>
+                  <button
+                    type="button"
+                    className="cxcomposer__doc-remove"
+                    aria-label={`Stop searching ${label}`}
+                    title={ref.from === 'project' ? 'Stop searching this project collection in this chat' : 'Stop searching this collection in this chat'}
+                    disabled={requestActive || !updateChatContext}
+                    onClick={() => {
+                      try { setCollectionSearched(ref.id, false) } catch (failure) { setCollectionError(failure.message) }
+                    }}
+                  >
+                    <IconClose size={14} />
+                  </button>
+                  <button type="button" className="cxcomposer__doc-open" disabled={!collection} title={collection ? `Open ${collection.name} in the knowledge library` : 'This collection was deleted. Remove it from this chat.'} onClick={() => openLibrary(ref.id)}>
+                    <IconCollection size={14} />
+                    <span className="cxcomposer__doc-name">{label}</span>
+                    {collection && (coverage?.pending ? (
+                      <span className="cxcomposer__doc-chunks cxcomposer__doc-chunks--indexing" title="Indexing for search by meaning. Keyword search works meanwhile.">
+                        indexing {coverage.done}/{coverage.indexable}
+                      </span>
+                    ) : (
+                      <span className="cxcomposer__doc-chunks">{collection.doc_ids.length} {collection.doc_ids.length === 1 ? 'doc' : 'docs'}{ref.from === 'project' ? ' · project' : ''}</span>
+                    ))}
+                  </button>
+                </div>
+              )
+            })}
             {attachedDocuments.map((doc) => {
               const coverage = indexStatus?.semantic?.available ? indexStatus.byId[doc.doc_id] : null
               const indexing = coverage && coverage.indexed_chunks + coverage.skipped_chunks < coverage.indexable_chunks
@@ -1082,7 +1125,7 @@ export default function ChatWorkspace({
               )
             })}
             {documentIngesting && <span className="cxcomposer__doc-status">Indexing document…</span>}
-            {attachedDocuments.length > 0 && ['encoder_not_installed', 'encoder_mismatch', 'encoder_load_failed'].includes(indexStatus?.semantic?.reason) && (
+            {(attachedDocuments.length > 0 || collectionRefs.length > 0) && ['encoder_not_installed', 'encoder_mismatch', 'encoder_load_failed'].includes(indexStatus?.semantic?.reason) && (
               <p className="cxcomposer__semantic-note" role="status">
                 Keyword search only. {indexStatus.semantic.message}
                 {indexStatus.semantic.reason === 'encoder_not_installed' && (
@@ -1196,7 +1239,7 @@ export default function ChatWorkspace({
               ref={docInputRef}
               className="sr-only"
               type="file"
-              accept=".pdf,.docx,.md,.txt,.csv,.json"
+              accept={DOCUMENT_ACCEPT}
               multiple
               onChange={(e) => {
                 handleDocumentFiles(e.target.files)
@@ -1219,6 +1262,18 @@ export default function ChatWorkspace({
                 {documentIngesting ? 'Indexing…' : attachedDocuments.length > 0 ? `Docs (${attachedDocuments.length})` : 'Documents'}
               </span>
             </button>
+                {knowledgeEnabled && (
+                  <button
+                    type="button"
+                    className={`cxcomposer__tool cxcomposer__tool--collapsible ${collectionRefs.length > 0 ? 'is-on' : ''}`}
+                    onClick={() => { close(); openLibrary() }}
+                    aria-label="Knowledge collections"
+                    title="Search a collection of library documents in this chat"
+                  >
+                    <IconCollection size={16} />{' '}
+                    <span className="cxcomposer__tool-label">{collectionRefs.length > 0 ? `Collections (${collectionRefs.length})` : 'Collections'}</span>
+                  </button>
+                )}
                 {visionReady && <>                <button
                   type="button"
                   className={`cxcomposer__tool cxcomposer__tool--collapsible ${composerImage ? 'is-on' : ''}`}
@@ -1230,7 +1285,7 @@ export default function ChatWorkspace({
                   <IconImage size={16} /> <span className="cxcomposer__tool-label">{composerImage ? 'Image ready' : 'Image'}</span>
                 </button>
 </>}
-                <p>Documents: PDF, Word, Markdown, text, CSV or JSON. Images are available with a vision model.</p>
+                <p>Documents: PDF, Word, Markdown, text, CSV or JSON. Collections search a group of library documents. Images are available with a vision model.</p>
               </div>}
             </ComposerMenu>
             {/* Guarded on BOTH halves of the gate: the engine must advertise the
@@ -1461,6 +1516,7 @@ export default function ChatWorkspace({
 
       {imageError && <p className="cxcomposer__image-error" role="alert">{imageError}</p>}
       {documentError && <p className="cxcomposer__image-error" role="alert">{documentError}</p>}
+      {collectionError && <p className="cxcomposer__image-error" role="alert">{collectionError}</p>}
 
       {sendBudget.level === 'error' && (
         <p className="cxcomposer__budget-error" role="alert">
@@ -1735,6 +1791,17 @@ export default function ChatWorkspace({
         </div>
       )}
       {viewerDocument && <DocumentViewer key={viewerDocument.doc_id} document={viewerDocument} onClose={closeDocumentViewer} />}
+      {library && (
+        <KnowledgeLibrary
+          collections={knowledge.collections}
+          refresh={knowledge.refresh}
+          initialCollectionId={library.collectionId}
+          searchedIds={updateChatContext ? searchedCollectionIds : null}
+          onToggleSearch={updateChatContext ? setCollectionSearched : null}
+          onClose={() => setLibrary(null)}
+          busy={requestActive}
+        />
+      )}
     </section>
     {filesOpen && <ConversationFiles key={selectedConversation?.id || 'draft'} files={files} selectedId={selectedFileId} onSelect={setSelectedFileId} onClose={() => setFilesOpen(false)} conversationId={selectedConversation?.id || 'draft'} />}
     </div>
