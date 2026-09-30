@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 
 use super::citations::{chunk_text_with_spans, retain_verifiable, sha256_hex};
 use super::document_collections::{self, CollectionError};
-use super::document_vectors::{self, Coverage, Unavailable, LIBRARY_RELEVANCE_FLOOR};
+use super::document_vectors::{self, Coverage, Unavailable};
 use super::{api_error, AppState};
 
 const DEFAULT_CHUNK_CHARS: usize = 512;
@@ -1005,9 +1005,16 @@ pub async fn search_documents(
         }
     }
 
-    let (results, ranked_by, coverage) = {
+    let (results, ranked_by, coverage, relevance_floor) = {
         let _lock = db_lock().lock().unwrap();
         let conn = open_connection().map_err(internal_error("sqlite_open_error"))?;
+        let relevance_floor = match (payload.library, query_vector.as_deref()) {
+            (true, Some(vector)) => Some(document_vectors::library_relevance_floor(
+                document_vectors::indexed_chunk_count(&conn, vector.len())
+                    .map_err(internal_error("search_error"))?,
+            )),
+            _ => None,
+        };
         let (mut results, mut ranked_by) = run_search(
             &conn,
             &SearchPlan {
@@ -1016,9 +1023,9 @@ pub async fn search_documents(
                 top_k,
                 keyword: mode != SearchMode::Semantic,
                 query_vector: query_vector.as_deref(),
-                library: payload.library.then_some(LibraryPlan {
+                library: relevance_floor.map(|floor| LibraryPlan {
                     pinned: &pinned,
-                    floor: LIBRARY_RELEVANCE_FLOOR,
+                    floor,
                 }),
             },
         )
@@ -1045,7 +1052,7 @@ pub async fn search_documents(
         } else {
             None
         };
-        (results, ranked_by, coverage)
+        (results, ranked_by, coverage, relevance_floor)
     };
     if coverage
         .as_ref()
@@ -1063,7 +1070,7 @@ pub async fn search_documents(
                 reason: unavailable,
                 coverage,
             },
-            relevance_floor: payload.library.then_some(LIBRARY_RELEVANCE_FLOOR),
+            relevance_floor,
         },
     }))
 }
@@ -1360,6 +1367,26 @@ mod tests {
         assert!(results.iter().any(|result| result.doc_id == "plain"
             && result.chunk_index == 0
             && result.similarity.is_none()));
+    }
+
+    #[test]
+    fn the_library_floor_rises_with_its_indexed_chunks() {
+        let conn = library();
+        index_policy(&conn, "policy");
+        seed_passages(&conn, "plain", &POLICY);
+        assert_eq!(
+            document_vectors::indexed_chunk_count(&conn, 3).unwrap(),
+            3,
+            "only chunks with a current vector count"
+        );
+        assert_eq!(
+            document_vectors::indexed_chunk_count(&conn, 768).unwrap(),
+            0
+        );
+        let floor = document_vectors::library_relevance_floor;
+        assert!((floor(0) - 0.6408).abs() < 1e-6 && (floor(1) - 0.6408).abs() < 1e-6);
+        assert!((floor(4406) - 0.6895).abs() < 1e-4);
+        assert!(floor(22) < floor(1_000) && floor(1_000) < floor(100_000));
     }
 
     #[test]
