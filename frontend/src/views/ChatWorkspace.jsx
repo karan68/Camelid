@@ -2,7 +2,7 @@ import { ToolActivityCard } from '../components/mcp/ToolActivityCard'
 import { toolActivityGroups } from '../lib/toolActivity.js'
 import { ComposerMenu } from '../components/chat/ComposerMenu'
 import { ConversationContext } from '../components/context/ContextEditors'
-import { contextCollectionRefs, contextSourceMessages, chatHistoryForRequest, withCollection, withoutCollection } from '../lib/projectContext.js'
+import { contextCollectionRefs, contextSourceMessages, chatHistoryForRequest, normalizeChatContext, withCollection, withoutCollection } from '../lib/projectContext.js'
 import { DOCUMENT_ACCEPT, documentsCoverage, ingestLibraryFile } from '../lib/knowledgeCollections.js'
 import { useKnowledgeCollections } from '../hooks/useKnowledgeCollections.js'
 import { KnowledgeLibrary } from '../components/knowledge/KnowledgeLibrary'
@@ -285,6 +285,9 @@ export default function ChatWorkspace({
   const collectionRefs = knowledgeEnabled ? contextCollectionRefs(chatContext, projects) : []
   const collectionsById = new Map((knowledge.collections || []).map((collection) => [collection.id, collection]))
   const searchedCollectionIds = new Set(collectionRefs.map((ref) => ref.id))
+  const searchLibrary = knowledgeEnabled && normalizeChatContext(chatContext).search_library
+  // Throws while a reply is generating; callers show the message.
+  const setLibrarySearched = (searched) => updateChatContext({ ...normalizeChatContext(chatContext), search_library: searched })
   const openLibrary = (collectionId = null) => {
     knowledge.refresh()
     setLibrary({ collectionId })
@@ -581,11 +584,11 @@ export default function ChatWorkspace({
     ...collectionRefs.flatMap((ref) => collectionsById.get(ref.id)?.doc_ids || []),
   ])].join('\n')
   useEffect(() => {
-    if (!watchedDocIdsKey) {
+    if (!watchedDocIdsKey && !searchLibrary) {
       setIndexStatus(null)
       return undefined
     }
-    const ids = watchedDocIdsKey.split('\n')
+    const ids = watchedDocIdsKey ? watchedDocIdsKey.split('\n') : []
     let cancelled = false
     let timer = null
     const poll = async () => {
@@ -595,7 +598,7 @@ export default function ChatWorkspace({
         if (cancelled || !status?.semantic) return
         const byId = Object.fromEntries((status.documents || []).map((doc) => [doc.id, doc]))
         setIndexStatus({ semantic: status.semantic, byId })
-        const pending = ids.some((id) => {
+        const pending = (searchLibrary ? Object.keys(byId) : ids).some((id) => {
           const doc = byId[id]
           return doc && doc.indexed_chunks + doc.skipped_chunks < doc.indexable_chunks
         })
@@ -611,7 +614,7 @@ export default function ChatWorkspace({
       cancelled = true
       if (timer) window.clearTimeout(timer)
     }
-  }, [watchedDocIdsKey])
+  }, [watchedDocIdsKey, searchLibrary])
 
   useEffect(() => {
     if (!followActive) return undefined
@@ -797,23 +800,39 @@ export default function ChatWorkspace({
         setCollectionError('Collections could not be read, so this message was sent without them.')
       }
     }
-    if (attachedDocuments.length > 0 || searchedCollections.length > 0) {
+    const pinnedSources = attachedDocuments.length > 0 || searchedCollections.length > 0
+    let librarySearched = false
+    if (pinnedSources || searchLibrary) {
+      const searchBody = {
+        query: composer,
+        ...(attachedDocuments.length > 0 ? { doc_ids: attachedDocuments.map((d) => d.doc_id) } : {}),
+        ...(searchedCollections.length > 0 ? { collection_ids: searchedCollections.map((c) => c.id) } : {}),
+        top_k: 4,
+      }
+      const search = (body) => fetch('/api/documents/search', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      })
       try {
-        const res = await fetch('/api/documents/search', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            query: composer,
-            ...(attachedDocuments.length > 0 ? { doc_ids: attachedDocuments.map((d) => d.doc_id) } : {}),
-            ...(searchedCollections.length > 0 ? { collection_ids: searchedCollections.map((c) => c.id) } : {}),
-            top_k: 4,
-          }),
-        })
-        if (!res.ok && searchedCollections.length > 0) {
-          const failure = await res.json().catch(() => null)
-          setCollectionError(failure?.error?.message || 'Document search failed, so this message was sent without document context.')
+        let res = null
+        if (searchLibrary) {
+          res = await search({ ...searchBody, library: true })
+          librarySearched = res.ok
+          if (!res.ok) {
+            const failure = await res.json().catch(() => null)
+            setCollectionError(`${failure?.error?.message || 'Whole-library search failed.'} This message was sent without searching the whole library.`)
+            res = null
+          }
         }
-        if (res.ok) {
+        if (!res && pinnedSources) {
+          res = await search(searchBody)
+          if (!res.ok && searchedCollections.length > 0) {
+            const failure = await res.json().catch(() => null)
+            setCollectionError(failure?.error?.message || 'Document search failed, so this message was sent without document context.')
+          }
+        }
+        if (res?.ok) {
           const data = await res.json()
           if (data.results && data.results.length > 0) {
             const citations = data.results
@@ -844,6 +863,11 @@ export default function ChatWorkspace({
         name: collection.name,
         passages: requestCitations.filter((citation) => collection.doc_ids.includes(citation.doc_id)).length,
       })),
+      // Counts only what the library added beyond the attached documents and collections.
+      library: librarySearched ? {
+        passages: requestCitations.filter((citation) => !attachedDocuments.some((doc) => doc.doc_id === citation.doc_id)
+          && !searchedCollections.some((collection) => collection.doc_ids.includes(citation.doc_id))).length,
+      } : null,
     })
   }
 
@@ -1059,8 +1083,39 @@ export default function ChatWorkspace({
           }
         }}
       >
-        {(attachedDocuments.length > 0 || documentIngesting || collectionRefs.length > 0) && (
+        {(attachedDocuments.length > 0 || documentIngesting || collectionRefs.length > 0 || searchLibrary) && (
           <div className="cxcomposer__docs">
+            {searchLibrary && (() => {
+              const libraryIds = indexStatus ? Object.keys(indexStatus.byId) : null
+              const coverage = libraryIds && indexStatus.semantic?.available ? documentsCoverage(libraryIds, indexStatus.byId) : null
+              return (
+                <div className="cxcomposer__doc-pill cxcomposer__doc-pill--library">
+                  <button
+                    type="button"
+                    className="cxcomposer__doc-remove"
+                    aria-label="Stop searching the whole library"
+                    title="Stop searching the whole library in this chat"
+                    disabled={requestActive || !updateChatContext}
+                    onClick={() => {
+                      try { setLibrarySearched(false) } catch (failure) { setCollectionError(failure.message) }
+                    }}
+                  >
+                    <IconClose size={14} />
+                  </button>
+                  <button type="button" className="cxcomposer__doc-open" title="Every document in the library is searched; only passages close in meaning to your message are used. Open the knowledge library." onClick={() => openLibrary()}>
+                    <IconSearch size={14} />
+                    <span className="cxcomposer__doc-name">Whole library</span>
+                    {coverage?.pending ? (
+                      <span className="cxcomposer__doc-chunks cxcomposer__doc-chunks--indexing" title="Passages are found only once they are indexed for search by meaning.">
+                        indexing {coverage.done}/{coverage.indexable}
+                      </span>
+                    ) : libraryIds && (
+                      <span className="cxcomposer__doc-chunks">{libraryIds.length} {libraryIds.length === 1 ? 'doc' : 'docs'}</span>
+                    )}
+                  </button>
+                </div>
+              )
+            })()}
             {knowledge.collections !== null && collectionRefs.map((ref) => {
               const collection = collectionsById.get(ref.id)
               const label = collection?.name || 'Collection unavailable'
@@ -1125,6 +1180,14 @@ export default function ChatWorkspace({
               )
             })}
             {documentIngesting && <span className="cxcomposer__doc-status">Indexing document…</span>}
+            {searchLibrary && indexStatus?.semantic && !indexStatus.semantic.available && (
+              <p className="cxcomposer__semantic-note cxcomposer__semantic-note--library" role="status">
+                Whole-library search needs search by meaning. {indexStatus.semantic.message}
+                {indexStatus.semantic.reason === 'encoder_not_installed' && (
+                  <button type="button" onClick={() => setTab('library')}>Open Models</button>
+                )}
+              </p>
+            )}
             {(attachedDocuments.length > 0 || collectionRefs.length > 0) && ['encoder_not_installed', 'encoder_mismatch', 'encoder_load_failed'].includes(indexStatus?.semantic?.reason) && (
               <p className="cxcomposer__semantic-note" role="status">
                 Keyword search only. {indexStatus.semantic.message}
@@ -1274,6 +1337,23 @@ export default function ChatWorkspace({
                     <span className="cxcomposer__tool-label">{collectionRefs.length > 0 ? `Collections (${collectionRefs.length})` : 'Collections'}</span>
                   </button>
                 )}
+                {knowledgeEnabled && (
+                  <button
+                    type="button"
+                    className={`cxcomposer__tool cxcomposer__tool--collapsible ${searchLibrary ? 'is-on' : ''}`}
+                    onClick={() => {
+                      close()
+                      try { setLibrarySearched(!searchLibrary) } catch (failure) { setCollectionError(failure.message) }
+                    }}
+                    disabled={!updateChatContext}
+                    aria-label="Search the whole library"
+                    aria-pressed={searchLibrary}
+                    title="Search every document in the library, using only passages close in meaning to your message"
+                  >
+                    <IconSearch size={16} />{' '}
+                    <span className="cxcomposer__tool-label">Whole library</span>
+                  </button>
+                )}
                 {visionReady && <>                <button
                   type="button"
                   className={`cxcomposer__tool cxcomposer__tool--collapsible ${composerImage ? 'is-on' : ''}`}
@@ -1285,7 +1365,7 @@ export default function ChatWorkspace({
                   <IconImage size={16} /> <span className="cxcomposer__tool-label">{composerImage ? 'Image ready' : 'Image'}</span>
                 </button>
 </>}
-                <p>Documents: PDF, Word, Markdown, text, CSV or JSON. Collections search a group of library documents. Images are available with a vision model.</p>
+                <p>Documents: PDF, Word, Markdown, text, CSV or JSON. Collections search a group of library documents. Whole library searches every document and uses only passages close in meaning to your message. Images are available with a vision model.</p>
               </div>}
             </ComposerMenu>
             {/* Guarded on BOTH halves of the gate: the engine must advertise the
