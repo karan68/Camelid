@@ -368,7 +368,15 @@ try {
   await page.click('button[aria-label="Edit conversation context"]')
   await page.waitForSelector('.context-collections .context-inheritance', { timeout: 5000 })
   assert.equal(await page.$eval('.context-collections .context-inheritance input', (input) => input.checked), false, 'this chat turned the project collection off')
-  await clickText('.context-modal .cx-modal__footer button', 'Cancel')
+  await page.$eval('.context-collections .context-inheritance input', (input) => input.click())
+  await clickText('.context-modal .cx-modal__footer button', 'Save context')
+  await page.waitForSelector('.cxcomposer__doc-pill--collection', { timeout: 5000 })
+  assert.deepEqual(await collectionChips(), ['HR2 docs · project'], 'the dialog turns the project collection back on')
+  await page.click('button[aria-label="Edit conversation context"]')
+  await page.waitForSelector('.context-collections .context-inheritance input', { timeout: 5000 })
+  await page.$eval('.context-collections .context-inheritance input', (input) => input.click())
+  await clickText('.context-modal .cx-modal__footer button', 'Save context')
+  await page.waitForFunction(() => !document.querySelector('.cxcomposer__doc-pill--collection'), { timeout: 5000 })
 
   /* ---- 5. a deleted collection is unavailable, and not searched ---------- */
   await page.evaluate(() => [...document.querySelectorAll('nav[aria-label="Primary"] button')].find((button) => button.textContent.trim() === 'Chat').click())

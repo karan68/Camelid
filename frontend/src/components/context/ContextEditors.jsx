@@ -1,7 +1,7 @@
 import { useCallback, useRef, useState } from 'react'
 import { Modal } from '../ui/Modal'
 import { IconFolder, IconFile } from '../ui/icons'
-import { buildContextSources, contextBytes, estimateContextTokens, MAX_INSTRUCTION_CHARS, MAX_REFERENCES, normalizeChatContext, readContextFile, validateContextDraft } from '../../lib/projectContext.js'
+import { buildContextSources, contextBytes, estimateContextTokens, MAX_INSTRUCTION_CHARS, MAX_REFERENCES, normalizeChatContext, readContextFile, validateContextDraft, withCollection, withoutCollection } from '../../lib/projectContext.js'
 import { CollectionChecklist } from '../knowledge/CollectionChecklist'
 import '../../styles/project-context.css'
 
@@ -90,7 +90,7 @@ function ContextDialog({ context, projects, globalPrompt, automaticCodePrompt, o
             {project?.collection_ids.length > 0 && <div className="context-inheritance"><h3>From {project.name}</h3>
               <CollectionChecklist collections={collections.filter(item => project.collection_ids.includes(item.id))}
                 checkedIds={project.collection_ids.filter(id => !draft.excluded_collection_ids.includes(id))}
-                onToggle={(id, on) => patch({ excluded_collection_ids: on ? draft.excluded_collection_ids.filter(item => item !== id) : [...draft.excluded_collection_ids, id] })} />
+                onToggle={(id, on) => patch({ excluded_collection_ids: (on ? withCollection : withoutCollection)(draft, projects, id).excluded_collection_ids })} />
             </div>}
             <CollectionChecklist collections={collections} excludeIds={project?.collection_ids || []} checkedIds={draft.collection_ids}
               onToggle={(id, on) => patch({ collection_ids: on ? [...draft.collection_ids, id] : draft.collection_ids.filter(item => item !== id) })} />
