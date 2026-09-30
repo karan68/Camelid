@@ -204,7 +204,7 @@ exist before anything is stored, and the new document joins them all.
 from outside `doc_ids` and `collection_ids` only when its cosine similarity to
 the query reaches a floor that rises with the number of chunks the library has
 indexed: 0.6408 + 0.0058 × ln(chunks), clamped to 0.3–0.9. That is 0.659 at 25
-chunks, 0.681 at 1,000 and 0.690 at 4,406. The named documents and collections
+chunks, 0.681 at 1,000 and 0.689 at 4,406. The named documents and collections
 are still searched in full and skip the floor, so an attached document is never
 crowded out by the rest of the library. Keyword matches are held to the floor
 too, which means a passage without a current vector from the pinned encoder
