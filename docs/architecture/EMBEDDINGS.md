@@ -200,6 +200,35 @@ collection when either is deleted and survive re-ingesting a document.
 `POST /api/documents/ingest` also accepts `collection_ids`: every one must
 exist before anything is stored, and the new document joins them all.
 
+**Whole library.** `library: true` searches every document and keeps a passage
+from outside `doc_ids` and `collection_ids` only when its cosine similarity to
+the query is at least 0.69 (`LIBRARY_RELEVANCE_FLOOR`). The named documents and
+collections are still searched in full and skip the floor, so an attached
+document is never crowded out by the rest of the library. Keyword matches are
+held to the floor too, which means a passage without a current vector from the
+pinned encoder counts only when its document is named. The floor is a
+similarity, so this needs the encoder: without it the request is a `409` with
+the encoder's reason code and `param` `library`, and `mode` `keyword` is a
+`422` (`library_search_needs_meaning`). Each result carries its `similarity`,
+and `retrieval.relevance_floor` reports the floor applied. When nothing clears
+it, the search returns no results. A search with neither list and no `library`
+flag still covers the whole library with no floor, as before.
+
+**How 0.69 was chosen.** By a rule written down, and its script hashed, before
+any similarity was collected (`qa/evidence-bundles/f2a-library-search-20260930/calibration/`). On two libraries of
+1,000 documents, BEIR SciFact (science claims) and BEIR FiQA-2018 (financial
+questions), each library's own test questions (300 and 200) are the ones that
+should find a passage, and the other library's questions plus 405 unrelated
+chat messages (MT-Bench prompts, seeded samples of Alpaca instructions and
+GSM8K problems, and 25 short chit-chat lines) are the ones that should not.
+Half of every group chose the floor, as the one with the highest true-positive
+plus true-negative rate; the other half was held out. On the held-out half at
+0.69, 85.2% of questions still received a passage from a relevant document
+(90.7% on SciFact, 77.0% on FiQA) and 88.4% of the messages that should find
+nothing received nothing (90.7% and 86.4%). About one unrelated message in
+nine therefore still brings passages, which reach the model as ordinary cited
+excerpts. The floor belongs to this encoder; another encoder would need its own.
+
 There is no separate rerank stage: `/v1/rerank` is the same bi-encoder cosine
 over the same encoder, so it would rescore candidates with the function the
 semantic ranker already used.
