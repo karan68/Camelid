@@ -79,6 +79,18 @@ const FOLLOW_UP_PROMPTS = [
 const MAX_VISION_UPLOAD_BYTES = 3 * 1024 * 1024
 const MAX_VISION_EDGE = 1600
 const INDEX_STATUS_POLL_MS = 1500
+const INDEX_PROGRESS = {
+  running: { label: 'indexing', title: 'Indexing for search by meaning. Keyword search works meanwhile.' },
+  waiting: { label: 'waiting to index', title: 'Waiting to be indexed for search by meaning. Keyword search works meanwhile.' },
+  stopped: { label: 'indexing stopped', title: 'Indexing for search by meaning stopped. Keyword search still works.' },
+}
+
+/** How background indexing stands while chunks are `pending`, or null when there is nothing left to index. */
+function indexProgress(semantic, pending) {
+  if (!semantic?.available || !pending) return null
+  if (semantic.indexing) return 'running'
+  return semantic.error ? 'stopped' : 'waiting'
+}
 
 const RETRIEVAL_NOTES = {
   hybrid: 'Found by keyword and by meaning',
@@ -598,11 +610,9 @@ export default function ChatWorkspace({
         if (cancelled || !status?.semantic) return
         const byId = Object.fromEntries((status.documents || []).map((doc) => [doc.id, doc]))
         setIndexStatus({ semantic: status.semantic, byId })
-        const pending = (searchLibrary ? Object.keys(byId) : ids).some((id) => {
-          const doc = byId[id]
-          return doc && doc.indexed_chunks + doc.skipped_chunks < doc.indexable_chunks
-        })
-        if (status.semantic.available && status.semantic.indexing && pending) {
+        // A stopped indexer restarts only for a new upload or a restart, so polling it changes nothing.
+        const watched = searchLibrary ? Object.keys(byId) : ids
+        if (['running', 'waiting'].includes(indexProgress(status.semantic, documentsCoverage(watched, byId).pending))) {
           timer = window.setTimeout(poll, INDEX_STATUS_POLL_MS)
         }
       } catch {
@@ -1119,7 +1129,8 @@ export default function ChatWorkspace({
             {knowledge.collections !== null && collectionRefs.map((ref) => {
               const collection = collectionsById.get(ref.id)
               const label = collection?.name || 'Collection unavailable'
-              const coverage = collection && indexStatus?.semantic?.available ? documentsCoverage(collection.doc_ids, indexStatus.byId) : null
+              const coverage = collection ? documentsCoverage(collection.doc_ids, indexStatus?.byId) : null
+              const progress = indexProgress(indexStatus?.semantic, coverage?.pending)
               return (
                 <div key={ref.id} className={`cxcomposer__doc-pill cxcomposer__doc-pill--collection${collection ? '' : ' is-unavailable'}`}>
                   <button
@@ -1137,9 +1148,12 @@ export default function ChatWorkspace({
                   <button type="button" className="cxcomposer__doc-open" disabled={!collection} title={collection ? `Open ${collection.name} in the knowledge library` : 'This collection was deleted. Remove it from this chat.'} onClick={() => openLibrary(ref.id)}>
                     <IconCollection size={14} />
                     <span className="cxcomposer__doc-name">{label}</span>
-                    {collection && (coverage?.pending ? (
-                      <span className="cxcomposer__doc-chunks cxcomposer__doc-chunks--indexing" title="Indexing for search by meaning. Keyword search works meanwhile.">
-                        indexing {coverage.done}/{coverage.indexable}
+                    {collection && (progress ? (
+                      <span
+                        className={`cxcomposer__doc-chunks cxcomposer__doc-chunks--${progress === 'stopped' ? 'stopped' : 'indexing'}`}
+                        title={INDEX_PROGRESS[progress].title}
+                      >
+                        {INDEX_PROGRESS[progress].label} {coverage.done}/{coverage.indexable}
                       </span>
                     ) : (
                       <span className="cxcomposer__doc-chunks">{collection.doc_ids.length} {collection.doc_ids.length === 1 ? 'doc' : 'docs'}{ref.from === 'project' ? ' · project' : ''}</span>
@@ -1149,8 +1163,8 @@ export default function ChatWorkspace({
               )
             })}
             {attachedDocuments.map((doc) => {
-              const coverage = indexStatus?.semantic?.available ? indexStatus.byId[doc.doc_id] : null
-              const indexing = coverage && coverage.indexed_chunks + coverage.skipped_chunks < coverage.indexable_chunks
+              const coverage = indexStatus?.byId[doc.doc_id]
+              const progress = indexProgress(indexStatus?.semantic, documentsCoverage([doc.doc_id], indexStatus?.byId).pending)
               return (
                 <div key={doc.doc_id} className="cxcomposer__doc-pill">
                   <button
@@ -1168,9 +1182,12 @@ export default function ChatWorkspace({
                   <button type="button" className="cxcomposer__doc-open" title={`Open ${doc.filename}`} onClick={() => openDocument(doc)}>
                     <IconFile size={14} />
                     <span className="cxcomposer__doc-name">{doc.filename}</span>
-                    {indexing ? (
-                      <span className="cxcomposer__doc-chunks cxcomposer__doc-chunks--indexing" title="Indexing for search by meaning. Keyword search works meanwhile.">
-                        indexing {coverage.indexed_chunks}/{coverage.indexable_chunks}
+                    {progress ? (
+                      <span
+                        className={`cxcomposer__doc-chunks cxcomposer__doc-chunks--${progress === 'stopped' ? 'stopped' : 'indexing'}`}
+                        title={INDEX_PROGRESS[progress].title}
+                      >
+                        {INDEX_PROGRESS[progress].label} {coverage.indexed_chunks}/{coverage.indexable_chunks}
                       </span>
                     ) : (
                       <span className="cxcomposer__doc-chunks">{doc.chunk_count} chunks</span>
@@ -1186,6 +1203,13 @@ export default function ChatWorkspace({
                 {indexStatus.semantic.reason === 'encoder_not_installed' && (
                   <button type="button" onClick={() => setTab('library')}>Open Models</button>
                 )}
+              </p>
+            )}
+            {watchedDocIdsKey && indexProgress(indexStatus?.semantic, documentsCoverage(watchedDocIdsKey.split('\n'), indexStatus?.byId).pending) === 'stopped' && (
+              <p className="cxcomposer__semantic-note cxcomposer__semantic-note--stopped" role="status">
+                <span>Indexing for search by meaning stopped:</span>{' '}
+                <span className="cxcomposer__semantic-error">{indexStatus.semantic.error}</span>{' '}
+                <span>Passages not yet indexed are found by keyword only until it runs again, when a document is added or Camelid restarts.</span>
               </p>
             )}
             {(attachedDocuments.length > 0 || collectionRefs.length > 0) && ['encoder_not_installed', 'encoder_mismatch', 'encoder_load_failed'].includes(indexStatus?.semantic?.reason) && (

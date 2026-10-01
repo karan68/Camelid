@@ -57,8 +57,10 @@ collection together, so a message searches each document once however many
 collections hold it. The results reach the model the same way as attached
 documents' results, as quoted source excerpts with verifiable citations. The
 composer shows a chip for each searched collection with its size, or its
-indexing progress while its documents are embedded; the sent message names each
-collection and how many of the passages used came from its documents.
+indexing progress while its documents are embedded (indexing, waiting to index,
+or indexing stopped, with the error, until the next upload or a restart); the
+sent message names each collection and how many of the passages used came from
+its documents.
 
 A deleted collection shows as **Collection unavailable** and is not searched;
 remove its chip to clear it. If the collections cannot be read, the message is

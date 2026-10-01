@@ -521,17 +521,23 @@ fn store(
     Ok(())
 }
 
-/// A skipped chunk whose text matches its hash again (for example a restored
-/// file) becomes pending once more.
-fn clear_recovered_skips(conn: &Connection) -> Result<(), rusqlite::Error> {
+/// A skipped chunk in scope whose text matches its hash again (for example a
+/// restored file) becomes pending once more.
+pub(crate) fn clear_recovered_skips(
+    conn: &Connection,
+    doc_ids: Option<&[String]>,
+) -> Result<(), rusqlite::Error> {
     let recovered = {
-        let mut statement = conn.prepare(
+        let mut binds = Vec::new();
+        let sql = format!(
             "SELECT c.id, c.content, c.chunk_sha256
              FROM document_chunk_vectors AS v
              JOIN document_chunks AS c ON c.id = v.chunk_id
-             WHERE v.vector IS NULL",
-        )?;
-        let rows = statement.query_map([], |row| {
+             WHERE v.vector IS NULL{}",
+            scope_clause(doc_ids, &mut binds)
+        );
+        let mut statement = conn.prepare(&sql)?;
+        let rows = statement.query_map(params_from_iter(binds.iter()), |row| {
             Ok((
                 row.get::<_, i64>(0)?,
                 row.get::<_, String>(1)?,
@@ -574,7 +580,7 @@ fn index_pending(encoder: &Encoder) -> Result<usize, String> {
             .map_err(|_| "document database lock poisoned".to_string())?;
         open_connection().map_err(|error| error.to_string())?
     };
-    locked(&conn, clear_recovered_skips)?;
+    locked(&conn, |conn| clear_recovered_skips(conn, None))?;
     let mut before_id = i64::MAX;
     let mut pass_top = None;
     let mut stored = 0;
@@ -759,7 +765,7 @@ pub async fn index_status(
         })?;
         // A skipped chunk whose text was restored must count as pending here,
         // or nothing would ever start the indexer for it.
-        clear_recovered_skips(&conn)
+        clear_recovered_skips(&conn, None)
             .and_then(|()| coverage_by_document(&conn))
             .map_err(|e| {
                 api_error(
@@ -893,6 +899,19 @@ pub(crate) mod tests {
             )
             .unwrap();
         store(conn, chunk_id, &hash, vector.len(), Some(vector)).unwrap();
+    }
+
+    /// Records `chunk_id` as skipped, the way the indexer does when its text
+    /// no longer matches its hash.
+    pub(crate) fn put_skip(conn: &Connection, chunk_id: i64) {
+        let hash: String = conn
+            .query_row(
+                "SELECT chunk_sha256 FROM document_chunks WHERE id = ?1",
+                params![chunk_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        store(conn, chunk_id, &hash, 3, None).unwrap();
     }
 
     pub(crate) fn unit(values: &[f32]) -> Vec<f32> {
@@ -1163,7 +1182,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         store(&conn, ids[0], &hash, 1, None).unwrap();
-        clear_recovered_skips(&conn).unwrap();
+        clear_recovered_skips(&conn, None).unwrap();
         assert_eq!(
             coverage(&conn, None).unwrap().skipped_chunks,
             1,
@@ -1175,7 +1194,13 @@ pub(crate) mod tests {
             params![content, ids[0]],
         )
         .unwrap();
-        clear_recovered_skips(&conn).unwrap();
+        clear_recovered_skips(&conn, Some(&["other".to_string()])).unwrap();
+        assert_eq!(
+            coverage(&conn, None).unwrap().skipped_chunks,
+            1,
+            "a check scoped to other documents leaves it alone"
+        );
+        clear_recovered_skips(&conn, Some(&["doc".to_string()])).unwrap();
         assert_eq!(coverage(&conn, None).unwrap().skipped_chunks, 0);
         assert!(pending_batch(&conn, i64::MAX, 100)
             .unwrap()
