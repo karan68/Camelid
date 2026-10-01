@@ -147,7 +147,9 @@ dimension count:
 - a vector is only scored while its chunk still carries that hash, and is
   dropped with its chunk when the document is deleted or re-ingested;
 - a chunk whose stored text no longer matches its recorded hash is skipped
-  rather than embedded, and becomes pending again if the text is restored;
+  rather than embedded, and becomes pending again once the text is restored:
+  the next search by meaning that covers it, or the next status request,
+  finds it;
 - chunks ingested before verifiable citations have no hash, are not embedded,
   and stay keyword-only until the document is attached again.
 
@@ -155,8 +157,12 @@ The indexer also starts when a search that ranks by meaning, or
 `GET /api/documents/index-status`, finds pending chunks, so an existing
 library is indexed on first use. That
 endpoint reports whether the encoder is available (with a reason code when it
-is not), whether indexing is running, and each document's indexable, indexed
-and skipped chunk counts.
+is not), whether indexing is running, the error that stopped the last run if
+one did, and each document's indexable, indexed and skipped chunk counts. A
+stopped run is not retried by searches or status requests, so a persistent
+failure cannot turn polling into a retry loop; the next upload or a restart
+tries again. The chat composer shows an attached document's progress as
+indexing, waiting to index, or indexing stopped with that error.
 
 **Ranking.** `mode` selects the rankers:
 

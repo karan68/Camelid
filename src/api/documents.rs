@@ -821,6 +821,55 @@ fn internal_error(code: &'static str) -> impl Fn(rusqlite::Error) -> Response {
     }
 }
 
+struct SearchOutcome {
+    results: Vec<DocumentSearchResult>,
+    ranked_by: &'static str,
+    coverage: Option<Coverage>,
+}
+
+/// A search's work under the database lock. Only `attached`, the explicitly
+/// attached documents, fall back to their opening passages when nothing
+/// matches; a collection is too broad for that to mean anything. Errors carry
+/// the API code they are reported with.
+fn search_locked(
+    conn: &Connection,
+    plan: &SearchPlan<'_>,
+    attached: Option<&[String]>,
+) -> Result<SearchOutcome, (&'static str, rusqlite::Error)> {
+    if plan.query_vector.is_some() {
+        // Otherwise a restored chunk would stay skipped for a client that only searches.
+        document_vectors::clear_recovered_skips(conn, plan.doc_ids)
+            .map_err(|error| ("index_coverage_error", error))?;
+    }
+    let (mut results, mut ranked_by) =
+        run_search(conn, plan).map_err(|error| ("search_error", error))?;
+    if results.is_empty() {
+        if let Some(attached_ids) = attached.filter(|ids| !ids.is_empty()) {
+            results = attached_document_context(conn, attached_ids, plan.top_k)
+                .and_then(|results| retain_verifiable(conn, results))
+                .map_err(|error| ("attached_document_fallback_error", error))?;
+            if !results.is_empty() {
+                ranked_by = "attached";
+            }
+        }
+    }
+    // Counting coverage scans every chunk in scope, so a search that did not
+    // rank by meaning skips it.
+    let coverage = if plan.query_vector.is_some() {
+        Some(
+            document_vectors::coverage(conn, plan.doc_ids)
+                .map_err(|error| ("index_coverage_error", error))?,
+        )
+    } else {
+        None
+    };
+    Ok(SearchOutcome {
+        results,
+        ranked_by,
+        coverage,
+    })
+}
+
 /// Endpoint: `POST /api/documents/search`
 pub async fn search_documents(
     State(state): State<AppState>,
@@ -901,10 +950,14 @@ pub async fn search_documents(
         }
     }
 
-    let (results, ranked_by, coverage) = {
+    let SearchOutcome {
+        results,
+        ranked_by,
+        coverage,
+    } = {
         let _lock = db_lock().lock().unwrap();
         let conn = open_connection().map_err(internal_error("sqlite_open_error"))?;
-        let (mut results, mut ranked_by) = run_search(
+        search_locked(
             &conn,
             &SearchPlan {
                 query: &query,
@@ -913,31 +966,9 @@ pub async fn search_documents(
                 keyword: mode != SearchMode::Semantic,
                 query_vector: query_vector.as_deref(),
             },
+            payload.doc_ids.as_deref(),
         )
-        .map_err(internal_error("search_error"))?;
-        // Only explicitly attached documents fall back to their opening
-        // passages; a collection is too broad for that to mean anything.
-        if results.is_empty() {
-            if let Some(attached_ids) = payload.doc_ids.as_deref().filter(|ids| !ids.is_empty()) {
-                results = attached_document_context(&conn, attached_ids, top_k)
-                    .and_then(|results| retain_verifiable(&conn, results))
-                    .map_err(internal_error("attached_document_fallback_error"))?;
-                if !results.is_empty() {
-                    ranked_by = "attached";
-                }
-            }
-        }
-        // Counting coverage scans every chunk in scope, so a search that did not
-        // rank by meaning skips it.
-        let coverage = if query_vector.is_some() {
-            Some(
-                document_vectors::coverage(&conn, scope.as_deref())
-                    .map_err(internal_error("index_coverage_error"))?,
-            )
-        } else {
-            None
-        };
-        (results, ranked_by, coverage)
+        .map_err(|(code, error)| internal_error(code)(error))?
     };
     if coverage
         .as_ref()
@@ -1132,7 +1163,7 @@ mod tests {
         assert!(results.iter().all(|result| result.retrieval == "attached"));
     }
 
-    use crate::api::document_vectors::tests::{put_vector, seed_passages, unit};
+    use crate::api::document_vectors::tests::{put_skip, put_vector, seed_passages, unit};
 
     const POLICY: [&str; 3] = [
         "Enterprise customers may request a refund within 60 days of the invoice date.",
@@ -1400,6 +1431,76 @@ mod tests {
             pick(10),
             vec![healthy_at(2), healthy_at(0), healthy_at(1)],
             "a pool that runs out returns what verified, in rank order"
+        );
+    }
+
+    #[test]
+    fn a_search_by_meaning_returns_a_restored_skipped_chunk_to_pending() {
+        let conn = library();
+        let ids = seed_passages(&conn, "policy", &POLICY[..1]);
+        // Skipped while its text failed its hash; the text has since been restored.
+        put_skip(&conn, ids[0]);
+        let stuck = document_vectors::coverage(&conn, None).unwrap();
+        assert_eq!(
+            (
+                stuck.indexable_chunks,
+                stuck.indexed_chunks,
+                stuck.skipped_chunks,
+                stuck.pending()
+            ),
+            (1, 0, 1, 0),
+            "nothing would start the indexer for it"
+        );
+
+        let keyword_only = search_locked(&conn, &plan("refund", None), None).unwrap();
+        assert_eq!(keyword_only.coverage, None);
+        assert_eq!(
+            document_vectors::coverage(&conn, None)
+                .unwrap()
+                .skipped_chunks,
+            1,
+            "a keyword search does not touch the index"
+        );
+
+        let query = unit(&[1.0, 0.0, 0.0]);
+        let searched = search_locked(&conn, &plan("refund", Some(&query)), None).unwrap();
+        let coverage = searched.coverage.unwrap();
+        assert_eq!(
+            (
+                coverage.indexed_chunks,
+                coverage.skipped_chunks,
+                coverage.pending()
+            ),
+            (0, 0, 1),
+            "the search itself reports it pending, which schedules indexing"
+        );
+        assert_eq!(searched.results.len(), 1, "keyword ranking still finds it");
+    }
+
+    #[test]
+    fn a_search_by_meaning_leaves_a_still_tampered_chunk_skipped() {
+        let conn = library();
+        let ids = seed_passages(&conn, "policy", &POLICY);
+        conn.execute(
+            "UPDATE document_chunks SET content = 'tampered' WHERE id = ?1",
+            params![ids[0]],
+        )
+        .unwrap();
+        put_skip(&conn, ids[0]);
+        put_vector(&conn, ids[1], &[0.0, 1.0, 0.0]);
+        put_vector(&conn, ids[2], &[0.0, 0.0, 1.0]);
+        let query = unit(&[0.0, 1.0, 0.0]);
+        let coverage = search_locked(&conn, &plan("support", Some(&query)), None)
+            .unwrap()
+            .coverage
+            .unwrap();
+        assert_eq!(
+            (
+                coverage.indexed_chunks,
+                coverage.skipped_chunks,
+                coverage.pending()
+            ),
+            (2, 1, 0)
         );
     }
 }

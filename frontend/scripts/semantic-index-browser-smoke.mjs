@@ -7,6 +7,9 @@
  *
  *   - an attached document shows its background indexing progress, and the
  *     page stops polling once indexing is done
+ *   - a document waiting for the indexer says so and is still polled
+ *   - a stopped indexer is shown as stopped, with its error, and is not
+ *     polled; a retry running after a failure shows progress again
  *   - a missing or foreign encoder says keyword search only, and offers the
  *     Models page when the encoder is simply not installed
  *   - a deliberately disabled encoder or a failing status endpoint shows
@@ -35,6 +38,9 @@ const status = (semantic, indexed, skipped = 0) => ({
 })
 const READY = { available: true, indexing: false }
 const INDEXING = { available: true, indexing: true }
+const FAILURE = 'chunk embedding failed: the encoder ran out of memory'
+const STOPPED = { available: true, indexing: false, error: FAILURE }
+const RETRYING = { available: true, indexing: true, error: FAILURE }
 const NOT_INSTALLED = {
   available: false, indexing: false, reason: 'encoder_not_installed',
   message: 'Semantic document search needs nomic-embed-text-v1.5.Q8_0.gguf in the models directory.',
@@ -221,7 +227,30 @@ try {
   await load([status(READY, 47, 1)])
   assert.equal(await chipText(), '48 chunks', 'a chunk skipped for failing its hash does not leave indexing stuck')
 
-  /* ---- 3. no encoder installed: say so, offer Models, do not poll ------- */
+  /* ---- 3. waiting for the indexer: say so, keep polling ----------------- */
+  await load([status(READY, 0), status(INDEXING, 12), status(READY, 48)])
+  assert.equal(await chipText(), 'waiting to index 0/48', 'incomplete coverage with no indexer running is not shown as indexing')
+  await page.waitForFunction(() => document.querySelector('.cxcomposer__doc-chunks--indexing')?.textContent === 'indexing 12/48', { timeout: POLL_MS * 4 })
+  await page.waitForFunction(() => document.querySelector('.cxcomposer__doc-open .cxcomposer__doc-chunks')?.textContent === '48 chunks', { timeout: POLL_MS * 4 })
+
+  /* ---- 4. a stopped indexer: show it and its error, stop polling -------- */
+  await load([status(STOPPED, 0)])
+  assert.equal(await chipText(), 'indexing stopped 0/48')
+  assert.equal(await page.$('.cxcomposer__doc-chunks--indexing'), null, 'a stopped indexer is not shown as progress')
+  assert.match(await page.$eval('.cxcomposer__doc-chunks--stopped', (node) => node.getAttribute('title')), /Keyword search still works/)
+  assert.match(await note(), /Indexing for search by meaning stopped:/)
+  assert.equal(await page.$eval('.cxcomposer__semantic-error', (node) => node.textContent), FAILURE, 'the reported error is shown as reported')
+  assert.match(await note(), /when a document is added or Camelid restarts/)
+  const callsWhenStopped = statusCalls
+  await sleep(POLL_MS * 3)
+  assert.equal(statusCalls, callsWhenStopped, 'a stopped indexer is not polled')
+
+  await load([status(RETRYING, 10), status(READY, 48)])
+  assert.equal(await chipText(), 'indexing 10/48', 'a retry after a failure shows progress')
+  assert.equal(await note(), null, 'the previous failure is not reported while the retry runs')
+  await page.waitForFunction(() => document.querySelector('.cxcomposer__doc-open .cxcomposer__doc-chunks')?.textContent === '48 chunks', { timeout: POLL_MS * 4 })
+
+  /* ---- 5. no encoder installed: say so, offer Models, do not poll ------- */
   await load([status(NOT_INSTALLED, 0)])
   await page.waitForSelector('.cxcomposer__semantic-note', { timeout: 5000 })
   assert.match(await note(), /Keyword search only\. Semantic document search needs nomic-embed-text-v1\.5\.Q8_0\.gguf/)
@@ -234,14 +263,14 @@ try {
   await page.evaluate(() => [...document.querySelectorAll('nav[aria-label="Primary"] button')].find((button) => button.textContent.trim() === 'Chat').click())
   await page.waitForSelector('main[data-view="chat"]', { timeout: 10000 })
 
-  /* ---- 4. disabled on purpose, or a failing endpoint: nothing shown ----- */
+  /* ---- 6. disabled on purpose, or a failing endpoint: nothing shown ----- */
   await load([status(DISABLED, 0)])
   assert.equal(await note(), null, 'an operator who turned it off is not nagged')
   await load([], { failing: true })
   assert.equal(await note(), null)
   assert.equal(await chipText(), '48 chunks', 'a failing status endpoint breaks nothing')
 
-  /* ---- 5. the chat searches in the default mode ------------------------- */
+  /* ---- 7. the chat searches in the default mode ------------------------- */
   await load([status(READY, 48)])
   await page.$eval('textarea[aria-label="Message Camelid"]:not([disabled])', (textarea) => {
     const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set
@@ -256,7 +285,7 @@ try {
   assert.equal(searchRequests[0].mode, undefined, 'the chat leaves the mode to the server')
   assert.deepEqual(searchRequests[0].doc_ids, [DOC.doc_id])
 
-  /* ---- 6. the citation viewer says how each passage was found ----------- */
+  /* ---- 8. the citation viewer says how each passage was found ----------- */
   const expected = ['Found by meaning', 'Found by keyword and by meaning', 'Found by keyword', 'Included because nothing else matched']
   for (const [index, text] of expected.entries()) {
     await page.click(`main[data-view="chat"] button.citation-pill[title="View source citation [${index + 1}]"]`)

@@ -1756,6 +1756,8 @@
 
 /* Semantic indexing state of attached documents, and how a cited passage was found. */
 .cxcomposer__doc-chunks--indexing { color: var(--color-accent); font-variant-numeric: tabular-nums; }
+.cxcomposer__doc-chunks--stopped { color: var(--color-warning); font-variant-numeric: tabular-nums; }
+.cxcomposer__semantic-error { font-family: var(--font-mono); color: var(--color-text-muted); overflow-wrap: anywhere; }
 .cxcomposer__semantic-note {
   display: flex;
   flex-basis: 100%;
