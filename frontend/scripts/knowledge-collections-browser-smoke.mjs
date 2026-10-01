@@ -9,6 +9,8 @@
  *     collection, and reports a clashing name
  *   - a collection searched in a chat shows in the composer, is sent as
  *     collection_ids, and is named on the sent message with its passages
+ *   - a collection whose members stopped indexing says so, with the error, and
+ *     is not polled; one waiting for the indexer says that instead
  *   - the chat stops searching it from the chip, and starts again from the
  *     conversation context
  *   - a project's collection reaches its new chats and can be turned off per chat
@@ -48,6 +50,9 @@ const documents = [
 let collections = []
 let nextId = 1
 let lanOnly = false
+// Overrides the fully indexed default: every chunk unindexed, with these semantic fields.
+let unindexed = null
+let statusCalls = 0
 const collectionsCalls = []
 const searchRequests = []
 const ingestRequests = []
@@ -169,9 +174,10 @@ const server = createServer(async (req, res) => {
     }
     if (path === '/api/documents' && req.method === 'GET') return sendJson(res, 200, documents)
     if (path === '/api/documents/index-status' && req.method === 'GET') {
+      statusCalls += 1
       return sendJson(res, 200, {
-        semantic: { encoder: 'nomic-embed-text-v1.5.Q8_0.gguf', available: true, indexing: false },
-        documents: documents.map((doc) => ({ id: doc.id, indexable_chunks: doc.chunk_count, indexed_chunks: doc.chunk_count, skipped_chunks: 0 })),
+        semantic: { encoder: 'nomic-embed-text-v1.5.Q8_0.gguf', available: true, indexing: false, ...unindexed },
+        documents: documents.map((doc) => ({ id: doc.id, indexable_chunks: doc.chunk_count, indexed_chunks: unindexed ? 0 : doc.chunk_count, skipped_chunks: 0 })),
       })
     }
     if (path === '/api/documents/ingest' && req.method === 'POST') {
@@ -334,7 +340,23 @@ try {
   await page.waitForFunction(() => document.querySelector('.citation-modal .citation-modal__badge')?.textContent.includes('Verified'), { timeout: 10000 })
   await page.click('.citation-modal__footer button')
 
-  /* ---- 3. stop from the chip, start again from the context --------------- */
+  /* ---- 3. stopped or waiting indexing shows on the collection ----------- */
+  const failure = 'chunk embedding failed: the encoder ran out of memory'
+  unindexed = { error: failure }
+  await load()
+  await waitText('.cxcomposer__doc-pill--collection .cxcomposer__doc-chunks--stopped', 'indexing stopped 0/5')
+  assert.equal(await page.$eval('.cxcomposer__semantic-note--stopped .cxcomposer__semantic-error', (node) => node.textContent), failure, 'the reported error is shown')
+  const callsWhenStopped = statusCalls
+  await sleep(4500)
+  assert.equal(statusCalls, callsWhenStopped, 'a stopped indexer is not polled')
+  unindexed = {}
+  await load()
+  await waitText('.cxcomposer__doc-pill--collection .cxcomposer__doc-chunks--indexing', 'waiting to index 0/5')
+  assert.equal(await page.$('.cxcomposer__semantic-note--stopped'), null, 'waiting is not a failure')
+  unindexed = null
+  await waitText('.cxcomposer__doc-pill--collection .cxcomposer__doc-open', 'HR2 docs')
+
+  /* ---- 4. stop from the chip, start again from the context --------------- */
   await page.click('button[aria-label="Stop searching HR"]')
   await page.waitForFunction(() => !document.querySelector('.cxcomposer__doc-pill--collection'), { timeout: 5000 })
   await load()
@@ -347,7 +369,7 @@ try {
   await page.waitForSelector('.cxcomposer__doc-pill--collection', { timeout: 5000 })
   assert.deepEqual(await collectionChips(), ['HR2 docs'])
 
-  /* ---- 4. a project's collections reach its chats ------------------------ */
+  /* ---- 5. a project's collections reach its chats ------------------------ */
   await page.evaluate(() => [...document.querySelectorAll('nav[aria-label="Primary"] button')].find((button) => button.textContent.trim() === 'Projects').click())
   await page.waitForSelector('.projects-view', { timeout: 10000 })
   await clickText('.projects-view button', 'New project')
@@ -378,7 +400,7 @@ try {
   await clickText('.context-modal .cx-modal__footer button', 'Save context')
   await page.waitForFunction(() => !document.querySelector('.cxcomposer__doc-pill--collection'), { timeout: 5000 })
 
-  /* ---- 5. a deleted collection is unavailable, and not searched ---------- */
+  /* ---- 6. a deleted collection is unavailable, and not searched ---------- */
   await page.evaluate(() => [...document.querySelectorAll('nav[aria-label="Primary"] button')].find((button) => button.textContent.trim() === 'Chat').click())
   await page.waitForSelector(composerReady, { timeout: 10000 })
   await page.evaluate(() => document.querySelector('button[aria-label="New chat"]')?.click())
@@ -396,7 +418,7 @@ try {
   await page.click('button[aria-label="Stop searching Collection unavailable"]')
   await page.waitForFunction(() => !document.querySelector('.cxcomposer__doc-pill--collection'), { timeout: 5000 })
 
-  /* ---- 6. upload straight into a collection ------------------------------ */
+  /* ---- 7. upload straight into a collection ------------------------------ */
   await openLibrary()
   await setValue('input[aria-label="New collection name"]', 'Finance')
   await page.click('button[aria-label="Create collection"]')
@@ -413,7 +435,7 @@ try {
   await closeLibrary()
   assert.deepEqual(await collectionChips(), ['Finance1 doc'])
 
-  /* ---- 7. the LAN chat surface: no collections, no requests -------------- */
+  /* ---- 8. the LAN chat surface: no collections, no requests -------------- */
   lanOnly = true
   const callsBefore = collectionsCalls.length
   await load()
