@@ -84,6 +84,12 @@ const INDEX_PROGRESS = {
   waiting: { label: 'waiting to index', title: 'Waiting to be indexed for search by meaning. Keyword search works meanwhile.' },
   stopped: { label: 'indexing stopped', title: 'Indexing for search by meaning stopped. Keyword search still works.' },
 }
+// A whole-library search finds a passage outside what is attached only once it is indexed.
+const LIBRARY_INDEX_TITLES = {
+  running: 'Passages are found only once they are indexed for search by meaning.',
+  waiting: 'Waiting to be indexed for search by meaning. Passages are found only once they are indexed.',
+  stopped: 'Indexing for search by meaning stopped. Passages not yet indexed are not found.',
+}
 
 /** How background indexing stands while chunks are `pending`, or null when there is nothing left to index. */
 function indexProgress(semantic, pending) {
@@ -1097,7 +1103,8 @@ export default function ChatWorkspace({
           <div className="cxcomposer__docs">
             {searchLibrary && (() => {
               const libraryIds = indexStatus ? Object.keys(indexStatus.byId) : null
-              const coverage = libraryIds && indexStatus.semantic?.available ? documentsCoverage(libraryIds, indexStatus.byId) : null
+              const coverage = libraryIds ? documentsCoverage(libraryIds, indexStatus.byId) : null
+              const progress = indexProgress(indexStatus?.semantic, coverage?.pending)
               return (
                 <div className="cxcomposer__doc-pill cxcomposer__doc-pill--library">
                   <button
@@ -1115,9 +1122,12 @@ export default function ChatWorkspace({
                   <button type="button" className="cxcomposer__doc-open" title="Every document in the library is searched; only passages close in meaning to your message are used. Open the knowledge library." onClick={() => openLibrary()}>
                     <IconSearch size={14} />
                     <span className="cxcomposer__doc-name">Whole library</span>
-                    {coverage?.pending ? (
-                      <span className="cxcomposer__doc-chunks cxcomposer__doc-chunks--indexing" title="Passages are found only once they are indexed for search by meaning.">
-                        indexing {coverage.done}/{coverage.indexable}
+                    {progress ? (
+                      <span
+                        className={`cxcomposer__doc-chunks cxcomposer__doc-chunks--${progress === 'stopped' ? 'stopped' : 'indexing'}`}
+                        title={LIBRARY_INDEX_TITLES[progress]}
+                      >
+                        {INDEX_PROGRESS[progress].label} {coverage.done}/{coverage.indexable}
                       </span>
                     ) : libraryIds && (
                       <span className="cxcomposer__doc-chunks">{libraryIds.length} {libraryIds.length === 1 ? 'doc' : 'docs'}</span>
@@ -1205,11 +1215,15 @@ export default function ChatWorkspace({
                 )}
               </p>
             )}
-            {watchedDocIdsKey && indexProgress(indexStatus?.semantic, documentsCoverage(watchedDocIdsKey.split('\n'), indexStatus?.byId).pending) === 'stopped' && (
+            {(searchLibrary || watchedDocIdsKey) && indexProgress(indexStatus?.semantic, documentsCoverage(searchLibrary ? Object.keys(indexStatus?.byId || {}) : watchedDocIdsKey.split('\n'), indexStatus?.byId).pending) === 'stopped' && (
               <p className="cxcomposer__semantic-note cxcomposer__semantic-note--stopped" role="status">
                 <span>Indexing for search by meaning stopped:</span>{' '}
                 <span className="cxcomposer__semantic-error">{indexStatus.semantic.error}</span>{' '}
-                <span>Passages not yet indexed are found by keyword only until it runs again, when a document is added or Camelid restarts.</span>
+                <span>
+                  {searchLibrary
+                    ? 'Until it runs again, when a document is added or Camelid restarts, passages not yet indexed are found only by keyword in attached documents and collections, and not at all elsewhere in the library.'
+                    : 'Passages not yet indexed are found by keyword only until it runs again, when a document is added or Camelid restarts.'}
+                </span>
               </p>
             )}
             {(attachedDocuments.length > 0 || collectionRefs.length > 0) && ['encoder_not_installed', 'encoder_mismatch', 'encoder_load_failed'].includes(indexStatus?.semantic?.reason) && (

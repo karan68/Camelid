@@ -6,6 +6,8 @@
  * every cross-origin request is aborted.
  *
  *   - Attach -> Whole library turns it on for this chat, and the composer says so
+ *   - stopped indexing shows on the library chip with the error, and is not
+ *     polled; waiting for the indexer says that instead
  *   - a message searches with `library: true` and nothing else pinned, and the
  *     sent message says how many passages the library supplied
  *   - a message nothing in the library is close to is sent unchanged
@@ -46,6 +48,9 @@ const documents = [
 ]
 let encoderAvailable = true
 let lanOnly = false
+// Overrides the fully indexed default: every chunk unindexed, with these semantic fields.
+let unindexed = null
+let statusCalls = 0
 const searchRequests = []
 const chatRequests = []
 const pageErrors = []
@@ -140,9 +145,10 @@ const server = createServer(async (req, res) => {
     if (path === '/api/collections' && req.method === 'GET') return sendJson(res, 200, [])
     if (path === '/api/documents' && req.method === 'GET') return sendJson(res, 200, documents)
     if (path === '/api/documents/index-status' && req.method === 'GET') {
+      statusCalls += 1
       return sendJson(res, 200, {
-        semantic: semanticStatus(),
-        documents: documents.map((doc) => ({ id: doc.id, indexable_chunks: doc.chunk_count, indexed_chunks: encoderAvailable ? doc.chunk_count : 0, skipped_chunks: 0 })),
+        semantic: { ...semanticStatus(), ...unindexed },
+        documents: documents.map((doc) => ({ id: doc.id, indexable_chunks: doc.chunk_count, indexed_chunks: encoderAvailable && !unindexed ? doc.chunk_count : 0, skipped_chunks: 0 })),
       })
     }
     if (path === '/api/documents/ingest' && req.method === 'POST') {
@@ -247,7 +253,25 @@ try {
   await page.waitForFunction((s) => /docs$/.test(document.querySelector(`${s} .cxcomposer__doc-chunks`)?.textContent || ''), { timeout: 5000 }, libraryChip)
   assert.deepEqual(await texts(`${libraryChip} .cxcomposer__doc-open`), ['Whole library3 docs'], 'the composer says the whole library will be searched')
 
-  /* ---- 2. a question the library answers -------------------------------- */
+  /* ---- 2. stopped or waiting indexing on the library chip -------------- */
+  const failure = 'chunk embedding failed: the encoder ran out of memory'
+  unindexed = { error: failure }
+  await load()
+  await page.waitForFunction((s) => document.querySelector(`${s} .cxcomposer__doc-chunks--stopped`)?.textContent === 'indexing stopped 0/6', { timeout: 10000 }, libraryChip)
+  assert.match(await page.$eval(`${libraryChip} .cxcomposer__doc-chunks--stopped`, (node) => node.title), /not yet indexed are not found/)
+  assert.equal(await page.$eval('.cxcomposer__semantic-note--stopped .cxcomposer__semantic-error', (node) => node.textContent), failure, 'the reported error is shown')
+  assert.match(await page.$eval('.cxcomposer__semantic-note--stopped', (node) => node.textContent), /not at all elsewhere in the library/)
+  const callsWhenStopped = statusCalls
+  await sleep(4500)
+  assert.equal(statusCalls, callsWhenStopped, 'a stopped indexer is not polled')
+  unindexed = {}
+  await load()
+  await page.waitForFunction((s) => document.querySelector(`${s} .cxcomposer__doc-chunks--indexing`)?.textContent === 'waiting to index 0/6', { timeout: 10000 }, libraryChip)
+  assert.equal(await page.$('.cxcomposer__semantic-note--stopped'), null, 'waiting is not a failure')
+  unindexed = null
+  await page.waitForFunction((s) => document.querySelector(`${s} .cxcomposer__doc-chunks`)?.textContent === '3 docs', { timeout: 10000 }, libraryChip)
+
+  /* ---- 3. a question the library answers -------------------------------- */
   const request = await send('How early do I book leave, and what do claims need?')
   assert.equal(searchRequests.length, 1, 'one document search per message')
   assert.deepEqual(searchRequests[0], { query: 'How early do I book leave, and what do claims need?', top_k: 4, library: true }, 'only the library flag, nothing pinned')
@@ -257,13 +281,13 @@ try {
   await page.waitForFunction(() => document.querySelector('.citation-modal .citation-modal__badge')?.textContent.includes('Verified'), { timeout: 10000 })
   await page.click('.citation-modal__footer button')
 
-  /* ---- 3. nothing close enough ------------------------------------------ */
+  /* ---- 4. nothing close enough ------------------------------------------ */
   const quiet = await send(OFF_TOPIC)
   assert.equal(searchRequests.at(-1).library, true)
   assert.equal(lastUserText(quiet), OFF_TOPIC, 'no document context is invented when nothing clears the floor')
   assert.deepEqual(await lastTurnChips('.cxturn__user-doc--library'), ['Whole libraryno passages used'])
 
-  /* ---- 4. an attached document as well ---------------------------------- */
+  /* ---- 5. an attached document as well ---------------------------------- */
   const dir = mkdtempSync(join(tmpdir(), 'camelid-library-'))
   const file = join(dir, 'leave-policy.md')
   writeFileSync(file, 'Book leave two weeks ahead.')
@@ -276,7 +300,7 @@ try {
   assert.deepEqual(await lastTurnChips('button.cxturn__user-doc'), ['leave-policy.md1 passage used'])
   await page.click('button[aria-label="Remove leave-policy.md"]')
 
-  /* ---- 5. saved with the chat ------------------------------------------- */
+  /* ---- 6. saved with the chat ------------------------------------------- */
   await load()
   await page.waitForSelector(libraryChip, { timeout: 5000 })
   await page.click('button[aria-label="Stop searching the whole library"]')
@@ -298,7 +322,7 @@ try {
   assert.ok(newChat, 'the sidebar offers New chat')
   await page.waitForFunction((s) => !document.querySelector(s), { timeout: 5000 }, libraryChip)
 
-  /* ---- 6. without the encoder ------------------------------------------- */
+  /* ---- 7. without the encoder ------------------------------------------- */
   encoderAvailable = false
   await load()
   await toggleLibrary()
@@ -318,7 +342,7 @@ try {
   await page.click('button[aria-label="Remove leave-policy.md"]')
   encoderAvailable = true
 
-  /* ---- 7. the LAN chat surface ------------------------------------------ */
+  /* ---- 8. the LAN chat surface ------------------------------------------ */
   lanOnly = true
   await load()
   await sleep(1000)

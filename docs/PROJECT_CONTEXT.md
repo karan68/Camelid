@@ -73,8 +73,9 @@ with nothing to attach or collect first. Only passages close enough in meaning
 to the message are used, so a message about something the library does not
 cover is sent without document context; attached documents and the chat's
 collections are searched as well, in full. The composer shows a **Whole
-library** chip with the library's size, or its indexing progress, since a
-document is found this way only once it is indexed. The sent message says how
+library** chip with the library's size, or its indexing progress (indexing,
+waiting to index, or indexing stopped, with the error), since a document is
+found this way only once it is indexed. The sent message says how
 many passages came from the library beyond what was attached or collected. The
 switch is saved with the conversation, and a new chat starts with it off. It
 needs search by meaning: without the embedding model the composer says so, and
