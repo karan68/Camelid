@@ -220,7 +220,16 @@ fn tinyllama_edge_reference_pack_records_required_prompt_shapes_and_tokens() {
             case["reference_prompt_token_count"].as_u64().unwrap() as usize,
             "case {name}"
         );
+        assert_eq!(
+            case["model_tokenizer_tokens"].as_array().unwrap()[0],
+            1,
+            "case {name}: the model-tokenizer arrays are generated with BOS too"
+        );
     }
+    assert_eq!(
+        fixture["model_tokenizer_reference"]["tokenizer_model_sha256"],
+        "9e556afd44213b6bd1be2b850ebbbd98f5481437a8021afaf58ee7fb1818d347"
+    );
 
     assert!(cases["multiline_whitespace"]["expected_prompt"]
         .as_str()
@@ -233,7 +242,7 @@ fn tinyllama_edge_reference_pack_records_required_prompt_shapes_and_tokens() {
 }
 
 #[test]
-fn encodes_tinyllama_edge_reference_pack_like_llama_cpp_when_available() {
+fn encodes_tinyllama_edge_reference_pack_like_its_own_tokenizer_when_available() {
     let Some(tokenizer) = load_real_tinyllama_tokenizer() else {
         return;
     };
@@ -252,7 +261,7 @@ fn encodes_tinyllama_edge_reference_pack_like_llama_cpp_when_available() {
         let text = case["expected_prompt"].as_str().unwrap();
         let add_special = case["add_special"].as_bool().unwrap();
         let parse_special = case["parse_special"].as_bool().unwrap();
-        let expected: Vec<u32> = case["tokens"]
+        let expected: Vec<u32> = case["model_tokenizer_tokens"]
             .as_array()
             .unwrap()
             .iter()
@@ -278,9 +287,9 @@ fn encodes_tinyllama_edge_reference_pack_like_llama_cpp_when_available() {
     assert!(
         failures.is_empty(),
         "TinyLlama tokenizer/chat-template edge parity failed for {}/{} case(s); expected IDs are \
-         from fixtures/tokenizer/tinyllama-chat-template-edge-cases.json backed by the committed \
-         llama.cpp parity reports. Do not edit the fixture to match the encoder — re-derive it \
-         with the invocation recorded under reference.invocation.\n{}",
+         the model's own SentencePiece tokenizer's, recorded under model_tokenizer_tokens in \
+         fixtures/tokenizer/tinyllama-chat-template-edge-cases.json. Do not edit the fixture to \
+         match the encoder -- re-derive it with scripts/gen-tinyllama-sentencepiece-reference.py.\n{}",
         failures.len(),
         cases.len(),
         failures.join("\n")
@@ -549,6 +558,40 @@ fn applies_tokenizer_merges_when_present() {
     let tokenizer = Tokenizer::from_gguf(&gguf).unwrap();
 
     assert_eq!(tokenizer.encode("hello", false, false).unwrap(), vec![4]);
+}
+
+#[test]
+fn llama_spm_with_flat_scores_merges_by_rank() {
+    // Without the `▁ hell` merge, merge ranks keep `▁` apart from `hell`;
+    // flat scores would merge leftmost-first into `▁hell` instead.
+    let merges = ["h e", "he l", "hel l"];
+    let encode = |equal_scores: bool| {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tokenizer.gguf");
+        write_tokenizer_gguf_with_overrides(
+            &path,
+            TokenizerFixtureOverrides {
+                model: "llama",
+                add_space_prefix: true,
+                equal_scores,
+                merges: &merges,
+                ..TokenizerFixtureOverrides::default()
+            },
+        );
+        let tokenizer = Tokenizer::from_gguf(&read_metadata(&path).unwrap()).unwrap();
+        tokenizer.encode("hell", false, false).unwrap()
+    };
+
+    assert_eq!(
+        encode(true),
+        vec![6, 13],
+        "flat scores: `▁` + `hell` by merge rank"
+    );
+    assert_eq!(
+        encode(false),
+        vec![10],
+        "real scores: the merge list is ignored and `▁hell` wins on score"
+    );
 }
 
 #[test]
@@ -850,6 +893,7 @@ struct TokenizerFixtureOverrides<'a> {
     token_type: Option<i32>,
     chat_template: Option<&'a str>,
     merges: &'a [&'a str],
+    equal_scores: bool,
 }
 
 fn write_tokenizer_gguf_with_overrides(path: &Path, overrides: TokenizerFixtureOverrides<'_>) {
@@ -873,7 +917,12 @@ fn write_tokenizer_gguf_with_overrides(path: &Path, overrides: TokenizerFixtureO
         token_types[3] = token_type;
     }
     let score_len = overrides.score_len.unwrap_or(all_scores.len());
-    let scores = &all_scores[..score_len];
+    let flat_scores = [0.0; 14];
+    let scores = if overrides.equal_scores {
+        &flat_scores[..score_len]
+    } else {
+        &all_scores[..score_len]
+    };
 
     let mut b = Vec::new();
     b.extend_from_slice(b"GGUF");
