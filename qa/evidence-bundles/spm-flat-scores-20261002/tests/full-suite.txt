@@ -1,0 +1,6 @@
+branch=fix/spm-degenerate-scores head=c7ea906a changed=2
+TEST_EXIT=101
+passed 3149 failed 1 ignored 159 binaries 70
+test encodes_tinyllama_edge_reference_pack_like_llama_cpp_when_available ... FAILED
+TOK_FULL_DONE
+EXIT=0

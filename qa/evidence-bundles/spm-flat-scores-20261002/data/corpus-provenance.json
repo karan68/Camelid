@@ -1,0 +1,13 @@
+{
+ "texts": 1362,
+ "by_source": {
+  "fixture": 30,
+  "probe": 27,
+  "offtopic": 405,
+  "scifact": 300,
+  "fiqa": 300,
+  "rust": 150,
+  "javascript": 150
+ },
+ "corpus_sha256": "6fcffaeef44cd72a419241872be84166093163cc09755c3313e345d3c18cf9a6"
+}
