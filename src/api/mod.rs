@@ -34,6 +34,7 @@ mod coding;
 mod continuous_batch;
 mod contract;
 pub(crate) mod document_collections;
+pub(crate) mod document_folders;
 pub(crate) mod document_vectors;
 pub(crate) mod documents;
 mod engine;
@@ -2962,6 +2963,18 @@ fn router_with_state_and_policy(state: AppState, policy: server::ServerPolicy) -
             "/api/collections/:id/documents/:doc_id",
             axum::routing::delete(document_collections::remove_collection_document),
         )
+        .route(
+            "/api/folders",
+            get(document_folders::list_watched_folders).post(document_folders::watch_folder),
+        )
+        .route(
+            "/api/folders/:id",
+            axum::routing::delete(document_folders::unwatch_folder),
+        )
+        .route(
+            "/api/folders/:id/scan",
+            post(document_folders::scan_watched_folder),
+        )
         .route("/api/models/local", get(local_models))
         .route("/api/models/local/delete", post(delete_local_model))
         .route("/api/models/quantize", post(quantize_model_endpoint))
@@ -3138,6 +3151,9 @@ pub async fn serve(
             .map(|c| (c.repo_id.to_string(), c.filename.to_string(), c.size_bytes))
             .collect(),
     );
+
+    // Watched library folders are re-scanned while the server runs.
+    document_folders::start_polling(state.models_dir.clone());
 
     // The router owns `state`; the startup load below shares the same Arcs, so
     // a model it loads is visible to every request the listener is already

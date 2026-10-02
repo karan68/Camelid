@@ -42,6 +42,37 @@
 .knowledge-pick .context-check { margin: 6px 0; align-items: center; }
 .knowledge-pick .context-check input { width: 14px; min-width: 14px; margin: 0; }
 
+.knowledge-detail.is-dropping { outline: 2px dashed var(--color-accent); outline-offset: 6px; border-radius: 8px; }
+.knowledge-drop-hint { margin: 0; font-size: 12px; }
+
+.knowledge-folders { margin-top: 6px; display: flex; flex-direction: column; align-items: flex-start; gap: 8px; }
+.knowledge-folder-list { list-style: none; margin: 0; padding: 0; width: 100%; display: flex; flex-direction: column; gap: 8px; }
+.knowledge-folder { border: 1px solid var(--color-border-strong); border-radius: 8px; padding: 8px 10px; display: flex; flex-direction: column; gap: 6px; font-size: 12px; }
+.knowledge-folder__head { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.knowledge-folder__head svg { flex-shrink: 0; color: var(--color-text-muted); }
+.knowledge-folder__path { flex: 1; min-width: 0; overflow-wrap: anywhere; font-size: 12px; }
+.knowledge-folder__status { margin: 0; color: var(--color-text-muted); line-height: 1.5; }
+.knowledge-folder__error { margin: 0; color: var(--color-danger, #d65959); line-height: 1.5; }
+.knowledge-folder__skipped summary { cursor: pointer; }
+.knowledge-folder__skipped ul { list-style: none; margin: 6px 0 0; padding: 0; max-height: 140px; overflow-y: auto; }
+.knowledge-folder__skipped li { display: flex; gap: 8px; padding: 2px 0; }
+.knowledge-folder__skipped li span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.knowledge-folder__skipped li small { color: var(--color-text-muted); flex-shrink: 0; }
+.knowledge-folder__actions { display: flex; gap: 6px; }
+.knowledge-folder-add { display: inline-flex; align-items: center; gap: 6px; }
+.knowledge-folder-form { width: 100%; display: flex; flex-direction: column; gap: 6px; font-size: 12px; }
+.knowledge-folder-form label { font-weight: 600; }
+.knowledge-folder-form__row { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.knowledge-folder-form__row input { flex: 1; min-width: 0; box-sizing: border-box; border: 1px solid var(--color-border-strong); border-radius: 8px; background: var(--color-bg); color: var(--color-text); font: inherit; font-size: 13px; padding: 8px 10px; }
+.knowledge-folder-form p { margin: 0; line-height: 1.5; }
+.knowledge-browser { border: 1px solid var(--color-border-strong); border-radius: 8px; padding: 6px; }
+.knowledge-browser__bar { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.knowledge-browser__bar code { flex: 1; min-width: 0; overflow-wrap: anywhere; font-size: 12px; }
+.knowledge-browser ul { list-style: none; margin: 6px 0 0; padding: 0; max-height: 180px; overflow-y: auto; }
+.knowledge-browser__entry { display: flex; align-items: center; gap: 8px; width: 100%; border: 0; border-radius: 6px; background: none; color: var(--color-text); font: inherit; font-size: 12px; padding: 5px 6px; text-align: left; cursor: pointer; }
+.knowledge-browser__entry:hover { background: var(--color-surface); }
+.knowledge-browser__entry svg { flex-shrink: 0; color: var(--color-text-muted); }
+
 .context-collections { margin-top: 20px; border-top: 1px solid var(--color-border-strong); padding-top: 14px; }
 .context-collections .context-check { align-items: center; }
 .context-collections .context-check svg { flex-shrink: 0; color: var(--color-text-muted); }

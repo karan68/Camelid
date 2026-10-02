@@ -68,6 +68,7 @@
     "smoke:semantic-index-browser": "node scripts/semantic-index-browser-smoke.mjs",
     "smoke:knowledge-collections-browser": "node scripts/knowledge-collections-browser-smoke.mjs",
     "smoke:library-search-browser": "node scripts/library-search-browser-smoke.mjs",
+    "smoke:watched-folders-browser": "node scripts/watched-folders-browser-smoke.mjs",
     "smoke:byte-units": "node scripts/byte-units-smoke.mjs",
     "smoke:context-meter": "node scripts/context-meter-smoke.mjs",
     "smoke:context-compaction": "node scripts/context-compaction-smoke.mjs",
