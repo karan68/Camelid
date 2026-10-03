@@ -184,6 +184,28 @@ scope's index coverage when meaning took part, and every result's `retrieval`
 field says whether keyword, meaning or both found it. A scope with nothing
 indexed yet reports `keyword`.
 
+**Scope.** Without `doc_ids` or `collection_ids` a search covers the whole
+library. Either narrows it: the search covers the named documents and every
+member of the named collections, each document once. An empty scope returns no
+results with `mode` `none`; an unknown collection is a `404`
+(`collection_not_found`); a scope of more than 30,000 documents is a `422`
+(`search_scope_too_large`), because each scoped document is bound as one SQLite
+variable. Collections are managed with the routes below; members are kept in
+`document_collection_members`, whose rows go with their document or their
+collection when either is deleted and survive re-ingesting a document.
+
+| Route | Effect |
+| --- | --- |
+| `GET /api/collections` | every collection by name, with member ids in the order added |
+| `POST /api/collections` `{name}` | `201`; names are trimmed, 1–80 characters without control characters, and unique ignoring ASCII case (`409 collection_name_taken`) |
+| `PATCH /api/collections/:id` `{name}` | rename, with the same rules |
+| `DELETE /api/collections/:id` | `204`; the documents stay in the library |
+| `POST /api/collections/:id/documents` `{doc_ids}` | adds them all, or none if any id is unknown (`404 document_not_found`) |
+| `DELETE /api/collections/:id/documents/:doc_id` | `204`; the document stays in the library |
+
+`POST /api/documents/ingest` also accepts `collection_ids`: every one must
+exist before anything is stored, and the new document joins them all.
+
 There is no separate rerank stage: `/v1/rerank` is the same bi-encoder cosine
 over the same encoder, so it would rescore candidates with the function the
 semantic ranker already used.

@@ -537,6 +537,12 @@ jobs:
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: npm run smoke:semantic-index-browser
 
+      # Knowledge collections: the library manages them, a chat or project
+      # searches them, and a deleted one is shown and left out of the search.
+      - name: Frontend knowledge collections browser smoke
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: npm run smoke:knowledge-collections-browser
+
       # Keeps the stream event boundary used to separate research latency,
       # model TTFT, and post-first-content decode rate gated in CI. The Web Auto
       # smoke above covers cancellation; this lane covers SSE usage/fallbacks.

@@ -2,7 +2,9 @@
 //!
 //! Provides document ingestion, exact-span chunking, SQLite FTS5 keyword
 //! indexing, and hybrid retrieval: BM25 and cosine similarity over stored chunk
-//! vectors (see `document_vectors`), fused by reciprocal rank.
+//! vectors (see `document_vectors`), fused by reciprocal rank. A search covers
+//! the whole library, named documents, or named collections
+//! (see `document_collections`).
 
 use std::collections::HashMap;
 use std::io::{Cursor, Read};
@@ -18,6 +20,7 @@ use rusqlite::{params, params_from_iter, types::Value, Connection};
 use serde::{Deserialize, Serialize};
 
 use super::citations::{chunk_text_with_spans, retain_verifiable, sha256_hex};
+use super::document_collections::{self, CollectionError};
 use super::document_vectors::{self, Coverage, Unavailable};
 use super::{api_error, AppState};
 
@@ -71,6 +74,7 @@ pub(crate) fn init_db(conn: &Connection) -> Result<(), rusqlite::Error> {
     )?;
     ensure_citation_columns(conn)?;
     document_vectors::init_schema(conn)?;
+    document_collections::init_schema(conn)?;
     Ok(())
 }
 
@@ -198,6 +202,9 @@ pub struct IngestDocumentRequest {
     pub content: String,
     #[serde(default)]
     pub is_base64: bool,
+    /// Collections the document joins; an unknown id ingests nothing.
+    #[serde(default)]
+    pub collection_ids: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -213,6 +220,9 @@ pub struct SearchDocumentsRequest {
     pub query: String,
     #[serde(default)]
     pub doc_ids: Option<Vec<String>>,
+    /// Searches every member of these collections as well as `doc_ids`.
+    #[serde(default)]
+    pub collection_ids: Option<Vec<String>>,
     #[serde(default = "default_top_k")]
     pub top_k: usize,
     #[serde(default)]
@@ -358,6 +368,9 @@ pub async fn ingest_document(
         .unwrap_or_default()
         .as_secs() as i64;
 
+    document_collections::require_collections(&tx, &payload.collection_ids)
+        .map_err(CollectionError::into_response)?;
+
     let ext = filename
         .split('.')
         .next_back()
@@ -390,13 +403,17 @@ pub async fn ingest_document(
         )
     })?;
 
-    // Insert or replace metadata only after the old chunk ids have been
-    // available for FTS cleanup; REPLACE can otherwise cascade-delete them
-    // before the external-content index rows are found.
+    // Update an existing row in place: INSERT OR REPLACE deletes it first, and
+    // that delete would cascade to the document's collection memberships.
     tx.execute(
-        "INSERT OR REPLACE INTO documents
+        "INSERT INTO documents
          (id, filename, file_type, byte_size, chunk_count, created_at, source_sha256, text_sha256, source_text)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+         ON CONFLICT(id) DO UPDATE SET
+           filename = excluded.filename, file_type = excluded.file_type,
+           byte_size = excluded.byte_size, chunk_count = excluded.chunk_count,
+           created_at = excluded.created_at, source_sha256 = excluded.source_sha256,
+           text_sha256 = excluded.text_sha256, source_text = excluded.source_text",
         params![
             doc_id,
             filename,
@@ -410,6 +427,14 @@ pub async fn ingest_document(
         ],
     ).map_err(|e| {
         api_error(StatusCode::INTERNAL_SERVER_ERROR, "insert_doc_error", e.to_string(), None)
+    })?;
+    document_collections::add_memberships(&tx, &payload.collection_ids, &doc_id).map_err(|e| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "collection_membership_error",
+            e.to_string(),
+            None,
+        )
     })?;
 
     // Insert chunks and index in FTS5
@@ -802,11 +827,14 @@ struct SearchOutcome {
     coverage: Option<Coverage>,
 }
 
-/// A search's work under the database lock. Errors carry the API code they
-/// are reported with.
+/// A search's work under the database lock. Only `attached`, the explicitly
+/// attached documents, fall back to their opening passages when nothing
+/// matches; a collection is too broad for that to mean anything. Errors carry
+/// the API code they are reported with.
 fn search_locked(
     conn: &Connection,
     plan: &SearchPlan<'_>,
+    attached: Option<&[String]>,
 ) -> Result<SearchOutcome, (&'static str, rusqlite::Error)> {
     if plan.query_vector.is_some() {
         // Otherwise a restored chunk would stay skipped for a client that only searches.
@@ -816,7 +844,7 @@ fn search_locked(
     let (mut results, mut ranked_by) =
         run_search(conn, plan).map_err(|error| ("search_error", error))?;
     if results.is_empty() {
-        if let Some(attached_ids) = plan.doc_ids {
+        if let Some(attached_ids) = attached.filter(|ids| !ids.is_empty()) {
             results = attached_document_context(conn, attached_ids, plan.top_k)
                 .and_then(|results| retain_verifiable(conn, results))
                 .map_err(|error| ("attached_document_fallback_error", error))?;
@@ -848,8 +876,8 @@ pub async fn search_documents(
     Json(payload): Json<SearchDocumentsRequest>,
 ) -> Result<Json<SearchDocumentsResponse>, Response> {
     let query = payload.query.trim().to_string();
-    if query.is_empty() || payload.doc_ids.as_ref().is_some_and(Vec::is_empty) {
-        return Ok(Json(SearchDocumentsResponse {
+    let nothing_to_search = || {
+        Json(SearchDocumentsResponse {
             results: Vec::new(),
             retrieval: RetrievalSummary {
                 mode: "none",
@@ -859,7 +887,23 @@ pub async fn search_documents(
                     coverage: None,
                 },
             },
-        }));
+        })
+    };
+    if query.is_empty() {
+        return Ok(nothing_to_search());
+    }
+    let scope = {
+        let _lock = db_lock().lock().unwrap();
+        let conn = open_connection().map_err(internal_error("sqlite_open_error"))?;
+        document_collections::resolve_scope(
+            &conn,
+            payload.doc_ids.as_deref(),
+            payload.collection_ids.as_deref(),
+        )
+        .map_err(CollectionError::into_response)?
+    };
+    if scope.as_ref().is_some_and(Vec::is_empty) {
+        return Ok(nothing_to_search());
     }
     let top_k = payload.top_k.clamp(1, 20);
     let mode = payload.mode;
@@ -917,11 +961,12 @@ pub async fn search_documents(
             &conn,
             &SearchPlan {
                 query: &query,
-                doc_ids: payload.doc_ids.as_deref(),
+                doc_ids: scope.as_deref(),
                 top_k,
                 keyword: mode != SearchMode::Semantic,
                 query_vector: query_vector.as_deref(),
             },
+            payload.doc_ids.as_deref(),
         )
         .map_err(|(code, error)| internal_error(code)(error))?
     };
@@ -1291,6 +1336,35 @@ mod tests {
     }
 
     #[test]
+    fn a_collection_scope_ranks_only_its_members() {
+        let mut conn = library();
+        index_policy(&conn, "member");
+        index_policy(&conn, "outsider");
+        let finance = document_collections::create(&conn, "Finance").unwrap();
+        document_collections::add_documents(&mut conn, &finance.id, &["member".to_string()])
+            .unwrap();
+        let scope = document_collections::resolve_scope(&conn, None, Some(&[finance.id])).unwrap();
+        let query = unit(&[1.0, 0.0, 0.0]);
+        let (results, mode) = run_search(
+            &conn,
+            &SearchPlan {
+                doc_ids: scope.as_deref(),
+                ..plan("refund", Some(&query))
+            },
+        )
+        .unwrap();
+        assert_eq!(mode, "hybrid");
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| result.doc_id.as_str())
+                .collect::<Vec<_>>(),
+            ["member", "member", "member"],
+            "the outsider holds identical passages and still never appears"
+        );
+    }
+
+    #[test]
     fn a_meaning_match_from_a_corrupted_document_is_withheld_and_backfilled() {
         let conn = library();
         index_policy(&conn, "corrupted");
@@ -1378,7 +1452,7 @@ mod tests {
             "nothing would start the indexer for it"
         );
 
-        let keyword_only = search_locked(&conn, &plan("refund", None)).unwrap();
+        let keyword_only = search_locked(&conn, &plan("refund", None), None).unwrap();
         assert_eq!(keyword_only.coverage, None);
         assert_eq!(
             document_vectors::coverage(&conn, None)
@@ -1389,7 +1463,7 @@ mod tests {
         );
 
         let query = unit(&[1.0, 0.0, 0.0]);
-        let searched = search_locked(&conn, &plan("refund", Some(&query))).unwrap();
+        let searched = search_locked(&conn, &plan("refund", Some(&query)), None).unwrap();
         let coverage = searched.coverage.unwrap();
         assert_eq!(
             (
@@ -1416,7 +1490,7 @@ mod tests {
         put_vector(&conn, ids[1], &[0.0, 1.0, 0.0]);
         put_vector(&conn, ids[2], &[0.0, 0.0, 1.0]);
         let query = unit(&[0.0, 1.0, 0.0]);
-        let coverage = search_locked(&conn, &plan("support", Some(&query)))
+        let coverage = search_locked(&conn, &plan("support", Some(&query)), None)
             .unwrap()
             .coverage
             .unwrap();
