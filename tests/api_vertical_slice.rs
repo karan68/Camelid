@@ -929,7 +929,7 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(
         body["support_contract"]["current_gate"],
-        "Current exact-row support: TinyLlama Q8_0 current gate; Llama 3.2 1B Instruct Q8_0 has checked bounded 512/1024/2048/4096/8192 packs; Llama 3.2 3B Instruct Q8_0 is supported_exact_row_smoke with the anchored checked bounded 512/1024/2048/4096/8192 raw-decode context ladder on the current canonical GGUF (prior-upload Ubuntu API/WebUI refresh at source head e9f926ed1a65 retained as historical evidence); and Llama 3 8B Instruct Q8_0 has checked bounded 512/1024/2048 packs where row-specific PASS artifacts exist. Mistral 7B Instruct v0.3 Q8_0 is supported_exact_row_smoke: checked tokenizer/template, parity (including GPU-vs-CPU greedy continuations on the exact row), bounded 512/1024/2048/4096/8192 context artifacts, and a support-promotion API/WebUI smoke bundle. LFM2.5-2.6B Q8_0 is hash-pinned supported_exact_row_smoke only on the Windows x86_64 runnable-CPU lane and one Mac16,10 / Apple M4 / macOS 26.5 arm64 resident-Metal lane after tokenizer/template and 96/96 short greedy parity, native runnable-chat receipts, a checked exact 512-token chat bucket, and the clean d31e5cb0 API/WebUI/SSE smoke; tools, sampling beyond greedy, adjacent files, broader context, CUDA, Linux, other Apple hardware or macOS revisions, and broad portability remain unclaimed. Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf has bounded one-token backend MoE runtime evidence only; later 5-token/API/WebUI/RSS promotion-candidate artifacts are superseded by Gate 9A 50-token divergence and a longer-continuation hang, so broad/API/WebUI/frontend readiness remains unsupported. The dense Qwen3 Q8_0 ChatML rows (0.6B/1.7B/4B/8B Instruct, thinking disabled) are supported_exact_row_smoke: qwen2 BPE pre-tokenizer + ChatML renderer, per-head QK-norm + NEOX RoPE, and token+text parity vs llama.cpp at 1/5/50 on macOS/Ubuntu and on Windows x86_64 CPU (cpu_reference + the x86_q8 AVX2 runtime-repack path, bit-identical), and additionally on Windows CUDA: the 0.6B/1.7B/4B rows fully VRAM-resident and the 8B row via the VRAM+host-RAM offload split (RTX 3060 Laptop 6 GB, driver 576.83, CUDA 12.9; GPU decode+single-shot prefill token+text identical to cpu_reference/llama.cpp at 1/5/50); 1.7B additionally has GPU-resident decode+prefill and a 15,373-token single-shot prefill lane on macOS, and thinking-mode is opt-in (leading-trace parity only). The 4B row additionally carries checked bounded-context packs 512/1024/2048/4096/8192, the 1.7B row 512/1024/2048/4096, and the 0.6B row 512/2048/4096/8192 (fully-GPU-resident raw-decode greedy parity vs llama.cpp acd79d603 at 50 tokens; the 1.7B 8192 and 0.6B 1024 buckets are held as documented benign near-ties). These are exact bounded lanes only; no model-native/larger context beyond the checked packs, arbitrary-template behavior, production throughput, portability, neighboring-row, or broad-family support is implied. Seven hash-pinned Prism ML Bonsai Q1_0, Prism Q2_0, and PQ2_0 artifacts are supported_exact_row_smoke on macOS Apple Silicon Metal and Windows x86_64 CUDA after paired text and vision validation; the claim is exact-file and limited to those two GPU platforms, with broader qwen3/qwen35 or quant support, bounded/model-native context, and production throughput still unclaimed. The seven files are mixed-arch: the 4B and 8B rows declare general.architecture=qwen3 (dense), only the 27B rows declare qwen35 (hybrid)."
+        "Current exact-row support: TinyLlama Q8_0 retains its runtime admission label, but full support requires refreshed validation after switching to the model's own tokenizer reference; Llama 3.2 1B Instruct Q8_0 has checked bounded 512/1024/2048/4096/8192 packs; Llama 3.2 3B Instruct Q8_0 is supported_exact_row_smoke with the anchored checked bounded 512/1024/2048/4096/8192 raw-decode context ladder on the current canonical GGUF (prior-upload Ubuntu API/WebUI refresh at source head e9f926ed1a65 retained as historical evidence); and Llama 3 8B Instruct Q8_0 has checked bounded 512/1024/2048 packs where row-specific PASS artifacts exist. Mistral 7B Instruct v0.3 Q8_0 is supported_exact_row_smoke: checked tokenizer/template, parity (including GPU-vs-CPU greedy continuations on the exact row), bounded 512/1024/2048/4096/8192 context artifacts, and a support-promotion API/WebUI smoke bundle. LFM2.5-2.6B Q8_0 is hash-pinned supported_exact_row_smoke only on the Windows x86_64 runnable-CPU lane and one Mac16,10 / Apple M4 / macOS 26.5 arm64 resident-Metal lane after tokenizer/template and 96/96 short greedy parity, native runnable-chat receipts, a checked exact 512-token chat bucket, and the clean d31e5cb0 API/WebUI/SSE smoke; tools, sampling beyond greedy, adjacent files, broader context, CUDA, Linux, other Apple hardware or macOS revisions, and broad portability remain unclaimed. Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf has bounded one-token backend MoE runtime evidence only; later 5-token/API/WebUI/RSS promotion-candidate artifacts are superseded by Gate 9A 50-token divergence and a longer-continuation hang, so broad/API/WebUI/frontend readiness remains unsupported. The dense Qwen3 Q8_0 ChatML rows (0.6B/1.7B/4B/8B Instruct, thinking disabled) are supported_exact_row_smoke: qwen2 BPE pre-tokenizer + ChatML renderer, per-head QK-norm + NEOX RoPE, and token+text parity vs llama.cpp at 1/5/50 on macOS/Ubuntu and on Windows x86_64 CPU (cpu_reference + the x86_q8 AVX2 runtime-repack path, bit-identical), and additionally on Windows CUDA: the 0.6B/1.7B/4B rows fully VRAM-resident and the 8B row via the VRAM+host-RAM offload split (RTX 3060 Laptop 6 GB, driver 576.83, CUDA 12.9; GPU decode+single-shot prefill token+text identical to cpu_reference/llama.cpp at 1/5/50); 1.7B additionally has GPU-resident decode+prefill and a 15,373-token single-shot prefill lane on macOS, and thinking-mode is opt-in (leading-trace parity only). The 4B row additionally carries checked bounded-context packs 512/1024/2048/4096/8192, the 1.7B row 512/1024/2048/4096, and the 0.6B row 512/2048/4096/8192 (fully-GPU-resident raw-decode greedy parity vs llama.cpp acd79d603 at 50 tokens; the 1.7B 8192 and 0.6B 1024 buckets are held as documented benign near-ties). These are exact bounded lanes only; no model-native/larger context beyond the checked packs, arbitrary-template behavior, production throughput, portability, neighboring-row, or broad-family support is implied. Seven hash-pinned Prism ML Bonsai Q1_0, Prism Q2_0, and PQ2_0 artifacts are supported_exact_row_smoke on macOS Apple Silicon Metal and Windows x86_64 CUDA after paired text and vision validation; the claim is exact-file and limited to those two GPU platforms, with broader qwen3/qwen35 or quant support, bounded/model-native context, and production throughput still unclaimed. The seven files are mixed-arch: the 4B and 8B rows declare general.architecture=qwen3 (dense), only the 27B rows declare qwen35 (hybrid)."
     );
     let q8 = body["supported_quantization"]
         .as_array()
@@ -1202,18 +1202,38 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
         .iter()
         .find(|item| item["id"] == "tinyllama_1_1b_chat_q8_0")
         .unwrap();
+    assert_eq!(tinyllama["support_scope"], "current_full_gate_exact_row");
+    assert_eq!(
+        tinyllama["full_support_status"],
+        "blocked_pending_normalized_full_support"
+    );
+    assert_eq!(tinyllama["tokenizer_works"], "model_sentencepiece_reference_validated_1361_of_1362_texts_known_literal_control_token_seam");
+    assert_eq!(
+        tinyllama["performance_measured"],
+        "historical_bounded_rss_perf_refresh_required"
+    );
+    assert_eq!(
+        tinyllama["frontend_load_path_verified"],
+        "historical_api_webui_refresh_required"
+    );
     assert_eq!(tinyllama["status"], "supported_current_gate");
     assert_eq!(tinyllama["metadata_parses"], "validated");
-    assert_eq!(tinyllama["generation_runs"], "validated");
-    assert_eq!(tinyllama["parity_audited"], "validated");
+    assert_eq!(
+        tinyllama["generation_runs"],
+        "runnable_smoke_validated_full_gate_refresh_required"
+    );
+    assert_eq!(
+        tinyllama["parity_audited"],
+        "model_tokenizer_reference_validated_legacy_llama_cpp_generation_parity_refresh_required"
+    );
     assert_eq!(
         tinyllama["tested_context"],
-        "short_50_token_gate_plus_bounded_512_context_pack"
+        "historical_short_50_token_and_bounded_512_context_packs_refresh_required"
     );
     assert_eq!(tinyllama["chat_template_renderer"], "tinyllama-marker");
     assert_eq!(
         tinyllama["chat_template_shape_pack"],
-        "validated_bounded_pack"
+        "model_tokenizer_edge_pack_validated_generation_refresh_required"
     );
     assert_eq!(
         tinyllama["chat_template_shape_pack_id"],
@@ -1221,7 +1241,7 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
     );
     assert_eq!(
         tinyllama["bounded_context_512_pack"],
-        "validated_bounded_pack"
+        "historical_llama_cpp_pack_refresh_required"
     );
     assert_eq!(
         tinyllama["bounded_context_512_pack_id"],
@@ -1237,9 +1257,12 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
     assert_eq!(tinyllama["bounded_context_4096_pack"], "not_promoted");
     assert_eq!(tinyllama["bounded_context_4096_pack_id"], "not_selected");
     assert_eq!(tinyllama["bounded_context_4096_window"], 4096);
-    assert_eq!(tinyllama["latest_checked_bucket"], "direct_chat_smoke");
-    assert_eq!(tinyllama["latest_checked_result"], "pass");
-    assert_eq!(tinyllama["latest_checked_output"], "Certainly! Here");
+    assert_eq!(
+        tinyllama["latest_checked_bucket"],
+        "model_tokenizer_reference_and_runnable_smoke"
+    );
+    assert_eq!(tinyllama["latest_checked_result"], "partial_pass_hold");
+    assert_eq!(tinyllama["latest_checked_output"], "1361/1362 corpus texts and 5/5 chat-template edge cases match the model tokenizer; unchanged-tokenization runnable-smoke passes; full gate refresh pending");
     let llama32_1b = compatibility
         .iter()
         .find(|item| item["id"] == "llama32_1b_instruct_q8_0")
