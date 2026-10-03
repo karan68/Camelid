@@ -1,8 +1,10 @@
 //! Local Document Drag-and-Drop RAG (Feature A)
 //!
-//! Provides document ingestion, sliding-window chunking, SQLite FTS5 lexical indexing,
-//! and hybrid retrieval (BM25 + cosine vector similarity / RRF) for "Chat with Documents".
+//! Provides document ingestion, exact-span chunking, SQLite FTS5 keyword
+//! indexing, and hybrid retrieval: BM25 and cosine similarity over stored chunk
+//! vectors (see `document_vectors`), fused by reciprocal rank.
 
+use std::collections::HashMap;
 use std::io::{Cursor, Read};
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
@@ -16,11 +18,16 @@ use rusqlite::{params, params_from_iter, types::Value, Connection};
 use serde::{Deserialize, Serialize};
 
 use super::citations::{chunk_text_with_spans, retain_verifiable, sha256_hex};
+use super::document_vectors::{self, Coverage, Unavailable};
 use super::{api_error, AppState};
 
 const DEFAULT_CHUNK_CHARS: usize = 512;
 const DEFAULT_CHUNK_OVERLAP: usize = 64;
 const DOCUMENTS_DB_FILE: &str = "documents_rag.sqlite3";
+/// Candidates each ranker contributes before fusion and citation checks.
+const CANDIDATE_POOL: usize = 50;
+/// The usual reciprocal-rank-fusion constant; it damps the weight of the very top ranks.
+const RRF_K: f64 = 60.0;
 
 static DB_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -63,6 +70,7 @@ pub(crate) fn init_db(conn: &Connection) -> Result<(), rusqlite::Error> {
         );",
     )?;
     ensure_citation_columns(conn)?;
+    document_vectors::init_schema(conn)?;
     Ok(())
 }
 
@@ -207,6 +215,21 @@ pub struct SearchDocumentsRequest {
     pub doc_ids: Option<Vec<String>>,
     #[serde(default = "default_top_k")]
     pub top_k: usize,
+    #[serde(default)]
+    pub mode: SearchMode,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SearchMode {
+    /// Hybrid when the encoder is available, keyword alone otherwise.
+    #[default]
+    Auto,
+    Keyword,
+    /// Vector similarity alone. Refused when the encoder is unavailable.
+    Semantic,
+    /// Refused when the encoder is unavailable, instead of silently degrading.
+    Hybrid,
 }
 
 fn default_top_k() -> usize {
@@ -219,6 +242,8 @@ pub struct DocumentSearchResult {
     pub filename: String,
     pub chunk_index: usize,
     pub excerpt: String,
+    /// Comparable only within one response: normalized BM25 for `keyword`,
+    /// cosine for `semantic`, and the fused reciprocal-rank score otherwise.
     pub score: f32,
     /// Byte range of `excerpt` within the document's canonical text plus the
     /// hashes that bind it there. `None` for rows ingested before F2a.
@@ -226,15 +251,35 @@ pub struct DocumentSearchResult {
     pub byte_end: Option<usize>,
     pub chunk_sha256: Option<String>,
     pub doc_sha256: Option<String>,
-    /// `keyword` for an FTS hit, `attached` when an explicitly attached
-    /// document is supplied as context because the user's wording had no
-    /// lexical overlap with its contents.
+    /// `keyword` for a BM25 hit only, `semantic` for a vector hit only,
+    /// `hybrid` when both rankers found it, and `attached` when an explicitly
+    /// attached document is supplied as context because nothing matched.
     pub retrieval: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SemanticSummary {
+    pub available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<&'static str>,
+    /// Index coverage of the searched scope, so a partly indexed library
+    /// shows. Present only when the search ranked by meaning.
+    #[serde(flatten)]
+    pub coverage: Option<Coverage>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RetrievalSummary {
+    /// What ranked the results: `hybrid`, `keyword`, `semantic`, `attached`,
+    /// or `none` when nothing was searched.
+    pub mode: &'static str,
+    pub semantic: SemanticSummary,
 }
 
 #[derive(Debug, Serialize)]
 pub struct SearchDocumentsResponse {
     pub results: Vec<DocumentSearchResult>,
+    pub retrieval: RetrievalSummary,
 }
 
 #[derive(Debug, Serialize)]
@@ -249,7 +294,7 @@ pub struct DocumentMetaView {
 
 /// Endpoint: `POST /api/documents/ingest`
 pub async fn ingest_document(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Json(payload): Json<IngestDocumentRequest>,
 ) -> Result<Json<IngestDocumentResponse>, Response> {
     let doc_id = payload
@@ -414,6 +459,7 @@ pub async fn ingest_document(
             None,
         )
     })?;
+    document_vectors::schedule_indexing(state.models_dir.clone(), true);
 
     Ok(Json(IngestDocumentResponse {
         doc_id,
@@ -502,49 +548,81 @@ fn attached_document_context(
     Ok(results)
 }
 
-/// Endpoint: `POST /api/documents/search`
-pub async fn search_documents(
-    State(_state): State<AppState>,
-    Json(payload): Json<SearchDocumentsRequest>,
-) -> Result<Json<SearchDocumentsResponse>, Response> {
-    let query_trimmed = payload.query.trim();
-    if query_trimmed.is_empty() {
-        return Ok(Json(SearchDocumentsResponse {
-            results: Vec::new(),
-        }));
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Found {
+    Keyword,
+    Semantic,
+    Both,
+}
+
+impl Found {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Keyword => "keyword",
+            Self::Semantic => "semantic",
+            Self::Both => "hybrid",
+        }
     }
+}
 
-    let fts_pattern = sanitize_fts5_query(query_trimmed);
-    let top_k = payload.top_k.clamp(1, 20);
-    if payload.doc_ids.as_ref().is_some_and(Vec::is_empty) {
-        return Ok(Json(SearchDocumentsResponse {
-            results: Vec::new(),
-        }));
+/// Reciprocal rank fusion: each ranking contributes `1 / (RRF_K + rank)` for
+/// the chunks it holds. Ties break on the better single-ranking position, then
+/// chunk id, so the order is deterministic.
+fn reciprocal_rank_fusion(keyword: &[i64], semantic: &[i64]) -> Vec<(i64, f32, Found)> {
+    let mut fused: HashMap<i64, (f64, usize, bool, bool)> = HashMap::new();
+    for (list, ids) in [(0, keyword), (1, semantic)] {
+        for (rank, id) in ids.iter().enumerate() {
+            let entry = fused.entry(*id).or_insert((0.0, usize::MAX, false, false));
+            entry.0 += 1.0 / (RRF_K + (rank + 1) as f64);
+            entry.1 = entry.1.min(rank);
+            if list == 0 {
+                entry.2 = true;
+            } else {
+                entry.3 = true;
+            }
+        }
     }
+    let mut ranked = fused
+        .into_iter()
+        .map(|(id, (score, best, in_keyword, in_semantic))| {
+            let found = match (in_keyword, in_semantic) {
+                (true, true) => Found::Both,
+                (true, false) => Found::Keyword,
+                _ => Found::Semantic,
+            };
+            (id, score, best, found)
+        })
+        .collect::<Vec<_>>();
+    ranked.sort_by(|left, right| {
+        right
+            .1
+            .total_cmp(&left.1)
+            .then(left.2.cmp(&right.2))
+            .then(left.0.cmp(&right.0))
+    });
+    ranked
+        .into_iter()
+        .map(|(id, score, _, found)| (id, score as f32, found))
+        .collect()
+}
 
-    let _lock = db_lock().lock().unwrap();
-    let conn = open_connection().map_err(|e| {
-        api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "sqlite_open_error",
-            e.to_string(),
-            None,
-        )
-    })?;
-
-    // Apply the document scope before ranking and LIMIT. Filtering afterward
-    // can discard all globally top-ranked rows even when an attached document
-    // contains relevant matches just below them.
+/// Chunks in scope ranked by BM25, best first, as `(chunk id, raw bm25)`.
+/// The scope is applied before the limit so an attached document is never
+/// crowded out by better matches elsewhere in the library.
+fn keyword_ranked(
+    conn: &Connection,
+    query: &str,
+    doc_ids: Option<&[String]>,
+    limit: usize,
+) -> Result<Vec<(i64, f64)>, rusqlite::Error> {
     let mut sql = String::from(
-        "SELECT c.doc_id, d.filename, c.chunk_index, c.content, bm25(document_chunks_fts) as score,
-                c.byte_start, c.byte_end, c.chunk_sha256, d.text_sha256
+        "SELECT c.id, bm25(document_chunks_fts) AS score
          FROM document_chunks_fts AS f
          JOIN document_chunks AS c ON c.id = f.rowid
-         JOIN documents AS d ON d.id = c.doc_id
          WHERE document_chunks_fts MATCH ?1",
     );
-    let mut bind_values = vec![Value::Text(fts_pattern)];
-    if let Some(allowed_ids) = payload.doc_ids.as_ref() {
+    let mut bind_values = vec![Value::Text(sanitize_fts5_query(query))];
+    if let Some(allowed_ids) = doc_ids {
         let placeholders = allowed_ids
             .iter()
             .map(|doc_id| {
@@ -555,105 +633,315 @@ pub async fn search_documents(
             .join(", ");
         sql.push_str(&format!(" AND c.doc_id IN ({placeholders})"));
     }
-    bind_values.push(Value::Integer(top_k as i64));
-    sql.push_str(&format!(" ORDER BY score ASC LIMIT ?{}", bind_values.len()));
-
-    let mut stmt = conn.prepare(&sql).map_err(|e| {
-        api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "prepare_fts_error",
-            e.to_string(),
-            None,
-        )
+    bind_values.push(Value::Integer(limit as i64));
+    sql.push_str(&format!(
+        " ORDER BY score ASC, c.id ASC LIMIT ?{}",
+        bind_values.len()
+    ));
+    let mut statement = conn.prepare(&sql)?;
+    let rows = statement.query_map(params_from_iter(bind_values.iter()), |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?))
     })?;
+    rows.collect()
+}
 
-    let mut query_results = Vec::new();
-    let rows = stmt
-        .query_map(params_from_iter(bind_values.iter()), |row| {
-            let doc_id: String = row.get(0)?;
-            let filename: String = row.get(1)?;
-            let chunk_index: i64 = row.get(2)?;
-            let content: String = row.get(3)?;
-            let raw_bm25: f64 = row.get(4)?;
-            let byte_start: Option<i64> = row.get(5)?;
-            let byte_end: Option<i64> = row.get(6)?;
-            let chunk_sha256: Option<String> = row.get(7)?;
-            let doc_sha256: Option<String> = row.get(8)?;
-            Ok((
-                doc_id,
-                filename,
-                chunk_index as usize,
-                content,
-                raw_bm25,
-                byte_start,
-                byte_end,
-                chunk_sha256,
-                doc_sha256,
-            ))
-        })
-        .map_err(|e| {
-            api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "query_fts_error",
-                e.to_string(),
-                None,
-            )
-        })?;
-
-    for row_res in rows.flatten() {
-        let (
-            doc_id,
-            filename,
-            chunk_index,
-            content,
-            raw_bm25,
-            byte_start,
-            byte_end,
-            chunk_sha256,
-            doc_sha256,
-        ) = row_res;
-        // BM25 in sqlite returns negative values where lower/more negative is better match
-        let normalized_score = (1.0 / (1.0 + raw_bm25.abs())) as f32;
-        query_results.push(DocumentSearchResult {
-            doc_id,
-            filename,
-            chunk_index,
-            excerpt: content,
-            score: normalized_score,
-            byte_start: byte_start.map(|value| value as usize),
-            byte_end: byte_end.map(|value| value as usize),
-            chunk_sha256,
-            doc_sha256,
-            retrieval: "keyword",
-        });
+/// Loads the ranked chunks in rank order. A chunk whose document row is gone
+/// drops out here.
+fn fetch_results(
+    conn: &Connection,
+    ranked: &[(i64, f32, &'static str)],
+) -> Result<Vec<DocumentSearchResult>, rusqlite::Error> {
+    if ranked.is_empty() {
+        return Ok(Vec::new());
     }
+    let placeholders = (1..=ranked.len())
+        .map(|index| format!("?{index}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT c.id, c.doc_id, d.filename, c.chunk_index, c.content,
+                c.byte_start, c.byte_end, c.chunk_sha256, d.text_sha256
+         FROM document_chunks AS c
+         JOIN documents AS d ON d.id = c.doc_id
+         WHERE c.id IN ({placeholders})"
+    );
+    let mut statement = conn.prepare(&sql)?;
+    let rows = statement.query_map(
+        params_from_iter(ranked.iter().map(|(id, _, _)| id)),
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                DocumentSearchResult {
+                    doc_id: row.get(1)?,
+                    filename: row.get(2)?,
+                    chunk_index: row.get::<_, i64>(3)? as usize,
+                    excerpt: row.get(4)?,
+                    score: 0.0,
+                    byte_start: row.get::<_, Option<i64>>(5)?.map(|value| value as usize),
+                    byte_end: row.get::<_, Option<i64>>(6)?.map(|value| value as usize),
+                    chunk_sha256: row.get(7)?,
+                    doc_sha256: row.get(8)?,
+                    retrieval: "keyword",
+                },
+            ))
+        },
+    )?;
+    let mut by_id = rows.collect::<Result<HashMap<_, _>, _>>()?;
+    Ok(ranked
+        .iter()
+        .filter_map(|(id, score, retrieval)| {
+            by_id.remove(id).map(|mut result| {
+                result.score = *score;
+                result.retrieval = retrieval;
+                result
+            })
+        })
+        .collect())
+}
 
-    query_results = retain_verifiable(&conn, query_results).map_err(|e| {
+pub(crate) struct SearchPlan<'a> {
+    pub query: &'a str,
+    pub doc_ids: Option<&'a [String]>,
+    pub top_k: usize,
+    pub keyword: bool,
+    pub query_vector: Option<&'a [f32]>,
+}
+
+/// Ranks, fuses and citation-checks one search. Returns the verified results
+/// and the mode that actually ranked them: a search that asked for vectors
+/// but found none indexed in scope reports `keyword`.
+pub(crate) fn run_search(
+    conn: &Connection,
+    plan: &SearchPlan<'_>,
+) -> Result<(Vec<DocumentSearchResult>, &'static str), rusqlite::Error> {
+    let keyword = if plan.keyword {
+        keyword_ranked(conn, plan.query, plan.doc_ids, CANDIDATE_POOL)?
+    } else {
+        Vec::new()
+    };
+    let semantic = match plan.query_vector {
+        Some(vector) => {
+            document_vectors::semantic_ranked(conn, vector, plan.doc_ids, CANDIDATE_POOL)?
+        }
+        None => Vec::new(),
+    };
+    let (mode, ranked): (&'static str, Vec<(i64, f32, &'static str)>) =
+        if plan.query_vector.is_some() && !plan.keyword {
+            (
+                "semantic",
+                semantic
+                    .into_iter()
+                    .map(|(id, score)| (id, score, "semantic"))
+                    .collect(),
+            )
+        } else if !semantic.is_empty() {
+            let keyword_ids = keyword.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+            let semantic_ids = semantic.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+            (
+                "hybrid",
+                reciprocal_rank_fusion(&keyword_ids, &semantic_ids)
+                    .into_iter()
+                    .map(|(id, score, found)| (id, score, found.label()))
+                    .collect(),
+            )
+        } else {
+            (
+                "keyword",
+                keyword
+                    .into_iter()
+                    // BM25 in SQLite is negative, more negative for a better match; map
+                    // it into [0, 1) so a better match also scores higher.
+                    .map(|(id, bm25)| {
+                        let strength = bm25.abs();
+                        (id, (strength / (1.0 + strength)) as f32, "keyword")
+                    })
+                    .collect(),
+            )
+        };
+    let results = first_verified(conn, fetch_results(conn, &ranked)?, plan.top_k)?;
+    Ok((results, mode))
+}
+
+/// The first `top_k` candidates, in rank order, that pass the citation check.
+/// Candidates are checked a window at a time, so a search that needs no
+/// replacements checks `top_k` of them rather than the whole candidate pool.
+fn first_verified(
+    conn: &Connection,
+    candidates: Vec<DocumentSearchResult>,
+    top_k: usize,
+) -> Result<Vec<DocumentSearchResult>, rusqlite::Error> {
+    let mut verified = Vec::with_capacity(top_k);
+    let mut candidates = candidates.into_iter();
+    while verified.len() < top_k {
+        let window = candidates
+            .by_ref()
+            .take(top_k - verified.len())
+            .collect::<Vec<_>>();
+        if window.is_empty() {
+            break;
+        }
+        verified.extend(retain_verifiable(conn, window)?);
+    }
+    Ok(verified)
+}
+
+fn internal_error(code: &'static str) -> impl Fn(rusqlite::Error) -> Response {
+    move |error| {
         api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            "citation_query_error",
-            e.to_string(),
+            code,
+            error.to_string(),
             None,
         )
-    })?;
+    }
+}
 
-    if query_results.is_empty() {
-        if let Some(attached_ids) = payload.doc_ids.as_deref() {
-            query_results = attached_document_context(&conn, attached_ids, top_k)
-                .and_then(|results| retain_verifiable(&conn, results))
-                .map_err(|e| {
-                    api_error(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "attached_document_fallback_error",
-                        e.to_string(),
-                        None,
-                    )
-                })?;
+struct SearchOutcome {
+    results: Vec<DocumentSearchResult>,
+    ranked_by: &'static str,
+    coverage: Option<Coverage>,
+}
+
+/// A search's work under the database lock. Errors carry the API code they
+/// are reported with.
+fn search_locked(
+    conn: &Connection,
+    plan: &SearchPlan<'_>,
+) -> Result<SearchOutcome, (&'static str, rusqlite::Error)> {
+    if plan.query_vector.is_some() {
+        // Otherwise a restored chunk would stay skipped for a client that only searches.
+        document_vectors::clear_recovered_skips(conn, plan.doc_ids)
+            .map_err(|error| ("index_coverage_error", error))?;
+    }
+    let (mut results, mut ranked_by) =
+        run_search(conn, plan).map_err(|error| ("search_error", error))?;
+    if results.is_empty() {
+        if let Some(attached_ids) = plan.doc_ids {
+            results = attached_document_context(conn, attached_ids, plan.top_k)
+                .and_then(|results| retain_verifiable(conn, results))
+                .map_err(|error| ("attached_document_fallback_error", error))?;
+            if !results.is_empty() {
+                ranked_by = "attached";
+            }
+        }
+    }
+    // Counting coverage scans every chunk in scope, so a search that did not
+    // rank by meaning skips it.
+    let coverage = if plan.query_vector.is_some() {
+        Some(
+            document_vectors::coverage(conn, plan.doc_ids)
+                .map_err(|error| ("index_coverage_error", error))?,
+        )
+    } else {
+        None
+    };
+    Ok(SearchOutcome {
+        results,
+        ranked_by,
+        coverage,
+    })
+}
+
+/// Endpoint: `POST /api/documents/search`
+pub async fn search_documents(
+    State(state): State<AppState>,
+    Json(payload): Json<SearchDocumentsRequest>,
+) -> Result<Json<SearchDocumentsResponse>, Response> {
+    let query = payload.query.trim().to_string();
+    if query.is_empty() || payload.doc_ids.as_ref().is_some_and(Vec::is_empty) {
+        return Ok(Json(SearchDocumentsResponse {
+            results: Vec::new(),
+            retrieval: RetrievalSummary {
+                mode: "none",
+                semantic: SemanticSummary {
+                    available: false,
+                    reason: None,
+                    coverage: None,
+                },
+            },
+        }));
+    }
+    let top_k = payload.top_k.clamp(1, 20);
+    let mode = payload.mode;
+
+    let mut unavailable = None;
+    let mut query_vector = None;
+    if mode == SearchMode::Keyword {
+        unavailable = Some("keyword_mode");
+    } else {
+        match document_vectors::encoder(&state.models_dir).await {
+            Ok(encoder) => {
+                let text = query.clone();
+                match tokio::task::spawn_blocking(move || encoder.embed_query(&text)).await {
+                    Ok(Ok(vector)) => query_vector = Some(vector),
+                    Ok(Err(error)) => {
+                        tracing::warn!(%error, "document query embedding failed");
+                        unavailable = Some(Unavailable::QueryFailed.code());
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "document query embedding task failed");
+                        unavailable = Some(Unavailable::QueryFailed.code());
+                    }
+                }
+            }
+            Err(reason) => {
+                if mode != SearchMode::Auto {
+                    return Err(api_error(
+                        StatusCode::CONFLICT,
+                        reason.code(),
+                        reason.message().to_string(),
+                        Some("mode"),
+                    ));
+                }
+                unavailable = Some(reason.code());
+            }
+        }
+        if query_vector.is_none() && mode != SearchMode::Auto {
+            return Err(api_error(
+                StatusCode::CONFLICT,
+                Unavailable::QueryFailed.code(),
+                Unavailable::QueryFailed.message().to_string(),
+                Some("mode"),
+            ));
         }
     }
 
+    let SearchOutcome {
+        results,
+        ranked_by,
+        coverage,
+    } = {
+        let _lock = db_lock().lock().unwrap();
+        let conn = open_connection().map_err(internal_error("sqlite_open_error"))?;
+        search_locked(
+            &conn,
+            &SearchPlan {
+                query: &query,
+                doc_ids: payload.doc_ids.as_deref(),
+                top_k,
+                keyword: mode != SearchMode::Semantic,
+                query_vector: query_vector.as_deref(),
+            },
+        )
+        .map_err(|(code, error)| internal_error(code)(error))?
+    };
+    if coverage
+        .as_ref()
+        .is_some_and(|coverage| coverage.pending() > 0)
+    {
+        document_vectors::schedule_indexing(state.models_dir.clone(), false);
+    }
+
     Ok(Json(SearchDocumentsResponse {
-        results: query_results,
+        results,
+        retrieval: RetrievalSummary {
+            mode: ranked_by,
+            semantic: SemanticSummary {
+                available: query_vector.is_some(),
+                reason: unavailable,
+                coverage,
+            },
+        },
     }))
 }
 
@@ -828,5 +1116,317 @@ mod tests {
         );
         assert_eq!(results[0].excerpt, "File1\nFile2");
         assert!(results.iter().all(|result| result.retrieval == "attached"));
+    }
+
+    use crate::api::document_vectors::tests::{put_skip, put_vector, seed_passages, unit};
+
+    const POLICY: [&str; 3] = [
+        "Enterprise customers may request a refund within 60 days of the invoice date.",
+        "Support is staffed from 08:00 to 20:00 UTC on weekdays and weekends.",
+        "Exports are fulfilled within thirty days as a signed archive.",
+    ];
+
+    fn library() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute("PRAGMA foreign_keys = ON;", []).unwrap();
+        init_db(&conn).unwrap();
+        conn
+    }
+
+    /// Seeds the policy and gives its refund, support and export passages
+    /// orthogonal vectors. Chunk indexes are 0, 1 and 2 in that order.
+    fn index_policy(conn: &Connection, doc_id: &str) -> Vec<i64> {
+        let ids = seed_passages(conn, doc_id, &POLICY);
+        for (axis, id) in ids.iter().enumerate() {
+            let mut vector = [0.0_f32; 3];
+            vector[axis] = 1.0;
+            put_vector(conn, *id, &vector);
+        }
+        ids
+    }
+
+    fn plan<'a>(query: &'a str, vector: Option<&'a [f32]>) -> SearchPlan<'a> {
+        SearchPlan {
+            query,
+            doc_ids: None,
+            top_k: 5,
+            keyword: true,
+            query_vector: vector,
+        }
+    }
+
+    fn found(results: &[DocumentSearchResult]) -> Vec<(usize, &'static str)> {
+        results
+            .iter()
+            .map(|result| (result.chunk_index, result.retrieval))
+            .collect()
+    }
+
+    #[test]
+    fn fusion_rewards_agreement_and_breaks_ties_deterministically() {
+        let fused = reciprocal_rank_fusion(&[10, 20, 30], &[30, 40]);
+        assert_eq!(
+            fused
+                .iter()
+                .map(|(id, _, found)| (*id, *found))
+                .collect::<Vec<_>>(),
+            vec![
+                (30, Found::Both),
+                (10, Found::Keyword),
+                (20, Found::Keyword),
+                (40, Found::Semantic)
+            ],
+            "found by both outranks either list's top hit alone; equal ranks tie on chunk id"
+        );
+        let expected = (1.0 / 63.0 + 1.0 / 61.0) as f32;
+        assert!((fused[0].1 - expected).abs() < 1e-7);
+
+        let tied = reciprocal_rank_fusion(&[7], &[3]);
+        assert_eq!(
+            tied.iter().map(|(id, _, _)| *id).collect::<Vec<_>>(),
+            vec![3, 7]
+        );
+        assert_eq!(
+            tied[0].1, tied[1].1,
+            "equal ranks score equally; the lower id goes first"
+        );
+        assert!(reciprocal_rank_fusion(&[], &[]).is_empty());
+    }
+
+    #[test]
+    fn without_vectors_search_is_the_plain_keyword_ranking() {
+        let conn = library();
+        seed_passages(&conn, "policy", &POLICY);
+        let (results, mode) = run_search(&conn, &plan("refund invoice", None)).unwrap();
+        assert_eq!(mode, "keyword");
+        assert_eq!(found(&results), vec![(0, "keyword")]);
+        assert!(results[0].score > 0.0 && results[0].score < 1.0);
+
+        let (results, _) = run_search(&conn, &plan("within days", None)).unwrap();
+        assert!(results.len() >= 2);
+        assert!(
+            results
+                .windows(2)
+                .all(|pair| pair[0].score >= pair[1].score),
+            "a better keyword match scores higher: {:?}",
+            results
+                .iter()
+                .map(|result| result.score)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_paraphrase_with_no_shared_words_is_found_by_meaning() {
+        let conn = library();
+        index_policy(&conn, "policy");
+        let query = unit(&[0.9, 0.1, 0.0]);
+
+        let (keyword_only, _) = run_search(&conn, &plan("reimbursement deadline", None)).unwrap();
+        assert!(
+            keyword_only.is_empty(),
+            "no word of the question is in the policy"
+        );
+
+        let (results, mode) =
+            run_search(&conn, &plan("reimbursement deadline", Some(&query))).unwrap();
+        assert_eq!(mode, "hybrid");
+        assert_eq!(found(&results)[0], (0, "semantic"));
+    }
+
+    #[test]
+    fn a_chunk_both_rankers_found_leads_the_fused_results() {
+        let conn = library();
+        index_policy(&conn, "policy");
+        // Meaning leans toward exports; the keyword names the refund passage.
+        let query = unit(&[0.6, 0.0, 0.8]);
+        let (results, mode) = run_search(&conn, &plan("refund", Some(&query))).unwrap();
+        assert_eq!(mode, "hybrid");
+        assert_eq!(found(&results)[..2], [(0, "hybrid"), (2, "semantic")]);
+    }
+
+    #[test]
+    fn semantic_mode_ranks_by_similarity_alone() {
+        let conn = library();
+        index_policy(&conn, "policy");
+        let query = unit(&[0.0, 1.0, 0.1]);
+        let (results, mode) = run_search(
+            &conn,
+            &SearchPlan {
+                keyword: false,
+                ..plan("refund", Some(&query))
+            },
+        )
+        .unwrap();
+        assert_eq!(mode, "semantic");
+        assert_eq!(
+            found(&results)[0],
+            (1, "semantic"),
+            "the keyword is ignored"
+        );
+        assert!(results.iter().all(|result| result.retrieval == "semantic"));
+    }
+
+    #[test]
+    fn a_scope_with_nothing_indexed_reports_keyword_ranking() {
+        let conn = library();
+        index_policy(&conn, "indexed");
+        seed_passages(&conn, "plain", &POLICY);
+        let query = unit(&[1.0, 0.0, 0.0]);
+        let scope = vec!["plain".to_string()];
+        let (results, mode) = run_search(
+            &conn,
+            &SearchPlan {
+                doc_ids: Some(&scope),
+                ..plan("refund", Some(&query))
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            mode, "keyword",
+            "vectors outside the scope do not make it hybrid"
+        );
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].doc_id, "plain");
+    }
+
+    #[test]
+    fn a_meaning_match_from_a_corrupted_document_is_withheld_and_backfilled() {
+        let conn = library();
+        index_policy(&conn, "corrupted");
+        index_policy(&conn, "healthy");
+        conn.execute(
+            "UPDATE documents SET source_text = REPLACE(source_text, '60 days', '90 days') WHERE id = 'corrupted'",
+            [],
+        )
+        .unwrap();
+        let query = unit(&[1.0, 0.0, 0.0]);
+        let (results, _) = run_search(
+            &conn,
+            &SearchPlan {
+                top_k: 2,
+                ..plan("reimbursement", Some(&query))
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            results.len(),
+            2,
+            "withheld candidates are replaced, not just dropped"
+        );
+        assert!(results.iter().all(|result| result.doc_id == "healthy"));
+        assert_eq!(results[0].chunk_index, 0);
+        assert!(results
+            .iter()
+            .all(|result| !result.excerpt.contains("90 days")));
+    }
+
+    #[test]
+    fn verification_keeps_rank_order_and_backfills_across_windows() {
+        let conn = library();
+        let corrupted = seed_passages(&conn, "corrupted", &POLICY);
+        let healthy = seed_passages(&conn, "healthy", &POLICY);
+        conn.execute(
+            "UPDATE documents SET source_text = REPLACE(source_text, '60 days', '90 days') WHERE id = 'corrupted'",
+            [],
+        )
+        .unwrap();
+        // Two withheld candidates lead, so the first window keeps nothing.
+        let order = [
+            corrupted[0],
+            corrupted[1],
+            healthy[2],
+            corrupted[2],
+            healthy[0],
+            healthy[1],
+        ];
+        let ranked = order
+            .iter()
+            .map(|id| (*id, 0.0_f32, "keyword"))
+            .collect::<Vec<_>>();
+        let pick = |top_k| {
+            first_verified(&conn, fetch_results(&conn, &ranked).unwrap(), top_k)
+                .unwrap()
+                .iter()
+                .map(|result| (result.doc_id.clone(), result.chunk_index))
+                .collect::<Vec<_>>()
+        };
+        let healthy_at = |index: usize| ("healthy".to_string(), index);
+        assert_eq!(pick(2), vec![healthy_at(2), healthy_at(0)]);
+        assert_eq!(
+            pick(10),
+            vec![healthy_at(2), healthy_at(0), healthy_at(1)],
+            "a pool that runs out returns what verified, in rank order"
+        );
+    }
+
+    #[test]
+    fn a_search_by_meaning_returns_a_restored_skipped_chunk_to_pending() {
+        let conn = library();
+        let ids = seed_passages(&conn, "policy", &POLICY[..1]);
+        // Skipped while its text failed its hash; the text has since been restored.
+        put_skip(&conn, ids[0]);
+        let stuck = document_vectors::coverage(&conn, None).unwrap();
+        assert_eq!(
+            (
+                stuck.indexable_chunks,
+                stuck.indexed_chunks,
+                stuck.skipped_chunks,
+                stuck.pending()
+            ),
+            (1, 0, 1, 0),
+            "nothing would start the indexer for it"
+        );
+
+        let keyword_only = search_locked(&conn, &plan("refund", None)).unwrap();
+        assert_eq!(keyword_only.coverage, None);
+        assert_eq!(
+            document_vectors::coverage(&conn, None)
+                .unwrap()
+                .skipped_chunks,
+            1,
+            "a keyword search does not touch the index"
+        );
+
+        let query = unit(&[1.0, 0.0, 0.0]);
+        let searched = search_locked(&conn, &plan("refund", Some(&query))).unwrap();
+        let coverage = searched.coverage.unwrap();
+        assert_eq!(
+            (
+                coverage.indexed_chunks,
+                coverage.skipped_chunks,
+                coverage.pending()
+            ),
+            (0, 0, 1),
+            "the search itself reports it pending, which schedules indexing"
+        );
+        assert_eq!(searched.results.len(), 1, "keyword ranking still finds it");
+    }
+
+    #[test]
+    fn a_search_by_meaning_leaves_a_still_tampered_chunk_skipped() {
+        let conn = library();
+        let ids = seed_passages(&conn, "policy", &POLICY);
+        conn.execute(
+            "UPDATE document_chunks SET content = 'tampered' WHERE id = ?1",
+            params![ids[0]],
+        )
+        .unwrap();
+        put_skip(&conn, ids[0]);
+        put_vector(&conn, ids[1], &[0.0, 1.0, 0.0]);
+        put_vector(&conn, ids[2], &[0.0, 0.0, 1.0]);
+        let query = unit(&[0.0, 1.0, 0.0]);
+        let coverage = search_locked(&conn, &plan("support", Some(&query)))
+            .unwrap()
+            .coverage
+            .unwrap();
+        assert_eq!(
+            (
+                coverage.indexed_chunks,
+                coverage.skipped_chunks,
+                coverage.pending()
+            ),
+            (2, 1, 0)
+        );
     }
 }
