@@ -1,0 +1,34 @@
+test bpe_tokenizer_matches_hf ... ok
+test spm_tokenizer_matches_hf ... FAILED
+  encode_mismatches=13/30  roundtrip_unstable=0/30
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.52s
+test decodes_byte_tokens_and_sentencepiece_space ... ok
+test applies_tokenizer_merges_when_present ... ok
+test accepts_qwen2_gpt2_bpe_pre_tokenizer ... ok
+test adds_dummy_prefix_after_control_token_before_newline ... ok
+test does_not_duplicate_dummy_prefix_after_control_token_before_space ... ok
+test encodes_empty_with_bos_when_special_enabled ... ok
+test encodes_known_piece_with_space_prefix ... ok
+test encodes_llama3_real_prompts_like_llama_cpp_when_available ... ok
+test encodes_mixtral_real_prompts_like_llama_cpp_when_available ... ok
+test falls_back_to_byte_tokens ... ok
+test llama3_reference_fixture_records_llama_cpp_token_ids ... ok
+test encodes_mistral_real_prompts_like_llama_cpp_when_available ... ok
+test encodes_and_decodes_minimal_gpt2_bpe_fixture ... ok
+test loads_gpt2_bpe_tokenizer_metadata_and_specials ... ok
+test llama_spm_with_flat_scores_merges_by_rank ... FAILED
+test mixtral_reference_pack_records_required_prompt_shapes_and_tokens ... ok
+test mistral_reference_pack_records_required_prompt_shapes_and_tokens ... ok
+test loads_llama_spm_tokenizer_metadata ... ok
+test preserves_chat_template_metadata_when_present ... ok
+test parse_special_spm_merges_dummy_prefix_into_the_following_piece ... ok
+test rejects_gpt2_bpe_without_supported_pre_tokenizer ... ok
+test rejects_score_array_shorter_than_tokens ... ok
+test rejects_unknown_token_type_value ... ok
+test rejects_special_token_id_outside_vocab ... ok
+test rejects_unsupported_tokenizer_model ... ok
+test verifies_llama3_real_vocab_ids_match_gguf_metadata_when_available ... ok
+test tinyllama_edge_reference_pack_records_required_prompt_shapes_and_tokens ... ok
+test encodes_tinyllama_edge_reference_pack_like_its_own_tokenizer_when_available ... FAILED
+TinyLlama tokenizer/chat-template edge parity failed for 5/5 case(s); expected IDs are the model's own SentencePiece tokenizer's, recorded under model_tokenizer_tokens in fixtures/tokenizer/tinyllama-chat-template-edge-cases.json. Do not edit the fixture to match the encoder -- re-derive it with scripts/gen-tinyllama-sentencepiece-reference.py.
+test result: FAILED. 26 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.28s

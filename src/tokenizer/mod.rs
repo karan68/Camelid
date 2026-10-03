@@ -691,18 +691,20 @@ impl Tokenizer {
             )));
         }
 
-        // `tokenizer.ggml.model = "llama"` is SPM proper: the reference segments it
-        // by token SCORE and ignores any merge list the converter happened to embed.
-        // Some Llama-family GGUFs ship merges anyway (TinyLlama carries 61k), and
-        // honouring them silently switched that model to rank-based BPE, segmenting
-        // ordinary words differently from the reference (`thunderstorm` -> `st|orm`
-        // instead of `stor|m`). Drop merges for this model only.
+        // `tokenizer.ggml.model = "llama"` is SPM proper: segments merge by token
+        // SCORE and a merge list the converter embedded is ignored -- unless every
+        // score is equal. A GGUF converted from a HF tokenizer.json (TinyLlama: 61k
+        // merges, all-zero scores) has no score order, so score merging degenerates
+        // to leftmost-first while the merge ranks still carry the real merge order.
         //
         // Scoped to the raw metadata string, NOT `TokenizerModel::LlamaSpm`: gemma2/
         // gemma3/gemma4 also map onto that enum but genuinely are merge-driven here
         // (the DiffusionGemma tokenizer-parity gate pins gemma4's merge behaviour),
         // and they declare their own tokenizer model names.
-        let spm_ignores_merges = model_name == "llama";
+        let scores_are_flat = scores[..token_texts.len()]
+            .windows(2)
+            .all(|pair| pair[0] == pair[1]);
+        let spm_ignores_merges = model_name == "llama" && !scores_are_flat;
         let bpe_registry = BpeRegistry::from_merges(if spm_ignores_merges {
             Vec::new()
         } else {

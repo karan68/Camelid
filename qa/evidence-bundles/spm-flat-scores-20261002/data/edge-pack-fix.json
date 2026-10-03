@@ -1,0 +1,165 @@
+{
+ "binary": "/tmp/f2r/bin/camelid-spm-cd81d7fb",
+ "cases": [
+  {
+   "case": "trailing_whitespace",
+   "sentencepiece_vs_llama_cpp": false,
+   "sentencepiece_vs_camelid": true,
+   "llama_cpp_first_difference": {
+    "index": 12,
+    "llama_cpp": [
+     2996,
+     492,
+     29881,
+     322
+    ],
+    "sentencepiece": [
+     3949,
+     295,
+     333,
+     322
+    ],
+    "pieces_sentencepiece": [
+     "▁cam",
+     "el",
+     "id",
+     "▁and"
+    ],
+    "pieces_llama_cpp": [
+     "▁came",
+     "li",
+     "d",
+     "▁and"
+    ]
+   }
+  },
+  {
+   "case": "special_control_chars",
+   "sentencepiece_vs_llama_cpp": false,
+   "sentencepiece_vs_camelid": true,
+   "llama_cpp_first_difference": {
+    "index": 16,
+    "llama_cpp": [
+     5159,
+     8875,
+     25299,
+     29989
+    ],
+    "sentencepiece": [
+     518,
+     3199,
+     29913,
+     25299
+    ],
+    "pieces_sentencepiece": [
+     "▁[",
+     "]{",
+     "}",
+     "<>"
+    ],
+    "pieces_llama_cpp": [
+     "▁[]",
+     "{}",
+     "<>",
+     "|"
+    ]
+   }
+  },
+  {
+   "case": "multiline_chat",
+   "sentencepiece_vs_llama_cpp": false,
+   "sentencepiece_vs_camelid": true,
+   "llama_cpp_first_difference": {
+    "index": 37,
+    "llama_cpp": [
+     259,
+     3542,
+     1023,
+     338
+    ],
+    "sentencepiece": [
+     29871,
+     7407,
+     1023,
+     338
+    ],
+    "pieces_sentencepiece": [
+     "▁",
+     "▁Line",
+     "▁two",
+     "▁is"
+    ],
+    "pieces_llama_cpp": [
+     "▁▁",
+     "Line",
+     "▁two",
+     "▁is"
+    ]
+   }
+  },
+  {
+   "case": "assistant_final_eos",
+   "sentencepiece_vs_llama_cpp": false,
+   "sentencepiece_vs_camelid": true,
+   "llama_cpp_first_difference": {
+    "index": 22,
+    "llama_cpp": [
+     5037,
+     29881,
+     2,
+     29871
+    ],
+    "sentencepiece": [
+     295,
+     333,
+     2,
+     29871
+    ],
+    "pieces_sentencepiece": [
+     "el",
+     "id",
+     "</s>",
+     "▁"
+    ],
+    "pieces_llama_cpp": [
+     "eli",
+     "d",
+     "</s>",
+     "▁"
+    ]
+   }
+  },
+  {
+   "case": "multiline_whitespace",
+   "sentencepiece_vs_llama_cpp": false,
+   "sentencepiece_vs_camelid": true,
+   "llama_cpp_first_difference": {
+    "index": 29,
+    "llama_cpp": [
+     259,
+     2568,
+     14927,
+     1196
+    ],
+    "sentencepiece": [
+     29871,
+     1894,
+     14927,
+     1196
+    ],
+    "pieces_sentencepiece": [
+     "▁",
+     "▁Ind",
+     "ented",
+     "▁line"
+    ],
+    "pieces_llama_cpp": [
+     "▁▁",
+     "Ind",
+     "ented",
+     "▁line"
+    ]
+   }
+  }
+ ]
+}

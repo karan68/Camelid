@@ -1,0 +1,5 @@
+FMT_EXIT=0
+CLIPPY_ALL_EXIT=0
+CLIPPY_DEFAULT_EXIT=0
+validation gates: 47 passed, 0 failed
+fixture matches the model's own tokenizer
