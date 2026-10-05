@@ -211,8 +211,11 @@ from outside `doc_ids` and `collection_ids` only when its cosine similarity to
 the query reaches a floor that rises with the number of chunks the library has
 indexed: 0.6408 + 0.0058 × ln(chunks), clamped to 0.3–0.9. That is 0.659 at 25
 chunks, 0.681 at 1,000 and 0.689 at 4,406. The named documents and collections
-are still searched in full and skip the floor, so an attached document is never
-crowded out by the rest of the library. Keyword matches are held to the floor
+are still searched in full and skip the floor. They are ranked apart from the
+rest of the library and keep at least half of `top_k` when they have that many
+passages, so closer passages elsewhere never crowd an attached document out;
+either side takes the slots the other cannot fill, and an attached document
+with no match still falls back to its opening passages. Keyword matches are held to the floor
 too, which means a passage without a current vector from the pinned encoder
 counts only when its document is named. The floor is a similarity, so this
 needs the encoder: without it the request is a `409` with the encoder's reason

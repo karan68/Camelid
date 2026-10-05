@@ -833,10 +833,14 @@ export default function ChatWorkspace({
       try {
         let res = null
         if (searchLibrary) {
-          res = await search({ ...searchBody, library: true })
-          librarySearched = res.ok
-          if (!res.ok) {
-            const failure = await res.json().catch(() => null)
+          // A request that never answers is a failure too, so attached sources are still searched.
+          res = await search({ ...searchBody, library: true }).catch((err) => {
+            console.error('Whole-library search error:', err)
+            return null
+          })
+          librarySearched = Boolean(res?.ok)
+          if (!res?.ok) {
+            const failure = res ? await res.json().catch(() => null) : null
             setCollectionError(`${failure?.error?.message || 'Whole-library search failed.'} This message was sent without searching the whole library.`)
             res = null
           }

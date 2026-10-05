@@ -785,6 +785,7 @@ pub(crate) fn run_search(
         None => Vec::new(),
     };
     let mut similarities = HashMap::new();
+    let mut pinned_chunks = HashSet::new();
     if let (Some(library), Some(vector)) = (&plan.library, plan.query_vector) {
         if !library.pinned.is_empty() {
             // Pinned documents get pools of their own, so the rest of the
@@ -823,6 +824,11 @@ pub(crate) fn run_search(
         };
         keyword.retain(|(id, _)| eligible(id));
         semantic.retain(|(id, _)| eligible(id));
+        pinned_chunks = relevance
+            .iter()
+            .filter(|(_, chunk)| pinned.contains(chunk.doc_id.as_str()))
+            .map(|(id, _)| *id)
+            .collect();
         similarities = relevance
             .into_values()
             .filter_map(|chunk| {
@@ -832,46 +838,90 @@ pub(crate) fn run_search(
             })
             .collect();
     }
-    let (mode, ranked): (&'static str, Vec<(i64, f32, &'static str)>) =
-        if plan.query_vector.is_some() && !plan.keyword {
-            (
-                "semantic",
-                semantic
-                    .into_iter()
-                    .map(|(id, score)| (id, score, "semantic"))
-                    .collect(),
-            )
-        } else if !semantic.is_empty() || (plan.library.is_some() && plan.query_vector.is_some()) {
-            let keyword_ids = keyword.iter().map(|(id, _)| *id).collect::<Vec<_>>();
-            let semantic_ids = semantic.iter().map(|(id, _)| *id).collect::<Vec<_>>();
-            (
-                "hybrid",
-                reciprocal_rank_fusion(&keyword_ids, &semantic_ids)
-                    .into_iter()
-                    .map(|(id, score, found)| (id, score, found.label()))
-                    .collect(),
-            )
-        } else {
-            (
-                "keyword",
-                keyword
-                    .into_iter()
-                    // BM25 in SQLite is negative, more negative for a better match; map
-                    // it into [0, 1) so a better match also scores higher.
-                    .map(|(id, bm25)| {
-                        let strength = bm25.abs();
-                        (id, (strength / (1.0 + strength)) as f32, "keyword")
-                    })
-                    .collect(),
-            )
-        };
-    let mut results = first_verified(conn, fetch_results(conn, &ranked)?, plan.top_k)?;
-    for result in &mut results {
+    let mut results = if pinned_chunks.is_empty() {
+        let (mode, ranked) = fuse_ranked(plan, keyword, semantic);
+        let results = first_verified(conn, fetch_results(conn, &ranked)?, plan.top_k)?;
+        (results, mode)
+    } else {
+        // Pinned documents and the rest of the library are ranked apart and
+        // share the slots, so passages from elsewhere in the library cannot
+        // push an attached document out of the answer.
+        let (pinned_keyword, keyword): (Vec<_>, Vec<_>) = keyword
+            .into_iter()
+            .partition(|(id, _)| pinned_chunks.contains(id));
+        let (pinned_semantic, semantic): (Vec<_>, Vec<_>) = semantic
+            .into_iter()
+            .partition(|(id, _)| pinned_chunks.contains(id));
+        let (mode, pinned_ranked) = fuse_ranked(plan, pinned_keyword, pinned_semantic);
+        let (_, library_ranked) = fuse_ranked(plan, keyword, semantic);
+        let pinned = first_verified(conn, fetch_results(conn, &pinned_ranked)?, plan.top_k)?;
+        let library = first_verified(conn, fetch_results(conn, &library_ranked)?, plan.top_k)?;
+        (share_slots(pinned, library, plan.top_k), mode)
+    };
+    for result in &mut results.0 {
         result.similarity = similarities
             .get(&(result.doc_id.clone(), result.chunk_index))
             .copied();
     }
-    Ok((results, mode))
+    Ok(results)
+}
+
+/// Fills `top_k` slots from two verified rankings: `first` keeps at least half
+/// of them when it has that many passages, and either side takes the slots the
+/// other cannot fill. `first`'s passages come first.
+fn share_slots(
+    first: Vec<DocumentSearchResult>,
+    second: Vec<DocumentSearchResult>,
+    top_k: usize,
+) -> Vec<DocumentSearchResult> {
+    let second_take = second.len().min(top_k - first.len().min(top_k.div_ceil(2)));
+    let first_take = first.len().min(top_k - second_take);
+    first
+        .into_iter()
+        .take(first_take)
+        .chain(second.into_iter().take(second_take))
+        .collect()
+}
+
+/// Orders one search's keyword and semantic candidates into a single ranking,
+/// with the mode that ranked them.
+fn fuse_ranked(
+    plan: &SearchPlan<'_>,
+    keyword: Vec<(i64, f64)>,
+    semantic: Vec<(i64, f32)>,
+) -> (&'static str, Vec<(i64, f32, &'static str)>) {
+    if plan.query_vector.is_some() && !plan.keyword {
+        (
+            "semantic",
+            semantic
+                .into_iter()
+                .map(|(id, score)| (id, score, "semantic"))
+                .collect(),
+        )
+    } else if !semantic.is_empty() || (plan.library.is_some() && plan.query_vector.is_some()) {
+        let keyword_ids = keyword.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+        let semantic_ids = semantic.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+        (
+            "hybrid",
+            reciprocal_rank_fusion(&keyword_ids, &semantic_ids)
+                .into_iter()
+                .map(|(id, score, found)| (id, score, found.label()))
+                .collect(),
+        )
+    } else {
+        (
+            "keyword",
+            keyword
+                .into_iter()
+                // BM25 in SQLite is negative, more negative for a better match; map
+                // it into [0, 1) so a better match also scores higher.
+                .map(|(id, bm25)| {
+                    let strength = bm25.abs();
+                    (id, (strength / (1.0 + strength)) as f32, "keyword")
+                })
+                .collect(),
+        )
+    }
 }
 
 /// The first `top_k` candidates, in rank order, that pass the citation check.
@@ -930,13 +980,24 @@ fn search_locked(
     }
     let (mut results, mut ranked_by) =
         run_search(conn, plan).map_err(|error| ("search_error", error))?;
-    if results.is_empty() {
+    // In a library-wide search the named documents fall back to their opening
+    // passages when none of theirs matched, as they would without the library.
+    let named_matched = match &plan.library {
+        Some(library) if !library.pinned.is_empty() => results
+            .iter()
+            .any(|result| library.pinned.contains(&result.doc_id)),
+        _ => !results.is_empty(),
+    };
+    if !named_matched {
         if let Some(attached_ids) = attached.filter(|ids| !ids.is_empty()) {
-            results = attached_document_context(conn, attached_ids, plan.top_k)
+            let fallback = attached_document_context(conn, attached_ids, plan.top_k)
                 .and_then(|results| retain_verifiable(conn, results))
                 .map_err(|error| ("attached_document_fallback_error", error))?;
-            if !results.is_empty() {
-                ranked_by = "attached";
+            if !fallback.is_empty() {
+                if results.is_empty() {
+                    ranked_by = "attached";
+                }
+                results = share_slots(fallback, results, plan.top_k);
             }
         }
     }
@@ -1384,6 +1445,78 @@ mod tests {
             ],
             "every attached passage counts; elsewhere only the support passage clears 0.9"
         );
+    }
+
+    #[test]
+    fn closer_library_passages_do_not_crowd_out_an_attached_document() {
+        let conn = library();
+        for doc_id in ["first", "second", "third"] {
+            index_policy(&conn, doc_id);
+        }
+        // Every attached passage is orthogonal to the query.
+        for id in seed_passages(&conn, "attached", &POLICY) {
+            put_vector(&conn, id, &[0.0, 0.0, 1.0]);
+        }
+        let pinned = vec!["attached".to_string()];
+        let query = unit(&[1.0, 0.0, 0.0]);
+        let plan = SearchPlan {
+            top_k: 2,
+            ..library_plan("unmatched", &query, &pinned, 0.5)
+        };
+        let (results, _) = run_search(&conn, &plan).unwrap();
+        let docs = results
+            .iter()
+            .map(|result| result.doc_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(docs.len(), 2);
+        assert_eq!(docs[0], "attached", "the attached document keeps a slot");
+        assert_ne!(docs[1], "attached", "the library keeps the other");
+    }
+
+    #[test]
+    fn an_unmatched_attached_document_still_falls_back_beside_library_passages() {
+        let conn = library();
+        index_policy(&conn, "elsewhere");
+        seed_passages(&conn, "attached", &POLICY);
+        let pinned = vec!["attached".to_string()];
+        let query = unit(&[1.0, 0.0, 0.0]);
+        let plan = library_plan("unmatched", &query, &pinned, 0.5);
+        let outcome = search_locked(&conn, &plan, Some(&pinned)).unwrap();
+        assert!(outcome
+            .results
+            .iter()
+            .any(|result| result.doc_id == "attached" && result.chunk_index == 0));
+        assert!(outcome
+            .results
+            .iter()
+            .any(|result| result.doc_id == "elsewhere" && result.chunk_index == 0));
+    }
+
+    #[test]
+    fn shared_slots_give_each_side_what_the_other_cannot_use() {
+        let conn = library();
+        index_policy(&conn, "a");
+        index_policy(&conn, "b");
+        let query = unit(&[1.0, 1.0, 1.0]);
+        let take = |doc_id: &str| {
+            let doc_ids = vec![doc_id.to_string()];
+            let plan = SearchPlan {
+                doc_ids: Some(&doc_ids),
+                ..plan("unmatched", Some(&query))
+            };
+            run_search(&conn, &plan).unwrap().0
+        };
+        let count = |results: &[DocumentSearchResult], doc_id: &str| {
+            results.iter().filter(|r| r.doc_id == doc_id).count()
+        };
+        let shared = share_slots(take("a"), take("b"), 4);
+        assert_eq!((count(&shared, "a"), count(&shared, "b")), (2, 2));
+        let shared = share_slots(take("a"), Vec::new(), 4);
+        assert_eq!(count(&shared, "a"), 3);
+        let shared = share_slots(take("a").into_iter().take(1).collect(), take("b"), 4);
+        assert_eq!((count(&shared, "a"), count(&shared, "b")), (1, 3));
+        let shared = share_slots(take("a"), take("b"), 1);
+        assert_eq!((count(&shared, "a"), count(&shared, "b")), (1, 0));
     }
 
     #[test]
