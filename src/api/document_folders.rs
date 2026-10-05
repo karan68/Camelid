@@ -628,7 +628,9 @@ pub(crate) fn scan_folder(
                 changes.unchanged += 1;
                 continue;
             }
-            if same_stat && previous.status != INDEXED {
+            // An unreadable file is tried again on every scan: the cause is
+            // usually passing, like another program holding the file open.
+            if same_stat && previous.status != INDEXED && previous.status != UNREADABLE {
                 changes.skipped += 1;
                 continue;
             }
@@ -683,6 +685,13 @@ pub(crate) fn scan_folder(
                 } else {
                     changes.added += 1;
                 }
+            }
+            // A file that could not be read this time keeps its document and
+            // its row, so the next scan reads it again if it changes and the
+            // document is not lost to a passing lock.
+            Read::Skip(UNREADABLE, _) if had_document => {
+                tracing::warn!(path = %file.rel_path, "watched file could not be read; its document is kept");
+                changes.unchanged += 1;
             }
             Read::Skip(reason, sha256) => {
                 if had_document && documents::remove_document(&tx, &doc_id)? {
@@ -797,7 +806,12 @@ pub(crate) fn schedule_scans(models_dir: PathBuf, folder_ids: Vec<String>) {
                         document_vectors::schedule_indexing(models_dir.clone(), true);
                     }
                     Ok(Ok(_)) => {}
-                    Ok(Err(error)) => tracing::warn!(%error, "watched folder scan stopped"),
+                    Ok(Err(error)) => {
+                        tracing::warn!(%error, "watched folder scan stopped");
+                        // Files stored before it stopped are committed, and the
+                        // next scan sees them as unchanged.
+                        document_vectors::schedule_indexing(models_dir.clone(), true);
+                    }
                     Err(error) => tracing::warn!(%error, "watched folder scan task failed"),
                 }
             }
@@ -851,6 +865,11 @@ pub(crate) fn start_polling(models_dir: PathBuf) {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             interval.tick().await;
+            // Opening the database would create it for someone who has never
+            // used the library, and then nothing is watched anyway.
+            if !documents::documents_db_path().exists() {
+                continue;
+            }
             let ids = tokio::task::spawn_blocking(|| {
                 let _lock = db_lock().lock().unwrap();
                 let conn = open_connection()?;
@@ -1237,6 +1256,105 @@ mod tests {
             }
         );
         assert!(library.documents().is_empty());
+    }
+
+    /// Keeps a file unreadable to the scanner until dropped: held open without
+    /// sharing on Windows, stripped of permissions on Unix.
+    #[allow(dead_code)]
+    struct HeldUnreadable {
+        path: PathBuf,
+        file: Option<std::fs::File>,
+    }
+
+    impl Drop for HeldUnreadable {
+        fn drop(&mut self) {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ =
+                    std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o644));
+            }
+        }
+    }
+
+    /// `None` where this process can read the file anyway, as root can.
+    fn hold_unreadable(path: &Path) -> Option<HeldUnreadable> {
+        #[cfg(windows)]
+        let held = {
+            use std::os::windows::fs::OpenOptionsExt;
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0)
+                .open(path)
+                .unwrap();
+            HeldUnreadable {
+                path: path.to_path_buf(),
+                file: Some(file),
+            }
+        };
+        #[cfg(unix)]
+        let held = {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0)).unwrap();
+            HeldUnreadable {
+                path: path.to_path_buf(),
+                file: None,
+            }
+        };
+        std::fs::read(path).is_err().then_some(held)
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_read_for_now_keeps_its_document_and_is_read_again() {
+        let mut library = Library::new();
+        library.write("notes.txt", "Readable at first.");
+        let id = library.watch();
+        done(library.scan(&id));
+        let doc_id = library.documents()[0].1.clone();
+        library.write("notes.txt", "Edited while another program held it.");
+        let path = library.dir.path().join("notes.txt");
+        let Some(held) = hold_unreadable(&path) else {
+            return;
+        };
+        library.scan(&id);
+        assert_eq!(
+            library.documents(),
+            [(
+                "notes.txt".to_string(),
+                doc_id.clone(),
+                "Readable at first.".to_string()
+            )],
+            "a passing read failure keeps the document"
+        );
+        drop(held);
+
+        done(library.scan(&id));
+        assert_eq!(
+            library.documents(),
+            [(
+                "notes.txt".to_string(),
+                doc_id,
+                "Edited while another program held it.".to_string()
+            )],
+            "the next scan reads the change under the same id"
+        );
+    }
+
+    #[test]
+    fn a_new_file_that_cannot_be_read_is_tried_again_on_every_scan() {
+        let mut library = Library::new();
+        library.write("notes.txt", "Held when the folder is first scanned.");
+        let id = library.watch();
+        let path = library.dir.path().join("notes.txt");
+        let Some(held) = hold_unreadable(&path) else {
+            return;
+        };
+        library.scan(&id);
+        assert!(library.documents().is_empty());
+        drop(held);
+
+        done(library.scan(&id));
+        assert_eq!(library.filenames(), ["notes.txt"]);
     }
 
     #[test]

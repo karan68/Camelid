@@ -39,7 +39,7 @@ pub(crate) fn db_lock() -> &'static Mutex<()> {
     DB_MUTEX.get_or_init(|| Mutex::new(()))
 }
 
-fn documents_db_path() -> PathBuf {
+pub(crate) fn documents_db_path() -> PathBuf {
     if let Ok(dir) = std::env::var("CAMELID_DATA_DIR") {
         PathBuf::from(dir).join(DOCUMENTS_DB_FILE)
     } else if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {

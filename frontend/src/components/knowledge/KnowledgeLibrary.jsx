@@ -18,6 +18,8 @@ import '../../styles/project-context.css'
 import '../../styles/knowledge.css'
 
 const countLabel = (count, one, many) => `${count.toLocaleString()} ${count === 1 ? one : many}`
+// A dropped folder is uploaded one file at a time; a larger tree belongs in a watched folder.
+const MAX_DROPPED_DOCUMENTS = 500
 const byFilename = (a, b) => a.filename.localeCompare(b.filename, undefined, { sensitivity: 'base' })
 
 /* Manage collections and their documents. Opened from the chat, it can also
@@ -105,6 +107,10 @@ export function KnowledgeLibrary({ collections, refresh, initialCollectionId = n
     filesFromDrop(event.dataTransfer)
       .then(found => {
         const readable = found.filter(item => isLibraryDocument(item.name))
+        if (readable.length > MAX_DROPPED_DOCUMENTS) {
+          setError(`The drop holds ${readable.length} documents. Drop at most ${MAX_DROPPED_DOCUMENTS} at a time, or watch the folder instead.`)
+          return
+        }
         if (found.length) upload(readable, found.length - readable.length)
       })
       .catch(failure => setError(failure?.message || 'Could not read the dropped files.'))

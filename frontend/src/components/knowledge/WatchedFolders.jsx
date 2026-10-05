@@ -24,6 +24,9 @@ const changedSomething = changes => Boolean(changes && (changes.added || changes
 export function WatchedFolders({ collection, onChanged, disabled = false }) {
   const [folders, setFolders] = useState(null)
   const [error, setError] = useState('')
+  // Kept apart from `error` so the next successful poll clears a failed one
+  // without hiding the result of an action.
+  const [loadError, setLoadError] = useState('')
   const [working, setWorking] = useState('')
   const [adding, setAdding] = useState(false)
   const [draft, setDraft] = useState('')
@@ -37,8 +40,9 @@ export function WatchedFolders({ collection, onChanged, disabled = false }) {
   const load = useCallback(async () => {
     try {
       setFolders(await listFolders())
+      setLoadError('')
     } catch (failure) {
-      setError(failure.message)
+      setLoadError(failure.message)
     }
   }, [])
   useEffect(() => { load() }, [load])
@@ -150,7 +154,7 @@ export function WatchedFolders({ collection, onChanged, disabled = false }) {
           </div>
           <p className="context-muted">Camelid reads the PDF, Word, Markdown, text, CSV, JSON and code files in the folder and its subfolders, then checks it for changes every 30 seconds while it runs. Hidden files and links are skipped.</p>
         </form>}
-      {error && <p role="alert" className="context-error">{error}</p>}
+      {(error || loadError) && <p role="alert" className="context-error">{error || loadError}</p>}
     </div>
   )
 }
