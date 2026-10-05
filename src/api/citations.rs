@@ -47,7 +47,10 @@ impl ChunkSpan {
 /// A window also ends where a new section begins (see `section_starts`), once it
 /// holds a quarter of `target_chars`, and the next window starts exactly there
 /// with no overlap, so one chunk does not carry the tail of one topic into the
-/// next and score below a question about either.
+/// next and score below a question about either. A heading that falls just
+/// past a window, where the overlapping next window could not end at it, ends
+/// that window instead, so such a window may run past `target_chars` by up to a
+/// quarter of it.
 pub fn chunk_text_with_spans(
     text: &str,
     target_chars: usize,
@@ -84,17 +87,26 @@ pub fn chunk_text_with_spans(
         }
 
         let hard_end = (start_ci + target).min(total);
-        let next_section = sections
-            .iter()
-            .copied()
-            .find(|&section| section >= start_ci + min_section && section <= hard_end);
+        let section_from = |from: usize| {
+            sections
+                .get(sections.partition_point(|&section| section < from))
+                .copied()
+        };
+        let mut next_section =
+            section_from(start_ci + min_section).filter(|&section| section <= hard_end);
         let mut end_ci = hard_end;
-        if let Some(section) = next_section {
-            end_ci = section;
-        } else if hard_end < total {
+        if next_section.is_none() && hard_end < total {
             if let Some(boundary) = preferred_break(&chars, start_ci, hard_end) {
                 end_ci = boundary;
             }
+            // A heading just past this window would fall inside the next
+            // window's first quarter, where it cannot end that window either,
+            // so this window runs on to it instead.
+            next_section = section_from(hard_end + 1)
+                .filter(|&section| section + overlap < end_ci + min_section);
+        }
+        if let Some(section) = next_section {
+            end_ci = section;
         }
         // Captured before trimming: a trailing newline must not hide the fact
         // that this window already consumed the rest of the document.
@@ -1068,6 +1080,25 @@ Security incidents that affect customer data are reported to the account owner w
                 "B\n\nThird short one here."
             ]
         );
+    }
+
+    #[test]
+    fn a_heading_just_past_a_window_still_starts_its_own_chunk() {
+        // The heading lands a few characters past the first window, inside the
+        // first quarter of the window that would overlap back into the section.
+        let text = format!(
+            "Refunds\n\n{}\n\nIncident handling\n\nBreaches are reported within seventy-two hours.\n",
+            "refund ".repeat(75)
+        );
+        let spans = chunk_text_with_spans(&text, 512, 64);
+        assert_eq!(spans.len(), 2);
+        assert!(spans[0].text.starts_with("Refunds"));
+        assert!(!spans[0].text.contains("Incident"));
+        assert!(spans[1].text.starts_with("Incident handling"));
+        assert!(spans[0].text.chars().count() < 512 + 128 - 64);
+        for span in &spans {
+            assert_eq!(span.text, &text[span.start..span.end]);
+        }
     }
 
     #[test]
