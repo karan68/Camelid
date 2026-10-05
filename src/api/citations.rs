@@ -43,6 +43,14 @@ impl ChunkSpan {
 /// input: `span.text == text[span.start..span.end]` holds for every span. That
 /// invariant is what makes a byte range citable; a chunker that reflows or
 /// re-joins text produces ranges that cannot be pointed at.
+///
+/// A window also ends where a new section begins (see `section_starts`), once it
+/// holds a quarter of `target_chars`, and the next window starts exactly there
+/// with no overlap, so one chunk does not carry the tail of one topic into the
+/// next and score below a question about either. A heading that falls just
+/// past a window, where the overlapping next window could not end at it, ends
+/// that window instead, so such a window may run past `target_chars` by up to a
+/// quarter of it.
 pub fn chunk_text_with_spans(
     text: &str,
     target_chars: usize,
@@ -50,6 +58,7 @@ pub fn chunk_text_with_spans(
 ) -> Vec<ChunkSpan> {
     let target = target_chars.max(1);
     let overlap = overlap_chars.min(target - 1);
+    let min_section = (target / 4).max(1);
 
     let chars: Vec<(usize, char)> = text.char_indices().collect();
     let total = chars.len();
@@ -57,6 +66,7 @@ pub fn chunk_text_with_spans(
     if total == 0 {
         return spans;
     }
+    let sections = section_starts(&chars);
 
     let byte_at = |index: usize| -> usize {
         if index >= total {
@@ -77,11 +87,26 @@ pub fn chunk_text_with_spans(
         }
 
         let hard_end = (start_ci + target).min(total);
+        let section_from = |from: usize| {
+            sections
+                .get(sections.partition_point(|&section| section < from))
+                .copied()
+        };
+        let mut next_section =
+            section_from(start_ci + min_section).filter(|&section| section <= hard_end);
         let mut end_ci = hard_end;
-        if hard_end < total {
+        if next_section.is_none() && hard_end < total {
             if let Some(boundary) = preferred_break(&chars, start_ci, hard_end) {
                 end_ci = boundary;
             }
+            // A heading just past this window would fall inside the next
+            // window's first quarter, where it cannot end that window either,
+            // so this window runs on to it instead.
+            next_section = section_from(hard_end + 1)
+                .filter(|&section| section + overlap < end_ci + min_section);
+        }
+        if let Some(section) = next_section {
+            end_ci = section;
         }
         // Captured before trimming: a trailing newline must not hide the fact
         // that this window already consumed the rest of the document.
@@ -103,10 +128,68 @@ pub fn chunk_text_with_spans(
         if consumed_to_end {
             break;
         }
-        start_ci = end_ci.saturating_sub(overlap).max(start_ci + 1);
+        start_ci = match next_section {
+            Some(section) => section,
+            None => end_ci.saturating_sub(overlap).max(start_ci + 1),
+        };
     }
 
     spans
+}
+
+/// Char indices where a section begins: the first character of a heading, which
+/// is a paragraph opening on a line after a blank line (or the text's first line)
+/// that is either a Markdown heading (one to six `#` and a space), or a single
+/// line of at most 80 characters that does not end like a sentence or a clause
+/// (`1. Scope`, `Refunds`).
+fn section_starts(chars: &[(usize, char)]) -> Vec<usize> {
+    let mut lines = Vec::new();
+    let mut line_start = 0;
+    for (index, (_, ch)) in chars.iter().enumerate() {
+        if *ch == '\n' {
+            lines.push((line_start, index));
+            line_start = index + 1;
+        }
+    }
+    lines.push((line_start, chars.len()));
+
+    let trimmed = |(start, end): (usize, usize)| -> (usize, usize) {
+        let mut first = start;
+        while first < end && chars[first].1.is_whitespace() {
+            first += 1;
+        }
+        let mut last = end;
+        while last > first && chars[last - 1].1.is_whitespace() {
+            last -= 1;
+        }
+        (first, last)
+    };
+    let blank = |line: (usize, usize)| {
+        let (first, last) = trimmed(line);
+        first == last
+    };
+
+    let mut starts = Vec::new();
+    for (index, &line) in lines.iter().enumerate() {
+        if blank(line) || (index > 0 && !blank(lines[index - 1])) {
+            continue;
+        }
+        let (first, last) = trimmed(line);
+        let hashes = chars[first..last]
+            .iter()
+            .take_while(|(_, ch)| *ch == '#')
+            .count();
+        let markdown = (1..=6).contains(&hashes)
+            && chars
+                .get(first + hashes)
+                .is_some_and(|(_, ch)| *ch == ' ' || *ch == '\t');
+        let single_line = lines.get(index + 1).is_none_or(|&next| blank(next));
+        let ends_like_prose = matches!(chars[last - 1].1, '.' | '!' | '?' | ':' | ';' | ',');
+        if markdown || (single_line && last - first <= 80 && !ends_like_prose) {
+            starts.push(first);
+        }
+    }
+    starts
 }
 
 /// Prefers a paragraph break, then a sentence end, then a word boundary in the
@@ -943,6 +1026,113 @@ Trial accounts are not eligible for refunds under any circumstance.\n";
             assert!(!span.text.starts_with(char::is_whitespace));
             assert!(!span.text.ends_with(char::is_whitespace));
         }
+    }
+
+    const SECTIONED: &str = "Support Policy\n\n\
+Version 4.2, effective 1 March 2026. This policy applies to every paid plan; where an order form says something different, the order form wins.\n\n\
+1. Refunds\n\n\
+Enterprise customers may request a refund within 60 days of the invoice date. Refunds are issued to the original payment method within five business days.\n\n\
+2. Data export\n\n\
+Customers can export their data at any time from the admin console. A full export requested in writing is fulfilled within thirty days.\n\n\
+3. Incident handling\n\n\
+Security incidents that affect customer data are reported to the account owner within seventy-two hours of confirmation.\n";
+
+    #[test]
+    fn each_section_gets_its_own_chunk_without_overlap() {
+        let spans = chunk_text_with_spans(SECTIONED, 512, 64);
+        let headings: Vec<&str> = spans
+            .iter()
+            .map(|span| span.text.lines().next().unwrap())
+            .collect();
+        assert_eq!(
+            headings,
+            [
+                "Support Policy",
+                "1. Refunds",
+                "2. Data export",
+                "3. Incident handling"
+            ]
+        );
+        for span in &spans {
+            assert_eq!(span.text, &SECTIONED[span.start..span.end]);
+        }
+        for pair in spans.windows(2) {
+            assert!(
+                pair[1].start >= pair[0].end,
+                "no chunk repeats the end of the previous section"
+            );
+        }
+    }
+
+    #[test]
+    fn sections_shorter_than_a_quarter_window_share_a_chunk() {
+        let text = "Notes\n\nShort one.\n\nA\n\nAnother short one.\n\nB\n\nThird short one here.\n";
+        assert_eq!(chunk_text_with_spans(text, 512, 64).len(), 1);
+        let small: Vec<String> = chunk_text_with_spans(text, 64, 8)
+            .into_iter()
+            .map(|span| span.text)
+            .collect();
+        assert_eq!(
+            small,
+            [
+                "Notes\n\nShort one.",
+                "A\n\nAnother short one.",
+                "B\n\nThird short one here."
+            ]
+        );
+    }
+
+    #[test]
+    fn a_heading_just_past_a_window_still_starts_its_own_chunk() {
+        // The heading lands a few characters past the first window, inside the
+        // first quarter of the window that would overlap back into the section.
+        let text = format!(
+            "Refunds\n\n{}\n\nIncident handling\n\nBreaches are reported within seventy-two hours.\n",
+            "refund ".repeat(75)
+        );
+        let spans = chunk_text_with_spans(&text, 512, 64);
+        assert_eq!(spans.len(), 2);
+        assert!(spans[0].text.starts_with("Refunds"));
+        assert!(!spans[0].text.contains("Incident"));
+        assert!(spans[1].text.starts_with("Incident handling"));
+        assert!(spans[0].text.chars().count() < 512 + 128 - 64);
+        for span in &spans {
+            assert_eq!(span.text, &text[span.start..span.end]);
+        }
+    }
+
+    #[test]
+    fn prose_without_headings_still_overlaps() {
+        let para = "This sentence exists to give the chunker realistic prose to split on. ";
+        let text = para.repeat(20);
+        let spans = chunk_text_with_spans(&text, 512, 64);
+        assert!(spans.len() > 1);
+        for pair in spans.windows(2) {
+            assert!(
+                pair[1].start < pair[0].end,
+                "windows inside a section overlap"
+            );
+        }
+    }
+
+    #[test]
+    fn headings_are_short_lines_or_markdown_after_a_blank_line() {
+        let text = "Title\n\n\
+Prose that ends like a sentence.\n\n\
+A line longer than eighty characters that carries no terminal punctuation at all here\n\n\
+# Markdown heading\nwith body text directly below\n\n\
+#[derive(Debug)]\nstruct NotAHeading;\n\n\
+#hashtag, not a heading\nwith a second line\n\n\
+####### seven hashes\nwith a second line\n\n\
+- a list item\n- another item\n\n\
+Section two\n\n\
+Mid-paragraph line\nThat is not a heading";
+        let chars: Vec<(usize, char)> = text.char_indices().collect();
+        let starts: Vec<&str> = section_starts(&chars)
+            .into_iter()
+            .map(|index| text[chars[index].0..].lines().next().unwrap())
+            .collect();
+        assert_eq!(starts, ["Title", "# Markdown heading", "Section two"]);
     }
 
     #[test]
