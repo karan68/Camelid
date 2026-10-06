@@ -1295,7 +1295,7 @@ mod tests {
         #[cfg(unix)]
         let held = {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0)).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000)).unwrap();
             HeldUnreadable {
                 path: path.to_path_buf(),
                 file: None,
