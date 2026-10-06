@@ -19,8 +19,9 @@ use axum::Json;
 use rusqlite::{params, params_from_iter, types::Value, Connection};
 use serde::{Deserialize, Serialize};
 
-use super::citations::{chunk_text_with_spans, retain_verifiable, sha256_hex};
+use super::citations::{chunk_text_with_spans, retain_verifiable, sha256_hex, ChunkSpan};
 use super::document_collections::{self, CollectionError};
+use super::document_folders;
 use super::document_vectors::{self, Coverage, Unavailable};
 use super::{api_error, AppState};
 
@@ -38,7 +39,7 @@ pub(crate) fn db_lock() -> &'static Mutex<()> {
     DB_MUTEX.get_or_init(|| Mutex::new(()))
 }
 
-fn documents_db_path() -> PathBuf {
+pub(crate) fn documents_db_path() -> PathBuf {
     if let Ok(dir) = std::env::var("CAMELID_DATA_DIR") {
         PathBuf::from(dir).join(DOCUMENTS_DB_FILE)
     } else if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
@@ -75,6 +76,7 @@ pub(crate) fn init_db(conn: &Connection) -> Result<(), rusqlite::Error> {
     ensure_citation_columns(conn)?;
     document_vectors::init_schema(conn)?;
     document_collections::init_schema(conn)?;
+    document_folders::init_schema(conn)?;
     Ok(())
 }
 
@@ -109,6 +111,19 @@ pub(crate) fn open_connection() -> Result<Connection, rusqlite::Error> {
     conn.execute("PRAGMA foreign_keys = ON;", [])?;
     init_db(&conn)?;
     Ok(conn)
+}
+
+/// The file types `extract_text_from_bytes` reads, and the only ones a watched
+/// folder picks up. An upload of any other type is read as lossy UTF-8.
+pub(crate) const DOCUMENT_EXTENSIONS: &[&str] =
+    &["txt", "md", "csv", "json", "rs", "py", "js", "docx", "pdf"];
+
+pub(crate) fn has_document_extension(filename: &str) -> bool {
+    filename.rsplit_once('.').is_some_and(|(_, extension)| {
+        DOCUMENT_EXTENSIONS
+            .iter()
+            .any(|known| extension.eq_ignore_ascii_case(known))
+    })
 }
 
 /// Extract clean textual tokens from supported document formats.
@@ -343,18 +358,12 @@ pub async fn ingest_document(
         (payload.content, digest)
     };
 
-    let byte_size = text_content.len();
-    let chunks = chunk_text_with_spans(&text_content, DEFAULT_CHUNK_CHARS, DEFAULT_CHUNK_OVERLAP);
-    let chunk_count = chunks.len();
-    let text_sha256 = sha256_hex(text_content.as_bytes());
+    let chunks = chunk_document(&text_content);
     if chunks.is_empty() {
-        return Err(api_error(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "empty_document",
-            "The document did not contain any readable text.".to_string(),
-            None,
-        ));
+        return Err(StoreError::Empty.into_response());
     }
+    let byte_size = text_content.len();
+    let chunk_count = chunks.len();
 
     let _lock = db_lock().lock().unwrap();
     let mut conn = open_connection().map_err(|e| {
@@ -374,120 +383,18 @@ pub async fn ingest_document(
             None,
         )
     })?;
-
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
-
-    document_collections::require_collections(&tx, &payload.collection_ids)
-        .map_err(CollectionError::into_response)?;
-
-    let ext = filename
-        .split('.')
-        .next_back()
-        .unwrap_or("txt")
-        .to_lowercase();
-
-    // Remove any previous chunks and their external-content FTS rows for doc_id.
-    tx.execute(
-        "DELETE FROM document_chunks_fts WHERE rowid IN (SELECT id FROM document_chunks WHERE doc_id = ?1)",
-        params![doc_id],
+    store_document(
+        &tx,
+        &NewDocument {
+            doc_id: &doc_id,
+            filename: &filename,
+            text: &text_content,
+            source_sha256: &source_sha256,
+            collection_ids: &payload.collection_ids,
+        },
+        &chunks,
     )
-    .map_err(|e| {
-        api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "delete_fts_error",
-            e.to_string(),
-            None,
-        )
-    })?;
-    tx.execute(
-        "DELETE FROM document_chunks WHERE doc_id = ?1",
-        params![doc_id],
-    )
-    .map_err(|e| {
-        api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "delete_chunk_error",
-            e.to_string(),
-            None,
-        )
-    })?;
-
-    // Update an existing row in place: INSERT OR REPLACE deletes it first, and
-    // that delete would cascade to the document's collection memberships.
-    tx.execute(
-        "INSERT INTO documents
-         (id, filename, file_type, byte_size, chunk_count, created_at, source_sha256, text_sha256, source_text)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-         ON CONFLICT(id) DO UPDATE SET
-           filename = excluded.filename, file_type = excluded.file_type,
-           byte_size = excluded.byte_size, chunk_count = excluded.chunk_count,
-           created_at = excluded.created_at, source_sha256 = excluded.source_sha256,
-           text_sha256 = excluded.text_sha256, source_text = excluded.source_text",
-        params![
-            doc_id,
-            filename,
-            ext,
-            byte_size as i64,
-            chunk_count as i64,
-            now,
-            source_sha256,
-            text_sha256,
-            text_content
-        ],
-    ).map_err(|e| {
-        api_error(StatusCode::INTERNAL_SERVER_ERROR, "insert_doc_error", e.to_string(), None)
-    })?;
-    document_collections::add_memberships(&tx, &payload.collection_ids, &doc_id).map_err(|e| {
-        api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "collection_membership_error",
-            e.to_string(),
-            None,
-        )
-    })?;
-
-    // Insert chunks and index in FTS5
-    for (idx, chunk) in chunks.iter().enumerate() {
-        tx.execute(
-            "INSERT INTO document_chunks
-             (doc_id, chunk_index, content, byte_start, byte_end, chunk_sha256)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                doc_id,
-                idx as i64,
-                chunk.text,
-                chunk.start as i64,
-                chunk.end as i64,
-                chunk.sha256()
-            ],
-        )
-        .map_err(|e| {
-            api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "insert_chunk_error",
-                e.to_string(),
-                None,
-            )
-        })?;
-
-        let rowid = tx.last_insert_rowid();
-        tx.execute(
-            "INSERT INTO document_chunks_fts (rowid, content) VALUES (?1, ?2)",
-            params![rowid, chunk.text],
-        )
-        .map_err(|e| {
-            api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "insert_fts_error",
-                e.to_string(),
-                None,
-            )
-        })?;
-    }
-
+    .map_err(StoreError::into_response)?;
     tx.commit().map_err(|e| {
         api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -504,6 +411,154 @@ pub async fn ingest_document(
         chunk_count,
         byte_size,
     }))
+}
+
+/// A document ready to store: its canonical text and the hash of the bytes it
+/// was read from.
+pub(crate) struct NewDocument<'a> {
+    pub doc_id: &'a str,
+    pub filename: &'a str,
+    pub text: &'a str,
+    pub source_sha256: &'a str,
+    /// Collections the document joins; they must exist.
+    pub collection_ids: &'a [String],
+}
+
+/// Why a document was not stored. A database error carries the API code it is
+/// reported with.
+#[derive(Debug)]
+pub(crate) enum StoreError {
+    Empty,
+    Collection(CollectionError),
+    Database(&'static str, rusqlite::Error),
+}
+
+impl StoreError {
+    pub(crate) fn into_response(self) -> Response {
+        match self {
+            Self::Empty => api_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "empty_document",
+                "The document did not contain any readable text.".to_string(),
+                None,
+            ),
+            Self::Collection(error) => error.into_response(),
+            Self::Database(code, error) => api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                code,
+                error.to_string(),
+                None,
+            ),
+        }
+    }
+}
+
+/// The library's chunks of a document's text.
+pub(crate) fn chunk_document(text: &str) -> Vec<ChunkSpan> {
+    chunk_text_with_spans(text, DEFAULT_CHUNK_CHARS, DEFAULT_CHUNK_OVERLAP)
+}
+
+/// Stores `doc` as `chunks` within the caller's transaction. An earlier version
+/// under the same id is replaced in place, so its collection memberships
+/// survive.
+pub(crate) fn store_document(
+    conn: &Connection,
+    doc: &NewDocument<'_>,
+    chunks: &[ChunkSpan],
+) -> Result<(), StoreError> {
+    if chunks.is_empty() {
+        return Err(StoreError::Empty);
+    }
+    let database = |code: &'static str| move |error| StoreError::Database(code, error);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+
+    document_collections::require_collections(conn, doc.collection_ids)
+        .map_err(StoreError::Collection)?;
+
+    let ext = doc
+        .filename
+        .split('.')
+        .next_back()
+        .unwrap_or("txt")
+        .to_lowercase();
+
+    // Remove any previous chunks and their external-content FTS rows for doc_id.
+    conn.execute(
+        "DELETE FROM document_chunks_fts WHERE rowid IN (SELECT id FROM document_chunks WHERE doc_id = ?1)",
+        params![doc.doc_id],
+    )
+    .map_err(database("delete_fts_error"))?;
+    conn.execute(
+        "DELETE FROM document_chunks WHERE doc_id = ?1",
+        params![doc.doc_id],
+    )
+    .map_err(database("delete_chunk_error"))?;
+
+    // Update an existing row in place: INSERT OR REPLACE deletes it first, and
+    // that delete would cascade to the document's collection memberships.
+    conn.execute(
+        "INSERT INTO documents
+         (id, filename, file_type, byte_size, chunk_count, created_at, source_sha256, text_sha256, source_text)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+         ON CONFLICT(id) DO UPDATE SET
+           filename = excluded.filename, file_type = excluded.file_type,
+           byte_size = excluded.byte_size, chunk_count = excluded.chunk_count,
+           created_at = excluded.created_at, source_sha256 = excluded.source_sha256,
+           text_sha256 = excluded.text_sha256, source_text = excluded.source_text",
+        params![
+            doc.doc_id,
+            doc.filename,
+            ext,
+            doc.text.len() as i64,
+            chunks.len() as i64,
+            now,
+            doc.source_sha256,
+            sha256_hex(doc.text.as_bytes()),
+            doc.text
+        ],
+    )
+    .map_err(database("insert_doc_error"))?;
+    document_collections::add_memberships(conn, doc.collection_ids, doc.doc_id)
+        .map_err(database("collection_membership_error"))?;
+
+    // Insert chunks and index in FTS5
+    for (idx, chunk) in chunks.iter().enumerate() {
+        conn.execute(
+            "INSERT INTO document_chunks
+             (doc_id, chunk_index, content, byte_start, byte_end, chunk_sha256)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                doc.doc_id,
+                idx as i64,
+                chunk.text,
+                chunk.start as i64,
+                chunk.end as i64,
+                chunk.sha256()
+            ],
+        )
+        .map_err(database("insert_chunk_error"))?;
+
+        let rowid = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO document_chunks_fts (rowid, content) VALUES (?1, ?2)",
+            params![rowid, chunk.text],
+        )
+        .map_err(database("insert_fts_error"))?;
+    }
+    Ok(())
+}
+
+/// Deletes a document with its chunks and their keyword-index rows; its vectors
+/// and collection memberships go with it by cascade. Returns whether it existed.
+pub(crate) fn remove_document(conn: &Connection, doc_id: &str) -> Result<bool, rusqlite::Error> {
+    conn.execute(
+        "DELETE FROM document_chunks_fts WHERE rowid IN (SELECT id FROM document_chunks WHERE doc_id = ?1)",
+        params![doc_id],
+    )?;
+    Ok(conn.execute("DELETE FROM documents WHERE id = ?1", params![doc_id])? > 0)
 }
 
 /// Sanitizes a text query into FTS5-safe query string.
@@ -1240,19 +1295,14 @@ pub async fn delete_document(
             None,
         )
     })?;
-    tx.execute(
-        "DELETE FROM document_chunks_fts WHERE rowid IN (SELECT id FROM document_chunks WHERE doc_id = ?1)",
-        params![doc_id],
-    )
-    .and_then(|_| tx.execute("DELETE FROM documents WHERE id = ?1", params![doc_id]))
-        .map_err(|e| {
-            api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "delete_error",
-                e.to_string(),
-                None,
-            )
-        })?;
+    remove_document(&tx, &doc_id).map_err(|e| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "delete_error",
+            e.to_string(),
+            None,
+        )
+    })?;
     tx.commit().map_err(|e| {
         api_error(
             StatusCode::INTERNAL_SERVER_ERROR,

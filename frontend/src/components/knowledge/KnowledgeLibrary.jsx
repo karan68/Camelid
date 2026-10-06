@@ -6,15 +6,20 @@ import {
   createCollection,
   deleteCollection,
   DOCUMENT_ACCEPT,
+  filesFromDrop,
   ingestLibraryFile,
+  isLibraryDocument,
   listLibraryDocuments,
   removeCollectionDocument,
   renameCollection,
 } from '../../lib/knowledgeCollections.js'
+import { WatchedFolders } from './WatchedFolders.jsx'
 import '../../styles/project-context.css'
 import '../../styles/knowledge.css'
 
 const countLabel = (count, one, many) => `${count.toLocaleString()} ${count === 1 ? one : many}`
+// A dropped folder is uploaded one file at a time; a larger tree belongs in a watched folder.
+const MAX_DROPPED_DOCUMENTS = 500
 const byFilename = (a, b) => a.filename.localeCompare(b.filename, undefined, { sensitivity: 'base' })
 
 /* Manage collections and their documents. Opened from the chat, it can also
@@ -28,12 +33,15 @@ export function KnowledgeLibrary({ collections, refresh, initialCollectionId = n
   const [working, setWorking] = useState('')
   const [error, setError] = useState('')
   const [confirmDelete, setConfirmDelete] = useState(false)
+  const [dropping, setDropping] = useState(false)
+  const [uploadProgress, setUploadProgress] = useState(null)
   const uploadRef = useRef(null)
 
   const loadDocuments = useCallback(async () => {
     try { setDocuments(await listLibraryDocuments()) } catch (failure) { setError(failure.message) }
   }, [])
   useEffect(() => { loadDocuments() }, [loadDocuments])
+  const refreshAll = useCallback(() => Promise.all([refresh(), loadDocuments()]), [refresh, loadDocuments])
 
   const list = collections || []
   const selected = list.find(item => item.id === selectedId) || list[0] || null
@@ -77,14 +85,41 @@ export function KnowledgeLibrary({ collections, refresh, initialCollectionId = n
     await removeCollectionDocument(selected.id, doc.id)
     await refresh()
   })
-  const upload = files => run('upload', async () => {
+  const upload = (items, skippedTypes = 0) => run('upload', async () => {
     const failures = []
-    for (const file of Array.from(files || [])) {
-      try { await ingestLibraryFile(file, [selected.id]) } catch (failure) { failures.push(failure.message) }
+    try {
+      for (const [index, { file, name }] of items.entries()) {
+        setUploadProgress({ done: index, total: items.length })
+        try { await ingestLibraryFile(file, [selected.id], name) } catch (failure) { failures.push(failure.message) }
+      }
+    } finally {
+      setUploadProgress(null)
     }
     await Promise.all([refresh(), loadDocuments()])
+    if (skippedTypes) failures.push(`Skipped ${countLabel(skippedTypes, 'file', 'files')} of a type the library does not read.`)
     if (failures.length) throw new Error(failures.join(' '))
   })
+  const pickFiles = files => upload(Array.from(files || []).map(file => ({ file, name: file.name })))
+  const dropFiles = event => {
+    event.preventDefault()
+    setDropping(false)
+    if (working) return
+    filesFromDrop(event.dataTransfer)
+      .then(found => {
+        const readable = found.filter(item => isLibraryDocument(item.name))
+        if (readable.length > MAX_DROPPED_DOCUMENTS) {
+          setError(`The drop holds ${readable.length} documents. Drop at most ${MAX_DROPPED_DOCUMENTS} at a time, or watch the folder instead.`)
+          return
+        }
+        if (found.length) upload(readable, found.length - readable.length)
+      })
+      .catch(failure => setError(failure?.message || 'Could not read the dropped files.'))
+  }
+  const dragOver = event => {
+    if (!Array.from(event.dataTransfer?.types || []).includes('Files')) return
+    event.preventDefault()
+    setDropping(true)
+  }
   const removeCollection = () => run('delete', async () => {
     setConfirmDelete(false)
     await deleteCollection(selected.id)
@@ -116,7 +151,8 @@ export function KnowledgeLibrary({ collections, refresh, initialCollectionId = n
             <button type="submit" className="cxturn__action" disabled={disabled || !newName.trim()} aria-label="Create collection"><IconPlus size={14} />Create</button>
           </form>
         </nav>
-        {selected ? <section className="knowledge-detail" aria-label={`Collection ${selected.name}`}>
+        {selected ? <section className={`knowledge-detail${dropping ? ' is-dropping' : ''}`} aria-label={`Collection ${selected.name}`}
+          onDragOver={dragOver} onDragLeave={event => { if (!event.currentTarget.contains(event.relatedTarget)) setDropping(false) }} onDrop={dropFiles}>
           <div className="context-row knowledge-detail__head">
             {renameDraft === null
               ? <h3>{selected.name}</h3>
@@ -131,7 +167,7 @@ export function KnowledgeLibrary({ collections, refresh, initialCollectionId = n
             </div>}
           </div>
           {confirmDelete && <div className="knowledge-confirm" role="group" aria-label={`Confirm deleting ${selected.name}`}>
-            <p>Delete {selected.name}? Its documents stay in your library. Chats and projects that searched it show it as unavailable.</p>
+            <p>Delete {selected.name}? Its documents stay in your library, and the folders it watches stop being watched. Chats and projects that searched it show it as unavailable.</p>
             <button type="button" className="context-primary knowledge-danger" disabled={disabled} onClick={removeCollection}>Delete collection</button>
             <button type="button" className="cxturn__action" onClick={() => setConfirmDelete(false)}>Cancel</button>
           </div>}
@@ -166,10 +202,14 @@ export function KnowledgeLibrary({ collections, refresh, initialCollectionId = n
               </button>}
             </details>
             <button type="button" className="cxturn__action knowledge-upload" disabled={disabled} onClick={() => uploadRef.current?.click()}>
-              {working === 'upload' ? 'Indexing…' : `Upload files into ${selected.name}`}
+              {working === 'upload'
+                ? (uploadProgress?.total > 1 ? `Indexing ${uploadProgress.done + 1} of ${uploadProgress.total}…` : 'Indexing…')
+                : `Upload files into ${selected.name}`}
             </button>
-            <input ref={uploadRef} type="file" multiple hidden accept={DOCUMENT_ACCEPT} aria-label={`Upload files into ${selected.name}`} onChange={event => { upload(event.target.files); event.target.value = '' }} />
+            <input ref={uploadRef} type="file" multiple hidden accept={DOCUMENT_ACCEPT} aria-label={`Upload files into ${selected.name}`} onChange={event => { pickFiles(event.target.files); event.target.value = '' }} />
+            <p className="context-muted knowledge-drop-hint">{dropping ? `Drop to add to ${selected.name}` : 'Or drop files or folders here.'}</p>
           </div>
+          <WatchedFolders collection={selected} onChanged={refreshAll} disabled={disabled} />
         </section> : <section className="knowledge-detail knowledge-detail--empty">
           <p className="context-muted">Create a collection to group documents, then use it in a chat or a project.</p>
         </section>}

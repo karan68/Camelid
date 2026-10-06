@@ -2,7 +2,8 @@
 //! or a project searches together.
 //!
 //! A collection only groups documents. Deleting a collection leaves its
-//! documents in the library; deleting a document removes it from every
+//! documents in the library and stops watching its folders (see
+//! `document_folders`); deleting a document removes it from every
 //! collection. Membership survives re-ingesting a document under the same id.
 
 use std::collections::HashSet;

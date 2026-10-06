@@ -6,6 +6,14 @@ const JSON_HEADERS = { 'Content-Type': 'application/json' }
 
 export const DOCUMENT_ACCEPT = '.pdf,.docx,.md,.txt,.csv,.json'
 
+/* The types the server reads, the same list a watched folder picks up. */
+const LIBRARY_EXTENSIONS = ['pdf', 'docx', 'md', 'txt', 'csv', 'json', 'rs', 'py', 'js']
+
+export function isLibraryDocument(name) {
+  const dot = String(name || '').lastIndexOf('.')
+  return dot > 0 && LIBRARY_EXTENSIONS.includes(name.slice(dot + 1).toLowerCase())
+}
+
 const readAsBase64 = blob => new Promise((resolve, reject) => {
   const reader = new FileReader()
   reader.onload = () => {
@@ -17,15 +25,17 @@ const readAsBase64 = blob => new Promise((resolve, reject) => {
   reader.readAsDataURL(blob)
 })
 
-/** Uploads one file into the library, optionally straight into collections. */
-export async function ingestLibraryFile(file, collectionIds = []) {
-  const lowerName = file.name.toLowerCase()
+/** Uploads one file into the library, optionally straight into collections.
+    `name` defaults to the file's own; a file from a dropped folder passes its
+    path inside that folder. */
+export async function ingestLibraryFile(file, collectionIds = [], name = file.name) {
+  const lowerName = name.toLowerCase()
   const isBinary = lowerName.endsWith('.pdf') || lowerName.endsWith('.docx')
   const response = await fetch('/api/documents/ingest', {
     method: 'POST',
     headers: JSON_HEADERS,
     body: JSON.stringify({
-      filename: file.name,
+      filename: name,
       content: isBinary ? await readAsBase64(file) : await file.text(),
       is_base64: isBinary,
       ...(collectionIds.length ? { collection_ids: collectionIds } : {}),
@@ -33,9 +43,37 @@ export async function ingestLibraryFile(file, collectionIds = []) {
   })
   if (!response.ok) {
     const failure = await response.json().catch(() => null)
-    throw new Error(failure?.error?.message || failure?.message || `Could not index ${file.name}.`)
+    throw new Error(failure?.error?.message || failure?.message || `Could not index ${name}.`)
   }
   return response.json()
+}
+
+const readEntries = reader => new Promise((resolve, reject) => reader.readEntries(resolve, reject))
+const entryFile = entry => new Promise((resolve, reject) => entry.file(resolve, reject))
+
+/** The files of a drop as `{ file, name }`, walking into dropped folders.
+    `name` is the path inside the drop; hidden entries are left out. Call it
+    from the drop handler itself: the browser forgets the items afterwards. */
+export async function filesFromDrop(dataTransfer) {
+  const entries = Array.from(dataTransfer?.items || [])
+    .filter(item => item.kind === 'file')
+    .map(item => item.webkitGetAsEntry?.())
+    .filter(Boolean)
+  if (!entries.length) return Array.from(dataTransfer?.files || []).map(file => ({ file, name: file.name }))
+  const found = []
+  const walk = async (entry, prefix) => {
+    if (entry.name.startsWith('.')) return
+    if (entry.isFile) {
+      found.push({ file: await entryFile(entry), name: `${prefix}${entry.name}` })
+    } else if (entry.isDirectory) {
+      const reader = entry.createReader()
+      for (let batch = await readEntries(reader); batch.length; batch = await readEntries(reader)) {
+        for (const child of batch) await walk(child, `${prefix}${entry.name}/`)
+      }
+    }
+  }
+  for (const entry of entries) await walk(entry, '')
+  return found
 }
 
 async function request(path, options = {}) {

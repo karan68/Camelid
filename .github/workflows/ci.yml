@@ -549,6 +549,10 @@ jobs:
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: npm run smoke:library-search-browser
 
+      - name: Frontend watched folders browser smoke
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: npm run smoke:watched-folders-browser
+
       # Keeps the stream event boundary used to separate research latency,
       # model TTFT, and post-first-content decode rate gated in CI. The Web Auto
       # smoke above covers cancellation; this lane covers SSE usage/fallbacks.
