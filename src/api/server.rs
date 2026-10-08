@@ -355,8 +355,12 @@ impl ServerPolicy {
         self.cors_origins.len()
     }
 
-    pub(crate) fn request_policy(&self) -> (ApiAuth, ApiSurface) {
-        (self.auth.clone(), self.api_surface)
+    pub(crate) fn request_policy(&self) -> (ApiAuth, ApiSurface, Arc<[HeaderValue]>) {
+        (
+            self.auth.clone(),
+            self.api_surface,
+            Arc::clone(&self.cors_origins),
+        )
     }
 
     pub(crate) fn api_surface(&self) -> ApiSurface {
@@ -365,7 +369,7 @@ impl ServerPolicy {
 }
 
 pub(crate) async fn authenticate(
-    State((auth, surface)): State<(ApiAuth, ApiSurface)>,
+    State((auth, surface, origins)): State<(ApiAuth, ApiSurface, Arc<[HeaderValue]>)>,
     request: Request,
     next: Next,
 ) -> Response {
@@ -378,7 +382,69 @@ pub(crate) async fn authenticate(
     if !surface.allows(request.method(), request.uri().path()) {
         return surface.forbidden();
     }
+    // CORS controls response visibility, but simple browser POSTs still execute.
+    // Explicit API credentials are not ambient browser credentials; otherwise
+    // a browser mutation must come from this origin or a configured CORS origin.
+    if !auth.enabled()
+        && !matches!(*request.method(), Method::GET | Method::HEAD)
+        && !browser_mutation_allowed(request.headers(), &origins)
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": {
+                "code": "untrusted_browser_origin",
+                "type": "permission_error",
+                "message": "browser mutations require the server origin or an explicitly configured CORS origin"
+            }})),
+        ).into_response();
+    }
     next.run(request).await
+}
+
+fn browser_mutation_allowed(headers: &axum::http::HeaderMap, allowed: &[HeaderValue]) -> bool {
+    if headers.get_all("origin").iter().count() > 1 {
+        return false;
+    }
+    if let Some(origin) = headers.get("origin") {
+        if allowed.contains(origin) {
+            return true;
+        }
+        let Some(origin) = origin
+            .to_str()
+            .ok()
+            .and_then(|value| value.parse::<axum::http::Uri>().ok())
+        else {
+            return false;
+        };
+        if !matches!(origin.scheme_str(), Some("http") | Some("https"))
+            || origin.path() != "/"
+            || origin.query().is_some()
+        {
+            return false;
+        }
+        let host = headers
+            .get("host")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<axum::http::uri::Authority>().ok());
+        // A matching Host proves nothing about a domain name: DNS rebinding
+        // points an attacker's name at this listener, so Origin and Host agree.
+        // Only names that cannot be rebound count as this server's own origin;
+        // a hostname in front of Camelid is listed with `--cors-origin`.
+        return host.as_ref().is_some_and(|host| {
+            origin.authority() == Some(host) && unrebindable_host(host.host())
+        });
+    }
+    // Origin-less CLI clients keep working. Browser fetch metadata still rejects
+    // cross-site and same-site requests whose Origin was stripped or omitted.
+    headers
+        .get("sec-fetch-site")
+        .is_none_or(|value| value == "same-origin" || value == "none")
+}
+
+/// An IP literal, or `localhost`, which browsers resolve to loopback without DNS.
+fn unrebindable_host(host: &str) -> bool {
+    let host = host.trim_matches(['[', ']']);
+    host.eq_ignore_ascii_case("localhost") || host.parse::<std::net::IpAddr>().is_ok()
 }
 
 fn parse_bearer(value: &str) -> Option<&str> {
@@ -486,6 +552,143 @@ mod tests {
         http::{header::ORIGIN, Request},
     };
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn anonymous_mutations_reject_untrusted_browser_origins() {
+        let app = super::super::router();
+        for path in [
+            "/api/models/unload",
+            "/api/runtime/kv-cache/purge",
+            "/api/speech/install",
+        ] {
+            for content_type in [
+                None,
+                Some("text/plain"),
+                Some("application/x-www-form-urlencoded"),
+            ] {
+                let mut request = Request::builder()
+                    .method(Method::POST)
+                    .uri(path)
+                    .header("host", "127.0.0.1:8181")
+                    .header(ORIGIN, "https://untrusted.example")
+                    .header("sec-fetch-site", "cross-site");
+                if let Some(content_type) = content_type {
+                    request = request.header(CONTENT_TYPE, content_type);
+                }
+                let response = app
+                    .clone()
+                    .oneshot(request.body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}");
+                let body = axum::body::to_bytes(response.into_body(), 4096)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    serde_json::from_slice::<serde_json::Value>(&body).unwrap()["error"]["code"],
+                    "untrusted_browser_origin"
+                );
+            }
+        }
+        for (name, value) in [
+            ("origin", "null"),
+            ("origin", "invalid"),
+            ("sec-fetch-site", "cross-site"),
+            ("sec-fetch-site", "same-site"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/api/models/unload")
+                        .header("host", "127.0.0.1:8181")
+                        .header(name, value)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
+    }
+
+    #[tokio::test]
+    async fn mutations_preserve_cli_same_origin_allowed_cors_and_explicit_credentials() {
+        for (key, origin, cors) in [
+            (None, None, None),
+            (None, Some("http://127.0.0.1:8181"), None),
+            (
+                None,
+                Some("https://allowed.example"),
+                Some("https://allowed.example"),
+            ),
+            (Some("test-key"), Some("https://other.example"), None),
+        ] {
+            let policy = ServerPolicy::resolve(
+                SocketAddr::from(([127, 0, 0, 1], 8181)),
+                ServeOptions {
+                    api_key: key.map(str::to_owned),
+                    cors_origins: cors
+                        .map(|origin| vec![origin.to_owned()])
+                        .unwrap_or_default(),
+                    ..ServeOptions::default()
+                },
+            )
+            .unwrap();
+            let state = super::super::AppState::default().with_server_policy(&policy);
+            let app = super::super::router_with_state_and_policy(state, policy);
+            let mut request = Request::builder()
+                .method(Method::POST)
+                .uri("/api/models/unload")
+                .header("host", "127.0.0.1:8181");
+            if let Some(origin) = origin {
+                request = request.header(ORIGIN, origin);
+            }
+            if let Some(key) = key {
+                request = request.header(&X_API_KEY, key);
+            }
+            assert_eq!(
+                app.oneshot(request.body(Body::empty()).unwrap())
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::NO_CONTENT
+            );
+        }
+    }
+
+    #[test]
+    fn a_rebound_hostname_is_not_this_servers_own_origin() {
+        let headers = |host: &str, origin: &str| {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert("host", host.parse().unwrap());
+            headers.insert("origin", origin.parse().unwrap());
+            headers
+        };
+        // DNS rebinding: the attacker's name resolves here, so Origin and Host agree.
+        assert!(!browser_mutation_allowed(
+            &headers("attacker.example:8181", "http://attacker.example:8181"),
+            &[]
+        ));
+        for (host, origin) in [
+            ("127.0.0.1:8181", "http://127.0.0.1:8181"),
+            ("localhost:8181", "http://localhost:8181"),
+            ("[::1]:8181", "http://[::1]:8181"),
+            ("203.0.113.20:8181", "http://203.0.113.20:8181"),
+        ] {
+            assert!(
+                browser_mutation_allowed(&headers(host, origin), &[]),
+                "{origin}"
+            );
+        }
+        // A hostname in front of Camelid is trusted once it is configured.
+        let configured = [HeaderValue::from_static("https://camelid.example")];
+        assert!(browser_mutation_allowed(
+            &headers("camelid.example", "https://camelid.example"),
+            &configured
+        ));
+    }
 
     #[test]
     fn remote_listener_requires_auth_or_explicit_override() {
