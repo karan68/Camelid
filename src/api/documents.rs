@@ -11,6 +11,7 @@ mod storage;
 
 use std::collections::{HashMap, HashSet};
 use std::io::{Cursor, Read};
+use std::panic::AssertUnwindSafe;
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -156,6 +157,16 @@ fn is_markup(filename: &str) -> bool {
 /// text extension is no guarantee: `.ts` is also a video container.
 fn looks_binary(bytes: &[u8]) -> bool {
     bytes.iter().take(8 * 1024).any(|&byte| byte == 0)
+}
+
+/// Reads a document's text, or `None` when its reader fails on the file. A
+/// parser that panics on a damaged or unusual file (the PDF reader's CMap
+/// parser does) costs that one document, not the request or scan reading it.
+pub(crate) fn read_document(filename: &str, raw_bytes: &[u8]) -> Option<String> {
+    std::panic::catch_unwind(AssertUnwindSafe(|| {
+        extract_text_from_bytes(filename, raw_bytes)
+    }))
+    .ok()
 }
 
 /// Extract clean textual tokens from supported document formats.
@@ -366,14 +377,15 @@ pub async fn ingest_document(
                 )
             })?;
         let digest = sha256_hex(&decoded);
-        (extract_text_from_bytes(&filename, &decoded), digest)
+        let text = read_document(&filename, &decoded)
+            .ok_or_else(|| StoreError::Unreadable.into_response())?;
+        (text, digest)
     } else {
         let digest = sha256_hex(payload.content.as_bytes());
         if is_markup(&filename) {
-            (
-                extract_text_from_bytes(&filename, payload.content.as_bytes()),
-                digest,
-            )
+            let text = read_document(&filename, payload.content.as_bytes())
+                .ok_or_else(|| StoreError::Unreadable.into_response())?;
+            (text, digest)
         } else {
             (payload.content, digest)
         }
@@ -450,6 +462,8 @@ pub(crate) struct NewDocument<'a> {
 #[derive(Debug)]
 pub(crate) enum StoreError {
     Empty,
+    /// The file's reader failed on it.
+    Unreadable,
     Collection(CollectionError),
     Database(&'static str, rusqlite::Error),
 }
@@ -461,6 +475,14 @@ impl StoreError {
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "empty_document",
                 "The document did not contain any readable text.".to_string(),
+                None,
+            ),
+            Self::Unreadable => api_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "extract_failed",
+                "The document could not be read: the file is damaged, or uses a feature \
+                 Camelid's reader does not support."
+                    .to_string(),
                 None,
             ),
             Self::Collection(error) => error.into_response(),
@@ -1412,6 +1434,56 @@ mod tests {
         assert_eq!(extract_text_from_bytes("clip.ts", &video), "");
         assert!(chunk_document(&extract_text_from_bytes("clip.ts", &video)).is_empty());
         assert_eq!(extract_text_from_bytes("notes.txt", b"plain"), "plain");
+    }
+
+    /// A one-page PDF whose font's ToUnicode CMap holds a malformed hex
+    /// string, which panics the PDF reader's CMap parser.
+    fn pdf_with_malformed_cmap() -> Vec<u8> {
+        let cmap = "begincmap\n1 begincodespacerange\n<00> <FF>\nendcodespacerange\n\
+                    1 beginbfchar\n<041> <0041>\nendbfchar\nendcmap";
+        let content = "BT /F1 12 Tf 72 720 Td <41> Tj ET";
+        let objects = [
+            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+             /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>"
+                .to_string(),
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /ToUnicode 6 0 R >>".to_string(),
+            format!(
+                "<< /Length {} >>\nstream\n{content}\nendstream",
+                content.len()
+            ),
+            format!("<< /Length {} >>\nstream\n{cmap}\nendstream", cmap.len()),
+        ];
+        let mut pdf = String::from("%PDF-1.4\n");
+        let mut offsets = Vec::new();
+        for (index, body) in objects.iter().enumerate() {
+            offsets.push(pdf.len());
+            pdf.push_str(&format!("{} 0 obj\n{body}\nendobj\n", index + 1));
+        }
+        let xref = pdf.len();
+        pdf.push_str(&format!(
+            "xref\n0 {}\n0000000000 65535 f \n",
+            objects.len() + 1
+        ));
+        for offset in offsets {
+            pdf.push_str(&format!("{offset:010} 00000 n \n"));
+        }
+        pdf.push_str(&format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+            objects.len() + 1
+        ));
+        pdf.into_bytes()
+    }
+
+    #[test]
+    fn a_file_its_reader_fails_on_is_refused_not_a_dropped_request() {
+        let pdf = pdf_with_malformed_cmap();
+        assert!(std::panic::catch_unwind(|| extract_text_from_bytes("bad.pdf", &pdf)).is_err());
+        assert_eq!(read_document("bad.pdf", &pdf), None);
+        let response = StoreError::Unreadable.into_response();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(read_document("ok.txt", b"fine").as_deref(), Some("fine"));
     }
 
     #[test]

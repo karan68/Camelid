@@ -12,7 +12,6 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -507,9 +506,7 @@ fn read_document(file: &FoundFile, known: Option<&Known>) -> Read {
         return Read::Same(sha256);
     }
     // A malformed file must not end the scan for every file after it.
-    let Ok(text) = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        documents::extract_text_from_bytes(&file.rel_path, &bytes)
-    })) else {
+    let Some(text) = documents::read_document(&file.rel_path, &bytes) else {
         return Read::Skip(EXTRACT_FAILED, Some(sha256));
     };
     let chunks = documents::chunk_document(&text);
