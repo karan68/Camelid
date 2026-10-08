@@ -30,7 +30,7 @@ is deterministic; see *Not covered*.
 483 real PDFs were tried to get 450 in. The 33 refused are listed in
 `data/ingest.json`:
 
-- **21 × `422 extract_failed`.** The PDF reader (pdf-extract, via
+- **22 × `422 extract_failed`.** The PDF reader (pdf-extract, via
   adobe-cmap-parser) panics on them. Before this branch the upload handler did
   not catch that, and the client saw the connection close with no response.
 - **10 × `413` and 1 broken pipe**: PDFs of 12.7–14.6 MB. Uploads are base64 JSON
@@ -151,7 +151,7 @@ this branch.
 - **A screenshot of clicking a citation on this library.** The viewer is
   covered by the browser smokes above against fixtures; on this library it was
   checked through the API it calls.
-- The 21 PDFs pdf-extract cannot read are reported above and not fixed here.
+- The 22 PDFs pdf-extract cannot read are reported above and not fixed here.
 
 ## Files
 
