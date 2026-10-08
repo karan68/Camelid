@@ -15,6 +15,7 @@ use std::panic::AssertUnwindSafe;
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path as AxumPath, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -103,6 +104,15 @@ pub(crate) fn open_connection() -> Result<Connection, rusqlite::Error> {
     init_db(&conn)?;
     Ok(conn)
 }
+
+/// The largest file the library reads, uploaded or from a watched folder.
+pub(crate) const MAX_DOCUMENT_BYTES: usize = 64 * 1024 * 1024;
+
+/// The body limit of `POST /api/documents/ingest`. An upload carries its file
+/// as base64 inside JSON, 4 bytes for every 3, plus the filename and the rest
+/// of the request; the route takes a file of `MAX_DOCUMENT_BYTES` even when the
+/// server-wide request limit is lower.
+pub(crate) const MAX_INGEST_BODY_BYTES: usize = MAX_DOCUMENT_BYTES.div_ceil(3) * 4 + 64 * 1024;
 
 /// How a library document's bytes become its canonical text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -357,8 +367,15 @@ pub struct DocumentMetaView {
 /// Endpoint: `POST /api/documents/ingest`
 pub async fn ingest_document(
     State(state): State<AppState>,
-    Json(payload): Json<IngestDocumentRequest>,
+    payload: Result<Json<IngestDocumentRequest>, JsonRejection>,
 ) -> Result<Json<IngestDocumentResponse>, Response> {
+    let Json(payload) = payload.map_err(|rejection| {
+        if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
+            StoreError::TooLarge.into_response()
+        } else {
+            super::malformed_json_error(rejection)
+        }
+    })?;
     let doc_id = payload
         .doc_id
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
@@ -376,11 +393,17 @@ pub async fn ingest_document(
                     None,
                 )
             })?;
+        if decoded.len() > MAX_DOCUMENT_BYTES {
+            return Err(StoreError::TooLarge.into_response());
+        }
         let digest = sha256_hex(&decoded);
         let text = read_document(&filename, &decoded)
             .ok_or_else(|| StoreError::Unreadable.into_response())?;
         (text, digest)
     } else {
+        if payload.content.len() > MAX_DOCUMENT_BYTES {
+            return Err(StoreError::TooLarge.into_response());
+        }
         let digest = sha256_hex(payload.content.as_bytes());
         if is_markup(&filename) {
             let text = read_document(&filename, payload.content.as_bytes())
@@ -464,6 +487,8 @@ pub(crate) enum StoreError {
     Empty,
     /// The file's reader failed on it.
     Unreadable,
+    /// The file is larger than `MAX_DOCUMENT_BYTES`.
+    TooLarge,
     Collection(CollectionError),
     Database(&'static str, rusqlite::Error),
 }
@@ -475,6 +500,15 @@ impl StoreError {
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "empty_document",
                 "The document did not contain any readable text.".to_string(),
+                None,
+            ),
+            Self::TooLarge => api_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "document_too_large",
+                format!(
+                    "The file is larger than {} MB, the most the Knowledge Library reads.",
+                    MAX_DOCUMENT_BYTES / (1024 * 1024)
+                ),
                 None,
             ),
             Self::Unreadable => api_error(
@@ -1484,6 +1518,66 @@ mod tests {
         let response = StoreError::Unreadable.into_response();
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(read_document("ok.txt", b"fine").as_deref(), Some("fine"));
+    }
+
+    fn ingest_request(body: Vec<u8>) -> axum::http::Request<axum::body::Body> {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/documents/ingest")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body))
+            .unwrap()
+    }
+
+    async fn error_code(response: Response) -> serde_json::Value {
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap()["error"]["code"].clone()
+    }
+
+    /// Every request here is refused before the handler opens a library.
+    #[tokio::test]
+    async fn an_upload_is_held_to_the_library_limit_not_the_server_wide_one() {
+        use tower::ServiceExt;
+        let app = crate::api::router_with_state(AppState::default());
+        let server_wide = crate::api::server::DEFAULT_MAX_REQUEST_BODY_BYTES;
+
+        // Past the server-wide limit and within the route's: read in full.
+        let response = app
+            .clone()
+            .oneshot(ingest_request(vec![b'x'; server_wide + 1]))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(error_code(response).await, "malformed_json");
+
+        // A file of exactly the limit fits the route, sent as base64.
+        assert!(
+            MAX_DOCUMENT_BYTES.div_ceil(3) * 4 + 1024 <= MAX_INGEST_BODY_BYTES,
+            "a {MAX_DOCUMENT_BYTES}-byte file must fit the ingest body limit"
+        );
+
+        // One byte over the limit, sent as base64: typed, before anything is read.
+        use base64::Engine;
+        let encoded =
+            base64::engine::general_purpose::STANDARD.encode(vec![b'a'; MAX_DOCUMENT_BYTES + 1]);
+        let body = format!(r#"{{"filename":"big.txt","content":"{encoded}","is_base64":true}}"#);
+        let response = app
+            .clone()
+            .oneshot(ingest_request(body.into_bytes()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(error_code(response).await, "document_too_large");
+
+        // Past the route's own limit: the same typed refusal, not plain text.
+        let response = app
+            .oneshot(ingest_request(vec![b'x'; MAX_INGEST_BODY_BYTES + 1]))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(error_code(response).await, "document_too_large");
     }
 
     #[test]

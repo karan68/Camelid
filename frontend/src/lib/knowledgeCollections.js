@@ -14,6 +14,10 @@ const LIBRARY_EXTENSIONS = ['txt', 'md', 'csv', 'json', 'html', 'htm', 'docx', '
 
 export const DOCUMENT_ACCEPT = LIBRARY_EXTENSIONS.map(extension => `.${extension}`).join(',')
 
+/* The largest file the server reads, uploaded or from a watched folder
+   (`MAX_DOCUMENT_BYTES` in src/api/documents.rs). */
+const MAX_DOCUMENT_BYTES = 64 * 1024 * 1024
+
 export function isLibraryDocument(name) {
   const dot = String(name || '').lastIndexOf('.')
   return dot > 0 && LIBRARY_EXTENSIONS.includes(name.slice(dot + 1).toLowerCase())
@@ -34,6 +38,7 @@ const readAsBase64 = blob => new Promise((resolve, reject) => {
     `name` defaults to the file's own; a file from a dropped folder passes its
     path inside that folder. */
 export async function ingestLibraryFile(file, collectionIds = [], name = file.name, apiBase = getApiBase()) {
+  if (file.size > MAX_DOCUMENT_BYTES) throw new Error(`${name} is larger than 64 MB, the most the library reads.`)
   const lowerName = name.toLowerCase()
   // Sent as bytes so the server reads them and hashes the file exactly as it is on disk.
   const isBinary = ['.pdf', '.docx', '.html', '.htm'].some(extension => lowerName.endsWith(extension))

@@ -100,7 +100,7 @@ a message is sent without the library, still searching what is attached. How
   and its headings become Markdown headings, so each section is chunked and cited
   on its own. Its citations still bind the original file's bytes. A text or code
   file with a NUL byte in its first 8 KiB is binary, not text, and is skipped as
-  having no text.
+  having no text. A file over 64 MB is refused, whether uploaded or watched.
 - Reference files are static UTF-8 copies: text, Markdown, code, CSV, or JSON.
   Re-add a file to update its contents. PDF and DOCX extraction continue to use
   the separate document attachment controls.

@@ -37,7 +37,7 @@ const MAX_FOLDER_ENTRIES: usize = 200_000;
 /// Folder nesting a scan descends; deeper folders are not read.
 const MAX_FOLDER_DEPTH: usize = 32;
 /// A larger file is listed as skipped instead of read.
-pub(crate) const MAX_DOCUMENT_BYTES: u64 = 64 * 1024 * 1024;
+pub(crate) const MAX_DOCUMENT_BYTES: u64 = documents::MAX_DOCUMENT_BYTES as u64;
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
 const LISTED_SKIPS: usize = 50;
 
