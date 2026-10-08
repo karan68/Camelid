@@ -6,6 +6,7 @@
 //! the whole library, named documents, or named collections
 //! (see `document_collections`).
 
+mod html;
 mod storage;
 
 use std::collections::{HashMap, HashSet};
@@ -102,55 +103,79 @@ pub(crate) fn open_connection() -> Result<Connection, rusqlite::Error> {
     Ok(conn)
 }
 
-/// The file types `extract_text_from_bytes` reads, and the only ones a watched
-/// folder picks up. An upload of any other type is read as lossy UTF-8.
-pub(crate) const DOCUMENT_EXTENSIONS: &[&str] =
-    &["txt", "md", "csv", "json", "rs", "py", "js", "docx", "pdf"];
+/// How a library document's bytes become its canonical text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DocumentKind {
+    /// Read as UTF-8 exactly as written: plain text, Markdown, data and source code.
+    Text,
+    Html,
+    Docx,
+    Pdf,
+}
 
-pub(crate) fn has_document_extension(filename: &str) -> bool {
-    filename.rsplit_once('.').is_some_and(|(_, extension)| {
-        DOCUMENT_EXTENSIONS
+/// The file types the library reads, and the only ones a watched folder picks
+/// up. An upload of any other type is read as lossy UTF-8. The web UI keeps
+/// the same list in `frontend/src/lib/knowledgeCollections.js`; a test holds
+/// the two together.
+const DOCUMENT_TYPES: &[(&[&str], DocumentKind)] = &[
+    (&["txt", "md", "csv", "json"], DocumentKind::Text),
+    (&["html", "htm"], DocumentKind::Html),
+    (&["docx"], DocumentKind::Docx),
+    (&["pdf"], DocumentKind::Pdf),
+    (
+        &[
+            "rs", "py", "js", "mjs", "cjs", "jsx", "ts", "tsx", "go", "java", "kt", "kts", "swift",
+            "c", "h", "cc", "cpp", "cxx", "hpp", "hh", "cs", "rb", "php", "scala", "lua", "dart",
+            "sh", "bash", "zsh", "sql",
+        ],
+        DocumentKind::Text,
+    ),
+];
+
+fn document_kind(filename: &str) -> Option<DocumentKind> {
+    let (_, extension) = filename.rsplit_once('.')?;
+    DOCUMENT_TYPES.iter().find_map(|(extensions, kind)| {
+        extensions
             .iter()
             .any(|known| extension.eq_ignore_ascii_case(known))
+            .then_some(*kind)
     })
+}
+
+pub(crate) fn has_document_extension(filename: &str) -> bool {
+    document_kind(filename).is_some()
+}
+
+/// Whether text sent as a string is markup the library reads for its text,
+/// rather than storing as written.
+fn is_markup(filename: &str) -> bool {
+    document_kind(filename) == Some(DocumentKind::Html)
+}
+
+/// A NUL byte in the first 8 KiB marks a binary file, the test `git` uses. A
+/// text extension is no guarantee: `.ts` is also a video container.
+fn looks_binary(bytes: &[u8]) -> bool {
+    bytes.iter().take(8 * 1024).any(|&byte| byte == 0)
 }
 
 /// Extract clean textual tokens from supported document formats.
 pub fn extract_text_from_bytes(filename: &str, raw_bytes: &[u8]) -> String {
-    let lower = filename.to_lowercase();
-    if lower.ends_with(".txt")
-        || lower.ends_with(".md")
-        || lower.ends_with(".csv")
-        || lower.ends_with(".json")
-        || lower.ends_with(".rs")
-        || lower.ends_with(".py")
-        || lower.ends_with(".js")
-    {
-        return String::from_utf8_lossy(raw_bytes).to_string();
-    }
-
-    // DOCX is a ZIP container. Read the actual XML entry so deflated documents
-    // work as well as the uncommon uncompressed form.
-    if lower.ends_with(".docx") {
-        if let Ok(archive) = zip_extract_text(raw_bytes) {
-            if !archive.is_empty() {
-                return archive;
+    match document_kind(filename) {
+        Some(DocumentKind::Text) => {
+            if looks_binary(raw_bytes) {
+                return String::new();
             }
+            String::from_utf8_lossy(raw_bytes).to_string()
         }
-        return String::new();
+        Some(DocumentKind::Html) => html::extract_text(raw_bytes),
+        // DOCX is a ZIP container. Read the actual XML entry so deflated
+        // documents work as well as the uncommon uncompressed form.
+        Some(DocumentKind::Docx) => zip_extract_text(raw_bytes).unwrap_or_default(),
+        // Let a PDF parser handle compressed streams, encodings, and font maps.
+        Some(DocumentKind::Pdf) => pdf_extract_text(raw_bytes),
+        // Fallback: extract readable UTF-8 strings
+        None => String::from_utf8_lossy(raw_bytes).to_string(),
     }
-
-    // Let a PDF parser handle compressed streams, encodings, and font maps.
-    if lower.ends_with(".pdf") {
-        let extracted = pdf_extract_text(raw_bytes);
-        if !extracted.is_empty() {
-            return extracted;
-        }
-        return String::new();
-    }
-
-    // Fallback: extract readable UTF-8 strings
-    String::from_utf8_lossy(raw_bytes).to_string()
 }
 
 fn zip_extract_text(bytes: &[u8]) -> Result<String, ()> {
@@ -344,7 +369,14 @@ pub async fn ingest_document(
         (extract_text_from_bytes(&filename, &decoded), digest)
     } else {
         let digest = sha256_hex(payload.content.as_bytes());
-        (payload.content, digest)
+        if is_markup(&filename) {
+            (
+                extract_text_from_bytes(&filename, payload.content.as_bytes()),
+                digest,
+            )
+        } else {
+            (payload.content, digest)
+        }
     };
 
     let chunks = chunk_document(&text_content);
@@ -1344,6 +1376,137 @@ mod tests {
         assert_eq!(
             extract_text_from_bytes("NOTES.DOCX", &bytes),
             "One & two three"
+        );
+    }
+
+    #[test]
+    fn html_and_source_code_are_library_documents() {
+        for name in [
+            "page.html",
+            "PAGE.HTM",
+            "main.go",
+            "App.tsx",
+            "lib.cpp",
+            "q.SQL",
+            "run.sh",
+        ] {
+            assert!(has_document_extension(name), "{name}");
+        }
+        for name in ["photo.png", "archive.zip", "README", "notes.", "data.xlsx"] {
+            assert!(!has_document_extension(name), "{name}");
+        }
+        assert_eq!(
+            extract_text_from_bytes("Guide.HTML", b"<h2>Refunds</h2><p>Five &amp; days.</p>"),
+            "## Refunds\n\nFive & days."
+        );
+        assert_eq!(
+            extract_text_from_bytes("main.go", b"package main\n\nfunc main() {}\n"),
+            "package main\n\nfunc main() {}\n"
+        );
+    }
+
+    #[test]
+    fn a_binary_file_with_a_text_extension_reads_as_empty() {
+        let mut video = vec![0x47, 0x40, 0x00, 0x10, 0x00];
+        video.extend_from_slice(b"looks like text later");
+        assert_eq!(extract_text_from_bytes("clip.ts", &video), "");
+        assert!(chunk_document(&extract_text_from_bytes("clip.ts", &video)).is_empty());
+        assert_eq!(extract_text_from_bytes("notes.txt", b"plain"), "plain");
+    }
+
+    #[test]
+    fn markup_sent_as_text_is_read_for_its_text() {
+        assert!(is_markup("index.html") && is_markup("INDEX.HTM"));
+        assert!(!is_markup("notes.md") && !is_markup("page.html.txt"));
+    }
+
+    /// The web UI offers and uploads the same types the server reads.
+    #[test]
+    fn the_web_ui_offers_exactly_the_library_document_types() {
+        let source = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/frontend/src/lib/knowledgeCollections.js"
+        ))
+        .unwrap();
+        let list = source
+            .split_once("const LIBRARY_EXTENSIONS = [")
+            .and_then(|(_, rest)| rest.split_once(']'))
+            .map(|(list, _)| list)
+            .expect("LIBRARY_EXTENSIONS in knowledgeCollections.js");
+        let mut frontend: Vec<String> = list
+            .split(',')
+            .map(|item| item.trim().trim_matches('\'').to_string())
+            .filter(|item| !item.is_empty())
+            .collect();
+        let mut server: Vec<String> = DOCUMENT_TYPES
+            .iter()
+            .flat_map(|(extensions, _)| extensions.iter().map(|ext| ext.to_string()))
+            .collect();
+        frontend.sort();
+        server.sort();
+        assert_eq!(frontend, server);
+    }
+
+    #[test]
+    fn an_html_page_is_stored_searched_and_cited_by_its_text() {
+        let conn = library();
+        // Long enough to span several windows, so the chunker has a choice of where to cut.
+        let refunds =
+            "Refunds are paid within <b>five</b> business days to the card that was charged. "
+                .repeat(4);
+        let security =
+            "We notify affected customers within 72 hours of confirming an incident. ".repeat(4);
+        let page = format!(
+            "<html><head><title>Support policy</title><style>.x{{}}</style></head><body>\
+             <h1>Support policy</h1><h2>Refunds</h2><p>{refunds}</p>\
+             <h2>Security incidents</h2><p>{security}</p>\
+             <script>var refund = 'not page text';</script></body></html>"
+        );
+        let text = extract_text_from_bytes("policy.html", page.as_bytes());
+        assert!(!text.contains('<') && !text.contains("not page text"));
+        let chunks = chunk_document(&text);
+        // Each heading starts its own chunk, so a section is cited on its own.
+        assert!(chunks
+            .iter()
+            .any(|chunk| chunk.text.starts_with("## Security incidents")));
+
+        store_document(
+            &conn,
+            &NewDocument {
+                doc_id: "policy",
+                filename: "policy.html",
+                text: &text,
+                source_sha256: &sha256_hex(page.as_bytes()),
+                collection_ids: &[],
+            },
+            &chunks,
+        )
+        .unwrap();
+        let file_type: String = conn
+            .query_row(
+                "SELECT file_type FROM documents WHERE id = 'policy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(file_type, "html");
+
+        let (results, _) = run_search(&conn, &plan("notify customers hours", None)).unwrap();
+        let top = &results[0];
+        assert!(
+            top.excerpt.starts_with("## Security incidents"),
+            "{:?}",
+            top.excerpt
+        );
+        let (start, end) = (top.byte_start.unwrap(), top.byte_end.unwrap());
+        assert_eq!(&text[start..end], top.excerpt);
+        assert_eq!(
+            top.chunk_sha256.as_deref(),
+            Some(sha256_hex(top.excerpt.as_bytes()).as_str())
+        );
+        assert_eq!(
+            top.doc_sha256.as_deref(),
+            Some(sha256_hex(text.as_bytes()).as_str())
         );
     }
 
