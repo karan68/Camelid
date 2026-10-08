@@ -33,11 +33,12 @@ is deterministic; see *Not covered*.
 - **21 × `422 extract_failed`.** The PDF reader (pdf-extract, via
   adobe-cmap-parser) panics on them. Before this branch the upload handler did
   not catch that, and the client saw the connection close with no response.
-- **11 × `413` and 1 broken pipe**: PDFs of 12.7–14.6 MB. Uploads are base64 JSON
-  under the 16 MiB request-body limit, so the largest PDF an upload accepts is
+- **10 × `413` and 1 broken pipe**: PDFs of 12.7–14.6 MB. Uploads are base64 JSON
+  under the 16 MiB request-body limit, so the largest PDF an upload accepted was
   about 12 MB (the largest accepted was 12,145,421 bytes), while a watched
-  folder reads files up to 64 MB. The 413 is axum's plain-text rejection, not a
-  typed Camelid error. Not changed here.
+  folder reads files up to 64 MB. The 413 was axum's plain-text rejection, not a
+  typed Camelid error. **Fixed on this branch after the run**; see *Upload size,
+  after the fix*.
 
 | Ingest | |
 | --- | --- |
@@ -129,6 +130,18 @@ of the two altered documents are refused as expected; 0 failures.
 `data/retrieve-after-restart.json`: 47 / 50 first; the three misses are exactly
 facts 7, 12 and 20, the ones corrupted above.
 
+## Upload size, after the fix
+
+`data/large-uploads.json`, build `v0.7.8-31-g6f271e78`, fresh library,
+`harness/large_uploads.py`. That commit's message was later corrected; its
+source tree `a14190e1` is identical to the upload-limit commit `54f1a5bb` on
+this branch.
+
+- The **11** PDFs refused for size above (12.7–14.6 MB) **all ingest** now:
+  3,408 chunks, and **3,408 / 3,408** of their citations resolve.
+- A file of 64 MB + 1 byte is refused with **`413 document_too_large`**: "The
+  file is larger than 64 MB, the most the Knowledge Library reads."
+
 ## Not covered
 
 - **Search by meaning at this scale.** Ranking was keyword only. The encoder
@@ -138,12 +151,12 @@ facts 7, 12 and 20, the ones corrupted above.
 - **A screenshot of clicking a citation on this library.** The viewer is
   covered by the browser smokes above against fixtures; on this library it was
   checked through the API it calls.
-- The 413 refusal and the ~12 MB upload ceiling, and the 21 PDFs pdf-extract
-  cannot read, are reported above and not fixed here.
+- The 21 PDFs pdf-extract cannot read are reported above and not fixed here.
 
 ## Files
 
 - `harness/` — `fetch_arxiv.py`, `make_planted_pdfs.py`, `gate.py` (all phases),
-  `run_gate.sh` (the main run), `run_chat2.sh` (the chat re-run).
+  `run_gate.sh` (the main run), `run_chat2.sh` (the chat re-run),
+  `large_uploads.py` (the upload-size check).
 - `data/` — one JSON per phase; `run2-ingest.json` is the re-run's ingest.
 - `source/` — the arXiv manifest, the planted facts, and the planted PDFs' sha256.
