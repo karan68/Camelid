@@ -170,13 +170,14 @@ fn looks_binary(bytes: &[u8]) -> bool {
 }
 
 /// Reads a document's text, or `None` when its reader fails on the file. A
-/// parser that panics on a damaged or unusual file (the PDF reader's CMap
-/// parser does) costs that one document, not the request or scan reading it.
+/// parser that panics on a damaged or unusual file costs that one document,
+/// not the request or scan reading it.
 pub(crate) fn read_document(filename: &str, raw_bytes: &[u8]) -> Option<String> {
-    std::panic::catch_unwind(AssertUnwindSafe(|| {
-        extract_text_from_bytes(filename, raw_bytes)
-    }))
-    .ok()
+    guarded(|| extract_text_from_bytes(filename, raw_bytes))
+}
+
+fn guarded(read: impl FnOnce() -> String) -> Option<String> {
+    std::panic::catch_unwind(AssertUnwindSafe(read)).ok()
 }
 
 /// Extract clean textual tokens from supported document formats.
@@ -237,9 +238,41 @@ fn decode_xml_entities(value: &str) -> String {
         .replace("&amp;", "&")
 }
 
+/// A PDF's text. pdf-extract reads most PDFs best, but panics on some real
+/// ones (a font map it cannot parse); then, or when it finds no text, lopdf
+/// reads the file page by page, leaving out only a page it cannot read. A PDF
+/// that pdf-extract reads gives exactly the text it always did.
 fn pdf_extract_text(bytes: &[u8]) -> String {
-    pdf_extract::extract_text_from_mem(bytes)
-        .unwrap_or_default()
+    let primary = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        pdf_extract::extract_text_from_mem(bytes)
+    }))
+    .ok()
+    .and_then(Result::ok)
+    .map(|text| text.split_whitespace().collect::<Vec<_>>().join(" "))
+    .unwrap_or_default();
+    if !primary.is_empty() {
+        return primary;
+    }
+    lopdf_page_text(bytes)
+}
+
+/// Every page lopdf can read, in order. A glyph lopdf cannot map to a
+/// character comes out as U+FFFD; it carries no meaning and would only clutter
+/// search and citations, so it is dropped.
+fn lopdf_page_text(bytes: &[u8]) -> String {
+    let Ok(Ok(document)) = std::panic::catch_unwind(|| lopdf::Document::load_mem(bytes)) else {
+        return String::new();
+    };
+    let mut text = String::new();
+    for page in document.get_pages().into_keys() {
+        if let Ok(Ok(page_text)) =
+            std::panic::catch_unwind(AssertUnwindSafe(|| document.extract_text(&[page])))
+        {
+            text.push_str(&page_text);
+            text.push(' ');
+        }
+    }
+    text.replace('\u{fffd}', " ")
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
@@ -1510,11 +1543,82 @@ mod tests {
         pdf.into_bytes()
     }
 
+    /// A one-page PDF with plain text in a standard font: what lopdf reads
+    /// when pdf-extract cannot.
+    fn simple_pdf(text: &str) -> Vec<u8> {
+        let content = format!("BT /F1 12 Tf 72 720 Td ({text}) Tj ET");
+        let objects = [
+            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+             /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>"
+                .to_string(),
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
+                .to_string(),
+            format!(
+                "<< /Length {} >>\nstream\n{content}\nendstream",
+                content.len()
+            ),
+        ];
+        let mut pdf = String::from("%PDF-1.4\n");
+        let mut offsets = Vec::new();
+        for (index, body) in objects.iter().enumerate() {
+            offsets.push(pdf.len());
+            pdf.push_str(&format!("{} 0 obj\n{body}\nendobj\n", index + 1));
+        }
+        let xref = pdf.len();
+        pdf.push_str(&format!(
+            "xref\n0 {}\n0000000000 65535 f \n",
+            objects.len() + 1
+        ));
+        for offset in offsets {
+            pdf.push_str(&format!("{offset:010} 00000 n \n"));
+        }
+        pdf.push_str(&format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+            objects.len() + 1
+        ));
+        pdf.into_bytes()
+    }
+
+    #[test]
+    fn a_pdf_pdf_extract_reads_keeps_its_text() {
+        let pdf = simple_pdf("Refunds take five business days.");
+        assert_eq!(pdf_extract_text(&pdf), "Refunds take five business days.");
+    }
+
+    #[test]
+    fn the_page_reader_reads_a_pdf_and_drops_unmapped_glyphs() {
+        let pdf = simple_pdf("Refunds take five business days.");
+        assert_eq!(lopdf_page_text(&pdf), "Refunds take five business days.");
+        assert_eq!(
+            lopdf_page_text(b"not a pdf"),
+            "",
+            "an unreadable file gives no text, not a panic"
+        );
+    }
+
+    #[test]
+    fn a_pdf_pdf_extract_panics_on_is_read_page_by_page() {
+        let pdf = pdf_with_malformed_cmap();
+        assert!(
+            std::panic::catch_unwind(|| pdf_extract::extract_text_from_mem(&pdf)).is_err(),
+            "the reader still panics on this file"
+        );
+        // The fallback reads it; the malformed map only spoils that font's glyphs.
+        assert!(std::panic::catch_unwind(|| pdf_extract_text(&pdf)).is_ok());
+        assert!(
+            read_document("bad.pdf", &pdf).is_some(),
+            "no longer a failed read"
+        );
+    }
+
     #[test]
     fn a_file_its_reader_fails_on_is_refused_not_a_dropped_request() {
-        let pdf = pdf_with_malformed_cmap();
-        assert!(std::panic::catch_unwind(|| extract_text_from_bytes("bad.pdf", &pdf)).is_err());
-        assert_eq!(read_document("bad.pdf", &pdf), None);
+        assert_eq!(
+            guarded(|| panic!("a reader that cannot read this file")),
+            None
+        );
         let response = StoreError::Unreadable.into_response();
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(read_document("ok.txt", b"fine").as_deref(), Some("fine"));
