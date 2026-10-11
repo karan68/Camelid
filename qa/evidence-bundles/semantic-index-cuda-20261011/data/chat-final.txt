@@ -1,0 +1,61 @@
+pid 347662
+health: build v0.7.8-27-gfa24c19c-dirty | model None | ready False
+chat 0: answer=True decoy=True cited=[] 7327ms
+chat 1: answer=True decoy=False cited=[1] 6179ms
+chat 2: answer=True decoy=True cited=[] 7485ms
+chat 3: answer=True decoy=False cited=[1] 5908ms
+chat 4: answer=True decoy=True cited=[] 7079ms
+chat 5: answer=True decoy=False cited=[1] 6124ms
+chat 6: answer=True decoy=False cited=[1] 5670ms
+chat 7: answer=True decoy=False cited=[1] 6136ms
+chat 8: answer=True decoy=False cited=[] 7344ms
+chat 9: answer=True decoy=False cited=[1] 5773ms
+chat 10: answer=True decoy=False cited=[1] 6155ms
+chat 11: answer=True decoy=False cited=[1] 5920ms
+chat 12: answer=True decoy=False cited=[1] 5773ms
+chat 13: answer=True decoy=True cited=[] 7208ms
+chat 14: answer=True decoy=False cited=[1, 3] 7024ms
+chat 15: answer=True decoy=False cited=[1] 5923ms
+chat 16: answer=True decoy=True cited=[1, 2] 7310ms
+chat 17: answer=True decoy=True cited=[] 7076ms
+chat 18: answer=False decoy=True cited=[1] 5728ms
+chat 19: answer=True decoy=False cited=[1] 6028ms
+chat 20: answer=True decoy=False cited=[] 7274ms
+chat 21: answer=True decoy=True cited=[] 7056ms
+chat 22: answer=True decoy=True cited=[1, 2, 3, 4] 7306ms
+chat 23: answer=True decoy=True cited=[] 7161ms
+chat 24: answer=True decoy=True cited=[1, 2] 7044ms
+chat 25: answer=True decoy=True cited=[] 7524ms
+chat 26: answer=True decoy=False cited=[] 6984ms
+chat 27: answer=True decoy=False cited=[1] 6103ms
+chat 28: answer=True decoy=False cited=[1] 6018ms
+chat 29: answer=True decoy=False cited=[1] 6023ms
+chat 30: answer=True decoy=False cited=[1] 5849ms
+chat 31: answer=True decoy=False cited=[1] 5991ms
+chat 32: answer=True decoy=False cited=[1] 6106ms
+chat 33: answer=True decoy=False cited=[1] 5731ms
+chat 34: answer=True decoy=True cited=[] 7316ms
+chat 35: answer=True decoy=True cited=[1, 2] 6007ms
+chat 36: answer=False decoy=True cited=[1] 6048ms
+chat 37: answer=True decoy=False cited=[1] 6117ms
+chat 38: answer=True decoy=False cited=[] 7382ms
+chat 39: answer=True decoy=False cited=[1] 6016ms
+chat 40: answer=True decoy=False cited=[1] 6084ms
+chat 41: answer=True decoy=False cited=[1, 4] 6110ms
+chat 42: answer=True decoy=False cited=[1] 5856ms
+chat 43: answer=True decoy=False cited=[1] 6182ms
+chat 44: answer=True decoy=False cited=[1] 5818ms
+chat 45: answer=True decoy=True cited=[] 6754ms
+chat 46: answer=True decoy=True cited=[] 7255ms
+chat 47: answer=True decoy=False cited=[1, 2, 3, 4] 6263ms
+chat 48: answer=True decoy=False cited=[1] 5919ms
+chat 49: answer=True decoy=True cited=[] 7472ms
+{
+ "model": "Llama 3.2 3B Instruct",
+ "questions": 50,
+ "states_right_number": 48,
+ "states_decoy_number": 18,
+ "right_and_cited_passage_resolves_to_it": 32,
+ "chat_ms_p50": 6123.5,
+ "chat_ms_p95": 7472.0
+}

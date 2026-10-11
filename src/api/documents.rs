@@ -648,43 +648,63 @@ impl Found {
 }
 
 /// Reciprocal rank fusion: each ranking contributes `1 / (RRF_K + rank)` for
-/// the chunks it holds. Ties break on the better single-ranking position, then
-/// chunk id, so the order is deterministic.
+/// the chunks it holds. An exact tie goes to the passage the keyword ranking
+/// placed higher, then to the better single-ranking position, then to the
+/// lower chunk id, so the order is deterministic.
+///
+/// Why keyword first: two passages that each top one list tie exactly. That
+/// is what happens with near-duplicates, such as the same sentence about a
+/// neighbouring part, which the encoder can barely tell apart while the words
+/// the question used still can. Breaking those ties on chunk id meant
+/// whichever file was added first won.
 fn reciprocal_rank_fusion(keyword: &[i64], semantic: &[i64]) -> Vec<(i64, f32, Found)> {
-    let mut fused: HashMap<i64, (f64, usize, bool, bool)> = HashMap::new();
+    struct Entry {
+        score: f64,
+        best: usize,
+        keyword_rank: Option<usize>,
+        in_semantic: bool,
+    }
+    let mut fused: HashMap<i64, Entry> = HashMap::new();
     for (list, ids) in [(0, keyword), (1, semantic)] {
         for (rank, id) in ids.iter().enumerate() {
-            let entry = fused.entry(*id).or_insert((0.0, usize::MAX, false, false));
-            entry.0 += 1.0 / (RRF_K + (rank + 1) as f64);
-            entry.1 = entry.1.min(rank);
+            let entry = fused.entry(*id).or_insert(Entry {
+                score: 0.0,
+                best: usize::MAX,
+                keyword_rank: None,
+                in_semantic: false,
+            });
+            entry.score += 1.0 / (RRF_K + (rank + 1) as f64);
+            entry.best = entry.best.min(rank);
             if list == 0 {
-                entry.2 = true;
+                entry.keyword_rank = Some(rank);
             } else {
-                entry.3 = true;
+                entry.in_semantic = true;
             }
         }
     }
-    let mut ranked = fused
+    let mut ranked = fused.into_iter().collect::<Vec<_>>();
+    ranked.sort_by(|(left_id, left), (right_id, right)| {
+        right
+            .score
+            .total_cmp(&left.score)
+            .then(
+                left.keyword_rank
+                    .unwrap_or(usize::MAX)
+                    .cmp(&right.keyword_rank.unwrap_or(usize::MAX)),
+            )
+            .then(left.best.cmp(&right.best))
+            .then(left_id.cmp(right_id))
+    });
+    ranked
         .into_iter()
-        .map(|(id, (score, best, in_keyword, in_semantic))| {
-            let found = match (in_keyword, in_semantic) {
+        .map(|(id, entry)| {
+            let found = match (entry.keyword_rank.is_some(), entry.in_semantic) {
                 (true, true) => Found::Both,
                 (true, false) => Found::Keyword,
                 _ => Found::Semantic,
             };
-            (id, score, best, found)
+            (id, entry.score as f32, found)
         })
-        .collect::<Vec<_>>();
-    ranked.sort_by(|left, right| {
-        right
-            .1
-            .total_cmp(&left.1)
-            .then(left.2.cmp(&right.2))
-            .then(left.0.cmp(&right.0))
-    });
-    ranked
-        .into_iter()
-        .map(|(id, score, _, found)| (id, score as f32, found))
         .collect()
 }
 
@@ -1045,15 +1065,14 @@ fn search_locked(
             }
         }
     }
-    // Counting coverage scans every chunk in scope, so a search that did not
-    // rank by meaning skips it.
-    let coverage = if plan.query_vector.is_some() {
-        Some(
-            document_vectors::coverage(conn, plan.doc_ids)
+    // Coverage is reported for searches that ranked by meaning; it is counted
+    // once per index generation, beside the cached vectors.
+    let coverage = match plan.query_vector {
+        Some(vector) => Some(
+            document_vectors::search_coverage(conn, plan.doc_ids, vector.len())
                 .map_err(|error| ("index_coverage_error", error))?,
-        )
-    } else {
-        None
+        ),
+        None => None,
     };
     Ok(SearchOutcome {
         results,
@@ -1629,7 +1648,7 @@ mod tests {
                 (20, Found::Keyword),
                 (40, Found::Semantic)
             ],
-            "found by both outranks either list's top hit alone; equal ranks tie on chunk id"
+            "found by both outranks either list's top hit alone; an equal score goes to the keyword hit"
         );
         let expected = (1.0 / 63.0 + 1.0 / 61.0) as f32;
         assert!((fused[0].1 - expected).abs() < 1e-7);
@@ -1637,13 +1656,38 @@ mod tests {
         let tied = reciprocal_rank_fusion(&[7], &[3]);
         assert_eq!(
             tied.iter().map(|(id, _, _)| *id).collect::<Vec<_>>(),
-            vec![3, 7]
+            vec![7, 3]
         );
         assert_eq!(
             tied[0].1, tied[1].1,
-            "equal ranks score equally; the lower id goes first"
+            "equal ranks score equally; the keyword hit goes first"
+        );
+        let both_keyword = reciprocal_rank_fusion(&[9, 4], &[]);
+        assert_eq!(
+            both_keyword
+                .iter()
+                .map(|(id, _, _)| *id)
+                .collect::<Vec<_>>(),
+            vec![9, 4],
+            "different scores are never reordered"
         );
         assert!(reciprocal_rank_fusion(&[], &[]).is_empty());
+    }
+
+    /// A fact and a near-duplicate about a neighbouring part: the words of the
+    /// question put the fact first, the encoder (barely) prefers the other one,
+    /// and the two fuse to exactly the same score. The fact must win whatever
+    /// order the two were added in.
+    #[test]
+    fn an_exact_fusion_tie_goes_to_the_keyword_ranking() {
+        for (fact, decoy) in [(1_i64, 2_i64), (2, 1)] {
+            let fused = reciprocal_rank_fusion(&[fact, decoy], &[decoy, fact]);
+            assert_eq!(fused[0].1, fused[1].1, "an exact tie");
+            assert_eq!(
+                fused.iter().map(|(id, _, _)| *id).collect::<Vec<_>>(),
+                vec![fact, decoy]
+            );
+        }
     }
 
     #[test]

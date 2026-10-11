@@ -1,0 +1,79 @@
+{
+ "ui": "after",
+ "results": [
+  {
+   "id": 21,
+   "question": "How much did it cost when the primary mirror of the Ivarsdal observatory was recoated?",
+   "library_pill": "Whole library\n550 docs",
+   "searches": [
+    {
+     "body": {
+      "query": "How much did it cost when the primary mirror of the Ivarsdal observatory was recoated?",
+      "top_k": 4,
+      "library": true
+     },
+     "response": {
+      "status": 200,
+      "mode": "hybrid",
+      "results": [
+       {
+        "filename": "planted-21.pdf",
+        "excerpt": "o manual steps with a single checklist reviewed by a supervisor. Several recommendations from the previous audit were carried forward without change. The primar"
+       },
+       {
+        "filename": "planted-06.pdf",
+        "excerpt": "ered in the mornings to avoid conflicts with operational duties. Several recommendations from the previous audit were carried forward without change. The primar"
+       },
+       {
+        "filename": "planted-20.pdf",
+        "excerpt": "ection process depended on paper forms that were often misfiled. Contractors were asked to submit revised estimates before the end of each review period. The se"
+       },
+       {
+        "filename": "planted-33.pdf",
+        "excerpt": "ons from the previous audit were carried forward without change. The primary mirror of the Ellismere observatory was recoated in 2022 at a cost of 380,300 euros"
+       }
+      ]
+     }
+    }
+   ],
+   "reply": "According to the document excerpts, the primary mirror of the Ivarsdal observatory was recoated at a cost of:\n\n335,300 euros in 2022 (Citation 1)\nNot mentioned in Citation 2, as it refers to the Brightwater observatory\n937,700 euros in 2015 (Citation 3)\n\nNote that Citation 4 mentions the Ellismere observatory, which is a different facility.\n\nLlama 3.2 3B Instruct Q4_K_M\nVERIFIED\ntokens in 447 · out 95\nfirst token 5.9s\n61 tok/s\n7.5s\n07:25 PM\nCLIENT-MEASURED\nDeveloper Diagnostics\n60.7 tok/s"
+  },
+  {
+   "id": 13,
+   "question": "How much did it cost when the north clarifier of the Wyncroft water treatment plant was relined?",
+   "library_pill": "Whole library\n550 docs",
+   "searches": [
+    {
+     "body": {
+      "query": "How much did it cost when the north clarifier of the Wyncroft water treatment plant was relined?",
+      "top_k": 4,
+      "library": true
+     },
+     "response": {
+      "status": 200,
+      "mode": "hybrid",
+      "results": [
+       {
+        "filename": "planted-13.pdf",
+        "excerpt": "nning was approved with minor amendments to its appendix tables. Training sessions were offered in the mornings to avoid conflicts with operational duties. The "
+       },
+       {
+        "filename": "planted-12.pdf",
+        "excerpt": "outstanding actions to be circulated a week before each meeting. The finance office reconciled invoices against purchase orders at the end of every month. The f"
+       },
+       {
+        "filename": "planted-40.pdf",
+        "excerpt": "outstanding actions to be circulated a week before each meeting. The north clarifier of the Aldermoor water treatment plant was relined in 2010 at a cost of 580"
+       },
+       {
+        "filename": "planted-31.pdf",
+        "excerpt": "met quarterly and recorded its decisions in the shared register. An external reviewer found the documentation adequate but recommended clearer version control. "
+       }
+      ]
+     }
+    }
+   ],
+   "reply": "According to the document excerpts, the cost of relining the north clarifier of the Wyncroft water treatment plant was:\n\n487,200 euros in 2009 (Citation 1)\n707,600 euros in 2012 (Citation 2)\n\nNote that Citation 3 mentions the Aldermoor water treatment plant, but it does not provide the cost of relining the north clarifier of the Wyncroft water treatment plant.\n\nLlama 3.2 3B Instruct Q4_K_M\nVERIFIED\ntokens in 455 · out 97\nfirst token 5.6s\n61 tok/s\n7.2s\n07:25 PM\nCLIENT-MEASURED\nDeveloper Diagnostics\n60.6 tok/s"
+  }
+ ]
+}

@@ -1,0 +1,36 @@
+pid 346752
+health: build v0.7.8-27-gfa24c19c-dirty | model None | ready False
+t=62s vectors 4496/114083 (+4496) lane/indexing/error: cuda True None gpu: 346752, 17404 MiB
+t=122s vectors 9744/114083 (+5248) lane/indexing/error: cuda True None gpu: 346752, 17436 MiB
+t=183s vectors 14992/114083 (+5248) lane/indexing/error: cuda True None gpu: 346752, 17436 MiB
+t=243s vectors 19600/114083 (+4608) lane/indexing/error: cuda True None gpu: 346752, 17436 MiB
+t=304s vectors 24336/114083 (+4736) lane/indexing/error: cuda True None gpu: 346752, 17436 MiB
+t=365s vectors 29380/114083 (+5044) lane/indexing/error: cuda True None gpu: 346752, 17468 MiB
+t=425s vectors 34320/114083 (+4940) lane/indexing/error: cuda True None gpu: 346752, 17468 MiB
+t=486s vectors 38544/114083 (+4224) lane/indexing/error: cuda True None gpu: 346752, 17468 MiB
+t=547s vectors 43408/114083 (+4864) lane/indexing/error: cuda True None gpu: 346752, 17468 MiB
+t=608s vectors 48016/114083 (+4608) lane/indexing/error: cuda True None gpu: 346752, 17468 MiB
+t=669s vectors 52624/114083 (+4608) lane/indexing/error: cuda True None gpu: 346752, 17468 MiB
+t=730s vectors 56720/114083 (+4096) lane/indexing/error: cuda True None gpu: 346752, 17468 MiB
+t=791s vectors 60816/114083 (+4096) lane/indexing/error: cuda True None gpu: 346752, 17468 MiB
+t=852s vectors 65040/114083 (+4224) lane/indexing/error: cuda True None gpu: 346752, 17468 MiB
+t=914s vectors 70160/114083 (+5120) lane/indexing/error: cuda True None gpu: 346752, 17468 MiB
+t=975s vectors 75536/114083 (+5376) lane/indexing/error: cuda True None gpu: 346752, 17468 MiB
+t=1036s vectors 81168/114083 (+5632) lane/indexing/error: cuda True None gpu: 346752, 17468 MiB
+t=1097s vectors 86672/114083 (+5504) lane/indexing/error: cuda True None gpu: 346752, 17468 MiB
+t=1158s vectors 91792/114083 (+5120) lane/indexing/error: cuda True None gpu: 346752, 17468 MiB
+t=1219s vectors 97040/114083 (+5248) lane/indexing/error: cuda True None gpu: 346752, 17468 MiB
+t=1281s vectors 102288/114083 (+5248) lane/indexing/error: cuda True None gpu: 346752, 17468 MiB
+t=1342s vectors 107664/114083 (+5376) lane/indexing/error: cuda True None gpu: 346752, 17468 MiB
+t=1404s vectors 112656/114083 (+4992) lane/indexing/error: cuda True None gpu: 346752, 17468 MiB
+t=1465s vectors 114083/114083 (+1427) lane/indexing/error: cuda False None gpu: 346752, 17468 MiB
+indexed 114083 of 114083 (114083 with a vector) in 1465 s
+gpu memory after indexing, idle: 346752, 17468 MiB
+collection_default {"questions": 50, "first": 44, "top5": 50, "decoy_first": 6, "modes": ["hybrid"], "ms_p50": 494.4, "ms_p95": 500.5}
+collection_semantic {"questions": 50, "first": 32, "top5": 49, "decoy_first": 15, "modes": ["semantic"], "ms_p50": 240.4, "ms_p95": 242.5}
+collection_keyword {"questions": 50, "first": 50, "top5": 50, "decoy_first": 0, "modes": ["keyword"], "ms_p50": 257.2, "ms_p95": 261.3}
+library {"questions": 50, "first": 44, "top5": 50, "decoy_first": 6, "modes": ["hybrid"], "ms_p50": 670.1, "ms_p95": 678.5}
+collection_default {"questions": 50, "first": 44, "top5": 50, "decoy_first": 6, "modes": ["hybrid"], "ms_p50": 495.0, "ms_p95": 501.3}
+collection_semantic {"questions": 50, "first": 32, "top5": 49, "decoy_first": 15, "modes": ["semantic"], "ms_p50": 240.3, "ms_p95": 242.4}
+collection_keyword {"questions": 50, "first": 50, "top5": 50, "decoy_first": 0, "modes": ["keyword"], "ms_p50": 257.3, "ms_p95": 261.1}
+library {"questions": 50, "first": 44, "top5": 50, "decoy_first": 6, "modes": ["hybrid"], "ms_p50": 671.8, "ms_p95": 682.1}

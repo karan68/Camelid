@@ -203,7 +203,7 @@ pub fn set_gpu_accel_enabled(enabled: bool) {
 // mistake. Kept ungated so the parse below stays covered by the test on every
 // platform, since the value's meaning does not vary by target.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
-fn devices_masked_by_env() -> bool {
+pub(crate) fn devices_masked_by_env() -> bool {
     devices_masked(std::env::var("CUDA_VISIBLE_DEVICES").ok().as_deref())
 }
 

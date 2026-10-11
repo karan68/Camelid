@@ -19,6 +19,9 @@ use crate::tensor::{CpuTensor, TensorStore};
 use crate::tokenizer::Tokenizer;
 use crate::{BackendError, Result};
 
+#[cfg(feature = "cuda")]
+mod cuda;
+
 const NOMIC_BERT_ARCH: &str = "nomic-bert";
 const MAX_BATCH_INPUTS: usize = 256;
 // The checkpoints advertise 32K training context, but Camelid's current
@@ -181,6 +184,9 @@ pub struct NomicBertRuntime {
     embedding_norm_weight: Vec<f32>,
     embedding_norm_bias: Vec<f32>,
     layers: Vec<EncoderLayer>,
+    /// The CUDA layer stack used for document indexing, built on first use.
+    #[cfg(feature = "cuda")]
+    cuda: cuda::Slot,
 }
 
 /// API-facing embedding runtime. The enum keeps the established Nomic encoder
@@ -189,6 +195,22 @@ pub struct NomicBertRuntime {
 pub enum EmbeddingRuntime {
     Nomic(Box<NomicBertRuntime>),
     BitNet(Box<BitNetEmbeddingRuntime>),
+}
+
+/// Where a batch of document embeddings was computed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncoderLane {
+    Cpu,
+    Cuda,
+}
+
+impl EncoderLane {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Cpu => "cpu",
+            Self::Cuda => "cuda",
+        }
+    }
 }
 
 impl std::fmt::Debug for EmbeddingRuntime {
@@ -254,6 +276,25 @@ impl EmbeddingRuntime {
         match self {
             Self::Nomic(runtime) => runtime.embed_batch(inputs, dimensions),
             Self::BitNet(runtime) => runtime.embed_batch(inputs, dimensions),
+        }
+    }
+
+    /// One search query for the document index: on the Nomic encoder's CUDA
+    /// lane when it is free, so the query is embedded like the indexed chunks
+    /// were, otherwise as [`Self::embed`].
+    pub fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
+        match self {
+            Self::Nomic(runtime) => runtime.embed_query(text),
+            Self::BitNet(runtime) => runtime.embed(text, None),
+        }
+    }
+
+    /// [`Self::embed_batch`] for the document index, which may run the Nomic
+    /// encoder on CUDA. Reports which lane produced the vectors.
+    pub fn embed_documents(&self, inputs: &[String]) -> Result<(Vec<Vec<f32>>, EncoderLane)> {
+        match self {
+            Self::Nomic(runtime) => runtime.embed_documents(inputs),
+            Self::BitNet(runtime) => Ok((runtime.embed_batch(inputs, None)?, EncoderLane::Cpu)),
         }
     }
 
@@ -709,6 +750,8 @@ impl NomicBertRuntime {
             embedding_norm_weight,
             embedding_norm_bias,
             layers,
+            #[cfg(feature = "cuda")]
+            cuda: cuda::Slot::default(),
         })
     }
 
@@ -760,7 +803,56 @@ impl NomicBertRuntime {
         })
     }
 
+    /// One document-search query. Uses the CUDA lane only if it is not busy with
+    /// an indexing batch, so a search never waits behind one.
+    pub fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
+        #[cfg(feature = "cuda")]
+        if let Some(mut vectors) =
+            self.cuda
+                .embed(self, std::slice::from_ref(&text.to_string()), false)?
+        {
+            if let Some(vector) = vectors.pop() {
+                return Ok(vector);
+            }
+        }
+        self.embed(text, None)
+    }
+
+    /// Embed documents for the document index: on the CUDA layer stack when GPU
+    /// acceleration is on and the lane builds, otherwise as [`Self::embed_batch`].
+    /// Any CUDA failure falls back to the CPU for that batch and turns the lane
+    /// off for the rest of the process.
+    pub fn embed_documents(&self, inputs: &[String]) -> Result<(Vec<Vec<f32>>, EncoderLane)> {
+        #[cfg(feature = "cuda")]
+        if !inputs.is_empty() && inputs.len() <= MAX_BATCH_INPUTS {
+            if let Some(vectors) = self.cuda.embed(self, inputs, true)? {
+                return Ok((vectors, EncoderLane::Cuda));
+            }
+        }
+        Ok((self.embed_batch(inputs, None)?, EncoderLane::Cpu))
+    }
+
     pub fn encode(&self, text: &str) -> Result<EncoderOutput> {
+        let (token_ids, mut hidden) = self.embed_input(text)?;
+        for (layer_index, layer) in self.layers.iter().enumerate() {
+            hidden = self.forward_layer(hidden, token_ids.len(), layer_index, layer)?;
+        }
+        Ok(self.output(token_ids, hidden))
+    }
+
+    fn output(&self, token_ids: Vec<u32>, token_embeddings: Vec<f32>) -> EncoderOutput {
+        EncoderOutput {
+            token_count: token_ids.len(),
+            token_ids,
+            token_embeddings,
+            embedding_length: self.config.embedding_length,
+        }
+    }
+
+    /// Tokenize `text` and build the encoder's input rows: token embeddings plus
+    /// the token-type row, layer-normalized. Everything after this is the layer
+    /// stack, which the CUDA lane can run instead.
+    fn embed_input(&self, text: &str) -> Result<(Vec<u32>, Vec<f32>)> {
         let token_ids = self.tokenizer.encode(text, true, false)?;
         if token_ids.is_empty() {
             return Err(BackendError::InvalidTokenizerMetadata(
@@ -792,16 +884,8 @@ impl NomicBertRuntime {
             &self.embedding_norm_bias,
             self.config.layer_norm_epsilon,
         )?;
-
-        for (layer_index, layer) in self.layers.iter().enumerate() {
-            hidden = self.forward_layer(hidden, token_ids.len(), layer_index, layer)?;
-        }
-        Ok(EncoderOutput {
-            token_ids,
-            token_embeddings: hidden,
-            token_count: tokens.shape.dims[0],
-            embedding_length: self.config.embedding_length,
-        })
+        debug_assert_eq!(tokens.shape.dims[0], token_ids.len());
+        Ok((token_ids, hidden))
     }
 
     fn forward_layer(
@@ -1320,5 +1404,110 @@ mod tests {
             with_bitnet_query_instruction("query: What is BitNet?"),
             "query: What is BitNet?"
         );
+    }
+
+    /// #801: the CUDA document encoder against the CPU, on real library chunks.
+    /// CAMELID_NOMIC_GGUF = the encoder, CAMELID_BENCH_CHUNKS = JSON lines of chunk text.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "needs CAMELID_NOMIC_GGUF, CAMELID_BENCH_CHUNKS and a CUDA device"]
+    fn cuda_document_vectors_match_the_cpu() {
+        let (Ok(model), Ok(chunks)) = (
+            std::env::var("CAMELID_NOMIC_GGUF"),
+            std::env::var("CAMELID_BENCH_CHUNKS"),
+        ) else {
+            return;
+        };
+        let runtime = EmbeddingRuntime::load(&model).expect("load encoder");
+        let texts: Vec<String> = std::fs::read_to_string(&chunks)
+            .expect("chunks")
+            .lines()
+            .map(|line| serde_json::from_str::<String>(line).expect("json string"))
+            .map(|text| runtime.prepare_retrieval_document(&text))
+            .collect();
+        let EmbeddingRuntime::Nomic(nomic) = &runtime else {
+            panic!("not the Nomic encoder");
+        };
+        let mut gpu = super::cuda::CudaEncoder::build_for_test(nomic).expect("CUDA encoder");
+        let width = nomic.config.embedding_length;
+
+        // One Q8 projection returns exactly the CPU's bits.
+        let (_, rows_in) = nomic.embed_input(&texts[0]).unwrap();
+        let rows = rows_in.len() / width;
+        let input = CpuTensor::from_f32("probe", vec![rows, width], rows_in.clone()).unwrap();
+        let cpu_qkv = linear_for_role_runtime(
+            &input,
+            &nomic.layers[0].qkv,
+            "probe_qkv",
+            "attention_q",
+            false,
+        )
+        .unwrap()
+        .data;
+        let gpu_qkv = gpu.qkv_for_test(0, &rows_in, rows).unwrap();
+        assert_eq!(cpu_qkv.len(), gpu_qkv.len());
+        let differing = cpu_qkv
+            .iter()
+            .zip(&gpu_qkv)
+            .filter(|(cpu, gpu)| cpu.to_bits() != gpu.to_bits())
+            .count();
+        eprintln!(
+            "qkv projection: {differing} of {} values differ from the CPU",
+            cpu_qkv.len()
+        );
+        assert_eq!(differing, 0);
+
+        let prepared: Vec<_> = texts
+            .iter()
+            .map(|text| nomic.embed_input(text).unwrap())
+            .collect();
+
+        // Throughput, after a warm-up forward.
+        gpu.forward_for_test(&prepared[..8]).unwrap();
+        let started = std::time::Instant::now();
+        for batch in prepared.chunks(128) {
+            gpu.forward_for_test(batch).unwrap();
+        }
+        let secs = started.elapsed().as_secs_f64();
+        eprintln!(
+            "CUDA layer stack: {} chunks in {secs:.2} s = {:.0} chunks/s",
+            prepared.len(),
+            prepared.len() as f64 / secs
+        );
+
+        // Whole vectors: the CPU encoder against the CUDA layer stack. The CPU
+        // side is slow in a test build, so CAMELID_BENCH_COMPARE can lower the count.
+        let compared = std::env::var("CAMELID_BENCH_COMPARE")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(48)
+            .min(texts.len());
+        if compared == 0 {
+            return;
+        }
+        let pool = |prepared: Vec<(Vec<u32>, Vec<f32>)>, hidden: Vec<Vec<f32>>| -> Vec<Vec<f32>> {
+            prepared
+                .into_iter()
+                .zip(hidden)
+                .map(|((ids, _), hidden)| {
+                    nomic
+                        .output(ids, hidden)
+                        .pool(nomic.config.pooling)
+                        .unwrap()
+                })
+                .collect()
+        };
+        let hidden = gpu.forward_for_test(&prepared[..compared]).unwrap();
+        let gpu_vectors = pool(prepared[..compared].to_vec(), hidden);
+        let (mut min_cosine, mut max_abs) = (f32::INFINITY, 0.0_f32);
+        for (text, gpu_vector) in texts.iter().zip(&gpu_vectors) {
+            let cpu_vector = nomic.embed(text, None).unwrap();
+            min_cosine = min_cosine.min(cosine_similarity(&cpu_vector, gpu_vector).unwrap());
+            for (cpu, gpu) in cpu_vector.iter().zip(gpu_vector) {
+                max_abs = max_abs.max((cpu - gpu).abs());
+            }
+        }
+        eprintln!("{compared} chunks: min cosine {min_cosine:.7}, max |cpu - gpu| {max_abs:.2e}");
+        assert!(min_cosine >= 0.9999, "min cosine {min_cosine}");
     }
 }

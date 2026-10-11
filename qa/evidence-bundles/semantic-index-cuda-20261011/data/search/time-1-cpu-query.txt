@@ -1,0 +1,8 @@
+collection_default {"questions": 50, "first": 36, "top5": 50, "decoy_first": 14, "modes": ["hybrid"], "ms_p50": 1226.6, "ms_p95": 1287.1}
+collection_semantic {"questions": 50, "first": 32, "top5": 49, "decoy_first": 15, "modes": ["semantic"], "ms_p50": 977.2, "ms_p95": 1032.8}
+collection_keyword {"questions": 50, "first": 50, "top5": 50, "decoy_first": 0, "modes": ["keyword"], "ms_p50": 251.0, "ms_p95": 256.0}
+library {"questions": 50, "first": 36, "top5": 50, "decoy_first": 14, "modes": ["hybrid"], "ms_p50": 1357.0, "ms_p95": 1422.1}
+split one doc, semantic            p50   434.9 ms
+split one doc, keyword             p50    77.1 ms
+split whole collection, semantic   p50   977.4 ms
+DONE

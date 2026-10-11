@@ -1,0 +1,2 @@
+      1 352585, camelid test binary (encoder only), 314 MiB
+   1873 352585, camelid test binary (encoder only), 858 MiB

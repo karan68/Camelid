@@ -258,6 +258,23 @@ semantic ranker already used.
 Set `CAMELID_DOCUMENT_SEMANTIC=0` (or `false`, `off`, `no`) to keep document
 search keyword-only; the encoder is then never loaded.
 
+**Indexing on the GPU.** In CUDA builds, with GPU acceleration on, the
+Knowledge Library runs the encoder's layers on the GPU (`src/embedding/cuda.rs`)
+for indexing and for document-search queries, many chunks per forward;
+`/v1/embeddings` and the supported row above stay on the CPU lane. The Q8
+linears return the CPU's bits and whole vectors stay within cosine 0.9999 of
+the CPU's (the ignored test `cuda_document_vectors_match_the_cpu`). On a 4-vCPU
+host with an L4 a 114,083-chunk library indexed in 1,465 s, against 0.37 chunks
+a second on the CPU (`qa/evidence-bundles/semantic-index-cuda-20261011`). Any
+CUDA failure falls back to the CPU for the rest of the process; a search never
+waits behind an indexing batch. Set `CAMELID_DOCUMENT_GPU_ENCODER=0` to keep
+the encoder on the CPU. Metal is not covered yet.
+
+The library's vectors are decoded once and kept in memory (4 bytes per
+dimension per chunk) until a chunk or vector changes; SQLite triggers on both
+tables bump a generation counter, so a stale copy is never used. An exact tie
+in hybrid ranking goes to the passage the keyword ranking placed higher.
+
 ## Evidence gate
 
 The ignored real-artifact test requires the SHA-pinned GGUF at
