@@ -39,16 +39,15 @@ const readAsBase64 = blob => new Promise((resolve, reject) => {
     path inside that folder. */
 export async function ingestLibraryFile(file, collectionIds = [], name = file.name, apiBase = getApiBase()) {
   if (file.size > MAX_DOCUMENT_BYTES) throw new Error(`${name} is larger than 64 MB, the most the library reads.`)
-  const lowerName = name.toLowerCase()
-  // Sent as bytes so the server reads them and hashes the file exactly as it is on disk.
-  const isBinary = ['.pdf', '.docx', '.html', '.htm'].some(extension => lowerName.endsWith(extension))
+  // Preserve every file's bytes for binary detection and the source hash,
+  // including text with a BOM or invalid UTF-8.
   const response = await apiFetch('/api/documents/ingest', {
     method: 'POST',
     headers: JSON_HEADERS,
     body: JSON.stringify({
       filename: name,
-      content: isBinary ? await readAsBase64(file) : await file.text(),
-      is_base64: isBinary,
+      content: await readAsBase64(file),
+      is_base64: true,
       ...(collectionIds.length ? { collection_ids: collectionIds } : {}),
     }),
   }, apiBase)

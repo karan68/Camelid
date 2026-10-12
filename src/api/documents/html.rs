@@ -179,11 +179,9 @@ impl Text {
         // Raw elements switch the tokenizer even inside hidden content, so
         // markup in a script cannot close the element around it.
         if let Some(kind) = raw_kind(name) {
-            if !tag.self_closing {
-                self.raw = Some(name.to_string());
-                return TokenSinkResult::RawData(kind);
-            }
-            return TokenSinkResult::Continue;
+            // HTML ignores the self-closing slash on non-void elements.
+            self.raw = Some(name.to_string());
+            return TokenSinkResult::RawData(kind);
         }
         if let Some((hidden, depth)) = self.hidden.as_mut() {
             if hidden == name && !tag.self_closing {
@@ -193,11 +191,8 @@ impl Text {
         }
         // An SVG `<title>` is a tooltip, and is hidden above; this is the page's.
         if name == "title" {
-            if !tag.self_closing {
-                self.in_title = true;
-                return TokenSinkResult::RawData(RawKind::Rcdata);
-            }
-            return TokenSinkResult::Continue;
+            self.in_title = true;
+            return TokenSinkResult::RawData(RawKind::Rcdata);
         }
         if is_hidden_container(name) {
             if !tag.self_closing {
@@ -448,6 +443,17 @@ mod tests {
             ""
         );
         assert_eq!(extract_text(b""), "");
+    }
+
+    #[test]
+    fn self_closing_slashes_do_not_expose_raw_html_content() {
+        assert_eq!(
+            extract_text(
+                b"<title/>Guide</title><script/>secret <p>injected</p></script>\
+                <style/>hidden styles</style><p>Kept.</p>"
+            ),
+            "# Guide\n\nKept."
+        );
     }
 
     #[test]

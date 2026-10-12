@@ -404,6 +404,11 @@ pub async fn ingest_document(
         if payload.content.len() > MAX_DOCUMENT_BYTES {
             return Err(StoreError::TooLarge.into_response());
         }
+        if document_kind(&filename) == Some(DocumentKind::Text)
+            && looks_binary(payload.content.as_bytes())
+        {
+            return Err(StoreError::Empty.into_response());
+        }
         let digest = sha256_hex(payload.content.as_bytes());
         if is_markup(&filename) {
             let text = read_document(&filename, payload.content.as_bytes())
@@ -1534,6 +1539,28 @@ mod tests {
             .await
             .unwrap();
         serde_json::from_slice::<serde_json::Value>(&body).unwrap()["error"]["code"].clone()
+    }
+
+    #[tokio::test]
+    async fn binary_text_uploads_are_refused_in_both_encodings() {
+        use base64::Engine;
+        use tower::ServiceExt;
+        let app = crate::api::router_with_state(AppState::default());
+        let bytes = b"transport\0stream";
+        for is_base64 in [false, true] {
+            let content = if is_base64 {
+                base64::engine::general_purpose::STANDARD.encode(bytes)
+            } else {
+                String::from_utf8(bytes.to_vec()).unwrap()
+            };
+            let body = serde_json::to_vec(&serde_json::json!({
+                "filename": "clip.ts", "content": content, "is_base64": is_base64
+            }))
+            .unwrap();
+            let response = app.clone().oneshot(ingest_request(body)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(error_code(response).await, "empty_document");
+        }
     }
 
     /// Every request here is refused before the handler opens a library.
