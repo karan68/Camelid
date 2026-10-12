@@ -93,11 +93,11 @@ const GROUNDING_FILES = Object.freeze({
   }),
   runtime_envelope: Object.freeze({
     path: 'qa/model-qualification/fixtures/smollm3-default-thinking-runtime-envelope-v1.json',
-    sha256: 'b7dd1daad021f0cd0e2c46a9e9c812471d19b3cb69f27ab493bf0d37f67ff114',
+    sha256: 'e66ee35545b13705a4ff55b8a1c1f846a182390bc27f54d06a0644106f699a22',
   }),
 })
 
-const RENDERER_GIT_BLOB_SHA1 = '2c91e0edb92494b8486f7e1a8a7dadd4db6833eb'
+const RENDERER_GIT_BLOB_SHA1 = 'd9e50af7ea6003ec736d27ccbd78d0937135f851'
 const SHAPE_CASE_ID = 'default_think_single_user_generation_prompt'
 const NORMALIZED_PROMPT_UTF8_BYTES = 1_392
 const NORMALIZED_PROMPT_SHA256 = '7619416ae94ba9a00378d976bfa944f5ba726747f9b67ba4e862d9a7fe20e4f1'

@@ -3050,9 +3050,17 @@ impl RunnableModel {
 
         #[cfg(target_os = "macos")]
         if qwen35_metal_enabled() {
-            match self.generate_qwen35_metal(prompt, max_new, stop, sampling, should_stop, on_token)
-            {
+            match self.generate_qwen35_metal(
+                prompt,
+                max_new,
+                stop,
+                sampling,
+                is_cancelled,
+                should_stop,
+                on_token,
+            ) {
                 Ok(tokens) => return Ok(tokens),
+                Err(BackendError::Cancelled) => return Err(BackendError::Cancelled),
                 Err(err) => {
                     eprintln!("[qwen35] resident Metal lane failed ({err}); using hybrid fallback");
                 }
@@ -3111,12 +3119,14 @@ impl RunnableModel {
     }
 
     #[cfg(target_os = "macos")]
+    #[allow(clippy::too_many_arguments)]
     fn generate_qwen35_metal(
         &self,
         prompt: &[u32],
         max_new: usize,
         stop: &[u32],
         sampling: Option<&SamplingConfig>,
+        is_cancelled: &dyn Fn() -> bool,
         should_stop: &dyn Fn(&[u32]) -> bool,
         on_token: &mut dyn FnMut(u32),
     ) -> Result<Vec<u32>> {
@@ -3140,17 +3150,29 @@ impl RunnableModel {
         let (&last_prompt_token, prior_prompt) = prompt
             .split_last()
             .ok_or_else(|| BackendError::InvalidTensorData("empty prompt".into()))?;
-        let mut prefill = Vec::with_capacity(prior_prompt.len());
-        for (position, &token) in prior_prompt.iter().enumerate() {
-            let embedding = self.token_embd.dequant_row(token as usize, "token_embd")?;
-            let (cos, sin) = qwen35_rope_tables(position, self.rope_base, self.rope_dim);
-            prefill.push((embedding, cos, sin));
+        // Each batch completes its command buffer before the next cancellation
+        // check; recurrent and KV state remain in the same resident engine.
+        const PROMPT_BATCH: usize = 16;
+        for (batch, tokens) in prior_prompt.chunks(PROMPT_BATCH).enumerate() {
+            if is_cancelled() {
+                return Err(BackendError::Cancelled);
+            }
+            let mut prefill = Vec::with_capacity(tokens.len());
+            for (offset, &token) in tokens.iter().enumerate() {
+                let position = batch * PROMPT_BATCH + offset;
+                let embedding = self.token_embd.dequant_row(token as usize, "token_embd")?;
+                let (cos, sin) = qwen35_rope_tables(position, self.rope_base, self.rope_dim);
+                prefill.push((embedding, cos, sin));
+            }
+            if !engine.forward_prefill_batch(&prefill) {
+                return Err(BackendError::InvalidTensorData(format!(
+                    "Qwen3.5 Metal batched prefill refused {} prompt slots",
+                    prefill.len()
+                )));
+            }
         }
-        if !engine.forward_prefill_batch(&prefill) {
-            return Err(BackendError::InvalidTensorData(format!(
-                "Qwen3.5 Metal batched prefill refused {} prompt slots",
-                prefill.len()
-            )));
+        if is_cancelled() {
+            return Err(BackendError::Cancelled);
         }
         let last_position = prior_prompt.len();
         let embedding = self

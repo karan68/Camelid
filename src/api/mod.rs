@@ -22206,7 +22206,7 @@ fn gpu_sampled_generation_step(
 fn run_stream_step(
     session: &mut LlamaInferenceSession,
     request: StreamStepRequest,
-) -> std::result::Result<LlamaGenerationStep, Box<Response>> {
+) -> crate::Result<LlamaGenerationStep> {
     let StreamStepRequest {
         greedy_fast,
         input,
@@ -22214,21 +22214,9 @@ fn run_stream_step(
         history,
         collect_dense_diagnostics,
     } = request;
-    let step_error = |err: String| {
-        Box::new(api_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "generation_step_failed",
-            err,
-            None,
-        ))
-    };
     if greedy_fast {
-        if let Some((id, forward_us)) = session
-            .generate_next_token_greedy_resident(input[0])
-            .map_err(|err| step_error(err.to_string()))?
-        {
-            return gpu_sampled_generation_step(id, forward_us)
-                .map_err(|err| step_error(err.to_string()));
+        if let Some((id, forward_us)) = session.generate_next_token_greedy_resident(input[0])? {
+            return gpu_sampled_generation_step(id, forward_us);
         }
     }
     // Temperature-only sampling: draw the next token on the GPU (Gumbel-max)
@@ -22236,24 +22224,20 @@ fn run_stream_step(
     // CPU (~7 ms/token). Other sampler shapes fall through to the CPU path.
     if !collect_dense_diagnostics {
         if let LlamaSampler::Sampling(cfg) = &sampler {
-            if let Some((id, forward_us)) = session
-                .generate_next_token_sampled_resident(input[0], cfg)
-                .map_err(|err| step_error(err.to_string()))?
+            if let Some((id, forward_us)) =
+                session.generate_next_token_sampled_resident(input[0], cfg)?
             {
-                return gpu_sampled_generation_step(id, forward_us)
-                    .map_err(|err| step_error(err.to_string()));
+                return gpu_sampled_generation_step(id, forward_us);
             }
         }
     }
-    session
-        .generate_next_token_with_history_diagnostics(
-            &input,
-            sampler,
-            &history,
-            collect_dense_diagnostics,
-            None,
-        )
-        .map_err(|err| step_error(err.to_string()))
+    session.generate_next_token_with_history_diagnostics(
+        &input,
+        sampler,
+        &history,
+        collect_dense_diagnostics,
+        None,
+    )
 }
 
 fn generation_timeout_response(
@@ -23961,9 +23945,32 @@ enum StreamDecodeEvent {
     },
 }
 
-/// The error-code/message pair `stream_error_event` would have produced for a
-/// Response-shaped failure, so the engine job can hand the SSE layer
-/// byte-identical error frames without shipping the `Response` across.
+/// Keep prompt-read interruption distinct from a model failure in SSE output.
+fn stream_step_error_event(
+    err: BackendError,
+    cancel: &GenerationCancel,
+    generated_tokens: usize,
+) -> StreamDecodeEvent {
+    if matches!(err, BackendError::Cancelled) {
+        if matches!(cancel.tripped(), Some(GenerationStopCause::TimedOut)) {
+            return StreamDecodeEvent::TimedOut {
+                timeout: cancel.timeout,
+                elapsed: cancel.started.elapsed(),
+                generated_tokens,
+            };
+        }
+        return StreamDecodeEvent::Failed {
+            code: "generation_cancelled".to_string(),
+            message: "generation cancelled".to_string(),
+        };
+    }
+    StreamDecodeEvent::Failed {
+        code: "generation_step_failed".to_string(),
+        message: err.to_string(),
+    }
+}
+
+/// Extract an API error without moving its response across the engine thread.
 fn stream_error_parts(response: &Response) -> (String, String) {
     if let Some(details) = response.extensions().get::<ApiErrorDetails>() {
         return (details.code.clone(), details.message.clone());
@@ -24267,9 +24274,12 @@ fn run_stream_decode_job(
                 },
             ) {
                 Ok(step) => step,
-                Err(response) => {
-                    let (code, message) = stream_error_parts(&response);
-                    send(StreamDecodeEvent::Failed { code, message });
+                Err(err) => {
+                    send(stream_step_error_event(
+                        err,
+                        &prepared.cancel,
+                        generated.len(),
+                    ));
                     return;
                 }
             };
@@ -25573,7 +25583,15 @@ impl CooperativeStreamDecodeJob {
             },
         ) {
             Ok(step) => step,
-            Err(response) => return self.fail(&response),
+            Err(err) => {
+                self.send(stream_step_error_event(
+                    err,
+                    &self.prepared.cancel,
+                    self.generated.len(),
+                ));
+                self.finished = true;
+                return engine::StepOutcome::Complete;
+            }
         };
         self.consume_step(step)
     }
@@ -36927,6 +36945,29 @@ mod tests {
             0,
         );
         assert_eq!(error_code_of(other).await, "generation_step_failed");
+    }
+
+    #[test]
+    fn streaming_prefill_interrupt_preserves_timeout_and_cancel_causes() {
+        let mut timeout = GenerationCancel::unbounded();
+        timeout.arm(Duration::ZERO);
+        assert!(matches!(
+            stream_step_error_event(BackendError::Cancelled, &timeout, 3),
+            StreamDecodeEvent::TimedOut {
+                generated_tokens: 3,
+                ..
+            }
+        ));
+        let cancelled = GenerationCancel::unbounded();
+        cancelled.token.cancel();
+        assert!(matches!(
+            stream_step_error_event(BackendError::Cancelled, &cancelled, 0),
+            StreamDecodeEvent::Failed { code, .. } if code == "generation_cancelled"
+        ));
+        assert!(matches!(
+            stream_step_error_event(BackendError::InvalidTensorData("failed".into()), &timeout, 0),
+            StreamDecodeEvent::Failed { code, .. } if code == "generation_step_failed"
+        ));
     }
 
     #[tokio::test]
