@@ -22,7 +22,7 @@ use rusqlite::{params, params_from_iter, types::Value, Connection};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use crate::embedding::{cosine_similarity, EmbeddingRuntime};
+use crate::embedding::{cosine_similarity, EmbeddingRuntime, EncoderLane};
 
 use super::citations::sha256_hex;
 use super::documents::{db_lock, open_connection};
@@ -36,6 +36,10 @@ const DISABLE_ENV: &str = "CAMELID_DOCUMENT_SEMANTIC";
 /// Chunks per encoder call. Small batches keep the database lock free for
 /// searches between batches.
 const INDEX_BATCH: usize = 16;
+/// Chunks per encoder call once a batch has run on CUDA. A GPU forward over
+/// many chunks costs little more than over a few, and the database lock is
+/// only held around reading and storing a batch, not while it is embedded.
+const CUDA_INDEX_BATCH: usize = 128;
 
 /// The cosine similarity below which a library-wide search leaves a passage
 /// out. It rises with the library's indexed chunks, because the best chance
@@ -73,8 +77,144 @@ pub(crate) fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
             encoder_sha256 TEXT NOT NULL,
             dims INTEGER NOT NULL,
             vector BLOB
-        );",
+        );
+        CREATE TABLE IF NOT EXISTS document_vector_generation (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            database TEXT NOT NULL,
+            value INTEGER NOT NULL
+        );
+        INSERT OR IGNORE INTO document_vector_generation (id, database, value)
+            VALUES (1, lower(hex(randomblob(16))), 0);
+        CREATE TRIGGER IF NOT EXISTS document_vector_generation_vector_insert
+            AFTER INSERT ON document_chunk_vectors
+            BEGIN UPDATE document_vector_generation SET value = value + 1 WHERE id = 1; END;
+        CREATE TRIGGER IF NOT EXISTS document_vector_generation_vector_update
+            AFTER UPDATE ON document_chunk_vectors
+            BEGIN UPDATE document_vector_generation SET value = value + 1 WHERE id = 1; END;
+        CREATE TRIGGER IF NOT EXISTS document_vector_generation_vector_delete
+            AFTER DELETE ON document_chunk_vectors
+            BEGIN UPDATE document_vector_generation SET value = value + 1 WHERE id = 1; END;
+        CREATE TRIGGER IF NOT EXISTS document_vector_generation_chunk_insert
+            AFTER INSERT ON document_chunks
+            BEGIN UPDATE document_vector_generation SET value = value + 1 WHERE id = 1; END;
+        CREATE TRIGGER IF NOT EXISTS document_vector_generation_chunk_update
+            AFTER UPDATE ON document_chunks
+            BEGIN UPDATE document_vector_generation SET value = value + 1 WHERE id = 1; END;
+        CREATE TRIGGER IF NOT EXISTS document_vector_generation_chunk_delete
+            AFTER DELETE ON document_chunks
+            BEGIN UPDATE document_vector_generation SET value = value + 1 WHERE id = 1; END;",
     )
+}
+
+/// The current vectors of the whole library, decoded once and reused by every
+/// search until a chunk or vector changes. Reading and decoding them from
+/// SQLite took about half a second per search on a 114,083-chunk library, and
+/// so did the index coverage each search by meaning reports, which is kept
+/// here per document for the same reason.
+/// Triggers bump `document_vector_generation` on every such change, from this
+/// process or any other, so a cached copy is never used past one. The random
+/// `database` id keeps one database's cache from answering for another.
+struct VectorCache {
+    generation: (String, i64),
+    dims: usize,
+    chunk_ids: Vec<i64>,
+    doc_ids: Vec<Arc<str>>,
+    vectors: Vec<f32>,
+    /// Each vector's squared norm, summed exactly as `cosine_similarity` does.
+    norms: Vec<f64>,
+    coverage: HashMap<String, Coverage>,
+}
+
+fn vector_cache() -> &'static Mutex<Option<Arc<VectorCache>>> {
+    static CACHE: OnceLock<Mutex<Option<Arc<VectorCache>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+
+fn vector_generation(conn: &Connection) -> Result<(String, i64), rusqlite::Error> {
+    conn.query_row(
+        "SELECT database, value FROM document_vector_generation WHERE id = 1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+}
+
+fn squared_norm(vector: &[f32]) -> f64 {
+    let mut norm = 0.0_f64;
+    for value in vector {
+        norm += f64::from(*value) * f64::from(*value);
+    }
+    norm
+}
+
+/// `cosine_similarity` with the two norms already summed. The three sums in
+/// `cosine_similarity` are independent and taken in the same order, so this
+/// returns the same bits.
+fn cosine_with_norms(query: &[f32], query_norm: f64, vector: &[f32], norm: f64) -> Option<f32> {
+    let mut product = 0.0_f64;
+    for (left, right) in query.iter().zip(vector) {
+        product += f64::from(*left) * f64::from(*right);
+    }
+    let denominator = (query_norm * norm).sqrt();
+    if !denominator.is_finite() || denominator <= f64::EPSILON {
+        return None;
+    }
+    Some((product / denominator) as f32)
+}
+
+fn current_vectors(conn: &Connection, dims: usize) -> Result<Arc<VectorCache>, rusqlite::Error> {
+    let generation = vector_generation(conn)?;
+    let mut cache = vector_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(cached) = cache.as_ref() {
+        if cached.generation == generation && cached.dims == dims {
+            return Ok(Arc::clone(cached));
+        }
+    }
+    let mut statement = conn.prepare(
+        "SELECT v.chunk_id, c.doc_id, v.vector
+         FROM document_chunk_vectors AS v
+         JOIN document_chunks AS c ON c.id = v.chunk_id
+         WHERE v.vector IS NOT NULL AND v.encoder_sha256 = ?1 AND v.dims = ?2
+           AND v.chunk_sha256 = c.chunk_sha256",
+    )?;
+    let mut doc_names: HashMap<String, Arc<str>> = HashMap::new();
+    let (mut chunk_ids, mut doc_ids, mut vectors, mut norms) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let rows = statement.query_map(params![ENCODER_SHA256, dims as i64], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Vec<u8>>(2)?,
+        ))
+    })?;
+    for row in rows {
+        let (chunk_id, doc_id, blob) = row?;
+        let Some(vector) = from_blob(&blob, dims) else {
+            continue;
+        };
+        let doc_id = doc_names
+            .entry(doc_id)
+            .or_insert_with_key(|doc_id| Arc::from(doc_id.as_str()))
+            .clone();
+        chunk_ids.push(chunk_id);
+        doc_ids.push(doc_id);
+        norms.push(squared_norm(&vector));
+        vectors.extend_from_slice(&vector);
+    }
+    drop(statement);
+    let coverage = coverage_by_document(conn)?.into_iter().collect();
+    let fresh = Arc::new(VectorCache {
+        generation,
+        dims,
+        chunk_ids,
+        doc_ids,
+        vectors,
+        norms,
+        coverage,
+    });
+    *cache = Some(Arc::clone(&fresh));
+    Ok(fresh)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,15 +260,15 @@ pub(crate) struct Encoder {
 impl Encoder {
     pub(crate) fn embed_query(&self, text: &str) -> crate::Result<Vec<f32>> {
         self.runtime
-            .embed(&self.runtime.prepare_retrieval_query(text), None)
+            .embed_query(&self.runtime.prepare_retrieval_query(text))
     }
 
-    fn embed_documents(&self, texts: &[String]) -> crate::Result<Vec<Vec<f32>>> {
+    fn embed_documents(&self, texts: &[String]) -> crate::Result<(Vec<Vec<f32>>, EncoderLane)> {
         let inputs = texts
             .iter()
             .map(|text| self.runtime.prepare_retrieval_document(text))
             .collect::<Vec<_>>();
-        self.runtime.embed_batch(&inputs, None)
+        self.runtime.embed_documents(&inputs)
     }
 }
 
@@ -294,34 +434,43 @@ pub(crate) fn semantic_ranked(
     doc_ids: Option<&[String]>,
     limit: usize,
 ) -> Result<Vec<(i64, f32)>, rusqlite::Error> {
-    let mut binds = vec![
-        Value::Text(ENCODER_SHA256.to_string()),
-        Value::Integer(query.len() as i64),
-    ];
-    let sql = format!(
-        "SELECT v.chunk_id, v.vector
-         FROM document_chunk_vectors AS v
-         JOIN document_chunks AS c ON c.id = v.chunk_id
-         WHERE v.vector IS NOT NULL AND v.encoder_sha256 = ?1 AND v.dims = ?2
-           AND v.chunk_sha256 = c.chunk_sha256{}",
-        scope_clause(doc_ids, &mut binds)
-    );
-    let mut statement = conn.prepare(&sql)?;
-    let mut ranked = Vec::new();
-    let rows = statement.query_map(params_from_iter(binds.iter()), |row| {
-        Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
-    })?;
-    for row in rows {
-        let (chunk_id, blob) = row?;
-        let Some(vector) = from_blob(&blob, query.len()) else {
-            continue;
-        };
-        if let Ok(score) = cosine_similarity(query, &vector) {
-            ranked.push((chunk_id, score));
-        }
+    if query.is_empty() {
+        return Ok(Vec::new());
     }
-    ranked.sort_by(|left, right| right.1.total_cmp(&left.1).then(left.0.cmp(&right.0)));
-    ranked.truncate(limit);
+    let cache = current_vectors(conn, query.len())?;
+    let scope: Option<std::collections::HashSet<&str>> =
+        doc_ids.map(|ids| ids.iter().map(String::as_str).collect());
+    let query_norm = squared_norm(query);
+    let dims = cache.dims;
+    let mut ranked: Vec<(i64, f32)> = {
+        use rayon::prelude::*;
+        cache
+            .chunk_ids
+            .par_iter()
+            .enumerate()
+            .filter_map(|(index, chunk_id)| {
+                if scope
+                    .as_ref()
+                    .is_some_and(|scope| !scope.contains(cache.doc_ids[index].as_ref()))
+                {
+                    return None;
+                }
+                let vector = &cache.vectors[index * dims..(index + 1) * dims];
+                cosine_with_norms(query, query_norm, vector, cache.norms[index])
+                    .map(|score| (*chunk_id, score))
+            })
+            .collect()
+    };
+    // Chunk ids are unique, so this order is total: selecting the best `limit`
+    // first and then sorting them gives the same list as sorting everything.
+    let order = |left: &(i64, f32), right: &(i64, f32)| {
+        right.1.total_cmp(&left.1).then(left.0.cmp(&right.0))
+    };
+    if ranked.len() > limit {
+        ranked.select_nth_unstable_by(limit, order);
+        ranked.truncate(limit);
+    }
+    ranked.sort_by(order);
     Ok(ranked)
 }
 
@@ -424,6 +573,34 @@ fn coverage_from_row(row: &rusqlite::Row<'_>, offset: usize) -> rusqlite::Result
         indexed_chunks: count(1)?,
         skipped_chunks: count(2)?,
     })
+}
+
+/// Index coverage of `doc_ids` (or the whole library) for a search by meaning
+/// with `dims`-sized query vectors: the per-document counts of the current
+/// generation, summed. The same totals as one scoped `COVERAGE_SELECT`.
+pub(crate) fn search_coverage(
+    conn: &Connection,
+    doc_ids: Option<&[String]>,
+    dims: usize,
+) -> Result<Coverage, rusqlite::Error> {
+    let cache = current_vectors(conn, dims)?;
+    let mut total = Coverage::default();
+    let mut add = |coverage: &Coverage| {
+        total.indexable_chunks += coverage.indexable_chunks;
+        total.indexed_chunks += coverage.indexed_chunks;
+        total.skipped_chunks += coverage.skipped_chunks;
+    };
+    match doc_ids {
+        Some(doc_ids) => {
+            let unique: std::collections::HashSet<&String> = doc_ids.iter().collect();
+            unique
+                .into_iter()
+                .filter_map(|doc_id| cache.coverage.get(doc_id))
+                .for_each(&mut add);
+        }
+        None => cache.coverage.values().for_each(&mut add),
+    }
+    Ok(total)
 }
 
 pub(crate) fn coverage(
@@ -584,8 +761,9 @@ fn index_pending(encoder: &Encoder) -> Result<usize, String> {
     let mut before_id = i64::MAX;
     let mut pass_top = None;
     let mut stored = 0;
+    let mut batch_size = INDEX_BATCH;
     loop {
-        let batch = locked(&conn, |conn| pending_batch(conn, before_id, INDEX_BATCH))?;
+        let batch = locked(&conn, |conn| pending_batch(conn, before_id, batch_size))?;
         let Some(last) = batch.last() else {
             break;
         };
@@ -601,9 +779,15 @@ fn index_pending(encoder: &Encoder) -> Result<usize, String> {
         let vectors = if texts.is_empty() {
             Vec::new()
         } else {
-            encoder
+            let (vectors, lane) = encoder
                 .embed_documents(&texts)
-                .map_err(|error| format!("chunk embedding failed: {error}"))?
+                .map_err(|error| format!("chunk embedding failed: {error}"))?;
+            record_lane(lane);
+            batch_size = match lane {
+                EncoderLane::Cuda => CUDA_INDEX_BATCH,
+                EncoderLane::Cpu => INDEX_BATCH,
+            };
+            vectors
         };
         if vectors.len() != intact.len()
             || vectors.iter().any(|vector| vector.len() != encoder.dims)
@@ -643,6 +827,25 @@ fn has_pending() -> bool {
 }
 
 static INDEXING: AtomicBool = AtomicBool::new(false);
+
+/// The lane of the most recent indexing batch: 0 none yet, 1 CPU, 2 CUDA.
+static LAST_LANE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+fn record_lane(lane: EncoderLane) {
+    let value = match lane {
+        EncoderLane::Cpu => 1,
+        EncoderLane::Cuda => 2,
+    };
+    LAST_LANE.store(value, Ordering::Release);
+}
+
+fn last_lane() -> Option<&'static str> {
+    match LAST_LANE.load(Ordering::Acquire) {
+        1 => Some(EncoderLane::Cpu.as_str()),
+        2 => Some(EncoderLane::Cuda.as_str()),
+        _ => None,
+    }
+}
 
 fn last_failure() -> &'static Mutex<Option<String>> {
     static LAST_FAILURE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
@@ -719,6 +922,9 @@ pub struct SemanticIndexStatus {
     pub message: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Where the latest batch of chunk vectors was computed: `cpu` or `cuda`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lane: Option<&'static str>,
 }
 
 impl SemanticIndexStatus {
@@ -731,6 +937,7 @@ impl SemanticIndexStatus {
             reason: reason.map(Unavailable::code),
             message: reason.map(Unavailable::message),
             error: recorded_failure(),
+            lane: last_lane(),
         }
     }
 }
@@ -927,6 +1134,106 @@ pub(crate) mod tests {
     }
 
     const TEXT: &str = "Enterprise customers may request a refund within 60 days of the invoice date. Refunds are issued to the original payment method. Trial accounts are not eligible for refunds under any circumstance. Exports are fulfilled within thirty days.";
+
+    #[test]
+    fn cosine_with_norms_returns_the_bits_of_cosine_similarity() {
+        let query: Vec<f32> = (0..768)
+            .map(|i| ((i * 37 % 101) as f32 - 50.0) * 0.013)
+            .collect();
+        for seed in 0..20_u32 {
+            let vector: Vec<f32> = (0..768_u32)
+                .map(|i| ((i * 7919 + seed * 104_729) % 211) as f32 * 0.007 - 0.7)
+                .collect();
+            let expected = cosine_similarity(&query, &vector).unwrap();
+            let cached =
+                cosine_with_norms(&query, squared_norm(&query), &vector, squared_norm(&vector))
+                    .unwrap();
+            assert_eq!(cached.to_bits(), expected.to_bits(), "seed {seed}");
+        }
+        assert!(cosine_with_norms(&[0.0; 4], 0.0, &[1.0; 4], 4.0).is_none());
+    }
+
+    #[test]
+    fn cached_vectors_follow_every_change_to_chunks_and_vectors() {
+        let conn = memory();
+        let ids = seed(&conn, "doc", TEXT);
+        let other = seed(&conn, "other", TEXT);
+        put_vector(&conn, ids[0], &unit(&[1.0, 0.0, 0.0]));
+        let query = unit(&[1.0, 0.1, 0.0]);
+        let ranked_ids = |conn: &Connection| {
+            semantic_ranked(conn, &query, None, 10)
+                .unwrap()
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ranked_ids(&conn), vec![ids[0]]);
+        put_vector(&conn, other[0], &unit(&[0.6, 0.8, 0.0]));
+        assert_eq!(ranked_ids(&conn), vec![ids[0], other[0]], "a new vector");
+        conn.execute(
+            "UPDATE document_chunks SET chunk_sha256 = 'rebound' WHERE id = ?1",
+            params![ids[0]],
+        )
+        .unwrap();
+        assert_eq!(
+            ranked_ids(&conn),
+            vec![other[0]],
+            "a chunk whose text changed"
+        );
+        conn.execute("DELETE FROM document_chunks WHERE doc_id = 'other'", [])
+            .unwrap();
+        assert!(ranked_ids(&conn).is_empty(), "a deleted document");
+        // A second database never answers from the first one's cache.
+        let fresh = memory();
+        let fresh_ids = seed(&fresh, "doc", TEXT);
+        assert!(ranked_ids(&fresh).is_empty());
+        put_vector(&fresh, fresh_ids[0], &unit(&[1.0, 0.0, 0.0]));
+        assert_eq!(ranked_ids(&fresh), vec![fresh_ids[0]]);
+    }
+
+    #[test]
+    fn search_coverage_matches_the_scoped_count() {
+        let conn = memory();
+        let a = seed(&conn, "a", TEXT);
+        let b = seed(&conn, "b", TEXT);
+        put_vector(&conn, a[0], &unit(&[1.0, 0.0, 0.0]));
+        let skipped_hash: String = conn
+            .query_row(
+                "SELECT chunk_sha256 FROM document_chunks WHERE id = ?1",
+                params![b[0]],
+                |row| row.get(0),
+            )
+            .unwrap();
+        store(&conn, b[0], &skipped_hash, 3, None).unwrap();
+        let scopes: [Option<Vec<String>>; 4] = [
+            None,
+            Some(vec!["a".into()]),
+            Some(vec!["b".into(), "b".into(), "a".into()]),
+            Some(vec!["missing".into()]),
+        ];
+        for scope in &scopes {
+            assert_eq!(
+                search_coverage(&conn, scope.as_deref(), 3).unwrap(),
+                coverage(&conn, scope.as_deref()).unwrap(),
+                "{scope:?}"
+            );
+        }
+        seed(&conn, "c", TEXT);
+        assert_eq!(
+            search_coverage(&conn, None, 3).unwrap(),
+            coverage(&conn, None).unwrap(),
+            "a document added after the cache was built"
+        );
+    }
+
+    #[test]
+    fn index_status_reports_the_lane_of_the_latest_batch() {
+        record_lane(EncoderLane::Cuda);
+        let status = SemanticIndexStatus::from_encoder(&Err(Unavailable::Disabled));
+        assert_eq!(serde_json::to_value(&status).unwrap()["lane"], "cuda");
+        record_lane(EncoderLane::Cpu);
+        assert_eq!(last_lane(), Some("cpu"));
+    }
 
     #[test]
     fn vectors_round_trip_through_their_blob() {

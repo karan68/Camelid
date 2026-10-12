@@ -1,0 +1,14 @@
+pid 326825
+health: build v0.7.8-27-gfa24c19c | model None | ready False
+{'available': True, 'encoder': 'nomic-embed-text-v1.5.Q8_0.gguf', 'indexing': True}
+minute 1 vectors 32 (+32)
+minute 2 vectors 48 (+16)
+minute 3 vectors 80 (+32)
+minute 4 vectors 96 (+16)
+minute 5 vectors 112 (+16)
+minute 6 vectors 144 (+32)
+minute 7 vectors 160 (+16)
+minute 8 vectors 192 (+32)
+minute 9 vectors 208 (+16)
+minute 10 vectors 224 (+16)
+total 224 in 601 s

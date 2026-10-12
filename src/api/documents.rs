@@ -35,6 +35,8 @@ const DEFAULT_CHUNK_OVERLAP: usize = 64;
 const CANDIDATE_POOL: usize = 50;
 /// The usual reciprocal-rank-fusion constant; it damps the weight of the very top ranks.
 const RRF_K: f64 = 60.0;
+/// Exact names and parts carry more weight than a neighbouring semantic match.
+const KEYWORD_RRF_WEIGHT: f64 = 4.0;
 
 static DB_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -773,44 +775,65 @@ impl Found {
     }
 }
 
-/// Reciprocal rank fusion: each ranking contributes `1 / (RRF_K + rank)` for
-/// the chunks it holds. Ties break on the better single-ranking position, then
-/// chunk id, so the order is deterministic.
+/// Weighted reciprocal rank fusion: keyword contributes `4 / (RRF_K + rank)`
+/// and semantic contributes `1 / (RRF_K + rank)` for the chunks each holds.
+/// An exact tie goes to the passage the keyword ranking
+/// placed higher, then to the better single-ranking position, then to the
+/// lower chunk id, so the order is deterministic.
+///
+/// Near-duplicates can lead the semantic list while the question's words
+/// distinguish the requested part. Keyword needs more than a tie-break to
+/// keep that distinction, while semantic still finds paraphrases with no
+/// shared words.
 fn reciprocal_rank_fusion(keyword: &[i64], semantic: &[i64]) -> Vec<(i64, f32, Found)> {
-    let mut fused: HashMap<i64, (f64, usize, bool, bool)> = HashMap::new();
+    struct Entry {
+        score: f64,
+        best: usize,
+        keyword_rank: Option<usize>,
+        in_semantic: bool,
+    }
+    let mut fused: HashMap<i64, Entry> = HashMap::new();
     for (list, ids) in [(0, keyword), (1, semantic)] {
         for (rank, id) in ids.iter().enumerate() {
-            let entry = fused.entry(*id).or_insert((0.0, usize::MAX, false, false));
-            entry.0 += 1.0 / (RRF_K + (rank + 1) as f64);
-            entry.1 = entry.1.min(rank);
+            let entry = fused.entry(*id).or_insert(Entry {
+                score: 0.0,
+                best: usize::MAX,
+                keyword_rank: None,
+                in_semantic: false,
+            });
+            let weight = if list == 0 { KEYWORD_RRF_WEIGHT } else { 1.0 };
+            entry.score += weight / (RRF_K + (rank + 1) as f64);
+            entry.best = entry.best.min(rank);
             if list == 0 {
-                entry.2 = true;
+                entry.keyword_rank = Some(rank);
             } else {
-                entry.3 = true;
+                entry.in_semantic = true;
             }
         }
     }
-    let mut ranked = fused
+    let mut ranked = fused.into_iter().collect::<Vec<_>>();
+    ranked.sort_by(|(left_id, left), (right_id, right)| {
+        right
+            .score
+            .total_cmp(&left.score)
+            .then(
+                left.keyword_rank
+                    .unwrap_or(usize::MAX)
+                    .cmp(&right.keyword_rank.unwrap_or(usize::MAX)),
+            )
+            .then(left.best.cmp(&right.best))
+            .then(left_id.cmp(right_id))
+    });
+    ranked
         .into_iter()
-        .map(|(id, (score, best, in_keyword, in_semantic))| {
-            let found = match (in_keyword, in_semantic) {
+        .map(|(id, entry)| {
+            let found = match (entry.keyword_rank.is_some(), entry.in_semantic) {
                 (true, true) => Found::Both,
                 (true, false) => Found::Keyword,
                 _ => Found::Semantic,
             };
-            (id, score, best, found)
+            (id, entry.score as f32, found)
         })
-        .collect::<Vec<_>>();
-    ranked.sort_by(|left, right| {
-        right
-            .1
-            .total_cmp(&left.1)
-            .then(left.2.cmp(&right.2))
-            .then(left.0.cmp(&right.0))
-    });
-    ranked
-        .into_iter()
-        .map(|(id, score, _, found)| (id, score as f32, found))
         .collect()
 }
 
@@ -1171,15 +1194,14 @@ fn search_locked(
             }
         }
     }
-    // Counting coverage scans every chunk in scope, so a search that did not
-    // rank by meaning skips it.
-    let coverage = if plan.query_vector.is_some() {
-        Some(
-            document_vectors::coverage(conn, plan.doc_ids)
+    // Coverage is reported for searches that ranked by meaning; it is counted
+    // once per index generation, beside the cached vectors.
+    let coverage = match plan.query_vector {
+        Some(vector) => Some(
+            document_vectors::search_coverage(conn, plan.doc_ids, vector.len())
                 .map_err(|error| ("index_coverage_error", error))?,
-        )
-    } else {
-        None
+        ),
+        None => None,
     };
     Ok(SearchOutcome {
         results,
@@ -2089,21 +2111,92 @@ mod tests {
                 (20, Found::Keyword),
                 (40, Found::Semantic)
             ],
-            "found by both outranks either list's top hit alone; equal ranks tie on chunk id"
+            "agreement still leads the separate keyword and semantic hits"
         );
-        let expected = (1.0 / 63.0 + 1.0 / 61.0) as f32;
+        let expected = (4.0 / 63.0 + 1.0 / 61.0) as f32;
         assert!((fused[0].1 - expected).abs() < 1e-7);
 
         let tied = reciprocal_rank_fusion(&[7], &[3]);
         assert_eq!(
             tied.iter().map(|(id, _, _)| *id).collect::<Vec<_>>(),
-            vec![3, 7]
+            vec![7, 3]
         );
+        assert!(
+            tied[0].1 > tied[1].1,
+            "the top keyword hit carries more weight than the top semantic-only hit"
+        );
+        let both_keyword = reciprocal_rank_fusion(&[9, 4], &[]);
         assert_eq!(
-            tied[0].1, tied[1].1,
-            "equal ranks score equally; the lower id goes first"
+            both_keyword
+                .iter()
+                .map(|(id, _, _)| *id)
+                .collect::<Vec<_>>(),
+            vec![9, 4],
+            "different scores are never reordered"
         );
         assert!(reciprocal_rank_fusion(&[], &[]).is_empty());
+    }
+
+    /// The keyword winner stays first even when a decoy leads semantic and
+    /// pushes the fact to fifth there, regardless of document insertion order.
+    #[test]
+    fn keyword_distinctions_outweigh_a_neighbouring_semantic_hit() {
+        for (fact, decoy) in [(1_i64, 2_i64), (2, 1)] {
+            for semantic in [vec![decoy, fact], vec![decoy, 3, 4, 5, fact]] {
+                let fused = reciprocal_rank_fusion(&[fact, decoy], &semantic);
+                assert_eq!(fused[0].0, fact);
+                assert!(fused[0].1 > fused[1].1);
+            }
+        }
+    }
+
+    #[test]
+    fn an_exact_part_match_leads_hybrid_search_despite_a_semantic_decoy() {
+        let fact = "The primary mirror at Ivarsdal was recoated at a cost of 335300 euros.";
+        let decoy = "The secondary mirror at Ivarsdal was recoated at a cost of 937700 euros.";
+        for reverse in [false, true] {
+            let conn = library();
+            let passages = if reverse {
+                [
+                    fact,
+                    decoy,
+                    "Other passage A",
+                    "Other passage B",
+                    "Other passage C",
+                ]
+            } else {
+                [
+                    decoy,
+                    fact,
+                    "Other passage A",
+                    "Other passage B",
+                    "Other passage C",
+                ]
+            };
+            let ids = seed_passages(&conn, "mirrors", &passages);
+            for (id, text) in ids.iter().zip(passages) {
+                let similarity: f32 = match text {
+                    text if text == fact => 0.95,
+                    text if text == decoy => 0.99,
+                    "Other passage A" => 0.98,
+                    "Other passage B" => 0.97,
+                    _ => 0.96,
+                };
+                put_vector(
+                    &conn,
+                    *id,
+                    &[similarity, (1.0 - similarity * similarity).sqrt()],
+                );
+            }
+            let query = "Ivarsdal primary mirror recoated cost";
+            let keyword = keyword_ranked(&conn, query, None, 5).unwrap();
+            let fact_id = ids[usize::from(!reverse)];
+            assert_eq!(keyword[0].0, fact_id, "the exact part wins BM25");
+            let (results, mode) = run_search(&conn, &plan(query, Some(&[1.0, 0.0]))).unwrap();
+            assert_eq!(mode, "hybrid");
+            assert_eq!(results[0].excerpt, fact);
+            assert_eq!(results[0].retrieval, "hybrid");
+        }
     }
 
     #[test]

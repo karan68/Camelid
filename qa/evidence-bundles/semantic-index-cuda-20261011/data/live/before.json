@@ -1,0 +1,45 @@
+{
+ "ui": "before",
+ "results": [
+  {
+   "id": 21,
+   "question": "How much did it cost when the primary mirror of the Ivarsdal observatory was recoated?",
+   "library_pill": "Whole library\nindexing 0/114083",
+   "searches": [
+    {
+     "body": {
+      "query": "How much did it cost when the primary mirror of the Ivarsdal observatory was recoated?",
+      "top_k": 4,
+      "library": true
+     },
+     "response": {
+      "status": 200,
+      "mode": "hybrid",
+      "results": []
+     }
+    }
+   ],
+   "reply": "I am unable to verify the cost of recoating the primary mirror of the Ivarsdal observatory.\n\nLlama 3.2 3B Instruct Q4_K_M\nVERIFIED\ntokens in 31 · out 23\nfirst token 622ms\n61 tok/s\n984ms\n07:24 PM\nCLIENT-MEASURED\nDeveloper Diagnostics\n60.9 tok/s"
+  },
+  {
+   "id": 13,
+   "question": "How much did it cost when the north clarifier of the Wyncroft water treatment plant was relined?",
+   "library_pill": "Whole library\nindexing 0/114083",
+   "searches": [
+    {
+     "body": {
+      "query": "How much did it cost when the north clarifier of the Wyncroft water treatment plant was relined?",
+      "top_k": 4,
+      "library": true
+     },
+     "response": {
+      "status": 200,
+      "mode": "hybrid",
+      "results": []
+     }
+    }
+   ],
+   "reply": "I'm not able to find any information on the cost of relining the north clarifier of the Wyncroft water treatment plant.\n\nLlama 3.2 3B Instruct Q4_K_M\nVERIFIED\ntokens in 33 · out 29\nfirst token 431ms\n65 tok/s\n863ms\n07:24 PM\nCLIENT-MEASURED\nDeveloper Diagnostics\n64.9 tok/s"
+  }
+ ]
+}
