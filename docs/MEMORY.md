@@ -24,8 +24,9 @@ yourself on the Memory page, or turn a saved note into one with **Make a memory*
 
 The suggestion is a second, short request to the same model, made after the
 reply has finished. It contains only your message — not the reply and not the
-rest of the conversation — and the facts already in memory, so they are not
-suggested twice. Where the model's serve lane supports structured output, the
+rest of the conversation — and the same memories in use that fit the chat's
+request limits, so they are not suggested twice. Where the model's serve lane
+supports structured output, the
 request asks for a JSON list through a schema; where it refuses one
 (`unsupported_parameter`), it is asked once more in plain words and the answer is
 read only if it is exactly `{"facts": [...]}`. If anything else comes back, or

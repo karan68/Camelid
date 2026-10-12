@@ -1873,7 +1873,7 @@ export default function ChatWorkspace({
                         onOpenMemory={onOpenMemory}
                       />}
                     {/* A model too slow to ask on its own waits for the user, under the latest reply only. */}
-                    {message.role === 'assistant' && !message.streaming && isLastMessage && memoryEnabled
+                    {message.role === 'assistant' && !message.streaming && isLastMessage && memoryEnabled && chatContext.use_memory
                       && priorUserMessage?.memory_suggestion_offer === true
                       && <MemoryOffer
                         looking={memoryLookup?.messageId === priorUserMessage.id}

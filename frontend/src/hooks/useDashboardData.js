@@ -24,6 +24,7 @@ import {
   cleanMemoryText,
   freshSuggestions,
   memoryKey,
+  memoriesForPrompt,
   newMemory,
   normalizeMemories,
   normalizeSuggestionCosts,
@@ -1197,6 +1198,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
         ? { ...item, context: next, updated_at: nowIso() } : item))
       persistContextValue(CONVERSATIONS_STORAGE_KEY, conversations)
       updateConversationsState(conversations)
+      if (!next.use_memory && memoryLookup?.conversationId === selectedConversation.id) memorySuggestionRef.current?.abort()
     } else {
       persistContextValue('camelid.draftContext', next)
       setDraftContext(next)
@@ -2626,6 +2628,11 @@ export function useDashboardData({ showNotice, clearNotice }) {
      suggestions; nothing is saved until the user accepts one. How long it took
      decides whether this model is asked automatically next time. */
   const suggestMemories = async ({ conversationId, messageId, userText, model, manual = false }) => {
+    const canSuggest = () => {
+      const conversation = localConversationsRef.current.find((item) => item.id === conversationId)
+      return memoryEnabledRef.current && conversation && normalizeChatContext(conversation.context).use_memory
+    }
+    if (!canSuggest()) return
     memorySuggestionRef.current?.abort()
     const controller = new AbortController()
     memorySuggestionRef.current = controller
@@ -2637,7 +2644,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
         headers: { 'Content-Type': 'application/json' },
         signal: controller.signal,
         body: JSON.stringify(suggestionRequest({
-          model, userText, constrained, knownFacts: userMemoriesRef.current.map((memory) => memory.text),
+          model, userText, constrained, knownFacts: memoriesForPrompt(userMemoriesRef.current).map((memory) => memory.text),
         })),
       })
       return { response, payload: await response.json().catch(() => null) }
@@ -2647,7 +2654,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
       // Some serve lanes cannot constrain output to a schema; ask them plainly.
       if (!response.ok && payload?.error?.code === 'unsupported_parameter') ({ response, payload } = await ask(false))
       if (response.ok) recordSuggestionCost(model, performance.now() - started)
-      if (!response.ok || controller.signal.aborted || !memoryEnabledRef.current) return
+      if (!response.ok || controller.signal.aborted || !canSuggest()) return
       const facts = freshSuggestions(parseSuggestionReply(payload?.choices?.[0]?.message?.content), {
         memories: userMemoriesRef.current,
       })
@@ -2673,7 +2680,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
   const lookForMemories = (conversationId, messageId) => {
     const conversation = localConversationsRef.current.find((item) => item.id === conversationId)
     const message = conversation?.messages?.find((item) => item.id === messageId && item.role === 'user')
-    if (!message || !memoryEnabledRef.current) return
+    if (!message || !memoryEnabledRef.current || !normalizeChatContext(conversation.context).use_memory) return
     const model = getRuntimeRequestModelId(selectedModel, runtime, selectedModelId)
     void suggestMemories({ conversationId, messageId, userText: String(message.content || ''), model, manual: true })
   }
@@ -2692,15 +2699,22 @@ export function useDashboardData({ showNotice, clearNotice }) {
     const factText = cleanMemoryText(editedText ?? suggestion?.text)
     if (!suggestion || suggestion.status !== 'pending' || !factText) return null
     const existing = userMemoriesRef.current.find((memory) => memoryKey(memory.text) === memoryKey(factText))
-    if (!existing && memoryLimitReached()) return null
-    const memory = existing || newMemory(factText, {
+    if (existing) {
+      patchSuggestions(conversationId, messageId, (items) => items.map((item) => (
+        item.id === suggestionId ? { ...item, status: 'dismissed' } : item
+      )))
+      showNotice('That is already in memory.', 'info')
+      return existing
+    }
+    if (memoryLimitReached()) return null
+    const memory = newMemory(factText, {
       kind: 'chat',
       conversation_id: conversationId,
       message_id: messageId,
       turn: userTurnNumber(conversation.messages, messageId),
       conversation_title: conversation.title || '',
     })
-    if (!existing) persistUserMemories((current) => [memory, ...current])
+    persistUserMemories((current) => [memory, ...current])
     patchSuggestions(conversationId, messageId, (items) => items.map((item) => (
       item.id === suggestionId ? { ...item, text: factText, status: 'saved', memory_id: memory.id } : item
     )))

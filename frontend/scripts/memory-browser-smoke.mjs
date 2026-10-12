@@ -258,6 +258,15 @@ const openChatReady = async () => {
   await page.waitForSelector('main[data-view="chat"]', { timeout: 30000 })
   await page.waitForSelector('textarea[aria-label="Message Camelid"]:not([disabled])', { timeout: 30000 })
 }
+const setChatMemory = async (enabled) => {
+  await clickVisible('[aria-label="Edit conversation context"]')
+  await page.waitForSelector('.context-modal')
+  const input = await page.waitForFunction(() => [...document.querySelectorAll('.context-modal label.context-check')]
+    .find((label) => label.textContent.trim() === 'Use memory in this chat')?.querySelector('input'))
+  if (await input.evaluate((element) => element.checked) !== enabled) await input.asElement().click()
+  await clickVisible('button', 'Save context')
+  await page.waitForSelector('.context-modal', { hidden: true })
+}
 
 const shot = async (name, selector = null, { mobile = false } = {}) => {
   if (!shotDir) return
@@ -451,6 +460,8 @@ try {
   assert.match(helloMemory, /- I prefer metric units\./)
   assert.match(helloMemory, /- The user always packs a charger\./)
   assert.doesNotMatch(helloMemory, /Sam/, 'a memory not in use is not sent')
+  await waitForExtraction(MSG.hello)
+  assert.doesNotMatch(extractionFor(MSG.hello)[0].body.messages[1].content, /Sam/, 'a memory not in use is not sent to the suggestion request either')
 
   /* ---- 10. a lane that refuses the schema -------------------------------- */
   fixture.refuseSchema = true
@@ -463,14 +474,41 @@ try {
   await page.waitForFunction(() => [...document.querySelectorAll('.memsug .memsug__item p')].some((p) => p.textContent === 'The user is learning Japanese.'), { timeout: 10000 })
   fixture.refuseSchema = false
 
+  // Rewording a suggestion to an existing fact must not make Undo delete the
+  // memory that existed before this suggestion was accepted.
+  const beforeDuplicate = await storedMemories()
+  await page.evaluate(() => [...document.querySelectorAll('.memsug .memsug__item')]
+    .find((row) => row.querySelector('p')?.textContent === 'The user is learning Japanese.')
+    .querySelectorAll('button')[1].click())
+  await page.waitForSelector('input[aria-label="Edit what to remember"]')
+  await fill('input[aria-label="Edit what to remember"]', 'I prefer metric units.')
+  await clickVisible('.memsug .is-editing button', 'Remember')
+  await page.waitForFunction(() => !document.querySelector('.memsug .is-editing'))
+  assert.deepEqual(await storedMemories(), beforeDuplicate, 'accepting an existing fact leaves the original memory untouched')
+  const japaneseMessage = (await currentConversation()).messages.find((message) => message.content === MSG.japanese)
+  assert.equal(japaneseMessage.memory_suggestions[0].status, 'dismissed', 'an existing fact is dismissed without adding an Undo action for its memory')
+
   /* ---- 10b. a model too slow to ask on its own waits for the user ------- */
   await page.evaluate((model) => localStorage.setItem('camelid.memorySuggestionMs', JSON.stringify({ [model]: 60000 })), MODEL_FILENAME)
   await send(MSG.cello)
   await sleep(800)
   assert.equal(extractionFor(MSG.cello).length, 0, 'a slow model is not asked on its own')
   await shot('7-offer', '.memsug--offer')
+  await setChatMemory(false)
+  assert.equal(await page.$('.memsug--offer'), null, 'turning memory off for this chat hides its existing offer')
+  assert.equal(extractionFor(MSG.cello).length, 0, 'turning memory off does not start the offered request')
+  await setChatMemory(true)
+  fixture.delayFor = MSG.cello
   await clickVisible('.memsug--offer button', 'Look for things to remember')
   await waitForExtraction(MSG.cello)
+  await setChatMemory(false)
+  for (let i = 0; i < 100 && !extractionFor(MSG.cello)[0].aborted; i += 1) await sleep(50)
+  assert.equal(extractionFor(MSG.cello)[0].aborted, true, 'turning memory off for this chat cancels its running suggestion request')
+  assert.ok(!(await suggestionRows()).some((row) => row.text.includes('cello')), 'a request cancelled by the chat switch suggests nothing')
+  fixture.delayFor = null
+  await setChatMemory(true)
+  await clickVisible('.memsug--offer button', 'Look for things to remember')
+  await waitForExtraction(MSG.cello, 2)
   await page.waitForFunction(() => [...document.querySelectorAll('.memsug .memsug__item p')].some((p) => p.textContent === 'The user plays the cello.'), { timeout: 10000 })
   assert.equal(await page.$('.memsug--offer'), null, 'the offer is gone once the model has been asked')
   const celloMessage = (await currentConversation()).messages.find((message) => message.content === MSG.cello)
