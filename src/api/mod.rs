@@ -2221,9 +2221,13 @@ impl GenerationCancel {
     /// Arm the wall-clock deadline at decode entry (same coverage as the old
     /// handler-side timer: prep/tokenization are not counted).
     fn arm(&mut self, timeout: Duration) {
-        self.started = Instant::now();
+        self.arm_at(Instant::now(), timeout);
+    }
+
+    fn arm_at(&mut self, started: Instant, timeout: Duration) {
+        self.started = started;
         self.timeout = timeout;
-        self.deadline = self.started.checked_add(timeout);
+        self.deadline = started.checked_add(timeout);
     }
 
     fn tripped(&self) -> Option<GenerationStopCause> {
@@ -24141,6 +24145,7 @@ fn run_stream_decode_job(
             return;
         }
     };
+    prepared.cancel.arm_at(generation_started, request_timeout);
     let stream_timing_diagnostics = stream_timing_diagnostics_enabled();
     if !send(StreamDecodeEvent::Started) {
         return;
@@ -24520,6 +24525,7 @@ impl CooperativeStreamDecodeJob {
         generation_started: Instant,
         request_timeout: Duration,
     ) -> Option<Self> {
+        prepared.cancel.arm_at(generation_started, request_timeout);
         if events.blocking_send(StreamDecodeEvent::Started).is_err() {
             return None;
         }
@@ -36945,6 +36951,26 @@ mod tests {
             0,
         );
         assert_eq!(error_code_of(other).await, "generation_step_failed");
+    }
+
+    #[test]
+    fn cooperative_stream_prefill_observes_its_wall_clock_deadline() {
+        let (events, _receiver) = tokio::sync::mpsc::channel(32);
+        let mut job = CooperativeStreamDecodeJob::new_at(
+            orphan_test_prepared("model-a.gguf"),
+            events,
+            Instant::now() - Duration::from_secs(2),
+            Duration::from_secs(1),
+        )
+        .expect("stream initializes");
+        assert!(matches!(
+            job.prepared.cancel.tripped(),
+            Some(GenerationStopCause::TimedOut)
+        ));
+        assert!(matches!(
+            prefill_step(&mut job.prepared.session),
+            Err(BackendError::Cancelled)
+        ));
     }
 
     #[test]

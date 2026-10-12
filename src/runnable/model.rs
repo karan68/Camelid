@@ -3150,16 +3150,10 @@ impl RunnableModel {
         let (&last_prompt_token, prior_prompt) = prompt
             .split_last()
             .ok_or_else(|| BackendError::InvalidTensorData("empty prompt".into()))?;
-        // Each batch completes its command buffer before the next cancellation
-        // check; recurrent and KV state remain in the same resident engine.
-        const PROMPT_BATCH: usize = 16;
-        for (batch, tokens) in prior_prompt.chunks(PROMPT_BATCH).enumerate() {
-            if is_cancelled() {
-                return Err(BackendError::Cancelled);
-            }
+        qwen35_metal_prefill_segments(prior_prompt, is_cancelled, &mut |base, tokens| {
             let mut prefill = Vec::with_capacity(tokens.len());
             for (offset, &token) in tokens.iter().enumerate() {
-                let position = batch * PROMPT_BATCH + offset;
+                let position = base + offset;
                 let embedding = self.token_embd.dequant_row(token as usize, "token_embd")?;
                 let (cos, sin) = qwen35_rope_tables(position, self.rope_base, self.rope_dim);
                 prefill.push((embedding, cos, sin));
@@ -3170,10 +3164,8 @@ impl RunnableModel {
                     prefill.len()
                 )));
             }
-        }
-        if is_cancelled() {
-            return Err(BackendError::Cancelled);
-        }
+            Ok(())
+        })?;
         let last_position = prior_prompt.len();
         let embedding = self
             .token_embd
@@ -5219,6 +5211,72 @@ fn qwen35_device_decode_steps(
         rope_position: first_rope_position + output_step,
         output_step,
     })
+}
+
+/// Bound Metal prompt work between cancellation checks. Each forward closure
+/// completes its command buffer before returning, preserving resident KV state.
+#[cfg(any(target_os = "macos", test))]
+fn qwen35_metal_prefill_segments(
+    prompt: &[u32],
+    is_cancelled: &dyn Fn() -> bool,
+    forward: &mut dyn FnMut(usize, &[u32]) -> Result<()>,
+) -> Result<()> {
+    const SEGMENT: usize = 16;
+    for (batch, tokens) in prompt.chunks(SEGMENT).enumerate() {
+        if is_cancelled() {
+            return Err(BackendError::Cancelled);
+        }
+        forward(batch * SEGMENT, tokens)?;
+    }
+    if is_cancelled() {
+        return Err(BackendError::Cancelled);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod qwen35_metal_prompt_cancel_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn cancelled_metal_prompt_never_dispatches_the_next_batch() {
+        let stopped = Cell::new(false);
+        let mut processed = Vec::new();
+        let prompt: Vec<u32> = (0..33).collect();
+        let result =
+            qwen35_metal_prefill_segments(&prompt, &|| stopped.get(), &mut |base, tokens| {
+                processed.push((base, tokens.to_vec()));
+                stopped.set(true);
+                Ok(())
+            });
+        assert!(matches!(result, Err(BackendError::Cancelled)));
+        assert_eq!(processed, vec![(0, prompt[..16].to_vec())]);
+    }
+
+    #[test]
+    fn healthy_metal_prompt_keeps_token_order_and_absolute_positions() {
+        let prompt: Vec<u32> = (0..33).collect();
+        let mut processed = Vec::new();
+        qwen35_metal_prefill_segments(&prompt, &|| false, &mut |base, tokens| {
+            processed.extend(
+                tokens
+                    .iter()
+                    .enumerate()
+                    .map(|(offset, &token)| (base + offset, token)),
+            );
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            processed,
+            prompt
+                .iter()
+                .enumerate()
+                .map(|(pos, &token)| (pos, token))
+                .collect::<Vec<_>>()
+        );
+    }
 }
 
 /// Prompt tokens the qwen35 CUDA device loop queues between syncs; the request's cancel
