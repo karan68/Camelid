@@ -32,6 +32,8 @@ const DEFAULT_CHUNK_OVERLAP: usize = 64;
 const CANDIDATE_POOL: usize = 50;
 /// The usual reciprocal-rank-fusion constant; it damps the weight of the very top ranks.
 const RRF_K: f64 = 60.0;
+/// Exact names and parts carry more weight than a neighbouring semantic match.
+const KEYWORD_RRF_WEIGHT: f64 = 4.0;
 
 static DB_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -647,16 +649,16 @@ impl Found {
     }
 }
 
-/// Reciprocal rank fusion: each ranking contributes `1 / (RRF_K + rank)` for
-/// the chunks it holds. An exact tie goes to the passage the keyword ranking
+/// Weighted reciprocal rank fusion: keyword contributes `4 / (RRF_K + rank)`
+/// and semantic contributes `1 / (RRF_K + rank)` for the chunks each holds.
+/// An exact tie goes to the passage the keyword ranking
 /// placed higher, then to the better single-ranking position, then to the
 /// lower chunk id, so the order is deterministic.
 ///
-/// Why keyword first: two passages that each top one list tie exactly. That
-/// is what happens with near-duplicates, such as the same sentence about a
-/// neighbouring part, which the encoder can barely tell apart while the words
-/// the question used still can. Breaking those ties on chunk id meant
-/// whichever file was added first won.
+/// Near-duplicates can lead the semantic list while the question's words
+/// distinguish the requested part. Keyword needs more than a tie-break to
+/// keep that distinction, while semantic still finds paraphrases with no
+/// shared words.
 fn reciprocal_rank_fusion(keyword: &[i64], semantic: &[i64]) -> Vec<(i64, f32, Found)> {
     struct Entry {
         score: f64,
@@ -673,7 +675,8 @@ fn reciprocal_rank_fusion(keyword: &[i64], semantic: &[i64]) -> Vec<(i64, f32, F
                 keyword_rank: None,
                 in_semantic: false,
             });
-            entry.score += 1.0 / (RRF_K + (rank + 1) as f64);
+            let weight = if list == 0 { KEYWORD_RRF_WEIGHT } else { 1.0 };
+            entry.score += weight / (RRF_K + (rank + 1) as f64);
             entry.best = entry.best.min(rank);
             if list == 0 {
                 entry.keyword_rank = Some(rank);
@@ -1648,9 +1651,9 @@ mod tests {
                 (20, Found::Keyword),
                 (40, Found::Semantic)
             ],
-            "found by both outranks either list's top hit alone; an equal score goes to the keyword hit"
+            "agreement still leads the separate keyword and semantic hits"
         );
-        let expected = (1.0 / 63.0 + 1.0 / 61.0) as f32;
+        let expected = (4.0 / 63.0 + 1.0 / 61.0) as f32;
         assert!((fused[0].1 - expected).abs() < 1e-7);
 
         let tied = reciprocal_rank_fusion(&[7], &[3]);
@@ -1658,9 +1661,9 @@ mod tests {
             tied.iter().map(|(id, _, _)| *id).collect::<Vec<_>>(),
             vec![7, 3]
         );
-        assert_eq!(
-            tied[0].1, tied[1].1,
-            "equal ranks score equally; the keyword hit goes first"
+        assert!(
+            tied[0].1 > tied[1].1,
+            "the top keyword hit carries more weight than the top semantic-only hit"
         );
         let both_keyword = reciprocal_rank_fusion(&[9, 4], &[]);
         assert_eq!(
@@ -1674,19 +1677,65 @@ mod tests {
         assert!(reciprocal_rank_fusion(&[], &[]).is_empty());
     }
 
-    /// A fact and a near-duplicate about a neighbouring part: the words of the
-    /// question put the fact first, the encoder (barely) prefers the other one,
-    /// and the two fuse to exactly the same score. The fact must win whatever
-    /// order the two were added in.
+    /// The keyword winner stays first even when a decoy leads semantic and
+    /// pushes the fact to fifth there, regardless of document insertion order.
     #[test]
-    fn an_exact_fusion_tie_goes_to_the_keyword_ranking() {
+    fn keyword_distinctions_outweigh_a_neighbouring_semantic_hit() {
         for (fact, decoy) in [(1_i64, 2_i64), (2, 1)] {
-            let fused = reciprocal_rank_fusion(&[fact, decoy], &[decoy, fact]);
-            assert_eq!(fused[0].1, fused[1].1, "an exact tie");
-            assert_eq!(
-                fused.iter().map(|(id, _, _)| *id).collect::<Vec<_>>(),
-                vec![fact, decoy]
-            );
+            for semantic in [vec![decoy, fact], vec![decoy, 3, 4, 5, fact]] {
+                let fused = reciprocal_rank_fusion(&[fact, decoy], &semantic);
+                assert_eq!(fused[0].0, fact);
+                assert!(fused[0].1 > fused[1].1);
+            }
+        }
+    }
+
+    #[test]
+    fn an_exact_part_match_leads_hybrid_search_despite_a_semantic_decoy() {
+        let fact = "The primary mirror at Ivarsdal was recoated at a cost of 335300 euros.";
+        let decoy = "The secondary mirror at Ivarsdal was recoated at a cost of 937700 euros.";
+        for reverse in [false, true] {
+            let conn = library();
+            let passages = if reverse {
+                [
+                    fact,
+                    decoy,
+                    "Other passage A",
+                    "Other passage B",
+                    "Other passage C",
+                ]
+            } else {
+                [
+                    decoy,
+                    fact,
+                    "Other passage A",
+                    "Other passage B",
+                    "Other passage C",
+                ]
+            };
+            let ids = seed_passages(&conn, "mirrors", &passages);
+            for (id, text) in ids.iter().zip(passages) {
+                let similarity: f32 = match text {
+                    text if text == fact => 0.95,
+                    text if text == decoy => 0.99,
+                    "Other passage A" => 0.98,
+                    "Other passage B" => 0.97,
+                    _ => 0.96,
+                };
+                put_vector(
+                    &conn,
+                    *id,
+                    &[similarity, (1.0 - similarity * similarity).sqrt()],
+                );
+            }
+            let query = "Ivarsdal primary mirror recoated cost";
+            let keyword = keyword_ranked(&conn, query, None, 5).unwrap();
+            let fact_id = ids[usize::from(!reverse)];
+            assert_eq!(keyword[0].0, fact_id, "the exact part wins BM25");
+            let (results, mode) = run_search(&conn, &plan(query, Some(&[1.0, 0.0]))).unwrap();
+            assert_eq!(mode, "hybrid");
+            assert_eq!(results[0].excerpt, fact);
+            assert_eq!(results[0].retrieval, "hybrid");
         }
     }
 
